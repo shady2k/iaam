@@ -12,6 +12,7 @@
 pub mod approx;
 pub mod decimal;
 pub mod exact;
+pub mod xirr;
 
 use thiserror::Error;
 

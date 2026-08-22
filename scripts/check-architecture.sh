@@ -80,13 +80,23 @@ if [ -n "$oracle_leak" ]; then
   err "iaam-oracle попал в продакшн- или build-зависимости (§15.4)"
 fi
 
-# --- 5. Двоичная плавающая точка в ядре только в numeric/approx.rs ---
+# --- 5. Двоичная плавающая точка в ядре только в объявленных файлах ---
+# Приближённый режим (§6.6) живёт в двух файлах и только в них: политика
+# и результат с границей погрешности (approx.rs) и сам решатель ставки
+# (xirr.rs). Список задан поимённо, а не маской каталога: маска позволила бы
+# завести третий файл с плавающей точкой незаметно.
+APPROX_FILES=(
+  "numeric/approx.rs"
+  "numeric/xirr.rs"
+)
 if [ -d "$CORE_SRC" ]; then
-  hits=$(grep -rn '\bf64\b\|\bf32\b' "$CORE_SRC" --include='*.rs' \
-    | { grep -v "^${CORE_SRC//./\\.}/numeric/approx\.rs:" || true; } \
-    | strip_comments || true)
+  hits=$(grep -rn '\bf64\b\|\bf32\b' "$CORE_SRC" --include='*.rs' || true)
+  for allowed in "${APPROX_FILES[@]}"; do
+    hits=$(printf '%s' "$hits" | { grep -v "^${CORE_SRC}/${allowed}:" || true; })
+  done
+  hits=$(printf '%s' "$hits" | strip_comments || true)
   if [ -n "$hits" ]; then
-    err "двоичная плавающая точка вне numeric/approx.rs (§6.6):"
+    err "двоичная плавающая точка вне приближённого режима (§6.6):"
     echo "$hits" >&2
   fi
 fi
@@ -119,17 +129,26 @@ for manifest in crates/*/Cargo.toml; do
   fi
 done
 
-# --- 8. approx.rs не разрастается в теневой расчётный слой ---
-# Исключение целого файла из заслона №5 опасно: в нём можно разместить
-# денежную арифметику. Ограничение размера делает это заметным.
-APPROX="$CORE_SRC/numeric/approx.rs"
-if [ -f "$APPROX" ]; then
-  lines=$(wc -l < "$APPROX")
-  if [ "$lines" -gt 200 ]; then
-    err "numeric/approx.rs разросся до $lines строк при пороге 200."
+# --- 8. Приближённый режим не разрастается в теневой расчётный слой ---
+# Исключение файла из заслона №5 опасно: в нём можно разместить денежную
+# арифметику. Ограничение размера делает это заметным. Порог у каждого файла
+# свой: решатель со сканированием диапазона и оценкой погрешности объективно
+# длиннее объявления политики. Считаются ВСЕ строки файла, включая тесты, —
+# так же, как считались для approx.rs; порог задан с учётом этого.
+APPROX_LIMITS=(
+  "numeric/approx.rs:200"
+  "numeric/xirr.rs:420"
+)
+for entry in "${APPROX_LIMITS[@]}"; do
+  file="$CORE_SRC/${entry%%:*}"
+  limit="${entry##*:}"
+  [ -f "$file" ] || continue
+  lines=$(wc -l < "$file")
+  if [ "$lines" -gt "$limit" ]; then
+    err "$file разросся до $lines строк при пороге $limit."
     err "Приближённый режим должен оставаться тонким (§6.6)."
   fi
-fi
+done
 
 if [ "$fail" -ne 0 ]; then
   echo "" >&2

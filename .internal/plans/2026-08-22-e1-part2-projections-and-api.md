@@ -1370,6 +1370,8 @@ git commit -m "feat(core): книга лотов со списанием вер�
 - Consumes: `contour::{ContourDefinition, FlowClass, classify}`, `event::leg::Leg::cash_effect`.
 - Produces: `projection::flows::{FlowLog, ExternalFlow, FlowDirection, FlowError}`; методы `FlowLog::apply(&Event, &ContourDefinition)`, `external() -> &[ExternalFlow]`, `internal()`, `irrelevant()`.
 
+> **Исправление при исполнении (2026-08-23).** Задача идёт **после задачи 4**: `classify` разбирает `EventKind` исчерпывающе. Мутационный прогон дал одного выжившего — `moves_money` можно было заменить на `true` незамеченно, и счётчик внутренних движений стал бы счётчиком событий. Закрыто тестом `an_event_that_moved_no_money_is_not_counted_as_a_movement`: оценка внутри контура движением не считается, перевод между своими счетами — считается.
+
 **Acceptance Criteria:**
 - Внешним потоком становится только то, что пересекает границу контура; сделки, доходы и комиссии внутри контура — нет.
 - Для перевода извне внутрь сумма потока равна **входящей ноге**, а не обеим.

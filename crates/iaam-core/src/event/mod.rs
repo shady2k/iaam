@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::dates::{EffectiveOrder, EventDates};
-use crate::ids::{AccountId, EventId, OwnerId};
-use crate::money::{CurrencyCode, Money, MoneyError};
+use crate::ids::{AccountId, EventId, InstrumentId, OwnerId};
+use crate::money::{CurrencyCode, Money, MoneyError, Quantity};
 use kind::{EventKind, TradeSide};
 use leg::{Leg, LegKind};
 use provenance::Provenance;
@@ -67,6 +67,22 @@ pub enum EventValidationError {
          и потому не является фактом движения"
     )]
     TransferToSelf { account: AccountId },
+    #[error(
+        "для {kind} нога не соответствует событию по полю {field}: \
+         событие говорит одно, нога другое"
+    )]
+    LegDoesNotMatchEvent {
+        kind: &'static str,
+        field: &'static str,
+    },
+    #[error("для {kind} величина {field} должна быть положительной, получено {value}")]
+    NonPositive {
+        kind: &'static str,
+        field: &'static str,
+        value: String,
+    },
+    #[error(transparent)]
+    Numeric(#[from] crate::numeric::NumericError),
     #[error(transparent)]
     Money(#[from] MoneyError),
 }
@@ -97,7 +113,14 @@ pub struct Event {
 }
 
 /// Текущая версия схемы события.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Версия 2 отличается от версии 1 добавленным вариантом
+/// [`EventKind::Valuation`]. Уже записанные факты версии 1 читаются
+/// без изменений — новый вариант в них просто не встречается, — но
+/// программа, знающая только версию 1, не разберёт новое событие.
+/// Оставить прежний номер значило бы, что одна версия обозначает две
+/// несовместимые схемы (§4.1).
+pub const SCHEMA_VERSION: u32 = 2;
 
 impl Event {
     /// Сумма денежного эффекта всех ног в указанной валюте.
@@ -148,12 +171,28 @@ impl Event {
             } => self.validate_transfer(name, *from, *to, *amount),
             EventKind::Trade {
                 side,
+                instrument,
+                quantity,
                 gross,
                 fee,
                 accrued_interest,
+            } => self.validate_trade(
+                name,
+                *side,
+                TradeDeclaration {
+                    instrument: *instrument,
+                    quantity: *quantity,
+                    gross: *gross,
+                    fee: *fee,
+                    accrued_interest: *accrued_interest,
+                },
+            ),
+            EventKind::OpeningPosition {
+                instrument,
+                quantity,
                 ..
-            } => self.validate_trade(name, *side, *gross, *fee, *accrued_interest),
-            EventKind::OpeningPosition { .. } => self.validate_opening_position(name),
+            } => self.validate_opening_position(name, *instrument, *quantity),
+            EventKind::Valuation { price, .. } => self.validate_valuation(name, *price),
         }
     }
 
@@ -244,26 +283,74 @@ impl Event {
     }
 
     /// Сделка: ровно одна денежная и ровно одна бумажная нога, денежная
-    /// нога равна расчётной сумме со знаком, заданным направлением сделки.
+    /// нога равна расчётной сумме со знаком направления, **а бумажная
+    /// нога говорит ровно то же, что тип события**.
+    ///
+    /// Последнее — не педантизм. Без этой сверки событие «куплено сто
+    /// бумаг X», чья нога зачисляет одну бумагу Y на чужой счёт, проходит
+    /// проверку и попадает в append-only журнал навсегда. Инвариант
+    /// проекции остановит отчёт, но исправить записанный факт можно будет
+    /// только сторнированием: входной заслон обязан не пропускать
+    /// противоречие, а не сохранять его (§4.3, §4.8).
     fn validate_trade(
         &self,
         name: &'static str,
         side: TradeSide,
-        gross: Money,
-        fee: Option<Money>,
-        accrued_interest: Option<Money>,
+        declared: TradeDeclaration,
     ) -> Result<(), EventValidationError> {
+        let TradeDeclaration {
+            instrument,
+            quantity,
+            gross,
+            fee,
+            accrued_interest,
+        } = declared;
+        require_positive(name, "gross", gross.amount().raw())?;
+        require_positive_quantity(name, "quantity", quantity)?;
+
         let cash = self.cash_legs();
         let cash_money = single_leg_money(name, &cash, "ровно одна денежная нога")?;
-        self.expect_single_security_leg(name)?;
+        require_own_account(name, cash[0].account, self.account)?;
         let expected = trade_settlement(side, gross, fee, accrued_interest)?;
-        require_equal(name, cash_money, expected)
+        require_equal(name, cash_money, expected)?;
+
+        let security = self.security_legs();
+        if security.len() != 1 {
+            return Err(EventValidationError::LegCount {
+                kind: name,
+                expected: "ровно одна бумажная нога",
+                found: security.len(),
+            });
+        }
+        let leg = security[0];
+        require_own_account(name, leg.account, self.account)?;
+        require_same_instrument(name, leg.instrument, instrument)?;
+
+        // Покупка увеличивает позицию, продажа уменьшает. Шорты вне
+        // периметра (§11), поэтому знак задан направлением однозначно.
+        let expected_quantity = match side {
+            TradeSide::Buy => quantity,
+            TradeSide::Sell => Quantity(quantity.0.checked_neg()?),
+        };
+        match leg.quantity {
+            Some(actual) if actual == expected_quantity => Ok(()),
+            _ => Err(EventValidationError::LegDoesNotMatchEvent {
+                kind: name,
+                field: "quantity",
+            }),
+        }
     }
 
     /// Восстановленная позиция описывает только бумагу: денег в этом
     /// событии не двигалось, иначе восстановление остатка выглядело бы
     /// как реальная покупка (§10.7).
-    fn validate_opening_position(&self, name: &'static str) -> Result<(), EventValidationError> {
+    fn validate_opening_position(
+        &self,
+        name: &'static str,
+        instrument: InstrumentId,
+        quantity: Quantity,
+    ) -> Result<(), EventValidationError> {
+        require_positive_quantity(name, "quantity", quantity)?;
         let cash = self.cash_legs();
         if !cash.is_empty() {
             return Err(EventValidationError::LegCount {
@@ -272,19 +359,53 @@ impl Event {
                 found: cash.len(),
             });
         }
-        self.expect_single_security_leg(name)
-    }
-
-    fn expect_single_security_leg(&self, name: &'static str) -> Result<(), EventValidationError> {
-        let sec = self.security_legs();
-        if sec.len() != 1 {
+        let security = self.security_legs();
+        if security.len() != 1 {
             return Err(EventValidationError::LegCount {
                 kind: name,
                 expected: "ровно одна бумажная нога",
-                found: sec.len(),
+                found: security.len(),
             });
         }
-        Ok(())
+        let leg = security[0];
+        require_own_account(name, leg.account, self.account)?;
+        require_same_instrument(name, leg.instrument, instrument)?;
+        match leg.quantity {
+            Some(actual) if actual == quantity => Ok(()),
+            _ => Err(EventValidationError::LegDoesNotMatchEvent {
+                kind: name,
+                field: "quantity",
+            }),
+        }
+    }
+
+    /// Оценка не двигает ни денег, ни бумаг: это утверждение о цене.
+    /// Нога здесь означала бы, что кто-то записал переоценку как факт
+    /// движения, — а нереализованный результат движением не является.
+    fn validate_valuation(
+        &self,
+        name: &'static str,
+        price: crate::numeric::decimal::Dec,
+    ) -> Result<(), EventValidationError> {
+        // Нулевая и отрицательная цена дают отрицательную стоимость
+        // позиции и внешне правдоподобную доходность. Бумага может
+        // обесцениться до нуля — но это факт делистинга (E3), а не цена.
+        if !price.is_positive() {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "price",
+                value: price.inner().to_string(),
+            });
+        }
+        if self.legs.is_empty() {
+            Ok(())
+        } else {
+            Err(EventValidationError::LegCount {
+                kind: name,
+                expected: "ни одной ноги",
+                found: self.legs.len(),
+            })
+        }
     }
 }
 
@@ -324,6 +445,78 @@ fn leg_money(name: &'static str, leg: &Leg) -> Result<Money, EventValidationErro
         expected: "нога с указанной суммой",
         found: 0,
     })
+}
+
+/// Объявленные условия сделки. Отдельная структура, потому что порог
+/// `too-many-arguments-threshold = 6` действует, а подавлять линт нельзя.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TradeDeclaration {
+    instrument: InstrumentId,
+    quantity: Quantity,
+    gross: Money,
+    fee: Option<Money>,
+    accrued_interest: Option<Money>,
+}
+
+fn require_positive(
+    name: &'static str,
+    field: &'static str,
+    value: i64,
+) -> Result<(), EventValidationError> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(EventValidationError::NonPositive {
+            kind: name,
+            field,
+            value: value.to_string(),
+        })
+    }
+}
+
+fn require_positive_quantity(
+    name: &'static str,
+    field: &'static str,
+    quantity: Quantity,
+) -> Result<(), EventValidationError> {
+    if quantity.0.is_positive() {
+        Ok(())
+    } else {
+        Err(EventValidationError::NonPositive {
+            kind: name,
+            field,
+            value: quantity.0.inner().to_string(),
+        })
+    }
+}
+
+/// Нога обязана лежать на счёте события: иначе одно событие двигало бы
+/// бумаги на чужом счёте, а лоты считались бы по своему.
+fn require_own_account(
+    name: &'static str,
+    leg: AccountId,
+    event: AccountId,
+) -> Result<(), EventValidationError> {
+    if leg == event {
+        Ok(())
+    } else {
+        let _ = name;
+        Err(EventValidationError::WrongAccount { expected: event })
+    }
+}
+
+fn require_same_instrument(
+    name: &'static str,
+    leg: Option<InstrumentId>,
+    declared: InstrumentId,
+) -> Result<(), EventValidationError> {
+    match leg {
+        Some(actual) if actual == declared => Ok(()),
+        _ => Err(EventValidationError::LegDoesNotMatchEvent {
+            kind: name,
+            field: "instrument",
+        }),
+    }
 }
 
 fn single_leg_money(
@@ -446,13 +639,14 @@ mod tests {
         }
     }
 
-    fn security_leg(account: AccountId, instrument: InstrumentId) -> Leg {
-        Leg::security(
-            account,
-            CustodyId::new_random(),
-            instrument,
-            Quantity::zero(),
-        )
+    fn qty(units: i64) -> Quantity {
+        Quantity(crate::numeric::decimal::Dec::new(
+            rust_decimal::Decimal::from(units),
+        ))
+    }
+
+    fn security_leg(account: AccountId, instrument: InstrumentId, quantity: Quantity) -> Leg {
+        Leg::security(account, CustodyId::new_random(), instrument, quantity)
     }
 
     // --- Общие тестовые конструкторы ---
@@ -979,7 +1173,7 @@ mod tests {
         let kind = EventKind::Trade {
             side: TradeSide::Buy,
             instrument,
-            quantity: Quantity::zero(),
+            quantity: qty(100),
             gross: rub(5_000_000),
             fee: Some(rub(3_500)),
             accrued_interest: None,
@@ -989,7 +1183,7 @@ mod tests {
             kind.clone(),
             vec![
                 Leg::cash(acc, rub(5_003_500)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(100)),
             ],
             acc,
         );
@@ -1002,7 +1196,7 @@ mod tests {
             kind,
             vec![
                 Leg::cash(acc, rub(-5_003_500)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(100)),
             ],
             acc,
         );
@@ -1018,14 +1212,14 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Buy,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: Some(rub(120_000)),
             },
             vec![
                 Leg::cash(acc, rub(-5_123_500)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(100)),
             ],
             acc,
         );
@@ -1041,14 +1235,14 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Sell,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: Some(rub(120_000)),
             },
             vec![
                 Leg::cash(acc, rub(5_116_500)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(-100)),
             ],
             acc,
         );
@@ -1065,14 +1259,14 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Buy,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: Some(rub(120_000)),
             },
             vec![
                 Leg::cash(acc, rub(-5_120_000)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(100)),
             ],
             acc,
         );
@@ -1082,14 +1276,14 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Sell,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
             },
             vec![
                 Leg::cash(acc, rub(5_000_000)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(-100)),
             ],
             acc,
         );
@@ -1106,14 +1300,14 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Buy,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: None,
             },
             vec![
                 Leg::cash(acc, rub(-4_996_500)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(100)),
             ],
             acc,
         );
@@ -1130,14 +1324,14 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Sell,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: None,
             },
             vec![
                 Leg::cash(acc, rub(4_996_500)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(-100)),
             ],
             acc,
         );
@@ -1151,7 +1345,7 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Buy,
                 instrument: InstrumentId::new_random(),
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
@@ -1173,15 +1367,15 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Buy,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
             },
             vec![
                 Leg::cash(acc, rub(-5_000_000)),
-                security_leg(acc, instrument),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(100)),
+                security_leg(acc, instrument, qty(100)),
             ],
             acc,
         );
@@ -1199,12 +1393,12 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Buy,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
             },
-            vec![security_leg(acc, instrument)],
+            vec![security_leg(acc, instrument, qty(100))],
             acc,
         );
         assert!(matches!(
@@ -1222,10 +1416,10 @@ mod tests {
         let ok = event(
             EventKind::OpeningPosition {
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 cost_basis: Some(rub(5_000_000)),
             },
-            vec![security_leg(acc, instrument)],
+            vec![security_leg(acc, instrument, qty(100))],
             acc,
         );
         assert!(ok.validate_structure().is_ok());
@@ -1240,12 +1434,12 @@ mod tests {
         let ev = event(
             EventKind::OpeningPosition {
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 cost_basis: None,
             },
             vec![
                 Leg::cash(acc, rub(-5_000_000)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(100)),
             ],
             acc,
         );
@@ -1261,7 +1455,7 @@ mod tests {
         let instrument = InstrumentId::new_random();
         let kind = EventKind::OpeningPosition {
             instrument,
-            quantity: Quantity::zero(),
+            quantity: qty(100),
             cost_basis: None,
         };
         let none = event(kind.clone(), vec![], acc);
@@ -1272,7 +1466,10 @@ mod tests {
 
         let two = event(
             kind,
-            vec![security_leg(acc, instrument), security_leg(acc, instrument)],
+            vec![
+                security_leg(acc, instrument, qty(100)),
+                security_leg(acc, instrument, qty(100)),
+            ],
             acc,
         );
         assert!(matches!(
@@ -1375,7 +1572,7 @@ mod tests {
             EventKind::Trade {
                 side: TradeSide::Buy,
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: None,
@@ -1383,7 +1580,7 @@ mod tests {
             vec![
                 Leg::cash(acc, rub(-5_000_000)),
                 Leg::fee(acc, rub(-3_500)),
-                security_leg(acc, instrument),
+                security_leg(acc, instrument, qty(100)),
             ],
             acc,
         );
@@ -1417,10 +1614,10 @@ mod tests {
         let ev = event(
             EventKind::OpeningPosition {
                 instrument,
-                quantity: Quantity::zero(),
+                quantity: qty(100),
                 cost_basis: None,
             },
-            vec![security_leg(acc, instrument)],
+            vec![security_leg(acc, instrument, qty(100))],
             acc,
         );
         assert_eq!(
@@ -1461,7 +1658,321 @@ mod tests {
             acc,
         );
         assert_eq!(ev.schema_version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn a_valuation_with_a_leg_is_rejected() {
+        let mut event = test_support::sample_event(1);
+        event.kind = EventKind::Valuation {
+            instrument: crate::ids::InstrumentId::new_random(),
+            price: crate::numeric::decimal::Dec::one(),
+            currency: CurrencyCode::Rub,
+            quality: crate::valuation::PriceQuality::OwnerEstimate,
+        };
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::LegCount { .. })
+        ));
+        event.legs = vec![];
+        assert!(event.validate_structure().is_ok());
+    }
+
+    // --- Сверка ноги с событием и знаки величин ---
+    //
+    // Каждый отказ проверяется отдельно: без этого мутационный заслон
+    // показывает, что проверку можно заменить на `Ok(())` и ни один
+    // тест не заметит (проверено — так и было).
+
+    fn buy_with(acc: AccountId, instrument: InstrumentId, quantity: Quantity, leg: Leg) -> Event {
+        event(
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity,
+                gross: rub(5_000_000),
+                fee: None,
+                accrued_interest: None,
+            },
+            vec![Leg::cash(acc, rub(-5_000_000)), leg],
+            acc,
+        )
+    }
+
+    #[test]
+    fn a_trade_of_zero_quantity_is_rejected() {
+        let acc = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let ev = buy_with(
+            acc,
+            instrument,
+            Quantity::zero(),
+            security_leg(acc, instrument, Quantity::zero()),
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::NonPositive {
+                field: "quantity",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_trade_of_negative_quantity_is_rejected() {
+        // Отрицательное количество в покупке — это шорт, а шорты вне
+        // периметра (§11): их денежный эффект сохраняется отдельным
+        // типом события, а не отрицательной сделкой.
+        let acc = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let ev = buy_with(
+            acc,
+            instrument,
+            qty(-10),
+            security_leg(acc, instrument, qty(-10)),
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::NonPositive {
+                field: "quantity",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_trade_of_zero_value_is_rejected() {
+        let acc = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let ev = event(
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity: qty(10),
+                gross: rub(0),
+                fee: None,
+                accrued_interest: None,
+            },
+            vec![
+                Leg::cash(acc, rub(0)),
+                security_leg(acc, instrument, qty(10)),
+            ],
+            acc,
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::NonPositive { field: "gross", .. })
+        ));
+    }
+
+    #[test]
+    fn a_security_leg_of_another_instrument_is_rejected() {
+        let acc = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let other = InstrumentId::new_random();
+        let ev = buy_with(acc, instrument, qty(10), security_leg(acc, other, qty(10)));
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::LegDoesNotMatchEvent {
+                field: "instrument",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_security_leg_on_another_account_is_rejected() {
+        let acc = AccountId::new_random();
+        let stranger = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let ev = buy_with(
+            acc,
+            instrument,
+            qty(10),
+            security_leg(stranger, instrument, qty(10)),
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::WrongAccount { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cash_leg_on_another_account_is_rejected() {
+        let acc = AccountId::new_random();
+        let stranger = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let ev = event(
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity: qty(10),
+                gross: rub(5_000_000),
+                fee: None,
+                accrued_interest: None,
+            },
+            vec![
+                Leg::cash(stranger, rub(-5_000_000)),
+                security_leg(acc, instrument, qty(10)),
+            ],
+            acc,
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::WrongAccount { .. })
+        ));
+    }
+
+    #[test]
+    fn a_leg_quantity_differing_from_the_event_is_rejected() {
+        let acc = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let ev = buy_with(
+            acc,
+            instrument,
+            qty(10),
+            security_leg(acc, instrument, qty(9)),
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::LegDoesNotMatchEvent {
+                field: "quantity",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_purchase_whose_leg_reduces_the_position_is_rejected() {
+        // Знак задан направлением сделки: покупка увеличивает позицию.
+        let acc = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let ev = buy_with(
+            acc,
+            instrument,
+            qty(10),
+            security_leg(acc, instrument, qty(-10)),
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::LegDoesNotMatchEvent {
+                field: "quantity",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_sale_whose_leg_increases_the_position_is_rejected() {
+        let acc = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let ev = event(
+            EventKind::Trade {
+                side: TradeSide::Sell,
+                instrument,
+                quantity: qty(10),
+                gross: rub(5_000_000),
+                fee: None,
+                accrued_interest: None,
+            },
+            vec![
+                Leg::cash(acc, rub(5_000_000)),
+                security_leg(acc, instrument, qty(10)),
+            ],
+            acc,
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::LegDoesNotMatchEvent {
+                field: "quantity",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_opening_position_disagreeing_with_its_leg_is_rejected() {
+        let acc = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let other = InstrumentId::new_random();
+
+        let wrong_quantity = event(
+            EventKind::OpeningPosition {
+                instrument,
+                quantity: qty(10),
+                cost_basis: None,
+            },
+            vec![security_leg(acc, instrument, qty(11))],
+            acc,
+        );
+        assert!(matches!(
+            wrong_quantity.validate_structure(),
+            Err(EventValidationError::LegDoesNotMatchEvent {
+                field: "quantity",
+                ..
+            })
+        ));
+
+        let wrong_instrument = event(
+            EventKind::OpeningPosition {
+                instrument,
+                quantity: qty(10),
+                cost_basis: None,
+            },
+            vec![security_leg(acc, other, qty(10))],
+            acc,
+        );
+        assert!(matches!(
+            wrong_instrument.validate_structure(),
+            Err(EventValidationError::LegDoesNotMatchEvent {
+                field: "instrument",
+                ..
+            })
+        ));
+
+        let zero = event(
+            EventKind::OpeningPosition {
+                instrument,
+                quantity: Quantity::zero(),
+                cost_basis: None,
+            },
+            vec![security_leg(acc, instrument, Quantity::zero())],
+            acc,
+        );
+        assert!(matches!(
+            zero.validate_structure(),
+            Err(EventValidationError::NonPositive {
+                field: "quantity",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_valuation_at_zero_or_below_is_rejected() {
+        // Нулевая цена даёт нулевую стоимость позиции и правдоподобную
+        // доходность. Обесценившаяся бумага — это факт делистинга (E3),
+        // а не цена.
+        let acc = AccountId::new_random();
+        for price in [
+            crate::numeric::decimal::Dec::zero(),
+            crate::numeric::decimal::Dec::new(rust_decimal::Decimal::from(-1)),
+        ] {
+            let ev = event(
+                EventKind::Valuation {
+                    instrument: InstrumentId::new_random(),
+                    price,
+                    currency: CurrencyCode::Rub,
+                    quality: crate::valuation::PriceQuality::OwnerEstimate,
+                },
+                vec![],
+                acc,
+            );
+            assert!(matches!(
+                ev.validate_structure(),
+                Err(EventValidationError::NonPositive { field: "price", .. })
+            ));
+        }
     }
 
     #[test]

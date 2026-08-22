@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AccountId, InstrumentId, TransferId};
-use crate::money::{Money, Quantity};
+use crate::money::{CurrencyCode, Money, Quantity};
+use crate::numeric::decimal::Dec;
+use crate::valuation::PriceQuality;
 
 /// Направление сделки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +66,20 @@ pub enum EventKind {
     },
     /// Восстановленный денежный остаток.
     OpeningCash { amount: Money },
+    /// Оценка инструмента по цене за единицу (§5.4).
+    ///
+    /// Факт с provenance, а не расчёт: цену кто-то опубликовал или назвал,
+    /// и без неё стоимость позиции неизвестна. На этапе 1 источник —
+    /// владелец или внешний агент; в E3 тот же вариант заполняет
+    /// `iaam-market`, и схема от этого не меняется.
+    ///
+    /// Денег не двигает: ног у события нет.
+    Valuation {
+        instrument: InstrumentId,
+        price: Dec,
+        currency: CurrencyCode,
+        quality: PriceQuality,
+    },
 }
 
 /// Происхождение комиссии. Нужно уже на этапе 1, потому что проценты
@@ -94,6 +110,7 @@ impl EventKind {
             Self::Fee { .. } => "fee",
             Self::OpeningPosition { .. } => "opening_position",
             Self::OpeningCash { .. } => "opening_cash",
+            Self::Valuation { .. } => "valuation",
         }
     }
 
@@ -116,7 +133,8 @@ impl EventKind {
             | Self::Income { .. }
             | Self::Fee { .. }
             | Self::OpeningPosition { .. }
-            | Self::OpeningCash { .. } => FlowEndpoints::WithinAccount,
+            | Self::OpeningCash { .. }
+            | Self::Valuation { .. } => FlowEndpoints::WithinAccount,
         }
     }
 }

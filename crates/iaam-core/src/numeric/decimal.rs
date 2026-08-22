@@ -35,6 +35,52 @@ impl Dec {
         MAX_SCALE
     }
 
+    #[must_use]
+    pub const fn one() -> Self {
+        Self(Decimal::ONE)
+    }
+
+    #[must_use]
+    pub const fn is_zero(&self) -> bool {
+        self.0.is_zero()
+    }
+
+    #[must_use]
+    pub const fn is_positive(&self) -> bool {
+        self.0.is_sign_positive() && !self.0.is_zero()
+    }
+
+    #[must_use]
+    pub const fn is_negative(&self) -> bool {
+        self.0.is_sign_negative() && !self.0.is_zero()
+    }
+
+    pub fn checked_sub(self, other: Self) -> Result<Self, NumericError> {
+        self.0
+            .checked_sub(other.0)
+            .map(Self)
+            .ok_or(NumericError::Overflow)
+    }
+
+    pub fn checked_mul(self, other: Self) -> Result<Self, NumericError> {
+        self.0
+            .checked_mul(other.0)
+            .map(Self)
+            .ok_or(NumericError::Overflow)
+    }
+
+    pub fn checked_neg(self) -> Result<Self, NumericError> {
+        Self::zero().checked_sub(self)
+    }
+
+    /// Сумма списка. Вынесена отдельно по той же причине, что и у `Exact`:
+    /// суммирование компонентов отчёта обязано отказывать явно.
+    pub fn sum(items: &[Self]) -> Result<Self, NumericError> {
+        items
+            .iter()
+            .try_fold(Self::zero(), |acc, x| acc.checked_add(*x))
+    }
+
     /// Сложение с проверкой переполнения. Штатный `+` у `Decimal` паникует
     /// при выходе за диапазон; тихая паника в расчёте доходности хуже
     /// типизированного отказа.
@@ -68,6 +114,77 @@ mod tests {
 
     fn dec(s: &str) -> Dec {
         Dec::new(Decimal::from_str(s).unwrap())
+    }
+
+    #[test]
+    fn is_zero_holds_only_at_zero_and_ignores_the_sign_of_zero() {
+        assert!(Dec::zero().is_zero());
+        assert!(dec("0.000").is_zero());
+        assert!(dec("-0").is_zero());
+        assert!(!dec("0.0000000001").is_zero());
+        assert!(!dec("-0.0000000001").is_zero());
+    }
+
+    #[test]
+    fn one_is_the_multiplicative_unit_and_not_zero() {
+        assert_eq!(Dec::one(), dec("1"));
+        assert!(!Dec::one().is_zero());
+    }
+
+    #[test]
+    fn sign_predicates_split_the_line_in_three_and_leave_zero_to_neither() {
+        // Ноль не положителен и не отрицателен — обе проверки обязаны
+        // отказать на нём, иначе «есть цена» и «цена ниже нуля»
+        // начинают пересекаться.
+        assert!(dec("0.01").is_positive());
+        assert!(!dec("0.01").is_negative());
+        assert!(dec("-0.01").is_negative());
+        assert!(!dec("-0.01").is_positive());
+        assert!(!Dec::zero().is_positive());
+        assert!(!Dec::zero().is_negative());
+        // Отрицательный ноль остаётся нулём: знак у него есть,
+        // а величины нет.
+        assert!(!dec("-0").is_negative());
+    }
+
+    #[test]
+    fn checked_sub_and_neg_are_exact_and_signed() {
+        assert_eq!(dec("0.3").checked_sub(dec("0.1")).unwrap(), dec("0.2"));
+        assert_eq!(dec("1").checked_sub(dec("3")).unwrap(), dec("-2"));
+        assert_eq!(dec("2.5").checked_neg().unwrap(), dec("-2.5"));
+        assert_eq!(dec("-2.5").checked_neg().unwrap(), dec("2.5"));
+        assert_eq!(Dec::zero().checked_neg().unwrap(), Dec::zero());
+    }
+
+    #[test]
+    fn checked_mul_multiplies_and_refuses_overflow() {
+        assert_eq!(dec("1.5").checked_mul(dec("4")).unwrap(), dec("6.0"));
+        let max = Dec::new(Decimal::MAX);
+        assert_eq!(max.checked_mul(max), Err(NumericError::Overflow));
+    }
+
+    #[test]
+    fn checked_sub_refuses_overflow_instead_of_panicking() {
+        let min = Dec::new(Decimal::MIN);
+        assert_eq!(
+            min.checked_sub(Dec::new(Decimal::MAX)),
+            Err(NumericError::Overflow)
+        );
+    }
+
+    #[test]
+    fn sum_of_an_empty_list_is_zero_and_of_a_list_is_its_total() {
+        assert_eq!(Dec::sum(&[]).unwrap(), Dec::zero());
+        assert_eq!(
+            Dec::sum(&[dec("0.1"), dec("0.2"), dec("-0.05")]).unwrap(),
+            dec("0.25")
+        );
+    }
+
+    #[test]
+    fn sum_refuses_when_the_running_total_overflows() {
+        let max = Dec::new(Decimal::MAX);
+        assert_eq!(Dec::sum(&[max, max]), Err(NumericError::Overflow));
     }
 
     #[test]

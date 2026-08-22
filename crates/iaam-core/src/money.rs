@@ -5,6 +5,7 @@
 //!   источником точности; это факты, их нельзя пересчитывать;
 //! - **расчётные величины** — [`crate::numeric::decimal::Dec`].
 
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -213,6 +214,17 @@ impl Money {
         items
             .iter()
             .try_fold(Self::zero(currency), |acc, item| acc.try_add(*item))
+    }
+
+    /// Переход в денежный режим: сумма как десятичная дробь.
+    ///
+    /// Единственная разрешённая точка перехода «проведённая сумма →
+    /// расчётная величина» (§3.4). Обратного перехода нет намеренно:
+    /// расчётная величина становится проведённой суммой только через
+    /// факт источника, а не через округление.
+    #[must_use]
+    pub fn to_calc_dec(&self) -> Dec {
+        Dec::new(Decimal::new(self.amount.raw(), self.currency.minor_units()))
     }
 
     /// Точное представление: `amount / 10^minor_units`.

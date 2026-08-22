@@ -12,3 +12,4 @@ pub mod money;
 pub mod numeric;
 pub mod projection;
 pub mod rules;
+pub mod valuation;

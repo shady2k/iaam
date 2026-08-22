@@ -28,6 +28,10 @@
 | Деньги нельзя сложить в обход валюты | `PostedMinor` с приватным полем, `Money` без `impl Add` |
 | Отрицание не паникует на границе типа | `checked_negate`, `checked_sub`, `Exact::neg` через `checked_neg` |
 | Три числовых режима | `numeric::{exact, decimal, approx}` |
+| Цена — факт с источником и качеством, а не параметр запроса | `EventKind::Valuation`, `valuation::PriceQuality` |
+| Нога сверяется с событием по инструменту, счёту и количеству со знаком | `Event::validate_trade`, `Event::validate_opening_position` |
+| Количество, цена и сумма сделки обязаны быть положительными | `EventValidationError::NonPositive` |
+| Версия схемы события — 2: вариант `Valuation` добавлен после заморозки версии 1 | `event::SCHEMA_VERSION` |
 
 ## Что менять нельзя без миграции
 

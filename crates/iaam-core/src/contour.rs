@@ -157,6 +157,7 @@ mod tests {
     use crate::event::test_support::sample_event;
     use crate::ids::{AccountId, CustodyId, InstrumentId, TransferId};
     use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
+    use crate::numeric::decimal::Dec;
 
     // Суммы записываются в минимальных единицах одним числом: группировка
     // вида `100_000_00` не компилируется (clippy::inconsistent_digit_grouping
@@ -210,24 +211,23 @@ mod tests {
     fn purchase(account: AccountId) -> Event {
         let gross = rub(5_000_000);
         let instrument = InstrumentId::new_random();
+        // Количество положительное и совпадает с ногой: структурная
+        // проверка сверяет ногу с событием (§4.3), и нулевое количество
+        // здесь означало бы сделку, которой не было.
+        let quantity = Quantity(Dec::new(rust_decimal::Decimal::from(100)));
         let mut event = sample_event(0);
         event.account = account;
         event.kind = EventKind::Trade {
             side: TradeSide::Buy,
             instrument,
-            quantity: Quantity::zero(),
+            quantity,
             gross,
             fee: None,
             accrued_interest: None,
         };
         event.legs = vec![
             Leg::cash(account, rub(-5_000_000)),
-            Leg::security(
-                account,
-                CustodyId::new_random(),
-                instrument,
-                Quantity::zero(),
-            ),
+            Leg::security(account, CustodyId::new_random(), instrument, quantity),
         ];
         event
     }

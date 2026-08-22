@@ -1,0 +1,26 @@
+[package]
+name = "iaam-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iaam-core = { path = "../iaam-core", version = "0.1.0" }
+iaam-store = { path = "../iaam-store", version = "0.1.0" }
+iaam-ingest = { path = "../iaam-ingest", version = "0.1.0" }
+# Один и только один механизм асинхронных трейтов (§3.2). Выбран async-trait:
+# порты обязаны быть объектобезопасными (`Arc<dyn Store>`), а RPITIT
+# объектобезопасности не даёт. Смешение механизмов запрещено заслоном.
+async-trait = "0.1"
+thiserror = "2"
+time = { version = "0.3", default-features = false, features = ["std", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

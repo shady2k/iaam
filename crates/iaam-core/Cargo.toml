@@ -19,3 +19,8 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# `rust_decimal` и `time` уже в [dependencies] крейты, поэтому интеграционным
+# тестам в tests/ доступны без отдельного объявления. Нужен только proptest.
+proptest = "1"

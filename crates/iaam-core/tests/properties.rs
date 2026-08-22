@@ -1,0 +1,172 @@
+//! Свойства с указанием области применимости (§15.3).
+//!
+//! Каждое свойство сопровождается оговоркой о том, где оно выполняется.
+//! Свойства без области — источник ложных падений, на которые проще
+//! всего ответить ослаблением генератора до тавтологии.
+//!
+//! **Намеренно отсутствуют** и не должны быть добавлены:
+//! - склейка периодов для XIRR: IRR не цепляется, свойства нет;
+//! - масштабирование всех сумм при включённых налогах: прогрессивная
+//!   шкала, пороги и минимальные комиссии его нарушают;
+//! - сдвиг дат при налоговых правилах: меняются база начисления дней,
+//!   налоговый год и ЛДВ.
+
+use iaam_core::dates::TradeDate;
+use iaam_core::ids::InstrumentId;
+use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
+use iaam_core::numeric::decimal::Dec;
+use iaam_core::rules::lot_disposal::{DisposalInput, FifoV1, Lot, LotDisposalRule, LotId};
+use proptest::prelude::*;
+use rust_decimal::Decimal;
+use time::macros::date;
+
+fn lot_strategy() -> impl Strategy<Value = (i64, i64)> {
+    // Количество 1..=1000, стоимость 1..=100_000_000 минорных единиц.
+    (1_i64..=1_000, 1_i64..=100_000_000)
+}
+
+/// Ничья при разнесении округляется к чётному, и стоимость сохраняется.
+/// Детерминированный аналог свойства: `proptest` до этого случая
+/// может и не добраться.
+#[test]
+fn tie_rounding_preserves_total_basis() {
+    let instrument = InstrumentId::new_random();
+    let lots = vec![Lot {
+        id: LotId::new_random(),
+        instrument,
+        acquired: None,
+        quantity: Quantity(Dec::new(Decimal::from(2))),
+        cost_basis: Money::new(PostedMinor::new(5), CurrencyCode::Rub),
+    }];
+
+    let out = FifoV1
+        .apply(&DisposalInput {
+            lots,
+            quantity: Quantity(Dec::new(Decimal::from(1))),
+        })
+        .expect("одна из двух штук доступна");
+
+    // 5 * 1 / 2 = 2,5 — ничья, округляется к чётному, то есть к 2.
+    assert_eq!(out.basis_released.amount().raw(), 2);
+    assert_eq!(out.remaining[0].cost_basis.amount().raw(), 3);
+    assert_eq!(
+        out.basis_released.amount().raw() + out.remaining[0].cost_basis.amount().raw(),
+        5,
+        "стоимость лота обязана сохраниться"
+    );
+}
+
+proptest! {
+    /// Область: любой набор лотов одной валюты, любое допустимое количество.
+    /// Инвариант точный — округление разносится так, что суммарная
+    /// стоимость лота сохраняется (§6.6).
+    ///
+    /// Чего свойство **не** ловит: ошибку в самом разнесении. Невыбывшая
+    /// часть считается как `cost_basis - taken`, то есть от того же значения,
+    /// которое вернул `split_basis`; их сумма равна исходной стоимости при
+    /// любом его результате. Проверено: `split_basis`, возвращающий
+    /// `value + 1`, оставляет свойство зелёным на 200 000 случаев.
+    /// Величину разнесения проверяет `tie_rounding_preserves_total_basis`
+    /// и модульные тесты `rules::lot_disposal`. Здесь проверяется другое:
+    /// что ни один лот не потерян и не учтён дважды при переходе из
+    /// `lots` в `disposed` и `remaining`.
+    #[test]
+    fn released_plus_remaining_equals_original_basis(
+        raw_lots in prop::collection::vec(lot_strategy(), 1..8),
+        sell_fraction in 0_u32..=100,
+    ) {
+        let instrument = InstrumentId::new_random();
+        let lots: Vec<Lot> = raw_lots
+            .iter()
+            .map(|(q, b)| Lot {
+                id: LotId::new_random(),
+                instrument,
+                acquired: Some(TradeDate(date!(2026 - 01 - 01))),
+                quantity: Quantity(Dec::new(Decimal::from(*q))),
+                cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+            })
+            .collect();
+
+        let total_qty: i64 = raw_lots.iter().map(|(q, _)| *q).sum();
+        let total_basis: i64 = raw_lots.iter().map(|(_, b)| *b).sum();
+        // Целочисленное деление: доля не превышает 100, поэтому результат
+        // никогда не больше доступного количества.
+        let sell_qty = total_qty * i64::from(sell_fraction) / 100;
+
+        let out = FifoV1
+            .apply(&DisposalInput {
+                lots,
+                quantity: Quantity(Dec::new(Decimal::from(sell_qty))),
+            })
+            .expect("количество в пределах доступного");
+
+        let remaining_basis: i64 =
+            out.remaining.iter().map(|l| l.cost_basis.amount().raw()).sum();
+
+        prop_assert_eq!(
+            out.basis_released.amount().raw() + remaining_basis,
+            total_basis,
+            "списанная и оставшаяся стоимость обязаны в сумме давать исходную"
+        );
+    }
+
+    /// Область: любое допустимое количество. Списанное количество
+    /// равно запрошенному — ни больше, ни меньше.
+    #[test]
+    fn disposed_quantity_equals_requested(
+        raw_lots in prop::collection::vec(lot_strategy(), 1..8),
+        sell_fraction in 0_u32..=100,
+    ) {
+        let instrument = InstrumentId::new_random();
+        let lots: Vec<Lot> = raw_lots
+            .iter()
+            .map(|(q, b)| Lot {
+                id: LotId::new_random(),
+                instrument,
+                acquired: None,
+                quantity: Quantity(Dec::new(Decimal::from(*q))),
+                cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+            })
+            .collect();
+
+        let total_qty: i64 = raw_lots.iter().map(|(q, _)| *q).sum();
+        let sell_qty = total_qty * i64::from(sell_fraction) / 100;
+
+        let out = FifoV1
+            .apply(&DisposalInput {
+                lots,
+                quantity: Quantity(Dec::new(Decimal::from(sell_qty))),
+            })
+            .expect("количество в пределах доступного");
+
+        let disposed: Decimal = out.disposed.iter().map(|d| d.quantity.0.inner()).sum();
+        prop_assert_eq!(disposed, Decimal::from(sell_qty));
+    }
+
+    /// Область: любые количества сверх доступного.
+    /// Отказ, а не отрицательный остаток.
+    #[test]
+    fn overselling_always_errors(
+        raw_lots in prop::collection::vec(lot_strategy(), 1..5),
+        excess in 1_i64..=1_000,
+    ) {
+        let instrument = InstrumentId::new_random();
+        let total_qty: i64 = raw_lots.iter().map(|(q, _)| *q).sum();
+        let lots: Vec<Lot> = raw_lots
+            .iter()
+            .map(|(q, b)| Lot {
+                id: LotId::new_random(),
+                instrument,
+                acquired: None,
+                quantity: Quantity(Dec::new(Decimal::from(*q))),
+                cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+            })
+            .collect();
+
+        let out = FifoV1.apply(&DisposalInput {
+            lots,
+            quantity: Quantity(Dec::new(Decimal::from(total_qty + excess))),
+        });
+        prop_assert!(out.is_err());
+    }
+}

@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/identity_mismatch.rs:6:24
+  |
+6 |     let _: AccountId = OwnerId::new_random();
+  |            ---------   ^^^^^^^^^^^^^^^^^^^^^ expected `AccountId`, found `OwnerId`
+  |            |
+  |            expected due to this

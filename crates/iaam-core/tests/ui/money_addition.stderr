@@ -1,0 +1,13 @@
+error[E0369]: cannot add `iaam_core::money::Money` to `iaam_core::money::Money`
+ --> tests/ui/money_addition.rs:8:20
+  |
+8 |     let _ = rubles + dollars;
+  |             ------ ^ ------- iaam_core::money::Money
+  |             |
+  |             iaam_core::money::Money
+  |
+note: `iaam_core::money::Money` does not implement `Add`
+ --> src/money.rs
+  |
+  | pub struct Money {
+  | ^^^^^^^^^^^^^^^^ `iaam_core::money::Money` is defined in another crate

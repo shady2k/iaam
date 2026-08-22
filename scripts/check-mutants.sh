@@ -48,6 +48,7 @@ MODULES=(
   "crates/iaam-store/src/snapshots.rs"
   "crates/iaam-store/src/reference.rs"
   "crates/iaam-store/src/tokens.rs"
+  "crates/iaam-store/src/bundle.rs"
   # Приёмка строит знаки и ноги события: ошибка здесь записывает
   # в append-only журнал факт, которого не было.
   "crates/iaam-ingest/src/operation.rs"

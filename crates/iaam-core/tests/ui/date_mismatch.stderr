@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/date_mismatch.rs:7:26
+  |
+7 |     let _: SettledDate = TradeDate(date!(2026 - 01 - 01));
+  |            -----------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `SettledDate`, found `TradeDate`
+  |            |
+  |            expected due to this

@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/posted_vs_calculated.rs:7:18
+  |
+7 |     let _: Dec = PostedMinor::new(100);
+  |            ---   ^^^^^^^^^^^^^^^^^^^^^ expected `Dec`, found `PostedMinor`
+  |            |
+  |            expected due to this

@@ -11,6 +11,11 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 # 256-битная целая арифметика для точного сравнения рациональных чисел.
 ethnum = "1"
+# Календарь. Выбран вместо chrono: меньше поверхность, нет зависимости
+# на локальную таймзону по умолчанию. Даты в системе — календарные (`Date`),
+# а не моменты времени: операция происходит в дату, а не в момент.
+time = { version = "0.3", default-features = false, features = ["std", "macros", "serde", "parsing", "formatting"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [lints]
 workspace = true

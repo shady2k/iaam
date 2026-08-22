@@ -2859,6 +2859,12 @@ git commit -m "feat(core): шесть семантических дат и ра�
 - Добавление варианта в `EventKind` ломает сборку во всех местах разбора
 - `Confidence::Unknown` представимо, нулевой заглушки нет
 
+> **Чего эта задача НЕ проверяет.** Корректность `Serialize`/`Deserialize`
+> держится только на том, что derive компилируется: round-trip через JSON
+> потребовал бы `serde_json` в dev-зависимостях `iaam-core`, которого
+> в плане нет. Журнал фактов, не переживающий сериализацию, бесполезен —
+> закрыть это надо, но отдельным решением, а не расширением границ задачи.
+
 - [ ] **Step 1: Реализовать ноги движения**
 
 Создать `crates/iaam-core/src/event/leg.rs`:
@@ -3093,6 +3099,20 @@ impl Provenance {
     #[must_use]
     pub fn source_operation_id(&self) -> Option<&str> {
         self.source_operation_id.as_deref()
+    }
+
+    // Версия парсера и локатор строки обязаны быть читаемыми.
+    // Происхождение, из которого нельзя достать версию разбора, не отвечает
+    // на вопрос, ради которого существует: «этот факт разобран сломанной
+    // версией парсера, его надо перечитать» (§10.1).
+    #[must_use]
+    pub const fn parser_version(&self) -> &ParserVersion {
+        &self.parser_version
+    }
+
+    #[must_use]
+    pub const fn row(&self) -> Option<&RowLocator> {
+        self.row.as_ref()
     }
 }
 
@@ -3364,6 +3384,12 @@ pub enum EventValidationError {
     WrongAccount { expected: AccountId },
     #[error("две стороны перевода не сходятся: остаток {residual}")]
     TransferResidual { residual: i64 },
+    #[error(
+        "счёт {account:?} указан и источником, и получателем перевода; \
+         перемещение денег внутри одного счёта не меняет ни один остаток \
+         и потому не является фактом движения"
+    )]
+    TransferToSelf { account: AccountId },
     #[error(transparent)]
     Money(#[from] MoneyError),
 }
@@ -3452,6 +3478,14 @@ impl Event {
                 require_equal(name, money, *amount)
             }
             EventKind::CashTransfer { from, to, amount, .. } => {
+                // Проверяется ДО разбора ног. Иначе причина отказа зависит
+                // от их числа: при двух ногах оба `find` вернут одну и ту же,
+                // остаток удвоится и отказ придёт как `TransferResidual` —
+                // по случайной причине; а две нулевые ноги дадут нулевой
+                // остаток, и вырожденное событие пройдёт проверку.
+                if from == to {
+                    return Err(EventValidationError::TransferToSelf { account: *from });
+                }
                 let legs = self.cash_legs();
                 if legs.len() != 2 {
                     return Err(EventValidationError::LegCount {

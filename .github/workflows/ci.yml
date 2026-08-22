@@ -23,5 +23,7 @@ jobs:
         run: nix develop -c cargo fmt --all -- --check
       - name: Clippy
         run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Architecture guards
+        run: nix develop -c ./scripts/check-architecture.sh
       - name: Test
         run: nix develop -c cargo test --workspace --all-features

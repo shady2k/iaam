@@ -26,6 +26,9 @@ MODULES=(
   "crates/iaam-core/src/event/correction.rs"
   "crates/iaam-core/src/contour.rs"
   "crates/iaam-core/src/rules/lot_disposal.rs"
+  # Эталон мутируется наравне с продакшеном: ошибка в эталоне маскирует
+  # ошибку в продакшене ровно так же, как наоборот (§15.4).
+  "crates/iaam-oracle/src/lots_reference.rs"
 )
 
 # Пустой список — это заслон, который проходит всегда. Опустошение массива

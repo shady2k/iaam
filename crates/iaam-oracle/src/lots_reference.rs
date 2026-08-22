@@ -106,6 +106,46 @@ mod tests {
     }
 
     #[test]
+    fn selling_more_than_held_is_an_error() {
+        // Ветка InsufficientQuantity эталона не покрывалась ничем: в фикстуре
+        // parity-теста нет случая с перепродажей, а собственных тестов
+        // у эталона не было. Мутационный заслон это и показал.
+        let lots = [RefLot {
+            quantity: 10,
+            basis_minor: 100_000,
+        }];
+        assert_eq!(
+            dispose_fifo_rational(&lots, 11),
+            Err(RefError::InsufficientQuantity)
+        );
+    }
+
+    #[test]
+    fn selling_nothing_consumes_no_lot_even_if_it_is_empty() {
+        // Лот с нулевым количеством и ненулевой стоимостью различает
+        // «ничего не продаём» и «списываем лот целиком»: при провале
+        // в следующую ветку `0 <= 0` истинно, и стоимость ушла бы
+        // в списанное. Вырожденный вход, но именно он отделяет
+        // одно намерение от другого.
+        let lots = [
+            RefLot {
+                quantity: 0,
+                basis_minor: 500,
+            },
+            RefLot {
+                quantity: 10,
+                basis_minor: 100_000,
+            },
+        ];
+        let out = dispose_fifo_rational(&lots, 0).unwrap();
+        assert_eq!(
+            out.basis_released_minor, 0,
+            "ничего не продано — ничего не списано"
+        );
+        assert_eq!(out.remaining.len(), 2, "оба лота остались нетронутыми");
+    }
+
+    #[test]
     fn taking_first_lot_whole() {
         let lots = [RefLot {
             quantity: 10,

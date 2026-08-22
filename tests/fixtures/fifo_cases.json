@@ -1,0 +1,62 @@
+{
+  "_comment": "Замороженные эталоны списания по FIFO. Ожидаемые значения посчитаны ВРУЧНУЮ и не правятся ради зелёного теста (§15.7 спецификации).",
+  "cases": [
+    {
+      "name": "первый лот целиком",
+      "_manual_calculation": "10 шт по 100,00 = 100000 копеек; продаём 10 → списывается весь первый лот",
+      "lots": [
+        { "quantity": 10, "basis_minor": 100000 },
+        { "quantity": 10, "basis_minor": 90000 }
+      ],
+      "sell_quantity": 10,
+      "expected_basis_released_minor": 100000,
+      "expected_remaining": [{ "quantity": 10, "basis_minor": 90000 }]
+    },
+    {
+      "name": "первый целиком плюс половина второго",
+      "_manual_calculation": "100000 + 90000*5/10 = 100000 + 45000 = 145000",
+      "lots": [
+        { "quantity": 10, "basis_minor": 100000 },
+        { "quantity": 10, "basis_minor": 90000 }
+      ],
+      "sell_quantity": 15,
+      "expected_basis_released_minor": 145000,
+      "expected_remaining": [{ "quantity": 5, "basis_minor": 45000 }]
+    },
+    {
+      "name": "неделимый остаток, округление половины к чётному",
+      "_manual_calculation": "лот 3 шт за 1000 копеек; продаём 1 → 1000*1/3 = 333,33... → 333; остаётся 667",
+      "lots": [{ "quantity": 3, "basis_minor": 1000 }],
+      "sell_quantity": 1,
+      "expected_basis_released_minor": 333,
+      "expected_remaining": [{ "quantity": 2, "basis_minor": 667 }]
+    },
+    {
+      "name": "ровно половина, ничья округляется к чётному",
+      "_manual_calculation": "лот 2 шт за 5 копеек; продаём 1 → 5*1/2 = 2,5 → 2 (чётное); остаётся 3",
+      "lots": [{ "quantity": 2, "basis_minor": 5 }],
+      "sell_quantity": 1,
+      "expected_basis_released_minor": 2,
+      "expected_remaining": [{ "quantity": 1, "basis_minor": 3 }]
+    },
+    {
+      "name": "ничья округляется к чётному вверх",
+      "_manual_calculation": "лот 2 шт за 15 копеек; продаём 1 → 15*1/2 = 7,5; из соседей 7 и 8 чётное — 8; остаётся 15-8 = 7",
+      "lots": [{ "quantity": 2, "basis_minor": 15 }],
+      "sell_quantity": 1,
+      "expected_basis_released_minor": 8,
+      "expected_remaining": [{ "quantity": 1, "basis_minor": 7 }]
+    },
+    {
+      "name": "продано всё",
+      "_manual_calculation": "100000 + 90000 = 190000; ничего не остаётся",
+      "lots": [
+        { "quantity": 10, "basis_minor": 100000 },
+        { "quantity": 10, "basis_minor": 90000 }
+      ],
+      "sell_quantity": 20,
+      "expected_basis_released_minor": 190000,
+      "expected_remaining": []
+    }
+  ]
+}

@@ -208,6 +208,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "iaam-oracle"
+version = "0.1.0"
+dependencies = [
+ "iaam-core",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

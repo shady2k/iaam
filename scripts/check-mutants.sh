@@ -41,6 +41,13 @@ MODULES=(
   # Контракт отчёта: именно здесь решается, доверять ли цифре.
   "crates/iaam-core/src/returns/mod.rs"
   "crates/iaam-core/src/valuation.rs"
+  # Хранилище держит границу владельца и append-only журнала: это
+  # свойства безопасности, а не удобства. План их в заслон не вносил;
+  # добавлено при исполнении задачи 11, где прогон дал десять выживших.
+  "crates/iaam-store/src/events.rs"
+  "crates/iaam-store/src/snapshots.rs"
+  "crates/iaam-store/src/reference.rs"
+  "crates/iaam-store/src/tokens.rs"
   # Эталон мутируется наравне с продакшеном: ошибка в эталоне маскирует
   # ошибку в продакшене ровно так же, как наоборот (§15.4).
   "crates/iaam-oracle/src/lots_reference.rs"

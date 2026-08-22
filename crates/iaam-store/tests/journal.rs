@@ -158,3 +158,32 @@ fn migrations_are_idempotent() {
         .unwrap();
     assert_eq!(version, iaam_store::schema::SCHEMA_VERSION);
 }
+
+#[test]
+fn the_store_assigns_the_sequence_and_does_not_take_it_from_the_caller() {
+    // Номер внутри дня — свойство журнала, а не пожелание клиента.
+    // Обе операции приходят с номером 1; вторая обязана лечь второй,
+    // иначе порядок внутри дня начнёт определяться случайным
+    // идентификатором вместо объявленной семантики (§4.8).
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+
+    let first = store
+        .append_event_in_order(&ctx.deposit(1, 100_000))
+        .unwrap();
+    let second = store
+        .append_event_in_order(&ctx.deposit(1, 50_000))
+        .unwrap();
+    assert!(matches!(first, Appended::Inserted { .. }));
+    assert!(matches!(second, Appended::Inserted { .. }));
+
+    let stored = store.load_events(ctx.owner).unwrap();
+    assert_eq!(stored.len(), 2);
+    let day = date!(2026 - 02 - 01);
+    assert_eq!(stored[0].order, EffectiveOrder::new(day, 1));
+    assert_eq!(
+        stored[1].order,
+        EffectiveOrder::new(day, 2),
+        "номер обязан быть назначен хранилищем, а не взят из события"
+    );
+}

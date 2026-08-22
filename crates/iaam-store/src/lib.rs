@@ -16,6 +16,24 @@ use std::path::Path;
 
 use rusqlite::Connection;
 use thiserror::Error;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+/// Момент записи в RFC 3339, UTC.
+///
+/// Одна на всю крейту: раньше эта функция существовала копией в
+/// `reference.rs` и в `tokens.rs`, и две копии одного форматирования
+/// расходятся молча — колонки `created_at` разных таблиц начали бы
+/// отличаться форматом, а сравнить их было бы уже нечем.
+///
+/// Отказ форматирования не паникует и не даёт пустой строки: пустое
+/// `created_at` неотличимо от «поля нет», а эпоха хотя бы заведомо
+/// неправдоподобна и потому заметна.
+pub(crate) fn now() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"))
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -85,5 +103,20 @@ impl SqliteStore {
     #[must_use]
     pub const fn connection_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_recorded_moment_is_a_parsable_utc_timestamp() {
+        // Пустая строка и произвольный текст в `created_at` неотличимы
+        // от «поля нет»: момент обязан разбираться обратно.
+        let stamp = now();
+        let parsed = OffsetDateTime::parse(&stamp, &Rfc3339).expect("момент разбирается обратно");
+        assert!(stamp.ends_with('Z'), "момент записывается в UTC: {stamp}");
+        assert!(parsed.year() >= 2025, "момент не из прошлого века: {stamp}");
     }
 }

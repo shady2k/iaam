@@ -15,3 +15,7 @@ result-*
 
 # direnv
 .direnv/
+
+# cargo-mutants: прямой запуск без --output оставляет отчёты в корне
+mutants.out/
+mutants.out.old/

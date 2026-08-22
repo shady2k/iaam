@@ -10,4 +10,10 @@ mod tests {
     fn workspace_builds() {
         assert_eq!(2 + 2, 4);
     }
+
+    #[test]
+    fn fixture_manifest_is_wired() {
+        let raw = include_str!("../../../tests/fixtures/smoke.json");
+        assert!(raw.contains("\"value\": 42"));
+    }
 }

@@ -566,6 +566,39 @@ pub(crate) mod test_support {
     use crate::money::PostedMinor;
     use time::macros::date;
 
+    /// Событие произвольного типа для тестов модулей ядра.
+    ///
+    /// Существует, чтобы тесты проекций не переписывали конверт события
+    /// в каждом модуле: переписанный вручную конверт незаметно расходится
+    /// с настоящим, и тест начинает проверять фикстуру, а не код.
+    pub(crate) fn event_with(
+        account: AccountId,
+        day: time::Date,
+        sequence: u32,
+        kind: EventKind,
+        legs: Vec<Leg>,
+    ) -> Event {
+        let dates = EventDates::for_cash(CashPostedDate(day));
+        Event {
+            id: EventId::new_random(),
+            schema_version: SCHEMA_VERSION,
+            owner: OwnerId::new_random(),
+            account,
+            kind,
+            dates,
+            order: EffectiveOrder::new(day, sequence),
+            legs,
+            provenance: Provenance::new(
+                SourceId::new_random(),
+                RawHash::parse(&"d".repeat(64)).unwrap(),
+                ParserVersion("test/1".into()),
+            ),
+            relation: Relation::None,
+            confidence: Confidence::Known,
+            idempotency_key: None,
+        }
+    }
+
     pub(crate) fn sample_event(sequence: u32) -> Event {
         sample_event_with(sequence, Relation::None)
     }

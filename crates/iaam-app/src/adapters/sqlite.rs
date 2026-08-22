@@ -82,11 +82,6 @@ impl Store for SqliteAdapter {
         .await
     }
 
-    async fn load_events(&self, owner: OwnerId) -> Result<Vec<Event>, AppError> {
-        self.blocking(move |store| store.load_events(owner).map_err(store_error))
-            .await
-    }
-
     async fn load_events_through(
         &self,
         owner: OwnerId,

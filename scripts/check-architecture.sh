@@ -164,6 +164,40 @@ for entry in "${APPROX_LIMITS[@]}"; do
   fi
 done
 
+# --- 9. Оболочка не считает деньги ---
+# Требование §3.1 и §13: любое число в ответе API приходит из ядра.
+# Заслон ищет денежную арифметику там, где её быть не может: в сценариях
+# приложения и в транспорте. Приёмка (iaam-ingest) сюда не входит
+# намеренно — она СОБИРАЕТ факт из полей источника, а не вычисляет
+# результат, и запрет сложения сделал бы её нереализуемой.
+SHELL_DIRS=("crates/iaam-app/src" "crates/iaam-server/src")
+for dir in "${SHELL_DIRS[@]}"; do
+  [ -d "$dir" ] || continue
+  hits=$(grep -rnE '\.(try_add|try_sub|checked_add|checked_sub|checked_mul|checked_negate)\(' \
+    "$dir" --include='*.rs' | strip_comments || true)
+  if [ -n "$hits" ]; then
+    err "денежная арифметика в оболочке ($dir): число в ответе обязано приходить из ядра (§3.1, §13)"
+    echo "$hits" >&2
+  fi
+done
+
+# --- 10. Один механизм асинхронных трейтов ---
+# §3.2 требует выбрать один и закрепить. Выбран async_trait, и он живёт
+# только в iaam-app: объектобезопасные порты существуют только там.
+# Смешение механизмов — это два способа писать одно и то же и вечный
+# спор о том, какой применять здесь.
+for crate_dir in crates/*/src; do
+  case "$crate_dir" in
+    crates/iaam-app/src) continue ;;
+  esac
+  [ -d "$crate_dir" ] || continue
+  hits=$(grep -rn 'async_trait' "$crate_dir" --include='*.rs' | strip_comments || true)
+  if [ -n "$hits" ]; then
+    err "async_trait вне iaam-app ($crate_dir): порты живут только в приложении (§3.2)"
+    echo "$hits" >&2
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "" >&2
   echo "Архитектурные заслоны не пройдены. Правьте код, а не заслон." >&2

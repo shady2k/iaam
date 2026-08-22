@@ -3,7 +3,7 @@
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::approx::SolverPolicy;
-use iaam_core::projection::{Projection, ProjectionContext, advance, project};
+use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::FxTable;
@@ -76,10 +76,7 @@ pub async fn returns(
     )
     .await?;
 
-    // Снимок сохраняется только для отчёта на сегодня: снимок, построенный
-    // по срезу на прошлую дату, лежал бы под тем же ключом и молча
-    // подменял бы состояние следующему запросу.
-    if as_of == today {
+    if snapshot_may_be_saved(as_of, today) {
         services
             .store
             .save_snapshot(principal.owner, projection.snapshot().clone())
@@ -96,6 +93,32 @@ pub async fn returns(
             solver_policy: SolverPolicy::returns_default(),
         },
     ))
+}
+
+/// Можно ли сохранить снимок, построенный по этому срезу.
+///
+/// Только для отчёта на сегодня: ключ снимка — контур, его версия и
+/// версия правила, поэтому снимок по срезу на прошлую дату лёг бы под
+/// тем же ключом и молча подменил бы состояние следующему запросу.
+///
+/// Вынесено отдельной функцией ради проверяемости: сравнение дат внутри
+/// сценария проверяется только через поднятый сервер и базу, а ошибка
+/// здесь не выглядит ошибкой — она даёт цифру, просто не ту.
+const fn snapshot_may_be_saved(as_of: Date, today: Date) -> bool {
+    // `Date` не реализует `PartialEq` в const-контексте через `==`
+    // для ссылок, но для значения — реализует.
+    as_of.ordinal() == today.ordinal() && as_of.year() == today.year()
+}
+
+/// Стоит ли пересчитывать журнал целиком после отказа `advance`.
+///
+/// Снимок — кэш, и его непригодность не является ошибкой работы: почти
+/// любой отказ — законный повод пересчитать. Кроме одного: нарушение
+/// инварианта пересчёт не исправит, он даст ровно то же самое, и вместо
+/// двойной работы отказ уходит наверх с идентификатором корреляции
+/// (§15.2).
+fn recompute_is_worth_it(error: &ProjectionError) -> bool {
+    !error.is_invariant_violation()
 }
 
 /// Построение проекции: продвижение снимка, если оно применимо,
@@ -126,7 +149,7 @@ async fn build_projection(
     if let Some(snapshot) = snapshot {
         match advance(&snapshot, events, context) {
             Ok(projection) => return Ok(projection),
-            Err(error) if error.is_invariant_violation() => {
+            Err(error) if !recompute_is_worth_it(&error) => {
                 // Нарушение инварианта — не повод пересчитывать: полный
                 // пересчёт даст то же самое. Отдаём его наверх, чтобы
                 // оно попало в лог с идентификатором корреляции (§15.2).
@@ -141,4 +164,44 @@ async fn build_projection(
     }
 
     project(events, context).map_err(AppError::from_projection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iaam_core::projection::invariants::InvariantViolation;
+    use time::macros::date;
+
+    #[test]
+    fn a_snapshot_is_saved_only_for_a_report_dated_today() {
+        // Вчерашний срез под сегодняшним ключом — это подмена состояния
+        // следующему запросу, а не экономия.
+        let today = date!(2026 - 01 - 01);
+        assert!(snapshot_may_be_saved(today, today));
+        assert!(!snapshot_may_be_saved(date!(2025 - 12 - 31), today));
+        assert!(!snapshot_may_be_saved(date!(2026 - 01 - 02), today));
+        // Тот же день другого года — не тот же день.
+        assert!(!snapshot_may_be_saved(date!(2025 - 01 - 01), today));
+    }
+
+    #[test]
+    fn every_failure_except_a_broken_invariant_is_worth_a_full_recompute() {
+        // Непригодный снимок — обычное дело: пересчитываем. Нарушенный
+        // инвариант пересчёт повторит слово в слово, поэтому отдаём его
+        // наверх сразу.
+        assert!(recompute_is_worth_it(
+            &ProjectionError::SnapshotFingerprintMismatch
+        ));
+        assert!(recompute_is_worth_it(
+            &ProjectionError::SnapshotRuleMismatch {
+                snapshot: LotRuleVersion(1),
+                requested: LotRuleVersion(2),
+            }
+        ));
+        assert!(!recompute_is_worth_it(&ProjectionError::Invariant(
+            InvariantViolation::ZeroExternalFlow {
+                event: iaam_core::ids::EventId::new_random(),
+            }
+        )));
+    }
 }

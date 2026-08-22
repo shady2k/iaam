@@ -77,7 +77,6 @@ pub trait Store: Send + Sync {
     /// Порядок назначает хранилище в той же транзакции, что и вставку:
     /// раздельные «узнать следующий номер» и «вставить» — гонка (§4.8).
     async fn append_events(&self, events: Vec<Event>) -> Result<Vec<Recorded>, AppError>;
-    async fn load_events(&self, owner: OwnerId) -> Result<Vec<Event>, AppError>;
     async fn load_events_through(
         &self,
         owner: OwnerId,
@@ -140,5 +139,34 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn today(&self) -> Date {
         time::OffsetDateTime::now_utc().date()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_only_scope_may_neither_submit_nor_administer() {
+        // Область действия токена — заслон безопасности, а не подсказка.
+        // Слипшиеся значения дают либо читателя, который пишет в журнал,
+        // либо владельца, который не может ничего.
+        assert!(Scope::Owner.may_submit());
+        assert!(Scope::Agent.may_submit());
+        assert!(!Scope::ReadOnly.may_submit());
+
+        assert!(Scope::Owner.may_administer());
+        assert!(
+            !Scope::Agent.may_administer(),
+            "агент отправляет операции, но не управляет токенами (§14)"
+        );
+        assert!(!Scope::ReadOnly.may_administer());
+    }
+
+    #[test]
+    fn every_scope_has_a_distinct_machine_readable_code() {
+        assert_eq!(Scope::Owner.code(), "owner");
+        assert_eq!(Scope::Agent.code(), "agent");
+        assert_eq!(Scope::ReadOnly.code(), "read_only");
     }
 }

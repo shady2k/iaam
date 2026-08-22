@@ -1,0 +1,39 @@
+[package]
+name = "iaam-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Транспорт знает про приложение и про ядро (доменные типы в DTO
+# преобразуются на границе), но НЕ про адаптеры: их собирает
+# iaam-bootstrap. Проверяется заслоном архитектуры (§3.2).
+iaam-app = { path = "../iaam-app", version = "0.1.0" }
+iaam-core = { path = "../iaam-core", version = "0.1.0" }
+axum = "0.8"
+rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+time = { version = "0.3", default-features = false, features = ["std", "macros", "parsing", "formatting", "serde"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "signal"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "limit"] }
+tracing = "0.1"
+utoipa = { version = "5", features = ["axum_extras", "time", "uuid"] }
+utoipa-axum = "0.2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+http-body-util = "0.1"
+# Снапшоты отчётов (§15.8): ловят непреднамеренное изменение формы ответа,
+# которое поштучные проверки полей пропускают.
+insta = { version = "1", features = ["json", "redactions"] }
+iaam-store = { path = "../iaam-store", version = "0.1.0" }
+tower = "0.5"
+
+[lints]
+workspace = true

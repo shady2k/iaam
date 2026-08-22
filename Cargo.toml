@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/iaam-core", "crates/iaam-oracle", "crates/iaam-store", "crates/iaam-ingest", "crates/iaam-app"]
+members = ["crates/iaam-core", "crates/iaam-oracle", "crates/iaam-store", "crates/iaam-ingest", "crates/iaam-app", "crates/iaam-server", "crates/iaam-bootstrap"]
 
 [workspace.package]
 edition = "2024"

@@ -1,0 +1,28 @@
+[package]
+name = "iaam-bootstrap"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "iaam"
+path = "src/main.rs"
+
+[dependencies]
+# Единственная крейта, которой позволено знать про всё: собрать конкретные
+# адаптеры где-то нужно, но это не повод давать транспорту знать про SQLite.
+iaam-app = { path = "../iaam-app", version = "0.1.0" }
+iaam-core = { path = "../iaam-core", version = "0.1.0" }
+iaam-server = { path = "../iaam-server", version = "0.1.0" }
+iaam-store = { path = "../iaam-store", version = "0.1.0" }
+axum = "0.8"
+rand = { version = "0.10", features = ["sys_rng"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

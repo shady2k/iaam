@@ -53,6 +53,33 @@ MODULES=(
   "crates/iaam-ingest/src/operation.rs"
   "crates/iaam-ingest/src/csv_source.rs"
   "crates/iaam-ingest/src/verdict.rs"
+  # Приложение и транспорт: здесь живут область действия токена,
+  # ограничитель частоты и нумерация вердиктов.
+  #
+  # Два файла оболочки в список НЕ входят, и это решение, а не упущение
+  # (§15.7 требует письменного обоснования — вот оно; полный разбор —
+  # в описании бида iaam-1fk.18):
+  #
+  #   adapters/sqlite.rs — чтение снимка `load_snapshot` заменяется на
+  #   «снимка нет» без единого наблюдаемого следствия. Так и задумано:
+  #   снимок является кэшем, и тождество «advance равен полному
+  #   пересчёту» — центральный инвариант проекции. Мутант меняет объём
+  #   работы, а не ответ. Остальные методы файла — делегирование в
+  #   iaam-store (он в списке выше) и покрыты контрактными тестами.
+  #
+  #   scenarios/reports.rs — условие «нарушение инварианта не повод
+  #   пересчитывать» заменяется на «пересчитывать всегда»: полный
+  #   пересчёт даёт ровно то же нарушение и тот же ответ. Это тоже
+  #   объём работы, а не ответ. Сами предикаты (snapshot_may_be_saved,
+  #   recompute_is_worth_it) вынесены отдельными функциями и проверяются
+  #   модульными тестами напрямую.
+  "crates/iaam-app/src/ports.rs"
+  "crates/iaam-app/src/error.rs"
+  "crates/iaam-app/src/scenarios/ingest.rs"
+  "crates/iaam-server/src/routes.rs"
+  "crates/iaam-server/src/auth.rs"
+  "crates/iaam-server/src/rate_limit.rs"
+  "crates/iaam-server/src/dto.rs"
   # Эталон мутируется наравне с продакшеном: ошибка в эталоне маскирует
   # ошибку в продакшене ровно так же, как наоборот (§15.4).
   "crates/iaam-oracle/src/lots_reference.rs"
@@ -199,7 +226,14 @@ for module in "${MODULES[@]}"; do
   # в "$out_dir/mutants.out/", а не в "$out_dir/".
   report="$out_dir/mutants.out"
 
-  if cargo mutants --package "$package" --file "$module" --output "$out_dir"; then
+  # `--test-workspace true` обязателен: без него cargo-mutants гоняет
+  # только тесты пакета, которому принадлежит модуль. Для ядра это
+  # совпадало случайно — его тесты лежат в нём же, — но модули оболочки
+  # проверяются контрактными тестами из iaam-server, и без этого флага
+  # заслон печатал бы «выживших нет» для кода, который никто не тестировал.
+  # Проверено исполнением: 46 выживших против 35 на одном и том же коде.
+  if cargo mutants --package "$package" --file "$module" \
+      --test-workspace true --output "$out_dir"; then
     echo "  выживших нет ($n_with мутантов убито)"
     checked=$((checked + 1))
     continue

@@ -1,0 +1,39 @@
+---
+source: crates/iaam-server/tests/contract.rs
+expression: report
+---
+{
+  "applied_rules": {
+    "contour": "[contour]",
+    "contour_version": 1,
+    "day_count": "act/365",
+    "fx_source": "owner_supplied",
+    "solver_max_iterations": 200,
+    "solver_rate_tolerance": "0.0000000001"
+  },
+  "as_of": "2026-01-01",
+  "contributed": {
+    "value": "50000.00"
+  },
+  "data_quality": {
+    "material_issues": [
+      "история начинается 2025-01-01"
+    ],
+    "status": "mixed",
+    "unconfirmed_share": "1"
+  },
+  "history_starts": "2025-01-01",
+  "report_currency": "RUB",
+  "terminal_value": {
+    "value": "50000.00"
+  },
+  "withdrawn": {
+    "value": "0"
+  },
+  "xirr_pre_tax": {
+    "day_count": "act/365",
+    "error_bound": "0.00000000",
+    "iterations": 7,
+    "value": "0.00000000"
+  }
+}

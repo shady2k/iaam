@@ -45,5 +45,33 @@ jobs:
         run: nix develop -c ./scripts/check-fixtures.sh
       - name: Dependency policy
         run: nix develop -c cargo deny check
+      # nextest изолирует тесты по процессам, что делает видимыми
+      # зависимости между ними. Doc-тесты nextest не выполняет — они идут
+      # отдельным шагом, иначе молча перестали бы запускаться.
       - name: Test
-        run: nix develop -c cargo test --workspace --all-features
+        run: nix develop -c cargo nextest run --workspace --all-features
+      - name: Doc tests
+        run: nix develop -c cargo test --workspace --doc
+      # `--branch` требует nightly (проверено на закреплённом stable 1.98.0:
+      # «error: the option `Z` is only accepted on the nightly compiler»),
+      # поэтому покрытие построчное. Не возвращайте флаг, не сменив тулчейн.
+      - name: Coverage
+        run: |
+          nix develop -c cargo llvm-cov --workspace --all-features \
+            --lcov --output-path lcov.info
+      # cargo llvm-cov строит полный отчёт, но не задаёт порог на добавленных
+      # строках. Без этого шага «покрытие по диффу» осталось бы артефактом,
+      # который никто не читает. Базовая ветка доступна благодаря
+      # fetch-depth: 0 выше; без неё diff-cover падает, а не пропускает.
+      - name: Diff coverage gate
+        if: github.event_name == 'pull_request'
+        run: |
+          nix develop -c diff-cover lcov.info \
+            --compare-branch=origin/${{ github.base_ref }} \
+            --fail-under=90
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: lcov.info

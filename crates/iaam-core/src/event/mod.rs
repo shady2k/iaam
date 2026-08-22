@@ -60,6 +60,12 @@ pub enum EventValidationError {
     WrongAccount { expected: AccountId },
     #[error("две стороны перевода не сходятся: остаток {residual}")]
     TransferResidual { residual: i64 },
+    #[error(
+        "счёт {account:?} указан и источником, и получателем перевода; \
+         перемещение денег внутри одного счёта не меняет ни один остаток \
+         и потому не является фактом движения"
+    )]
+    TransferToSelf { account: AccountId },
     #[error(transparent)]
     Money(#[from] MoneyError),
 }
@@ -201,6 +207,14 @@ impl Event {
         to: AccountId,
         declared: Money,
     ) -> Result<(), EventValidationError> {
+        // Проверяется ДО разбора ног. Иначе причина отказа зависела бы от их
+        // числа: при двух ногах оба `find` вернули бы одну и ту же, остаток
+        // удвоился бы и отказ пришёл бы как `TransferResidual` — по случайной
+        // причине; а две нулевые ноги дали бы нулевой остаток и событие
+        // прошло бы проверку.
+        if from == to {
+            return Err(EventValidationError::TransferToSelf { account: from });
+        }
         let legs = self.cash_legs();
         if legs.len() != 2 {
             return Err(EventValidationError::LegCount {
@@ -779,6 +793,74 @@ mod tests {
             three.validate_structure(),
             Err(EventValidationError::LegCount { found: 3, .. })
         ));
+    }
+
+    #[test]
+    fn transfer_to_the_same_account_is_not_a_movement() {
+        // Один счёт по обе стороны — не движение денег: ни один остаток
+        // не меняется. Отказ приходит по существу, а не потому, что
+        // остаток ног случайно не сошёлся.
+        let acc = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from: acc,
+                to: acc,
+                amount: rub(10_000_000),
+            },
+            vec![
+                Leg::cash(acc, rub(-10_000_000)),
+                Leg::cash(acc, rub(10_000_000)),
+            ],
+            acc,
+        );
+        assert_eq!(
+            ev.validate_structure(),
+            Err(EventValidationError::TransferToSelf { account: acc })
+        );
+    }
+
+    #[test]
+    fn a_transfer_to_self_of_nothing_is_rejected_too() {
+        // Вырожденный случай: две нулевые ноги на одном счёте дают нулевой
+        // остаток, и проверка сходимости пропустила бы событие. Отказ должен
+        // приходить от проверки счетов, а не от арифметики ног.
+        let acc = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from: acc,
+                to: acc,
+                amount: rub(0),
+            },
+            vec![Leg::cash(acc, rub(0)), Leg::cash(acc, rub(0))],
+            acc,
+        );
+        assert_eq!(
+            ev.validate_structure(),
+            Err(EventValidationError::TransferToSelf { account: acc })
+        );
+    }
+
+    #[test]
+    fn the_self_transfer_check_runs_before_the_legs_are_read() {
+        // Ног нет вовсе — отказ всё равно называет настоящую причину,
+        // а не «ожидалось ровно две денежные ноги».
+        let acc = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from: acc,
+                to: acc,
+                amount: rub(10_000_000),
+            },
+            vec![],
+            acc,
+        );
+        assert_eq!(
+            ev.validate_structure(),
+            Err(EventValidationError::TransferToSelf { account: acc })
+        );
     }
 
     #[test]

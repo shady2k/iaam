@@ -26,6 +26,21 @@ MODULES=(
   "crates/iaam-core/src/event/correction.rs"
   "crates/iaam-core/src/contour.rs"
   "crates/iaam-core/src/rules/lot_disposal.rs"
+  # Арифметика Dec — числовое основание всех денежных расчётов.
+  # В первой редакции плана её в списке не было: расширено при
+  # исполнении задачи 9 (iaam-1fk.22).
+  "crates/iaam-core/src/numeric/decimal.rs"
+  "crates/iaam-core/src/projection/balances.rs"
+  "crates/iaam-core/src/projection/lots.rs"
+  "crates/iaam-core/src/projection/flows.rs"
+  "crates/iaam-core/src/projection/invariants.rs"
+  "crates/iaam-core/src/projection/state.rs"
+  "crates/iaam-core/src/projection/mod.rs"
+  "crates/iaam-core/src/numeric/xirr.rs"
+  "crates/iaam-core/src/returns/xirr.rs"
+  # Контракт отчёта: именно здесь решается, доверять ли цифре.
+  "crates/iaam-core/src/returns/mod.rs"
+  "crates/iaam-core/src/valuation.rs"
   # Эталон мутируется наравне с продакшеном: ошибка в эталоне маскирует
   # ошибку в продакшене ровно так же, как наоборот (§15.4).
   "crates/iaam-oracle/src/lots_reference.rs"

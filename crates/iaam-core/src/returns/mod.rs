@@ -310,6 +310,102 @@ mod tests {
     use super::*;
     use crate::numeric::xirr::SolverRefusal;
 
+    use crate::contour::{ContourId, ContourVersion};
+    use crate::event::kind::EventKind;
+    use crate::event::leg::Leg;
+    use crate::event::test_support::event_with;
+    use crate::ids::{AccountId, InstrumentId};
+    use crate::money::{Money, PostedMinor};
+    use crate::projection::{ProjectionContext, project};
+    use crate::rules::{LotRuleVersion, RuleRegistry};
+    use crate::valuation::PriceQuality;
+    use time::macros::date;
+
+    #[test]
+    fn every_data_quality_status_has_a_machine_readable_code() {
+        // Внешний агент разбирает код, а не текст. Пустая строка вместо
+        // кода неотличима от «статуса нет».
+        assert_eq!(DataQualityStatus::Clean.code(), "clean");
+        assert_eq!(DataQualityStatus::Mixed.code(), "mixed");
+        assert_eq!(DataQualityStatus::Incomplete.code(), "incomplete");
+    }
+
+    /// Строит состояние из одного пополнения и одной оценки заданного
+    /// качества. Больше в блоке качества данных ничего не участвует.
+    fn quality_of(price_quality: PriceQuality) -> DataQuality {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let rules = RuleRegistry::with_defaults();
+        let ctx = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let amount = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
+        let events = vec![
+            event_with(
+                account,
+                date!(2025 - 01 - 01),
+                1,
+                EventKind::CashIn { amount },
+                vec![Leg::cash(account, amount)],
+            ),
+            event_with(
+                account,
+                date!(2025 - 02 - 01),
+                2,
+                EventKind::Valuation {
+                    instrument,
+                    price: Dec::one(),
+                    currency: CurrencyCode::Rub,
+                    quality: price_quality,
+                },
+                vec![],
+            ),
+        ];
+        let projection = project(&events, &ctx).expect("проекция");
+        data_quality(projection.snapshot().state())
+    }
+
+    #[test]
+    fn the_start_of_history_is_a_fact_about_the_period_not_a_defect() {
+        // Полная цена и никаких других проблем: остаётся только отметка
+        // «данных ранее такой-то даты нет». Она сообщается всегда, но
+        // неполнотой не является — иначе статус `Incomplete` перестал бы
+        // что-либо означать, потому что стоял бы всегда.
+        let quality = quality_of(PriceQuality::Executable);
+        assert_eq!(quality.status, DataQualityStatus::Mixed);
+        assert!(
+            quality
+                .material_issues
+                .iter()
+                .any(|issue| matches!(issue, MaterialIssue::HistoryStartsAt { .. })),
+            "начало истории обязано быть названо"
+        );
+        assert!(
+            !quality
+                .material_issues
+                .iter()
+                .any(|issue| matches!(issue, MaterialIssue::PriceNotExecutable { .. })),
+            "исполнимая цена проблемой не является"
+        );
+    }
+
+    #[test]
+    fn a_price_that_is_not_executable_makes_the_report_incomplete() {
+        // Оценка владельца — не рыночная цена. Стоимость позиции по ней
+        // посчитать можно, но выдавать её как подтверждённую нельзя.
+        let quality = quality_of(PriceQuality::OwnerEstimate);
+        assert_eq!(quality.status, DataQualityStatus::Incomplete);
+        assert!(
+            quality
+                .material_issues
+                .iter()
+                .any(|issue| matches!(issue, MaterialIssue::PriceNotExecutable { .. }))
+        );
+    }
+
     #[test]
     fn every_refusal_has_a_machine_readable_code() {
         assert_eq!(NotComputable::NoExternalFlows.code(), "no_external_flows");

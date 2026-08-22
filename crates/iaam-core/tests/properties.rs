@@ -170,3 +170,110 @@ proptest! {
         prop_assert!(out.is_err());
     }
 }
+mod projection_properties {
+    use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+    use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+    use iaam_core::event::kind::EventKind;
+    use iaam_core::event::leg::Leg;
+    use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+    use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+    use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
+    use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+    use iaam_core::projection::{ProjectionContext, project};
+    use iaam_core::rules::{LotRuleVersion, RuleRegistry};
+    use proptest::prelude::*;
+    use time::macros::date;
+
+    fn deposit(account: AccountId, sequence: u32, minor: i64) -> Event {
+        let amount = Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
+        let day = date!(2025 - 01 - 01) + time::Duration::days(i64::from(sequence));
+        Event {
+            id: EventId::new_random(),
+            schema_version: SCHEMA_VERSION,
+            owner: OwnerId::new_random(),
+            account,
+            kind: EventKind::CashIn { amount },
+            dates: EventDates::for_cash(CashPostedDate(day)),
+            order: EffectiveOrder::new(day, sequence),
+            legs: vec![Leg::cash(account, amount)],
+            provenance: Provenance::new(
+                SourceId::new_random(),
+                RawHash::parse(&"e".repeat(64)).unwrap(),
+                ParserVersion("prop/1".into()),
+            ),
+            relation: Relation::None,
+            confidence: Confidence::Known,
+            idempotency_key: None,
+        }
+    }
+
+    proptest! {
+        /// Область: всегда (§4.8). Порядок задаёт `EffectiveOrder`,
+        /// а не порядок загрузки файлов.
+        #[test]
+        fn import_order_never_changes_the_projection(
+            amounts in prop::collection::vec(1_i64..1_000_000, 1..12),
+            rotation in 0_usize..12,
+        ) {
+            let account = AccountId::new_random();
+            let contour = ContourDefinition::new(
+                ContourId::new_random(),
+                ContourVersion(1),
+                [account],
+            );
+            let rules = RuleRegistry::with_defaults();
+            let ctx = ProjectionContext {
+                contour: &contour,
+                rules: &rules,
+                lot_rule: LotRuleVersion(1),
+            };
+
+            let events: Vec<Event> = amounts
+                .iter()
+                .enumerate()
+                .map(|(i, minor)| {
+                    let index = u32::try_from(i).unwrap_or(u32::MAX);
+                    deposit(account, index + 1, *minor)
+                })
+                .collect();
+
+            let mut rotated = events.clone();
+            let shift = rotation % events.len().max(1);
+            rotated.rotate_left(shift);
+
+            prop_assert_eq!(
+                project(&events, &ctx).unwrap().snapshot().fingerprint(),
+                project(&rotated, &ctx).unwrap().snapshot().fingerprint()
+            );
+        }
+
+        /// Область: всегда. Сторно вместе с исходным событием не оставляют
+        /// следа ни в остатках, ни в потоках.
+        #[test]
+        fn an_event_and_its_reversal_leave_no_trace(minor in 1_i64..1_000_000) {
+            let account = AccountId::new_random();
+            let contour = ContourDefinition::new(
+                ContourId::new_random(),
+                ContourVersion(1),
+                [account],
+            );
+            let rules = RuleRegistry::with_defaults();
+            let ctx = ProjectionContext {
+                contour: &contour,
+                rules: &rules,
+                lot_rule: LotRuleVersion(1),
+            };
+
+            let original = deposit(account, 1, minor);
+            let mut reversal = deposit(account, 2, minor);
+            reversal.relation = Relation::Reversal { target: original.id };
+
+            let projection = project(&[original, reversal], &ctx).unwrap();
+            prop_assert!(projection.state().flows().external().is_empty());
+            prop_assert_eq!(
+                projection.state().balances().cash(account, CurrencyCode::Rub),
+                None
+            );
+        }
+    }
+}

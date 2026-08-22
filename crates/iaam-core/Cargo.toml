@@ -28,3 +28,5 @@ workspace = true
 # `rust_decimal` и `time` уже в [dependencies] крейты, поэтому интеграционным
 # тестам в tests/ доступны без отдельного объявления. Нужен только proptest.
 proptest = "1"
+# Чтение замороженного корпуса эталонных ставок (tests/fixtures/xirr_cases.json).
+serde_json = "1"

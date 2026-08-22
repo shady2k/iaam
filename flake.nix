@@ -34,7 +34,10 @@
           ];
           # rusqlite с feature "bundled" компилирует SQLite из исходников
           shellHook = ''
-            echo "iaam dev shell · $(rustc --version)"
+            # В stderr, а не в stdout: приветствие в stdout попадает
+            # в любой перенаправленный вывод и портит его. Генератор
+            # фикстур пишет JSON в stdout, и баннер делал его неразбираемым.
+            echo "iaam dev shell · $(rustc --version)" >&2
           '';
         };
       });

@@ -550,6 +550,7 @@ git commit -m "ci: rustfmt, clippy -D warnings, forbid unsafe; заслоны п
 - Добавление зависимости `iaam-core` на любую крейту воркспейса роняет скрипт
 - Появление `f64` в `iaam-core` вне `src/numeric/approx.rs` роняет скрипт
 - Появление `async fn`, `Mutex` или `tokio` в `iaam-core` роняет скрипт
+- Крейта без `[lints] workspace = true` роняет скрипт — иначе она молча выпадает из-под запрета `unsafe`
 
 - [ ] **Step 1: Создать `scripts/check-architecture.sh`**
 
@@ -635,7 +636,20 @@ if [ -d "$CORE_SRC" ]; then
   fi
 fi
 
-# --- 7. approx.rs не разрастается в теневой расчётный слой ---
+# --- 7. Каждая крейта наследует линты воркспейса ---
+# unsafe запрещён таблицей [workspace.lints.rust], но она применяется
+# к крейте только при [lints] workspace = true. Крейта без этой строки
+# молча выпадает из-под запрета, и ничто об этом не сообщает.
+for manifest in crates/*/Cargo.toml; do
+  [ -f "$manifest" ] || continue
+  if ! grep -qA1 '^\[lints\]' "$manifest" | grep -q 'workspace *= *true'; then
+    if ! awk '/^\[lints\]/{f=1;next} f&&/workspace *= *true/{found=1} /^\[/&&!/^\[lints\]/{f=0} END{exit !found}' "$manifest"; then
+      err "$manifest не наследует линты воркспейса: нужна секция [lints] с workspace = true (§15.1)"
+    fi
+  fi
+done
+
+# --- 8. approx.rs не разрастается в теневой расчётный слой ---
 # Исключение целого файла из заслона №5 опасно: в нём можно разместить
 # денежную арифметику. Ограничение размера делает это заметным.
 APPROX="$CORE_SRC/numeric/approx.rs"

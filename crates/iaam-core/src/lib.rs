@@ -5,6 +5,7 @@
 //! крейты воркспейса. См. §3.1 спецификации.
 
 pub mod dates;
+pub mod event;
 pub mod ids;
 pub mod money;
 pub mod numeric;

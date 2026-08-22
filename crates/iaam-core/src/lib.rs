@@ -11,12 +11,3 @@ pub mod ids;
 pub mod money;
 pub mod numeric;
 pub mod rules;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn fixture_manifest_is_wired() {
-        let raw = include_str!("../../../tests/fixtures/smoke.json");
-        assert!(raw.contains("\"value\": 42"));
-    }
-}

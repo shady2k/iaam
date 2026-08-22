@@ -11,5 +11,6 @@ pub mod ids;
 pub mod money;
 pub mod numeric;
 pub mod projection;
+pub mod returns;
 pub mod rules;
 pub mod valuation;

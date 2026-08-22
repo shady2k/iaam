@@ -16,6 +16,10 @@ ethnum = "1"
 # а не моменты времени: операция происходит в дату, а не в момент.
 time = { version = "0.3", default-features = false, features = ["std", "macros", "serde", "parsing", "formatting"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+# Каноническая сериализация состояния для отпечатка. CBOR, потому что
+# карты состояния имеют составные ключи: JSON их не берёт.
+ciborium = "0.2"
+sha2 = "0.11"
 
 [lints]
 workspace = true

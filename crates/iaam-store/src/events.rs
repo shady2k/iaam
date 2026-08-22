@@ -1,0 +1,208 @@
+//! Журнал фактов: запись и чтение.
+
+use iaam_core::dates::EffectiveOrder;
+use iaam_core::event::{Event, Relation};
+use iaam_core::ids::{EventId, OwnerId};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+use crate::{SqliteStore, StoreError};
+
+/// Что произошло при попытке записи.
+///
+/// Повтор — не ошибка: повторный вызов с тем же ключом обязан вернуть
+/// тот же результат, иначе клиент, не получивший ответа, не может
+/// безопасно повторить запрос (§10.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Appended {
+    Inserted { id: EventId },
+    Duplicate { existing: EventId },
+}
+
+impl SqliteStore {
+    /// Запись события с уже назначенным порядком.
+    ///
+    /// Применяется там, где порядок задан извне и менять его нельзя:
+    /// импорт архивного бандла и восстановление из архива.
+    pub fn append_event(&self, event: &Event) -> Result<Appended, StoreError> {
+        if let Some(existing) = find_duplicate(&self.conn, event)? {
+            return Ok(Appended::Duplicate { existing });
+        }
+        insert_event(&self.conn, event)?;
+        Ok(Appended::Inserted { id: event.id })
+    }
+
+    /// Запись события с назначением порядкового номера **в той же
+    /// транзакции**.
+    ///
+    /// Раздельные «узнать `MAX(sequence) + 1`» и «вставить» — гонка:
+    /// два одновременных запроса получают один и тот же номер, и порядок
+    /// внутри дня начинает определяться случайным идентификатором вместо
+    /// объявленной семантики (§4.8). Транзакция с немедленным захватом
+    /// записи закрывает гонку и между процессами, а уникальный индекс
+    /// `(owner, effective_date, sequence)` превращает оставшийся зазор
+    /// в ошибку вместо тихой перестановки.
+    pub fn append_event_in_order(&mut self, event: &Event) -> Result<Appended, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = find_duplicate(&transaction, event)? {
+            return Ok(Appended::Duplicate { existing });
+        }
+        let day = event.order.date();
+        let used: Option<u32> = transaction.query_row(
+            "SELECT MAX(sequence) FROM events WHERE owner = ?1 AND effective_date = ?2",
+            params![event.owner.inner().to_string(), day.to_string()],
+            |row| row.get(0),
+        )?;
+        let stamped = Event {
+            order: EffectiveOrder::new(day, used.map_or(1, |value| value.saturating_add(1))),
+            ..event.clone()
+        };
+        insert_event(&transaction, &stamped)?;
+        transaction.commit()?;
+        Ok(Appended::Inserted { id: stamped.id })
+    }
+
+    /// Весь журнал владельца в порядке `EffectiveOrder`.
+    ///
+    /// Порядок задаётся базой, но проекция всё равно сортирует срез сама:
+    /// ядро не обязано верить порядку, пришедшему снаружи (§4.8).
+    pub fn load_events(&self, owner: OwnerId) -> Result<Vec<Event>, StoreError> {
+        self.query_events(
+            "SELECT id, payload FROM events
+             WHERE owner = ?1
+             ORDER BY effective_date, sequence, id",
+            params![owner.inner().to_string()],
+        )
+    }
+
+    /// Журнал владельца по дату включительно. Срез для отчёта на дату
+    /// собирает оболочка: ядро событий по датам не фильтрует (§6.1).
+    pub fn load_events_through(
+        &self,
+        owner: OwnerId,
+        through: time::Date,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.query_events(
+            "SELECT id, payload FROM events
+             WHERE owner = ?1 AND effective_date <= ?2
+             ORDER BY effective_date, sequence, id",
+            params![owner.inner().to_string(), through.to_string()],
+        )
+    }
+
+    fn query_events(
+        &self,
+        sql: &str,
+        parameters: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<Event>, StoreError> {
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = statement.query_map(parameters, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            let event: Event = serde_json::from_str(&payload)
+                .map_err(|source| StoreError::EventDecode { id, source })?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+}
+
+/// Вставка события. Тело вынесено из публичных методов: оба пути записи
+/// обязаны класть в базу одно и то же, и второй экземпляр этого SQL
+/// когда-нибудь разошёлся бы с первым.
+pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), StoreError> {
+    let payload = serde_json::to_string(event).map_err(StoreError::EventEncode)?;
+    let (relation_kind, relation_target) = match event.relation {
+        Relation::None => ("none", None),
+        Relation::Reversal { target } => ("reversal", Some(target.inner().to_string())),
+        Relation::Replacement { target } => ("replacement", Some(target.inner().to_string())),
+    };
+    let recorded_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"));
+
+    conn.execute(
+        "INSERT INTO events (
+             id, schema_version, owner, account, kind, effective_date, sequence,
+             relation_kind, relation_target, source, source_operation_id,
+             idempotency_key, raw_hash, payload, recorded_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            event.id.inner().to_string(),
+            event.schema_version,
+            event.owner.inner().to_string(),
+            event.account.inner().to_string(),
+            event.kind.discriminant(),
+            event.order.date().to_string(),
+            event.order.sequence(),
+            relation_kind,
+            relation_target,
+            event.provenance.source().inner().to_string(),
+            event.provenance.source_operation_id(),
+            event.idempotency_key.as_deref(),
+            event.provenance.raw_hash().as_str(),
+            payload,
+            recorded_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Поиск дубликата по ключам от сильного к слабому (§10.6).
+///
+/// Естественный ключ «счёт + дата + сумма» здесь намеренно отсутствует:
+/// две одинаковые покупки в один день — законная ситуация, и склеивать
+/// их значит терять факт.
+pub(crate) fn find_duplicate(
+    conn: &Connection,
+    event: &Event,
+) -> Result<Option<EventId>, StoreError> {
+    if let Some(operation) = event.provenance.source_operation_id() {
+        let found = lookup(
+            conn,
+            "SELECT id FROM events WHERE owner = ?1 AND source = ?2 AND source_operation_id = ?3",
+            params![
+                event.owner.inner().to_string(),
+                event.provenance.source().inner().to_string(),
+                operation
+            ],
+        )?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    if let Some(key) = event.idempotency_key.as_deref() {
+        let found = lookup(
+            conn,
+            "SELECT id FROM events WHERE owner = ?1 AND idempotency_key = ?2",
+            params![event.owner.inner().to_string(), key],
+        )?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    lookup(
+        conn,
+        "SELECT id FROM events WHERE id = ?1",
+        params![event.id.inner().to_string()],
+    )
+}
+
+fn lookup(
+    conn: &Connection,
+    sql: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+) -> Result<Option<EventId>, StoreError> {
+    let found: Option<String> = conn
+        .query_row(sql, parameters, |row| row.get(0))
+        .optional()?;
+    Ok(found
+        .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+        .map(EventId))
+}

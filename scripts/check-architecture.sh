@@ -61,6 +61,20 @@ if [ -n "$bad" ]; then
   err "iaam-server зависит от адаптеров: $bad — их место в iaam-bootstrap (§3.2)"
 fi
 
+# --- 2a. Адаптер знает только ядро ---
+# iaam-store — адаптер хранилища. Он переводит доменные типы в строки
+# базы и обратно, и потому обязан знать ядро — но ни приложение, ни
+# транспорт, ни другой адаптер. Зависимость в обратную сторону превратила
+# бы слои в клубок, и «оболочка не считает» перестало бы быть проверяемым:
+# считать начал бы адаптер.
+bad=$(meta \
+  | jq -r '.packages[] | select(.name=="iaam-store") | .dependencies[]
+           | select(.kind == null) | .name' \
+  | { grep -E '^iaam-(app|server|bootstrap|ingest|market)$' || true; })
+if [ -n "$bad" ]; then
+  err "iaam-store зависит от вышележащих слоёв: $bad (§3.2)"
+fi
+
 # --- 3. Никаких shared/common/utils крейт ---
 for forbidden in shared common utils; do
   if [ -d "crates/iaam-$forbidden" ]; then

@@ -1,0 +1,23 @@
+[package]
+name = "iaam-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Версия рядом с путём обязательна: `cargo deny` считает path-зависимость
+# без версии wildcard-зависимостью, а wildcards = "deny" в deny.toml.
+iaam-core = { path = "../iaam-core", version = "0.1.0" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Снимок проекции содержит карты с составными ключами, которые JSON
+# представить не может («key must be a string»). CBOR может.
+ciborium = "0.2"
+thiserror = "2"
+time = { version = "0.3", default-features = false, features = ["std", "macros", "parsing", "formatting"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[lints]
+workspace = true

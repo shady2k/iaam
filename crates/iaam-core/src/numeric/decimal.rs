@@ -35,6 +35,16 @@ impl Dec {
         MAX_SCALE
     }
 
+    /// Сложение с проверкой переполнения. Штатный `+` у `Decimal` паникует
+    /// при выходе за диапазон; тихая паника в расчёте доходности хуже
+    /// типизированного отказа.
+    pub fn checked_add(self, other: Self) -> Result<Self, NumericError> {
+        self.0
+            .checked_add(other.0)
+            .map(Self)
+            .ok_or(NumericError::Overflow)
+    }
+
     /// Перевод в точный режим. Возможен без потерь: десятичная дробь
     /// с масштабом `s` — это рациональное число со знаменателем `10^s`.
     pub fn to_exact(&self) -> Result<Exact, NumericError> {
@@ -58,6 +68,29 @@ mod tests {
 
     fn dec(s: &str) -> Dec {
         Dec::new(Decimal::from_str(s).unwrap())
+    }
+
+    #[test]
+    fn checked_add_sums_without_binary_rounding() {
+        // Ожидание посчитано вручную, а не снято с вывода (§15.5).
+        assert_eq!(dec("0.1").checked_add(dec("0.2")).unwrap(), dec("0.3"));
+    }
+
+    #[test]
+    fn checked_add_is_not_either_operand() {
+        // Отдельно от предыдущего: сумма разных величин обязана отличаться
+        // от каждого слагаемого, иначе «сложение», возвращающее один из
+        // операндов, прошло бы незамеченным.
+        let sum = dec("2.5").checked_add(dec("7.5")).unwrap();
+        assert_ne!(sum, dec("2.5"));
+        assert_ne!(sum, dec("7.5"));
+        assert_eq!(sum, dec("10"));
+    }
+
+    #[test]
+    fn checked_add_refuses_overflow_instead_of_panicking() {
+        let max = Dec::new(Decimal::MAX);
+        assert_eq!(max.checked_add(max), Err(NumericError::Overflow));
     }
 
     #[test]

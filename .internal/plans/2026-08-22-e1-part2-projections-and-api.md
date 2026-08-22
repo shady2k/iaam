@@ -135,7 +135,8 @@ crates/
   iaam-core/                       СУЩЕСТВУЕТ, дополняется
     src/lib.rs                     + pub mod projection; returns; valuation;
     src/money.rs                   + Money::to_calc_dec               задача 4
-    src/numeric/decimal.rs         + арифметика Dec с проверками      задача 4
+    src/numeric/decimal.rs         + Dec::checked_add                 задача 1
+    src/numeric/decimal.rs         + остальная арифметика Dec         задача 4
     src/event/kind.rs              + вариант Valuation (§5.4)         задача 4
     src/event/mod.rs               + форма Valuation, конструктор для тестов
     src/numeric/xirr.rs            НОВЫЙ  решатель ставки             задача 6
@@ -227,6 +228,13 @@ Cargo.toml                         пять новых крейт в members
 - Create: `crates/iaam-core/src/projection/balances.rs`
 - Create: `crates/iaam-core/src/projection/mod.rs` (пока только объявления модулей)
 - Modify: `crates/iaam-core/src/lib.rs` — `pub mod projection;`
+- Modify: `crates/iaam-core/src/numeric/decimal.rs` — `Dec::checked_add`
+
+> **Исправление при исполнении (2026-08-23).** Первая редакция объявляла задачи 1–4
+> независимыми, но код этой задачи складывает количества через `Dec::checked_add`,
+> которого в крейте нет: план заводил его в задаче 4. Расхождение исправлено
+> в пользу компилятора — `checked_add` вместе с тестами переехал сюда, задача 4
+> добавляет остальную арифметику `Dec`. Независимость задач 1–4 восстановлена.
 
 **Interfaces:**
 - Consumes: `event::Event`, `event::leg::{Leg, LegKind}`, `money::{Money, PostedMinor, Quantity, CurrencyCode}`, `ids::*` — всё уже существует.
@@ -556,21 +564,43 @@ impl Balances {
 pub mod balances;
 ```
 
-Плюс строка `pub mod projection;` в `crates/iaam-core/src/lib.rs` (в алфавитном порядке, после `pub mod money;`).
+Плюс строка `pub mod projection;` в `crates/iaam-core/src/lib.rs` в алфавитном порядке — то есть после `pub mod numeric;`, а не после `pub mod money;`.
+
+В `crates/iaam-core/src/numeric/decimal.rs`, перед `to_exact`, — сложение, которого требует `apply`:
+
+```rust
+    /// Сложение с проверкой переполнения. Штатный `+` у `Decimal` паникует
+    /// при выходе за диапазон; тихая паника в расчёте доходности хуже
+    /// типизированного отказа.
+    pub fn checked_add(self, other: Self) -> Result<Self, NumericError> {
+        self.0
+            .checked_add(other.0)
+            .map(Self)
+            .ok_or(NumericError::Overflow)
+    }
+```
+
+и три теста к нему в том же файле: сумма без двоичного округления (`0.1 + 0.2 == 0.3`), сумма не равна ни одному из слагаемых, переполнение даёт `NumericError::Overflow`, а не панику. Второй тест существует отдельно от первого потому, что «сложение», возвращающее операнд, иначе проходит незамеченным.
 
 - [ ] **Шаг 4: Зелёная сборка**
 
 ```bash
 nix develop -c cargo test -p iaam-core balances
 nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
+nix develop -c cargo mutants --package iaam-core \
+  --file crates/iaam-core/src/projection/balances.rs \
+  --file crates/iaam-core/src/numeric/decimal.rs
 ```
 
-Ожидается: пять тестов проходят, clippy молчит.
+Ожидается: восемь тестов `balances` проходят (первая редакция говорила «пять» — тестов в шаге 1 семь, плюс добавленный ниже), clippy молчит, выживших мутантов нет.
+
+Мутационный прогон при исполнении дал одного выжившего: в `quantity_of` условие отбора `key.account == account && key.instrument == instrument` заменялось на `||` незамеченно — сумма молча вбирала бы чужую позицию. Закрыто тестом `quantity_of_sums_neither_a_foreign_account_nor_a_foreign_instrument`: три позиции — своя, свой счёт с чужим инструментом, чужой счёт со своим инструментом — и ответ, равный только первой.
 
 - [ ] **Шаг 5: Коммит**
 
 ```bash
-git add crates/iaam-core/src/projection crates/iaam-core/src/lib.rs
+git add crates/iaam-core/src/projection crates/iaam-core/src/lib.rs \
+  crates/iaam-core/src/numeric/decimal.rs
 git commit -m "feat(core): денежные остатки и позиции по ногам событий (iaam-1fk)"
 ```
 
@@ -1787,7 +1817,7 @@ git commit -m "feat(core): датированные потоки границы 
 - Modify: `docs/irreversible-core.md` — новая строка в таблице
 
 **Interfaces:**
-- Produces: `valuation::{PriceQuality, InstrumentPrice, PriceBoard, FxSource, FxTable, ValuationError, convert}`; `money::Money::to_calc_dec() -> Dec`; `numeric::decimal::Dec::{one, is_zero, is_negative, checked_add, checked_sub, checked_mul, checked_neg, sum}`; `event::kind::EventKind::Valuation`.
+- Produces: `valuation::{PriceQuality, InstrumentPrice, PriceBoard, FxSource, FxTable, ValuationError, convert}`; `money::Money::to_calc_dec() -> Dec`; `numeric::decimal::Dec::{one, is_zero, is_positive, is_negative, checked_sub, checked_mul, checked_neg, sum}` (`checked_add` уже есть — его завела задача 1); `event::kind::EventKind::Valuation`.
 
 **Acceptance Criteria:**
 - Цена приходит **фактом с provenance** — событием журнала, а не параметром запроса.
@@ -1829,15 +1859,7 @@ git commit -m "feat(core): датированные потоки границы 
         self.0.is_sign_negative() && !self.0.is_zero()
     }
 
-    /// Сложение с проверкой переполнения. Штатный `+` у `Decimal` паникует
-    /// при выходе за диапазон; тихая паника в расчёте доходности хуже
-    /// типизированного отказа.
-    pub fn checked_add(self, other: Self) -> Result<Self, NumericError> {
-        self.0
-            .checked_add(other.0)
-            .map(Self)
-            .ok_or(NumericError::Overflow)
-    }
+    // checked_add уже добавлен задачей 1.
 
     pub fn checked_sub(self, other: Self) -> Result<Self, NumericError> {
         self.0

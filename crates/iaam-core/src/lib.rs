@@ -10,4 +10,5 @@ pub mod event;
 pub mod ids;
 pub mod money;
 pub mod numeric;
+pub mod projection;
 pub mod rules;

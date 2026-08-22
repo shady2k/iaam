@@ -561,7 +561,14 @@ git commit -m "ci: rustfmt, clippy -D warnings, forbid unsafe; заслоны п
 set -euo pipefail
 
 # Заслоны работают из корня репозитория независимо от того, откуда вызваны.
-cd "$(git rev-parse --show-toplevel)"
+# Корень ищется от каталога самого скрипта, а не от cwd вызывающего: иначе
+# запуск из не-git каталога даёт пустую строку, `cd ""` и заслон, проверяющий
+# не тот каталог. Не определили корень — это отказ заслона, а не успех.
+if ! REPO_ROOT=$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null); then
+  echo "АРХИТЕКТУРА: не удалось определить корень репозитория от $(dirname -- "${BASH_SOURCE[0]}")" >&2
+  exit 1
+fi
+cd "$REPO_ROOT"
 
 fail=0
 err() { echo "АРХИТЕКТУРА: $*" >&2; fail=1; }
@@ -569,21 +576,33 @@ err() { echo "АРХИТЕКТУРА: $*" >&2; fail=1; }
 CORE_SRC="crates/iaam-core/src"
 
 # Отбрасывает строки, содержимое которых является комментарием.
-# Без этого заслон падает на doc-комментарии, объясняющем сам запрет.
+# Без этого заслон падает на doc-комментарии, объясняющем сам запрет:
+# в шапке ядра написано «ни `async`, ни `Mutex`» — это верный код, а не нарушение.
+# На вход подаётся вывод `grep -rn`, то есть «путь:номер:тело».
 strip_comments() {
-  awk -F: '{
+  awk '{
     body = $0
     sub(/^[^:]*:[0-9]+:/, "", body)
-    if (body !~ /^[[:space:]]*(\/\/|\*|\/\*)/) print
+    if (body !~ /^[[:space:]]*(\/\/|\*\/|\*|\/\*)/) print
   }'
 }
 
-meta() { cargo metadata --no-deps --format-version 1; }
+# cargo metadata читается ОДИН раз: четыре вызова в цикле заслона — это
+# четыре шанса, что один из них молча упадёт и заслон пропустит нарушение.
+# Падение самого cargo metadata — это отказ заслона, а не его успех.
+meta_err=$(mktemp)
+trap 'rm -f "$meta_err"' EXIT
+if ! META=$(cargo metadata --no-deps --format-version 1 2>"$meta_err"); then
+  echo "АРХИТЕКТУРА: cargo metadata не выполнился — заслон не может быть проверен" >&2
+  cat "$meta_err" >&2
+  exit 1
+fi
+meta() { printf '%s' "$META"; }
 
 # --- 1. iaam-core не зависит ни от одной крейты воркспейса ---
 core_deps=$(meta \
   | jq -r '.packages[] | select(.name=="iaam-core") | .dependencies[].name' \
-  | grep '^iaam-' || true)
+  | { grep '^iaam-' || true; })
 if [ -n "$core_deps" ]; then
   err "iaam-core зависит от крейт воркспейса: $core_deps (§3.2)"
 fi
@@ -594,7 +613,7 @@ fi
 bad=$(meta \
   | jq -r '.packages[] | select(.name=="iaam-server") | .dependencies[]
            | select(.kind == null) | .name' \
-  | grep -E '^iaam-(store|market|ingest)$' || true)
+  | { grep -E '^iaam-(store|market|ingest)$' || true; })
 if [ -n "$bad" ]; then
   err "iaam-server зависит от адаптеров: $bad — их место в iaam-bootstrap (§3.2)"
 fi
@@ -607,16 +626,21 @@ for forbidden in shared common utils; do
 done
 
 # --- 4. Эталон не попадает в продакшн-зависимости ---
-if meta | jq -r '.packages[] | select(.name!="iaam-oracle") | .dependencies[]
-                 | select(.kind == null or .kind == "build") | .name' \
-   | grep -qx 'iaam-oracle'; then
+# grep -q здесь нельзя: он закрывает пайп, jq умирает по SIGPIPE, и при
+# pipefail код пайплайна становится ненулевым — то есть настоящее нарушение
+# читалось бы как «проверка пройдена». Ловим текстом, а не кодом возврата.
+oracle_leak=$(meta \
+  | jq -r '.packages[] | select(.name!="iaam-oracle") | .dependencies[]
+           | select(.kind == null or .kind == "build") | .name' \
+  | { grep -x 'iaam-oracle' || true; })
+if [ -n "$oracle_leak" ]; then
   err "iaam-oracle попал в продакшн- или build-зависимости (§15.4)"
 fi
 
 # --- 5. Двоичная плавающая точка в ядре только в numeric/approx.rs ---
 if [ -d "$CORE_SRC" ]; then
   hits=$(grep -rn '\bf64\b\|\bf32\b' "$CORE_SRC" --include='*.rs' \
-    | grep -v "^$CORE_SRC/numeric/approx.rs:" \
+    | { grep -v "^${CORE_SRC//./\\.}/numeric/approx\.rs:" || true; } \
     | strip_comments || true)
   if [ -n "$hits" ]; then
     err "двоичная плавающая точка вне numeric/approx.rs (§6.6):"
@@ -642,10 +666,13 @@ fi
 # молча выпадает из-под запрета, и ничто об этом не сообщает.
 for manifest in crates/*/Cargo.toml; do
   [ -f "$manifest" ] || continue
-  if ! grep -qA1 '^\[lints\]' "$manifest" | grep -q 'workspace *= *true'; then
-    if ! awk '/^\[lints\]/{f=1;next} f&&/workspace *= *true/{found=1} /^\[/&&!/^\[lints\]/{f=0} END{exit !found}' "$manifest"; then
-      err "$manifest не наследует линты воркспейса: нужна секция [lints] с workspace = true (§15.1)"
-    fi
+  if ! awk '
+      /^[[:space:]]*\[lints\]/            { in_lints = 1; next }
+      /^[[:space:]]*\[/                   { in_lints = 0 }
+      in_lints && /^[[:space:]]*workspace[[:space:]]*=[[:space:]]*true/ { found = 1 }
+      END                                 { exit !found }
+    ' "$manifest"; then
+    err "$manifest не наследует линты воркспейса: нужна секция [lints] с workspace = true (§15.1)"
   fi
 done
 
@@ -669,17 +696,27 @@ fi
 echo "Архитектурные заслоны пройдены."
 ```
 
-> **Почему отбрасываются комментарии.** Без этого заслон падает на собственном
-> doc-комментарии ядра, который объясняет запрет и потому содержит слова
-> `Mutex` и `async`. Заслон, срабатывающий на верном коде, будет отключён
-> при первом же столкновении — и вместе с ним пропадёт настоящая проверка.
+> **Этот скрипт проверен на исполнении** — в отличие от Rust-кода в плане.
+> Первая редакция содержала пять дефектов, из которых один был fail-open:
+> `grep -qx` в пайплайне под `set -o pipefail` инвертировал результат
+> (`grep -q` закрывает пайп → `jq` умирает по SIGPIPE → код пайплайна
+> ненулевой → условие ложно), и настоящая утечка эталона читалась бы
+> как «заслон пройден». Заслон, молча пропускающий нарушение, хуже
+> отсутствующего.
+>
+> Остальные четыре: мёртвая ветка `grep -qA1` с инвертированной логикой;
+> четыре отдельных вызова `cargo metadata`, каждый с `|| true` — четыре
+> шанса молча упасть; `|| true`, привязанный ко всему пайплайну вместо
+> grep-стадии; неэкранированная точка в `approx\.rs`.
 
-> **Почему `iaam-bootstrap`.** Собрать конкретные адаптеры где-то нужно,
-> но требование «`iaam-server` не знает про SQLite» и требование «точка
-> сборки в `main` сервера» противоречат друг другу: зависимость объявляется
-> на уровне пакета, а не таргета. Точка сборки выносится в отдельную крейту
-> `iaam-bootstrap`, зависящую от `iaam-app` и всех адаптеров; `iaam-server`
-> и `iaam-cli` остаются библиотеками транспорта.
+> **Про `cd` в корень.** `cd "$(git rev-parse --show-toplevel)"` не выполняет
+> требование «работает из любого каталога»: из не-git каталога подстановка
+> пуста и получается `cd ""`. Корень ищется от каталога **самого скрипта**.
+
+> **Заслон №1 запрещает ядру зависимости всех видов, включая
+> `[dev-dependencies]`.** Это осознанно: `iaam-oracle` (задача 14) зависит
+> от `iaam-core`, а не наоборот. Но помните ограничение — ядро не сможет
+> получить dev-зависимость на крейту воркспейса никогда.
 
 - [ ] **Step 2: Сделать исполняемым и запустить**
 
@@ -931,6 +968,12 @@ nix develop -c ./scripts/check-fixtures.sh          # ожидается: вых
 sed -i 's/43/42/' tests/fixtures/smoke.json
 nix develop -c ./scripts/check-fixtures.sh          # ожидается: пройдено
 ```
+
+> **Осторожно с пайпами через `nix develop -c`.** `shellHook` в `flake.nix`
+> печатает баннер в stdout, поэтому `nix develop -c cargo metadata | jq`
+> из командной строки ломается: баннер попадает на вход `jq`. Внутри
+> скрипта проблемы нет — баннер выводится один раз до старта скрипта.
+> Учитывайте это в задачах, где что-то пайпится.
 
 - [ ] **Step 5: Создать `deny.toml`**
 

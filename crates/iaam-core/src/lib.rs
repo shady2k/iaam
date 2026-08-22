@@ -10,6 +10,7 @@ pub mod event;
 pub mod ids;
 pub mod money;
 pub mod numeric;
+pub mod rules;
 
 #[cfg(test)]
 mod tests {

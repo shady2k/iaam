@@ -3934,10 +3934,14 @@ mod tests {
     use crate::event::test_support::{sample_event, sample_event_with};
     use crate::event::Relation;
 
+    // ВАЖНО для всех тестов ниже: `resolve` возвращает ссылки в переданный
+    // срез, поэтому `resolve(&[a, b])` не компилируется — E0716, временный
+    // массив умирает в конце выражения. Журнал надо связать переменной.
     #[test]
     fn plain_event_is_effective() {
         let e = sample_event(0);
-        let out = resolve(&[e.clone()]).unwrap();
+        let journal = std::slice::from_ref(&e);
+        let out = resolve(journal).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, e.id);
     }
@@ -3959,6 +3963,11 @@ mod tests {
         assert_eq!(out[0].id, replacement.id, "действует замена, не исходное");
     }
 
+    // Двух перестановок для утверждения «порядок не влияет» недостаточно.
+    // В рабочей реализации проверено на всех перестановках смешанного
+    // журнала с намеренной ничьёй по `EffectiveOrder`. Идентификаторы там
+    // заданы явно (`EventId(Uuid::from_u128(n))`): со случайными ожидаемая
+    // последовательность зависела бы от жребия, и тест был бы флаки.
     #[test]
     fn result_does_not_depend_on_input_order() {
         let original = sample_event(0);
@@ -4063,8 +4072,10 @@ use crate::ids::EventId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CorrectionError {
-    #[error("событие {source:?} ссылается на несуществующее {target:?}")]
-    DanglingTarget { source: EventId, target: EventId },
+    // Поле НЕ называть `source`: `thiserror` трактует его как
+    // `Error::source` и требует `std::error::Error` от типа поля — E0599.
+    #[error("событие {correction:?} ссылается на несуществующее {target:?}")]
+    DanglingTarget { correction: EventId, target: EventId },
     #[error("событие {target:?} заменяется более чем одним событием: {first:?} и {second:?}")]
     ConflictingReplacements { target: EventId, first: EventId, second: EventId },
     #[error("событие {id:?} встречается в срезе более одного раза")]
@@ -4104,10 +4115,15 @@ pub fn resolve(events: &[Event]) -> Result<Vec<&Event>, CorrectionError> {
                     return Err(CorrectionError::DanglingTarget { source: e.id, target });
                 }
                 if let Some(existing) = replaced_by.insert(target, e.id) {
-                    // Детерминированный порядок сообщения: меньший идентификатор первым,
-                    // чтобы текст ошибки не зависел от порядка импорта.
-                    let (first, second) =
-                        if existing < e.id { (existing, e.id) } else { (e.id, existing) };
+                    // Детерминированный порядок сообщения: меньший идентификатор
+                    // первым, чтобы текст ошибки не зависел от порядка импорта.
+                    //
+                    // `min`/`max`, а не `if existing < e.id`: равные
+                    // идентификаторы отсечены проверкой на дубликаты выше,
+                    // поэтому строгость сравнения ненаблюдаема, и мутант
+                    // `<` → `<=` неубиваем ни одним тестом. Вместо того чтобы
+                    // объявлять его эквивалентным, произвольный выбор убран.
+                    let (first, second) = (existing.min(e.id), existing.max(e.id));
                     return Err(CorrectionError::ConflictingReplacements {
                         target,
                         first,

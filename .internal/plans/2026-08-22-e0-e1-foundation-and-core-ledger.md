@@ -37,7 +37,7 @@
 
 | Правило | Источник |
 |---|---|
-| `#![forbid(unsafe_code)]` в каждой крейте первой стороны | §15.1 |
+| `unsafe` запрещён во всех крейтах первой стороны. Обеспечивается таблицей `[workspace.lints.rust]` в корневом `Cargo.toml` **плюс** `[lints] workspace = true` в каждой крейте. Крейта без второй строки молча выпадает из-под запрета — это проверяется заслоном архитектуры (задача 3) | §15.1 |
 | `f64` запрещён в доменных величинах (проведённые суммы, налоговая база, члены тождества). Допустим только внутри решателей ставок с документированной границей погрешности | §6.6, §15.1 |
 | `iaam-core` — синхронная, без `async`, без `Mutex`, без ввода-вывода, без зависимостей на другие крейты воркспейса | §3.1, §3.2 |
 | Строковые дискриминаторы запрещены там, где возможен `enum` | §15.1 |
@@ -394,7 +394,8 @@ git commit -m "build: воспроизводимый тулчейн через N
 **Acceptance Criteria:**
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` проходит
 - Намеренно внесённое `unsafe { }` в `iaam-core` **не компилируется**
-- CI зелёный на текущем коммите
+- `clippy.toml` доказанно читается — проверено несуществующим ключом
+- Workflow создан и синтаксически корректен. **Зелёный прогон CI в критерии не входит**: он требует пуша, а пуш в задачах запрещён. Проверяется на закрытии эпика.
 
 - [ ] **Step 1: Создать `rustfmt.toml`**
 
@@ -460,13 +461,25 @@ pub fn deliberately_broken() {
 nix develop -c cargo build --workspace
 ```
 
-Ожидается: **ошибка компиляции** `usage of an `unsafe` block ... forbidden`.
+Ожидается **ошибка компиляции** ровно такого вида:
+
+```
+error: usage of an `unsafe` block
+  = note: requested on the command line with `-F unsafe-code`
+```
+
+> **Слова `forbidden` в тексте нет** — проверено на исполнении. Флаг
+> `-F unsafe-code` cargo выводит из таблицы `[workspace.lints.rust]`.
+> Если ждать буквального «forbidden», можно решить, что сработал не тот
+> заслон.
 
 Уберите эту функцию. Заслон проверен.
 
 - [ ] **Step 5: Проверить, что clippy действительно валит сборку**
 
-Временно добавьте:
+Временно добавьте функцию **перед** `#[cfg(test)] mod tests`, а не в конец
+файла: код после тестового модуля даёт вдобавок `items_after_test_module`,
+и целевая претензия теряется в шуме.
 
 ```rust
 pub fn deliberately_lint_bad(v: &Vec<i32>) -> usize {
@@ -480,9 +493,32 @@ pub fn deliberately_lint_bad(v: &Vec<i32>) -> usize {
 nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Ожидается: **ошибка** `writing &Vec instead of &[_]` уровня error, а не warning.
+Ожидается **error**, а не warning:
+
+```
+error: writing `&Vec` instead of `&[_]` involves a new object where a slice will do
+  = note: `-D clippy::ptr-arg` implied by `-D clippy::all`
+```
 
 Уберите функцию.
+
+- [ ] **Step 5a: Проверить, что `clippy.toml` вообще читается**
+
+Конфигурация, которую никто не читает, — тот же непроверенный заслон:
+оба заданных ключа валидны, поэтому молчание неотличимо от игнорирования.
+
+Временно допишите в `clippy.toml` несуществующий ключ:
+
+```toml
+this-key-does-not-exist = 1
+```
+
+```bash
+nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Ожидается: ошибка с указанием пути `/…/clippy.toml:4:1` — то есть файл
+прочитан. Уберите ключ.
 
 - [ ] **Step 6: Коммит**
 
@@ -490,6 +526,10 @@ nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warni
 git add rustfmt.toml clippy.toml .github/workflows/ci.yml
 git commit -m "ci: rustfmt, clippy -D warnings, forbid unsafe; заслоны проверены (iaam-a4x)"
 ```
+
+> **Трейлер.** Во все коммиты, сделанные агентом, добавляется
+> `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
+> В командах плана он не выписан ради краткости, но ставится всегда.
 
 ---
 

@@ -79,7 +79,8 @@ check '#\[cfg\(ignore\)\]' 'отключение кода через cfg(ignore)
 # потерю `[lints] workspace = true` ловит scripts/check-architecture.sh.
 if ! policy_files=$(git diff --name-only "${DIFF_RANGE[@]}" -- \
   '.github/workflows' 'scripts' 'deny.toml' 'clippy.toml' \
-  '.cargo/mutants.toml' 'Cargo.toml' 'tests/fixtures'); then
+  '.cargo/mutants.toml' 'Cargo.toml' 'tests/fixtures' \
+  'flake.nix' 'flake.lock' 'rustfmt.toml'); then
   echo "ОШИБКА: git diff --name-only не выполнился — заслон не может быть проверен." >&2
   exit 1
 fi

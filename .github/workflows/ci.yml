@@ -25,5 +25,25 @@ jobs:
         run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Architecture guards
         run: nix develop -c ./scripts/check-architecture.sh
+      - name: Diff lint
+        env:
+          # Владелец выставляет переменную в настройках репозитория,
+          # когда изменение политики качества действительно одобрено.
+          POLICY_CHANGE_APPROVED: ${{ vars.POLICY_CHANGE_APPROVED }}
+        run: |
+          if [ -n "${{ github.base_ref }}" ]; then
+            BASE="origin/${{ github.base_ref }}"
+          else
+            BASE="${{ github.event.before }}"
+            # Первый push в ветку даёт нулевой SHA — сравниваем с пустым деревом.
+            if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git hash-object -t tree /dev/null)
+            fi
+          fi
+          nix develop -c ./scripts/check-diff-lint.sh "$BASE"
+      - name: Frozen fixtures
+        run: nix develop -c ./scripts/check-fixtures.sh
+      - name: Dependency policy
+        run: nix develop -c cargo deny check
       - name: Test
         run: nix develop -c cargo test --workspace --all-features

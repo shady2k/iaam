@@ -28,6 +28,9 @@
             pkgs.cargo-audit
             pkgs.jq
             pkgs.sqlite
+            # Покрытие по диффу: cargo llvm-cov строит полный отчёт,
+            # но порог на добавленных строках задаёт diff-cover.
+            pkgs.python3Packages.diff-cover
           ];
           # rusqlite с feature "bundled" компилирует SQLite из исходников
           shellHook = ''

@@ -1,5 +1,6 @@
 //! Envelope события журнала (§4.1).
 
+pub mod correction;
 pub mod kind;
 pub mod leg;
 pub mod provenance;
@@ -361,6 +362,48 @@ fn require_equal(
     Ok(())
 }
 
+/// Конструкторы событий для тестов. Доступны и другим модулям крейты,
+/// поэтому вынесены из приватного `mod tests`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::provenance::{ParserVersion, Provenance, RawHash};
+    use super::*;
+    use crate::dates::CashPostedDate;
+    use crate::ids::SourceId;
+    use crate::money::PostedMinor;
+    use time::macros::date;
+
+    pub(crate) fn sample_event(sequence: u32) -> Event {
+        sample_event_with(sequence, Relation::None)
+    }
+
+    pub(crate) fn sample_event_with(sequence: u32, relation: Relation) -> Event {
+        let account = AccountId::new_random();
+        // Сумма записывается одним числом в минимальных единицах:
+        // группировка вида `10_000_00` не компилируется
+        // (clippy::inconsistent_digit_grouping входит в `all`, а `all = deny`).
+        let amount = Money::new(PostedMinor::new(1_000_000), CurrencyCode::Rub);
+        Event {
+            id: EventId::new_random(),
+            schema_version: SCHEMA_VERSION,
+            owner: OwnerId::new_random(),
+            account,
+            kind: EventKind::CashIn { amount },
+            dates: EventDates::for_cash(CashPostedDate(date!(2026 - 03 - 01))),
+            order: EffectiveOrder::new(date!(2026 - 03 - 01), sequence),
+            legs: vec![Leg::cash(account, amount)],
+            provenance: Provenance::new(
+                SourceId::new_random(),
+                RawHash::parse(&"b".repeat(64)).unwrap(),
+                ParserVersion("test/1".into()),
+            ),
+            relation,
+            confidence: Confidence::Known,
+            idempotency_key: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::kind::{FeeOrigin, TradeSide};
@@ -410,6 +453,17 @@ mod tests {
             instrument,
             Quantity::zero(),
         )
+    }
+
+    // --- Общие тестовые конструкторы ---
+
+    #[test]
+    fn sample_event_passes_structural_validation() {
+        // Конструктор из `test_support` используется другими модулями крейты
+        // как «обычное событие». Событие, не проходящее структурную проверку,
+        // в этой роли негодно: тесты исправлений опирались бы на факт,
+        // который журнал не принял бы.
+        assert!(test_support::sample_event(0).validate_structure().is_ok());
     }
 
     // --- Комиссия ---

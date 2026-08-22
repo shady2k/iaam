@@ -48,6 +48,11 @@ MODULES=(
   "crates/iaam-store/src/snapshots.rs"
   "crates/iaam-store/src/reference.rs"
   "crates/iaam-store/src/tokens.rs"
+  # Приёмка строит знаки и ноги события: ошибка здесь записывает
+  # в append-only журнал факт, которого не было.
+  "crates/iaam-ingest/src/operation.rs"
+  "crates/iaam-ingest/src/csv_source.rs"
+  "crates/iaam-ingest/src/verdict.rs"
   # Эталон мутируется наравне с продакшеном: ошибка в эталоне маскирует
   # ошибку в продакшене ровно так же, как наоборот (§15.4).
   "crates/iaam-oracle/src/lots_reference.rs"

@@ -1,0 +1,19 @@
+[package]
+name = "iaam-ingest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iaam-core = { path = "../iaam-core", version = "0.1.0" }
+csv = "1"
+rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+thiserror = "2"
+time = { version = "0.3", default-features = false, features = ["std", "macros", "parsing", "formatting"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[lints]
+workspace = true

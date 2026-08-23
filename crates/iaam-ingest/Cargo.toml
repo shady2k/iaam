@@ -10,15 +10,16 @@ iaam-core = { path = "../iaam-core", version = "0.1.0" }
 csv = "1"
 rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
 serde = { version = "1", features = ["derive"] }
+# Каноническая форма отпечатка дедупликации (§10.6): JSON выделенной
+# структуры с версией формата. Не только для тестов — отсюда и обычная
+# зависимость, а не dev.
+serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
-time = { version = "0.3", default-features = false, features = ["std", "macros", "parsing", "formatting"] }
+# Каноническая форма отпечатка включает даты, поэтому "serde" объявлен
+# здесь явно, а не берётся объединением фич из iaam-core.
+time = { version = "0.3", default-features = false, features = ["std", "macros", "serde", "parsing", "formatting"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-
-[dev-dependencies]
-# Вердикт уходит наружу по REST: round-trip проверяется здесь, а не
-# у внешнего агента.
-serde_json = "1"
 
 [lints]
 workspace = true

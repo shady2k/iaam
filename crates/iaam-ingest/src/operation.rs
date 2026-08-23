@@ -5,14 +5,13 @@ use iaam_core::dates::{
 };
 use iaam_core::event::kind::{EventKind, FeeOrigin, OpeningAssertions, TradeSide};
 use iaam_core::event::leg::Leg;
-use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::provenance::{ParserVersion, Provenance};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::PriceQuality;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::verdict::Rejection;
 
@@ -162,7 +161,10 @@ pub fn normalize(
     })?;
 
     let (kind, legs) = build(operation, &operation.kind)?;
-    let raw_hash = fingerprint(operation);
+    // Отпечаток тот же самый, что у дедупликации, и считается там же:
+    // второй экземпляр этой функции разошёлся бы с первым молча, а по
+    // отпечаткам уже дедуплицировано (§10.6).
+    let raw_hash = crate::dedup::fingerprint(operation);
 
     Ok(Normalized {
         event: Event {
@@ -196,28 +198,6 @@ pub fn normalize(
             idempotency_key: operation.idempotency_key.clone(),
         },
     })
-}
-
-/// Отпечаток нормализованной записи (§10.6, ключ третьей силы).
-fn fingerprint(operation: &SubmittedOperation) -> RawHash {
-    let mut hasher = Sha256::new();
-    hasher.update(operation.account.inner().as_bytes());
-    hasher.update(format!("{:?}", operation.kind).as_bytes());
-    hasher.update(format!("{:?}", operation.dates).as_bytes());
-    let digest = hasher.finalize();
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    // Длина и алфавит гарантированы SHA-256, поэтому разбор не может
-    // отказать; но подставлять заглушку в случае отказа нельзя —
-    // provenance без хеша не должно существовать.
-    RawHash::parse(&hex).unwrap_or_else(|| {
-        unreachable_hash();
-    })
-}
-
-/// Отдельная функция вместо `unwrap`: `unwrap` на `Option` в этом месте
-/// читался бы как «а вдруг», хотя вариант невозможен по построению.
-fn unreachable_hash() -> ! {
-    panic!("SHA-256 всегда даёт 64 шестнадцатеричных знака")
 }
 
 /// Перевод десятичной суммы в минимальные единицы **без округления**.

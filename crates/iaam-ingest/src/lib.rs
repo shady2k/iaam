@@ -11,6 +11,7 @@
 //! знать внешний агент, которому арифметика запрещена (§13).
 
 pub mod csv_source;
+pub mod dedup;
 pub mod operation;
 pub mod verdict;
 

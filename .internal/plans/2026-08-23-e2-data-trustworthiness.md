@@ -5346,97 +5346,120 @@ git commit -m "feat(store): правила классификации с ист�
 
 ## Задача 12: Иерархия ключей дедупликации
 
+> Развёрнута до полной глубины 2026-08-23, после задач 10 и 11.
+
 **Files:**
 - Create: `crates/iaam-ingest/src/dedup.rs`
 - Modify: `crates/iaam-ingest/src/lib.rs`
+- Modify: `crates/iaam-ingest/src/operation.rs` — отпечаток берётся из `dedup`
+- Modify: `crates/iaam-core/src/event/provenance.rs` — `RowLocator.document` становится `RawHash`
 - Test: `crates/iaam-ingest/tests/dedup.rs`
 
 **Interfaces:**
 - Consumes: `SubmittedOperation`, `Provenance`.
-- Produces: `DedupKey` (`SourceOperationId`, `IdempotencyKey`, `NormalizedFingerprint`, `DocumentRow`); `DedupDecision` (`Duplicate { key }`, `Fresh`, `PossibleDuplicate { of, score }`); `choose_key(&SubmittedOperation, &DocumentContext) -> DedupKey`; `fingerprint(&Normalized) -> RawHash`; `assess(&DedupKey, &[KnownRecord], &DocumentContext) -> DedupDecision`.
+- Produces: `DedupKey` (`SourceOperationId`, `IdempotencyKey`, `NormalizedFingerprint`, `DocumentRow`); `DedupLevel`; `DedupDecision` (`Duplicate { key, existing }`, `Fresh`, `PossibleDuplicate { of, level }`); `DocumentContext`; `KnownRecord`; `fingerprint(&SubmittedOperation) -> RawHash`; `choose_key(&SubmittedOperation, &DocumentContext) -> Option<DedupKey>`; `assess(Option<&DedupKey>, &RawHash, &DocumentContext, &[KnownRecord]) -> DedupDecision`.
 
 **Acceptance Criteria:**
 - Иерархия §10.6 реализована целиком: пять уровней, выбирается сильнейший доступный
 - Две одинаковые покупки в один день **не** становятся дубликатом — прямой тест
-- Повторная загрузка того же документа даёт `Duplicate` по уровню 4 на каждой строке
+- Повторная загрузка того же документа даёт `Duplicate` по локатору строки на каждой строке
 - Совпадение отпечатка между **разными** документами даёт `PossibleDuplicate`, а не удаление
 - Вероятностный дубликат никогда не приводит к автоматическому отбрасыванию — отдельный тест на то, что строка записана
 
-- [ ] **Шаг 1: Написать тесты**
+### Поправка к решению наброска об уровне 3
 
-Создайте `crates/iaam-ingest/tests/dedup.rs`:
+Набросок этой задачи объявлял отпечаток **жёстким** ключом внутри
+одного документа. Это противоречит его же критерию приёмки: две
+законные одинаковые покупки лежат в одном документе разными строками,
+отпечаток у них совпадает, и жёсткий уровень 3 объявил бы вторую
+дубликатом — ровно то, что §10.6 запрещает прямым текстом. Одно из двух
+обязано было уступить.
+
+Уступает уровень 3, и вот почему. **Внутри документа тождество строки —
+это её локатор, а не её содержимое.** Документ и есть свидетельство
+того, что операций было две: парсер увидел две строки. Отпечаток же
+описывает содержание, а одинаковое содержание — нормальное явление
+(две части исполнения одной заявки). Поэтому:
+
+| §10.6 | Ключ | Когда действует |
+|---|---|---|
+| 1 | `SourceOperationId` | источник дал стабильный идентификатор |
+| 2 | `IdempotencyKey` | клиент назвал подачу |
+| 4 | `DocumentRow` | документ известен **и** известен локатор |
+| 3 | `NormalizedFingerprint` | документ известен, а локатора нет |
+| 5 | подсказка по отпечатку | совпадение с записью **другого** документа или канала без файла |
+
+**Порядок выбора — 1, 2, 4, 3**, а не 1, 2, 3, 4: локатор сильнее голого
+отпечатка, потому что отпечаток не является тождеством. Отклонение от
+нумерации спеки намеренное и записано здесь, а не спрятано в коде.
+
+Уровень 3 не мёртв: канал, который даёт документ, но не даёт номера
+строки (выписка, разобранная не по таблице), опирается именно на него.
+
+**Совпадение отпечатка внутри одного документа на другом локаторе —
+`Fresh`, и даже не подсказка.** Иначе отчёт с двумя одинаковыми
+покупками завалил бы владельца подсказками на ровном месте.
+
+**Но подсказку снимает только доказанное совпадение документа.** Два
+канала без файла (повторная выгрузка из API без идентификаторов
+операций) документа не имеют вовсе, и сравнение «`None` равно `None`,
+значит один документ» объявило бы их одной строкой — молчаливое
+удвоение позиции. Отсутствие документа не является совпадением
+документов.
+
+### Прочие решения развёртывания
+
+1. **`RowLocator.document` становится `RawHash` вместо `String`.**
+   Уровень 4 — «хеш документа плюс локатор»; свободная строка в этом
+   поле означала бы имя файла, а имя файла не является тождеством:
+   тот же отчёт, сохранённый под другим именем, перестал бы
+   дедуплицироваться. По хешу локатор разрешается в `source_documents`
+   задачи 10, а человеческое имя документа берётся оттуда же.
+   В рабочем коде `RowLocator` пока не строится нигде — правится один
+   тест ядра.
+2. **Отпечаток считается один раз и живёт в `dedup`.** Сейчас он живёт
+   приватной функцией в `operation.rs` и строится на `format!("{:?}")`:
+   переименование поля молча меняет все отпечатки, а по ним уже
+   дедуплицировано. Каноническая форма — JSON выделенной структуры
+   с номером версии формата; `operation.rs` зовёт ту же функцию, второго
+   экземпляра не существует.
+3. **Ожидаемый отпечаток в тесте заморожен и посчитан независимо**
+   (§15.5): значение получено `sha256sum` от канонической строки вне
+   программы, команда воспроизведения записана в самом тесте. Из вывода
+   программы оно не берётся никогда.
+4. **`reason` подсказки — перечисление `DedupLevel`, а не строка.**
+   Строковый дискриминатор запрещён там, где возможен `enum`.
+
+- [ ] **Шаг 1: `RowLocator.document` — `RawHash`**
+
+Правится `crates/iaam-core/src/event/provenance.rs` и тест
+`crates/iaam-core/tests/serde_roundtrip.rs` — тест первым.
+
+- [ ] **Шаг 2: Тесты дедупликации**
+
+`crates/iaam-ingest/tests/dedup.rs`, по одному поведению на тест:
+
+| Тест | Что доказывает |
+|---|---|
+| `the_strongest_available_key_wins` | при всех доступных ключах выбран `SourceOperationId` |
+| `the_row_locator_outranks_a_bare_fingerprint` | порядок 1, 2, 4, 3 |
+| `a_channel_without_a_row_number_falls_back_to_the_fingerprint` | уровень 3 не мёртв |
+| `a_submission_that_nothing_identifies_has_no_key` | `choose_key` → `None` |
+| `two_identical_purchases_on_one_day_are_not_a_duplicate` | §10.6 прямым текстом |
+| `reloading_the_same_document_duplicates_every_row` | `Duplicate` по локатору на каждой строке |
+| `the_same_fingerprint_across_documents_is_only_a_hint` | `PossibleDuplicate`, не удаление |
+| `a_possible_duplicate_is_still_recorded` | вероятностная оценка не отбрасывает строку |
+| `two_identical_submissions_from_a_stream_are_a_hint` | отсутствие документа не снимает подсказку |
+| `the_client_key_catches_a_resubmission_without_a_document` | уровень 2 |
+| `the_fingerprint_ignores_the_keys_that_name_the_submission` | ключ идемпотентности не входит в отпечаток |
+| `the_canonical_fingerprint_is_frozen` | замороженное значение, посчитанное независимо |
+
+- [ ] **Шаг 3: Реализация `dedup.rs`**
 
 ```rust
 //! Идемпотентность и дедупликация (§10.6).
-
-use iaam_ingest::dedup::{DedupDecision, DedupKey, assess, choose_key};
-
-#[test]
-fn the_strongest_available_key_wins() {
-    // Иерархия от сильного к слабому: стабильный идентификатор
-    // источника сильнее клиентского ключа, клиентский — сильнее
-    // отпечатка. Взять слабый при доступном сильном значит
-    // потерять точность дедупликации на ровном месте.
-    // ... операция с source_operation_id и idempotency_key
-    // ... assert!(matches!(choose_key(&op, &ctx), DedupKey::SourceOperationId(_)));
-}
-
-#[test]
-fn two_identical_purchases_on_one_day_are_not_a_duplicate() {
-    // Прямое требование §10.6. Естественный ключ «счёт + дата + сумма»
-    // объявил бы их одной сделкой, и вторая покупка исчезла бы из
-    // портфеля — молча и навсегда.
-    // ... две одинаковые операции из РАЗНЫХ строк одного документа
-    // ... assert_eq!(вторая, DedupDecision::Fresh);
-}
-
-#[test]
-fn reloading_the_same_document_duplicates_every_row() {
-    // Тот же файл, те же строки — уровень 4 (хеш документа + локатор).
-    // Это и есть нормальный путь: владелец загрузил отчёт дважды.
-}
-
-#[test]
-fn the_same_fingerprint_across_documents_is_only_a_hint() {
-    // Отпечаток совпал, но документы разные: это может быть законная
-    // одинаковая операция. Показываем, не удаляем.
-    // ... assert!(matches!(решение, DedupDecision::PossibleDuplicate { .. }));
-}
-
-#[test]
-fn a_possible_duplicate_is_still_recorded() {
-    // Вероятностная оценка не приводит к автоматическому удалению
-    // (§10.6). Проверяется именно запись, а не текст вердикта.
-}
-```
-
-- [ ] **Шаг 2: Реализация**
-
-Создайте `crates/iaam-ingest/src/dedup.rs`:
-
-```rust
-//! Идемпотентность и дедупликация (§10.6).
-//!
-//! Иерархия ключей от сильного к слабому:
-//!
-//! 1. стабильный `sourceOperationId`, если источник его даёт;
-//! 2. клиентский `idempotencyKey`;
-//! 3. отпечаток нормализованной сырой записи;
-//! 4. хеш документа плюс локатор строки;
-//! 5. вероятностная оценка — показывается, но **не** удаляет.
-//!
-//! **Решение плана об уровне 3.** Спека ставит отпечаток выше пары
-//! «документ + строка», но при этом прямо запрещает считать дубликатом
-//! две законные одинаковые покупки в один день. Отпечаток у них
-//! совпадает. Поэтому уровень 3 действует жёстко только **внутри
-//! одного документа**, где повтор отпечатка означает повторную подачу
-//! того же файла; между разными документами тот же отпечаток
-//! понижается до уровня 5 — подсказки, ничего не удаляющей.
-//! Естественный ключ «счёт + дата + сумма» не используется нигде:
-//! он даёт ложные совпадения и не ловит дубликаты после нормализации.
 
 /// Ключ, по которому строка признаётся уже виденной.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DedupKey {
     SourceOperationId(String),
     IdempotencyKey(String),
@@ -5444,45 +5467,35 @@ pub enum DedupKey {
     DocumentRow { document: RawHash, sheet: Option<String>, row: u64 },
 }
 
-impl DedupKey {
-    /// Сила ключа: чем меньше, тем сильнее. Нужна, чтобы выбор
-    /// сильнейшего был проверяемым, а не следствием порядка ветвей.
-    #[must_use]
-    pub const fn strength(&self) -> u8 {
-        match self {
-            Self::SourceOperationId(_) => 1,
-            Self::IdempotencyKey(_) => 2,
-            Self::NormalizedFingerprint { .. } => 3,
-            Self::DocumentRow { .. } => 4,
-        }
-    }
+/// Уровень иерархии §10.6, по которому принято решение.
+pub enum DedupLevel {
+    SourceOperationId,
+    IdempotencyKey,
+    NormalizedFingerprint,
+    DocumentRow,
+    Probabilistic,
 }
 
 /// Что делать со строкой.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DedupDecision {
-    /// Уже записано ранее.
     Duplicate { key: DedupKey, existing: EventId },
-    /// Не встречалось.
     Fresh,
-    /// Похоже на дубликат, но доказательства нет.
-    ///
-    /// **Никогда** не приводит к удалению: показывается владельцу
-    /// вместе с записанной строкой (§10.6).
-    PossibleDuplicate { of: EventId, reason: &'static str },
+    /// Похоже на дубликат, но доказательства нет. **Никогда** не
+    /// приводит к удалению: показывается владельцу вместе
+    /// с записанной строкой (§10.6).
+    PossibleDuplicate { of: EventId, level: DedupLevel },
 }
 ```
 
-Дальше — `choose_key`, `fingerprint` (SHA-256 по канонической
-сериализации нормализованной операции: поля в фиксированном порядке,
-суммы в минимальных единицах) и `assess`, реализующий описанное выше
-правило уровня 3.
+`assess` по порядку: точное совпадение выбранного ключа → `Duplicate`;
+иначе совпадение отпечатка с записью **другого** документа или канала
+без файла → `PossibleDuplicate`; иначе `Fresh`.
 
-- [ ] **Шаг 3: Прогнать и закоммитить**
+- [ ] **Шаг 4: Прогнать и закоммитить**
 
 ```bash
 nix develop -c cargo test -p iaam-ingest 2>&1 | tail -15
-git add crates/iaam-ingest
+git add crates/iaam-ingest crates/iaam-core
 git commit -m "feat(ingest): иерархия ключей дедупликации из пяти уровней (iaam-023)"
 ```
 

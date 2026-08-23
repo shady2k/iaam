@@ -35,9 +35,14 @@ impl RawHash {
 pub struct ParserVersion(pub String);
 
 /// Указание на конкретную строку исходного документа.
+///
+/// Документ назван хешом, а не именем файла: имя не является
+/// тождеством — тот же отчёт, сохранённый под другим именем, перестал
+/// бы дедуплицироваться (§10.6, уровень 4). Человеческое имя документа
+/// хранится рядом с сырьём и разрешается по этому хешу.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowLocator {
-    pub document: String,
+    pub document: RawHash,
     pub sheet: Option<String>,
     pub row: u64,
 }
@@ -185,7 +190,7 @@ mod tests {
     #[test]
     fn row_locator_points_at_the_exact_line_of_the_document() {
         let row = RowLocator {
-            document: "broker-2026-Q1.xlsx".to_owned(),
+            document: hash("e"),
             sheet: Some("Сделки".to_owned()),
             row: 118,
         };

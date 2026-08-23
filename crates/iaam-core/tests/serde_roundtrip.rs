@@ -47,7 +47,10 @@ fn envelope(kind: EventKind, legs: Vec<Leg>) -> Event {
         )
         .with_source_operation_id("op-42")
         .with_row(RowLocator {
-            document: "отчёт.xlsx".into(),
+            // Документ назван хешом, а не именем файла: тот же отчёт,
+            // сохранённый под другим именем, обязан остаться тем же
+            // документом.
+            document: RawHash::parse(&"a".repeat(64)).expect("хеш документа"),
             sheet: Some("Сделки".into()),
             row: 17,
         }),

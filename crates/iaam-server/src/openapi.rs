@@ -10,10 +10,10 @@ use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 
 use crate::dto::{
-    AccountDto, ComputedDto, ContourVersionDto, CreateAccountRequest, CreateContourVersionRequest,
-    CurrencyDto, DataQualityDto, FeeOriginDto, FxRateDto, HealthDto, OperationDatesDto,
-    OperationDto, OperationKindDto, PriceQualityDto, RateDto, ReturnsReportDto,
-    SubmitOperationsRequest, VerdictDto,
+    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, ComputedDto, ContourVersionDto,
+    CreateAccountRequest, CreateContourVersionRequest, CurrencyDto, DataQualityDto, FeeOriginDto,
+    FxRateDto, HealthDto, OperationDatesDto, OperationDto, OperationKindDto, PriceQualityDto,
+    RateDto, ReturnsReportDto, SubmitOperationsRequest, VerdictDto,
 };
 use crate::error::ApiError;
 
@@ -50,7 +50,9 @@ impl Modify for BearerSecurity {
     modifiers(&BearerSecurity),
     components(schemas(
         AccountDto,
+        AddBrokerAccessRequest,
         ApiError,
+        BrokerAccessDto,
         ComputedDto,
         ContourVersionDto,
         CreateAccountRequest,

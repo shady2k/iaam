@@ -11,6 +11,7 @@ use iaam_core::rules::LotRuleVersion;
 use iaam_ingest::SubmittedOperation;
 use time::Date;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::error::AppError;
 
@@ -134,6 +135,51 @@ pub trait Store: Send + Sync {
 /// отчёт «на сегодня» иначе невоспроизводим в тесте.
 pub trait Clock: Send + Sync {
     fn today(&self) -> Date;
+}
+
+/// Заведённый доступ в том виде, в каком его показывают владельцу.
+///
+/// Ни токена, ни шифротекста здесь нет и быть не может: то, чего порт
+/// не вернул, транспорт не может отдать наружу ни ответом, ни логом (§14).
+/// Момент заведения и момент отзыва — строки хранилища: часы одни на
+/// всю крейту хранилища, и пересобирать их тип на границе значило бы
+/// завести вторые часы.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerAccessView {
+    pub id: Uuid,
+    pub broker: String,
+    pub scope: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+/// Хранилище брокерских доступов.
+///
+/// Отдельный порт, а не метод `Store`: заведение доступа требует ключа
+/// шифрования, которого у хранилища фактов нет и быть не должно.
+///
+/// Токен принимается в `Zeroizing<String>`, а не в `String`: открытым
+/// он живёт ровно до шифрования и зануляется при уничтожении. Обычная
+/// строка оставила бы его в освобождённой памяти процесса.
+#[async_trait]
+pub trait BrokerVault: Send + Sync {
+    /// Завести доступ. Возвращает идентификатор записи — по нему доступ
+    /// отзывают. Сам токен не возвращается: то, чего вызывающий не
+    /// получил, он не может выдать наружу.
+    async fn add_access(
+        &self,
+        owner: OwnerId,
+        broker: String,
+        token: Zeroizing<String>,
+    ) -> Result<BrokerAccessView, AppError>;
+
+    /// Все доступы владельца, включая отозванные: «когда система
+    /// перестала ходить к брокеру» является вопросом, на который
+    /// нужен ответ.
+    async fn list_access(&self, owner: OwnerId) -> Result<Vec<BrokerAccessView>, AppError>;
+
+    /// Отозвать доступ. Не удаление: отозванный остаётся историей.
+    async fn revoke_access(&self, owner: OwnerId, id: Uuid) -> Result<(), AppError>;
 }
 
 /// Почему обращение к брокеру не удалось.

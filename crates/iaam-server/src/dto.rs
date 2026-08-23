@@ -8,8 +8,11 @@
 //! точкой: JSON-число `0.1` в двоичной плавающей точке не равно одной
 //! десятой, и денежная сумма, прошедшая через него, перестаёт быть фактом.
 
+use std::fmt;
+
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
+use iaam_app::ports::BrokerAccessView;
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::CurrencyCode;
@@ -754,6 +757,65 @@ pub struct CreateAccountRequest {
     pub institution: Option<String>,
 }
 
+/// Приём брокерского токена.
+///
+/// **`Debug` написан вручную.** Производный напечатал бы токен целиком,
+/// а `{:?}` над непонятым запросом — обычный способ разобраться, почему
+/// он не разобрался. Из лога токен уже не убрать (§14).
+///
+/// Области прав здесь нет намеренно: она задаётся системой, а не
+/// клиентом (§14). Лишние поля тела молча игнорируются, поэтому
+/// присланная клиентом «область» ни на что не влияет.
+#[derive(Deserialize, ToSchema)]
+pub struct AddBrokerAccessRequest {
+    /// Код брокера, например `tinkoff`.
+    pub broker: String,
+    /// Токен брокера. Секрет: принимается, но никогда не возвращается,
+    /// поэтому в схеме помечен как `password` и `writeOnly`.
+    #[schema(format = Password, write_only, example = "<секрет>")]
+    pub token: String,
+}
+
+impl fmt::Debug for AddBrokerAccessRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AddBrokerAccessRequest")
+            .field("broker", &self.broker)
+            .field("token", &"<скрыт>")
+            .finish()
+    }
+}
+
+/// Заведённый доступ к брокеру.
+///
+/// `Debug` производный: секрета в этом типе нет — ни токена, ни
+/// шифротекста сюда не попадает, потому что их нет и в порте.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BrokerAccessDto {
+    pub id: Uuid,
+    pub broker: String,
+    /// Область прав. Всегда `read_only`: торговые права не
+    /// запрашиваются ни при каких условиях (§14).
+    pub scope: String,
+    pub created_at: String,
+    /// Момент отзыва. `null` — доступ действует. Поле не опускается
+    /// при отсутствии значения: пропавшее поле неотличимо от «не знаем».
+    pub revoked_at: Option<String>,
+}
+
+impl BrokerAccessDto {
+    #[must_use]
+    pub fn from_domain(access: BrokerAccessView) -> Self {
+        Self {
+            id: access.id,
+            broker: access.broker,
+            scope: access.scope,
+            created_at: access.created_at,
+            revoked_at: access.revoked_at,
+        }
+    }
+}
+
 /// Новая версия состава контура.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateContourVersionRequest {
@@ -847,6 +909,28 @@ mod tests {
             "без ожидаемого значения отказ не объясняет, что чинить"
         );
         assert_eq!(rejected.actual.as_deref(), Some("-1"));
+    }
+
+    #[test]
+    fn the_debug_of_a_broker_request_never_carries_the_token() {
+        // `{:?}` над непонятым запросом — обычный способ разобраться,
+        // почему он не разобрался, и производный `Debug` отправил бы
+        // туда сам токен. Из лога его уже не убрать (§14).
+        const TOKEN: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
+        let request = AddBrokerAccessRequest {
+            broker: "tinkoff".into(),
+            token: TOKEN.into(),
+        };
+
+        let printed = format!("{request:?}");
+        assert!(
+            !printed.contains(TOKEN),
+            "токен утёк в отладочный вывод: {printed}"
+        );
+        assert!(
+            printed.contains("tinkoff"),
+            "код брокера секретом не является и обязан оставаться видимым: {printed}"
+        );
     }
 
     #[test]

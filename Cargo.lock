@@ -900,6 +900,7 @@ name = "iaam-app"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "iaam-broker",
  "iaam-core",
  "iaam-ingest",
  "iaam-store",
@@ -908,6 +909,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -916,6 +918,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "iaam-app",
+ "iaam-broker",
  "iaam-core",
  "iaam-server",
  "iaam-store",
@@ -925,6 +928,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -933,6 +937,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
+ "iaam-store",
  "reqwest",
  "serde",
  "serde_json",
@@ -993,6 +998,7 @@ dependencies = [
  "axum",
  "http-body-util",
  "iaam-app",
+ "iaam-broker",
  "iaam-core",
  "iaam-store",
  "insta",
@@ -1009,6 +1015,7 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

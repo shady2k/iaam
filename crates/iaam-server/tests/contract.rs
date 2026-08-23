@@ -15,7 +15,8 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
-use iaam_app::ports::Clock;
+use iaam_app::ports::{BrokerVault, Clock};
+use iaam_broker::credentials::Key;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
 use iaam_server::auth::hash_token;
 use iaam_server::rate_limit::RateLimiter;
@@ -119,8 +120,18 @@ fn harness_with(store: SqliteStore) -> Harness {
         )
         .expect("токен чтения");
 
+    // Ключ прямо из байтов, а не из файла: файл во временном каталоге
+    // пришлось бы удалять, и тест, упавший до удаления, оставлял бы
+    // за собой ключ. Постоянные байты здесь безопасны — база живёт
+    // ровно столько же, сколько тест.
+    let adapter = Arc::new(SqliteAdapter::with_broker_key(
+        store,
+        Some(Key::from_bytes([7; 32])),
+    ));
+    let broker: Arc<dyn BrokerVault> = adapter.clone();
     let services = Arc::new(AppServices::new(
-        Arc::new(SqliteAdapter::new(store)),
+        adapter,
+        broker,
         Arc::new(FixedClock(date!(2026 - 01 - 01))),
     ));
     let state = ServerState::new(
@@ -168,6 +179,15 @@ fn get(path: &str, token: Option<&str>) -> Request<Body> {
         builder = builder.header("Authorization", format!("Bearer {token}"));
     }
     builder.body(Body::empty()).expect("запрос")
+}
+
+fn delete(path: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .method("DELETE")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("запрос")
 }
 
 fn post(path: &str, token: &str, body: &Value) -> Request<Body> {
@@ -220,12 +240,19 @@ async fn every_documented_path_answers_something_other_than_404() {
                 .header("Content-Type", "application/json")
                 .body(Body::from("{}"))
                 .expect("запрос");
-            let (status, _) = call(&harness.router, request).await;
-            assert_ne!(
-                status,
-                StatusCode::NOT_FOUND,
-                "маршрут {path} {verb} описан в спеке, но не существует"
-            );
+            let (status, body) = call(&harness.router, request).await;
+            // `404` бывает двух разных родов, и заслон различает их по
+            // телу ответа. Отсутствующий **маршрут** отдаёт пустой `404`
+            // самого axum — это и есть расхождение со спекой, ради
+            // которого тест написан. Отсутствующий **ресурс** отдаёт наш
+            // `ApiError` с машиночитаемым кодом, и это законный ответ:
+            // идентификатор в запросе случайный, и записи с ним нет.
+            if status == StatusCode::NOT_FOUND {
+                assert!(
+                    body.get("code").and_then(Value::as_str).is_some(),
+                    "маршрут {path} {verb} описан в спеке, но не существует"
+                );
+            }
             assert_ne!(
                 status,
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -996,4 +1023,165 @@ async fn an_event_added_behind_the_snapshot_boundary_forces_a_recompute_not_a_fa
         after["history_starts"], "2025-01-01",
         "и сдвинуть начало истории"
     );
+}
+
+/// Токен брокера, который тесты отдают серверу. Значение подобрано
+/// так, чтобы его подстрока не встречалась в ответе случайно.
+const BROKER_TOKEN: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
+
+fn add_broker_access_body() -> Value {
+    json!({ "broker": "tinkoff", "token": BROKER_TOKEN })
+}
+
+#[tokio::test]
+async fn a_provisioned_broker_access_never_echoes_the_token_back() {
+    // Токен, вернувшийся в ответе, попадёт в лог клиента, в историю
+    // отладочного запроса и в снимок экрана. То, чего сервер не отдал,
+    // туда попасть не может (§14).
+    let harness = harness();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &add_broker_access_body(),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["broker"], "tinkoff");
+    assert!(
+        !body.to_string().contains(BROKER_TOKEN),
+        "токен не возвращается наружу ни одним полем: {body}"
+    );
+    assert!(
+        body["revoked_at"].is_null(),
+        "заведённый доступ действует: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_scope_of_a_broker_access_is_read_only_whatever_the_client_sends() {
+    // Область прав задаёт система, а не клиент: торговые права
+    // не запрашиваются ни при каких условиях (§14). Присланное клиентом
+    // поле игнорируется молча — принять его означало бы завести доступ,
+    // которым можно торговать.
+    let harness = harness();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &json!({
+                "broker": "tinkoff",
+                "token": BROKER_TOKEN,
+                "scope": "full_access",
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["scope"], "read_only",
+        "область прав задаёт система, а не клиент: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() {
+    // Отзыв — это не удаление: запись остаётся историей, но перестаёт
+    // быть действующей. Пропавшая из списка запись отвечала бы «доступа
+    // не было», а не «доступ отозван тогда-то».
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &add_broker_access_body(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("идентификатор").to_owned();
+
+    let (status, list) = call(
+        &harness.router,
+        get("/v1/broker-access", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = find_access(&list, &id).expect("заведённый доступ обязан быть в списке");
+    assert!(
+        listed["revoked_at"].is_null(),
+        "только что заведённый доступ действует: {listed}"
+    );
+
+    let (status, body) = call(
+        &harness.router,
+        delete(&format!("/v1/broker-access/{id}"), &harness.owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, list) = call(
+        &harness.router,
+        get("/v1/broker-access", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = find_access(&list, &id).expect("отозванный доступ остаётся историей");
+    assert!(
+        !listed["revoked_at"].is_null(),
+        "отозванный доступ перестаёт быть действующим: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_only_token_may_not_touch_broker_access_at_all() {
+    // Заведение чужого токена, чтение списка и отзыв — управление
+    // доступом, а не чтение портфеля. Токен чтения не управляет ничем.
+    let harness = harness();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.readonly_token,
+            &add_broker_access_body(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden");
+
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/broker-access", Some(&harness.readonly_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/broker-access/{}", Uuid::new_v4()),
+            &harness.readonly_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// Запись списка по идентификатору.
+fn find_access(list: &Value, id: &str) -> Option<Value> {
+    list.as_array()?
+        .iter()
+        .find(|access| access["id"] == id)
+        .cloned()
 }

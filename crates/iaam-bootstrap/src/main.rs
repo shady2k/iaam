@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
-use iaam_app::ports::SystemClock;
+use iaam_app::ports::{BrokerVault, SystemClock};
 use iaam_broker::credentials::Key;
 use iaam_core::ids::OwnerId;
 use iaam_server::auth::hash_token;
@@ -67,10 +67,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let services = Arc::new(AppServices::new(
-        Arc::new(SqliteAdapter::new(store)),
-        Arc::new(SystemClock),
-    ));
+    // Ключ шифрования брокерских доступов необязателен: без него сервер
+    // поднимается, а маршруты брокера отвечают 503. Заданный, но
+    // нечитаемый ключ — другое дело: это опечатка в настройке, и молчаливый
+    // старт скрыл бы её до первого заведения доступа.
+    let broker_key = config.broker_key.as_deref().map(Key::from_file).transpose()?;
+
+    // Один и тот же адаптер и как хранилище фактов, и как хранилище
+    // брокерских доступов: за обоими одно соединение с базой, и второй
+    // экземпляр означал бы второго писателя.
+    let adapter = Arc::new(SqliteAdapter::with_broker_key(store, broker_key));
+    let broker: Arc<dyn BrokerVault> = adapter.clone();
+    let services = Arc::new(AppServices::new(adapter, broker, Arc::new(SystemClock)));
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let (router, _api) = build(ServerState::new(services, limiter));
 

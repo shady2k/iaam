@@ -8,33 +8,64 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use iaam_broker::credentials::{BrokerScope, Key, seal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::ids::{AccountId, OwnerId};
 use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
 use iaam_store::SqliteStore;
+use iaam_store::broker_access::NewBrokerAccess;
+use iaam_store::documents::BrokerCode;
 use iaam_store::events::Appended;
 use iaam_store::reference::AccountRecord;
 use iaam_store::tokens::TokenScope;
 use time::Date;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::error::AppError;
-use crate::ports::{AccountView, Principal, Recorded, Scope, Store};
+use crate::ports::{
+    AccountView, BrokerAccessView, BrokerVault, Principal, Recorded, Scope, Store,
+};
 
 /// Соединение под мьютексом: `rusqlite::Connection` не `Sync`, а писатель
 /// у однопользовательской базы один. Пул появится тогда, когда появится
 /// второй писатель, а не раньше.
 pub struct SqliteAdapter {
     store: Arc<Mutex<SqliteStore>>,
+    /// Ключ шифрования брокерских доступов. Живёт вне базы и потому
+    /// приходит извне, а не из неё. `None` — ключ не задан настройкой,
+    /// и тогда брокерские доступы не заводятся и не читаются: заводить
+    /// их «пока без шифрования» означало бы положить чужой токен
+    /// открытым и обнаружить это по утечке базы (§14).
+    broker_key: Option<Key>,
 }
 
 impl SqliteAdapter {
     #[must_use]
     pub fn new(store: SqliteStore) -> Self {
+        Self::with_broker_key(store, None)
+    }
+
+    /// Тот же адаптер с ключом шифрования брокерских доступов.
+    #[must_use]
+    pub fn with_broker_key(store: SqliteStore, key: Option<Key>) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
+            broker_key: key,
         }
+    }
+
+    /// Ключ или отказ.
+    ///
+    /// Отказ отдельным вариантом, а не `Store`: отсутствие ключа —
+    /// это незаконченная настройка сервера, а не сбой хранилища, и
+    /// повтор запроса её не исправит.
+    fn key(&self) -> Result<&Key, AppError> {
+        self.broker_key.as_ref().ok_or(AppError::NotConfigured {
+            what: "шифрование доступа к брокеру",
+        })
     }
 
     /// Выполнение блокирующей операции.
@@ -212,6 +243,114 @@ impl Store for SqliteAdapter {
             store
                 .record_token_use(&token_hash, &route, &outcome)
                 .map_err(store_error)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl BrokerVault for SqliteAdapter {
+    async fn add_access(
+        &self,
+        owner: OwnerId,
+        broker: String,
+        token: Zeroizing<String>,
+    ) -> Result<BrokerAccessView, AppError> {
+        let key = self.key()?;
+        let code = BrokerCode::parse(&broker).ok_or_else(|| AppError::Invalid {
+            field: "broker".to_owned(),
+            expected: "непустой код брокера".to_owned(),
+            actual: broker.clone(),
+        })?;
+        // Обрамляющие пробелы не часть токена: заголовок с лишним
+        // пробелом брокер отвергнет, а причину назовёт невнятно.
+        let token = Zeroizing::new(token.trim().to_owned());
+        if token.is_empty() {
+            return Err(AppError::Invalid {
+                field: "token".to_owned(),
+                expected: "непустой токен".to_owned(),
+                // Значение не называется даже здесь: текст ошибки —
+                // это то, что точно попадёт в лог (§14).
+                actual: "пустая строка".to_owned(),
+            });
+        }
+
+        // Шифрование до ухода в блокирующую задачу: открытым токен
+        // не пересекает границу потоков и не копируется в замыкание.
+        let sealed = seal(key, &token);
+        let access = NewBrokerAccess {
+            id: Uuid::new_v4(),
+            owner,
+            broker: code,
+            // Область прав задаётся здесь, а не приходит снаружи:
+            // торговые права не запрашиваются ни при каких условиях (§14).
+            scope: BrokerScope::ReadOnly.code().to_owned(),
+            nonce: sealed.nonce().to_vec(),
+            ciphertext: sealed.ciphertext().to_vec(),
+        };
+        // Запись и чтение обратно — одной блокирующей задачей. Момент
+        // заведения ставит хранилище, и собрать представление здесь
+        // значило бы показать владельцу выдуманное время; а вторым
+        // вызовом читать нельзя — между ними доступ успевают отозвать.
+        let owner_of_access = access.owner;
+        let broker_of_access = access.broker.clone();
+        self.blocking(move |store| {
+            store.insert_broker_access(&access).map_err(store_error)?;
+            let stored = store
+                .find_broker_access(owner_of_access, &broker_of_access)
+                .map_err(store_error)?
+                .ok_or(AppError::Store(
+                    "доступ заведён, но не прочитан обратно".to_owned(),
+                ))?;
+            Ok(BrokerAccessView {
+                id: stored.id,
+                broker: stored.broker.as_str().to_owned(),
+                scope: stored.scope,
+                created_at: stored.created_at,
+                revoked_at: stored.revoked_at,
+            })
+        })
+        .await
+    }
+
+    async fn list_access(&self, owner: OwnerId) -> Result<Vec<BrokerAccessView>, AppError> {
+        // Ключ требуется и на чтении списка: без него показанный доступ
+        // обещал бы то, чем воспользоваться нельзя, и разбираться с этим
+        // пришлось бы по пустому ответу брокера, а не по настройке.
+        self.key()?;
+        self.blocking(move |store| {
+            let history = store.broker_access_history(owner).map_err(store_error)?;
+            Ok(history
+                .into_iter()
+                .map(|access| BrokerAccessView {
+                    id: access.id,
+                    broker: access.broker.as_str().to_owned(),
+                    scope: access.scope,
+                    created_at: access.created_at,
+                    revoked_at: access.revoked_at,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    async fn revoke_access(&self, owner: OwnerId, id: Uuid) -> Result<(), AppError> {
+        self.key()?;
+        self.blocking(move |store| {
+            store.revoke_broker_access(owner, id).map_err(|error| {
+                // Отсутствующий доступ — ошибка запроса, а не сбой
+                // хранилища: повтор её не исправит, и `500` отправил бы
+                // владельца искать поломку там, где её нет. Чужой доступ
+                // даёт тот же ответ намеренно — иначе он сообщал бы
+                // постороннему, что такая запись существует (§14).
+                match error {
+                    iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
+                        what: "доступ к брокеру",
+                        id: id.to_string(),
+                    },
+                    other => store_error(other),
+                }
+            })
         })
         .await
     }

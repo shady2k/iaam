@@ -18,18 +18,29 @@ pub mod scenarios;
 
 use std::sync::Arc;
 
-use ports::{Clock, Store};
+use ports::{BrokerVault, Clock, Store};
 
 /// Собранные зависимости. Точка сборки создаёт один экземпляр,
 /// обработчики получают `Arc<AppServices>` (§3.2).
 pub struct AppServices {
     pub store: Arc<dyn Store>,
+    /// Хранилище брокерских доступов. Отдельным полем, а не частью
+    /// `store`: за ним стоит ключ шифрования, и его может не быть.
+    pub broker: Arc<dyn BrokerVault>,
     pub clock: Arc<dyn Clock>,
 }
 
 impl AppServices {
     #[must_use]
-    pub fn new(store: Arc<dyn Store>, clock: Arc<dyn Clock>) -> Self {
-        Self { store, clock }
+    pub fn new(
+        store: Arc<dyn Store>,
+        broker: Arc<dyn BrokerVault>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            store,
+            broker,
+            clock,
+        }
     }
 }

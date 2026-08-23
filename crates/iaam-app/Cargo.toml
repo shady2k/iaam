@@ -9,6 +9,9 @@ rust-version.workspace = true
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
 iaam-store = { path = "../iaam-store", version = "0.1.0" }
 iaam-ingest = { path = "../iaam-ingest", version = "0.1.0" }
+# Шифрование брокерского доступа: адаптер хранилища держит шифротекст
+# непрозрачными байтами, а ключ и сам шифр живут здесь.
+iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
 # Один и только один механизм асинхронных трейтов (§3.2). Выбран async-trait:
 # порты обязаны быть объектобезопасными (`Arc<dyn Store>`), а RPITIT
 # объектобезопасности не даёт. Смешение механизмов запрещено заслоном.
@@ -18,6 +21,8 @@ time = { version = "0.3", default-features = false, features = ["std", "macros"]
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
+# Брокерский токен живёт открытым ровно до шифрования и зануляется.
+zeroize = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }

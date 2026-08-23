@@ -38,6 +38,12 @@ pub enum AppError {
     Reconciliation(#[source] ObserveError),
     #[error("периметр не оценён: {0}")]
     Perimeter(#[source] PerimeterError),
+    /// Возможность не включена настройкой, а не сломана: шифрование
+    /// доступа к брокеру без ключа. Отдельно от `Store`, потому что
+    /// внешнему агенту это разные поводы: одно чинится настройкой
+    /// сервера, другое — повтором запроса.
+    #[error("{what} не настроено")]
+    NotConfigured { what: &'static str },
 }
 
 impl From<ObserveError> for AppError {
@@ -78,6 +84,7 @@ impl AppError {
             Self::Projection(_) => "projection_failed",
             Self::Reconciliation(_) => "reconciliation_failed",
             Self::Perimeter(_) => "perimeter_assessment_failed",
+            Self::NotConfigured { .. } => "not_configured",
         }
     }
 }
@@ -123,6 +130,13 @@ mod tests {
         assert_eq!(
             AppError::Projection(ProjectionError::SnapshotFingerprintMismatch).code(),
             "projection_failed"
+        );
+        assert_eq!(
+            AppError::NotConfigured {
+                what: "шифрование доступа к брокеру",
+            }
+            .code(),
+            "not_configured"
         );
     }
 }

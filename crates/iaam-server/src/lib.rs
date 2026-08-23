@@ -45,6 +45,11 @@ impl ServerState {
 pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
     let protected = OpenApiRouter::new()
         .routes(routes!(routes::list_accounts, routes::create_account))
+        .routes(routes!(
+            routes::list_broker_access,
+            routes::add_broker_access
+        ))
+        .routes(routes!(routes::revoke_broker_access))
         .routes(routes!(routes::create_contour_version))
         .routes(routes!(routes::ingest_operations))
         .routes(routes!(routes::ingest_csv))

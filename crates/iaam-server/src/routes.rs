@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
@@ -26,11 +26,13 @@ use serde::Deserialize;
 use time::Date;
 use utoipa::IntoParams;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::ServerState;
 use crate::dto::{
-    AccountDto, ContourVersionDto, CreateAccountRequest, CreateContourVersionRequest, CurrencyDto,
-    FxRateDto, HealthDto, ReturnsReportDto, SubmitOperationsRequest, VerdictDto,
+    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, ContourVersionDto, CreateAccountRequest,
+    CreateContourVersionRequest, CurrencyDto, FxRateDto, HealthDto, ReturnsReportDto,
+    SubmitOperationsRequest, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 
@@ -107,6 +109,98 @@ pub async fn create_account(
             institution: account.institution,
         }),
     ))
+}
+
+/// Заведение брокерского доступа.
+///
+/// Токен приходит от владельца и наружу не возвращается: в ответе —
+/// только идентификатор записи, по которому доступ отзывают (§14).
+#[utoipa::path(
+    post,
+    path = "/v1/broker-access",
+    request_body = AddBrokerAccessRequest,
+    responses(
+        (status = 201, description = "Доступ заведён", body = BrokerAccessDto),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 422, description = "Код брокера или токен пусты", body = ApiError),
+        (status = 503, description = "Шифрование доступа не настроено", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn add_broker_access(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<AddBrokerAccessRequest>,
+) -> Result<(StatusCode, Json<BrokerAccessDto>), ApiFailure> {
+    require_admin(&principal)?;
+    // Токен заворачивается в зануляемую память сразу при разборе тела
+    // и дальше не копируется: открытым он живёт до шифрования в адаптере
+    // и зануляется при уничтожении.
+    let token = Zeroizing::new(request.token);
+    let created = state
+        .services
+        .broker
+        .add_access(principal.owner, request.broker, token)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(BrokerAccessDto::from_domain(created)),
+    ))
+}
+
+/// Список брокерских доступов.
+///
+/// Отозванные тоже показываются: «когда система перестала ходить
+/// к брокеру» является вопросом, на который нужен ответ. Действующий
+/// от отозванного отличается полем `revoked_at`.
+#[utoipa::path(
+    get,
+    path = "/v1/broker-access",
+    responses(
+        (status = 200, description = "Доступы владельца", body = Vec<BrokerAccessDto>),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 503, description = "Шифрование доступа не настроено", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_broker_access(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<BrokerAccessDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let access = state.services.broker.list_access(principal.owner).await?;
+    Ok(Json(
+        access
+            .into_iter()
+            .map(BrokerAccessDto::from_domain)
+            .collect(),
+    ))
+}
+
+/// Отзыв брокерского доступа.
+#[utoipa::path(
+    delete,
+    path = "/v1/broker-access/{id}",
+    params(("id" = Uuid, Path, description = "Идентификатор заведённого доступа")),
+    responses(
+        (status = 204, description = "Доступ отозван"),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 503, description = "Шифрование доступа не настроено", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn revoke_broker_access(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiFailure> {
+    require_admin(&principal)?;
+    state
+        .services
+        .broker
+        .revoke_access(principal.owner, id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Новая версия состава контура.

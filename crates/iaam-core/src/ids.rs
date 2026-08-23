@@ -56,6 +56,15 @@ typed_id!(
     /// без него классификатор контура не знает второй счёт (§4.10).
     TransferId
 );
+typed_id!(
+    /// Правило классификации владельца (§10.4).
+    ///
+    /// Не путать с [`crate::rules::lot_disposal::RuleId`]: тот называет
+    /// версию правила списания лотов (`fifo/214.1/v1`), одну на всю
+    /// программу, а этот — решение конкретного владельца о конкретной
+    /// операции, которое он заводит, правит и выводит из обращения.
+    ClassificationRuleId
+);
 
 #[cfg(test)]
 mod tests {
@@ -71,6 +80,7 @@ mod tests {
         assert_eq!(SourceId(raw).inner(), raw);
         assert_eq!(EventId(raw).inner(), raw);
         assert_eq!(TransferId(raw).inner(), raw);
+        assert_eq!(ClassificationRuleId(raw).inner(), raw);
     }
 
     #[test]

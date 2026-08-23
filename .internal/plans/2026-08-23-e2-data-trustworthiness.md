@@ -5251,13 +5251,18 @@ git commit -m "feat(store): сырьё документов и строк для
 
 ## Задача 11: `iaam-store` — правила классификации
 
+> Развёрнута до полной глубины 2026-08-23, после задачи 10: типы
+> хранилища уже существуют и не угадываются.
+
 **Files:**
 - Create: `crates/iaam-store/src/rules.rs`
+- Modify: `crates/iaam-store/migrations/0002_sources_and_rules.sql` — колонка `replaces`
+- Modify: `crates/iaam-core/src/ids.rs` — `ClassificationRuleId`
 - Modify: `crates/iaam-store/src/lib.rs`
 - Test: `crates/iaam-store/tests/rules.rs`
 
 **Interfaces:**
-- Produces: `StoredRule { id, owner, version, matcher, outcome, created_at, retired_at }`; `insert_rule`, `list_active_rules(owner)`, `retire_rule(owner, id, at)`, `rule_history(owner)`.
+- Produces: `StoredRule { id, owner, version, matcher, outcome, created_at, retired_at, replaces }`; `insert_rule(owner, matcher, outcome)`, `amend_rule(owner, previous, matcher, outcome)`, `retire_rule(owner, id)`, `list_active_rules(owner)`, `rule_history(owner)`.
 
 **Acceptance Criteria:**
 - Правило не удаляется, а выводится из обращения датой: история решений остаётся видимой
@@ -5265,23 +5270,75 @@ git commit -m "feat(store): сырьё документов и строк для
 - Активные правила выбираются одним запросом в порядке версии
 - Владелец входит в каждый запрос
 
-- [ ] **Шаг 1: Тест**
+**Решения развёртывания.** Четыре, и каждое меняет контур:
 
-`crates/iaam-store/tests/rules.rs`: правило заводится, читается активным;
-после `retire_rule` не попадает в активные, но остаётся в истории;
-вторая версия того же правила не затирает первую; чужие правила
-не видны.
+1. **`ClassificationRuleId` заводится в `iaam-core::ids`, а не
+   в хранилище.** Правило классификации — понятие §10.4, и задача 13
+   всё равно им пользуется; идентичность, изобретённая хранилищем,
+   к задаче 13 существовала бы в двух экземплярах. Имя полное, потому
+   что `RuleId` в ядре уже занят версией правила списания лотов
+   (`fifo/214.1/v1`) — это другое понятие, и короткое имя сделало бы
+   их неразличимыми на месте использования.
+2. **`version` — сквозной номер решения владельца, а не номер внутри
+   линии правила.** Колонка `id` объявлена первичным ключом, двух строк
+   с одним `id` быть не может; версия нумерует решения владельца по
+   порядку, и пересчёт истории по ней узнаёт, каким решением он вызван.
+3. **Правка — это `amend_rule`, а не `insert_rule` рядом.** Старая
+   строка выводится из обращения и новая заводится **одной
+   транзакцией**: между ними нет момента, когда действуют оба правила
+   или не действует ни одного. Новая строка ссылается на прежнюю
+   колонкой `replaces` — без неё вывод из обращения и заведение
+   остаются двумя несвязанными строками, и «как это правило дошло до
+   нынешнего вида» ответа не имеет. Миграция 0002 ещё не выпущена,
+   колонка добавляется в неё же.
+4. **`retire_rule(owner, id)` без параметра момента** — момент ставит
+   хранилище, как `revoke_token`. Присланный клиентом момент вывода из
+   обращения — это момент, которому нечем верить, а часы в крейте одни.
 
-- [ ] **Шаг 2: Реализация**
+Повторный вывод из обращения уже выведенного правила — отказ, а не
+тихое обновление даты: дата вывода не переписывается задним числом.
 
-По образцу `reference.rs`. `matcher` и `outcome` — JSON-строки
-доменных типов задачи 13: хранилище не знает их устройства, оно хранит.
+- [ ] **Шаг 1: `ClassificationRuleId` в ядре**
 
-- [ ] **Шаг 3: Коммит**
+В `crates/iaam-core/src/ids.rs` добавьте `typed_id!(ClassificationRuleId)` и строку
+в тест `ids_keep_the_uuid_they_wrap` — тест первым.
+
+- [ ] **Шаг 2: Колонка `replaces` в миграции 0002**
+
+```sql
+    replaces   TEXT REFERENCES classification_rules (id),
+```
+
+- [ ] **Шаг 3: Тесты**
+
+`crates/iaam-store/tests/rules.rs`, по одному поведению на тест:
+
+| Тест | Что доказывает |
+|---|---|
+| `a_new_rule_is_active_from_the_moment_it_is_stored` | заведение и чтение активных |
+| `a_retired_rule_leaves_the_active_set_but_stays_in_history` | вывод из обращения не удаляет |
+| `an_amendment_adds_a_version_and_retires_the_one_it_replaces` | правка не затирает прежнюю, `replaces` указывает на неё |
+| `a_rule_is_retired_once_and_the_date_is_not_rewritten` | повторный вывод — отказ |
+| `versions_are_numbered_within_the_owner` | номер решения не течёт между владельцами |
+| `another_owners_rules_are_neither_active_nor_in_our_history` | владелец в каждом запросе |
+| `another_owners_rule_is_neither_amended_nor_retired` | чужое правило не правится и не выводится |
+| `a_matcher_or_outcome_that_is_not_json_is_refused` | нечитаемое правило не доходит до задачи 13 |
+
+- [ ] **Шаг 4: Реализация `rules.rs`**
+
+По образцу `documents.rs`: параметризованные запросы, владелец в каждом,
+номер версии назначается в той же немедленной транзакции, что и вставка
+(раздельно — та же гонка, что в `append_event_in_order`). `matcher`
+и `outcome` — JSON-строки доменных типов задачи 13: хранилище не знает
+их устройства, оно хранит; но разбираемость как JSON проверяет при
+записи, иначе правило, которое задача 13 не сможет прочитать, ляжет
+в базу молча.
+
+- [ ] **Шаг 5: Коммит**
 
 ```bash
 nix develop -c cargo test -p iaam-store 2>&1 | tail -10
-git add crates/iaam-store
+git add crates/iaam-store crates/iaam-core
 git commit -m "feat(store): правила классификации с историей версий (iaam-023)"
 ```
 

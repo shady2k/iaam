@@ -76,7 +76,17 @@ CREATE TABLE classification_rules (
     matcher    TEXT NOT NULL,
     outcome    TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    retired_at TEXT
+    retired_at TEXT,
+    -- Правка правила — новая строка, ссылающаяся на прежнюю. Без этой
+    -- колонки вывод из обращения и заведение остаются двумя
+    -- несвязанными строками, и «как правило дошло до нынешнего вида»
+    -- ответа не имеет.
+    replaces   TEXT REFERENCES classification_rules (id)
 ) STRICT;
+
+-- Номер решения уникален внутри владельца: без этого два одновременных
+-- запроса получают один номер, и порядок правил перестаёт быть порядком.
+CREATE UNIQUE INDEX classification_rules_by_version
+    ON classification_rules (owner, version);
 
 CREATE INDEX classification_rules_by_owner ON classification_rules (owner, retired_at);

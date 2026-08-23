@@ -9,6 +9,7 @@ pub mod bundle;
 pub mod documents;
 pub mod events;
 pub mod reference;
+pub mod rules;
 pub mod schema;
 pub mod snapshots;
 pub mod tokens;
@@ -62,6 +63,12 @@ pub enum StoreError {
     DocumentDecode { id: String, detail: String },
     #[error("номер строки {row} не помещается в хранилище")]
     RowNumberOutOfRange { row: u64 },
+    #[error("поле {field} правила классификации не является JSON: {source}")]
+    RuleNotJson {
+        field: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// Подключение к базе.

@@ -15,6 +15,12 @@ pub enum ConfigError {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database: PathBuf,
+    /// Файл с ключом шифрования брокерских доступов.
+    ///
+    /// Необязателен: нужен только командам, работающим с доступом
+    /// к брокеру. Умолчания у него нет и быть не может — ключ
+    /// «в известном месте» известен всем.
+    pub broker_key: Option<PathBuf>,
     pub listen: SocketAddr,
     pub rate_limit: u32,
     pub rate_window: Duration,
@@ -41,6 +47,9 @@ impl Config {
 
         Ok(Self {
             database: PathBuf::from(database),
+            broker_key: std::env::var("IAAM_BROKER_KEY_FILE")
+                .ok()
+                .map(PathBuf::from),
             listen,
             rate_limit,
             rate_window,

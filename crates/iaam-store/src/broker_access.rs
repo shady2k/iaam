@@ -53,7 +53,47 @@ impl BrokerAccess {
     }
 }
 
+/// Кого считать владельцем, когда его не назвали явно.
+///
+/// Идентификатор владельца нигде не печатается — при выпуске токена
+/// наружу уходит только сам токен, — и человеку взять его неоткуда.
+/// Поэтому единственного владельца система умеет узнать сама, а
+/// выбирать между несколькими отказывается: завести брокерский доступ
+/// не тому владельцу означает обнаружить это по чужим сделкам
+/// в портфеле.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoleOwner {
+    /// Токен ещё не выпускался.
+    None,
+    Single(OwnerId),
+    /// Владельцев несколько: выбирать за человека нельзя.
+    Several,
+}
+
 impl SqliteStore {
+    /// Владелец, если он в системе один.
+    pub fn sole_token_owner(&self) -> Result<SoleOwner, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT DISTINCT owner FROM api_tokens LIMIT 2")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut owners = Vec::new();
+        for row in rows {
+            let raw = row?;
+            owners.push(OwnerId(Uuid::parse_str(&raw).map_err(|_| {
+                StoreError::NotFound {
+                    what: "владелец",
+                    id: raw,
+                }
+            })?));
+        }
+        Ok(match owners.as_slice() {
+            [] => SoleOwner::None,
+            [single] => SoleOwner::Single(*single),
+            _ => SoleOwner::Several,
+        })
+    }
+
     /// Заведение доступа.
     ///
     /// Второй действующий доступ к тому же брокеру отбивается

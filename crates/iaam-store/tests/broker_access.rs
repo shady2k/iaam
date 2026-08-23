@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, seal};
 use iaam_core::ids::OwnerId;
 use iaam_store::SqliteStore;
-use iaam_store::broker_access::{BrokerAccess, NewBrokerAccess};
+use iaam_store::broker_access::{BrokerAccess, NewBrokerAccess, SoleOwner};
 use iaam_store::documents::BrokerCode;
 use uuid::Uuid;
 
@@ -201,4 +201,50 @@ fn a_revoked_access_makes_room_for_a_new_one() {
 
     let found: BrokerAccess = store.find_broker_access(owner, &broker).unwrap().unwrap();
     assert_eq!(found.id, second.id);
+}
+
+// --- кого считать владельцем, когда его не назвали ---
+
+#[test]
+fn without_a_single_token_there_is_no_owner_to_assume() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    assert_eq!(store.sole_token_owner().unwrap(), SoleOwner::None);
+}
+
+#[test]
+fn one_owner_is_assumed_when_only_one_exists() {
+    // Владелец не печатается при выпуске токена, и знать свой
+    // идентификатор ему неоткуда: единственного нужно уметь узнать.
+    let store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    issue(&store, owner, "ноутбук");
+    issue(&store, owner, "телефон");
+
+    assert_eq!(store.sole_token_owner().unwrap(), SoleOwner::Single(owner));
+}
+
+#[test]
+fn several_owners_are_never_guessed_between() {
+    // Выбрать владельца за человека значит завести брокерский доступ
+    // не тому — и обнаружить это по чужим сделкам в портфеле.
+    let store = SqliteStore::open_in_memory().unwrap();
+    issue(&store, OwnerId::new_random(), "первый");
+    issue(&store, OwnerId::new_random(), "второй");
+
+    assert_eq!(store.sole_token_owner().unwrap(), SoleOwner::Several);
+}
+
+fn issue(store: &SqliteStore, owner: OwnerId, label: &str) {
+    store
+        .insert_token(
+            &iaam_store::tokens::TokenRecord {
+                id: Uuid::new_v4(),
+                owner,
+                label: label.to_owned(),
+                scope: iaam_store::tokens::TokenScope::Owner,
+                revoked: false,
+            },
+            &format!("хеш-{label}-{}", owner.inner()),
+        )
+        .unwrap();
 }

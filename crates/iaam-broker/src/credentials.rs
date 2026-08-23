@@ -10,10 +10,14 @@
 
 use std::env;
 use std::fmt;
+use std::fs;
+use std::io;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chacha20poly1305::aead::{Aead, Generate, KeyInit};
+use chacha20poly1305::aead::{Aead, Generate, Key as AeadKey, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -35,6 +39,14 @@ pub enum CryptoError {
     NotAuthentic,
     #[error("расшифрованный доступ не является текстом")]
     NotText,
+    #[error("файл ключа {path} не читается: {detail}")]
+    KeyFileUnreadable { path: String, detail: String },
+    #[error(
+        "файл ключа {path} уже существует: перезапись сделала бы нечитаемыми все заведённые доступы"
+    )]
+    KeyFileExists { path: String },
+    #[error("файл ключа {path} не записан: {detail}")]
+    KeyFileNotWritten { path: String, detail: String },
 }
 
 /// Ключ шифрования доступа. Живёт вне базы.
@@ -72,6 +84,71 @@ impl Key {
                     found: decoded.len(),
                 })?;
         Ok(Self::from_bytes(bytes))
+    }
+
+    /// Ключ из файла.
+    ///
+    /// Основной способ в бою: переменная окружения видна
+    /// в `/proc/<pid>/environ` тому же пользователю и наследуется
+    /// каждым дочерним процессом, а файл — нет.
+    pub fn from_file(path: &Path) -> Result<Self, CryptoError> {
+        let encoded = Zeroizing::new(fs::read_to_string(path).map_err(|error| {
+            CryptoError::KeyFileUnreadable {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }
+        })?);
+        Self::from_base64(&encoded)
+    }
+
+    /// Заведение нового случайного ключа в файле.
+    ///
+    /// Возвращает `()`, а не ключ: то, чего вызывающий не получил, он
+    /// не может ни напечатать, ни записать в лог. Ключ существует
+    /// только в файле, доступном одному владельцу процесса.
+    ///
+    /// Существующий файл **не перезаписывается**: новый ключ на месте
+    /// старого делает нечитаемыми все ранее заведённые доступы — молча
+    /// и необратимо.
+    pub fn create_at(path: &Path) -> Result<(), CryptoError> {
+        // Ключ берётся у криптографического источника библиотеки шифра,
+        // а не у общего генератора: ключ — это доступ к чужим деньгам,
+        // и слабый источник здесь дороже всего остального в этом файле.
+        let generated = AeadKey::<ChaCha20Poly1305>::generate();
+        let mut material = Zeroizing::new([0_u8; KEY_BYTES]);
+        material.copy_from_slice(&generated);
+        let encoded = Zeroizing::new(STANDARD.encode(&material[..]));
+        // Режим задаётся при создании, а не после: файл, на мгновение
+        // доступный всем, доступен всем.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::AlreadyExists => CryptoError::KeyFileExists {
+                    path: path.display().to_string(),
+                },
+                _ => CryptoError::KeyFileNotWritten {
+                    path: path.display().to_string(),
+                    detail: error.to_string(),
+                },
+            })?;
+        io::Write::write_all(&mut file, encoded.as_bytes()).map_err(|error| {
+            CryptoError::KeyFileNotWritten {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+        // Умаска могла срезать биты доступа при создании: режим
+        // подтверждается явно, а не предполагается.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            CryptoError::KeyFileNotWritten {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(())
     }
 
     /// Ключ из переменной окружения.

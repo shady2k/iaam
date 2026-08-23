@@ -4,12 +4,14 @@
 //! Заслон архитектуры проверяет, что это остаётся правдой.
 
 mod config;
+mod provision;
 
 use std::sync::Arc;
 
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::SystemClock;
+use iaam_broker::credentials::Key;
 use iaam_core::ids::OwnerId;
 use iaam_server::auth::hash_token;
 use iaam_server::rate_limit::RateLimiter;
@@ -18,6 +20,7 @@ use iaam_store::SqliteStore;
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use rand::TryRng;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::config::Config;
 
@@ -34,13 +37,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::from_env()?;
-    let store = SqliteStore::open(&config.database)?;
+    let mut store = SqliteStore::open(&config.database)?;
 
     // Разовая выдача токена владельца: без него в систему не войти,
     // а откладывать аутентификацию нельзя (§14).
     if let Ok(label) = std::env::var("IAAM_ISSUE_OWNER_TOKEN") {
         let token = issue_owner_token(&store, &label)?;
         println!("{token}");
+        return Ok(());
+    }
+
+    // Заведение ключа шифрования брокерских доступов. Ключ создаёт сама
+    // программа и наружу не отдаёт: то, чего человек не увидел, он не
+    // может ни переслать, ни записать не туда (§14).
+    if std::env::var("IAAM_GENERATE_BROKER_KEY").is_ok() {
+        let path = broker_key_path(&config)?;
+        Key::create_at(&path)?;
+        println!("ключ заведён: {}", path.display());
+        return Ok(());
+    }
+
+    // Приём брокерского токена. Токен читается со стандартного ввода,
+    // а не из аргумента командной строки: список процессов виден всей
+    // машине, а история командной оболочки переживает сессию.
+    if let Ok(broker) = std::env::var("IAAM_ADD_BROKER_ACCESS") {
+        let key = Key::from_file(&broker_key_path(&config)?)?;
+        let id = provision::add_broker_access(&mut store, &key, &broker, &read_token()?)?;
+        println!("доступ к брокеру {broker} заведён: {id}");
         return Ok(());
     }
 
@@ -57,6 +80,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown())
         .await?;
     Ok(())
+}
+
+/// Путь к файлу ключа. Отсутствие переменной — отказ, а не умолчание.
+fn broker_key_path(config: &Config) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    config
+        .broker_key
+        .clone()
+        .ok_or_else(|| "переменная IAAM_BROKER_KEY_FILE не задана".into())
+}
+
+/// Чтение токена со стандартного ввода.
+///
+/// Возвращается в зануляемой памяти: открытый токен живёт ровно до
+/// шифрования и не остаётся в освобождённой памяти процесса.
+fn read_token() -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    // Подсказка идёт в поток ошибок: стандартный вывод занят ответом
+    // команды, и подмешивать в него приглашение нельзя.
+    eprintln!("вставьте токен брокера и завершите ввод (Ctrl-D):");
+    let mut token = Zeroizing::new(String::new());
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut token)?;
+    Ok(token)
 }
 
 /// Выдача токена владельца. Сам токен печатается **один раз** и нигде

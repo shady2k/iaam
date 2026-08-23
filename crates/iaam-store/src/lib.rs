@@ -6,6 +6,7 @@
 //! останавливает исполнитель (§3.2).
 
 pub mod bundle;
+pub mod documents;
 pub mod events;
 pub mod reference;
 pub mod schema;
@@ -57,6 +58,10 @@ pub enum StoreError {
     NotFound { what: &'static str, id: String },
     #[error("архивный бандл повреждён: {detail}")]
     BundleCorrupted { detail: String },
+    #[error("сохранённый документ {id} не читается: {detail}")]
+    DocumentDecode { id: String, detail: String },
+    #[error("номер строки {row} не помещается в хранилище")]
+    RowNumberOutOfRange { row: u64 },
 }
 
 /// Подключение к базе.

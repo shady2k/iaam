@@ -5165,9 +5165,19 @@ CREATE TABLE raw_rows (
     row      INTEGER NOT NULL,
     payload  TEXT NOT NULL,
     status   TEXT NOT NULL,
-    PRIMARY KEY (document, sheet, row),
     FOREIGN KEY (document) REFERENCES source_documents (id)
 ) STRICT;
+
+-- Локатор уникален, но первичным ключом быть не может: в STRICT-таблице
+-- колонки первичного ключа неявно NOT NULL, а у CSV листа нет, и
+-- `PRIMARY KEY (document, sheet, row)` запретил бы хранить его строки
+-- вовсе. Пустой строкой лист не подменяется: неизвестное — NULL (§4.9).
+--
+-- `ifnull` в индексе обязателен: в обычном уникальном индексе SQLite
+-- считает NULL несовпадающими, и один и тот же кусок сырья без листа
+-- лёг бы в базу дважды.
+CREATE UNIQUE INDEX raw_rows_by_locator
+    ON raw_rows (document, ifnull(sheet, ''), row);
 
 -- Сырьё неизменяемо наравне с журналом: «поправить строку в исходнике»
 -- означает переписать факт задним числом. Разбор повторяется, сырьё —

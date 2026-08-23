@@ -5587,14 +5587,17 @@ git commit -m "feat(ingest): правила классификации и пер
 
 ## Задача 14: Реестр парсеров отчётов и контрольные секции
 
+> Развёрнута до полной глубины 2026-08-23, после задач 10–13.
+
 **Files:**
-- Create: `crates/iaam-ingest/src/report/mod.rs`, `crates/iaam-ingest/src/report/sections.rs`
+- Create: `crates/iaam-ingest/src/report/mod.rs`, `crates/iaam-ingest/src/report/workbook.rs`, `crates/iaam-ingest/src/report/sections.rs`
+- Create: `scripts/gen-report-fixtures.py`, `crates/iaam-ingest/tests/fixtures/minimal_workbook.xlsx`
 - Modify: `crates/iaam-ingest/Cargo.toml` — `calamine`
 - Modify: `crates/iaam-ingest/src/lib.rs`
 - Test: `crates/iaam-ingest/tests/report_registry.rs`
 
 **Interfaces:**
-- Produces: `Broker { Tinkoff, Finam }`; `ReportFormat { Xlsx, Xls }`; `trait ReportParser { fn broker(&self) -> Broker; fn format(&self) -> ReportFormat; fn version(&self) -> ParserVersion; fn recognises(&self, workbook: &Workbook) -> bool; fn parse(&self, workbook: &Workbook, directory: &Directory) -> ParsedReport; }`; `ParsedReport { period: Option<AssertionPeriod>, rows: Vec<LocatedRow>, sections: Vec<ControlClaim>, unsupported: Vec<Quarantined> }`; `LocatedRow { locator: RowLocator, outcome: ParsedRow }`; `Quarantined { locator, reason: UnsupportedReason }`; `UnsupportedReason { Repo, Margin, Derivative, Short }`; `ParserRegistry::builtin()`, `ParserRegistry::detect(&[u8]) -> Result<&dyn ReportParser, DetectError>`.
+- Produces: `Broker`; `ReportFormat`; `Cell`; `Sheet`; `Workbook`; `WorkbookError`; `trait ReportParser`; `ParsedReport`; `LocatedRow`; `Quarantined`; `UnsupportedReason`; `ParserRegistry::{builtin, of, detect}`; `DetectError`; `ControlSections` и её `claims()`.
 
 **Acceptance Criteria:**
 - Парсер выбирается **по содержимому**, а не по имени файла: имя ничего не гарантирует
@@ -5604,33 +5607,61 @@ git commit -m "feat(ingest): правила классификации и пер
 - Версия парсера — часть его контракта и попадает в provenance каждой строки
 - Ни одна функция разбора отчёта не переиспользуется каналом API — заслон в задаче 21
 
-- [ ] **Шаг 1: Тест реестра**
+### Решения развёртывания
 
-`crates/iaam-ingest/tests/report_registry.rs`: файл Т-Инвестиций
-опознаётся как таковой при любом имени; файл Финама — как Финам;
-неизвестная книга даёт `DetectError::Unrecognised`, а не выбор
-случайного парсера; переименование файла ничего не меняет.
+1. **`Workbook` — собственный тип, а не тип `calamine`.** Парсеры
+   и тесты не зависят от API библиотеки, а книгу можно собрать
+   в памяти без файла: опознание проверяется без двоичных фикстур.
+   Замена библиотеки чтения не трогает ни один парсер.
+2. **`detect` принимает открытую книгу, а не байты.** Вызывающему книга
+   нужна и для разбора; открывать её дважды значит разбирать один файл
+   двумя разными представлениями.
+3. **Опознали двое — ошибка `Ambiguous`, а не первый выигравший.** Два
+   парсера на один файл означают, что признак опознания слишком слаб;
+   молча взять любой значит записать факты чужим разбором.
+4. **`ParserRegistry::builtin()` пока пуст** — парсеры приходят задачами
+   15 и 16. Заслон на это стоит тестом: пустой реестр никого не
+   опознаёт и возвращает `Unrecognised`, а не выбирает наугад.
+5. **Числовая ячейка XLSX — двоичная плавающая точка, и это граница
+   ввода-вывода.** Перевод в `Dec` идёт через кратчайшее обратимое
+   строковое представление; доменные величины `f64` не видят. Число,
+   которого десятичный тип не представляет, остаётся текстом — не нулём
+   и не потерянной ячейкой (§4.9).
+6. **Дата в XLSX — число со стилем даты**, эпоха 30 декабря 1899 года.
+   Без стиля ячейка неотличима от обычного числа, поэтому фикстура
+   содержит `styles.xml`: иначе путь чтения дат остался бы
+   непроверенным.
+7. **Ячейка с ошибкой вычисления — отдельный вид ячейки**, а не текст:
+   `#Н/Д`, попавшее в текстовую ячейку, парсер принял бы за подпись.
+8. **Настоящий отчёт брокера фикстурой быть не может** — он содержит
+   персональные данные владельца. Фикстура собирается скриптом
+   `gen-report-fixtures.py`: двоичный файл неизвестного происхождения
+   ничем не отличается от случайных байтов.
 
-- [ ] **Шаг 2: Написать контракт и реестр**
+- [ ] **Шаг 1: Фикстура и тесты**
 
-`report/mod.rs` описывает трейт, реестр и типы результата. Тело
-`detect` пробует каждый парсер по `recognises`, который смотрит на
-имена листов и опорные ячейки заголовка. Первый опознавший выигрывает;
-если опознали двое — это ошибка `DetectError::Ambiguous`, а не выбор
-первого: два парсера на один файл означают, что признак опознания
-слишком слабый, и молча взять любой значит записать факты чужим
-разбором.
+| Тест | Что доказывает |
+|---|---|
+| `a_workbook_is_recognised_by_what_is_inside_it` | опознание по содержимому |
+| `an_unrecognised_workbook_is_an_error_not_a_guess` | `Unrecognised`, а не случайный парсер |
+| `two_parsers_claiming_one_workbook_is_an_error` | `Ambiguous` |
+| `the_builtin_registry_recognises_nothing_until_parsers_arrive` | пустой реестр честен |
+| `a_real_xlsx_opens_into_sheets_and_cells` | обвязка `calamine` работает |
+| `a_date_cell_arrives_as_a_date_and_not_as_a_number` | стиль даты прочитан |
+| `an_unreadable_stream_is_a_typed_error` | не паника |
+| `a_quarantined_row_does_not_cancel_the_document` | §11 |
+| `an_unparsed_row_does_not_cancel_the_document` | §10.1 |
+| `an_absent_control_section_never_becomes_a_zero` | §4.9 |
+| `present_control_sections_become_claims_of_the_right_dimension` | §10.3 |
+| `each_parser_carries_its_own_version` | версия — часть контракта |
 
-`report/sections.rs` переводит контрольные секции в `ControlClaim`:
-остатки на начало и конец, обороты, количества, суммы комиссий,
-купонов и дивидендов, удержанный налог. Секция, которой в документе
-нет, не превращается в утверждение с нулём — её просто нет (§4.9).
+- [ ] **Шаг 2: Реализация** — `report/workbook.rs` (чтение и типы ячеек), `report/mod.rs` (контракт, реестр, результат), `report/sections.rs` (контрольные секции в `ControlClaim`).
 
 - [ ] **Шаг 3: Коммит**
 
 ```bash
 nix develop -c cargo test -p iaam-ingest 2>&1 | tail -15
-git add crates/iaam-ingest
+git add crates/iaam-ingest scripts
 git commit -m "feat(ingest): реестр парсеров отчётов и контрольные секции (iaam-023)"
 ```
 

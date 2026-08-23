@@ -14,6 +14,7 @@ pub mod classification;
 pub mod csv_source;
 pub mod dedup;
 pub mod operation;
+pub mod report;
 pub mod verdict;
 
 pub use operation::{Normalized, OperationDates, OperationKind, SubmittedOperation, normalize};

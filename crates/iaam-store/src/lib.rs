@@ -5,6 +5,7 @@
 //! `rusqlite` блокирует поток, и вызов его прямо из обработчика axum
 //! останавливает исполнитель (§3.2).
 
+pub mod broker_access;
 pub mod bundle;
 pub mod documents;
 pub mod events;

@@ -5,7 +5,10 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::ids::{AccountId, OwnerId};
 use iaam_core::projection::Snapshot;
+use iaam_core::reconciliation::claim::ControlClaim;
+use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
+use iaam_ingest::SubmittedOperation;
 use time::Date;
 use uuid::Uuid;
 
@@ -131,6 +134,63 @@ pub trait Store: Send + Sync {
 /// отчёт «на сегодня» иначе невоспроизводим в тесте.
 pub trait Clock: Send + Sync {
     fn today(&self) -> Date;
+}
+
+/// Почему обращение к брокеру не удалось.
+///
+/// Тип принадлежит порту, а не адаптеру: иначе сценарий узнал бы про
+/// HTTP и про конкретного брокера через возвращаемое значение.
+///
+/// Ни один вариант не несёт токена: сообщение об ошибке — это то, что
+/// точно попадёт в лог (§14).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BrokerError {
+    #[error("доступ к брокеру {broker} не заведён")]
+    NoAccess { broker: String },
+    #[error("доступ к брокеру {broker} заведён с правами, отличными от чтения")]
+    ScopeNotReadOnly { broker: String },
+    #[error("брокер {broker} отказал: {detail}")]
+    Refused { broker: String, detail: String },
+    #[error("брокер {broker} недоступен: {detail}")]
+    Unreachable { broker: String, detail: String },
+    #[error("ответ брокера {broker} не разобран: {detail}")]
+    Unparsable { broker: String, detail: String },
+}
+
+/// Канал брокера: второй способ получить те же данные.
+///
+/// Существует ради независимости (§10.3): совпадение разобранного
+/// отчёта с ответом API — основание 3, и только оно даёт
+/// `accepted_independent` на реальных данных. Поэтому **реализация
+/// этого порта не делит код разбора с парсерами отчётов**: общая
+/// функция нормализации исказила бы обе стороны одной ошибкой, и
+/// сверка её не заметила бы.
+///
+/// У брокера запрашивается только доступ на чтение. Метода, что-либо
+/// отправляющего брокеру, здесь нет и не появится (§14).
+#[async_trait]
+pub trait BrokerChannel: Send + Sync {
+    /// Операции счёта за интервал.
+    async fn fetch_operations(
+        &self,
+        account: AccountId,
+        from: Date,
+        to: Date,
+    ) -> Result<Vec<SubmittedOperation>, BrokerError>;
+
+    /// Контрольные величины на дату: остатки и количества.
+    ///
+    /// Возвращает утверждения источника, а не расчёт: с ними потом
+    /// сходится посчитанное по журналу.
+    async fn fetch_portfolio(
+        &self,
+        account: AccountId,
+        at: Date,
+    ) -> Result<Vec<ControlClaim>, BrokerError>;
+
+    /// Чем именно получены данные. Версия разбора и отсутствие
+    /// документа — то, из чего выводится независимость канала.
+    fn channel(&self) -> SourceChannel;
 }
 
 /// Системные часы.

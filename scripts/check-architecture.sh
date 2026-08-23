@@ -70,9 +70,25 @@ fi
 bad=$(meta \
   | jq -r '.packages[] | select(.name=="iaam-store") | .dependencies[]
            | select(.kind == null) | .name' \
-  | { grep -E '^iaam-(app|server|bootstrap|ingest|market)$' || true; })
+  | { grep -E '^iaam-(app|server|bootstrap|ingest|market|broker)$' || true; })
 if [ -n "$bad" ]; then
   err "iaam-store зависит от вышележащих слоёв: $bad (§3.2)"
+fi
+
+# --- 2b. Крейта доступа к брокеру знает ядро и никого больше ---
+# iaam-broker — адаптер внешнего канала: шифрование доступа и клиенты
+# брокерских API. Порт BrokerChannel живёт в iaam-app, потому что
+# объектобезопасные асинхронные трейты существуют только там; знать про
+# приложение, транспорт или соседний адаптер этой крейте незачем.
+# Отдельная строка про iaam-store: хранилище держит шифротекст
+# непрозрачными байтами, и обратная зависимость означала бы, что
+# адаптер хранилища взялся расшифровывать доступ.
+bad=$(meta \
+  | jq -r '.packages[] | select(.name=="iaam-broker") | .dependencies[]
+           | select(.kind == null) | .name' \
+  | { grep -E '^iaam-(app|server|bootstrap|store|ingest|market)$' || true; })
+if [ -n "$bad" ]; then
+  err "iaam-broker зависит от вышележащих слоёв или соседних адаптеров: $bad (§3.2)"
 fi
 
 # --- 3. Никаких shared/common/utils крейт ---

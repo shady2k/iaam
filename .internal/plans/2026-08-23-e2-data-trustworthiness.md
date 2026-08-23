@@ -5735,55 +5735,92 @@ git commit -m "feat(ingest): парсер брокерского отчёта Ф
 
 ## Задача 17: `iaam-broker` — порт, доступ к брокеру и шифрование токена
 
+> Развёрнута до полной глубины 2026-08-23. Ветка «отчёты» (15, 16)
+> остановлена: без образца настоящей выгрузки парсер выдумывается
+> и разваливается на первом же реальном файле.
+
 **Files:**
 - Create: `crates/iaam-broker/{Cargo.toml,src/lib.rs,src/credentials.rs}`
 - Create: `crates/iaam-store/migrations/0003_broker_access.sql`, `crates/iaam-store/src/broker_access.rs`
 - Modify: `crates/iaam-app/src/ports.rs` — порт `BrokerChannel`
-- Modify: `Cargo.toml`, `scripts/check-architecture.sh`, `deny.toml` при необходимости
-- Test: `crates/iaam-broker/tests/credentials.rs`
+- Modify: `Cargo.toml`, `scripts/check-architecture.sh`
+- Test: `crates/iaam-broker/tests/credentials.rs`, `crates/iaam-store/tests/broker_access.rs`
 
 **Interfaces:**
-- Produces: `trait BrokerChannel: Send + Sync { async fn fetch_operations(&self, account, from, to) -> Result<Vec<SubmittedOperation>, BrokerError>; async fn fetch_portfolio(&self, account, at) -> Result<Vec<ControlClaim>, BrokerError>; fn channel(&self) -> SourceChannel; }`; `SealedToken { ciphertext, nonce }`; `seal(&Key, &str) -> SealedToken`, `open(&Key, &SealedToken) -> Result<Zeroizing<String>, CryptoError>`; `Key::from_env(&str) -> Result<Key, CryptoError>`.
+- Produces: `Key::{from_env, from_base64}`; `SealedToken`; `BrokerToken`; `seal`; `open`; `CryptoError`; `BrokerScope`; `BrokerAccessRecord`; `insert_broker_access`, `find_broker_access`, `revoke_broker_access`; `trait BrokerChannel` и `BrokerError` в `iaam-app/src/ports.rs`.
 
 **Acceptance Criteria:**
-- Токен хранится **только** шифротекстом; ключ берётся вне базы (переменная окружения или файл, путь — из конфигурации)
-- Утечка файла БД не даёт токена: тест открывает базу и убеждается, что подстроки токена в ней нет
-- Токен не попадает ни в `Debug`, ни в лог, ни в ответ API: `Debug` для `SealedToken` и для расшифрованного значения печатает заглушку — отдельный тест
-- Расшифрованный токен живёт в `Zeroizing` и не копируется в `String` без нужды
+- Токен хранится **только** шифротекстом; ключ берётся вне базы
+- Утечка файла БД не даёт токена: тест ищет подстроку токена в байтах файла
+- Токен не попадает ни в `Debug`, ни в лог, ни в ответ API
+- Расшифрованный токен живёт в зануляемой памяти
 - У брокера запрашивается только доступ на чтение; область прав записывается рядом с доступом и проверяется перед вызовом
-- Новая крейта внесена в `scripts/check-architecture.sh`: `iaam-broker` знает ядро, но не приложение и не транспорт
+- Новая крейта внесена в `scripts/check-architecture.sh`
 
-- [ ] **Шаг 1: Тест на то, что токена нет в базе**
+### Решения развёртывания
 
-```rust
-#[test]
-fn a_leaked_database_file_does_not_leak_the_token() {
-    // §14 буквально: утечка файла БД не должна давать доступ к
-    // брокерскому счёту. Проверяется не «мы вызвали шифрование»,
-    // а отсутствие подстроки в байтах файла — единственная форма
-    // этой проверки, которую нельзя пройти случайно.
-}
+1. **`BrokerToken` — обёртка над `Zeroizing<String>` с заглушкой
+   в `Debug`.** `Zeroizing` зануляет память, но его собственный `Debug`
+   печатает содержимое: секрет утёк бы в лог через первый же `{:?}`.
+   Возвращать голый `Zeroizing<String>`, как значилось в наброске,
+   поэтому нельзя.
+2. **Порт `BrokerChannel` живёт в `iaam-app/src/ports.rs`, и его ошибка
+   тоже.** `async_trait` существует только в приложении (заслон 10),
+   а тип принадлежит порту, а не адаптеру — по образцу `Recorded`.
+   `iaam-broker` не знает ни приложения, ни хранилища; связывает их
+   адаптер в `iaam-app/src/adapters`, как это уже сделано для SQLite.
+3. **Хранилище держит шифротекст и nonce непрозрачными байтами.**
+   `iaam-store` не зависит от `iaam-broker`: адаптер, знающий
+   криптографию соседнего адаптера, превращает слои в клубок. Область
+   прав хранится строкой и толкуется в `iaam-broker` — по образцу
+   `matcher`/`outcome` задачи 11.
+4. **Область прав проверяется разбором, а не доверием.**
+   `BrokerScope::parse` принимает единственное значение — «только
+   чтение». Строка «полный доступ», оказавшаяся в базе, не
+   расшифровывается в доступ, а даёт отказ: торговые права не
+   запрашиваются ни при каких условиях (§14).
+5. **Доступ к брокеру не входит в архивный бандл.** Переносимый архив
+   с живым доступом к брокерскому счёту — это способ вынести доступ
+   из системы вместе с архивом. Заслон — тест, ищущий шифротекст
+   в сериализованном бандле.
+6. **Один действующий доступ на пару владелец+брокер.** Второй
+   действующий доступ означает, что неизвестно, каким из них система
+   ходит к брокеру.
 
-#[test]
-fn debug_never_prints_the_secret() {
-    // Секрет утекает в лог через Debug чаще, чем через ответ API.
-}
-```
+- [ ] **Шаг 1: Тесты**
 
-- [ ] **Шаг 2: Реализация**
+`crates/iaam-broker/tests/credentials.rs`:
 
-Шифрование — `chacha20poly1305` (чистый Rust, без C-зависимостей),
-случайный nonce на запись, ключ 32 байта из окружения в base64.
-Ключ **не** хранится в базе и не попадает в бандл (`bundle.rs`):
-архив с ключом внутри не является архивом.
+| Тест | Что доказывает |
+|---|---|
+| `a_sealed_token_opens_back_into_the_same_secret` | шифрование обратимо |
+| `the_same_token_sealed_twice_looks_different` | nonce случаен |
+| `opening_with_a_wrong_key_fails` | ключ обязателен |
+| `a_tampered_ciphertext_is_refused` | подделка ловится AEAD |
+| `debug_never_prints_the_secret` | секрет не утекает в лог |
+| `an_error_message_never_carries_the_secret` | и в текст ошибки тоже |
+| `a_key_must_be_thirty_two_bytes` | короткий ключ — отказ |
+| `a_missing_key_variable_is_an_error_not_a_default_key` | умолчания нет |
+| `only_read_only_access_is_accepted` | §14 |
 
-- [ ] **Шаг 3: Коммит**
+`crates/iaam-store/tests/broker_access.rs`:
+
+| Тест | Что доказывает |
+|---|---|
+| `a_leaked_database_file_does_not_leak_the_token` | §14 буквально |
+| `an_archive_bundle_carries_no_broker_access` | архив не выносит доступ |
+| `broker_access_of_another_owner_is_not_found` | владелец в каждом запросе |
+| `a_revoked_access_is_not_found_but_stays_in_history` | отзыв не удаляет |
+| `a_second_active_access_for_one_broker_is_refused` | один действующий |
+
+- [ ] **Шаг 2: Реализация** — `chacha20poly1305`, случайный nonce на запись, ключ 32 байта из окружения в base64.
+
+- [ ] **Шаг 3: Заслон и коммит**
 
 ```bash
 nix develop -c cargo test -p iaam-broker -p iaam-store 2>&1 | tail -15
-nix develop -c ./scripts/check-architecture.sh
-nix develop -c cargo deny check
-git add crates/iaam-broker crates/iaam-store Cargo.toml scripts/check-architecture.sh
+nix develop -c bash scripts/check-architecture.sh
+nix develop -c cargo deny check licenses bans
 git commit -m "feat(broker): порт канала брокера и шифрование доступа (iaam-023)"
 ```
 

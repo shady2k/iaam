@@ -21,5 +21,11 @@ thiserror = "2"
 time = { version = "0.3", default-features = false, features = ["std", "macros", "parsing", "formatting"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
+[dev-dependencies]
+# Только для тестов: хранилище держит шифротекст непрозрачным и о
+# криптографии соседнего адаптера ничего не знает. Тесту же нужно
+# зашифровать настоящий токен, чтобы искать его в байтах файла базы.
+iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
+
 [lints]
 workspace = true

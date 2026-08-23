@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{AccountId, InstrumentId, TransferId};
 use crate::money::{CurrencyCode, Money, Quantity};
 use crate::numeric::decimal::Dec;
+use crate::reconciliation::claim::{AssertionPeriod, ControlClaim};
 use crate::valuation::PriceQuality;
 
 /// Направление сделки.
@@ -80,6 +81,16 @@ pub enum EventKind {
         currency: CurrencyCode,
         quality: PriceQuality,
     },
+    /// Контрольное утверждение источника о полноте интервала (§10.3).
+    ///
+    /// Факт с provenance, а не расчёт: контрольная секция отчёта — это
+    /// то, что источник о себе сказал. Сверка сравнивает её с тем, что
+    /// насчитала проекция, и из совпадения рождается основание повышения
+    /// статуса. Денег не двигает: ног у события нет.
+    ControlAssertion {
+        period: AssertionPeriod,
+        claim: ControlClaim,
+    },
 }
 
 /// Происхождение комиссии. Нужно уже на этапе 1, потому что проценты
@@ -111,6 +122,7 @@ impl EventKind {
             Self::OpeningPosition { .. } => "opening_position",
             Self::OpeningCash { .. } => "opening_cash",
             Self::Valuation { .. } => "valuation",
+            Self::ControlAssertion { .. } => "control_assertion",
         }
     }
 
@@ -134,7 +146,8 @@ impl EventKind {
             | Self::Fee { .. }
             | Self::OpeningPosition { .. }
             | Self::OpeningCash { .. }
-            | Self::Valuation { .. } => FlowEndpoints::WithinAccount,
+            | Self::Valuation { .. }
+            | Self::ControlAssertion { .. } => FlowEndpoints::WithinAccount,
         }
     }
 }

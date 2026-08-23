@@ -114,13 +114,15 @@ pub struct Event {
 
 /// Текущая версия схемы события.
 ///
-/// Версия 2 отличается от версии 1 добавленным вариантом
-/// [`EventKind::Valuation`]. Уже записанные факты версии 1 читаются
-/// без изменений — новый вариант в них просто не встречается, — но
-/// программа, знающая только версию 1, не разберёт новое событие.
-/// Оставить прежний номер значило бы, что одна версия обозначает две
-/// несовместимые схемы (§4.1).
-pub const SCHEMA_VERSION: u32 = 2;
+/// Версия 2 отличалась от версии 1 добавленным вариантом
+/// [`EventKind::Valuation`]; версия 3 отличается от версии 2
+/// добавленным вариантом [`EventKind::ControlAssertion`]. Уже
+/// записанные факты прежних версий читаются без изменений — новый
+/// вариант в них просто не встречается, — но программа, знающая только
+/// версию 2, не разберёт контрольное утверждение и потому не должна
+/// притворяться, что разобрала. Оставить прежний номер значило бы, что
+/// одна версия обозначает две несовместимые схемы (§4.1).
+pub const SCHEMA_VERSION: u32 = 3;
 
 impl Event {
     /// Сумма денежного эффекта всех ног в указанной валюте.
@@ -193,6 +195,9 @@ impl Event {
                 ..
             } => self.validate_opening_position(name, *instrument, *quantity),
             EventKind::Valuation { price, .. } => self.validate_valuation(name, *price),
+            EventKind::ControlAssertion { period, claim } => {
+                self.validate_control_assertion(name, *period, *claim)
+            }
         }
     }
 
@@ -395,6 +400,57 @@ impl Event {
                 kind: name,
                 field: "price",
                 value: price.inner().to_string(),
+            });
+        }
+        if self.legs.is_empty() {
+            Ok(())
+        } else {
+            Err(EventValidationError::LegCount {
+                kind: name,
+                expected: "ни одной ноги",
+                found: self.legs.len(),
+            })
+        }
+    }
+
+    /// Контрольное утверждение: ног нет, интервал корректен, величины,
+    /// которые обязаны быть модулями, — неотрицательны.
+    ///
+    /// Отрицательный денежный остаток пропускается намеренно: это
+    /// законное состояние (§11). Отрицательное количество бумаг — нет:
+    /// шорты вне периметра, и минус здесь означает либо шорт, либо
+    /// перепутанный знак при разборе.
+    fn validate_control_assertion(
+        &self,
+        name: &'static str,
+        period: crate::reconciliation::claim::AssertionPeriod,
+        claim: crate::reconciliation::claim::ControlClaim,
+    ) -> Result<(), EventValidationError> {
+        use crate::reconciliation::claim::ControlClaim;
+
+        if !period.is_well_formed() {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "period",
+                value: format!("{} .. {}", period.from, period.to),
+            });
+        }
+        if let ControlClaim::PositionQuantity { quantity, .. } = claim
+            && quantity.0.is_negative()
+        {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "quantity",
+                value: quantity.0.inner().to_string(),
+            });
+        }
+        if let Some((field, value)) = claim.non_negative_field()
+            && value < 0
+        {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field,
+                value: value.to_string(),
             });
         }
         if self.legs.is_empty() {
@@ -1691,7 +1747,14 @@ mod tests {
             acc,
         );
         assert_eq!(ev.schema_version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 2);
+        // Литерал закреплён намеренно: подъём версии схемы обязан быть
+        // осознанным решением, а не побочным следствием правки. Каждое
+        // изменение этой строки требует ответа на вопрос, читаются ли
+        // уже записанные факты прежних версий (§4.1).
+        //
+        // 1 → 2: добавлен `EventKind::Valuation`.
+        // 2 → 3: добавлен `EventKind::ControlAssertion` (§10.3).
+        assert_eq!(SCHEMA_VERSION, 3);
     }
 
     #[test]
@@ -2016,5 +2079,156 @@ mod tests {
             Relation::Reversal { target }
         );
         assert_ne!(Relation::Replacement { target }, Relation::None);
+    }
+
+    #[test]
+    fn a_control_assertion_carries_no_legs() {
+        // Утверждение о полноте интервала не двигает денег. Нога у него
+        // означала бы, что контрольная секция отчёта попала в остаток
+        // вторым экземпляром и удвоила его.
+        use crate::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+
+        let account = AccountId::new_random();
+        let period =
+            AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31)).unwrap();
+        let claim = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(1_000_000),
+            at: BalancePoint::Closing,
+        };
+        let kind = EventKind::ControlAssertion { period, claim };
+
+        let clean =
+            test_support::event_with(account, date!(2026 - 03 - 31), 1, kind.clone(), vec![]);
+        assert!(clean.validate_structure().is_ok());
+
+        let with_leg = test_support::event_with(
+            account,
+            date!(2026 - 03 - 31),
+            2,
+            kind,
+            vec![Leg::cash(account, rub(1_000_000))],
+        );
+        assert!(matches!(
+            with_leg.validate_structure(),
+            Err(EventValidationError::LegCount { .. })
+        ));
+    }
+
+    #[test]
+    fn a_control_assertion_with_an_inverted_period_is_rejected() {
+        // Конструктор такой интервал не создаёт, но событие приходит
+        // и из JSON, где конструктор не вызывался. Валидация формы —
+        // второй рубеж, и он обязан ловить состояние, а не полагаться
+        // на то, что первый рубеж отработал.
+        use crate::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+
+        assert!(AssertionPeriod::between(date!(2026 - 03 - 31), date!(2026 - 03 - 01)).is_none());
+
+        let inverted = AssertionPeriod {
+            from: date!(2026 - 03 - 31),
+            to: date!(2026 - 03 - 01),
+        };
+        let kind = EventKind::ControlAssertion {
+            period: inverted,
+            claim: ControlClaim::CashBalance {
+                currency: CurrencyCode::Rub,
+                amount: PostedMinor::new(1),
+                at: BalancePoint::Opening,
+            },
+        };
+        let event = test_support::event_with(
+            AccountId::new_random(),
+            date!(2026 - 03 - 01),
+            1,
+            kind,
+            vec![],
+        );
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::NonPositive {
+                field: "period",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn negative_totals_are_rejected_but_a_negative_cash_balance_is_not() {
+        // Отрицательный остаток — законное состояние (§11): технический
+        // овердрафт и тайминги расчётов. Отрицательная сумма комиссий
+        // законным состоянием не является: это ошибка разбора знака,
+        // и принять её значит внести её в журнал навсегда.
+        use crate::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+
+        let account = AccountId::new_random();
+        let period =
+            AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31)).unwrap();
+
+        let overdraft = EventKind::ControlAssertion {
+            period,
+            claim: ControlClaim::CashBalance {
+                currency: CurrencyCode::Rub,
+                amount: PostedMinor::new(-5_000),
+                at: BalancePoint::Closing,
+            },
+        };
+        assert!(
+            test_support::event_with(account, date!(2026 - 03 - 31), 1, overdraft, vec![])
+                .validate_structure()
+                .is_ok()
+        );
+
+        let negative_fees = EventKind::ControlAssertion {
+            period,
+            claim: ControlClaim::FeesTotal {
+                currency: CurrencyCode::Rub,
+                amount: PostedMinor::new(-100),
+            },
+        };
+        assert!(matches!(
+            test_support::event_with(account, date!(2026 - 03 - 31), 2, negative_fees, vec![])
+                .validate_structure(),
+            Err(EventValidationError::NonPositive {
+                field: "amount",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_negative_position_quantity_is_outside_the_perimeter() {
+        // Шорты вне периметра (§11). Отрицательное количество в контрольной
+        // секции означает либо шорт, либо перепутанный знак — принимать
+        // нельзя ни то, ни другое.
+        use crate::numeric::decimal::Dec;
+        use crate::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+        use rust_decimal::Decimal;
+
+        let period =
+            AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31)).unwrap();
+        let kind = EventKind::ControlAssertion {
+            period,
+            claim: ControlClaim::PositionQuantity {
+                instrument: InstrumentId::new_random(),
+                custody: CustodyId::new_random(),
+                quantity: Quantity(Dec::new(Decimal::from(-10))),
+                at: BalancePoint::Closing,
+            },
+        };
+        assert!(matches!(
+            test_support::event_with(
+                AccountId::new_random(),
+                date!(2026 - 03 - 31),
+                1,
+                kind,
+                vec![]
+            )
+            .validate_structure(),
+            Err(EventValidationError::NonPositive {
+                field: "quantity",
+                ..
+            })
+        ));
     }
 }

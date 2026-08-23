@@ -238,7 +238,8 @@ impl LotBook {
             | EventKind::Income { .. }
             | EventKind::Fee { .. }
             | EventKind::OpeningCash { .. }
-            | EventKind::Valuation { .. } => Ok(()),
+            | EventKind::Valuation { .. }
+            | EventKind::ControlAssertion { .. } => Ok(()),
         }
     }
 

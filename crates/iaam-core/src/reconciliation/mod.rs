@@ -8,6 +8,7 @@
 
 pub mod check;
 pub mod claim;
+pub mod evidence;
 pub mod observed;
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,32 @@ impl Dimension {
     #[must_use]
     pub const fn all() -> [Self; 4] {
         [Self::Cash, Self::Positions, Self::TaxBasis, Self::Income]
+    }
+}
+
+/// Уровень достоверности утверждения (§10.3).
+///
+/// Порядок значим: сравнение используется для повышения статуса.
+/// Уровней три, а не два, потому что операции и контрольные остатки
+/// извлекаются одним парсером из одного документа: общая ошибка разбора
+/// исказит обе стороны проверки одинаково, и сверка её не заметит.
+/// Средний уровень существует ровно для этого случая и называет вещи
+/// своими именами — «сошлось внутри одного источника».
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ConfidenceLevel {
+    Provisional,
+    AcceptedInternal,
+    AcceptedIndependent,
+}
+
+impl ConfidenceLevel {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Provisional => "provisional",
+            Self::AcceptedInternal => "accepted_internal",
+            Self::AcceptedIndependent => "accepted_independent",
+        }
     }
 }
 

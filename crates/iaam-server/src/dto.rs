@@ -409,6 +409,13 @@ pub struct VerdictDto {
     pub actual: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Счёт, о котором идёт речь. Заполняется у вердиктов сверки:
+    /// расхождение без счёта — это задание «поищите где-нибудь».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<Uuid>,
+    /// Измерение, по которому не сошлось или нечего сверять (§10.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<String>,
 }
 
 impl VerdictDto {
@@ -422,10 +429,33 @@ impl VerdictDto {
             expected: None,
             actual: None,
             detail: None,
+            account_id: None,
+            dimension: None,
         };
         match verdict {
+            Verdict::Accepted { event } => Self {
+                event_id: Some(event.inner()),
+                ..base
+            },
             Verdict::Provisional { event } => Self {
                 event_id: Some(event.inner()),
+                ..base
+            },
+            Verdict::Discrepancy {
+                event,
+                account,
+                dimension,
+                detail,
+            } => Self {
+                event_id: Some(event.inner()),
+                account_id: Some(account.inner()),
+                dimension: Some(dimension.code().to_owned()),
+                detail: Some(detail.clone()),
+                ..base
+            },
+            Verdict::NeedsReconciliation { account, dimension } => Self {
+                account_id: Some(account.inner()),
+                dimension: Some(dimension.code().to_owned()),
                 ..base
             },
             Verdict::Duplicate { existing } => Self {

@@ -13,7 +13,19 @@ multiple-versions = "warn"
 wildcards = "deny"
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+# CDLA-Permissive-2.0 — лицензия крейты `webpki-root-certs`: это не код,
+# а список корневых сертификатов Mozilla. Приходит транзитивно из
+# `reqwest`, чья фича `rustls` тянет `rustls-platform-verifier` жёстко;
+# отвязаться можно только через приватные фичи вида `__rustls`, а
+# опираться на приватные фичи чужой крейты — это сборка, ломающаяся на
+# её следующем выпуске.
+#
+# Клиент брокера этот список **не читает**: он собран через
+# `tls_certs_only`, который отключает встроенные корни и оставляет
+# единственный якорь — корень Минцифры (см. iaam-broker/certs). Лицензия
+# разрешена поимённо, а не классом: разрешать «все permissive» значило бы
+# перестать замечать, что именно приходит в зависимости.
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0"]
 
 [sources]
 unknown-registry = "deny"

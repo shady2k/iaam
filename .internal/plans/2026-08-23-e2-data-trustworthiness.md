@@ -5503,49 +5503,77 @@ git commit -m "feat(ingest): иерархия ключей дедупликац�
 
 ## Задача 13: Правила классификации и пересчёт истории
 
+> Развёрнута до полной глубины 2026-08-23, после задач 10–12.
+
 **Files:**
 - Create: `crates/iaam-ingest/src/classification.rs`
 - Modify: `crates/iaam-ingest/src/lib.rs`
 - Test: `crates/iaam-ingest/tests/classification.rs`
 
 **Interfaces:**
-- Consumes: правила из задачи 11, сырьё из задачи 10, `Relation::{Reversal, Replacement}`.
-- Produces: `RuleMatcher { counterparty_account: Option<String>, description_contains: Option<String>, kind: Option<String> }`; `Classification` (`InternalTransfer { to: AccountId }`, `ExternalFlow`, `Fee { origin: FeeOrigin }`, `Income`); `ClassificationRule { id, version, matcher, outcome }`; `classify(&SubmittedOperation, &[ClassificationRule]) -> ClassificationResult`; `ClassificationResult` (`Resolved(Classification)`, `Ambiguous { question: String }`); `recompute_plan(old_events, rows, rules) -> Vec<Correction>`.
+- Consumes: правила из задачи 11 (хранение), сырьё из задачи 10, `Relation::{Reversal, Replacement}`, `event::correction::resolve`.
+- Produces: `Movement`; `Counterparty`; `ClassificationSubject`; `RuleMatcher`; `Classification`; `ClassificationRule`; `Basis`; `Question`; `ClassificationResult`; `classify(&ClassificationSubject, &[ClassificationRule]) -> ClassificationResult`; `classification_of(&Event) -> Option<Classification>`; `Correction`; `CorrectionStep`; `recompute_plan(&[Event], &BTreeMap<EventId, ClassificationSubject>, &[ClassificationRule]) -> Result<Vec<Correction>, CorrectionError>`.
 
 **Acceptance Criteria:**
-- Операция, классификация которой не выводится из данных и не покрыта правилом, даёт `needs_classification` с конкретным вопросом, а не догадку
+- Операция, классификация которой не выводится из данных и не покрыта правилом, даёт вопрос владельцу, а не догадку
 - Ответ владельца становится правилом, и следующая такая же операция вопроса не вызывает
 - Правка правила **пересчитывает историю**: строится план из сторнирования и замены, журнал не переписывается
 - Пересчёт идемпотентен: повторный запуск с тем же правилом не создаёт новых исправлений
 - Правило видимо: его формулировку можно показать владельцу и она однозначно объясняет прошлую классификацию
 
+### Решения развёртывания
+
+1. **Классифицируется не операция, а признаки строки.** Правило смотрит
+   на счёт-контрагент, описание и слово, которым источник назвал
+   операцию, — ничего этого в `SubmittedOperation` нет и быть не должно:
+   к моменту, когда операция построена, тип уже выбран. Поэтому вводится
+   `ClassificationSubject` — то, что видно **до** выбора типа.
+2. **Вопрос владельцу — перечисление `Question`, а не строка.** Вопрос
+   уходит в API и должен рендериться с человеческими именами счетов,
+   которых у чистой функции нет. Строка с UUID внутри не является
+   «конкретным вопросом».
+3. **Перевод на собственный счёт выводится из данных и правила не
+   требует.** Правило нужно там, где данных не хватает; заводить его на
+   выводимое означало бы спрашивать владельца о том, что уже известно.
+   Отсюда `Basis::{Derived, Rule}` в ответе: «почему так
+   классифицировано» — часть ответа, а не догадка читателя.
+4. **Из нескольких подошедших правил выигрывает старшая версия.**
+   Правка правила заводит новую версию (задача 11), и старшая — это
+   последнее решение владельца. Пустой матчер не подходит ни к чему:
+   правило «на всё» заводится только по ошибке.
+5. **План пересчёта не умеет выражать правку.** `Correction` раскрывается
+   ровно в два шага — сторно и замену; варианта «изменить событие»
+   в типе нет, поэтому append-only journal гарантирован формой типа,
+   а не дисциплиной вызывающего.
+6. **Идемпотентность не программируется, а следует из устройства.**
+   План строится по **действующему** набору (`resolve`), и после
+   применения исправлений действующим становится замещающее событие,
+   классификация которого уже совпадает с правилом. Повторный запуск
+   даёт пустой план сам собой.
+
 - [ ] **Шаг 1: Тесты**
 
 `crates/iaam-ingest/tests/classification.rs`:
 
-1. перевод на счёт, о котором ничего не известно → `Ambiguous` с
-   вопросом, называющим счета;
-2. то же после добавления правила «переводы на счёт B — внутренние» →
-   `Resolved(InternalTransfer)`;
-3. правка правила на «внешние» → план пересчёта содержит по паре
-   сторно+замена на каждое затронутое событие, и **ни одного** UPDATE;
-4. повторный пересчёт тем же правилом даёт пустой план;
-5. событие, не затронутое правилом, в план не попадает.
+| Тест | Что доказывает |
+|---|---|
+| `a_transfer_to_an_own_account_needs_no_rule` | выводимое не спрашивают |
+| `a_transfer_to_an_unknown_counterparty_asks_the_owner` | вопрос, а не догадка |
+| `the_owners_answer_becomes_a_rule_and_the_question_stops` | правило снимает вопрос |
+| `the_newest_matching_rule_wins` | старшая версия — последнее решение |
+| `a_matcher_that_asks_for_nothing_matches_nothing` | правила «на всё» не бывает |
+| `the_description_matcher_ignores_letter_case` | брокерский текст пишут как придётся |
+| `every_matcher_condition_must_hold` | условия матчера соединяются «и» |
+| `a_rule_explains_itself_in_words` | правило видимо владельцу |
+| `an_outflow_without_a_counterparty_asks_fee_or_withdrawal` | вопрос по делу |
+| `an_inflow_without_a_counterparty_asks_income_or_return` | вопрос по делу |
+| `amending_a_rule_produces_a_reversal_and_a_replacement` | пересчёт через исправления |
+| `an_event_the_rule_does_not_touch_stays_out_of_the_plan` | пересчёт не трогает лишнее |
+| `recomputing_twice_produces_nothing_the_second_time` | идемпотентность |
+| `an_event_that_carries_no_classification_is_never_recomputed` | сделка не классифицируется |
+| `an_ambiguous_subject_is_left_alone_by_the_recompute` | догадка запрещена и здесь |
 
-- [ ] **Шаг 2: Реализация**
-
-Ключевое устройство: **классификация не является полем события.**
-Событие несёт факт (`CashTransfer` с обоими счетами), а «внутренний или
-внешний» выводится контуром (§4.10) — это уже так. Правила нужны там,
-где из данных не выводится **тип операции**: перевод третьему лицу
-против перевода себе, комиссия против вывода, доход против возврата.
-
-Пересчёт истории строится как список исправлений: на каждое событие,
-чья классификация изменилась, — `Relation::Reversal` на исходное и
-следом `Relation::Replacement` с новой классификацией. Журнал остаётся
-append-only (§4.8); «пересчёт» означает новые факты, а не правку
-старых. Исходные строки берутся из `raw_rows` (задача 10) — без сырья
-переразобрать нечего.
+- [ ] **Шаг 2: Реализация** — `classification.rs` по решениям выше.
 
 - [ ] **Шаг 3: Прогнать и закоммитить**
 

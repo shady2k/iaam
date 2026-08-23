@@ -10,6 +10,7 @@
 //! конвенция становится частью публичного контракта, и её обязан
 //! знать внешний агент, которому арифметика запрещена (§13).
 
+pub mod classification;
 pub mod csv_source;
 pub mod dedup;
 pub mod operation;

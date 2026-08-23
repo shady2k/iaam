@@ -7,6 +7,7 @@
 //! а не событие, и поля «уровень достоверности» у события не существует.
 
 pub mod claim;
+pub mod observed;
 
 use serde::{Deserialize, Serialize};
 

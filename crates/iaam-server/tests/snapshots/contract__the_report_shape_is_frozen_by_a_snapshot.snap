@@ -8,6 +8,7 @@ expression: report
     "contour_version": 1,
     "day_count": "act/365",
     "fx_source": "owner_supplied",
+    "perimeter_settlement_window_days": 5,
     "solver_max_iterations": 200,
     "solver_rate_tolerance": "0.0000000001"
   },
@@ -17,10 +18,16 @@ expression: report
   },
   "data_quality": {
     "material_issues": [
-      "история начинается 2025-01-01"
+      "история начинается 2025-01-01",
+      "по счёту [uuid] нет независимого подтверждения измерения cash"
     ],
-    "status": "mixed",
-    "unconfirmed_share": "1"
+    "nav_coverage": {
+      "accepted_independent": "0",
+      "accepted_internal": "0",
+      "discrepant": "0",
+      "provisional": "1"
+    },
+    "status": "mixed"
   },
   "history_starts": "2025-01-01",
   "report_currency": "RUB",

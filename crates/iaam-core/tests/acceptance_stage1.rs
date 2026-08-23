@@ -198,12 +198,21 @@ fn single_account_answers_the_three_questions_of_stage_one() {
     assert!(!projection.invariants().checked().is_empty());
 
     let fx = FxTable::new(FxSource::OwnerSupplied);
+    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
+    // а не подтверждение данных. Пустые реестр и оценка означают
+    // «ничего не подтверждено», что для расчёта нейтрально.
+    let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
+    let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
+        iaam_core::perimeter::PerimeterPolicy::default(),
+    );
     let request = ReturnsRequest {
         contour: &contour,
         as_of: date!(2026 - 01 - 01),
         report_currency: CurrencyCode::Rub,
         fx: &fx,
         solver_policy: SolverPolicy::returns_default(),
+        ledger: &ledger,
+        perimeter: &perimeter,
     };
     let report = returns_report(state, &request);
 

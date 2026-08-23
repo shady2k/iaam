@@ -139,7 +139,13 @@ impl From<AppError> for ApiFailure {
                     },
                 )
             }
-            AppError::Store(_) | AppError::Projection(_) => {
+            AppError::Store(_)
+            | AppError::Projection(_)
+            // Сверка и оценка периметра отказывают по той же причине,
+            // что и проекция: срез журнала не годится. Наружу уходит
+            // код, подробности — в лог.
+            | AppError::Reconciliation(_)
+            | AppError::Perimeter(_) => {
                 tracing::error!(error = %error, "сценарий не выполнен");
                 Self::new(
                     StatusCode::INTERNAL_SERVER_ERROR,

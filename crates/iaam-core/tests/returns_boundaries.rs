@@ -95,12 +95,21 @@ fn a_flow_on_the_report_date_is_included() {
     let as_of = date!(2026 - 01 - 01);
     let fixture = project_days(&[(date!(2025 - 06 - 01), 10_000_000), (as_of, 5_000_000)]);
     let fx = FxTable::new(FxSource::OwnerSupplied);
+    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
+    // а не подтверждение данных. Пустые реестр и оценка означают
+    // «ничего не подтверждено», что для расчёта нейтрально.
+    let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
+    let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
+        iaam_core::perimeter::PerimeterPolicy::default(),
+    );
     let request = ReturnsRequest {
         contour: &fixture.contour,
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,
         solver_policy: SolverPolicy::returns_default(),
+        ledger: &ledger,
+        perimeter: &perimeter,
     };
 
     let series = flow_series(fixture.projection.state(), &request).expect("ряд потоков");
@@ -116,12 +125,21 @@ fn a_slice_containing_events_after_the_report_date_is_refused() {
     let as_of = date!(2026 - 01 - 01);
     let fixture = project_days(&[(as_of, 10_000_000), (date!(2026 - 02 - 01), 1_000_000)]);
     let fx = FxTable::new(FxSource::OwnerSupplied);
+    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
+    // а не подтверждение данных. Пустые реестр и оценка означают
+    // «ничего не подтверждено», что для расчёта нейтрально.
+    let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
+    let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
+        iaam_core::perimeter::PerimeterPolicy::default(),
+    );
     let request = ReturnsRequest {
         contour: &fixture.contour,
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,
         solver_policy: SolverPolicy::returns_default(),
+        ledger: &ledger,
+        perimeter: &perimeter,
     };
 
     assert!(matches!(
@@ -141,12 +159,21 @@ fn a_slice_ending_exactly_on_the_report_date_is_accepted() {
     let as_of = date!(2026 - 01 - 01);
     let fixture = project_days(&[(as_of, 10_000_000)]);
     let fx = FxTable::new(FxSource::OwnerSupplied);
+    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
+    // а не подтверждение данных. Пустые реестр и оценка означают
+    // «ничего не подтверждено», что для расчёта нейтрально.
+    let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
+    let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
+        iaam_core::perimeter::PerimeterPolicy::default(),
+    );
     let request = ReturnsRequest {
         contour: &fixture.contour,
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,
         solver_policy: SolverPolicy::returns_default(),
+        ledger: &ledger,
+        perimeter: &perimeter,
     };
     assert!(flow_series(fixture.projection.state(), &request).is_ok());
     assert!(terminal_value(fixture.projection.state(), &request).is_ok());

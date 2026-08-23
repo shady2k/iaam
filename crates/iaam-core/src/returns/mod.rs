@@ -22,7 +22,9 @@ use crate::money::CurrencyCode;
 use crate::numeric::approx::SolverPolicy;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverRefusal};
+use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
 use crate::projection::state::LedgerState;
+use crate::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use crate::rules::lot_disposal::RuleId;
 use crate::valuation::{FxSource, FxTable, PriceQuality, ValuationError};
 
@@ -74,6 +76,9 @@ pub enum NotComputable {
     StateNewerThanReport { last_event: Date, as_of: Date },
     /// Арифметическая невозможность: переполнение, деление на ноль.
     Numeric { code: &'static str },
+    /// На счёте финансирование вне периметра: экономику система
+    /// не достраивает (§11).
+    UnsupportedFinancing { account: AccountId },
 }
 
 impl NotComputable {
@@ -88,6 +93,7 @@ impl NotComputable {
             Self::NoExternalFlows => "no_external_flows",
             Self::StateNewerThanReport { .. } => "state_newer_than_report",
             Self::Numeric { .. } => "numeric",
+            Self::UnsupportedFinancing { .. } => "unsupported_financing",
         }
     }
 }
@@ -144,19 +150,75 @@ pub enum MaterialIssue {
     },
     /// Данных до этой даты нет; всё, что раньше, в расчёт не вошло.
     HistoryStartsAt { date: Date },
+    /// Независимого подтверждения по счёту нет (§10.5).
+    NoIndependentSource {
+        account: AccountId,
+        dimension: Dimension,
+    },
+    /// Сверка по счёту не сходится.
+    Discrepancy {
+        account: AccountId,
+        dimension: Dimension,
+    },
+    /// На счёте присутствует финансирование вне периметра (§11).
+    UnsupportedFinancing { account: AccountId },
+}
+
+impl MaterialIssue {
+    /// Делает ли проблема ответ **неполным**.
+    ///
+    /// Две проблемы неполнотой не являются и потому не переводят статус
+    /// в `Incomplete`:
+    ///
+    /// - начало истории — это факт о периоде, а не дефект (§10.7);
+    /// - отсутствие независимого источника — нормальное состояние
+    ///   данных: §10.5 прямо требует считать такие записи в отчётах
+    ///   по умолчанию, иначе система бесполезна именно для банков без
+    ///   экспорта и ручного ввода. Показывать это надо, объявлять ответ
+    ///   неполным — нельзя, иначе `Incomplete` перестанет что-либо
+    ///   означать, потому что будет стоять почти всегда.
+    ///
+    /// Насколько велика неподтверждённая доля, говорит `navCoverage`,
+    /// а не статус.
+    #[must_use]
+    pub const fn is_defect(&self) -> bool {
+        match self {
+            Self::HistoryStartsAt { .. } | Self::NoIndependentSource { .. } => false,
+            Self::RestoredWithoutBasis { .. }
+            | Self::PriceNotExecutable { .. }
+            | Self::NegativeCash { .. }
+            | Self::Discrepancy { .. }
+            | Self::UnsupportedFinancing { .. } => true,
+        }
+    }
+}
+
+/// Покрытие стоимости портфеля уровнями достоверности (§10.5).
+///
+/// Доли считаются по **модулю** стоимости счёта: счёт с отрицательным
+/// остатком тоже покрыт или не покрыт сверкой, и выбросить его значило
+/// бы посчитать долю от неполного портфеля.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavCoverage {
+    pub accepted_independent: Dec,
+    pub accepted_internal: Dec,
+    pub provisional: Dec,
+    /// Доля стоимости, по которой сверка не сходится.
+    ///
+    /// §10.5 показывает в примере три доли. Четвёртая добавлена
+    /// намеренно: без неё расходящийся счёт попадал бы в `provisional`
+    /// и выглядел как «просто пока не подтверждён» — то есть проблема
+    /// пряталась бы ровно в той цифре, которая существует, чтобы её
+    /// показывать.
+    pub discrepant: Dec,
 }
 
 /// Блок качества данных.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataQuality {
     pub status: DataQualityStatus,
-    /// Доля данных без независимого подтверждения.
-    ///
-    /// На этапе 1 равна единице **по определению, а не по подсчёту**:
-    /// сверки не существует, подтверждать нечем. Считать её по полю
-    /// `Confidence` было бы подменой: `Confidence` описывает уверенность
-    /// в значении (§4.9), а не факт сверки (§10.3).
-    pub unconfirmed_share: Dec,
+    /// Какая доля стоимости портфеля чем подтверждена.
+    pub nav_coverage: NavCoverage,
     pub material_issues: Vec<MaterialIssue>,
 }
 
@@ -173,6 +235,9 @@ pub struct AppliedRules {
     pub fx_source: FxSource,
     pub day_count: DayCount,
     pub solver_policy: SolverPolicy,
+    /// Порог, по которому классифицирован отрицательный остаток (§11).
+    /// Цифра, зависящая от порога, обязана нести порог рядом с собой.
+    pub perimeter_policy: PerimeterPolicy,
 }
 
 /// Запрос отчёта.
@@ -183,6 +248,11 @@ pub struct ReturnsRequest<'a> {
     pub report_currency: CurrencyCode,
     pub fx: &'a FxTable,
     pub solver_policy: SolverPolicy,
+    /// Реестр сверки: без него доля подтверждённого неизвестна (§10.5).
+    pub ledger: &'a ReconciliationLedger,
+    /// Оценка периметра: без неё отчёт не знает, где отказаться
+    /// считать (§11).
+    pub perimeter: &'a PerimeterAssessment,
 }
 
 /// Ответ на три вопроса этапа 1.
@@ -255,15 +325,15 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
             fx_source: request.fx.source().clone(),
             day_count: DayCount::Act365,
             solver_policy: request.solver_policy,
+            perimeter_policy: request.perimeter.policy(),
         },
-        data_quality: data_quality(state),
+        data_quality: data_quality(state, request),
     }
 }
 
-/// Блок качества данных строится из состояния, а не из желания
-/// показать зелёный статус: на этапе 1 подтверждать нечем, поэтому
-/// `Clean` недостижим, и это записано прямо здесь.
-fn data_quality(state: &LedgerState) -> DataQuality {
+/// Блок качества данных строится из состояния, реестра сверки и оценки
+/// периметра, а не из желания показать зелёный статус.
+fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
     let mut issues = Vec::new();
     for account in state.coverage().restored_accounts() {
         issues.push(MaterialIssue::RestoredWithoutBasis { account: *account });
@@ -285,26 +355,118 @@ fn data_quality(state: &LedgerState) -> DataQuality {
     if let Some(date) = state.coverage().first_event() {
         issues.push(MaterialIssue::HistoryStartsAt { date });
     }
-    // Начало истории сообщается всегда, но неполнотой не является:
-    // «данных до 01.03.2024 нет» — это факт о периоде, а не дефект.
-    // Статусом управляют остальные проблемы.
-    let material = issues
-        .iter()
-        .any(|issue| !matches!(issue, MaterialIssue::HistoryStartsAt { .. }));
+
+    // Стоимость по счетам может не посчитаться — например, без цены.
+    // Тогда взвешивать покрытие нечем, и оно честно остаётся
+    // неизвестным, а не выдаётся за полное.
+    // Стоимость по счетам может не посчитаться — например, без цены.
+    // Тогда взвешивать покрытие нечем, и оно честно остаётся
+    // неизвестным, а не выдаётся за полное.
+    let values = xirr::account_values(state, request).unwrap_or_default();
+    let mut shares = Shares::default();
+    for (account, value) in &values {
+        if request.perimeter.financing_present(*account) {
+            issues.push(MaterialIssue::UnsupportedFinancing { account: *account });
+        }
+        // Деньги подтверждаются измерением `cash`, бумаги — измерением
+        // `positions`. Это разные утверждения о разных частях счёта,
+        // и взвешивать их одним статусом значило бы либо занижать
+        // подтверждение денег из-за неподтверждённых бумаг, либо
+        // наоборот.
+        for (part, dimension) in [
+            (value.cash, Dimension::Cash),
+            (value.positions, Dimension::Positions),
+        ] {
+            if part.is_zero() {
+                // Измерению, в котором у счёта ничего нет, нечего
+                // подтверждать: сообщать о его неподтверждённости —
+                // это шум, а не проблема.
+                continue;
+            }
+            let status = request
+                .ledger
+                .status_for(*account, request.as_of, dimension);
+            match status {
+                DimensionStatus::Discrepant => issues.push(MaterialIssue::Discrepancy {
+                    account: *account,
+                    dimension,
+                }),
+                DimensionStatus::Provisional => {
+                    issues.push(MaterialIssue::NoIndependentSource {
+                        account: *account,
+                        dimension,
+                    });
+                }
+                DimensionStatus::AcceptedInternal | DimensionStatus::AcceptedIndependent => {}
+            }
+            shares.add(status, part.inner().abs());
+        }
+    }
+    let nav_coverage = shares.finish();
+
+    let material = issues.iter().any(MaterialIssue::is_defect);
+    let status = if material {
+        DataQualityStatus::Incomplete
+    } else if nav_coverage.provisional.is_zero() && nav_coverage.discrepant.is_zero() {
+        DataQualityStatus::Clean
+    } else {
+        DataQualityStatus::Mixed
+    };
     DataQuality {
-        // `Clean` на этапе 1 недостижим и не выставляется: подтверждать
-        // данные нечем, пока нет сверки (E2).
-        status: if material {
-            DataQualityStatus::Incomplete
-        } else {
-            DataQualityStatus::Mixed
-        },
-        // Этап 1: независимого подтверждения нет ни у одного события,
-        // потому что механизма подтверждения ещё не существует (E2).
-        unconfirmed_share: Dec::one(),
+        status,
+        nav_coverage,
         material_issues: issues,
     }
 }
+
+/// Накопитель долей.
+///
+/// Считает в `rust_decimal`, потому что доля — расчётная величина,
+/// а не проведённая сумма (§3.4).
+#[derive(Debug, Default)]
+struct Shares {
+    independent: rust_decimal::Decimal,
+    internal: rust_decimal::Decimal,
+    provisional: rust_decimal::Decimal,
+    discrepant: rust_decimal::Decimal,
+}
+
+impl Shares {
+    fn add(&mut self, level: DimensionStatus, weight: rust_decimal::Decimal) {
+        let slot = match level {
+            DimensionStatus::AcceptedIndependent => &mut self.independent,
+            DimensionStatus::AcceptedInternal => &mut self.internal,
+            DimensionStatus::Provisional => &mut self.provisional,
+            DimensionStatus::Discrepant => &mut self.discrepant,
+        };
+        *slot += weight;
+    }
+
+    /// Доли от суммы весов.
+    ///
+    /// Нулевая сумма означает пустой портфель или непосчитанную
+    /// стоимость: доли неопределимы, и честный ответ — «ничего не
+    /// подтверждено», а не деление на ноль и не выдуманная единица
+    /// в независимом подтверждении.
+    fn finish(self) -> NavCoverage {
+        let total = self.independent + self.internal + self.provisional + self.discrepant;
+        if total.is_zero() {
+            return NavCoverage {
+                accepted_independent: Dec::zero(),
+                accepted_internal: Dec::zero(),
+                provisional: Dec::one(),
+                discrepant: Dec::zero(),
+            };
+        }
+        NavCoverage {
+            accepted_independent: Dec::new(self.independent / total),
+            accepted_internal: Dec::new(self.internal / total),
+            provisional: Dec::new(self.provisional / total),
+            discrepant: Dec::new(self.discrepant / total),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,7 +527,22 @@ mod tests {
             ),
         ];
         let projection = project(&events, &ctx).expect("проекция");
-        data_quality(projection.snapshot().state())
+        // Реестр сверки пуст, оценка периметра пуста: этот помощник
+        // проверяет ровно материальные проблемы состояния, а покрытие
+        // и периметр разобраны отдельными тестами.
+        let ledger = crate::reconciliation::ReconciliationLedger::default();
+        let perimeter = crate::perimeter::PerimeterAssessment::empty(PerimeterPolicy::default());
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2025 - 03 - 01),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+        };
+        data_quality(projection.snapshot().state(), &request)
     }
 
     #[test]

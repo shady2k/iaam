@@ -4,7 +4,9 @@
 //! в отчёт блоком качества; нарушение инварианта отменяет отчёт и уходит
 //! в лог с идентификатором корреляции.
 
+use iaam_core::perimeter::PerimeterError;
 use iaam_core::projection::ProjectionError;
+use iaam_core::reconciliation::observed::ObserveError;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -28,6 +30,26 @@ pub enum AppError {
     },
     #[error("проекция не построена: {0}")]
     Projection(#[source] ProjectionError),
+    /// Срез журнала не годится для сверки: событие без даты,
+    /// переполнение остатка. Отдельно от `Projection`, потому что
+    /// внешнему агенту это разные поводы: одно означает неверный срез,
+    /// другое — невозможность подтвердить данные.
+    #[error("сверка не построена: {0}")]
+    Reconciliation(#[source] ObserveError),
+    #[error("периметр не оценён: {0}")]
+    Perimeter(#[source] PerimeterError),
+}
+
+impl From<ObserveError> for AppError {
+    fn from(error: ObserveError) -> Self {
+        Self::Reconciliation(error)
+    }
+}
+
+impl From<PerimeterError> for AppError {
+    fn from(error: PerimeterError) -> Self {
+        Self::Perimeter(error)
+    }
 }
 
 impl AppError {
@@ -54,6 +76,8 @@ impl AppError {
             Self::Invalid { .. } => "invalid_request",
             Self::Invariant { .. } => "invariant_violated",
             Self::Projection(_) => "projection_failed",
+            Self::Reconciliation(_) => "reconciliation_failed",
+            Self::Perimeter(_) => "perimeter_assessment_failed",
         }
     }
 }

@@ -3,7 +3,9 @@
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::approx::SolverPolicy;
+use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
+use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::FxTable;
@@ -83,6 +85,12 @@ pub async fn returns(
             .await?;
     }
 
+    // Сверка и периметр — чистые функции от того же среза журнала.
+    // Оболочка их не считает: она подаёт срез и передаёт результат
+    // в отчёт (§3.1).
+    let perimeter = assess(&events, PerimeterPolicy::default())?;
+    let ledger = ReconciliationLedger::build_with(&events, &perimeter.exceptions())?;
+
     Ok(returns_report(
         projection.state(),
         &ReturnsRequest {
@@ -91,6 +99,8 @@ pub async fn returns(
             report_currency: query.report_currency,
             fx: &query.fx,
             solver_policy: SolverPolicy::returns_default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
         },
     ))
 }

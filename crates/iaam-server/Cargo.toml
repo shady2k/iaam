@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
 http-body-util = "0.1"
 # Снапшоты отчётов (§15.8): ловят непреднамеренное изменение формы ответа,
 # которое поштучные проверки полей пропускают.
-insta = { version = "1", features = ["json", "redactions"] }
+insta = { version = "1", features = ["filters", "json", "redactions"] }
 iaam-store = { path = "../iaam-store", version = "0.1.0" }
 tower = "0.5"
 

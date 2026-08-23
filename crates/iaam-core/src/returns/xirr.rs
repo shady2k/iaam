@@ -4,9 +4,12 @@
 //! курсы, цены и знаковая конвенция. Сам решатель работает с парами
 //! «смещение в днях, сумма» и о портфеле ничего не знает.
 
+use std::collections::BTreeMap;
+
 use time::Date;
 
 use super::{Computed, NotComputable, ReturnsRequest};
+use crate::ids::AccountId;
 use crate::money::CurrencyCode;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverFlow, solve};
@@ -56,31 +59,70 @@ pub fn flow_series(
     })
 }
 
-/// Стоимость контура на дату отчёта: деньги плюс позиции по последней цене.
+/// Стоимость счёта, разложенная на деньги и бумаги.
+///
+/// Разложение существенно для покрытия NAV (§10.5): деньги
+/// подтверждаются измерением `cash`, бумаги — измерением `positions`,
+/// и это **разные** утверждения. Одна цифра на счёт заставила бы брать
+/// худшее из двух, и тогда счёт без единой бумаги никогда не стал бы
+/// подтверждённым: измерение `positions`, о котором нечего утверждать,
+/// вечно тянуло бы его вниз.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountValue {
+    pub cash: Dec,
+    pub positions: Dec,
+}
+
+impl Default for AccountValue {
+    /// Нулевые части пишутся руками: `Dec` намеренно не имеет
+    /// умолчания, потому что нулевая заглушка вместо неизвестной
+    /// величины запрещена (§4.9). Здесь ноль осмыслен — накопитель
+    /// начинает с него для счёта, который уже признан существующим.
+    fn default() -> Self {
+        Self {
+            cash: Dec::zero(),
+            positions: Dec::zero(),
+        }
+    }
+}
+
+impl AccountValue {
+    /// Стоимость счёта целиком.
+    pub fn total(&self) -> Result<Dec, NotComputable> {
+        add(self.cash, self.positions)
+    }
+}
+
+/// Стоимость контура **по счетам** на дату отчёта: деньги плюс позиции
+/// по последней цене.
 ///
 /// Это **ликвидационная** оценка в упрощённом виде (§5.1): комиссий
 /// закрытия и налога к уплате в ней нет, потому что ни того, ни другого
 /// этап 1 не считает. Разрыв с `contractual_hold_value` не вычисляется —
 /// вклады и облигации целиком относятся к E3.
-pub fn terminal_value(state: &LedgerState, request: &ReturnsRequest) -> Result<Dec, NotComputable> {
+///
+/// Разбиение по счетам существует потому, что покрытие NAV по уровням
+/// достоверности (§10.5) взвешивается стоимостью счёта: доля,
+/// посчитанная по числу записей, объявила бы счёт с одной сделкой на
+/// миллион равным счёту с сотней сделок на тысячу.
+pub fn account_values(
+    state: &LedgerState,
+    request: &ReturnsRequest,
+) -> Result<BTreeMap<AccountId, AccountValue>, NotComputable> {
     guard_state_not_newer(state, request.as_of)?;
-    let mut total = Dec::zero();
+    let mut values: BTreeMap<AccountId, AccountValue> = BTreeMap::new();
 
     for (account, money) in state.balances().iter_cash() {
         if !request.contour.contains(account) {
             continue;
         }
-        total = add(
-            total,
-            convert(money, request.report_currency, request.as_of, request.fx)?,
-        )?;
+        let converted = convert(money, request.report_currency, request.as_of, request.fx)?;
+        let slot = values.entry(account).or_default();
+        slot.cash = add(slot.cash, converted)?;
     }
 
     for (key, quantity) in state.balances().iter_positions() {
-        if !request.contour.contains(key.account) {
-            continue;
-        }
-        if quantity.0.is_zero() {
+        if !request.contour.contains(key.account) || quantity.0.is_zero() {
             continue;
         }
         let price = state
@@ -90,7 +132,18 @@ pub fn terminal_value(state: &LedgerState, request: &ReturnsRequest) -> Result<D
                 instrument: key.instrument,
             })?;
         let local = mul(quantity.0, price.price)?;
-        total = add(total, in_report_currency(local, price.currency, request)?)?;
+        let converted = in_report_currency(local, price.currency, request)?;
+        let slot = values.entry(key.account).or_default();
+        slot.positions = add(slot.positions, converted)?;
+    }
+    Ok(values)
+}
+
+/// Стоимость контура на дату отчёта — сумма по счетам.
+pub fn terminal_value(state: &LedgerState, request: &ReturnsRequest) -> Result<Dec, NotComputable> {
+    let mut total = Dec::zero();
+    for value in account_values(state, request)?.values() {
+        total = add(total, value.total()?)?;
     }
     Ok(total)
 }

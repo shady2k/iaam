@@ -529,6 +529,10 @@ fn describe(reason: &NotComputable) -> String {
             format!("срез содержит события до {last_event}, отчёт на {as_of}")
         }
         NotComputable::Numeric { code } => format!("арифметический отказ: {code}"),
+        NotComputable::UnsupportedFinancing { account } => format!(
+            "на счёте {} присутствует финансирование вне периметра",
+            account.inner()
+        ),
     }
 }
 
@@ -561,11 +565,20 @@ pub struct RateDto {
     pub detail: Option<String>,
 }
 
+/// Доли стоимости портфеля по уровням достоверности (§10.5).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct NavCoverageDto {
+    pub accepted_independent: String,
+    pub accepted_internal: String,
+    pub provisional: String,
+    pub discrepant: String,
+}
+
 /// Блок качества данных (§10.5).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DataQualityDto {
     pub status: String,
-    pub unconfirmed_share: String,
+    pub nav_coverage: NavCoverageDto,
     pub material_issues: Vec<String>,
 }
 
@@ -573,7 +586,16 @@ impl DataQualityDto {
     fn from_domain(quality: &DataQuality) -> Self {
         Self {
             status: quality.status.code().to_owned(),
-            unconfirmed_share: quality.unconfirmed_share.inner().to_string(),
+            nav_coverage: NavCoverageDto {
+                accepted_independent: quality
+                    .nav_coverage
+                    .accepted_independent
+                    .inner()
+                    .to_string(),
+                accepted_internal: quality.nav_coverage.accepted_internal.inner().to_string(),
+                provisional: quality.nav_coverage.provisional.inner().to_string(),
+                discrepant: quality.nav_coverage.discrepant.inner().to_string(),
+            },
             material_issues: quality.material_issues.iter().map(issue).collect(),
         }
     }
@@ -599,6 +621,20 @@ fn issue(value: &MaterialIssue) -> String {
             currency.code()
         ),
         MaterialIssue::HistoryStartsAt { date } => format!("история начинается {date}"),
+        MaterialIssue::NoIndependentSource { account, dimension } => format!(
+            "по счёту {} нет независимого подтверждения измерения {}",
+            account.inner(),
+            dimension.code()
+        ),
+        MaterialIssue::Discrepancy { account, dimension } => format!(
+            "сверка счёта {} по измерению {} не сходится",
+            account.inner(),
+            dimension.code()
+        ),
+        MaterialIssue::UnsupportedFinancing { account } => format!(
+            "на счёте {} присутствует финансирование вне периметра",
+            account.inner()
+        ),
     }
 }
 
@@ -640,6 +676,10 @@ pub struct AppliedRulesDto {
     /// объявленную погрешность результата.
     pub solver_rate_tolerance: String,
     pub solver_max_iterations: u32,
+    /// Окно расчётов, по которому классифицирован отрицательный
+    /// остаток (§11). Цифра, зависящая от порога, обязана нести порог
+    /// рядом с собой: иначе воспроизвести классификацию невозможно.
+    pub perimeter_settlement_window_days: u16,
 }
 
 impl ReturnsReportDto {
@@ -687,6 +727,10 @@ impl ReturnsReportDto {
                     .rate_tolerance
                     .to_string(),
                 solver_max_iterations: report.applied_rules.solver_policy.max_iterations,
+                perimeter_settlement_window_days: report
+                    .applied_rules
+                    .perimeter_policy
+                    .settlement_window_days,
             },
             data_quality: DataQualityDto::from_domain(&report.data_quality),
         }

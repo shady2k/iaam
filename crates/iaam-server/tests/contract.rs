@@ -407,7 +407,16 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         (rate - 0.133_270_341_032).abs() < 1e-7,
         "ставка {rate} не совпадает с эталонной"
     );
-    assert_eq!(report["data_quality"]["unconfirmed_share"], "1");
+    // Данные введены руками и ничем не подтверждены: вся стоимость
+    // портфеля лежит в доле `provisional`. Это не дефект — §10.5
+    // требует считать такие записи в отчётах по умолчанию, — но
+    // владелец обязан видеть, какая именно доля не подтверждена.
+    assert_eq!(report["data_quality"]["nav_coverage"]["provisional"], "1");
+    assert_eq!(
+        report["data_quality"]["nav_coverage"]["accepted_independent"],
+        "0"
+    );
+    assert_eq!(report["data_quality"]["nav_coverage"]["discrepant"], "0");
 }
 
 #[tokio::test]
@@ -497,8 +506,20 @@ async fn the_report_shape_is_frozen_by_a_snapshot() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    insta::assert_json_snapshot!(report, {
-        ".applied_rules.contour" => "[contour]",
+    // Идентификаторы счетов случайны в каждом прогоне, а материальные
+    // проблемы их называют. Заменяются они фильтром, а не редакцией
+    // поля: редакция скрыла бы текст проблемы целиком, и снимок
+    // перестал бы проверять то, ради чего существует, — какие именно
+    // проблемы система сообщает владельцу.
+    let mut settings = insta::Settings::clone_current();
+    settings.add_filter(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        "[uuid]",
+    );
+    settings.bind(|| {
+        insta::assert_json_snapshot!(report, {
+            ".applied_rules.contour" => "[contour]",
+        });
     });
 }
 #[tokio::test]

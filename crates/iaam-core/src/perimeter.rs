@@ -104,11 +104,6 @@ pub struct PerimeterExceptions {
 }
 
 impl PerimeterExceptions {
-    #[must_use]
-    pub fn none() -> Self {
-        Self::default()
-    }
-
     pub fn add(
         &mut self,
         account: AccountId,
@@ -139,6 +134,16 @@ impl PerimeterExceptions {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Сколько различных исключений записано.
+    ///
+    /// Существует не для удобства: без него нельзя проверить, что
+    /// повтор одного исключения не удваивает список, а `is_empty`
+    /// на это не отвечает.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -192,7 +197,7 @@ impl PerimeterAssessment {
     /// Исключения сверки, следующие из оценки.
     #[must_use]
     pub fn exceptions(&self) -> PerimeterExceptions {
-        let mut exceptions = PerimeterExceptions::none();
+        let mut exceptions = PerimeterExceptions::default();
         for account in &self.financing {
             exceptions.add(
                 *account,
@@ -307,5 +312,130 @@ fn classify(
         from,
         resolved,
         classification,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::AccountId;
+
+    #[test]
+    fn every_classification_has_a_distinct_machine_readable_code() {
+        // Внешний агент разбирает код, а не текст. Пустая строка вместо
+        // кода неотличима от «классификации нет», а один код на все три —
+        // от «минус есть, а какой, неизвестно».
+        let all = [
+            NegativeCashClassification::TemporarySettlementDeficit,
+            NegativeCashClassification::UnsupportedMarginLiability,
+            NegativeCashClassification::UnclassifiedNegativeCash,
+        ];
+        let mut codes: Vec<&str> = all.iter().map(|c| c.code()).collect();
+        let count = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), count, "коды классификаций совпали");
+        assert_eq!(
+            codes,
+            vec![
+                "temporary_settlement_deficit",
+                "unclassified_negative_cash",
+                "unsupported_margin_liability",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_temporary_deficit_lets_period_reports_through() {
+        // §11: в двух случаях из трёх налоговые и финансовые отчёты
+        // за период возвращают not_computable. Ошибка здесь выдала бы
+        // экономику неподдерживаемого финансирования за посчитанную.
+        assert!(!NegativeCashClassification::TemporarySettlementDeficit.blocks_reports());
+        assert!(NegativeCashClassification::UnsupportedMarginLiability.blocks_reports());
+        assert!(NegativeCashClassification::UnclassifiedNegativeCash.blocks_reports());
+    }
+
+    #[test]
+    fn an_exception_is_recorded_once_per_account_and_dimension() {
+        // Повтор того же исключения не удваивает список: владелец
+        // увидел бы одну причину дважды и решил, что проблем две.
+        let account = AccountId::new_random();
+        let mut exceptions = PerimeterExceptions::default();
+        assert!(exceptions.is_empty());
+
+        exceptions.add(
+            account,
+            Dimension::Cash,
+            ReconciliationException::UnsupportedFinancingPresent,
+        );
+        exceptions.add(
+            account,
+            Dimension::Cash,
+            ReconciliationException::UnsupportedFinancingPresent,
+        );
+        assert!(!exceptions.is_empty());
+        assert_eq!(
+            exceptions.covers(account, Dimension::Cash),
+            Some(ReconciliationException::UnsupportedFinancingPresent)
+        );
+        assert_eq!(exceptions.len(), 1, "повтор не добавил вторую запись");
+    }
+
+    #[test]
+    fn exceptions_are_kept_apart_by_account_dimension_and_reason() {
+        // Три поля ключа, и каждое обязано различать записи. Слипшийся
+        // ключ либо прячет исключение чужого счёта, либо накрывает
+        // измерение, которого причина не объясняет.
+        let ours = AccountId::new_random();
+        let theirs = AccountId::new_random();
+        let mut exceptions = PerimeterExceptions::default();
+
+        exceptions.add(
+            ours,
+            Dimension::Cash,
+            ReconciliationException::UnsupportedFinancingPresent,
+        );
+        exceptions.add(
+            ours,
+            Dimension::Positions,
+            ReconciliationException::UnsupportedRepoEncumbrance,
+        );
+        exceptions.add(
+            theirs,
+            Dimension::Cash,
+            ReconciliationException::UnsupportedFinancingPresent,
+        );
+        exceptions.add(
+            ours,
+            Dimension::Cash,
+            ReconciliationException::UnsupportedRepoEncumbrance,
+        );
+
+        assert_eq!(exceptions.len(), 4, "различающиеся записи не слились");
+        assert_eq!(
+            exceptions.covers(ours, Dimension::Positions),
+            Some(ReconciliationException::UnsupportedRepoEncumbrance)
+        );
+        assert_eq!(
+            exceptions.covers(theirs, Dimension::Cash),
+            Some(ReconciliationException::UnsupportedFinancingPresent)
+        );
+        assert_eq!(
+            exceptions.covers(AccountId::new_random(), Dimension::Cash),
+            None,
+            "счёт без исключений ничем не накрыт"
+        );
+    }
+
+    #[test]
+    fn an_empty_assessment_reports_no_spans_and_no_exceptions() {
+        let policy = PerimeterPolicy {
+            settlement_window_days: 3,
+        };
+        let assessment = PerimeterAssessment::empty(policy);
+        assert!(assessment.spans().is_empty());
+        assert!(assessment.exceptions().is_empty());
+        assert_eq!(assessment.policy().settlement_window_days, 3);
+        assert!(!assessment.financing_present(AccountId::new_random()));
     }
 }

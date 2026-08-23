@@ -41,6 +41,19 @@ MODULES=(
   # Контракт отчёта: именно здесь решается, доверять ли цифре.
   "crates/iaam-core/src/returns/mod.rs"
   "crates/iaam-core/src/valuation.rs"
+  # Сверка решает, можно ли верить цифре. Ошибка здесь не искажает
+  # ни одной суммы — она объявляет непроверенные данные проверенными,
+  # и заметить это по самим цифрам невозможно (§10.3). Добавлено
+  # планом E2, задача 9.
+  "crates/iaam-core/src/reconciliation/claim.rs"
+  "crates/iaam-core/src/reconciliation/observed.rs"
+  "crates/iaam-core/src/reconciliation/check.rs"
+  "crates/iaam-core/src/reconciliation/evidence.rs"
+  "crates/iaam-core/src/reconciliation/mod.rs"
+  # Периметр решает, где система отказывается считать (§11). Мутант,
+  # снимающий отказ, выдаёт экономику неподдерживаемого финансирования
+  # за посчитанную.
+  "crates/iaam-core/src/perimeter.rs"
   # Хранилище держит границу владельца и append-only журнала: это
   # свойства безопасности, а не удобства. План их в заслон не вносил;
   # добавлено при исполнении задачи 11, где прогон дал десять выживших.

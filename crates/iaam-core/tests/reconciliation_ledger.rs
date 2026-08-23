@@ -418,7 +418,7 @@ fn a_discrepancy_covered_by_a_perimeter_exception_is_excepted_not_discrepant() {
         "без исключения это обычное расхождение"
     );
 
-    let mut exceptions = PerimeterExceptions::none();
+    let mut exceptions = PerimeterExceptions::default();
     exceptions.add(
         account,
         Dimension::Cash,
@@ -448,5 +448,54 @@ fn a_discrepancy_covered_by_a_perimeter_exception_is_excepted_not_discrepant() {
             .iter()
             .any(|check| matches!(check.outcome, ClaimOutcome::Discrepant(_))),
         "накрытое исключением расхождение не остаётся расхождением"
+    );
+}
+
+#[test]
+fn a_status_carries_the_grounds_that_produced_it() {
+    // Владелец спрашивает не только «можно ли верить», но и «почему».
+    // Статус без оснований — это цифра без объяснения, а §10.3 вводит
+    // основания именно для того, чтобы уровень можно было проверить.
+    use iaam_core::reconciliation::evidence::Ground;
+
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let march_channel = TestChannel::new("tinkoff-xlsx/1", "march");
+
+    let mut events = vec![deposit(&march_channel, owner, account, 100_000)];
+    events.extend(full_sections(
+        &march_channel,
+        owner,
+        account,
+        march(),
+        Sections {
+            opening: 0,
+            closing: 100_000,
+            debit: 100_000,
+            credit: 0,
+        },
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    let status = ledger
+        .statuses()
+        .find(|status| status.account() == account)
+        .expect("статус за март");
+
+    assert_eq!(status.period(), march());
+    let grounds: Vec<Ground> = status
+        .evidence()
+        .iter()
+        .map(iaam_core::reconciliation::evidence::Evidence::ground)
+        .collect();
+    assert_eq!(
+        grounds,
+        vec![Ground::SeparateSectionsAgree],
+        "статус обязан назвать основание, по которому он получен"
+    );
+    assert_eq!(
+        status.outcomes().len(),
+        3,
+        "все три проверенных утверждения остаются видимыми"
     );
 }

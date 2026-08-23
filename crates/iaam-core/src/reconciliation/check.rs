@@ -463,6 +463,43 @@ mod tests {
     }
 
     #[test]
+    fn each_reason_for_incomparability_has_a_distinct_code() {
+        // «Нечего сверять» и «налоговых фактов нет» — разные ответы
+        // владельцу: первый требует назвать остаток, второй не требует
+        // ничего до E5. Один код на оба сделал бы их неразличимыми.
+        assert_eq!(
+            NotComparable::NoJournalCoverage.code(),
+            "no_journal_coverage"
+        );
+        assert_eq!(
+            NotComparable::TaxFactsNotRecorded.code(),
+            "tax_facts_not_recorded"
+        );
+    }
+
+    #[test]
+    fn every_outcome_has_a_distinct_code() {
+        let outcomes = [
+            ClaimOutcome::Matched,
+            ClaimOutcome::NotComparable {
+                reason: NotComparable::NoJournalCoverage,
+            },
+            ClaimOutcome::Excepted {
+                exception: ReconciliationException::UnsupportedRepoEncumbrance,
+            },
+        ];
+        let mut codes: Vec<&str> = outcomes.iter().map(ClaimOutcome::code).collect();
+        let count = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), count);
+        assert_eq!(
+            ReconciliationException::UnsupportedFinancingPresent.code(),
+            "unsupported_financing_present"
+        );
+    }
+
+    #[test]
     fn an_exception_neither_confirms_nor_is_a_discrepancy() {
         // §11: «мы знаем, почему не сходится» — это не «сошлось».
         let excepted = ClaimOutcome::Excepted {

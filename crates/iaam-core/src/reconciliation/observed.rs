@@ -429,6 +429,75 @@ mod tests {
     }
 
     #[test]
+    fn an_event_on_the_first_day_belongs_to_the_period_not_before_it() {
+        // Граница интервала включается: событие первого марта — это
+        // март, а не «до марта». Сдвиг границы на один день перенёс бы
+        // операцию в остаток на начало, и обе стороны сверки съехали бы
+        // одинаково — то есть ошибка стала бы невидимой.
+        let account = AccountId::new_random();
+        let events = vec![event_with(
+            account,
+            date!(2026 - 03 - 01),
+            1,
+            EventKind::CashIn {
+                amount: rub(100_000),
+            },
+            vec![Leg::cash(account, rub(100_000))],
+        )];
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(
+            observed.cash_at(BalancePoint::Opening, CurrencyCode::Rub),
+            None,
+            "первого марта в остатке на начало марта ещё нет"
+        );
+        assert_eq!(
+            observed.cash_at(BalancePoint::Closing, CurrencyCode::Rub),
+            Some(PostedMinor::new(100_000))
+        );
+        assert_eq!(
+            observed.turnover(CurrencyCode::Rub).unwrap().debit,
+            PostedMinor::new(100_000),
+            "операция первого марта входит в оборот марта"
+        );
+    }
+
+    #[test]
+    fn every_touching_event_is_counted_once() {
+        // Счётчик решает, есть ли у счёта история вообще: по нему
+        // сверка отличает «не сошлось» от «сверять не с чем».
+        let account = AccountId::new_random();
+        let events = vec![
+            event_with(
+                account,
+                date!(2026 - 02 - 20),
+                1,
+                EventKind::CashIn { amount: rub(1) },
+                vec![Leg::cash(account, rub(1))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 02),
+                1,
+                EventKind::CashIn { amount: rub(1) },
+                vec![Leg::cash(account, rub(1))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 03),
+                1,
+                EventKind::CashIn { amount: rub(1) },
+                vec![Leg::cash(account, rub(1))],
+            ),
+        ];
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(
+            observed.events_seen(),
+            3,
+            "считаются и события до интервала, и события внутри него"
+        );
+    }
+
+    #[test]
     fn absence_of_movement_is_not_zero() {
         // `None` и `Some(0)` — разные утверждения. Первое означает
         // «данных нет», второе «данные есть, и остаток нулевой».

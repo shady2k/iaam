@@ -321,6 +321,15 @@ mod tests {
     }
 
     #[test]
+    fn each_balance_point_has_a_distinct_machine_readable_code() {
+        // Момент остатка уходит наружу кодом: «на начало» и «на конец» —
+        // разные утверждения, и слипшийся код превратил бы одно в другое.
+        assert_eq!(BalancePoint::Opening.code(), "opening");
+        assert_eq!(BalancePoint::Closing.code(), "closing");
+        assert_ne!(BalancePoint::Opening.code(), BalancePoint::Closing.code());
+    }
+
+    #[test]
     fn a_negative_cash_balance_is_not_a_sign_violation() {
         // §11: технический овердрафт и тайминги расчётов дают минус,
         // и он обязан войти в NAV обязательством, а не быть отвергнут.

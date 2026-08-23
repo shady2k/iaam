@@ -384,3 +384,69 @@ fn the_ledger_is_a_pure_function_of_the_journal() {
         );
     }
 }
+
+#[test]
+fn a_discrepancy_covered_by_a_perimeter_exception_is_excepted_not_discrepant() {
+    // §11: система знает, почему цифры не сходятся, и не отправляет
+    // владельца чинить то, что не поддерживает. Но подтверждением это
+    // не становится: измерение не поднимается выше provisional.
+    use iaam_core::perimeter::PerimeterExceptions;
+    use iaam_core::reconciliation::check::{ClaimOutcome, ReconciliationException};
+
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let march_channel = TestChannel::new("tinkoff-xlsx/1", "march");
+
+    let mut events = vec![deposit(&march_channel, owner, account, 100_000)];
+    events.extend(full_sections(
+        &march_channel,
+        owner,
+        account,
+        march(),
+        Sections {
+            opening: 0,
+            closing: 999_999,
+            debit: 100_000,
+            credit: 0,
+        },
+    ));
+
+    let bare = ReconciliationLedger::build(&events).unwrap();
+    assert_eq!(
+        bare.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        DimensionStatus::Discrepant,
+        "без исключения это обычное расхождение"
+    );
+
+    let mut exceptions = PerimeterExceptions::none();
+    exceptions.add(
+        account,
+        Dimension::Cash,
+        ReconciliationException::UnsupportedFinancingPresent,
+    );
+    let excused = ReconciliationLedger::build_with(&events, &exceptions).unwrap();
+
+    assert_eq!(
+        excused.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        DimensionStatus::Provisional,
+        "исключение снимает требование чинить, но не подтверждает данные"
+    );
+    let status = excused
+        .statuses()
+        .find(|status| status.account() == account)
+        .expect("статус за март");
+    assert!(
+        status
+            .outcomes()
+            .iter()
+            .any(|check| matches!(check.outcome, ClaimOutcome::Excepted { .. })),
+        "исход обязан быть помечен исключением, а не расхождением"
+    );
+    assert!(
+        !status
+            .outcomes()
+            .iter()
+            .any(|check| matches!(check.outcome, ClaimOutcome::Discrepant(_))),
+        "накрытое исключением расхождение не остаётся расхождением"
+    );
+}

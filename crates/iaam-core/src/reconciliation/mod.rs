@@ -202,10 +202,23 @@ pub struct ReconciliationLedger {
 }
 
 impl ReconciliationLedger {
-    /// Сборка реестра из журнала.
+    /// Сборка реестра из журнала без исключений периметра.
     ///
     /// Логика вынесена из конструктора с именем `new` намеренно (§15.7).
     pub fn build(events: &[Event]) -> Result<Self, ObserveError> {
+        Self::build_with(events, &crate::perimeter::PerimeterExceptions::none())
+    }
+
+    /// Сборка реестра с исключениями периметра (§11).
+    ///
+    /// Расхождение, накрытое исключением, становится `Excepted`:
+    /// система знает, почему цифры не сходятся, и не отправляет
+    /// владельца чинить то, что не поддерживает. Подтверждением такой
+    /// исход не является — «знаем причину» не равно «сошлось».
+    pub fn build_with(
+        events: &[Event],
+        exceptions: &crate::perimeter::PerimeterExceptions,
+    ) -> Result<Self, ObserveError> {
         let groups = collect_groups(events);
 
         // Шаг 1: каждая группа сверяется со своей проекцией.
@@ -218,7 +231,12 @@ impl ReconciliationLedger {
                     .iter()
                     .map(|claim| ClaimCheck {
                         claim: *claim,
-                        outcome: check_claim(claim, &observed),
+                        outcome: apply_exceptions(
+                            check_claim(claim, &observed),
+                            group.account,
+                            claim.dimension(),
+                            exceptions,
+                        ),
                     })
                     .collect(),
             );
@@ -317,6 +335,22 @@ impl ReconciliationLedger {
             });
         }
         result.unwrap_or(DimensionStatus::Provisional)
+    }
+}
+
+/// Замена расхождения исключением периметра (§11).
+///
+/// Заменяется **только** расхождение: несравнимость исключением не
+/// объясняется, а совпадение объяснять незачем.
+fn apply_exceptions(
+    outcome: ClaimOutcome,
+    account: AccountId,
+    dimension: Dimension,
+    exceptions: &crate::perimeter::PerimeterExceptions,
+) -> ClaimOutcome {
+    match (outcome, exceptions.covers(account, dimension)) {
+        (ClaimOutcome::Discrepant(_), Some(exception)) => ClaimOutcome::Excepted { exception },
+        (outcome, _) => outcome,
     }
 }
 

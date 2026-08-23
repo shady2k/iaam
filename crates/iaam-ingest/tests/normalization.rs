@@ -166,8 +166,12 @@ fn a_negative_amount_is_rejected_with_field_expected_actual() {
         currency: CurrencyCode::Rub,
     });
     let rejection = normalize(&operation, context()).unwrap_err();
-    assert_eq!(rejection.field, "amount_minor");
-    assert_eq!(rejection.actual, "-1");
+    // Поле и величина называются так же, как их прислал клиент: одна
+    // копейка — это «-0.01», а не «-1». Отказ, говорящий во внутренних
+    // единицах, отправляет чинить не то, что отправляли.
+    assert_eq!(rejection.field, "amount");
+    assert_eq!(rejection.actual, "-0.01");
+    assert_eq!(rejection.expected, "положительная величина");
 }
 
 #[test]
@@ -256,6 +260,9 @@ fn a_zero_amount_is_rejected_just_like_a_negative_one() {
         currency: CurrencyCode::Rub,
     });
     let rejection = normalize(&zero, context()).expect_err("ноль обязан быть отклонён");
-    assert_eq!(rejection.field, "amount_minor");
-    assert_eq!(rejection.actual, "0");
+    assert_eq!(rejection.field, "amount");
+    assert_eq!(
+        rejection.actual, "0.00",
+        "величина печатается в тех же единицах, что прислал клиент"
+    );
 }

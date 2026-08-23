@@ -216,6 +216,25 @@ for module in "${MODULES[@]}"; do
   fi
 
   echo "  мутантов к проверке: $n_with"
+
+  # Какими тестами проверять модуль.
+  #
+  # По умолчанию cargo-mutants при `--package X` гоняет тесты ТОЛЬКО
+  # пакета X. Для большинства модулей это верно: их тесты лежат рядом.
+  # Но сценарии приложения проверяются контрактными тестами, которые
+  # живут в iaam-server, и без явного указания заслон печатал бы
+  # «выживших нет» для кода, который никто не тестировал. Проверено
+  # исполнением: 46 выживших против 35 на одном и том же коде.
+  #
+  # Указываются именно нужные пакеты, а не `--test-workspace true`:
+  # прогон всего набора тестов на каждого мутанта поднимает цену
+  # с полутора секунд до тринадцати, то есть примерно в девять раз.
+  extra_test_packages=()
+  case "$module" in
+    crates/iaam-app/src/*)
+      extra_test_packages=(--test-package iaam-app --test-package iaam-server)
+      ;;
+  esac
   out_dir="target/mutants/$(printf '%s' "$module" | tr '/' '_')"
   # `--output DIR` не создаёт промежуточные каталоги: без mkdir прогон падает
   # с «create output parent directory», а по коду возврата это неотличимо
@@ -227,14 +246,8 @@ for module in "${MODULES[@]}"; do
   # в "$out_dir/mutants.out/", а не в "$out_dir/".
   report="$out_dir/mutants.out"
 
-  # `--test-workspace true` обязателен: без него cargo-mutants гоняет
-  # только тесты пакета, которому принадлежит модуль. Для ядра это
-  # совпадало случайно — его тесты лежат в нём же, — но модули оболочки
-  # проверяются контрактными тестами из iaam-server, и без этого флага
-  # заслон печатал бы «выживших нет» для кода, который никто не тестировал.
-  # Проверено исполнением: 46 выживших против 35 на одном и том же коде.
   if cargo mutants --package "$package" --file "$module" \
-      --test-workspace true --output "$out_dir"; then
+      "${extra_test_packages[@]}" --output "$out_dir"; then
     echo "  выживших нет ($n_with мутантов убито)"
     checked=$((checked + 1))
     continue

@@ -255,14 +255,20 @@ fn money(minor: i64, currency: CurrencyCode) -> Money {
     Money::new(PostedMinor::new(minor), currency)
 }
 
-fn positive(value: i64, field: &str) -> Result<i64, Rejection> {
+/// Величина обязана быть положительной.
+///
+/// Имя поля и величина в отказе — те же, что прислал клиент: `amount`,
+/// а не `amount_minor`, и `-5.00`, а не `-500`. Отказ, называющий
+/// внутреннее имя и внутренние единицы, отправляет клиента чинить поле,
+/// которого он не отправлял (§10.4).
+fn positive(value: i64, field: &str, currency: CurrencyCode) -> Result<i64, Rejection> {
     if value > 0 {
         Ok(value)
     } else {
         Err(Rejection {
             field: field.to_owned(),
-            expected: "положительная величина в минимальных единицах".into(),
-            actual: value.to_string(),
+            expected: "положительная величина".into(),
+            actual: money(value, currency).to_calc_dec().inner().to_string(),
         })
     }
 }
@@ -280,7 +286,7 @@ fn build(
             amount_minor,
             currency,
         } => {
-            let amount = money(positive(*amount_minor, "amount_minor")?, *currency);
+            let amount = money(positive(*amount_minor, "amount", *currency)?, *currency);
             Ok((
                 EventKind::CashIn { amount },
                 vec![Leg::cash(account, amount)],
@@ -290,7 +296,7 @@ fn build(
             amount_minor,
             currency,
         } => {
-            let amount = money(-positive(*amount_minor, "amount_minor")?, *currency);
+            let amount = money(-positive(*amount_minor, "amount", *currency)?, *currency);
             Ok((
                 EventKind::CashOut { amount },
                 vec![Leg::cash(account, amount)],
@@ -308,9 +314,9 @@ fn build(
                     actual: to.inner().to_string(),
                 });
             }
-            let amount = money(positive(*amount_minor, "amount_minor")?, *currency);
+            let amount = money(positive(*amount_minor, "amount", *currency)?, *currency);
             let outgoing = amount.checked_negate().map_err(|error| Rejection {
-                field: "amount_minor".into(),
+                field: "amount".into(),
                 expected: "представимая сумма".into(),
                 actual: error.to_string(),
             })?;
@@ -333,7 +339,7 @@ fn build(
             accrued_interest_minor,
             currency,
         } => {
-            let gross = money(positive(*gross_minor, "gross_minor")?, *currency);
+            let gross = money(positive(*gross_minor, "amount", *currency)?, *currency);
             let fee = fee_money(*fee_minor, *currency)?;
             let accrued = fee_money(*accrued_interest_minor, *currency)?;
             let mut settlement = gross.amount().raw();
@@ -363,7 +369,7 @@ fn build(
             accrued_interest_minor,
             currency,
         } => {
-            let gross = money(positive(*gross_minor, "gross_minor")?, *currency);
+            let gross = money(positive(*gross_minor, "amount", *currency)?, *currency);
             let fee = fee_money(*fee_minor, *currency)?;
             let accrued = fee_money(*accrued_interest_minor, *currency)?;
             let mut settlement = gross.amount().raw();
@@ -394,7 +400,7 @@ fn build(
             gross_minor,
             currency,
         } => {
-            let gross = money(positive(*gross_minor, "gross_minor")?, *currency);
+            let gross = money(positive(*gross_minor, "amount", *currency)?, *currency);
             Ok((
                 EventKind::Income {
                     instrument: *instrument,
@@ -408,7 +414,7 @@ fn build(
             currency,
             origin,
         } => {
-            let amount = money(-positive(*amount_minor, "amount_minor")?, *currency);
+            let amount = money(-positive(*amount_minor, "amount", *currency)?, *currency);
             Ok((
                 EventKind::Fee {
                     amount,
@@ -437,7 +443,7 @@ fn build(
             currency,
         } => {
             let cost_basis = match cost_basis_minor {
-                Some(value) => Some(money(positive(*value, "cost_basis_minor")?, *currency)),
+                Some(value) => Some(money(positive(*value, "cost_basis", *currency)?, *currency)),
                 None => None,
             };
             Ok((
@@ -476,6 +482,6 @@ fn build(
 fn fee_money(value: Option<i64>, currency: CurrencyCode) -> Result<Option<Money>, Rejection> {
     match value {
         None => Ok(None),
-        Some(minor) => Ok(Some(money(positive(minor, "fee_minor")?, currency))),
+        Some(minor) => Ok(Some(money(positive(minor, "fee", currency)?, currency))),
     }
 }

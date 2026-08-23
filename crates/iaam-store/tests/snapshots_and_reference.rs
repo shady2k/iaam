@@ -176,7 +176,7 @@ fn a_revoked_token_is_not_found() {
         Some(record.clone())
     );
 
-    store.revoke_token(record.id).unwrap();
+    store.revoke_token(record.owner, record.id).unwrap();
     assert_eq!(store.find_token("хеш-токена").unwrap(), None);
 }
 

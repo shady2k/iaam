@@ -10,10 +10,11 @@ use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 
 use crate::dto::{
-    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, ComputedDto, ContourVersionDto,
-    CreateAccountRequest, CreateContourVersionRequest, CurrencyDto, DataQualityDto, FeeOriginDto,
-    FxRateDto, HealthDto, OperationDatesDto, OperationDto, OperationKindDto, PriceQualityDto,
-    RateDto, ReturnsReportDto, SubmitOperationsRequest, VerdictDto,
+    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, ClaimRequest, ComputedDto,
+    ContourVersionDto, CreateAccountRequest, CreateContourVersionRequest, CreateTokenRequest,
+    CurrencyDto, DataQualityDto, FeeOriginDto, FxRateDto, HealthDto, IssuedTokenDto,
+    OperationDatesDto, OperationDto, OperationKindDto, PriceQualityDto, RateDto, ReturnsReportDto,
+    SubmitOperationsRequest, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::ApiError;
 
@@ -53,15 +54,18 @@ impl Modify for BearerSecurity {
         AddBrokerAccessRequest,
         ApiError,
         BrokerAccessDto,
+        ClaimRequest,
         ComputedDto,
         ContourVersionDto,
         CreateAccountRequest,
         CreateContourVersionRequest,
+        CreateTokenRequest,
         CurrencyDto,
         DataQualityDto,
         FeeOriginDto,
         FxRateDto,
         HealthDto,
+        IssuedTokenDto,
         OperationDatesDto,
         OperationDto,
         OperationKindDto,
@@ -69,6 +73,8 @@ impl Modify for BearerSecurity {
         RateDto,
         ReturnsReportDto,
         SubmitOperationsRequest,
+        TokenDto,
+        TokenScopeDto,
         VerdictDto,
     ))
 )]

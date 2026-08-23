@@ -158,7 +158,12 @@ impl From<AppError> for ApiFailure {
             // что и проекция: срез журнала не годится. Наружу уходит
             // код, подробности — в лог.
             | AppError::Reconciliation(_)
-            | AppError::Perimeter(_) => {
+            | AppError::Perimeter(_)
+            // Отказ источника случайности — тоже `500`: секрет не выдан,
+            // и это отказ сервера, а не ошибка запроса. Повтор запроса
+            // имеет смысл, а вот подмена запасным генератором — нет,
+            // поэтому наружу уходит отказ, а не токен (§14).
+            | AppError::Random(_) => {
                 tracing::error!(error = %error, "сценарий не выполнен");
                 Self::new(
                     StatusCode::INTERNAL_SERVER_ERROR,

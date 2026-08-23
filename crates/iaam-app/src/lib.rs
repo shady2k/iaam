@@ -15,10 +15,11 @@ pub use iaam_ingest as ingest;
 pub mod error;
 pub mod ports;
 pub mod scenarios;
+pub mod tokens;
 
 use std::sync::Arc;
 
-use ports::{BrokerVault, Clock, Store};
+use ports::{BrokerVault, Clock, Store, TokenAdmin};
 
 /// Собранные зависимости. Точка сборки создаёт один экземпляр,
 /// обработчики получают `Arc<AppServices>` (§3.2).
@@ -27,6 +28,10 @@ pub struct AppServices {
     /// Хранилище брокерских доступов. Отдельным полем, а не частью
     /// `store`: за ним стоит ключ шифрования, и его может не быть.
     pub broker: Arc<dyn BrokerVault>,
+    /// Управление токенами. Отдельным полем по той же причине, по
+    /// которой это отдельный порт: читать журнал и раздавать права
+    /// на него — разные полномочия (§14).
+    pub tokens: Arc<dyn TokenAdmin>,
     pub clock: Arc<dyn Clock>,
 }
 
@@ -35,11 +40,13 @@ impl AppServices {
     pub fn new(
         store: Arc<dyn Store>,
         broker: Arc<dyn BrokerVault>,
+        tokens: Arc<dyn TokenAdmin>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             store,
             broker,
+            tokens,
             clock,
         }
     }

@@ -16,6 +16,11 @@ iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
 # порты обязаны быть объектобезопасными (`Arc<dyn Store>`), а RPITIT
 # объектобезопасности не даёт. Смешение механизмов запрещено заслоном.
 async-trait = "0.1"
+# Выпуск токена живёт в адаптере хранилища (порт `TokenAdmin`), и потому
+# криптографический источник случайности и SHA-256 нужны здесь: вторая
+# копия этой пары в транспорте разошлась бы с первой молча.
+rand = { version = "0.10", features = ["sys_rng"] }
+sha2 = "0.11"
 thiserror = "2"
 time = { version = "0.3", default-features = false, features = ["std", "macros"] }
 tokio = { version = "1", features = ["rt", "macros", "sync"] }

@@ -72,6 +72,23 @@ pub struct TokenRecord {
     pub revoked: bool,
 }
 
+/// Выданный токен в том виде, в каком его показывают владельцу.
+///
+/// **Ни токена, ни его хеша здесь нет и быть не может.** Хеш — это то,
+/// что достаточно подставить в `WHERE token_hash = ?`, чтобы система
+/// признала запрос своим; список выданных токенов, показывающий хеши,
+/// был бы списком отмычек. То, чего структура не несёт, транспорт
+/// не может отдать наружу ни ответом, ни логом (§14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenSummary {
+    pub id: Uuid,
+    pub label: String,
+    pub scope: TokenScope,
+    pub created_at: String,
+    /// Момент отзыва. `None` — токен действует.
+    pub revoked_at: Option<String>,
+}
+
 impl SqliteStore {
     /// Регистрация токена по его хешу.
     pub fn insert_token(&self, record: &TokenRecord, token_hash: &str) -> Result<(), StoreError> {
@@ -123,12 +140,67 @@ impl SqliteStore {
         }))
     }
 
-    pub fn revoke_token(&self, id: Uuid) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE api_tokens SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
-            params![id.to_string(), now()],
+    /// Отзыв токена.
+    ///
+    /// Владелец входит в запрос, а не проверяется вызывающим:
+    /// идентификатор токена не является правом на него, и без владельца
+    /// в `WHERE` любой знающий чужой идентификатор отзывал бы чужой
+    /// токен (§14). Ничего не обновилось — `NotFound`: отозванный
+    /// заранее, несуществующий и чужой обязаны быть неотличимы, иначе
+    /// ответ сообщает постороннему, что такая запись есть.
+    pub fn revoke_token(&self, owner: OwnerId, id: Uuid) -> Result<(), StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE api_tokens SET revoked_at = ?3
+             WHERE owner = ?1 AND id = ?2 AND revoked_at IS NULL",
+            params![owner.inner().to_string(), id.to_string(), now()],
         )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                what: "действующий токен",
+                id: id.to_string(),
+            });
+        }
         Ok(())
+    }
+
+    /// Выданные токены владельца, включая отозванные.
+    ///
+    /// Отозванные показываются по той же причине, что и отозванные
+    /// брокерские доступы: «когда токен перестал пускать» является
+    /// вопросом, на который нужен ответ. Хеша в ответе нет — см.
+    /// `TokenSummary`.
+    pub fn list_tokens(&self, owner: OwnerId) -> Result<Vec<TokenSummary>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, label, scope, created_at, revoked_at FROM api_tokens
+             WHERE owner = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map(params![owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            let (id, label, scope, created_at, revoked_at) = row?;
+            tokens.push(TokenSummary {
+                id: Uuid::parse_str(&id).map_err(|_| StoreError::NotFound {
+                    what: "token",
+                    id: id.clone(),
+                })?,
+                label,
+                scope: TokenScope::parse(&scope).ok_or(StoreError::NotFound {
+                    what: "token_scope",
+                    id: scope.clone(),
+                })?,
+                created_at,
+                revoked_at,
+            });
+        }
+        Ok(tokens)
     }
 
     /// Журнал использования токена (§14). Пишется на каждый запрос,

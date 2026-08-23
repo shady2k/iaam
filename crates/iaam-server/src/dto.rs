@@ -12,7 +12,7 @@ use std::fmt;
 
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
-use iaam_app::ports::BrokerAccessView;
+use iaam_app::ports::{BrokerAccessView, IssuedToken, Scope, TokenView};
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::CurrencyCode;
@@ -816,6 +816,135 @@ impl BrokerAccessDto {
     }
 }
 
+/// Присвоение экземпляра.
+///
+/// Код прочитан с консоли при старте сервера — см. `claim`. Метка
+/// описывает, чем именно владелец будет ходить: «ноутбук», «телефон».
+#[derive(Clone, Deserialize, ToSchema)]
+pub struct ClaimRequest {
+    /// Одноразовый код присвоения. Секрет: принимается, но никогда
+    /// не возвращается, поэтому в схеме помечен как `password`.
+    #[schema(format = Password, write_only, example = "<код с консоли>")]
+    pub code: String,
+    /// Метка выпускаемого токена.
+    pub label: String,
+}
+
+/// `Debug` вручную: код присвоения — это право завести владельца,
+/// и производный вывод отправил бы его в первый же лог.
+impl fmt::Debug for ClaimRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaimRequest")
+            .field("code", &"<скрыт>")
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+/// Область прав в транспорте. Отдельный тип, потому что `Scope`
+/// приложения не знает про OpenAPI и знать не должен.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenScopeDto {
+    /// Полный доступ владельца. В запросе на выпуск **не принимается**:
+    /// владелец заводится присвоением экземпляра или консолью.
+    Owner,
+    Agent,
+    ReadOnly,
+}
+
+impl TokenScopeDto {
+    #[must_use]
+    pub const fn from_domain(scope: Scope) -> Self {
+        match scope {
+            Scope::Owner => Self::Owner,
+            Scope::Agent => Self::Agent,
+            Scope::ReadOnly => Self::ReadOnly,
+        }
+    }
+}
+
+/// Запрос на выпуск токена.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateTokenRequest {
+    /// Чем этот токен будет ходить: «домашний агент», «телефон».
+    /// Метка — единственное, по чему потом узнают, какой токен отзывать.
+    pub label: String,
+    pub scope: TokenScopeDto,
+}
+
+/// Только что выпущенный токен.
+///
+/// Один тип и на присвоение экземпляра, и на выпуск токена агенту:
+/// в обоих случаях наружу уходит секрет, показываемый **один раз**,
+/// и второй такой тип означал бы второе место, где о нём можно забыть.
+#[derive(Clone, Serialize, ToSchema)]
+pub struct IssuedTokenDto {
+    /// Идентификатор записи — по нему токен отзывают.
+    pub id: Uuid,
+    /// Сам токен. Показывается **один раз**: в базе остаётся только
+    /// хеш, и повторить показ неоткуда.
+    #[schema(format = Password, example = "<секрет>")]
+    pub token: String,
+    pub label: String,
+    pub scope: TokenScopeDto,
+}
+
+/// `Debug` вручную: производный вывел бы токен в первый же лог,
+/// а лог переживает и процесс, и сам токен.
+impl fmt::Debug for IssuedTokenDto {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IssuedTokenDto")
+            .field("id", &self.id)
+            .field("token", &"<скрыт>")
+            .field("label", &self.label)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+impl IssuedTokenDto {
+    #[must_use]
+    pub fn from_domain(issued: IssuedToken) -> Self {
+        Self {
+            id: issued.id,
+            token: issued.token,
+            label: issued.label,
+            scope: TokenScopeDto::from_domain(issued.scope),
+        }
+    }
+}
+
+/// Выданный токен в списке.
+///
+/// `Debug` производный: секрета в этом типе нет — ни токена, ни хеша
+/// сюда не попадает, потому что их нет и в порте.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TokenDto {
+    pub id: Uuid,
+    pub label: String,
+    pub scope: TokenScopeDto,
+    pub created_at: String,
+    /// Момент отзыва. `null` — токен действует. Поле не опускается
+    /// при отсутствии значения: пропавшее поле неотличимо от «не знаем».
+    pub revoked_at: Option<String>,
+}
+
+impl TokenDto {
+    #[must_use]
+    pub fn from_domain(token: TokenView) -> Self {
+        Self {
+            id: token.id,
+            label: token.label,
+            scope: TokenScopeDto::from_domain(token.scope),
+            created_at: token.created_at,
+            revoked_at: token.revoked_at,
+        }
+    }
+}
+
 /// Новая версия состава контура.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateContourVersionRequest {
@@ -931,6 +1060,47 @@ mod tests {
             printed.contains("tinkoff"),
             "код брокера секретом не является и обязан оставаться видимым: {printed}"
         );
+    }
+
+    #[test]
+    fn an_issued_token_never_reaches_the_debug_output() {
+        // Ответ с токеном показывается один раз — и ровно один раз он
+        // существует открытым. Производный `Debug` отправил бы его
+        // в первый же лог, а лог переживает и процесс, и сам токен.
+        const ISSUED: &str = "0123456789abcdef0123456789abcdef";
+        let response = IssuedTokenDto {
+            id: Uuid::new_v4(),
+            token: ISSUED.into(),
+            label: "домашний агент".into(),
+            scope: TokenScopeDto::Agent,
+        };
+
+        let printed = format!("{response:?}");
+        assert!(
+            !printed.contains(ISSUED),
+            "токен утёк в отладочный вывод: {printed}"
+        );
+        assert!(
+            printed.contains("домашний агент"),
+            "метка секретом не является и обязана оставаться видимой: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_claim_code_never_reaches_the_debug_output() {
+        // Код присвоения — это право завести владельца в пустой базе.
+        const CODE: &str = "0123456789abcdef0123456789abcdef";
+        let request = ClaimRequest {
+            code: CODE.into(),
+            label: "ноутбук".into(),
+        };
+
+        let printed = format!("{request:?}");
+        assert!(
+            !printed.contains(CODE),
+            "код присвоения утёк в отладочный вывод: {printed}"
+        );
+        assert!(printed.contains("ноутбук"), "{printed}");
     }
 
     #[test]

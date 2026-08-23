@@ -15,19 +15,21 @@ use iaam_core::ids::{AccountId, OwnerId};
 use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
 use iaam_store::SqliteStore;
-use iaam_store::broker_access::NewBrokerAccess;
+use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
 use iaam_store::documents::BrokerCode;
 use iaam_store::events::Appended;
 use iaam_store::reference::AccountRecord;
-use iaam_store::tokens::TokenScope;
+use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountView, BrokerAccessView, BrokerVault, Principal, Recorded, Scope, Store,
+    AccountView, BrokerAccessView, BrokerVault, IssuedToken, Principal, Recorded, Scope, SoleOwner,
+    Store, TokenAdmin, TokenView,
 };
+use crate::tokens::{hash_token, secret_hex};
 
 /// Соединение под мьютексом: `rusqlite::Connection` не `Sync`, а писатель
 /// у однопользовательской базы один. Пул появится тогда, когда появится
@@ -94,6 +96,27 @@ impl SqliteAdapter {
 
 fn store_error(error: iaam_store::StoreError) -> AppError {
     AppError::Store(error.to_string())
+}
+
+/// Права токена: из хранилища в порт.
+///
+/// Перевод в обе стороны исчерпывающим `match`, а не по строке-коду:
+/// новое право обязано сломать сборку здесь, а не молча превратиться
+/// в «читатель» при разборе неизвестного кода (§15.1).
+const fn scope_from_store(scope: TokenScope) -> Scope {
+    match scope {
+        TokenScope::Owner => Scope::Owner,
+        TokenScope::Agent => Scope::Agent,
+        TokenScope::ReadOnly => Scope::ReadOnly,
+    }
+}
+
+const fn scope_to_store(scope: Scope) -> TokenScope {
+    match scope {
+        Scope::Owner => TokenScope::Owner,
+        Scope::Agent => TokenScope::Agent,
+        Scope::ReadOnly => TokenScope::ReadOnly,
+    }
 }
 
 #[async_trait]
@@ -223,11 +246,7 @@ impl Store for SqliteAdapter {
             Ok(found.map(|record| Principal {
                 token_id: record.id,
                 owner: record.owner,
-                scope: match record.scope {
-                    TokenScope::Owner => Scope::Owner,
-                    TokenScope::Agent => Scope::Agent,
-                    TokenScope::ReadOnly => Scope::ReadOnly,
-                },
+                scope: scope_from_store(record.scope),
             }))
         })
         .await
@@ -346,6 +365,92 @@ impl BrokerVault for SqliteAdapter {
                 match error {
                     iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
                         what: "доступ к брокеру",
+                        id: id.to_string(),
+                    },
+                    other => store_error(other),
+                }
+            })
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl TokenAdmin for SqliteAdapter {
+    async fn sole_owner(&self) -> Result<SoleOwner, AppError> {
+        self.blocking(move |store| {
+            let found = store.sole_token_owner().map_err(store_error)?;
+            Ok(match found {
+                StoredSoleOwner::None => SoleOwner::None,
+                StoredSoleOwner::Single(owner) => SoleOwner::Single(owner),
+                StoredSoleOwner::Several => SoleOwner::Several,
+            })
+        })
+        .await
+    }
+
+    /// Выпуск токена: случайные 32 байта, хеш в базу, сам токен наружу.
+    ///
+    /// 32 байта из системного источника, а не «достаточно длинная»
+    /// строка: токен — это ключ от чужих денег, и стойкость здесь
+    /// задаётся один раз на всю систему. Токен возвращается открытым
+    /// ровно один раз — в базе остаётся только хеш, и утечка файла базы
+    /// не отдаёт доступ к API (§14).
+    async fn issue_token(
+        &self,
+        owner: OwnerId,
+        label: String,
+        scope: Scope,
+    ) -> Result<IssuedToken, AppError> {
+        // Секрет порождается до ухода в блокирующую задачу: отказ
+        // источника случайности не должен выглядеть как отказ базы.
+        let token = secret_hex(32)?;
+        let hash = hash_token(&token);
+        let record = TokenRecord {
+            id: Uuid::new_v4(),
+            owner,
+            label: label.clone(),
+            scope: scope_to_store(scope),
+            revoked: false,
+        };
+        let id = record.id;
+        self.blocking(move |store| store.insert_token(&record, &hash).map_err(store_error))
+            .await?;
+        Ok(IssuedToken {
+            id,
+            token,
+            label,
+            scope,
+        })
+    }
+
+    async fn list_tokens(&self, owner: OwnerId) -> Result<Vec<TokenView>, AppError> {
+        self.blocking(move |store| {
+            let tokens = store.list_tokens(owner).map_err(store_error)?;
+            Ok(tokens
+                .into_iter()
+                .map(|token| TokenView {
+                    id: token.id,
+                    label: token.label,
+                    scope: scope_from_store(token.scope),
+                    created_at: token.created_at,
+                    revoked_at: token.revoked_at,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    async fn revoke_token(&self, owner: OwnerId, id: Uuid) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store.revoke_token(owner, id).map_err(|error| {
+                // Отсутствующий токен — ошибка запроса, а не сбой
+                // хранилища: повтор её не исправит. Чужой токен даёт
+                // тот же ответ намеренно — иначе он сообщал бы
+                // постороннему, что такая запись существует (§14).
+                match error {
+                    iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
+                        what: "токен",
                         id: id.to_string(),
                     },
                     other => store_error(other),

@@ -15,7 +15,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
-use iaam_app::ports::{BrokerVault, Clock};
+use iaam_app::ports::{BrokerVault, Clock, TokenAdmin};
 use iaam_broker::credentials::Key;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
 use iaam_server::auth::hash_token;
@@ -129,9 +129,11 @@ fn harness_with(store: SqliteStore) -> Harness {
         Some(Key::from_bytes([7; 32])),
     ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
+    let tokens: Arc<dyn TokenAdmin> = adapter.clone();
     let services = Arc::new(AppServices::new(
         adapter,
         broker,
+        tokens,
         Arc::new(FixedClock(date!(2026 - 01 - 01))),
     ));
     let state = ServerState::new(
@@ -198,6 +200,66 @@ fn post(path: &str, token: &str, body: &Value) -> Request<Body> {
         .header("Content-Type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("запрос")
+}
+
+/// Запрос без токена: присвоение экземпляра зовут тогда, когда токена
+/// ещё нет и взять его неоткуда.
+fn post_public(path: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .method("POST")
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("запрос")
+}
+
+/// Стенд без владельца: экземпляр ещё не присвоен.
+///
+/// Отдельный стенд, а не признак у общего: в общем владелец заведён
+/// с первой строки, и присваивать там нечего. Код присвоения берётся
+/// из той же функции, которой его порождает точка сборки, — иначе тест
+/// проверял бы не тот путь, которым код попадает к человеку.
+async fn unclaimed_harness() -> (Router, String) {
+    unclaimed_harness_with(SqliteStore::open_in_memory().expect("база в памяти")).await
+}
+
+/// Тот же стенд на базе файлом: проверка того, что владелец завёлся
+/// **помимо** присвоения, требует второго соединения к той же базе.
+async fn unclaimed_harness_on_disk() -> (Router, String, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("iaam-claim-{}.db", Uuid::new_v4()));
+    let store = SqliteStore::open(&path).expect("база файлом");
+    let (router, code) = unclaimed_harness_with(store).await;
+    (router, code, path)
+}
+
+async fn unclaimed_harness_with(store: SqliteStore) -> (Router, String) {
+    let state = claim_state(store);
+    let code = iaam_server::claim::arm(&state)
+        .await
+        .expect("состояние базы прочитано")
+        .expect("владельца нет — код присвоения обязан быть порождён");
+    let (router, _) = build(state);
+    (router, code)
+}
+
+/// Состояние сервера поверх готовой базы.
+///
+/// Общее для стендов присвоения: собирать его в каждом означало бы,
+/// что тесты проверяют разные сборки одного и того же.
+fn claim_state(store: SqliteStore) -> ServerState {
+    let adapter = Arc::new(SqliteAdapter::new(store));
+    let broker: Arc<dyn BrokerVault> = adapter.clone();
+    let tokens: Arc<dyn TokenAdmin> = adapter.clone();
+    let services = Arc::new(AppServices::new(
+        adapter,
+        broker,
+        tokens,
+        Arc::new(FixedClock(date!(2026 - 01 - 01))),
+    ));
+    ServerState::new(
+        services,
+        Arc::new(RateLimiter::new(1_000, Duration::from_secs(60))),
+    )
 }
 
 #[tokio::test]
@@ -1184,4 +1246,358 @@ fn find_access(list: &Value, id: &str) -> Option<Value> {
         .iter()
         .find(|access| access["id"] == id)
         .cloned()
+}
+
+// --- Присвоение экземпляра и управление токенами (§14) ---
+
+#[tokio::test]
+async fn the_printed_code_claims_the_instance_and_the_token_it_gives_works() {
+    // Присвоение — не регистрация: код печатается один раз при старте,
+    // и прочитать его может только тот, кто запустил программу. Доступ
+    // к консоли и есть доказательство права на экземпляр.
+    let (router, code) = unclaimed_harness().await;
+
+    let (status, body) = call(
+        &router,
+        post_public("/v1/claim", &json!({ "code": code, "label": "ноутбук" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["label"], "ноутбук");
+    assert_eq!(body["scope"], "owner");
+    let token = body["token"].as_str().expect("токен владельца").to_owned();
+    assert!(!token.is_empty(), "присвоение обязано выдать токен: {body}");
+
+    // Выданный токен — настоящий: им проходит защищённый запрос.
+    let (status, accounts) = call(&router, get("/v1/accounts", Some(&token))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "токен присвоения обязан пускать: {accounts}"
+    );
+}
+
+#[tokio::test]
+async fn the_same_claim_code_never_works_twice() {
+    // Код одноразовый, и это свойство самого кода: он стирается из
+    // памяти в момент использования. Второй обмен — это либо повтор
+    // запроса, либо чужая рука; различить их нечем, и оба получают
+    // тот же отказ, что и неверный код.
+    let (router, code) = unclaimed_harness().await;
+
+    let (status, body) = call(
+        &router,
+        post_public("/v1/claim", &json!({ "code": code, "label": "ноутбук" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = call(
+        &router,
+        post_public("/v1/claim", &json!({ "code": code, "label": "ещё раз" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "claim_refused");
+}
+
+#[tokio::test]
+async fn a_wrong_claim_code_is_refused_and_does_not_burn_the_right_one() {
+    // Неверный код не стирает верный: иначе любой посторонний одним
+    // запросом с мусором закрывал бы присвоение навсегда.
+    let (router, code) = unclaimed_harness().await;
+
+    let (status, body) = call(
+        &router,
+        post_public("/v1/claim", &json!({ "code": "не тот код", "label": "чужой" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "claim_refused");
+
+    let (status, body) = call(
+        &router,
+        post_public("/v1/claim", &json!({ "code": code, "label": "ноутбук" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "верный код обязан пережить чужую попытку: {body}"
+    );
+}
+
+#[tokio::test]
+async fn claiming_is_closed_once_an_owner_exists_even_with_a_valid_code() {
+    // Владелец мог завестись помимо присвоения — командой консоли уже
+    // после старта, — и напечатанный тогда код устарел. Принять его
+    // значило бы завести второго владельца: пустой портфель в чужой
+    // базе, а у первого пропавшие деньги.
+    let (router, code, path) = unclaimed_harness_on_disk().await;
+
+    {
+        let store = SqliteStore::open(&path).expect("второе соединение");
+        store
+            .insert_token(
+                &TokenRecord {
+                    id: Uuid::new_v4(),
+                    owner: OwnerId::new_random(),
+                    label: "заведён с консоли".into(),
+                    scope: TokenScope::Owner,
+                    revoked: false,
+                },
+                &hash_token("issued-from-the-console"),
+            )
+            .expect("токен владельца");
+    }
+
+    let (status, body) = call(
+        &router,
+        post_public("/v1/claim", &json!({ "code": code, "label": "опоздавший" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "already_claimed");
+}
+
+#[tokio::test]
+async fn an_instance_with_an_owner_generates_no_claim_code_at_all() {
+    // Секрет, который никому не нужен, всё равно остаётся секретом,
+    // лежащим в памяти. Владелец есть — код не порождается вовсе,
+    // и присвоение отвечает отказом на любой предъявленный код.
+    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    store
+        .insert_token(
+            &TokenRecord {
+                id: Uuid::new_v4(),
+                owner: OwnerId::new_random(),
+                label: "владелец".into(),
+                scope: TokenScope::Owner,
+                revoked: false,
+            },
+            &hash_token("owner-secret-token"),
+        )
+        .expect("токен владельца");
+    let state = claim_state(store);
+
+    assert!(
+        iaam_server::claim::arm(&state)
+            .await
+            .expect("состояние базы прочитано")
+            .is_none(),
+        "владелец есть — код присвоения порождаться не должен"
+    );
+
+    let (router, _) = build(state);
+    let (status, body) = call(
+        &router,
+        post_public(
+            "/v1/claim",
+            &json!({ "code": "любой", "label": "посторонний" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "claim_refused");
+}
+
+#[tokio::test]
+async fn an_owner_token_is_never_issued_through_the_api() {
+    // Владелец заводится присвоением экземпляра или консолью. Маршрут,
+    // выпускающий полный доступ, превращал бы один украденный токен
+    // в неотличимые копии, и отзыв исходного ничего бы не менял.
+    let harness = harness();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/tokens",
+            &harness.owner_token,
+            &json!({ "label": "второй владелец", "scope": "owner" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["field"], "scope");
+    assert_eq!(body["actual"], "owner");
+}
+
+#[tokio::test]
+async fn an_agent_token_may_not_manage_tokens_at_all() {
+    // Агент отправляет операции, но не раздаёт права на портфель:
+    // иначе украденный агентский токен выписывал бы себе замену
+    // быстрее, чем владелец успевал бы его отозвать.
+    let harness = harness();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/tokens",
+            &harness.agent_token,
+            &json!({ "label": "ещё агент", "scope": "agent" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden");
+
+    let (status, body) = call(&harness.router, get("/v1/tokens", Some(&harness.agent_token))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/tokens/{}", Uuid::new_v4()),
+            &harness.agent_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn the_token_list_carries_neither_tokens_nor_their_hashes() {
+    // Хеш — это то, что достаточно подставить в запрос поиска, чтобы
+    // система признала предъявителя своим. Список выданных токенов,
+    // показывающий хеши, был бы списком отмычек. Проверка подстрокой
+    // по всему телу, а не по полям: поле, добавленное завтра, глазами
+    // не проверяется.
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/tokens",
+            &harness.owner_token,
+            &json!({ "label": "домашний агент", "scope": "agent" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let issued = created["token"].as_str().expect("токен").to_owned();
+
+    let (status, list) = call(&harness.router, get("/v1/tokens", Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let body = list.to_string();
+
+    assert!(
+        body.contains("домашний агент"),
+        "выданный токен обязан быть в списке: {body}"
+    );
+    for secret in [&issued, &harness.owner_token, &harness.agent_token] {
+        assert!(
+            !body.contains(secret.as_str()),
+            "токен утёк в список выданных токенов: {body}"
+        );
+        assert!(
+            !body.contains(&hash_token(secret)),
+            "хеш токена утёк в список выданных токенов: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_revoked_token_stops_being_accepted_and_stays_in_the_history() {
+    // Отзыв — это не удаление: запись остаётся историей, но перестаёт
+    // пускать. Пропавшая из списка запись отвечала бы «токена не было»,
+    // а не «токен отозван тогда-то».
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/tokens",
+            &harness.owner_token,
+            &json!({ "label": "телефон", "scope": "read_only" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("идентификатор").to_owned();
+    let token = created["token"].as_str().expect("токен").to_owned();
+
+    let (status, accounts) = call(&harness.router, get("/v1/accounts", Some(&token))).await;
+    assert_eq!(status, StatusCode::OK, "выпущенный токен пускает: {accounts}");
+
+    let (status, body) = call(
+        &harness.router,
+        delete(&format!("/v1/tokens/{id}"), &harness.owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, body) = call(&harness.router, get("/v1/accounts", Some(&token))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "отозванный токен не пускает: {body}"
+    );
+
+    let (status, list) = call(&harness.router, get("/v1/tokens", Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = find_access(&list, &id).expect("отозванный токен остаётся историей");
+    assert!(
+        !listed["revoked_at"].is_null(),
+        "отозванный токен перестаёт быть действующим: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
+    // Идентификатор токена не является правом на него: без владельца
+    // в запросе отзыва любой знающий чужой идентификатор отзывал бы
+    // чужой токен. Ответ одинаков с «нет такого» намеренно — разные
+    // сообщили бы постороннему, что запись существует (§14).
+    let (harness, path) = harness_on_disk();
+
+    // Токен второго владельца заводится вторым соединением к той же
+    // базе: через API его не завести — владелец в системе один, и это
+    // ровно то состояние, в котором чужой токен вообще может появиться.
+    let stranger_token = "stranger-secret-token";
+    let stranger = TokenRecord {
+        id: Uuid::new_v4(),
+        owner: OwnerId::new_random(),
+        label: "чужой".into(),
+        scope: TokenScope::Agent,
+        revoked: false,
+    };
+    {
+        let store = SqliteStore::open(&path).expect("второе соединение");
+        store
+            .insert_token(&stranger, &hash_token(stranger_token))
+            .expect("чужой токен");
+    }
+
+    let (status, body) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/tokens/{}", stranger.id),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "not_found");
+
+    // Отсутствующий токен отвечает ровно тем же: отличить одно
+    // от другого по ответу нельзя.
+    let (missing, body) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/tokens/{}", Uuid::new_v4()),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(missing, status, "{body}");
+
+    // И чужой токен остался действующим: отказ обязан быть отказом,
+    // а не «не сказали, но сделали».
+    let (status, accounts) = call(&harness.router, get("/v1/accounts", Some(stranger_token))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "чужой токен не отозван чужими руками: {accounts}"
+    );
 }

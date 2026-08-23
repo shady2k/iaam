@@ -44,6 +44,12 @@ pub enum AppError {
     /// сервера, другое — повтором запроса.
     #[error("{what} не настроено")]
     NotConfigured { what: &'static str },
+    /// Системный источник случайности отказал. Отдельно от `Store`,
+    /// потому что это не сбой хранилища и чинится не повтором запроса,
+    /// а состоянием машины; и отдельно потому, что выдать секрет,
+    /// полученный неизвестно чем, нельзя ни при каких условиях (§14).
+    #[error("источник случайности недоступен: {0}")]
+    Random(String),
 }
 
 impl From<ObserveError> for AppError {
@@ -85,6 +91,7 @@ impl AppError {
             Self::Reconciliation(_) => "reconciliation_failed",
             Self::Perimeter(_) => "perimeter_assessment_failed",
             Self::NotConfigured { .. } => "not_configured",
+            Self::Random(_) => "random_unavailable",
         }
     }
 }
@@ -137,6 +144,10 @@ mod tests {
             }
             .code(),
             "not_configured"
+        );
+        assert_eq!(
+            AppError::Random("источник закрыт".into()).code(),
+            "random_unavailable"
         );
     }
 }

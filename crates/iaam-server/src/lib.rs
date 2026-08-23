@@ -6,13 +6,14 @@
 //! в ответах API, является ошибкой.
 
 pub mod auth;
+pub mod claim;
 pub mod dto;
 pub mod error;
 pub mod openapi;
 pub mod rate_limit;
 pub mod routes;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::routing::get;
 use axum::{Json, Router, middleware};
@@ -21,6 +22,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::claim::ClaimCode;
 use crate::openapi::ApiDoc;
 use crate::rate_limit::RateLimiter;
 
@@ -29,19 +31,70 @@ use crate::rate_limit::RateLimiter;
 pub struct ServerState {
     pub services: Arc<AppServices>,
     pub limiter: Arc<RateLimiter>,
+    /// Код присвоения экземпляра. `None` — присваивать нечего:
+    /// владелец либо уже есть, либо код уже использован.
+    ///
+    /// В памяти процесса и только в ней: утечка файла базы не должна
+    /// отдавать экземпляр (§14). Мьютекс стандартный, а не `tokio`:
+    /// под ним не ждут ввода-вывода, а `Option` меняется одной
+    /// операцией — асинхронный мьютекс здесь стоил бы дороже, чем даёт.
+    claim: Arc<Mutex<Option<ClaimCode>>>,
 }
 
 impl ServerState {
     #[must_use]
     pub fn new(services: Arc<AppServices>, limiter: Arc<RateLimiter>) -> Self {
-        Self { services, limiter }
+        Self {
+            services,
+            limiter,
+            claim: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Взвести код присвоения. Зовётся при старте — см. `claim::arm`.
+    pub fn arm_claim(&self, code: ClaimCode) {
+        *self.locked_claim() = Some(code);
+    }
+
+    /// Принять код, если он верен, и **стереть** его.
+    ///
+    /// Проверка и стирание — одна операция под одним замком: разделив
+    /// их, два одновременных запроса с верным кодом получили бы по
+    /// токену владельца каждый. Неверный код кода не стирает: иначе
+    /// любой посторонний одним запросом с мусором закрывал бы
+    /// присвоение навсегда.
+    pub fn accept_claim(&self, code: &str) -> bool {
+        let mut guard = self.locked_claim();
+        match guard.as_ref() {
+            Some(stored) if stored.accepts(code) => {
+                *guard = None;
+                true
+            }
+            Some(_) | None => false,
+        }
+    }
+
+    /// Замок над кодом присвоения.
+    ///
+    /// Отравленный мьютекс восстанавливается, а не приводит к панике:
+    /// паника в одном запросе не должна выводить из строя весь сервис,
+    /// а `Option<ClaimCode>` паника предыдущего вызова не повреждает.
+    fn locked_claim(&self) -> std::sync::MutexGuard<'_, Option<ClaimCode>> {
+        match self.claim.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
 /// Сборка приложения axum вместе с порождённой спекой.
 ///
-/// Публичным остаётся только `/v1/health` и сама спека: аутентификация
-/// с первого дня, и отложенной она не станет никогда (§14).
+/// Публичными остаются `/v1/health`, сама спека и присвоение
+/// экземпляра: аутентификация с первого дня, и отложенной она не станет
+/// никогда (§14). Присвоение — исключение по необходимости, а не по
+/// слабости: токена у того, кто присваивает, ещё нет, и позвать
+/// защищённый маршрут ему нечем. Вместо токена его пускает одноразовый
+/// код, прочитанный с консоли, — см. `claim`.
 pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
     let protected = OpenApiRouter::new()
         .routes(routes!(routes::list_accounts, routes::create_account))
@@ -50,6 +103,8 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
             routes::add_broker_access
         ))
         .routes(routes!(routes::revoke_broker_access))
+        .routes(routes!(routes::list_tokens, routes::create_token))
+        .routes(routes!(routes::revoke_token))
         .routes(routes!(routes::create_contour_version))
         .routes(routes!(routes::ingest_operations))
         .routes(routes!(routes::ingest_csv))
@@ -64,6 +119,7 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(routes::health))
+        .routes(routes!(routes::claim))
         .merge(protected)
         .split_for_parts();
 

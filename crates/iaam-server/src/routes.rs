@@ -12,11 +12,11 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{SubmittedOperation, Verdict};
-use iaam_app::ports::{AccountView, Principal};
+use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
 use iaam_app::scenarios::ingest::submit_operations;
 use iaam_app::scenarios::reports::{ReturnsQuery, returns};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{AccountId, SourceId};
+use iaam_core::ids::{AccountId, OwnerId, SourceId};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::PROJECTION_VERSION;
 use iaam_core::rules::LotRuleVersion;
@@ -30,9 +30,10 @@ use zeroize::Zeroizing;
 
 use crate::ServerState;
 use crate::dto::{
-    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, ContourVersionDto, CreateAccountRequest,
-    CreateContourVersionRequest, CurrencyDto, FxRateDto, HealthDto, ReturnsReportDto,
-    SubmitOperationsRequest, VerdictDto,
+    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, ClaimRequest, ContourVersionDto,
+    CreateAccountRequest, CreateContourVersionRequest, CreateTokenRequest, CurrencyDto, FxRateDto,
+    HealthDto, IssuedTokenDto, ReturnsReportDto, SubmitOperationsRequest, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 
@@ -199,6 +200,191 @@ pub async fn revoke_broker_access(
         .services
         .broker
         .revoke_access(principal.owner, id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Присвоение экземпляра.
+///
+/// **Единственный маршрут без аутентификации, кроме `/v1/health`.**
+/// Иначе и быть не может: токена у присваивающего ещё нет, и позвать
+/// защищённый маршрут ему нечем. Вместо токена его пускает одноразовый
+/// код, напечатанный при старте в консоль, — то есть доказательством
+/// служит доступ к машине, а не знание чего-либо пересылаемого.
+///
+/// Открытой регистрации здесь не будет никогда: второй пришедший завёл
+/// бы себе пустой портфель в чужой базе. Владелец уже есть — присвоение
+/// закрыто навсегда.
+#[utoipa::path(
+    post,
+    path = "/v1/claim",
+    request_body = ClaimRequest,
+    responses(
+        (status = 201, description = "Экземпляр присвоен", body = IssuedTokenDto),
+        (status = 403, description = "Код неверен, просрочен или уже использован", body = ApiError),
+        (status = 409, description = "Владелец уже есть: присвоение закрыто", body = ApiError)
+    )
+)]
+pub async fn claim(
+    State(state): State<ServerState>,
+    Json(request): Json<ClaimRequest>,
+) -> Result<(StatusCode, Json<IssuedTokenDto>), ApiFailure> {
+    // Код проверяется до состояния базы: одноразовость — свойство
+    // самого кода, а не следствие того, что владелец завёлся. Проверка
+    // и стирание идут одной операцией под одним замком — разделив их,
+    // два одновременных запроса с верным кодом получили бы по токену
+    // владельца каждый.
+    if !state.accept_claim(&request.code) {
+        // Неверный, просроченный и уже использованный код дают
+        // **одинаковый** ответ: разные сообщили бы, что код угадан
+        // наполовину (§14).
+        return Err(claim_refused());
+    }
+
+    // Код был верен, но владелец успел появиться — например, его завели
+    // с консоли уже после старта, и напечатанный код устарел. Присвоение
+    // закрыто навсегда: второй владелец в однопользовательской системе
+    // означает пустой портфель в чужой базе. Код при этом уже истрачен,
+    // и это не потеря — присваивать всё равно нечего.
+    match state.services.tokens.sole_owner().await? {
+        SoleOwner::None => {}
+        SoleOwner::Single(_) | SoleOwner::Several => {
+            return Err(ApiFailure::new(
+                StatusCode::CONFLICT,
+                ApiError::simple(
+                    "already_claimed",
+                    "экземпляр уже присвоен: потерянный токен восстанавливается с консоли",
+                ),
+            ));
+        }
+    }
+
+    // Владелец заводится здесь и только здесь через API: дальше он
+    // существует, и второго присвоения не будет.
+    let issued = state
+        .services
+        .tokens
+        .issue_token(OwnerId::new_random(), request.label, Scope::Owner)
+        .await?;
+    Ok((StatusCode::CREATED, Json(IssuedTokenDto::from_domain(issued))))
+}
+
+/// Отказ в присвоении.
+///
+/// Один текст на три разные причины намеренно: сообщение, различающее
+/// «код не тот» и «код просрочен», подтверждает угадавшему, что он
+/// угадал (§14).
+fn claim_refused() -> ApiFailure {
+    ApiFailure::new(
+        StatusCode::FORBIDDEN,
+        ApiError::simple(
+            "claim_refused",
+            "код присвоения не принят: неверен, просрочен или уже использован",
+        ),
+    )
+}
+
+/// Выпуск токена.
+///
+/// Токен показывается **один раз**: в базе остаётся только его хеш,
+/// и повторить показ неоткуда (§14).
+#[utoipa::path(
+    post,
+    path = "/v1/tokens",
+    request_body = CreateTokenRequest,
+    responses(
+        (status = 201, description = "Токен выпущен и показан один раз", body = IssuedTokenDto),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 422, description = "Область owner через API не выпускается", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_token(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<IssuedTokenDto>), ApiFailure> {
+    require_admin(&principal)?;
+    let scope = match request.scope {
+        // Полный доступ через API не выпускается: владелец заводится
+        // присвоением экземпляра или консолью. Иначе украденный токен
+        // владельца немедленно размножался бы в неотличимые копии,
+        // и отзыв исходного ничего бы не менял.
+        TokenScopeDto::Owner => {
+            return Err(ApiFailure::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiError {
+                    code: "invalid_request".into(),
+                    message: "токен владельца через API не выпускается: владелец заводится \
+                              присвоением экземпляра или командой консоли"
+                        .into(),
+                    field: Some("scope".into()),
+                    expected: Some("agent или read_only".into()),
+                    actual: Some("owner".into()),
+                    correlation_id: None,
+                },
+            ));
+        }
+        TokenScopeDto::Agent => Scope::Agent,
+        TokenScopeDto::ReadOnly => Scope::ReadOnly,
+    };
+    let issued = state
+        .services
+        .tokens
+        .issue_token(principal.owner, request.label, scope)
+        .await?;
+    Ok((StatusCode::CREATED, Json(IssuedTokenDto::from_domain(issued))))
+}
+
+/// Список выданных токенов.
+///
+/// Ни токенов, ни их хешей в ответе нет и быть не может: хеш — это то,
+/// что достаточно подставить в запрос поиска, чтобы система признала
+/// предъявителя своим. Отозванные показываются: «когда токен перестал
+/// пускать» является вопросом, на который нужен ответ.
+#[utoipa::path(
+    get,
+    path = "/v1/tokens",
+    responses(
+        (status = 200, description = "Токены владельца", body = Vec<TokenDto>),
+        (status = 403, description = "Недостаточно прав", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_tokens(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<TokenDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let tokens = state.services.tokens.list_tokens(principal.owner).await?;
+    Ok(Json(tokens.into_iter().map(TokenDto::from_domain).collect()))
+}
+
+/// Отзыв токена.
+///
+/// Отсутствующий и чужой токен дают одинаковый `404` намеренно: разные
+/// ответы сообщили бы постороннему, что такая запись есть (§14).
+#[utoipa::path(
+    delete,
+    path = "/v1/tokens/{id}",
+    params(("id" = Uuid, Path, description = "Идентификатор выданного токена")),
+    responses(
+        (status = 204, description = "Токен отозван"),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 404, description = "Токена нет или он чужой", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn revoke_token(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiFailure> {
+    require_admin(&principal)?;
+    state
+        .services
+        .tokens
+        .revoke_token(principal.owner, id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -157,6 +157,7 @@ impl World {
                 instrument,
                 quantity: qty(units),
                 cost_basis: None,
+                assertions: iaam_core::event::kind::OpeningAssertions::default(),
             },
             vec![Leg::security(account, custody, instrument, qty(units))],
         )

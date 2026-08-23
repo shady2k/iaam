@@ -3,7 +3,7 @@
 use iaam_core::dates::{
     CashPostedDate, EffectiveOrder, EventDates, PaidDate, SettledDate, TradeDate,
 };
-use iaam_core::event::kind::{EventKind, FeeOrigin, TradeSide};
+use iaam_core::event::kind::{EventKind, FeeOrigin, OpeningAssertions, TradeSide};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
@@ -98,6 +98,15 @@ pub enum OperationKind {
         quantity: Dec,
         cost_basis_minor: Option<i64>,
         currency: CurrencyCode,
+        /// Что владелец знает о восстановленной позиции (§10.7).
+        ///
+        /// Отсутствие — «ничего не сказано»: приёмка подставляет
+        /// умолчание, в котором всё неизвестно, и **не выводит**
+        /// уверенность из наличия других полей. Присланная стоимость
+        /// не делает налоговую базу документированной: документ
+        /// подтверждает человек, а не факт заполнения поля.
+        #[serde(default)]
+        assertions: Option<OpeningAssertions>,
     },
     Valuation {
         instrument: InstrumentId,
@@ -441,6 +450,7 @@ fn build(
             quantity,
             cost_basis_minor,
             currency,
+            assertions,
         } => {
             let cost_basis = match cost_basis_minor {
                 Some(value) => Some(money(positive(*value, "cost_basis", *currency)?, *currency)),
@@ -451,6 +461,7 @@ fn build(
                     instrument: *instrument,
                     quantity: Quantity(*quantity),
                     cost_basis,
+                    assertions: assertions.unwrap_or_default(),
                 },
                 vec![Leg::security(
                     account,

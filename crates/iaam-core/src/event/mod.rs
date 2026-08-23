@@ -1507,6 +1507,7 @@ mod tests {
                 instrument,
                 quantity: qty(100),
                 cost_basis: Some(rub(5_000_000)),
+                assertions: kind::OpeningAssertions::default(),
             },
             vec![security_leg(acc, instrument, qty(100))],
             acc,
@@ -1525,6 +1526,7 @@ mod tests {
                 instrument,
                 quantity: qty(100),
                 cost_basis: None,
+                assertions: kind::OpeningAssertions::default(),
             },
             vec![
                 Leg::cash(acc, rub(-5_000_000)),
@@ -1546,6 +1548,7 @@ mod tests {
             instrument,
             quantity: qty(100),
             cost_basis: None,
+            assertions: kind::OpeningAssertions::default(),
         };
         let none = event(kind.clone(), vec![], acc);
         assert!(matches!(
@@ -1705,6 +1708,7 @@ mod tests {
                 instrument,
                 quantity: qty(100),
                 cost_basis: None,
+                assertions: kind::OpeningAssertions::default(),
             },
             vec![security_leg(acc, instrument, qty(100))],
             acc,
@@ -1997,6 +2001,7 @@ mod tests {
                 instrument,
                 quantity: qty(10),
                 cost_basis: None,
+                assertions: kind::OpeningAssertions::default(),
             },
             vec![security_leg(acc, instrument, qty(11))],
             acc,
@@ -2014,6 +2019,7 @@ mod tests {
                 instrument,
                 quantity: qty(10),
                 cost_basis: None,
+                assertions: kind::OpeningAssertions::default(),
             },
             vec![security_leg(acc, other, qty(10))],
             acc,
@@ -2031,6 +2037,7 @@ mod tests {
                 instrument,
                 quantity: Quantity::zero(),
                 cost_basis: None,
+                assertions: kind::OpeningAssertions::default(),
             },
             vec![security_leg(acc, instrument, Quantity::zero())],
             acc,

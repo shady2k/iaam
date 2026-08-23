@@ -116,6 +116,7 @@ fn every_kind() -> Vec<Event> {
                 instrument,
                 quantity: qty(3),
                 cost_basis: None,
+                assertions: iaam_core::event::kind::OpeningAssertions::default(),
             },
             vec![Leg::security(account, custody, instrument, qty(3))],
         ),

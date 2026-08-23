@@ -13,6 +13,95 @@ use crate::numeric::decimal::Dec;
 use crate::reconciliation::claim::{AssertionPeriod, ControlClaim};
 use crate::valuation::PriceQuality;
 
+/// Уверенность в количестве (§10.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Certainty {
+    Known,
+    Estimated,
+}
+
+/// Уверенность в дате приобретения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DateCertainty {
+    Known,
+    Estimated,
+    Unknown,
+}
+
+/// Уверенность в налоговой стоимости.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BasisCertainty {
+    Documented,
+    Estimated,
+    Unknown,
+}
+
+/// Троичный ответ. `Unknown` — полноценное значение, а не «нет» (§4.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tristate {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// Известно ли что-то вообще.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Knowledge {
+    Known,
+    Unknown,
+}
+
+/// Восстановленное начало как **набор утверждений с уверенностью**
+/// (§10.7), а не строка с ценой.
+///
+/// Умолчание — «неизвестно» по каждому пункту. Это не заглушка: событие,
+/// записанное до появления этого поля, действительно ничего из
+/// перечисленного не утверждало, и приписать ему `Known` значило бы
+/// задним числом объявить документированным то, чего никто не видел.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpeningAssertions {
+    pub quantity: Certainty,
+    pub acquisition_date: Option<time::Date>,
+    pub acquisition_date_certainty: DateCertainty,
+    pub tax_basis: BasisCertainty,
+    pub basis_currency: Option<CurrencyCode>,
+    pub basis_rate: Option<Dec>,
+    pub fees_included: Tristate,
+    pub ldv_eligibility: Knowledge,
+    pub prior_corporate_actions: Knowledge,
+}
+
+impl Default for OpeningAssertions {
+    fn default() -> Self {
+        Self {
+            // Количество восстановленной позиции — оценка, пока владелец
+            // не сказал иного: «известно» по умолчанию означало бы, что
+            // система сама подтвердила то, что ей продиктовали.
+            quantity: Certainty::Estimated,
+            acquisition_date: None,
+            acquisition_date_certainty: DateCertainty::Unknown,
+            tax_basis: BasisCertainty::Unknown,
+            basis_currency: None,
+            basis_rate: None,
+            fees_included: Tristate::Unknown,
+            ldv_eligibility: Knowledge::Unknown,
+            prior_corporate_actions: Knowledge::Unknown,
+        }
+    }
+}
+
+impl OpeningAssertions {
+    /// Достаточно ли известно, чтобы считать налоговую стоимость.
+    ///
+    /// Используется отчётом: если стоимость неизвестна, налоговый отчёт
+    /// обязан вернуть диапазон или `not_computable`, но не точную цифру
+    /// (§10.7). Сам расчёт появится в E5.
+    #[must_use]
+    pub const fn basis_is_documented(&self) -> bool {
+        matches!(self.tax_basis, BasisCertainty::Documented)
+    }
+}
+
 /// Направление сделки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TradeSide {
@@ -64,6 +153,14 @@ pub enum EventKind {
         instrument: InstrumentId,
         quantity: Quantity,
         cost_basis: Option<Money>,
+        /// Набор утверждений о восстановленном начале (§10.7).
+        ///
+        /// `#[serde(default)]` обязателен: журнал append-only, и уже
+        /// записанные события этого поля не содержат. Отсутствие поля
+        /// означает «ничего из этого не утверждалось», а не выдуманные
+        /// значения.
+        #[serde(default)]
+        assertions: OpeningAssertions,
     },
     /// Восстановленный денежный остаток.
     OpeningCash { amount: Money },
@@ -199,6 +296,7 @@ mod tests {
             instrument: InstrumentId::new_random(),
             quantity: Quantity::zero(),
             cost_basis: None,
+            assertions: OpeningAssertions::default(),
         }
     }
 

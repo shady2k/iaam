@@ -436,6 +436,7 @@ mod tests {
                 instrument,
                 quantity,
                 cost_basis: None,
+                assertions: crate::event::kind::OpeningAssertions::default(),
             },
             vec![Leg::security(account, custody, instrument, quantity)],
         )];

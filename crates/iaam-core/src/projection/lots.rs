@@ -227,10 +227,15 @@ impl LotBook {
                 },
                 rules,
             ),
+            // Утверждения восстановленного начала (§10.7) книгу лотов
+            // не меняют: они описывают, насколько можно верить
+            // количеству и стоимости, а не сами величины. Читает их
+            // отчёт о качестве данных.
             EventKind::OpeningPosition {
                 instrument,
                 quantity,
                 cost_basis,
+                assertions: _,
             } => self.restore(event, *instrument, *quantity, *cost_basis),
             EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
@@ -605,6 +610,7 @@ mod tests {
                 instrument: trade.instrument,
                 quantity: qty(50),
                 cost_basis: None,
+                assertions: crate::event::kind::OpeningAssertions::default(),
             },
             vec![Leg::security(
                 trade.account,

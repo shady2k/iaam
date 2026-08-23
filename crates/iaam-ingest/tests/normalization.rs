@@ -92,6 +92,7 @@ fn all_kinds() -> Vec<OperationKind> {
             quantity,
             cost_basis_minor: None,
             currency: CurrencyCode::Rub,
+            assertions: None,
         },
         OperationKind::Valuation {
             instrument,

@@ -369,6 +369,13 @@ impl OperationDto {
                 quantity: Dec::new(decimal(quantity, "quantity")?),
                 cost_basis_minor: optional_minor(cost_basis.as_ref(), *currency, "cost_basis")?,
                 currency: currency.to_domain(),
+                // Утверждения о восстановленном начале (§10.7) через
+                // транспорт пока не принимаются: их DTO появится вместе
+                // с остальными маршрутами приёмки. `None` означает
+                // «владелец ничего не утверждал», и приёмка подставит
+                // умолчание, в котором всё неизвестно, — а не выдумает
+                // уверенность из наличия стоимости.
+                assertions: None,
             },
             OperationKindDto::Valuation {
                 instrument,

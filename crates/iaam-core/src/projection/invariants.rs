@@ -176,6 +176,8 @@ mod tests {
     use crate::ids::{AccountId, CustodyId, InstrumentId};
     use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
     use crate::numeric::decimal::Dec;
+    use crate::projection::lots::LotBook;
+    use crate::projection::state::LedgerState;
     use crate::projection::{ProjectionContext, project};
     use crate::rules::{LotRuleVersion, RuleRegistry};
     use rust_decimal::Decimal;
@@ -353,6 +355,77 @@ mod tests {
                 CheckedInvariant::FlowsNonZero { flows: 0 },
             ]
         );
+    }
+
+    #[test]
+    fn lots_disagreeing_with_positions_abort_the_projection() {
+        // §15.2: нарушенный инвариант отменяет отчёт целиком, а не
+        // помечает его предупреждением. Две независимые дороги к одному
+        // количеству — позиция по ногам события и сумма лотов по типу
+        // события и правилу списания — обязаны сходиться; расхождение
+        // означает, что одна из них врёт, и какая именно, неизвестно.
+        //
+        // Расхождение строится вручную, потому что через журнал его
+        // больше не получить: структурная проверка сверяет ногу с
+        // событием и не пропускает противоречие в журнал вовсе. Это
+        // правильно и делает инвариант вторым рубежом, а не первым, —
+        // но второй рубеж, который никто не проверял, рубежом не является.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let mut state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+
+        // Настоящая покупка: она ложится и в остатки, и в книгу лотов.
+        let rules = RuleRegistry::with_defaults();
+        let purchase = event_with(
+            account,
+            date!(2025 - 04 - 01),
+            1,
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity: qty(10),
+                gross: rub(1_000_000),
+                fee: None,
+                accrued_interest: None,
+            },
+            vec![
+                Leg::cash(account, rub(-1_000_000)),
+                Leg::security(account, custody, instrument, qty(10)),
+            ],
+        );
+        {
+            let (balances, book, _) = state.parts_mut();
+            balances.apply(&purchase).expect("остатки");
+            book.apply(&purchase, &rules).expect("лоты");
+        }
+
+        // А теперь бумага «появилась» на счёте мимо книги лотов — ровно
+        // то, что даёт задвоенная нога или потерянная запись о продаже.
+        let phantom = event_with(
+            account,
+            date!(2025 - 04 - 02),
+            2,
+            EventKind::CashIn { amount: rub(1) },
+            vec![Leg::security(account, custody, instrument, qty(5))],
+        );
+        {
+            let (balances, _, _) = state.parts_mut();
+            balances.apply(&phantom).expect("нога применяется");
+        }
+
+        let verdict = check(&state, &[]);
+        let violation = verdict.expect_err("расхождение обязано отменить проекцию");
+        assert!(matches!(
+            violation,
+            InvariantViolation::LotsDoNotMatchPosition { .. }
+        ));
+        assert_eq!(violation.code(), "lots_do_not_match_position");
+
+        // И наверх это уходит именно как нарушение инварианта, а не как
+        // неполнота данных: первое отменяет отчёт, второе помечает
+        // величину невычислимой.
+        assert!(crate::projection::ProjectionError::from(violation).is_invariant_violation());
     }
 
     #[test]

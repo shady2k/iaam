@@ -14,7 +14,9 @@
 //! общая ошибка исказила бы обе стороны, и сверка её не заметила бы
 //! (§10.3). Заслон на это ставится задачей 21.
 
+pub mod finam;
 pub mod sections;
+pub mod tinkoff;
 pub mod workbook;
 
 use iaam_core::event::provenance::{ParserVersion, RowLocator};

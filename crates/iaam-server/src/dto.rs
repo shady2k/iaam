@@ -1368,3 +1368,37 @@ pub struct BrokerAccessUpdateRequest {
     pub environment: BrokerEnvironmentDto,
     pub token: String,
 }
+
+/// Инструмент справочника.
+///
+/// Поля `source` псевдонима здесь нет намеренно: справочник глобален
+/// и читается всеми, а `SourceId` указывает на документ конкретного
+/// владельца (§14).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InstrumentDto {
+    pub id: String,
+    /// `null` — род не установлен; такой инструмент оценивается
+    /// как неполный (§4.9, §5.4).
+    pub kind: Option<String>,
+    pub symbol: String,
+    pub title: String,
+    pub denomination_currency: String,
+    pub settlement_currency: String,
+    pub quote_currency: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResolveInstrumentRequest {
+    pub namespace: String,
+    pub value: String,
+    /// Дата документа. Обязательна: ISIN меняется, и «текущего»
+    /// ответа не существует (§4.7).
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub on: Date,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResolvedInstrumentDto {
+    pub instrument: String,
+}

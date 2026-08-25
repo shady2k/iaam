@@ -46,6 +46,12 @@ pub struct AppServices {
 }
 
 impl AppServices {
+    /// Сборка с умолчаниями для необязательных портов.
+    ///
+    /// Конструктора со всеми семью портами нет намеренно: поля структуры
+    /// публичны, и литерал с именованными полями читается лучше
+    /// позиционного вызова, а перестановку двух портов одного вида
+    /// компилятор на литерале заметит по имени поля (§15.1).
     #[must_use]
     pub fn new(
         store: Arc<dyn Store>,
@@ -54,35 +60,14 @@ impl AppServices {
         tokens: Arc<dyn TokenAdmin>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self::with_ports(
-            store,
-            directory,
-            broker,
-            tokens,
-            clock,
-            Arc::new(UnavailableBrokerChannelFactory),
-            Arc::new(UnavailableClassificationRuleStore),
-        )
-    }
-
-    #[must_use]
-    pub fn with_ports(
-        store: Arc<dyn Store>,
-        directory: Arc<dyn InstrumentDirectory>,
-        broker: Arc<dyn BrokerVault>,
-        tokens: Arc<dyn TokenAdmin>,
-        clock: Arc<dyn Clock>,
-        channels: Arc<dyn BrokerChannelFactory>,
-        rules: Arc<dyn ClassificationRuleStore>,
-    ) -> Self {
         Self {
             store,
             directory,
             broker,
             tokens,
             clock,
-            channels,
-            rules,
+            channels: Arc::new(UnavailableBrokerChannelFactory),
+            rules: Arc::new(UnavailableClassificationRuleStore),
         }
     }
 }

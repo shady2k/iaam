@@ -3,7 +3,7 @@
 use iaam_core::ids::{CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
-use iaam_store::reference::{AliasRecord, CustodyRecord, InstrumentRecord};
+use iaam_store::reference::{AliasRecord, AliasRename, CustodyRecord, InstrumentRecord};
 use iaam_store::{ResolveError, SqliteStore};
 use time::macros::date;
 
@@ -115,14 +115,14 @@ fn a_renamed_code_resolves_from_both_sides_of_the_change() {
         .expect("исходный псевдоним");
 
     store
-        .rename_alias(
-            AliasNamespace::Isin,
-            "RU000AOLD001",
-            "RU000ANEW002",
-            date!(2024 - 01 - 01),
+        .rename_alias(&AliasRename {
+            namespace: AliasNamespace::Isin,
+            from: "RU000AOLD001".to_owned(),
+            to: "RU000ANEW002".to_owned(),
+            on: date!(2024 - 01 - 01),
             instrument,
-            SourceId::new_random(),
-        )
+            source: SourceId::new_random(),
+        })
         .expect("смена кода");
 
     let before = store
@@ -148,14 +148,14 @@ fn the_new_code_does_not_resolve_before_the_change() {
         ))
         .expect("исходный псевдоним");
     store
-        .rename_alias(
-            AliasNamespace::Isin,
-            "RU000AOLD001",
-            "RU000ANEW002",
-            date!(2024 - 01 - 01),
+        .rename_alias(&AliasRename {
+            namespace: AliasNamespace::Isin,
+            from: "RU000AOLD001".to_owned(),
+            to: "RU000ANEW002".to_owned(),
+            on: date!(2024 - 01 - 01),
             instrument,
-            SourceId::new_random(),
-        )
+            source: SourceId::new_random(),
+        })
         .expect("смена кода");
 
     let anachronism =

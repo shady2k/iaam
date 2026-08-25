@@ -216,15 +216,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let channels: Arc<dyn BrokerChannelFactory> = adapter.clone();
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
-    let services = Arc::new(AppServices::with_ports(
-        adapter.clone(),
-        adapter,
+    let services = Arc::new(AppServices {
+        store: adapter.clone(),
+        directory: adapter,
         broker,
         tokens,
-        Arc::new(SystemClock),
+        clock: Arc::new(SystemClock),
         channels,
         rules,
-    ));
+    });
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let state = ServerState::new(services, limiter);
 

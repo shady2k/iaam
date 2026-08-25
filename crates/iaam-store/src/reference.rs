@@ -49,6 +49,25 @@ pub struct AliasRecord {
     pub source: SourceId,
 }
 
+/// Смена внешнего кода инструмента.
+///
+/// Структура, а не шесть позиционных аргументов. Дело не только в пороге
+/// clippy: `from` и `to` — два соседних `&str`, которые компилятор
+/// переставленными местами не увидит, а результатом станет псевдоним,
+/// заведённый задом наперёд (§15.1).
+#[derive(Debug, Clone)]
+pub struct AliasRename {
+    pub namespace: AliasNamespace,
+    /// Код, действующий до смены.
+    pub from: String,
+    /// Код, действующий с даты смены.
+    pub to: String,
+    /// Дата смены: старый интервал закрывается ею, новый ею же открывается.
+    pub on: Date,
+    pub instrument: InstrumentId,
+    pub source: SourceId,
+}
+
 /// Дата в хранилище — ISO-8601, как и везде в схеме.
 fn date_to_text(value: Date) -> String {
     value
@@ -217,15 +236,16 @@ impl SqliteStore {
     /// Одна транзакция обязательна: между двумя операциями старый код
     /// уже закрыт, а новый ещё не заведён, и параллельный резолвинг
     /// документа получил бы `Unknown` вместо инструмента.
-    pub fn rename_alias(
-        &mut self,
-        namespace: AliasNamespace,
-        from: &str,
-        to: &str,
-        on: Date,
-        instrument: InstrumentId,
-        source: SourceId,
-    ) -> Result<(), StoreError> {
+    pub fn rename_alias(&mut self, rename: &AliasRename) -> Result<(), StoreError> {
+        let AliasRename {
+            namespace,
+            from,
+            to,
+            on,
+            instrument,
+            source,
+        } = rename;
+        let (namespace, on, instrument, source) = (*namespace, *on, *instrument, *source);
         let transaction = self.conn.transaction()?;
         transaction.execute(
             "UPDATE instrument_aliases SET valid_to = ?1

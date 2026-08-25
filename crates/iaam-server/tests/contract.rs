@@ -195,15 +195,15 @@ fn harness_with_factory(
         channel_factory.unwrap_or_else(|| adapter.clone());
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
-    let services = Arc::new(AppServices::with_ports(
-        adapter.clone(),
-        adapter,
+    let services = Arc::new(AppServices {
+        store: adapter.clone(),
+        directory: adapter,
         broker,
         tokens,
-        Arc::new(FixedClock(date!(2026 - 01 - 01))),
+        clock: Arc::new(FixedClock(date!(2026 - 01 - 01))),
         channels,
         rules,
-    ));
+    });
     let state = ServerState::new(
         services,
         Arc::new(RateLimiter::new(1_000, Duration::from_secs(60))),

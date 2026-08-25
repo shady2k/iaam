@@ -5,10 +5,10 @@
 //! ни в текст ошибки он не попадает — ошибки здесь называют поле
 //! и причину, но никогда значение.
 
-use iaam_broker::credentials::{BrokerScope, Key, seal};
+use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_store::SqliteStore;
-use iaam_store::broker_access::{NewBrokerAccess, SoleOwner};
+use iaam_store::broker_access::{BrokerAccessCiphertext, NewBrokerAccess, SoleOwner};
 use iaam_store::documents::BrokerCode;
 use thiserror::Error;
 use uuid::Uuid;
@@ -25,6 +25,8 @@ pub enum ProvisionError {
     SeveralOwners,
     #[error("доступ не сохранён: {0}")]
     NotStored(#[from] iaam_store::StoreError),
+    #[error("доступ не удалось открыть старым ключом: {0}")]
+    OldKey(#[from] iaam_broker::credentials::CryptoError),
 }
 
 /// Завести доступ к брокеру.
@@ -66,6 +68,32 @@ pub fn add_broker_access(
     };
     store.insert_broker_access(&access)?;
     Ok(access.id)
+}
+
+/// Перешифровать всю историю доступов в одной транзакции хранилища.
+///
+/// Старый ключ используется только до подготовки полного списка новых
+/// шифротекстов. Хранилище ничего не меняет, пока расшифровка каждой
+/// строки не прошла успешно.
+pub fn rotate_broker_access(
+    store: &mut SqliteStore,
+    old_key: &Key,
+    new_key: &Key,
+) -> Result<usize, ProvisionError> {
+    let history = store.all_broker_access_history()?;
+    let mut replacements = Vec::with_capacity(history.len());
+    for access in &history {
+        let sealed = SealedToken::of(access.nonce.clone(), access.ciphertext.clone());
+        let token = open(old_key, &sealed)?;
+        let replacement = seal(new_key, token.expose());
+        replacements.push(BrokerAccessCiphertext {
+            id: access.id,
+            nonce: replacement.nonce().to_vec(),
+            ciphertext: replacement.ciphertext().to_vec(),
+        });
+    }
+    store.rotate_broker_access_ciphertexts(&replacements)?;
+    Ok(replacements.len())
 }
 
 #[cfg(test)]
@@ -201,5 +229,27 @@ mod tests {
             .unwrap_err();
         assert!(!error.to_string().contains(TOKEN));
         assert!(!format!("{error:?}").contains(TOKEN));
+    }
+
+    #[test]
+    fn key_rotation_reencrypts_active_and_revoked_accesses() {
+        let (mut store, owner) = store_with_owner();
+        let old_key = key();
+        let new_key = Key::from_bytes([12; 32]);
+        let first = add_broker_access(&mut store, &old_key, "tinkoff", Environment::Sandbox, TOKEN)
+            .unwrap();
+        store.revoke_broker_access(owner, first).unwrap();
+        add_broker_access(&mut store, &old_key, "tinkoff", Environment::Sandbox, TOKEN).unwrap();
+
+        let rotated = rotate_broker_access(&mut store, &old_key, &new_key).unwrap();
+        assert_eq!(rotated, 2);
+        for entry in store.broker_access_history(owner).unwrap() {
+            let sealed = iaam_broker::credentials::SealedToken::of(
+                entry.nonce.clone(),
+                entry.ciphertext.clone(),
+            );
+            assert_eq!(open(&new_key, &sealed).unwrap().expose(), TOKEN);
+            assert!(open(&old_key, &sealed).is_err());
+        }
     }
 }

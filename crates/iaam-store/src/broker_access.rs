@@ -35,6 +35,17 @@ pub struct NewBrokerAccess {
     pub ciphertext: Vec<u8>,
 }
 
+/// Новые криптографические части существующей записи доступа.
+///
+/// Идентичность и историю записи хранилище сохраняет; меняются только
+/// nonce и шифротекст.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerAccessCiphertext {
+    pub id: Uuid,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
 /// Сохранённый доступ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerAccess {
@@ -142,6 +153,41 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Атомарно заменяет шифротексты всех переданных доступов.
+    ///
+    /// Список строится вызывающим слоем после расшифровки старым ключом.
+    /// Отозванные строки тоже входят в историю и потому должны быть
+    /// переданы сюда. Если хотя бы одного идентификатора нет, транзакция
+    /// откатывается целиком.
+    pub fn rotate_broker_access_ciphertexts(
+        &mut self,
+        replacements: &[BrokerAccessCiphertext],
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for replacement in replacements {
+            let changed = transaction.execute(
+                "UPDATE broker_access
+                 SET nonce = ?1, ciphertext = ?2
+                 WHERE id = ?3",
+                params![
+                    replacement.nonce,
+                    replacement.ciphertext,
+                    replacement.id.to_string()
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::NotFound {
+                    what: "доступ к брокеру",
+                    id: replacement.id.to_string(),
+                });
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Действующий доступ владельца к брокеру в названной среде.
     ///
     /// Отозванный не находится: отозванным доступом не ходят. Среда
@@ -178,6 +224,24 @@ impl SqliteStore {
     /// Не удаление: отозванный доступ остаётся историей — «когда
     /// система перестала ходить к брокеру» является вопросом, на
     /// который нужен ответ.
+    ///
+    /// Все доступы всех владельцев, включая отозванные.
+    pub fn all_broker_access_history(&self) -> Result<Vec<BrokerAccess>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT DISTINCT owner FROM broker_access")?;
+        let owners = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut history = Vec::new();
+        for owner in owners {
+            let owner = owner?;
+            let owner = OwnerId(Uuid::parse_str(&owner).map_err(|_| StoreError::NotFound {
+                what: "владелец",
+                id: owner,
+            })?);
+            history.extend(self.broker_access_history(owner)?);
+        }
+        Ok(history)
+    }
     pub fn revoke_broker_access(&mut self, owner: OwnerId, id: Uuid) -> Result<(), StoreError> {
         let updated = self.conn.execute(
             "UPDATE broker_access SET revoked_at = ?3

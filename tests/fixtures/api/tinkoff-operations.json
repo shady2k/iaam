@@ -1,0 +1,287 @@
+{
+  "hasNext": false,
+  "nextCursor": "",
+  "items": [
+    {
+      "cursor": "564e10ad-ec2a-4fc1-8bff-caa0bc44b55b",
+      "brokerAccountId": "d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4",
+      "id": "564e10ad-ec2a-4fc1-8bff-caa0bc44b55b",
+      "parentOperationId": "",
+      "name": "Российский рубль",
+      "date": "2026-08-25T09:13:11.207837Z",
+      "type": "OPERATION_TYPE_INPUT",
+      "description": "Пополнение брокерского счёта",
+      "state": "OPERATION_STATE_EXECUTED",
+      "instrumentUid": "1de2c824-a1c2-44fa-8fd5-18105634c758",
+      "figi": "RUB000UTSTOM",
+      "instrumentType": "",
+      "instrumentKind": "INSTRUMENT_TYPE_UNSPECIFIED",
+      "positionUid": "8897d441-43f9-415a-8797-5e4a24362b33",
+      "ticker": "RUB000UTSTOM",
+      "classCode": "CETS",
+      "payment": {
+        "currency": "rub",
+        "units": "100000",
+        "nano": 0
+      },
+      "price": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "commission": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "yield": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "yieldRelative": {
+        "units": "0",
+        "nano": 0
+      },
+      "accruedInt": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "quantity": "0",
+      "quantityRest": "0",
+      "quantityDone": "0",
+      "cancelReason": "",
+      "tradesInfo": {
+        "trades": [
+          {
+            "num": "564e10ad-ec2a-4fc1-8bff-caa0bc44b55b",
+            "date": "2026-08-25T09:13:11.207837Z",
+            "quantity": "0",
+            "price": {
+              "currency": "",
+              "units": "0",
+              "nano": 0
+            },
+            "yield": {
+              "currency": "",
+              "units": "0",
+              "nano": 0
+            },
+            "yieldRelative": {
+              "units": "0",
+              "nano": 0
+            }
+          }
+        ]
+      },
+      "assetUid": "",
+      "childOperations": []
+    },
+    {
+      "cursor": "7aa1cf04-71c7-4b62-81c7-7f27ec4cfb8d",
+      "brokerAccountId": "d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4",
+      "id": "7aa1cf04-71c7-4b62-81c7-7f27ec4cfb8d",
+      "parentOperationId": "",
+      "name": "Сбер Банк",
+      "date": "2026-08-25T09:13:11.088296Z",
+      "type": "OPERATION_TYPE_BROKER_FEE",
+      "description": "Удержание комиссии за операцию",
+      "state": "OPERATION_STATE_EXECUTED",
+      "instrumentUid": "1c004240-d18d-46e1-8ac1-2aa05ebfdb38",
+      "figi": "BBG004730N88",
+      "instrumentType": "share",
+      "instrumentKind": "INSTRUMENT_TYPE_SHARE",
+      "positionUid": "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a",
+      "ticker": "SBER",
+      "classCode": "TQBR",
+      "payment": {
+        "currency": "rub",
+        "units": "0",
+        "nano": -135065000
+      },
+      "price": {
+        "currency": "rub",
+        "units": "0",
+        "nano": 0
+      },
+      "commission": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "yield": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "yieldRelative": {
+        "units": "0",
+        "nano": 0
+      },
+      "accruedInt": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "quantity": "0",
+      "quantityRest": "0",
+      "quantityDone": "0",
+      "cancelReason": "",
+      "assetUid": "",
+      "childOperations": []
+    },
+    {
+      "cursor": "06896b3e-038c-4970-85f2-fd5fc2dfb306",
+      "brokerAccountId": "d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4",
+      "id": "06896b3e-038c-4970-85f2-fd5fc2dfb306",
+      "parentOperationId": "",
+      "name": "Сбер Банк",
+      "date": "2026-08-25T09:13:11.088291Z",
+      "type": "OPERATION_TYPE_BUY",
+      "description": "Покупка ценных бумаг",
+      "state": "OPERATION_STATE_EXECUTED",
+      "instrumentUid": "1c004240-d18d-46e1-8ac1-2aa05ebfdb38",
+      "figi": "BBG004730N88",
+      "instrumentType": "share",
+      "instrumentKind": "INSTRUMENT_TYPE_SHARE",
+      "positionUid": "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a",
+      "ticker": "SBER",
+      "classCode": "TQBR",
+      "payment": {
+        "currency": "rub",
+        "units": "-270",
+        "nano": -130000000
+      },
+      "price": {
+        "currency": "rub",
+        "units": "270",
+        "nano": 130000000
+      },
+      "commission": {
+        "currency": "rub",
+        "units": "0",
+        "nano": -135065000
+      },
+      "yield": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "yieldRelative": {
+        "units": "0",
+        "nano": 0
+      },
+      "accruedInt": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "quantity": "1",
+      "quantityRest": "0",
+      "quantityDone": "1",
+      "cancelReason": "",
+      "tradesInfo": {
+        "trades": [
+          {
+            "num": "06896b3e-038c-4970-85f2-fd5fc2dfb306",
+            "date": "2026-08-25T09:13:11.088291Z",
+            "quantity": "1",
+            "price": {
+              "currency": "rub",
+              "units": "270",
+              "nano": 130000000
+            },
+            "yield": {
+              "currency": "",
+              "units": "0",
+              "nano": 0
+            },
+            "yieldRelative": {
+              "units": "0",
+              "nano": 0
+            }
+          }
+        ]
+      },
+      "assetUid": "",
+      "childOperations": []
+    },
+    {
+      "cursor": "21fc2e49-a985-4720-87a3-f8476f2c9cad",
+      "brokerAccountId": "d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4",
+      "id": "21fc2e49-a985-4720-87a3-f8476f2c9cad",
+      "parentOperationId": "",
+      "name": "Российский рубль",
+      "date": "2026-08-25T09:12:23.850256Z",
+      "type": "OPERATION_TYPE_INPUT",
+      "description": "Пополнение брокерского счёта",
+      "state": "OPERATION_STATE_EXECUTED",
+      "instrumentUid": "1de2c824-a1c2-44fa-8fd5-18105634c758",
+      "figi": "RUB000UTSTOM",
+      "instrumentType": "",
+      "instrumentKind": "INSTRUMENT_TYPE_UNSPECIFIED",
+      "positionUid": "8897d441-43f9-415a-8797-5e4a24362b33",
+      "ticker": "RUB000UTSTOM",
+      "classCode": "CETS",
+      "payment": {
+        "currency": "rub",
+        "units": "100000",
+        "nano": 0
+      },
+      "price": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "commission": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "yield": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "yieldRelative": {
+        "units": "0",
+        "nano": 0
+      },
+      "accruedInt": {
+        "currency": "",
+        "units": "0",
+        "nano": 0
+      },
+      "quantity": "0",
+      "quantityRest": "0",
+      "quantityDone": "0",
+      "cancelReason": "",
+      "tradesInfo": {
+        "trades": [
+          {
+            "num": "21fc2e49-a985-4720-87a3-f8476f2c9cad",
+            "date": "2026-08-25T09:12:23.850256Z",
+            "quantity": "0",
+            "price": {
+              "currency": "",
+              "units": "0",
+              "nano": 0
+            },
+            "yield": {
+              "currency": "",
+              "units": "0",
+              "nano": 0
+            },
+            "yieldRelative": {
+              "units": "0",
+              "nano": 0
+            }
+          }
+        ]
+      },
+      "assetUid": "",
+      "childOperations": []
+    }
+  ]
+}

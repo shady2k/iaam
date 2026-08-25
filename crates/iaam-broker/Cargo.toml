@@ -6,6 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Разбор ответов канала даёт типы ядра: контрольные утверждения и точные
+# деньги. Ядро — единственная крейта, которую этому адаптеру знать можно;
+# соседние адаптеры запрещены заслоном архитектуры (§3.2).
+iaam-core = { path = "../iaam-core", version = "0.1.0" }
+# Даты интервала и момента утверждения. Своя арифметика календаря
+# в разборе — лишнее место для ошибки.
+time = { version = "0.3", default-features = false, features = ["std", "parsing", "formatting", "macros"] }
 # ChaCha20-Poly1305: чистый Rust без C-зависимостей и с проверкой
 # подлинности — подделанный шифротекст обязан быть отказом, а не
 # расшифровкой в мусор.
@@ -37,6 +44,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Режим песочницы берёт заведённый доступ из базы, а не из переменной
 # окружения: проверяется тот же путь, которым ходит боевой код.
 iaam-store = { path = "../iaam-store", version = "0.1.0" }
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros"] }
 
 [lints]
 workspace = true

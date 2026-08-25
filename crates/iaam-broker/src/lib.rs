@@ -8,4 +8,6 @@
 
 pub mod credentials;
 pub mod environment;
+pub mod finam;
+pub mod tinkoff;
 pub mod trust;

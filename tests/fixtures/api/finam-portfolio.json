@@ -1,0 +1,22 @@
+{
+  "account_id": "00000000-0000-0000-0000-000000000001",
+  "equity": {"value": "200000"},
+  "cash": [
+    {
+      "currency_code": "RUB",
+      "units": "199729",
+      "nanos": 730000000
+    },
+    {
+      "currency_code": "USD",
+      "units": "10",
+      "nanos": 500000000
+    }
+  ],
+  "positions": [
+    {
+      "symbol": "01234567-89ab-cdef-0123-456789abcdef",
+      "quantity": {"value": "1"}
+    }
+  ]
+}

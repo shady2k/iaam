@@ -1,0 +1,12 @@
+{
+  "accounts": [
+    {
+      "id": "d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4",
+      "type": "ACCOUNT_TYPE_TINKOFF",
+      "name": "string",
+      "status": "ACCOUNT_STATUS_OPEN",
+      "openedDate": "2026-08-25T06:34:56.800559Z",
+      "accessLevel": "ACCOUNT_ACCESS_LEVEL_FULL_ACCESS"
+    }
+  ]
+}

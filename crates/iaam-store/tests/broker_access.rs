@@ -7,7 +7,7 @@ use iaam_broker::credentials::{BrokerScope, Key, SealedToken, seal};
 use iaam_broker::environment::Environment;
 use iaam_core::ids::OwnerId;
 use iaam_store::SqliteStore;
-use iaam_store::broker_access::{BrokerAccess, NewBrokerAccess, SoleOwner};
+use iaam_store::broker_access::{BrokerAccess, BrokerAccessCiphertext, NewBrokerAccess, SoleOwner};
 use iaam_store::documents::BrokerCode;
 use uuid::Uuid;
 
@@ -249,6 +249,46 @@ fn the_two_environments_of_one_broker_live_side_by_side() {
     assert_eq!(found_sandbox.id, sandbox.id);
     assert_eq!(found_prod.environment, "prod");
     assert_eq!(found_sandbox.environment, "sandbox");
+}
+
+#[test]
+fn a_mid_rotation_failure_leaves_every_ciphertext_under_the_old_key() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let old_key = Key::from_bytes([21; 32]);
+    let new_key = Key::from_bytes([22; 32]);
+    let owner = OwnerId::new_random();
+    let prod = access(owner, "tinkoff", Environment::Prod, &old_key);
+    let sandbox = access(owner, "tinkoff", Environment::Sandbox, &old_key);
+    store.insert_broker_access(&prod).unwrap();
+    store.insert_broker_access(&sandbox).unwrap();
+    store.revoke_broker_access(owner, sandbox.id).unwrap();
+
+    let replacement = seal(&new_key, SECRET);
+    let missing = seal(&new_key, SECRET);
+    let result = store.rotate_broker_access_ciphertexts(&[
+        BrokerAccessCiphertext {
+            id: prod.id,
+            nonce: replacement.nonce().to_vec(),
+            ciphertext: replacement.ciphertext().to_vec(),
+        },
+        BrokerAccessCiphertext {
+            id: Uuid::new_v4(),
+            nonce: missing.nonce().to_vec(),
+            ciphertext: missing.ciphertext().to_vec(),
+        },
+    ]);
+
+    assert!(result.is_err());
+    for entry in store.broker_access_history(owner).unwrap() {
+        let sealed = SealedToken::of(entry.nonce.clone(), entry.ciphertext.clone());
+        assert_eq!(
+            iaam_broker::credentials::open(&old_key, &sealed)
+                .unwrap()
+                .expose(),
+            SECRET
+        );
+        assert!(iaam_broker::credentials::open(&new_key, &sealed).is_err());
+    }
 }
 
 #[test]

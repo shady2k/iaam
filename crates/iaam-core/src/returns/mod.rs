@@ -491,6 +491,30 @@ mod tests {
         assert_eq!(DataQualityStatus::Mixed.code(), "mixed");
         assert_eq!(DataQualityStatus::Incomplete.code(), "incomplete");
     }
+    #[test]
+    fn shares_add_accumulates_weights_before_normalizing() {
+        let mut shares = Shares::default();
+        shares.add(
+            DimensionStatus::AcceptedIndependent,
+            rust_decimal::Decimal::new(2, 0),
+        );
+        shares.add(
+            DimensionStatus::Provisional,
+            rust_decimal::Decimal::new(1, 0),
+        );
+        assert_eq!(shares.independent, rust_decimal::Decimal::new(2, 0));
+        assert_eq!(shares.provisional, rust_decimal::Decimal::new(1, 0));
+
+        let coverage = shares.finish();
+        assert_eq!(
+            coverage.accepted_independent,
+            Dec::new(rust_decimal::Decimal::new(2, 0) / rust_decimal::Decimal::new(3, 0))
+        );
+        assert_eq!(
+            coverage.provisional,
+            Dec::new(rust_decimal::Decimal::new(1, 0) / rust_decimal::Decimal::new(3, 0))
+        );
+    }
 
     /// Строит состояние из одного пополнения и одной оценки заданного
     /// качества. Больше в блоке качества данных ничего не участвует.

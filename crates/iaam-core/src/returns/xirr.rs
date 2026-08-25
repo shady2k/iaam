@@ -246,3 +246,127 @@ fn neg(value: Dec) -> Result<Dec, NotComputable> {
 fn numeric(_: crate::numeric::NumericError) -> NotComputable {
     NotComputable::Numeric { code: "numeric" }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contour::{ContourDefinition, ContourId, ContourVersion};
+    use crate::event::kind::{EventKind, TradeSide};
+    use crate::event::leg::Leg;
+    use crate::event::test_support::event_with;
+    use crate::ids::{AccountId, CustodyId, InstrumentId};
+    use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
+    use crate::numeric::approx::SolverPolicy;
+    use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
+    use crate::projection::{ProjectionContext, project};
+    use crate::reconciliation::ReconciliationLedger;
+    use crate::rules::{LotRuleVersion, RuleRegistry};
+    use crate::valuation::{FxSource, FxTable};
+    use time::macros::date;
+
+    fn rub(minor: i64) -> Money {
+        Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
+    }
+
+    fn qty(units: i64) -> Quantity {
+        Quantity(Dec::new(rust_decimal::Decimal::from(units)))
+    }
+
+    #[test]
+    fn account_values_ignore_outside_positions_and_zero_inside_positions() {
+        let inside = AccountId::new_random();
+        let outside = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let projection_contour = ContourDefinition::new(
+            ContourId::new_random(),
+            ContourVersion(1),
+            [inside, outside],
+        );
+        let requested_contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [inside]);
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &projection_contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let events = vec![
+            event_with(
+                outside,
+                date!(2026 - 01 - 01),
+                1,
+                EventKind::Trade {
+                    side: TradeSide::Buy,
+                    instrument,
+                    quantity: qty(10),
+                    gross: rub(1_000),
+                    fee: None,
+                    accrued_interest: None,
+                },
+                vec![
+                    Leg::cash(outside, rub(-1_000)),
+                    Leg::security(outside, custody, instrument, qty(10)),
+                ],
+            ),
+            event_with(
+                inside,
+                date!(2026 - 01 - 02),
+                2,
+                EventKind::Trade {
+                    side: TradeSide::Buy,
+                    instrument,
+                    quantity: qty(10),
+                    gross: rub(1_000),
+                    fee: None,
+                    accrued_interest: None,
+                },
+                vec![
+                    Leg::cash(inside, rub(-1_000)),
+                    Leg::security(inside, custody, instrument, qty(10)),
+                ],
+            ),
+            event_with(
+                inside,
+                date!(2026 - 01 - 03),
+                3,
+                EventKind::Trade {
+                    side: TradeSide::Sell,
+                    instrument,
+                    quantity: qty(10),
+                    gross: rub(1_000),
+                    fee: None,
+                    accrued_interest: None,
+                },
+                vec![
+                    Leg::cash(inside, rub(1_000)),
+                    Leg::security(inside, custody, instrument, qty(-10)),
+                ],
+            ),
+        ];
+        let snapshot = project(&events, &context)
+            .expect("проекция")
+            .into_snapshot();
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let request = ReturnsRequest {
+            contour: &requested_contour,
+            as_of: date!(2026 - 01 - 04),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+        };
+
+        let values = account_values(snapshot.state(), &request).expect("стоимости счетов");
+        assert_eq!(
+            values.get(&inside),
+            Some(&AccountValue {
+                cash: Dec::zero(),
+                positions: Dec::zero(),
+            })
+        );
+        assert!(!values.contains_key(&outside));
+    }
+}

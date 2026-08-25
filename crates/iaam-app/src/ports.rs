@@ -9,6 +9,8 @@ use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
 use iaam_ingest::SubmittedOperation;
+use serde_json::Value;
+use std::sync::Arc;
 use time::Date;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -154,6 +156,35 @@ pub struct BrokerAccessView {
     pub scope: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
+}
+
+/// Сохранённое правило в форме, которую может отдавать транспорт.
+///
+/// Сами JSON matcher/outcome остаются непрозрачными для хранилища и
+/// возвращаются без повторной трактовки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassificationRuleView {
+    pub id: uuid::Uuid,
+    pub version: u32,
+    pub matcher: String,
+    pub outcome: String,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub replaces: Option<uuid::Uuid>,
+}
+
+/// Порт исторических правил классификации.
+#[async_trait]
+pub trait ClassificationRuleStore: Send + Sync {
+    async fn list_rules(&self, owner: OwnerId) -> Result<Vec<ClassificationRuleView>, AppError>;
+    async fn create_rule(
+        &self,
+        owner: OwnerId,
+        matcher: String,
+        outcome: String,
+        replaces: Option<uuid::Uuid>,
+    ) -> Result<ClassificationRuleView, AppError>;
+    async fn retire_rule(&self, owner: OwnerId, id: uuid::Uuid) -> Result<(), AppError>;
 }
 
 /// Среда брокера в словаре порта.
@@ -330,6 +361,27 @@ pub enum BrokerError {
     Unparsable { broker: String, detail: String },
 }
 
+/// Операция канала, которую нельзя принять в журнал.
+///
+/// Исходный JSON сохраняется без перекодирования в другой доменный тип:
+/// вызывающий должен иметь возможность объяснить расхождение по полям
+/// ответа брокера.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Quarantined {
+    pub raw: Value,
+    pub reason: String,
+}
+
+/// Результат получения страницы операций брокерского канала.
+///
+/// Отказанные строки не теряются: они отделены от принятых операций, но
+/// доезжают до вызывающего вместе с причиной и исходным JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedOperations {
+    pub accepted: Vec<SubmittedOperation>,
+    pub quarantined: Vec<Quarantined>,
+}
+
 /// Канал брокера: второй способ получить те же данные.
 ///
 /// Существует ради независимости (§10.3): совпадение разобранного
@@ -343,13 +395,13 @@ pub enum BrokerError {
 /// отправляющего брокеру, здесь нет и не появится (§14).
 #[async_trait]
 pub trait BrokerChannel: Send + Sync {
-    /// Операции счёта за интервал.
+    /// Операции счёта за интервал: принятые и отправленные в карантин.
     async fn fetch_operations(
         &self,
         account: AccountId,
         from: Date,
         to: Date,
-    ) -> Result<Vec<SubmittedOperation>, BrokerError>;
+    ) -> Result<ParsedOperations, BrokerError>;
 
     /// Контрольные величины на дату: остатки и количества.
     ///
@@ -364,6 +416,61 @@ pub trait BrokerChannel: Send + Sync {
     /// Чем именно получены данные. Версия разбора и отсутствие
     /// документа — то, из чего выводится независимость канала.
     fn channel(&self) -> SourceChannel;
+}
+
+/// Фабрика канала, скрывающая от сценария хранение и расшифровку доступа.
+///
+/// Секрет пересекает границу только внутри реализации адаптера и никогда
+/// не возвращается в приложение или транспорт.
+#[async_trait]
+pub trait BrokerChannelFactory: Send + Sync {
+    async fn open(&self, owner: OwnerId, broker: &str) -> Result<Arc<dyn BrokerChannel>, AppError>;
+}
+
+/// Явная заглушка точки сборки без настроенного адаптера.
+pub struct UnavailableBrokerChannelFactory;
+
+#[async_trait]
+impl BrokerChannelFactory for UnavailableBrokerChannelFactory {
+    async fn open(
+        &self,
+        _owner: OwnerId,
+        _broker: &str,
+    ) -> Result<Arc<dyn BrokerChannel>, AppError> {
+        Err(AppError::NotConfigured {
+            what: "канал брокера",
+        })
+    }
+}
+
+/// Явная заглушка порта правил для тестовых сборок без хранилища правил.
+pub struct UnavailableClassificationRuleStore;
+
+#[async_trait]
+impl ClassificationRuleStore for UnavailableClassificationRuleStore {
+    async fn list_rules(&self, _owner: OwnerId) -> Result<Vec<ClassificationRuleView>, AppError> {
+        Err(AppError::NotConfigured {
+            what: "правила классификации",
+        })
+    }
+
+    async fn create_rule(
+        &self,
+        _owner: OwnerId,
+        _matcher: String,
+        _outcome: String,
+        _replaces: Option<uuid::Uuid>,
+    ) -> Result<ClassificationRuleView, AppError> {
+        Err(AppError::NotConfigured {
+            what: "правила классификации",
+        })
+    }
+
+    async fn retire_rule(&self, _owner: OwnerId, _id: uuid::Uuid) -> Result<(), AppError> {
+        Err(AppError::NotConfigured {
+            what: "правила классификации",
+        })
+    }
 }
 
 /// Системные часы.

@@ -108,6 +108,17 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
         .routes(routes!(routes::create_contour_version))
         .routes(routes!(routes::ingest_operations))
         .routes(routes!(routes::ingest_csv))
+        .routes(routes!(routes::upload_document))
+        .routes(routes!(routes::reparse_document))
+        .routes(routes!(routes::reconciliation))
+        .routes(routes!(routes::reconciliation_balance))
+        .routes(routes!(
+            routes::list_classification_rules,
+            routes::create_classification_rule
+        ))
+        .routes(routes!(routes::delete_classification_rule))
+        .routes(routes!(routes::sync_broker))
+        .routes(routes!(routes::update_broker_access))
         .routes(routes!(
             routes::returns_report,
             routes::returns_report_with_rates

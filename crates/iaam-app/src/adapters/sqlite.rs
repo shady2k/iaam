@@ -8,11 +8,12 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iaam_broker::credentials::{BrokerScope, Key, seal};
+use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
+use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
-use iaam_core::ids::{AccountId, OwnerId};
+use iaam_core::ids::{AccountId, ClassificationRuleId, OwnerId, SourceId};
 use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
 use iaam_store::SqliteStore;
@@ -27,8 +28,9 @@ use zeroize::Zeroizing;
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountView, BrokerAccessView, BrokerEnvironment, BrokerVault, IssuedToken, Principal,
-    Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    AccountView, BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment,
+    BrokerVault, ClassificationRuleStore, ClassificationRuleView, IssuedToken, Principal, Recorded,
+    Scope, SoleOwner, Store, TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 
@@ -388,6 +390,160 @@ impl BrokerVault for SqliteAdapter {
                     other => store_error(other),
                 }
             })
+        })
+        .await
+    }
+}
+
+struct ChannelAccess {
+    id: Uuid,
+    environment: String,
+    scope: String,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+#[async_trait]
+impl BrokerChannelFactory for SqliteAdapter {
+    async fn open(&self, owner: OwnerId, broker: &str) -> Result<Arc<dyn BrokerChannel>, AppError> {
+        let code = BrokerCode::parse(broker).ok_or_else(|| AppError::Invalid {
+            field: "broker".to_owned(),
+            expected: "поддерживаемый код брокера".to_owned(),
+            actual: broker.to_owned(),
+        })?;
+        if code.as_str() != "tinkoff" {
+            return Err(AppError::Invalid {
+                field: "broker".to_owned(),
+                expected: "tinkoff".to_owned(),
+                actual: broker.to_owned(),
+            });
+        }
+
+        let key = self.key()?.clone();
+        let broker = broker.to_owned();
+        let access = self
+            .blocking(move |store| {
+                let mut active = store
+                    .broker_access_history(owner)
+                    .map_err(store_error)?
+                    .into_iter()
+                    .filter(|access| {
+                        access.broker.as_str() == broker && access.revoked_at.is_none()
+                    });
+                let Some(first) = active.next() else {
+                    return Err(AppError::NotConfigured {
+                        what: "доступ к брокеру",
+                    });
+                };
+                if active.next().is_some() {
+                    return Err(AppError::Invalid {
+                        field: "broker".to_owned(),
+                        expected: "ровно один действующий доступ".to_owned(),
+                        actual: broker,
+                    });
+                }
+                Ok(ChannelAccess {
+                    id: first.id,
+                    environment: first.environment,
+                    scope: first.scope,
+                    nonce: first.nonce,
+                    ciphertext: first.ciphertext,
+                })
+            })
+            .await?;
+
+        if BrokerScope::parse(&access.scope) != Some(BrokerScope::ReadOnly) {
+            return Err(AppError::Invalid {
+                field: "scope".to_owned(),
+                expected: BrokerScope::ReadOnly.code().to_owned(),
+                actual: access.scope,
+            });
+        }
+        let environment =
+            Environment::parse(&access.environment).ok_or_else(|| AppError::Invalid {
+                field: "environment".to_owned(),
+                expected: "prod или sandbox".to_owned(),
+                actual: access.environment.clone(),
+            })?;
+        let token =
+            open(&key, &SealedToken::of(access.nonce, access.ciphertext)).map_err(|_| {
+                AppError::NotConfigured {
+                    what: "доступ к брокеру",
+                }
+            })?;
+        let client = TinkoffClient::new(environment, token)
+            .map_err(|error| AppError::Store(format!("клиент брокера не создан: {error}")))?;
+        Ok(Arc::new(crate::adapters::tinkoff::TinkoffChannel::new(
+            client,
+            SourceId(access.id),
+        )))
+    }
+}
+
+fn classification_rule_view(rule: iaam_store::rules::StoredRule) -> ClassificationRuleView {
+    ClassificationRuleView {
+        id: rule.id.inner(),
+        version: rule.version,
+        matcher: rule.matcher,
+        outcome: rule.outcome,
+        created_at: rule.created_at,
+        retired_at: rule.retired_at,
+        replaces: rule.replaces.map(|id| id.inner()),
+    }
+}
+
+#[async_trait]
+impl ClassificationRuleStore for SqliteAdapter {
+    async fn list_rules(&self, owner: OwnerId) -> Result<Vec<ClassificationRuleView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .rule_history(owner)
+                .map(|rules| rules.into_iter().map(classification_rule_view).collect())
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn create_rule(
+        &self,
+        owner: OwnerId,
+        matcher: String,
+        outcome: String,
+        replaces: Option<Uuid>,
+    ) -> Result<ClassificationRuleView, AppError> {
+        self.blocking(move |store| {
+            let rule = match replaces {
+                Some(previous) => {
+                    store.amend_rule(owner, ClassificationRuleId(previous), &matcher, &outcome)
+                }
+                None => store.insert_rule(owner, &matcher, &outcome),
+            }
+            .map_err(|error| match error {
+                iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
+                    what: "действующее правило классификации",
+                    id: replaces.map_or_else(String::new, |id| id.to_string()),
+                },
+                iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
+                    what: what.to_owned(),
+                },
+                other => store_error(other),
+            })?;
+            Ok(classification_rule_view(rule))
+        })
+        .await
+    }
+
+    async fn retire_rule(&self, owner: OwnerId, id: Uuid) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .retire_rule(owner, ClassificationRuleId(id))
+                .map_err(|error| match error {
+                    iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
+                        what: "действующее правило классификации",
+                        id: id.to_string(),
+                    },
+                    other => store_error(other),
+                })
         })
         .await
     }

@@ -6,19 +6,27 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
-use iaam_app::ingest::{SubmittedOperation, Verdict};
+use iaam_app::ingest::{Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
+use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
+use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::ingest::submit_operations;
+use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, statuses};
 use iaam_app::scenarios::reports::{ReturnsQuery, returns};
+use iaam_app::sync::sync_broker as run_sync_broker;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{AccountId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, CustodyId, OwnerId, SourceId};
+use iaam_core::money::{PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::PROJECTION_VERSION;
+use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
+use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
 use iaam_core::rules::LotRuleVersion;
 use iaam_core::valuation::{FxSource, FxTable};
 use rust_decimal::Decimal;
@@ -30,12 +38,356 @@ use zeroize::Zeroizing;
 
 use crate::ServerState;
 use crate::dto::{
-    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, ClaimRequest, ContourVersionDto,
-    CreateAccountRequest, CreateContourVersionRequest, CreateTokenRequest, CurrencyDto, FxRateDto,
-    HealthDto, IssuedTokenDto, ReturnsReportDto, SubmitOperationsRequest, TokenDto, TokenScopeDto,
-    VerdictDto,
+    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerAccessUpdateRequest,
+    BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
+    ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
+    CreateContourVersionRequest, CreateTokenRequest, CurrencyDto, DimensionStatusDto, DocumentDto,
+    DocumentParams, EvidenceDto, FxRateDto, HealthDto, IssuedTokenDto, OwnerBalanceRequest,
+    ReconciliationParams, ReconciliationStatusDto, ReturnsReportDto, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
+use iaam_app::scenarios::documents::UploadedDocument;
+
+/// Загрузка отчёта с построчными исходами.
+#[utoipa::path(
+    post,
+    path = "/v1/documents",
+    params(DocumentParams),
+    request_body(content = String, description = "Двоичная книга XLSX/XLS"),
+    responses(
+        (status = 200, description = "Исход по каждой строке", body = DocumentDto),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 422, description = "Документ не опознан или некорректен", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn upload_document(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Query(params): Query<DocumentParams>,
+    body: Bytes,
+) -> Result<Json<DocumentDto>, ApiFailure> {
+    let directory = build_directory(&state.services, &principal).await?;
+    let result = upload_report(
+        &state.services,
+        &principal,
+        &body,
+        &directory,
+        params.account.map(AccountId),
+    )
+    .await?;
+    Ok(Json(document_dto(result)))
+}
+
+/// Повторный разбор исходника с проверкой его идентичности.
+#[utoipa::path(
+    post,
+    path = "/v1/documents/{id}/reparse",
+    params(
+        ("id" = String, Path, description = "SHA-256 исходного документа"),
+        DocumentParams
+    ),
+    request_body(content = String, description = "Двоичная книга XLSX/XLS"),
+    responses(
+        (status = 200, description = "Исход по каждой строке", body = DocumentDto),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 422, description = "Хеш или документ некорректны", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn reparse_document(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(document_hash): Path<String>,
+    Query(params): Query<DocumentParams>,
+    body: Bytes,
+) -> Result<Json<DocumentDto>, ApiFailure> {
+    let directory = build_directory(&state.services, &principal).await?;
+    let result = reparse_report(
+        &state.services,
+        &principal,
+        &document_hash,
+        &body,
+        &directory,
+        params.account.map(AccountId),
+    )
+    .await?;
+    Ok(Json(document_dto(result)))
+}
+
+/// Статусы сверки с основаниями и исходами утверждений.
+#[utoipa::path(
+    get,
+    path = "/v1/reconciliation",
+    params(ReconciliationParams),
+    responses(
+        (status = 200, description = "Статусы сверки", body = Vec<ReconciliationStatusDto>),
+        (status = 422, description = "Диапазон дат некорректен", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn reconciliation(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Query(params): Query<ReconciliationParams>,
+) -> Result<Json<Vec<ReconciliationStatusDto>>, ApiFailure> {
+    let from = parse_query_date("from", &params.from)?;
+    let to = parse_query_date("to", &params.to)?;
+    let statuses = statuses(
+        &state.services,
+        &principal,
+        AccountId(params.account),
+        from,
+        to,
+    )
+    .await?;
+    Ok(Json(
+        statuses.iter().map(reconciliation_status_dto).collect(),
+    ))
+}
+
+/// Запись названного владельцем остатка.
+#[utoipa::path(
+    post,
+    path = "/v1/reconciliation/balance",
+    request_body = OwnerBalanceRequest,
+    responses(
+        (status = 200, description = "Обновлённые статусы", body = Vec<ReconciliationStatusDto>),
+        (status = 403, description = "Только владелец", body = ApiError),
+        (status = 422, description = "Баланс некорректен", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn reconciliation_balance(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<OwnerBalanceRequest>,
+) -> Result<Json<Vec<ReconciliationStatusDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let period = AssertionPeriod::between(request.from, request.to).ok_or_else(|| {
+        invalid_field(
+            "period",
+            "from не позже to",
+            format!("{}..{}", request.from, request.to),
+        )
+    })?;
+    let at = match request.at.as_str() {
+        "opening" => BalancePoint::Opening,
+        "closing" => BalancePoint::Closing,
+        actual => {
+            return Err(invalid_field(
+                "at",
+                "opening или closing",
+                actual.to_owned(),
+            ));
+        }
+    };
+    let cash = request
+        .cash
+        .map(|cash| {
+            let amount = cash.amount.parse::<Decimal>().map_err(|_| {
+                invalid_field("cash.amount", "десятичная строка", cash.amount.clone())
+            })?;
+            let amount = iaam_app::ingest::operation::to_minor_units(
+                amount,
+                cash.currency.to_domain(),
+                "cash.amount",
+            )
+            .map_err(invalid_rejection)?;
+            Ok::<_, ApiFailure>((cash.currency.to_domain(), PostedMinor::new(amount)))
+        })
+        .transpose()?;
+    let mut positions = Vec::with_capacity(request.positions.len());
+    for position in request.positions {
+        let quantity = position.quantity.parse::<Decimal>().map_err(|_| {
+            invalid_field(
+                "positions.quantity",
+                "десятичная строка",
+                position.quantity.clone(),
+            )
+        })?;
+        positions.push((
+            iaam_core::ids::InstrumentId(position.instrument),
+            CustodyId(position.custody),
+            Quantity(Dec::new(quantity)),
+        ));
+    }
+    let raw_hash = request.source_hash.unwrap_or_else(|| "0".repeat(64));
+    let raw_hash = iaam_core::event::provenance::RawHash::parse(&raw_hash)
+        .ok_or_else(|| invalid_field("source_hash", "64 hex-символа", raw_hash))?;
+    let _ = record_owner_balance(
+        &state.services,
+        &principal,
+        OwnerBalance {
+            account: AccountId(request.account),
+            period,
+            at,
+            cash,
+            positions,
+            raw_hash,
+        },
+    )
+    .await?;
+    let statuses = statuses(
+        &state.services,
+        &principal,
+        AccountId(request.account),
+        period.from,
+        period.to,
+    )
+    .await?;
+    Ok(Json(
+        statuses.iter().map(reconciliation_status_dto).collect(),
+    ))
+}
+
+/// Действующие и выведенные из обращения правила классификации.
+#[utoipa::path(
+    get,
+    path = "/v1/classification-rules",
+    responses(
+        (status = 200, description = "История правил классификации", body = Vec<ClassificationRuleDto>),
+        (status = 403, description = "Только владелец", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_classification_rules(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<ClassificationRuleDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let rules = list_rules(&state.services, &principal).await?;
+    Ok(Json(
+        rules
+            .into_iter()
+            .map(ClassificationRuleDto::from_port)
+            .collect(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/classification-rules",
+    request_body = ClassificationRuleRequest,
+    responses(
+        (status = 201, description = "Правило добавлено", body = ClassificationRuleDto),
+        (status = 403, description = "Только владелец", body = ApiError),
+        (status = 422, description = "Правило некорректно", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_classification_rule(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<ClassificationRuleRequest>,
+) -> Result<(StatusCode, Json<ClassificationRuleDto>), ApiFailure> {
+    require_admin(&principal)?;
+    let rule = create_rule(
+        &state.services,
+        &principal,
+        request.matcher,
+        request.outcome,
+        request.replaces,
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ClassificationRuleDto::from_port(rule)),
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/classification-rules/{id}",
+    params(("id" = Uuid, Path, description = "Идентификатор правила")),
+    responses(
+        (status = 204, description = "Правило выведено из обращения"),
+        (status = 403, description = "Только владелец", body = ApiError),
+        (status = 404, description = "Правило не найдено", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn delete_classification_rule(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiFailure> {
+    require_admin(&principal)?;
+    retire_rule(&state.services, &principal, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Синхронизация одного брокерского канала за интервал.
+#[utoipa::path(
+    post,
+    path = "/v1/brokers/{broker}/sync",
+    params(("broker" = String, Path, description = "Код брокера")),
+    request_body = BrokerSyncRequest,
+    responses(
+        (status = 200, description = "Результат синхронизации", body = SyncOutcomeDto),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 503, description = "Канал или доступ брокера не настроены", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn sync_broker(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(broker): Path<String>,
+    Json(request): Json<BrokerSyncRequest>,
+) -> Result<Json<SyncOutcomeDto>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let channel = state
+        .services
+        .channels
+        .open(principal.owner, &broker)
+        .await?;
+    let outcome = run_sync_broker(
+        &state.services,
+        &principal,
+        channel.as_ref(),
+        AccountId(request.account),
+        request.from,
+        request.to,
+    )
+    .await?;
+    Ok(Json(SyncOutcomeDto::from_domain(outcome)))
+}
+/// Ротация доступа без возврата переданного секрета.
+#[utoipa::path(
+    put,
+    path = "/v1/brokers/{broker}/access",
+    params(("broker" = String, Path, description = "Код брокера")),
+    request_body = BrokerAccessUpdateRequest,
+    responses(
+        (status = 200, description = "Доступ обновлён", body = BrokerAccessDto),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 503, description = "Шифрование доступа не настроено", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn update_broker_access(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(broker): Path<String>,
+    Json(request): Json<BrokerAccessUpdateRequest>,
+) -> Result<Json<BrokerAccessDto>, ApiFailure> {
+    require_admin(&principal)?;
+    let access = state
+        .services
+        .broker
+        .add_access(
+            principal.owner,
+            broker,
+            request.environment.to_domain(),
+            Zeroizing::new(request.token),
+        )
+        .await?;
+    Ok(Json(BrokerAccessDto::from_domain(access)))
+}
 
 /// Состояние сервиса.
 #[utoipa::path(
@@ -659,7 +1011,90 @@ pub async fn returns_report_with_rates(
     Ok(Json(ReturnsReportDto::from_domain(&report)))
 }
 
-/// Разбор даты отчёта.
+fn document_dto(document: UploadedDocument) -> DocumentDto {
+    let (period_from, period_to) = document
+        .period
+        .map_or((None, None), |period| (Some(period.from), Some(period.to)));
+    DocumentDto {
+        document_hash: document.document_hash,
+        source: document.source.inner(),
+        broker: document.broker.code().to_owned(),
+        format: document.format.code().to_owned(),
+        parser_version: document.parser_version.0,
+        period_from,
+        period_to,
+        rows: document
+            .rows
+            .into_iter()
+            .map(|row| VerdictDto::from_domain(row.row as usize, &row.verdict))
+            .collect(),
+    }
+}
+
+fn reconciliation_status_dto(status: &ReconciliationStatus) -> ReconciliationStatusDto {
+    ReconciliationStatusDto {
+        account: status.account().inner(),
+        from: status.period().from,
+        to: status.period().to,
+        dimensions: Dimension::all()
+            .into_iter()
+            .map(|dimension| DimensionStatusDto {
+                dimension: dimension.code().to_owned(),
+                status: status.dimension(dimension).code().to_owned(),
+            })
+            .collect(),
+        evidence: status
+            .evidence()
+            .iter()
+            .map(|evidence| EvidenceDto {
+                ground: evidence.ground().code().to_owned(),
+                level: evidence.level().code().to_owned(),
+                dimensions: evidence
+                    .dimensions()
+                    .into_iter()
+                    .map(|dimension| dimension.code().to_owned())
+                    .collect(),
+                confirming_parser: evidence.confirming().parser_version.0.clone(),
+                confirmed_parser: evidence.confirmed().parser_version.0.clone(),
+            })
+            .collect(),
+        outcomes: status
+            .outcomes()
+            .iter()
+            .map(|outcome| ClaimOutcomeDto {
+                claim: outcome.claim.discriminant().to_owned(),
+                outcome: outcome.outcome.code().to_owned(),
+            })
+            .collect(),
+    }
+}
+
+fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure> {
+    Date::parse(
+        value,
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .map_err(|_| invalid_field(field, "ГГГГ-ММ-ДД", value.to_owned()))
+}
+
+fn invalid_field(field: impl Into<String>, expected: &str, actual: String) -> ApiFailure {
+    let field = field.into();
+    ApiFailure::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ApiError {
+            code: "invalid_request".into(),
+            message: format!("некорректное поле {field}"),
+            field: Some(field),
+            expected: Some(expected.into()),
+            actual: Some(actual),
+            correlation_id: None,
+        },
+    )
+}
+fn invalid_rejection(rejection: Rejection) -> ApiFailure {
+    invalid_field(rejection.field, &rejection.expected, rejection.actual)
+}
+
 ///
 /// Отдельная функция с явным отказом `422`: `serde` для `time::Date`
 /// не принимает строку «ГГГГ-ММ-ДД» без указания формата, и молчаливое

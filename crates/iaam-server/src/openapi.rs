@@ -10,11 +10,14 @@ use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 
 use crate::dto::{
-    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerEnvironmentDto, ClaimRequest,
-    ComputedDto, ContourVersionDto, CreateAccountRequest, CreateContourVersionRequest,
-    CreateTokenRequest, CurrencyDto, DataQualityDto, FeeOriginDto, FxRateDto, HealthDto,
-    IssuedTokenDto, OperationDatesDto, OperationDto, OperationKindDto, PriceQualityDto, RateDto,
-    ReturnsReportDto, SubmitOperationsRequest, TokenDto, TokenScopeDto, VerdictDto,
+    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerAccessUpdateRequest,
+    BrokerEnvironmentDto, BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
+    ClassificationRuleRequest, ComputedDto, ContourVersionDto, CreateAccountRequest,
+    CreateContourVersionRequest, CreateTokenRequest, CurrencyDto, DataQualityDto,
+    DimensionStatusDto, DocumentDto, EvidenceDto, FeeOriginDto, FxRateDto, HealthDto,
+    IssuedTokenDto, OperationDatesDto, OperationDto, OperationKindDto, OwnerBalanceRequest,
+    PriceQualityDto, RateDto, ReconciliationStatusDto, ReturnsReportDto, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::ApiError;
 
@@ -75,7 +78,18 @@ impl Modify for BearerSecurity {
         ReturnsReportDto,
         SubmitOperationsRequest,
         TokenDto,
+        BrokerAccessUpdateRequest,
+        BrokerSyncRequest,
+        ClaimOutcomeDto,
+        ClassificationRuleDto,
+        ClassificationRuleRequest,
+        DimensionStatusDto,
+        DocumentDto,
+        EvidenceDto,
+        OwnerBalanceRequest,
+        ReconciliationStatusDto,
         TokenScopeDto,
+        SyncOutcomeDto,
         VerdictDto,
     ))
 )]

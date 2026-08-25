@@ -56,7 +56,7 @@ pub async fn returns(
 
     let today = services.clock.today();
     let as_of = query.as_of.unwrap_or(today);
-    let events = services
+    let projection_events = services
         .store
         .load_events_through(principal.owner, as_of)
         .await?;
@@ -73,7 +73,7 @@ pub async fn returns(
         principal.owner,
         query,
         &definition,
-        &events,
+        &projection_events,
         &context,
     )
     .await?;
@@ -85,24 +85,20 @@ pub async fn returns(
             .await?;
     }
 
-    // Сверка и периметр — чистые функции от того же среза журнала.
-    // Оболочка их не считает: она подаёт срез и передаёт результат
-    // в отчёт (§3.1).
-    let perimeter = assess(&events, PerimeterPolicy::default())?;
-    let ledger = ReconciliationLedger::build_with(&events, &perimeter.exceptions())?;
+    // Projection is a historical snapshot; reconciliation may use facts
+    // received later because they can confirm an earlier period.
+    let reconciliation_events = services
+        .store
+        .load_events_through(principal.owner, Date::MAX)
+        .await?;
 
-    Ok(returns_report(
-        projection.state(),
-        &ReturnsRequest {
-            contour: &definition,
-            as_of,
-            report_currency: query.report_currency,
-            fx: &query.fx,
-            solver_policy: SolverPolicy::returns_default(),
-            ledger: &ledger,
-            perimeter: &perimeter,
-        },
-    ))
+    report_from_projection(
+        &projection,
+        query,
+        &definition,
+        as_of,
+        &reconciliation_events,
+    )
 }
 
 /// Можно ли сохранить снимок, построенный по этому срезу.
@@ -118,6 +114,30 @@ const fn snapshot_may_be_saved(as_of: Date, today: Date) -> bool {
     // `Date` не реализует `PartialEq` в const-контексте через `==`
     // для ссылок, но для значения — реализует.
     as_of.ordinal() == today.ordinal() && as_of.year() == today.year()
+}
+
+fn report_from_projection(
+    projection: &Projection,
+    query: &ReturnsQuery,
+    definition: &ContourDefinition,
+    as_of: Date,
+    reconciliation_events: &[iaam_core::event::Event],
+) -> Result<ReturnsReport, AppError> {
+    let perimeter = assess(reconciliation_events, PerimeterPolicy::default())?;
+    let ledger = ReconciliationLedger::build_with(reconciliation_events, &perimeter.exceptions())?;
+
+    Ok(returns_report(
+        projection.state(),
+        &ReturnsRequest {
+            contour: definition,
+            as_of,
+            report_currency: query.report_currency,
+            fx: &query.fx,
+            solver_policy: SolverPolicy::returns_default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+        },
+    ))
 }
 
 /// Стоит ли пересчитывать журнал целиком после отказа `advance`.
@@ -181,6 +201,140 @@ mod tests {
     use super::*;
     use iaam_core::projection::invariants::InvariantViolation;
     use time::macros::date;
+
+    #[test]
+    fn a_later_opening_assertion_confirms_the_earlier_report() {
+        use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+        use iaam_core::event::kind::EventKind;
+        use iaam_core::event::leg::Leg;
+        use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+        use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+        use iaam_core::ids::{EventId, SourceId};
+        use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+        use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+        use iaam_core::returns::DataQualityStatus;
+        use iaam_core::valuation::{FxSource, FxTable};
+
+        let owner = iaam_core::ids::OwnerId::new_random();
+        let account = iaam_core::ids::AccountId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let march = AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+            .unwrap_or_else(|| panic!("valid March period"));
+        let april = AssertionPeriod::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30))
+            .unwrap_or_else(|| panic!("valid April period"));
+        let provenance = Provenance::new(
+            SourceId::new_random(),
+            RawHash::parse(&"a".repeat(64)).unwrap_or_else(|| panic!("valid raw hash")),
+            ParserVersion("tinkoff-xlsx/1".to_owned()),
+        );
+        let later_provenance = Provenance::new(
+            SourceId::new_random(),
+            RawHash::parse(&"b".repeat(64)).unwrap_or_else(|| panic!("valid later raw hash")),
+            ParserVersion("tinkoff-xlsx/1".to_owned()),
+        );
+        let event = |day, sequence, kind| Event {
+            id: EventId::new_random(),
+            schema_version: SCHEMA_VERSION,
+            owner,
+            account,
+            kind,
+            dates: EventDates::for_cash(CashPostedDate(day)),
+            order: EffectiveOrder::new(day, sequence),
+            legs: Vec::new(),
+            provenance: provenance.clone(),
+            relation: Relation::None,
+            confidence: Confidence::Known,
+            idempotency_key: None,
+        };
+        let deposit = Event {
+            legs: vec![Leg::cash(
+                account,
+                Money::new(PostedMinor::new(100_000), CurrencyCode::Rub),
+            )],
+            kind: EventKind::CashIn {
+                amount: Money::new(PostedMinor::new(100_000), CurrencyCode::Rub),
+            },
+            ..event(
+                date!(2026 - 03 - 02),
+                1,
+                EventKind::CashIn {
+                    amount: Money::new(PostedMinor::new(100_000), CurrencyCode::Rub),
+                },
+            )
+        };
+        let march_closing = event(
+            date!(2026 - 03 - 31),
+            2,
+            EventKind::ControlAssertion {
+                period: march,
+                claim: ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(100_000),
+                    at: BalancePoint::Closing,
+                },
+            },
+        );
+        let april_opening = Event {
+            provenance: later_provenance,
+            ..event(
+                date!(2026 - 04 - 30),
+                1,
+                EventKind::ControlAssertion {
+                    period: april,
+                    claim: ControlClaim::CashBalance {
+                        currency: CurrencyCode::Rub,
+                        amount: PostedMinor::new(100_000),
+                        at: BalancePoint::Opening,
+                    },
+                },
+            )
+        };
+        let all_events = vec![deposit, march_closing, april_opening];
+        let projection_events: Vec<_> = all_events
+            .iter()
+            .filter(|event| {
+                event
+                    .dates
+                    .effective_date()
+                    .is_some_and(|date| date <= date!(2026 - 03 - 31))
+            })
+            .cloned()
+            .collect();
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let projection = project(&projection_events, &context)
+            .unwrap_or_else(|error| panic!("projection: {error}"));
+        let query = ReturnsQuery {
+            contour: contour.id(),
+            contour_version: Some(contour.version()),
+            as_of: Some(date!(2026 - 03 - 31)),
+            report_currency: CurrencyCode::Rub,
+            fx: FxTable::new(FxSource::OwnerSupplied),
+            lot_rule: LotRuleVersion(1),
+        };
+        let report = report_from_projection(
+            &projection,
+            &query,
+            &contour,
+            date!(2026 - 03 - 31),
+            &all_events,
+        )
+        .unwrap_or_else(|error| panic!("report: {error}"));
+
+        assert_eq!(
+            report.data_quality.nav_coverage.accepted_internal,
+            iaam_core::numeric::decimal::Dec::one()
+        );
+        assert_eq!(
+            report.data_quality.nav_coverage.provisional,
+            iaam_core::numeric::decimal::Dec::zero()
+        );
+        assert_eq!(report.data_quality.status, DataQualityStatus::Clean);
+    }
 
     #[test]
     fn a_snapshot_is_saved_only_for_a_report_dated_today() {

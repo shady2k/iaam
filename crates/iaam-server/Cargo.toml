@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
 http-body-util = "0.1"
 # Снапшоты отчётов (§15.8): ловят непреднамеренное изменение формы ответа,

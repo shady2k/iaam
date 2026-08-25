@@ -12,7 +12,9 @@ use std::fmt;
 
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
-use iaam_app::ports::{BrokerAccessView, BrokerEnvironment, IssuedToken, Scope, TokenView};
+use iaam_app::ports::{
+    BrokerAccessView, BrokerEnvironment, ClassificationRuleView, IssuedToken, Scope, TokenView,
+};
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::CurrencyCode;
@@ -22,7 +24,7 @@ use iaam_core::valuation::PriceQuality;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::Date;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 // Собственный формат дат: штатная сериализация `time::Date` не является
@@ -1178,4 +1180,191 @@ mod tests {
             "разные причины обязаны объясняться по-разному"
         );
     }
+}
+/// Параметры загрузки отчёта. Тело маршрута — двоичные байты книги.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct DocumentParams {
+    #[serde(default)]
+    pub account: Option<Uuid>,
+}
+
+/// Ответ загрузки отчёта.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DocumentDto {
+    pub document_hash: String,
+    pub source: Uuid,
+    pub broker: String,
+    pub format: String,
+    pub parser_version: String,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub period_from: Option<Date>,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub period_to: Option<Date>,
+    pub rows: Vec<VerdictDto>,
+}
+
+/// Параметры диапазона сверки.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct ReconciliationParams {
+    pub account: Uuid,
+    pub from: String,
+    pub to: String,
+}
+
+/// Статус одного измерения.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DimensionStatusDto {
+    pub dimension: String,
+    pub status: String,
+}
+
+/// Основание повышения статуса.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EvidenceDto {
+    pub ground: String,
+    pub level: String,
+    pub dimensions: Vec<String>,
+    pub confirming_parser: String,
+    pub confirmed_parser: String,
+}
+
+/// Исход одного контрольного утверждения.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClaimOutcomeDto {
+    pub claim: String,
+    pub outcome: String,
+}
+
+/// Статус сверки счёта за интервал.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReconciliationStatusDto {
+    pub account: Uuid,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub to: Date,
+    pub dimensions: Vec<DimensionStatusDto>,
+    pub evidence: Vec<EvidenceDto>,
+    pub outcomes: Vec<ClaimOutcomeDto>,
+}
+
+/// Денежный остаток, названный владельцем.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct OwnerCashDto {
+    pub currency: CurrencyDto,
+    pub amount: String,
+}
+
+/// Позиция, названная владельцем.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct OwnerPositionDto {
+    pub instrument: Uuid,
+    pub custody: Uuid,
+    pub quantity: String,
+}
+
+/// Ответ владельца на запрос контрольного остатка.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct OwnerBalanceRequest {
+    pub account: Uuid,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub to: Date,
+    pub at: String,
+    #[serde(default)]
+    pub cash: Option<OwnerCashDto>,
+    #[serde(default)]
+    pub positions: Vec<OwnerPositionDto>,
+    #[serde(default)]
+    pub source_hash: Option<String>,
+}
+
+/// Правило классификации.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClassificationRuleDto {
+    pub id: Uuid,
+    pub version: u64,
+    pub matcher: String,
+    pub outcome: String,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub replaces: Option<Uuid>,
+}
+
+impl ClassificationRuleDto {
+    #[must_use]
+    pub fn from_port(rule: ClassificationRuleView) -> Self {
+        Self {
+            id: rule.id,
+            version: u64::from(rule.version),
+            matcher: rule.matcher,
+            outcome: rule.outcome,
+            created_at: rule.created_at,
+            retired_at: rule.retired_at,
+            replaces: rule.replaces,
+        }
+    }
+}
+
+/// Запрос создания или изменения правила.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ClassificationRuleRequest {
+    pub matcher: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub replaces: Option<Uuid>,
+}
+
+/// Идентификатор правила в DELETE.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct ClassificationRuleParams {
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct BrokerSyncRequest {
+    pub account: Uuid,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub to: Date,
+}
+
+/// Результат синхронизации брокерского канала.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SyncOutcomeDto {
+    pub recorded: Vec<VerdictDto>,
+    pub duplicates: usize,
+    pub assertions: usize,
+}
+
+impl SyncOutcomeDto {
+    #[must_use]
+    pub fn from_domain(outcome: iaam_app::sync::SyncOutcome) -> Self {
+        Self {
+            recorded: outcome
+                .recorded
+                .iter()
+                .enumerate()
+                .map(|(row, verdict)| VerdictDto::from_domain(row + 1, verdict))
+                .collect(),
+            duplicates: outcome.duplicates,
+            assertions: outcome.assertions,
+        }
+    }
+}
+/// Замена секрета доступа: секрет никогда не является частью ответа.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct BrokerAccessUpdateRequest {
+    pub environment: BrokerEnvironmentDto,
+    pub token: String,
 }

@@ -150,15 +150,17 @@ impl From<AppError> for ApiFailure {
             // запроса её не исправит, поэтому 503 с указанием, что
             // именно задать. Текст называет переменную окружения:
             // «сервис недоступен» без причины нечинибельно.
-            AppError::NotConfigured { what } => Self::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ApiError::simple(
-                    "not_configured",
-                    format!(
-                        "{what} не настроено: задайте IAAM_BROKER_KEY_FILE и перезапустите сервер"
-                    ),
-                ),
-            ),
+            AppError::NotConfigured { what } => {
+                let message = if what == "шифрование доступа к брокеру" {
+                    format!("{what} не настроено: задайте IAAM_BROKER_KEY_FILE и перезапустите сервер")
+                } else {
+                    format!("{what} не настроено")
+                };
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ApiError::simple("not_configured", message),
+                )
+            }
             AppError::Store(_)
             | AppError::Projection(_)
             // Сверка и оценка периметра отказывают по той же причине,

@@ -91,6 +91,17 @@ if [ -n "$bad" ]; then
   err "iaam-broker зависит от вышележащих слоёв или соседних адаптеров: $bad (§3.2)"
 fi
 
+# --- Каналы получения данных не делят код разбора (§10.3) ---
+# Независимость канала — это не декларация, а свойство кода. Если
+# клиент API начнёт звать функцию парсера отчёта, общая ошибка исказит
+# обе стороны сверки, и уровень accepted_independent станет ложью,
+# которую ни один тест не поймает: тесты сверки увидят совпадение.
+bad=$(grep -rn 'iaam_ingest::report' crates/iaam-broker/src 2>/dev/null || true)
+if [ -n "$bad" ]; then
+  err "iaam-broker использует парсер отчётов: каналы обязаны быть независимы (§10.3)
+$bad"
+fi
+
 # --- 3. Никаких shared/common/utils крейт ---
 for forbidden in shared common utils; do
   if [ -d "crates/iaam-$forbidden" ]; then

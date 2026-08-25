@@ -15,9 +15,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
-use iaam_app::ports::{BrokerVault, Clock, TokenAdmin};
+use iaam_app::ports::{
+    BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
+    ParsedOperations, TokenAdmin,
+};
 use iaam_broker::credentials::Key;
-use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
+use iaam_core::event::provenance::ParserVersion;
+use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_server::auth::hash_token;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
@@ -38,6 +42,52 @@ struct FixedClock(Date);
 impl Clock for FixedClock {
     fn today(&self) -> Date {
         self.0
+    }
+}
+
+struct EmptyChannel {
+    source: iaam_core::reconciliation::evidence::SourceChannel,
+}
+
+#[async_trait::async_trait]
+impl BrokerChannel for EmptyChannel {
+    async fn fetch_operations(
+        &self,
+        _account: AccountId,
+        _from: Date,
+        _to: Date,
+    ) -> Result<ParsedOperations, BrokerError> {
+        Ok(ParsedOperations {
+            accepted: Vec::new(),
+            quarantined: Vec::new(),
+        })
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _at: Date,
+    ) -> Result<Vec<iaam_core::reconciliation::claim::ControlClaim>, BrokerError> {
+        Ok(Vec::new())
+    }
+
+    fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
+        self.source.clone()
+    }
+}
+
+struct FixedChannelFactory {
+    channel: Arc<dyn BrokerChannel>,
+}
+
+#[async_trait::async_trait]
+impl BrokerChannelFactory for FixedChannelFactory {
+    async fn open(
+        &self,
+        _owner: OwnerId,
+        _broker: &str,
+    ) -> Result<Arc<dyn BrokerChannel>, iaam_app::error::AppError> {
+        Ok(self.channel.clone())
     }
 }
 
@@ -66,6 +116,13 @@ fn harness_on_disk() -> (Harness, std::path::PathBuf) {
 }
 
 fn harness_with(store: SqliteStore) -> Harness {
+    harness_with_factory(store, None)
+}
+
+fn harness_with_factory(
+    store: SqliteStore,
+    channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
+) -> Harness {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
 
@@ -129,12 +186,17 @@ fn harness_with(store: SqliteStore) -> Harness {
         Some(Key::from_bytes([7; 32])),
     ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
+    let channels: Arc<dyn BrokerChannelFactory> =
+        channel_factory.unwrap_or_else(|| adapter.clone());
+    let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
-    let services = Arc::new(AppServices::new(
+    let services = Arc::new(AppServices::with_ports(
         adapter,
         broker,
         tokens,
         Arc::new(FixedClock(date!(2026 - 01 - 01))),
+        channels,
+        rules,
     ));
     let state = ServerState::new(
         services,
@@ -1738,4 +1800,137 @@ async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
         StatusCode::OK,
         "чужой токен не отозван чужими руками: {accounts}"
     );
+}
+
+#[tokio::test]
+async fn classification_rules_are_visible_versioned_and_retirable() {
+    let harness = harness();
+    let request = json!({
+        "matcher": r#"{"kind":"income"}"#,
+        "outcome": r#"{"kind":"external_flow"}"#,
+    });
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/classification-rules", &harness.owner_token, &request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["version"], 1);
+    assert!(!created.to_string().contains(BROKER_TOKEN), "{created}");
+    let id = created["id"].as_str().expect("идентификатор").to_owned();
+
+    let (status, history) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history.as_array().expect("история").len(), 1);
+    assert_eq!(history[0]["matcher"], r#"{"kind":"income"}"#);
+    assert!(!history.to_string().contains(BROKER_TOKEN), "{history}");
+
+    let (status, body) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/classification-rules/{id}"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, history) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert!(!history[0]["retired_at"].is_null(), "{history}");
+}
+
+#[tokio::test]
+async fn only_the_owner_can_manage_classification_rules() {
+    let harness = harness();
+    let rule = json!({
+        "matcher": r#"{"kind":"income"}"#,
+        "outcome": r#"{"kind":"external_flow"}"#,
+    });
+    for (method, body) in [
+        (
+            "GET",
+            get("/v1/classification-rules", Some(&harness.readonly_token)),
+        ),
+        (
+            "POST",
+            post("/v1/classification-rules", &harness.readonly_token, &rule),
+        ),
+        (
+            "DELETE",
+            delete(
+                &format!("/v1/classification-rules/{}", Uuid::new_v4()),
+                &harness.readonly_token,
+            ),
+        ),
+    ] {
+        let (status, response) = call(&harness.router, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {response}");
+        assert_eq!(response["code"], "forbidden", "{method}: {response}");
+    }
+}
+
+#[tokio::test]
+async fn broker_sync_returns_the_scenario_outcome() {
+    let channel: Arc<dyn BrokerChannel> = Arc::new(EmptyChannel {
+        source: iaam_core::reconciliation::evidence::SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("contract-test".to_owned()),
+            document: None,
+        },
+    });
+    let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory { channel });
+    let harness = harness_with_factory(
+        SqliteStore::open_in_memory().expect("база в памяти"),
+        Some(factory),
+    );
+    let body = json!({
+        "account": harness.account.inner(),
+        "from": "2025-01-01",
+        "to": "2025-01-31",
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/brokers/tinkoff/sync", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["recorded"], json!([]));
+    assert_eq!(response["duplicates"], 0);
+    assert_eq!(response["assertions"], 0);
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
+}
+
+#[tokio::test]
+async fn broker_sync_reports_unconfigured_access_as_503_and_rejects_read_only() {
+    let harness = harness();
+    let body = json!({
+        "account": harness.account.inner(),
+        "from": "2025-01-01",
+        "to": "2025-01-31",
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/brokers/tinkoff/sync", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["code"], "not_configured");
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
+
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/brokers/tinkoff/sync", &harness.readonly_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(response["code"], "forbidden");
 }

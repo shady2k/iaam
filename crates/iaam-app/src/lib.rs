@@ -15,11 +15,16 @@ pub use iaam_ingest as ingest;
 pub mod error;
 pub mod ports;
 pub mod scenarios;
+#[path = "scenarios/sync.rs"]
+pub mod sync;
 pub mod tokens;
 
 use std::sync::Arc;
 
-use ports::{BrokerVault, Clock, Store, TokenAdmin};
+use ports::{
+    BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Clock, Store, TokenAdmin,
+    UnavailableBrokerChannelFactory, UnavailableClassificationRuleStore,
+};
 
 /// Собранные зависимости. Точка сборки создаёт один экземпляр,
 /// обработчики получают `Arc<AppServices>` (§3.2).
@@ -33,6 +38,10 @@ pub struct AppServices {
     /// на него — разные полномочия (§14).
     pub tokens: Arc<dyn TokenAdmin>,
     pub clock: Arc<dyn Clock>,
+    /// Создание канала брокера. Секреты остаются внутри адаптера.
+    pub channels: Arc<dyn BrokerChannelFactory>,
+    /// Исторические правила классификации.
+    pub rules: Arc<dyn ClassificationRuleStore>,
 }
 
 impl AppServices {
@@ -43,11 +52,32 @@ impl AppServices {
         tokens: Arc<dyn TokenAdmin>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        Self::with_ports(
+            store,
+            broker,
+            tokens,
+            clock,
+            Arc::new(UnavailableBrokerChannelFactory),
+            Arc::new(UnavailableClassificationRuleStore),
+        )
+    }
+
+    #[must_use]
+    pub fn with_ports(
+        store: Arc<dyn Store>,
+        broker: Arc<dyn BrokerVault>,
+        tokens: Arc<dyn TokenAdmin>,
+        clock: Arc<dyn Clock>,
+        channels: Arc<dyn BrokerChannelFactory>,
+        rules: Arc<dyn ClassificationRuleStore>,
+    ) -> Self {
         Self {
             store,
             broker,
             tokens,
             clock,
+            channels,
+            rules,
         }
     }
 }

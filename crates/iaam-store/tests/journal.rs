@@ -9,7 +9,32 @@ use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_store::SqliteStore;
 use iaam_store::events::Appended;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use time::macros::date;
+
+struct TempDatabase {
+    path: PathBuf,
+}
+
+impl Drop for TempDatabase {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(self.path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(self.path.with_extension("sqlite-shm"));
+    }
+}
+
+fn concurrent_database(ctx: &Ctx) -> TempDatabase {
+    TempDatabase {
+        path: std::env::temp_dir().join(format!(
+            "iaam-store-concurrent-ordering-{}.sqlite",
+            ctx.owner.inner()
+        )),
+    }
+}
 
 struct Ctx {
     owner: OwnerId,
@@ -185,5 +210,95 @@ fn the_store_assigns_the_sequence_and_does_not_take_it_from_the_caller() {
         stored[1].order,
         EffectiveOrder::new(day, 2),
         "номер обязан быть назначен хранилищем, а не взят из события"
+    );
+}
+#[test]
+fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
+    let ctx = Arc::new(Ctx::new());
+    let database = concurrent_database(&ctx);
+    let initial_store = SqliteStore::open(&database.path).unwrap();
+    drop(initial_store);
+
+    let first_store = SqliteStore::open(&database.path).unwrap();
+    let second_store = SqliteStore::open(&database.path).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let first_barrier = Arc::clone(&barrier);
+    let first_event = ctx.deposit(1, 100_000);
+    let first = thread::spawn(move || {
+        let mut store = first_store;
+        first_barrier.wait();
+        store
+            .append_event_in_order(&first_event)
+            .map_err(|error| error.to_string())
+    });
+
+    let second_barrier = Arc::clone(&barrier);
+    let second_event = ctx.deposit(1, 50_000);
+    let second = thread::spawn(move || {
+        let mut store = second_store;
+        second_barrier.wait();
+        store
+            .append_event_in_order(&second_event)
+            .map_err(|error| error.to_string())
+    });
+
+    let first = first.join().expect("первый писатель не должен паниковать");
+    let second = second.join().expect("второй писатель не должен паниковать");
+    let outcomes = [first, second];
+    let successful_writes = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    let failed_writes = outcomes.iter().filter(|outcome| outcome.is_err()).count();
+    assert!(
+        (1..=2).contains(&successful_writes),
+        "должен успеть один или оба писателя: {outcomes:?}"
+    );
+    assert_eq!(successful_writes + failed_writes, 2);
+
+    let verification_store = SqliteStore::open(&database.path).unwrap();
+    let owner = ctx.owner.inner().to_string();
+    let day = date!(2026 - 02 - 01).to_string();
+    let duplicate_sequences: Vec<u32> = verification_store
+        .connection()
+        .prepare(
+            "SELECT sequence
+             FROM events
+             WHERE owner = ?1 AND effective_date = ?2
+             GROUP BY sequence
+             HAVING COUNT(*) > 1",
+        )
+        .unwrap()
+        .query_map([owner.as_str(), day.as_str()], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        duplicate_sequences.is_empty(),
+        "один порядковый номер выдан дважды: {duplicate_sequences:?}"
+    );
+
+    let stored_rows: u32 = verification_store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*)
+             FROM events
+             WHERE owner = ?1 AND effective_date = ?2",
+            [owner.as_str(), day.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_rows, successful_writes as u32,
+        "ошибка записи не должна оставлять строку в базе"
+    );
+
+    let sequences: Vec<u32> = verification_store
+        .load_events(ctx.owner)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.order.sequence())
+        .collect();
+    assert_eq!(
+        sequences,
+        (1..=successful_writes as u32).collect::<Vec<_>>(),
+        "успешные записи должны занимать последовательность без пропусков"
     );
 }

@@ -15,12 +15,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
-use iaam_app::ingest::{Rejection, Verdict};
+use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
     ParsedOperations, TokenAdmin,
 };
 use iaam_broker::credentials::Key;
+use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
@@ -81,6 +82,49 @@ impl BrokerChannel for EmptyChannel {
     }
 }
 
+struct PopulatedChannel {
+    source: iaam_core::reconciliation::evidence::SourceChannel,
+}
+
+#[async_trait::async_trait]
+impl BrokerChannel for PopulatedChannel {
+    async fn fetch_operations(
+        &self,
+        account: AccountId,
+        _from: Date,
+        _to: Date,
+    ) -> Result<ParsedOperations, BrokerError> {
+        Ok(ParsedOperations {
+            accepted: vec![SubmittedOperation {
+                account,
+                kind: OperationKind::Deposit {
+                    amount_minor: 1_000,
+                    currency: CurrencyCode::Rub,
+                },
+                dates: OperationDates {
+                    cash_posted: Some(date!(2025 - 01 - 01)),
+                    ..Default::default()
+                },
+                idempotency_key: Some("sync-row-1".to_owned()),
+                source_operation_id: Some("broker-row-1".to_owned()),
+            }],
+            quarantined: Vec::new(),
+        })
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _at: Date,
+    ) -> Result<Vec<iaam_core::reconciliation::claim::ControlClaim>, BrokerError> {
+        Ok(Vec::new())
+    }
+
+    fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
+        self.source.clone()
+    }
+}
+
 struct FixedChannelFactory {
     channel: Arc<dyn BrokerChannel>,
 }
@@ -102,6 +146,7 @@ struct Harness {
     owner_token: String,
     agent_token: String,
     readonly_token: String,
+    owner: OwnerId,
     account: AccountId,
     instrument: InstrumentId,
     custody: CustodyId,
@@ -118,6 +163,49 @@ fn harness_on_disk() -> (Harness, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("iaam-contract-{}.db", Uuid::new_v4()));
     let store = SqliteStore::open(&path).expect("база файлом");
     (harness_with(store), path)
+}
+
+fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account: AccountId) {
+    let period = iaam_core::reconciliation::claim::AssertionPeriod::between(
+        date!(2025 - 01 - 01),
+        date!(2025 - 01 - 31),
+    )
+    .expect("период");
+    let source = SourceId::new_random();
+    let event = iaam_core::event::Event {
+        id: iaam_core::ids::EventId::new_random(),
+        schema_version: iaam_core::event::SCHEMA_VERSION,
+        owner,
+        account,
+        kind: iaam_core::event::kind::EventKind::ControlAssertion {
+            period,
+            claim: iaam_core::reconciliation::claim::ControlClaim::CashBalance {
+                currency: CurrencyCode::Rub,
+                amount: iaam_core::money::PostedMinor::new(10_000),
+                at: iaam_core::reconciliation::claim::BalancePoint::Closing,
+            },
+        },
+        dates: EventDates::for_cash(CashPostedDate(period.to)),
+        order: EffectiveOrder::new(period.to, 1),
+        legs: Vec::new(),
+        provenance: iaam_core::event::provenance::Provenance::new(
+            source,
+            iaam_core::event::provenance::RawHash::parse(&"b".repeat(64)).expect("хеш"),
+            ParserVersion("contract-test".to_owned()),
+        ),
+        relation: iaam_core::event::Relation::None,
+        confidence: iaam_core::event::Confidence::Known,
+        idempotency_key: Some(format!(
+            "owner-balance:{}:{}:{}",
+            account.inner(),
+            period.from,
+            period.to
+        )),
+    };
+    SqliteStore::open(path)
+        .expect("второе соединение")
+        .append_event(&event)
+        .expect("утверждение сверки");
 }
 
 fn harness_with(store: SqliteStore) -> Harness {
@@ -216,6 +304,7 @@ fn harness_with_factory(
         owner_token: owner_token.to_owned(),
         agent_token: agent_token.to_owned(),
         readonly_token: readonly_token.to_owned(),
+        owner,
         account,
         instrument: InstrumentId::new_random(),
         custody: CustodyId::new_random(),
@@ -1883,6 +1972,94 @@ async fn only_the_owner_can_manage_classification_rules() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {response}");
         assert_eq!(response["code"], "forbidden", "{method}: {response}");
     }
+}
+
+#[tokio::test]
+async fn reconciliation_returns_nonempty_status_content() {
+    let (harness, path) = harness_on_disk();
+    add_reconciliation_assertion(&path, harness.owner, harness.account);
+
+    let (status, response) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2025-01-01&to=2025-01-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let statuses = response.as_array().expect("статусы сверки");
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
+    assert_eq!(statuses[0]["from"], "2025-01-01");
+    assert_eq!(statuses[0]["to"], "2025-01-31");
+    assert_eq!(statuses[0]["dimensions"][0]["dimension"], "cash");
+    assert_eq!(statuses[0]["dimensions"][0]["status"], "provisional");
+    assert_eq!(statuses[0]["outcomes"][0]["claim"], "cash_balance");
+    assert_eq!(statuses[0]["outcomes"][0]["outcome"], "not_comparable");
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn reconciliation_balance_returns_nonempty_status_content() {
+    let (harness, path) = harness_on_disk();
+    add_reconciliation_assertion(&path, harness.owner, harness.account);
+    let balance = json!({
+        "account": harness.account.inner(),
+        "from": "2025-01-01",
+        "to": "2025-01-31",
+        "at": "closing",
+        "cash": { "currency": "RUB", "amount": "100.00" },
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &balance),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let statuses = response.as_array().expect("статусы сверки");
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
+    assert_eq!(statuses[0]["dimensions"][0]["dimension"], "cash");
+    assert_eq!(statuses[0]["dimensions"][0]["status"], "provisional");
+    assert_eq!(statuses[0]["outcomes"][0]["claim"], "cash_balance");
+    assert_eq!(statuses[0]["outcomes"][0]["outcome"], "not_comparable");
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn broker_sync_numbers_recorded_verdicts_from_one() {
+    let channel: Arc<dyn BrokerChannel> = Arc::new(PopulatedChannel {
+        source: iaam_core::reconciliation::evidence::SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("contract-test".to_owned()),
+            document: None,
+        },
+    });
+    let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory { channel });
+    let harness = harness_with_factory(
+        SqliteStore::open_in_memory().expect("база в памяти"),
+        Some(factory),
+    );
+    let body = json!({
+        "account": harness.account.inner(),
+        "from": "2025-01-01",
+        "to": "2025-01-31",
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/brokers/tinkoff/sync", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["recorded"].as_array().expect("вердикты").len(), 1);
+    assert_eq!(response["recorded"][0]["verdict"], "provisional");
+    assert_eq!(response["recorded"][0]["row"], 1);
 }
 
 #[tokio::test]

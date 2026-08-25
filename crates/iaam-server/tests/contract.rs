@@ -15,6 +15,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
+use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
     ParsedOperations, TokenAdmin,
@@ -22,7 +23,9 @@ use iaam_app::ports::{
 use iaam_broker::credentials::Key;
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
+use iaam_core::reconciliation::Dimension;
 use iaam_server::auth::hash_token;
+use iaam_server::dto::VerdictDto;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::SqliteStore;
@@ -1933,4 +1936,198 @@ async fn broker_sync_reports_unconfigured_access_as_503_and_rejects_read_only() 
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
     assert_eq!(response["code"], "forbidden");
+}
+
+#[tokio::test]
+async fn ingest_verdicts_return_their_populated_fields() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "контракт",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "1000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-01-01" },
+            "idempotency_key": "verdict-fields",
+        }],
+    });
+
+    let (status, first) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let provisional_event = first[0]["event_id"].as_str().expect("provisional event_id");
+    assert!(
+        Uuid::parse_str(provisional_event).is_ok(),
+        "event_id обязан быть UUID: {provisional_event}"
+    );
+
+    let (status, second) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second[0]["verdict"], "duplicate");
+    assert_eq!(second[0]["event_id"], provisional_event);
+    assert!(
+        second[0]["event_id"].as_str().is_some(),
+        "duplicate обязан назвать существующее событие"
+    );
+
+    let rejected_body = json!({
+        "source_label": "контракт",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "-5.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-01-02" },
+        }],
+    });
+    let (status, rejected) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &rejected_body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rejected}");
+    assert_eq!(rejected[0]["verdict"], "rejected");
+    assert_eq!(rejected[0]["field"], "amount");
+    assert_eq!(rejected[0]["expected"], "положительная величина");
+    assert_eq!(rejected[0]["actual"], "-5.00");
+}
+
+#[tokio::test]
+async fn a_document_verdict_return_contains_its_detail() {
+    let harness = harness();
+    let request = Request::builder()
+        .uri(format!("/v1/documents?account={}", harness.account.inner()))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .body(Body::from(
+            include_bytes!("../../../tests/fixtures/reports/tinkoff-synthetic.xlsx").as_slice(),
+        ))
+        .expect("запрос");
+    let (status, response) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let rows = response["rows"].as_array().expect("строки документа");
+    let unsupported = rows
+        .iter()
+        .find(|row| row["verdict"] == "unsupported")
+        .expect("отчёт обязан вернуть строку вне периметра");
+    assert_eq!(unsupported["detail"], "repo");
+}
+
+#[test]
+fn verdict_dto_json_contains_every_variant_field() {
+    let event = iaam_core::ids::EventId::new_random();
+    let account = AccountId::new_random();
+    let cases = [
+        (
+            Verdict::Accepted { event },
+            json!({
+                "row": 7,
+                "verdict": "accepted",
+                "event_id": event.inner(),
+            }),
+        ),
+        (
+            Verdict::Provisional { event },
+            json!({
+                "row": 7,
+                "verdict": "provisional",
+                "event_id": event.inner(),
+            }),
+        ),
+        (
+            Verdict::Discrepancy {
+                event,
+                account,
+                dimension: Dimension::Cash,
+                detail: "остаток не сошёлся".into(),
+            },
+            json!({
+                "row": 7,
+                "verdict": "discrepancy",
+                "event_id": event.inner(),
+                "account_id": account.inner(),
+                "dimension": "cash",
+                "detail": "остаток не сошёлся",
+            }),
+        ),
+        (
+            Verdict::NeedsReconciliation {
+                account,
+                dimension: Dimension::Cash,
+            },
+            json!({
+                "row": 7,
+                "verdict": "needs_reconciliation",
+                "account_id": account.inner(),
+                "dimension": "cash",
+            }),
+        ),
+        (
+            Verdict::Duplicate { existing: event },
+            json!({
+                "row": 7,
+                "verdict": "duplicate",
+                "event_id": event.inner(),
+            }),
+        ),
+        (
+            Verdict::NeedsClassification {
+                question: "перевод внутренний?".into(),
+            },
+            json!({
+                "row": 7,
+                "verdict": "needs_classification",
+                "detail": "перевод внутренний?",
+            }),
+        ),
+        (
+            Verdict::Unsupported {
+                reason: "repo".into(),
+            },
+            json!({
+                "row": 7,
+                "verdict": "unsupported",
+                "detail": "repo",
+            }),
+        ),
+        (
+            Verdict::Rejected {
+                rejection: Rejection {
+                    field: "amount".into(),
+                    expected: "положительная величина".into(),
+                    actual: "-5.00".into(),
+                },
+            },
+            json!({
+                "row": 7,
+                "verdict": "rejected",
+                "field": "amount",
+                "expected": "положительная величина",
+                "actual": "-5.00",
+            }),
+        ),
+    ];
+
+    for (domain, expected) in cases {
+        let actual = serde_json::to_value(VerdictDto::from_domain(7, &domain))
+            .expect("вердикт сериализуется");
+        assert_eq!(actual, expected, "содержимое вердикта {domain:?}");
+    }
 }

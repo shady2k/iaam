@@ -144,7 +144,7 @@ CREATE TABLE instrument_aliases (
     instrument TEXT NOT NULL REFERENCES instruments(id),
     valid_from TEXT NOT NULL,
     valid_to   TEXT,           -- NULL = открытый интервал
-    source     TEXT NOT NULL REFERENCES source_documents(id), -- откуда узнали
+    source     TEXT NOT NULL,  -- откуда узнали, типизирован как SourceId
     created_at TEXT NOT NULL,
     PRIMARY KEY (namespace, value, valid_from),
     CHECK (valid_to IS NULL OR valid_to > valid_from)
@@ -163,11 +163,18 @@ CREATE INDEX instrument_aliases_by_instrument
 это уже известные грабли проекта, память
 `lesson-sqlite-strict-primary-key-not-null-document`.
 
-**`source` — типизированный `SourceId`, а не свободная строка**, и внешним ключом
-смотрит в `source_documents` из E2. Псевдоним — такое же утверждение о мире, как
-цена: E1.4 уже требует, чтобы цена приходила фактом с provenance, а не
-параметром запроса. Строка «откуда-то узнали» не позволила бы ни отозвать
-псевдонимы испорченного документа, ни отличить их от заведённых вручную.
+**`source` — типизированный `SourceId`, а не свободная строка.** Псевдоним —
+такое же утверждение о мире, как цена: E1.4 уже требует, чтобы цена приходила
+фактом с provenance, а не параметром запроса. Строка «откуда-то узнали» не
+позволила бы ни отозвать псевдонимы испорченного документа, ни отличить их от
+заведённых вручную.
+
+**Внешнего ключа на `source_documents` при этом нет, и это решение, а не
+упущение.** `source_documents` заведена с колонкой `owner` и хранит загрузки
+конкретного владельца, а `instruments` глобальна. Ключ потребовал бы, чтобы
+каждый псевдоним происходил из загруженного документа — а это неверно и для
+ручного ввода, и для синхронизации с MOEX ISS, которая придёт в E3.2.
+Ссылочная целостность держится типом `SourceId` на границе кода.
 
 ### 3.3 `custody_places` — новая таблица
 

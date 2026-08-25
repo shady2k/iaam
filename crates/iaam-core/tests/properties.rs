@@ -277,3 +277,16 @@ mod projection_properties {
         }
     }
 }
+
+proptest! {
+    /// Разбор кода не выдумывает род: любая строка, не совпадающая
+    /// с кодом варианта, обязана дать None.
+    #[test]
+    fn an_arbitrary_string_is_never_mistaken_for_a_kind(text in r"\PC{0,16}") {
+        let parsed = iaam_core::instrument::InstrumentKind::from_code(&text);
+        let expected = iaam_core::instrument::InstrumentKind::ALL
+            .into_iter()
+            .find(|kind| kind.code() == text);
+        prop_assert_eq!(parsed, expected);
+    }
+}

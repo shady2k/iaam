@@ -28,6 +28,14 @@ pub enum AppError {
         #[source]
         source: ProjectionError,
     },
+    /// Инвариант справочника нарушен: код разрешается более чем в один
+    /// инструмент, то есть пробит триггер
+    /// `instrument_aliases_do_not_overlap`.
+    /// Отдельно от `Invariant`, потому что тот несёт источник из домена
+    /// проекции: подставить туда любой вариант ради сигнатуры значит
+    /// отправить разбирающегося смотреть снимки вместо схемы справочника.
+    #[error("нарушен инвариант справочника, идентификатор корреляции {correlation}: {detail}")]
+    DirectoryInvariant { correlation: Uuid, detail: String },
     #[error("проекция не построена: {0}")]
     Projection(#[source] ProjectionError),
     /// Срез журнала не годится для сверки: событие без даты,
@@ -92,6 +100,7 @@ impl AppError {
             Self::NotFound { .. } => "not_found",
             Self::Invalid { .. } => "invalid_request",
             Self::Invariant { .. } => "invariant_violated",
+            Self::DirectoryInvariant { .. } => "directory_invariant_violated",
             Self::Projection(_) => "projection_failed",
             Self::Reconciliation(_) => "reconciliation_failed",
             Self::Perimeter(_) => "perimeter_assessment_failed",
@@ -139,6 +148,14 @@ mod tests {
             }
             .code(),
             "invariant_violated"
+        );
+        assert_eq!(
+            AppError::DirectoryInvariant {
+                correlation: Uuid::new_v4(),
+                detail: "код ticker:ABC на 2026-08-25 разрешается в 2 инструмента".into(),
+            }
+            .code(),
+            "directory_invariant_violated"
         );
         assert_eq!(
             AppError::Projection(ProjectionError::SnapshotFingerprintMismatch).code(),

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
-use iaam_core::ids::{AccountId, OwnerId};
+use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
 use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
@@ -73,6 +73,69 @@ pub struct AccountView {
     pub id: AccountId,
     pub title: String,
     pub institution: Option<String>,
+}
+/// Инструмент как его видит транспорт.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentView {
+    pub id: InstrumentId,
+    /// `None` — род не установлен. Оценка такого инструмента неполна,
+    /// и подставлять акцию по умолчанию запрещено (§4.9).
+    pub kind: Option<String>,
+    pub symbol: String,
+    pub title: String,
+    pub denomination_currency: String,
+    pub settlement_currency: String,
+    pub quote_currency: String,
+}
+
+/// Действующий псевдоним инструмента.
+///
+/// Поля `source` здесь нет намеренно: справочник глобален и читается
+/// всеми, а `SourceId` указывает на документ конкретного владельца.
+/// Отдать его наружу означало бы раскрыть существование чужой
+/// загрузки (§14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasView {
+    pub namespace: String,
+    pub value: String,
+    pub instrument: InstrumentId,
+    pub valid_from: Date,
+    pub valid_to: Option<Date>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyView {
+    pub id: CustodyId,
+    pub title: String,
+    pub institution: Option<String>,
+}
+
+/// Справочник инструментов (§4.5, §4.7).
+#[async_trait]
+pub trait InstrumentDirectory: Send + Sync {
+    /// Инструмент по внешнему коду на дату.
+    ///
+    /// Дата обязательна и умолчания «сегодня» не имеет: ISIN меняется
+    /// корпоративным действием, поэтому «текущего» ответа на вопрос
+    /// «какой инструмент стоит за этим кодом» не существует (§4.7).
+    async fn resolve(
+        &self,
+        namespace: &str,
+        value: &str,
+        on: Date,
+    ) -> Result<InstrumentId, AppError>;
+
+    async fn instrument(&self, id: InstrumentId) -> Result<Option<InstrumentView>, AppError>;
+
+    async fn list_instruments(&self) -> Result<Vec<InstrumentView>, AppError>;
+
+    /// Все псевдонимы со своими интервалами.
+    ///
+    /// Отдаются целиком, одним запросом: разбор документа иначе ходил бы
+    /// в базу на каждую строку.
+    async fn list_aliases(&self) -> Result<Vec<AliasView>, AppError>;
+
+    async fn list_custody_places(&self, owner: OwnerId) -> Result<Vec<CustodyView>, AppError>;
 }
 
 /// Хранилище фактов и справочников.
@@ -508,5 +571,13 @@ mod tests {
         assert_eq!(Scope::Owner.code(), "owner");
         assert_eq!(Scope::Agent.code(), "agent");
         assert_eq!(Scope::ReadOnly.code(), "read_only");
+    }
+    /// Порт обязан быть объектобезопасным: точка сборки держит
+    /// адаптеры за `Arc<dyn ...>`, и выбор адаптера не должен
+    /// подниматься в типы на этапе компиляции (§3.2).
+    #[test]
+    fn the_instrument_directory_port_is_object_safe() {
+        fn accepts(_: &dyn InstrumentDirectory) {}
+        let _: fn(&dyn InstrumentDirectory) = accepts;
     }
 }

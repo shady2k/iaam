@@ -1614,6 +1614,16 @@ git commit -m "feat(app): порт InstrumentDirectory и адаптер пов�
 **Files:**
 - Modify: `crates/iaam-ingest/src/csv_source.rs:30-37` (`Directory`), `:191-233` (`build_trade`), рядом с `:234` (`lookup`)
 - Modify: `crates/iaam-server/src/routes.rs:1140-1150` (`build_directory`)
+- Modify: `crates/iaam-app/src/lib.rs` — поле `directory: Arc<dyn InstrumentDirectory>`
+  в `AppServices` и в конструктор
+- Modify: **все места конструирования `Directory` и `AppServices`** — смена типа
+  поля доходит до каждого из них, иначе крейта не собирается. На сегодня это
+  `crates/iaam-app/tests/sync.rs`, `crates/iaam-server/tests/contract.rs`,
+  `crates/iaam-bootstrap/src/main.rs`; список проверять `grep -rn "Directory {" crates/`,
+  а не переписывать отсюда. **Это адаптация к типу, а не переписывание тестов:**
+  где фикстура клала `InstrumentId`, она кладёт вектор из одной пары
+  «интервал + `InstrumentId`» с открытым интервалом; утверждения, имена
+  и комментарии тестов остаются нетронутыми.
 
 **Interfaces:**
 - Consumes: `AliasInterval` (T1), `InstrumentDirectory` (T4).

@@ -13,6 +13,7 @@
 
 use iaam_core::dates::TradeDate;
 use iaam_core::ids::InstrumentId;
+use iaam_core::instrument::AliasInterval;
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::rules::lot_disposal::{DisposalInput, FifoV1, Lot, LotDisposalRule, LotId};
@@ -288,5 +289,83 @@ proptest! {
             .into_iter()
             .find(|kind| kind.code() == text);
         prop_assert_eq!(parsed, expected);
+    }
+}
+
+proptest! {
+    /// Из непересекающихся интервалов любую дату покрывает не более
+    /// одного.
+    ///
+    /// Это математическое содержание свойства однозначности резолвинга
+    /// (E3.1): резолвер обязан вернуть один инструмент или ни одного,
+    /// но никогда двух. Проверяется здесь, а не в `iaam-store`, потому
+    /// что база к утверждению отношения не имеет: однозначность даёт
+    /// геометрия полуинтервалов, а хранилище лишь обязано ей
+    /// пользоваться. Что оно ею действительно пользуется, проверяет
+    /// граничный тест `a_code_never_resolves_to_two_instruments`
+    /// в `crates/iaam-store/tests/instrument_directory.rs`.
+    ///
+    /// **Область применимости.** Интервалы строятся непересекающимися
+    /// по построению — попарно из отсортированных различных границ,
+    /// с зазорами между парами. Пересекающиеся интервалы свойству не
+    /// подчиняются, и это не дефект свойства: их запрещает триггер
+    /// `instrument_aliases_do_not_overlap` в схеме, а не арифметика.
+    #[test]
+    fn at_most_one_of_several_disjoint_intervals_covers_any_day(
+        bounds in prop::collection::vec(0_i64..3_000, 2..12),
+        probe in -100_i64..3_100,
+    ) {
+        let origin = date!(2020 - 01 - 01);
+        let day = |offset: i64| {
+            origin
+                .checked_add(time::Duration::days(offset))
+                .expect("дата в пределах календаря")
+        };
+
+        let mut sorted = bounds;
+        sorted.sort_unstable();
+
+        // Цепочка СМЕЖНЫХ интервалов: [b0, b1), [b1, b2), [b2, b3), …
+        //
+        // Именно так выглядит история псевдонима: смена ISIN закрывает
+        // старый интервал и открывает новый той же датой. И только на
+        // такой форме свойство способно упасть — при включительном
+        // конце каждая внутренняя граница попала бы сразу в два
+        // интервала. Разрозненные пары с зазорами здесь не годятся:
+        // стык между ними приходилось бы ждать от случайного
+        // совпадения двух чисел, то есть практически никогда, и
+        // свойство молча выродилось бы в тавтологию.
+        //
+        // Вырожденные звенья (b_i == b_{i+1}) отбрасываются: пустой
+        // интервал запрещён проверкой CHECK в схеме и покрывает пустое
+        // множество.
+        let intervals: Vec<AliasInterval> = sorted
+            .windows(2)
+            .filter(|pair| pair[0] < pair[1])
+            .map(|pair| AliasInterval {
+                valid_from: day(pair[0]),
+                valid_to: Some(day(pair[1])),
+            })
+            .collect();
+        prop_assume!(!intervals.is_empty());
+
+        // Проверяются ВСЕ границы цепочки, а не только случайная дата.
+        // Случайный пробник попадает ровно в границу примерно в одном
+        // случае из трёхсот, поэтому off-by-one он находит от случая
+        // к случаю — то есть не находит. Граница же и есть то место,
+        // где интервалы могут наложиться.
+        let mut probes: Vec<i64> = sorted.clone();
+        probes.push(probe);
+
+        for point in probes {
+            let covering = intervals
+                .iter()
+                .filter(|interval| interval.covers(day(point)))
+                .count();
+            prop_assert!(
+                covering <= 1,
+                "день {point} покрыт {covering} интервалами из {intervals:?}"
+            );
+        }
     }
 }

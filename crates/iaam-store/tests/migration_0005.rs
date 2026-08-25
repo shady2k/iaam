@@ -114,3 +114,29 @@ fn adjacent_alias_intervals_are_allowed() {
         "смежные интервалы стыкуются без зазора: конец полуинтервала исключителен"
     );
 }
+
+/// Таблица создаётся под именем `instruments_new` и переименовывается,
+/// поэтому её собственный внешний ключ на `lineage_parent` в момент
+/// создания указывает на `instruments_new`. Полагаться на то, что
+/// `ALTER TABLE ... RENAME TO` перепишет эту самоссылку, нельзя молча:
+/// поведение зависит от `legacy_alter_table`, а сломанный ключ никак
+/// себя не проявит, пока не появится первая замещающая облигация —
+/// то есть спустя месяцы после миграции.
+#[test]
+fn the_self_reference_survives_the_rename() {
+    let conn = database_at_version_four();
+    apply_migration_0005(&conn);
+
+    let ddl: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'instruments'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("определение таблицы");
+
+    assert!(
+        !ddl.contains("instruments_new"),
+        "внешний ключ остался на промежуточное имя таблицы: {ddl}"
+    );
+}

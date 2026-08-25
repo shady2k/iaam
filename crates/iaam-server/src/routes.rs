@@ -141,7 +141,12 @@ pub async fn add_broker_access(
     let created = state
         .services
         .broker
-        .add_access(principal.owner, request.broker, token)
+        .add_access(
+            principal.owner,
+            request.broker,
+            request.environment.to_domain(),
+            token,
+        )
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -266,7 +271,10 @@ pub async fn claim(
         .tokens
         .issue_token(OwnerId::new_random(), request.label, Scope::Owner)
         .await?;
-    Ok((StatusCode::CREATED, Json(IssuedTokenDto::from_domain(issued))))
+    Ok((
+        StatusCode::CREATED,
+        Json(IssuedTokenDto::from_domain(issued)),
+    ))
 }
 
 /// Отказ в присвоении.
@@ -333,7 +341,10 @@ pub async fn create_token(
         .tokens
         .issue_token(principal.owner, request.label, scope)
         .await?;
-    Ok((StatusCode::CREATED, Json(IssuedTokenDto::from_domain(issued))))
+    Ok((
+        StatusCode::CREATED,
+        Json(IssuedTokenDto::from_domain(issued)),
+    ))
 }
 
 /// Список выданных токенов.
@@ -357,7 +368,9 @@ pub async fn list_tokens(
 ) -> Result<Json<Vec<TokenDto>>, ApiFailure> {
     require_admin(&principal)?;
     let tokens = state.services.tokens.list_tokens(principal.owner).await?;
-    Ok(Json(tokens.into_iter().map(TokenDto::from_domain).collect()))
+    Ok(Json(
+        tokens.into_iter().map(TokenDto::from_domain).collect(),
+    ))
 }
 
 /// Отзыв токена.

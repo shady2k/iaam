@@ -64,6 +64,12 @@ pub enum StoreError {
     DocumentDecode { id: String, detail: String },
     #[error("номер строки {row} не помещается в хранилище")]
     RowNumberOutOfRange { row: u64 },
+    /// Действующая запись уже есть. Отдельно от `Sqlite`, потому что
+    /// это ответ на вопрос владельца, а не сбой: текст «UNIQUE
+    /// constraint failed» отправляет искать поломку там, где её нет,
+    /// да ещё и рассказывает наружу устройство схемы.
+    #[error("{what} уже заведён: сначала отзовите действующий")]
+    AlreadyExists { what: &'static str },
     #[error("поле {field} правила классификации не является JSON: {source}")]
     RuleNotJson {
         field: &'static str,

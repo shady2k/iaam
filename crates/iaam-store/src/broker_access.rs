@@ -5,10 +5,15 @@
 //! не знает. Адаптер, знающий криптографию соседнего адаптера,
 //! превращает слои в клубок.
 //!
-//! Область прав хранится строкой по той же причине, что `matcher`
-//! и `outcome` правил: хранилище её не толкует, оно хранит. Разбирает
-//! её `iaam-broker`, и строка, обещающая торговые права, там даёт
-//! отказ, а не доступ.
+//! Область прав и среда хранятся строками по той же причине, что
+//! `matcher` и `outcome` правил: хранилище их не толкует, оно хранит.
+//! Разбирает их `iaam-broker`: строка, обещающая торговые права, даёт
+//! там отказ, а не доступ, а среда решает, к какому шлюзу идти.
+//!
+//! Сред у брокера может быть несколько, и токены у них **разные**:
+//! боевой токен песочница не принимает, песочный не принимает бой.
+//! Поэтому действующий доступ один на тройку владелец+брокер+среда,
+//! а не на пару владелец+брокер.
 
 use iaam_core::ids::OwnerId;
 use rusqlite::{TransactionBehavior, params};
@@ -23,6 +28,8 @@ pub struct NewBrokerAccess {
     pub id: Uuid,
     pub owner: OwnerId,
     pub broker: BrokerCode,
+    /// Среда брокера: боевая или песочница. Толкуется в `iaam-broker`.
+    pub environment: String,
     pub scope: String,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
@@ -34,6 +41,7 @@ pub struct BrokerAccess {
     pub id: Uuid,
     pub owner: OwnerId,
     pub broker: BrokerCode,
+    pub environment: String,
     pub scope: String,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
@@ -103,37 +111,53 @@ impl SqliteStore {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
+        let inserted = transaction.execute(
             "INSERT INTO broker_access (
-                 id, owner, broker, scope, nonce, ciphertext, created_at, revoked_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                 id, owner, broker, environment, scope, nonce, ciphertext, created_at, revoked_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
             params![
                 access.id.to_string(),
                 access.owner.inner().to_string(),
                 access.broker.as_str(),
+                access.environment,
                 access.scope,
                 access.nonce,
                 access.ciphertext,
                 now(),
             ],
-        )?;
+        );
+        // Нарушение уникальности — это «доступ в этой среде уже есть»,
+        // а не сбой хранилища. Разбирается здесь: дальше по слоям едет
+        // ответ на вопрос владельца, а не текст SQLite, из которого
+        // наружу видно устройство схемы.
+        if let Err(rusqlite::Error::SqliteFailure(error, _)) = &inserted
+            && error.code == rusqlite::ErrorCode::ConstraintViolation
+        {
+            return Err(StoreError::AlreadyExists {
+                what: "действующий доступ к брокеру в этой среде",
+            });
+        }
+        inserted?;
         transaction.commit()?;
         Ok(())
     }
 
-    /// Действующий доступ владельца к брокеру.
+    /// Действующий доступ владельца к брокеру в названной среде.
     ///
-    /// Отозванный не находится: отозванным доступом не ходят.
+    /// Отозванный не находится: отозванным доступом не ходят. Среда
+    /// обязательна и умолчания не имеет: доступ, выбранный за вызывающего,
+    /// — это поход в чужую среду, замеченный по чужому ответу.
     pub fn find_broker_access(
         &self,
         owner: OwnerId,
         broker: &BrokerCode,
+        environment: &str,
     ) -> Result<Option<BrokerAccess>, StoreError> {
         let mut found = self.query_access(
-            "SELECT id, broker, scope, nonce, ciphertext, created_at, revoked_at
+            "SELECT id, broker, environment, scope, nonce, ciphertext, created_at, revoked_at
              FROM broker_access
-             WHERE owner = ?1 AND broker = ?2 AND revoked_at IS NULL",
-            params![owner.inner().to_string(), broker.as_str()],
+             WHERE owner = ?1 AND broker = ?2 AND environment = ?3 AND revoked_at IS NULL",
+            params![owner.inner().to_string(), broker.as_str(), environment],
             owner,
         )?;
         Ok(found.pop())
@@ -142,7 +166,7 @@ impl SqliteStore {
     /// Все доступы владельца, включая отозванные.
     pub fn broker_access_history(&self, owner: OwnerId) -> Result<Vec<BrokerAccess>, StoreError> {
         self.query_access(
-            "SELECT id, broker, scope, nonce, ciphertext, created_at, revoked_at
+            "SELECT id, broker, environment, scope, nonce, ciphertext, created_at, revoked_at
              FROM broker_access WHERE owner = ?1 ORDER BY created_at, id",
             params![owner.inner().to_string()],
             owner,
@@ -181,15 +205,16 @@ impl SqliteStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(3)?,
                 row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut access = Vec::new();
         for row in rows {
-            let (id, broker, scope, nonce, ciphertext, created_at, revoked_at) = row?;
+            let (id, broker, environment, scope, nonce, ciphertext, created_at, revoked_at) = row?;
             access.push(BrokerAccess {
                 id: Uuid::parse_str(&id).map_err(|_| StoreError::NotFound {
                     what: "доступ к брокеру",
@@ -200,6 +225,7 @@ impl SqliteStore {
                     id,
                     detail: "код брокера пуст".to_owned(),
                 })?,
+                environment,
                 scope,
                 nonce,
                 ciphertext,

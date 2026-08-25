@@ -1092,7 +1092,7 @@ async fn an_event_added_behind_the_snapshot_boundary_forces_a_recompute_not_a_fa
 const BROKER_TOKEN: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
 
 fn add_broker_access_body() -> Value {
-    json!({ "broker": "tinkoff", "token": BROKER_TOKEN })
+    json!({ "broker": "tinkoff", "environment": "sandbox", "token": BROKER_TOKEN })
 }
 
 #[tokio::test]
@@ -1139,6 +1139,7 @@ async fn the_scope_of_a_broker_access_is_read_only_whatever_the_client_sends() {
             &harness.owner_token,
             &json!({
                 "broker": "tinkoff",
+                "environment": "sandbox",
                 "token": BROKER_TOKEN,
                 "scope": "full_access",
             }),
@@ -1202,6 +1203,127 @@ async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() 
         !listed["revoked_at"].is_null(),
         "отозванный доступ перестаёт быть действующим: {listed}"
     );
+}
+
+#[tokio::test]
+async fn both_environments_of_one_broker_are_provisioned_side_by_side() {
+    // Токены у сред разные: боевой песочница не принимает, песочный
+    // не принимает бой. Значит оба доступа обязаны уживаться, иначе
+    // живая проверка и боевой канал исключают друг друга.
+    let harness = harness();
+
+    let (status, sandbox) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &json!({ "broker": "tinkoff", "environment": "sandbox", "token": BROKER_TOKEN }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{sandbox}");
+    assert_eq!(sandbox["environment"], "sandbox");
+
+    let (status, prod) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &json!({ "broker": "tinkoff", "environment": "prod", "token": "t.другой-токен-боевой" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{prod}");
+    assert_eq!(prod["environment"], "prod");
+    assert_ne!(sandbox["id"], prod["id"]);
+
+    let (status, list) = call(
+        &harness.router,
+        get("/v1/broker-access", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let environments: Vec<&str> = list
+        .as_array()
+        .expect("список доступов")
+        .iter()
+        .filter_map(|access| access["environment"].as_str())
+        .collect();
+    assert!(environments.contains(&"prod"), "{list}");
+    assert!(environments.contains(&"sandbox"), "{list}");
+}
+
+#[tokio::test]
+async fn a_second_access_in_the_same_environment_is_refused_understandably() {
+    // Два действующих доступа в одной среде означают, что неизвестно,
+    // каким из них система ходит. Отказ обязан называть причину:
+    // «внутренняя ошибка» отправила бы владельца искать поломку
+    // там, где её нет, — на самом деле нужно сначала отозвать старый.
+    let harness = harness();
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &add_broker_access_body(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &add_broker_access_body(),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[tokio::test]
+async fn an_access_without_a_named_environment_is_refused() {
+    // Умолчание здесь означало бы песочный токен, молча записанный
+    // боевым: шлюз ответит отказом на первом же обращении, а по тексту
+    // отказа о среде не догадаться — проверено на живом шлюзе.
+    let harness = harness();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &json!({ "broker": "tinkoff", "token": BROKER_TOKEN }),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "среда без умолчания: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_environment_is_refused() {
+    let harness = harness();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &json!({ "broker": "tinkoff", "environment": "стенд", "token": BROKER_TOKEN }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
 
 #[tokio::test]
@@ -1309,7 +1431,10 @@ async fn a_wrong_claim_code_is_refused_and_does_not_burn_the_right_one() {
 
     let (status, body) = call(
         &router,
-        post_public("/v1/claim", &json!({ "code": "не тот код", "label": "чужой" })),
+        post_public(
+            "/v1/claim",
+            &json!({ "code": "не тот код", "label": "чужой" }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -1442,7 +1567,11 @@ async fn an_agent_token_may_not_manage_tokens_at_all() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["code"], "forbidden");
 
-    let (status, body) = call(&harness.router, get("/v1/tokens", Some(&harness.agent_token))).await;
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/tokens", Some(&harness.agent_token)),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
     let (status, body) = call(
@@ -1477,7 +1606,11 @@ async fn the_token_list_carries_neither_tokens_nor_their_hashes() {
     assert_eq!(status, StatusCode::CREATED, "{created}");
     let issued = created["token"].as_str().expect("токен").to_owned();
 
-    let (status, list) = call(&harness.router, get("/v1/tokens", Some(&harness.owner_token))).await;
+    let (status, list) = call(
+        &harness.router,
+        get("/v1/tokens", Some(&harness.owner_token)),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{list}");
     let body = list.to_string();
 
@@ -1518,7 +1651,11 @@ async fn a_revoked_token_stops_being_accepted_and_stays_in_the_history() {
     let token = created["token"].as_str().expect("токен").to_owned();
 
     let (status, accounts) = call(&harness.router, get("/v1/accounts", Some(&token))).await;
-    assert_eq!(status, StatusCode::OK, "выпущенный токен пускает: {accounts}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "выпущенный токен пускает: {accounts}"
+    );
 
     let (status, body) = call(
         &harness.router,
@@ -1534,7 +1671,11 @@ async fn a_revoked_token_stops_being_accepted_and_stays_in_the_history() {
         "отозванный токен не пускает: {body}"
     );
 
-    let (status, list) = call(&harness.router, get("/v1/tokens", Some(&harness.owner_token))).await;
+    let (status, list) = call(
+        &harness.router,
+        get("/v1/tokens", Some(&harness.owner_token)),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{list}");
     let listed = find_access(&list, &id).expect("отозванный токен остаётся историей");
     assert!(
@@ -1571,10 +1712,7 @@ async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
 
     let (status, body) = call(
         &harness.router,
-        delete(
-            &format!("/v1/tokens/{}", stranger.id),
-            &harness.owner_token,
-        ),
+        delete(&format!("/v1/tokens/{}", stranger.id), &harness.owner_token),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");

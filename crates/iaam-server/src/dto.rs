@@ -12,7 +12,7 @@ use std::fmt;
 
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
-use iaam_app::ports::{BrokerAccessView, IssuedToken, Scope, TokenView};
+use iaam_app::ports::{BrokerAccessView, BrokerEnvironment, IssuedToken, Scope, TokenView};
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::CurrencyCode;
@@ -770,6 +770,11 @@ pub struct CreateAccountRequest {
 pub struct AddBrokerAccessRequest {
     /// Код брокера, например `tinkoff`.
     pub broker: String,
+    /// Среда брокера. Поле обязательное и умолчания не имеет: токены
+    /// у сред разные, и молча записанная не та среда оборачивается
+    /// отказом шлюза при первом обращении — по тексту которого о среде
+    /// не догадаться.
+    pub environment: BrokerEnvironmentDto,
     /// Токен брокера. Секрет: принимается, но никогда не возвращается,
     /// поэтому в схеме помечен как `password` и `writeOnly`.
     #[schema(format = Password, write_only, example = "<секрет>")]
@@ -781,8 +786,28 @@ impl fmt::Debug for AddBrokerAccessRequest {
         formatter
             .debug_struct("AddBrokerAccessRequest")
             .field("broker", &self.broker)
+            .field("environment", &self.environment)
             .field("token", &"<скрыт>")
             .finish()
+    }
+}
+
+/// Среда брокера в транспорте. Отдельный тип, потому что
+/// `BrokerEnvironment` порта не знает про OpenAPI и знать не должна.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerEnvironmentDto {
+    Prod,
+    Sandbox,
+}
+
+impl BrokerEnvironmentDto {
+    #[must_use]
+    pub const fn to_domain(self) -> BrokerEnvironment {
+        match self {
+            Self::Prod => BrokerEnvironment::Prod,
+            Self::Sandbox => BrokerEnvironment::Sandbox,
+        }
     }
 }
 
@@ -794,6 +819,10 @@ impl fmt::Debug for AddBrokerAccessRequest {
 pub struct BrokerAccessDto {
     pub id: Uuid,
     pub broker: String,
+    /// Среда: `prod` или `sandbox`. Строкой, а не перечислением:
+    /// запись пришла из базы, и незнакомое значение обязано доехать
+    /// до владельца как есть, а не превратиться в отказ на чтении.
+    pub environment: String,
     /// Область прав. Всегда `read_only`: торговые права не
     /// запрашиваются ни при каких условиях (§14).
     pub scope: String,
@@ -809,6 +838,7 @@ impl BrokerAccessDto {
         Self {
             id: access.id,
             broker: access.broker,
+            environment: access.environment,
             scope: access.scope,
             created_at: access.created_at,
             revoked_at: access.revoked_at,
@@ -1048,6 +1078,7 @@ mod tests {
         const TOKEN: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
         let request = AddBrokerAccessRequest {
             broker: "tinkoff".into(),
+            environment: BrokerEnvironmentDto::Sandbox,
             token: TOKEN.into(),
         };
 
@@ -1059,6 +1090,10 @@ mod tests {
         assert!(
             printed.contains("tinkoff"),
             "код брокера секретом не является и обязан оставаться видимым: {printed}"
+        );
+        assert!(
+            printed.contains("Sandbox"),
+            "среда секретом не является и обязана оставаться видимой: {printed}"
         );
     }
 

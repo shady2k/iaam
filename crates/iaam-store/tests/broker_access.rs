@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, seal};
+use iaam_broker::environment::Environment;
 use iaam_core::ids::OwnerId;
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::{BrokerAccess, NewBrokerAccess, SoleOwner};
@@ -47,12 +48,13 @@ impl Drop for TempDatabase {
     }
 }
 
-fn access(owner: OwnerId, broker: &str, key: &Key) -> NewBrokerAccess {
+fn access(owner: OwnerId, broker: &str, environment: Environment, key: &Key) -> NewBrokerAccess {
     let sealed = seal(key, SECRET);
     NewBrokerAccess {
         id: Uuid::new_v4(),
         owner,
         broker: BrokerCode::parse(broker).unwrap(),
+        environment: environment.code().to_owned(),
         scope: BrokerScope::ReadOnly.code().to_owned(),
         nonce: sealed.nonce().to_vec(),
         ciphertext: sealed.ciphertext().to_vec(),
@@ -68,7 +70,7 @@ fn a_leaked_database_file_does_not_leak_the_token() {
     let directory = TempDatabase::create("leak");
     let key = Key::from_bytes([9; 32]);
     let owner = OwnerId::new_random();
-    let entry = access(owner, "tinkoff", &key);
+    let entry = access(owner, "tinkoff", Environment::Prod, &key);
     let ciphertext = entry.ciphertext.clone();
     {
         let mut store = SqliteStore::open(&directory.file()).unwrap();
@@ -99,7 +101,7 @@ fn an_archive_bundle_carries_no_broker_access() {
     let mut store = SqliteStore::open_in_memory().unwrap();
     let key = Key::from_bytes([8; 32]);
     let owner = OwnerId::new_random();
-    let entry = access(owner, "tinkoff", &key);
+    let entry = access(owner, "tinkoff", Environment::Prod, &key);
     let ciphertext = entry.ciphertext.clone();
     store.insert_broker_access(&entry).unwrap();
 
@@ -121,10 +123,13 @@ fn a_stored_access_opens_back_with_the_key() {
     let owner = OwnerId::new_random();
     let broker = BrokerCode::parse("tinkoff").unwrap();
     store
-        .insert_broker_access(&access(owner, "tinkoff", &key))
+        .insert_broker_access(&access(owner, "tinkoff", Environment::Prod, &key))
         .unwrap();
 
-    let found = store.find_broker_access(owner, &broker).unwrap().unwrap();
+    let found = store
+        .find_broker_access(owner, &broker, Environment::Prod.code())
+        .unwrap()
+        .unwrap();
     assert_eq!(
         BrokerScope::parse(&found.scope),
         Some(BrokerScope::ReadOnly)
@@ -141,12 +146,17 @@ fn broker_access_of_another_owner_is_not_found() {
     let key = Key::from_bytes([6; 32]);
     let theirs = OwnerId::new_random();
     store
-        .insert_broker_access(&access(theirs, "tinkoff", &key))
+        .insert_broker_access(&access(theirs, "tinkoff", Environment::Prod, &key))
         .unwrap();
 
     let stranger = OwnerId::new_random();
     let broker = BrokerCode::parse("tinkoff").unwrap();
-    assert_eq!(store.find_broker_access(stranger, &broker).unwrap(), None);
+    assert_eq!(
+        store
+            .find_broker_access(stranger, &broker, Environment::Prod.code())
+            .unwrap(),
+        None
+    );
     assert_eq!(store.broker_access_history(stranger).unwrap(), vec![]);
 }
 
@@ -156,12 +166,17 @@ fn a_revoked_access_is_not_found_but_stays_in_history() {
     let key = Key::from_bytes([5; 32]);
     let owner = OwnerId::new_random();
     let broker = BrokerCode::parse("tinkoff").unwrap();
-    let entry = access(owner, "tinkoff", &key);
+    let entry = access(owner, "tinkoff", Environment::Prod, &key);
     store.insert_broker_access(&entry).unwrap();
 
     store.revoke_broker_access(owner, entry.id).unwrap();
 
-    assert_eq!(store.find_broker_access(owner, &broker).unwrap(), None);
+    assert_eq!(
+        store
+            .find_broker_access(owner, &broker, Environment::Prod.code())
+            .unwrap(),
+        None
+    );
     let history = store.broker_access_history(owner).unwrap();
     assert_eq!(history.len(), 1);
     assert!(history[0].revoked_at.is_some());
@@ -169,18 +184,18 @@ fn a_revoked_access_is_not_found_but_stays_in_history() {
 
 #[test]
 fn a_second_active_access_for_one_broker_is_refused() {
-    // Два действующих доступа означают, что неизвестно, каким из них
-    // система ходит к брокеру.
+    // Два действующих доступа в одной среде означают, что неизвестно,
+    // каким из них система ходит к брокеру.
     let mut store = SqliteStore::open_in_memory().unwrap();
     let key = Key::from_bytes([4; 32]);
     let owner = OwnerId::new_random();
     store
-        .insert_broker_access(&access(owner, "tinkoff", &key))
+        .insert_broker_access(&access(owner, "tinkoff", Environment::Prod, &key))
         .unwrap();
 
     assert!(
         store
-            .insert_broker_access(&access(owner, "tinkoff", &key))
+            .insert_broker_access(&access(owner, "tinkoff", Environment::Prod, &key))
             .is_err(),
         "второй действующий доступ к тому же брокеру заведён"
     );
@@ -192,15 +207,99 @@ fn a_revoked_access_makes_room_for_a_new_one() {
     let key = Key::from_bytes([3; 32]);
     let owner = OwnerId::new_random();
     let broker = BrokerCode::parse("tinkoff").unwrap();
-    let first = access(owner, "tinkoff", &key);
+    let first = access(owner, "tinkoff", Environment::Prod, &key);
     store.insert_broker_access(&first).unwrap();
     store.revoke_broker_access(owner, first.id).unwrap();
 
-    let second = access(owner, "tinkoff", &key);
+    let second = access(owner, "tinkoff", Environment::Prod, &key);
     store.insert_broker_access(&second).unwrap();
 
-    let found: BrokerAccess = store.find_broker_access(owner, &broker).unwrap().unwrap();
+    let found: BrokerAccess = store
+        .find_broker_access(owner, &broker, Environment::Prod.code())
+        .unwrap()
+        .unwrap();
     assert_eq!(found.id, second.id);
+}
+
+#[test]
+fn the_two_environments_of_one_broker_live_side_by_side() {
+    // Токены у сред разные: боевой песочница не принимает, песочный
+    // не принимает бой. Значит оба доступа обязаны существовать
+    // одновременно, иначе живая проверка и боевой канал исключают
+    // друг друга.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let key = Key::from_bytes([2; 32]);
+    let owner = OwnerId::new_random();
+    let prod = access(owner, "tinkoff", Environment::Prod, &key);
+    let sandbox = access(owner, "tinkoff", Environment::Sandbox, &key);
+
+    store.insert_broker_access(&prod).unwrap();
+    store.insert_broker_access(&sandbox).unwrap();
+
+    let broker = BrokerCode::parse("tinkoff").unwrap();
+    let found_prod = store
+        .find_broker_access(owner, &broker, Environment::Prod.code())
+        .unwrap()
+        .unwrap();
+    let found_sandbox = store
+        .find_broker_access(owner, &broker, Environment::Sandbox.code())
+        .unwrap()
+        .unwrap();
+    assert_eq!(found_prod.id, prod.id);
+    assert_eq!(found_sandbox.id, sandbox.id);
+    assert_eq!(found_prod.environment, "prod");
+    assert_eq!(found_sandbox.environment, "sandbox");
+}
+
+#[test]
+fn an_access_of_one_environment_is_not_found_in_the_other() {
+    // Иначе живая проверка молча сходила бы в песочницу боевым
+    // токеном — и получила бы отказ, по которому о среде
+    // не догадаться.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let key = Key::from_bytes([1; 32]);
+    let owner = OwnerId::new_random();
+    store
+        .insert_broker_access(&access(owner, "tinkoff", Environment::Prod, &key))
+        .unwrap();
+
+    let broker = BrokerCode::parse("tinkoff").unwrap();
+    assert_eq!(
+        store
+            .find_broker_access(owner, &broker, Environment::Sandbox.code())
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_revoked_access_makes_room_only_in_its_own_environment() {
+    // Отзыв песочного доступа не должен освобождать место боевому:
+    // это разные записи и разные токены.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let key = Key::from_bytes([10; 32]);
+    let owner = OwnerId::new_random();
+    let prod = access(owner, "tinkoff", Environment::Prod, &key);
+    let sandbox = access(owner, "tinkoff", Environment::Sandbox, &key);
+    store.insert_broker_access(&prod).unwrap();
+    store.insert_broker_access(&sandbox).unwrap();
+
+    store.revoke_broker_access(owner, sandbox.id).unwrap();
+
+    let broker = BrokerCode::parse("tinkoff").unwrap();
+    assert!(
+        store
+            .find_broker_access(owner, &broker, Environment::Prod.code())
+            .unwrap()
+            .is_some(),
+        "отзыв песочного доступа задел боевой"
+    );
+    assert!(
+        store
+            .insert_broker_access(&access(owner, "tinkoff", Environment::Prod, &key))
+            .is_err(),
+        "место боевого доступа освободилось от чужого отзыва"
+    );
 }
 
 // --- кого считать владельцем, когда его не назвали ---

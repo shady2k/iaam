@@ -6,6 +6,7 @@
 //! и причину, но никогда значение.
 
 use iaam_broker::credentials::{BrokerScope, Key, seal};
+use iaam_broker::environment::Environment;
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::{NewBrokerAccess, SoleOwner};
 use iaam_store::documents::BrokerCode;
@@ -35,6 +36,7 @@ pub fn add_broker_access(
     store: &mut SqliteStore,
     key: &Key,
     broker: &str,
+    environment: Environment,
     token: &str,
 ) -> Result<Uuid, ProvisionError> {
     let broker = BrokerCode::parse(broker).ok_or(ProvisionError::BrokerNotNamed)?;
@@ -53,6 +55,9 @@ pub fn add_broker_access(
         id: Uuid::new_v4(),
         owner,
         broker,
+        // Среда называется при заведении: токены у сред разные, и
+        // угадать за человека, какой он держит, нельзя.
+        environment: environment.code().to_owned(),
         // Область прав задаётся здесь, а не приходит снаружи: торговые
         // права не запрашиваются ни при каких условиях (§14).
         scope: BrokerScope::ReadOnly.code().to_owned(),
@@ -105,10 +110,14 @@ mod tests {
         let (mut store, owner) = store_with_owner();
         let key = key();
 
-        let id = add_broker_access(&mut store, &key, "tinkoff", TOKEN).unwrap();
+        let id =
+            add_broker_access(&mut store, &key, "tinkoff", Environment::Sandbox, TOKEN).unwrap();
 
         let broker = BrokerCode::parse("tinkoff").unwrap();
-        let found: BrokerAccess = store.find_broker_access(owner, &broker).unwrap().unwrap();
+        let found: BrokerAccess = store
+            .find_broker_access(owner, &broker, Environment::Sandbox.code())
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, id);
         assert_eq!(
             BrokerScope::parse(&found.scope),
@@ -127,10 +136,20 @@ mod tests {
         let (mut store, owner) = store_with_owner();
         let key = key();
 
-        add_broker_access(&mut store, &key, "tinkoff", &format!("  {TOKEN}\n")).unwrap();
+        add_broker_access(
+            &mut store,
+            &key,
+            "tinkoff",
+            Environment::Sandbox,
+            &format!("  {TOKEN}\n"),
+        )
+        .unwrap();
 
         let broker = BrokerCode::parse("tinkoff").unwrap();
-        let found = store.find_broker_access(owner, &broker).unwrap().unwrap();
+        let found = store
+            .find_broker_access(owner, &broker, Environment::Sandbox.code())
+            .unwrap()
+            .unwrap();
         let (nonce, ciphertext) = found.sealed_parts();
         let sealed = iaam_broker::credentials::SealedToken::of(nonce.to_vec(), ciphertext.to_vec());
         assert_eq!(open(&key, &sealed).unwrap().expose(), TOKEN);
@@ -140,7 +159,7 @@ mod tests {
     fn an_empty_token_is_refused() {
         let (mut store, _) = store_with_owner();
         assert!(matches!(
-            add_broker_access(&mut store, &key(), "tinkoff", "   \n"),
+            add_broker_access(&mut store, &key(), "tinkoff", Environment::Sandbox, "   \n"),
             Err(ProvisionError::TokenEmpty)
         ));
     }
@@ -149,7 +168,7 @@ mod tests {
     fn a_broker_without_a_name_is_refused() {
         let (mut store, _) = store_with_owner();
         assert!(matches!(
-            add_broker_access(&mut store, &key(), "  ", TOKEN),
+            add_broker_access(&mut store, &key(), "  ", Environment::Sandbox, TOKEN),
             Err(ProvisionError::BrokerNotNamed)
         ));
     }
@@ -158,7 +177,7 @@ mod tests {
     fn without_an_owner_nothing_is_provisioned() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         assert!(matches!(
-            add_broker_access(&mut store, &key(), "tinkoff", TOKEN),
+            add_broker_access(&mut store, &key(), "tinkoff", Environment::Sandbox, TOKEN),
             Err(ProvisionError::NoOwner)
         ));
     }
@@ -169,7 +188,7 @@ mod tests {
         issue(&store, OwnerId::new_random(), "второй");
 
         assert!(matches!(
-            add_broker_access(&mut store, &key(), "tinkoff", TOKEN),
+            add_broker_access(&mut store, &key(), "tinkoff", Environment::Sandbox, TOKEN),
             Err(ProvisionError::SeveralOwners)
         ));
     }
@@ -178,7 +197,8 @@ mod tests {
     fn no_error_message_carries_the_token() {
         // Сообщение об ошибке — это то, что точно попадёт в лог.
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let error = add_broker_access(&mut store, &key(), "tinkoff", TOKEN).unwrap_err();
+        let error = add_broker_access(&mut store, &key(), "tinkoff", Environment::Sandbox, TOKEN)
+            .unwrap_err();
         assert!(!error.to_string().contains(TOKEN));
         assert!(!format!("{error:?}").contains(TOKEN));
     }

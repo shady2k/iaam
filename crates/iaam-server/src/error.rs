@@ -118,6 +118,13 @@ impl From<AppError> for ApiFailure {
                     correlation_id: None,
                 },
             ),
+            // Действующая запись уже есть: повтор запроса её не заменит,
+            // и `500` отправил бы владельца искать поломку вместо отзыва
+            // старой записи.
+            AppError::Conflict { ref what } => Self::new(
+                StatusCode::CONFLICT,
+                ApiError::simple("already_exists", what.clone()),
+            ),
             AppError::NotFound { what, ref id } => Self::new(
                 StatusCode::NOT_FOUND,
                 ApiError::simple("not_found", format!("не найдено: {what} {id}")),

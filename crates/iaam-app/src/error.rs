@@ -50,6 +50,11 @@ pub enum AppError {
     /// полученный неизвестно чем, нельзя ни при каких условиях (§14).
     #[error("источник случайности недоступен: {0}")]
     Random(String),
+    /// Запись уже есть, и вторая такая же означала бы, что неизвестно,
+    /// какой из них пользуются. Отдельно от `Store`, потому что чинится
+    /// не повтором запроса, а отзывом действующей записи.
+    #[error("{what}")]
+    Conflict { what: String },
 }
 
 impl From<ObserveError> for AppError {
@@ -92,6 +97,7 @@ impl AppError {
             Self::Perimeter(_) => "perimeter_assessment_failed",
             Self::NotConfigured { .. } => "not_configured",
             Self::Random(_) => "random_unavailable",
+            Self::Conflict { .. } => "already_exists",
         }
     }
 }
@@ -148,6 +154,13 @@ mod tests {
         assert_eq!(
             AppError::Random("источник закрыт".into()).code(),
             "random_unavailable"
+        );
+        assert_eq!(
+            AppError::Conflict {
+                what: "доступ уже заведён".into(),
+            }
+            .code(),
+            "already_exists"
         );
     }
 }

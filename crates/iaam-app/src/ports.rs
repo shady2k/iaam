@@ -148,9 +148,34 @@ pub trait Clock: Send + Sync {
 pub struct BrokerAccessView {
     pub id: Uuid,
     pub broker: String,
+    /// Среда брокера: боевая или песочница. Часть ответа намеренно —
+    /// по списку доступов должно быть видно, куда система ходит.
+    pub environment: String,
     pub scope: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
+}
+
+/// Среда брокера в словаре порта.
+///
+/// Отдельное перечисление, а не тип `iaam-broker`: транспорт зовёт порт
+/// и адаптера знать не должен — как уже сделано для области прав
+/// (`Scope` порта против `BrokerScope` брокера). Адрес шлюза сюда
+/// не входит: он свойство адаптера, который в эту среду ходит.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerEnvironment {
+    Prod,
+    Sandbox,
+}
+
+impl BrokerEnvironment {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Prod => "prod",
+            Self::Sandbox => "sandbox",
+        }
+    }
 }
 
 /// Хранилище брокерских доступов.
@@ -170,6 +195,7 @@ pub trait BrokerVault: Send + Sync {
         &self,
         owner: OwnerId,
         broker: String,
+        environment: BrokerEnvironment,
         token: Zeroizing<String>,
     ) -> Result<BrokerAccessView, AppError>;
 

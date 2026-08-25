@@ -16,16 +16,19 @@
 use std::env;
 use std::fs;
 
+use iaam_broker::environment::Environment;
 use iaam_broker::trust::tinkoff_client;
 
-const SANDBOX: &str = "https://sandbox-invest-public-api.tbank.ru/rest";
-const METHOD: &str = "tinkoff.public.invest.api.contract.v1.SandboxService/GetSandboxAccounts";
+// Обычный метод по адресу песочницы — рекомендуемый Т-Инвестициями
+// способ. Метод песочницы по этому же адресу даёт `40003`, то есть
+// жалобу на токен вместо жалобы на маршрут.
+const METHOD: &str = "tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = tinkoff_client()?;
     let mut request = client
-        .post(format!("{SANDBOX}/{METHOD}"))
+        .post(format!("{}/{METHOD}", Environment::Sandbox.base_url()))
         .header("Content-Type", "application/json")
         .body("{}");
 

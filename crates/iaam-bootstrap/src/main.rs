@@ -12,6 +12,7 @@ use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{BrokerVault, Scope, SoleOwner, SystemClock, TokenAdmin};
 use iaam_broker::credentials::Key;
+use iaam_broker::environment::Environment;
 use iaam_core::ids::OwnerId;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
@@ -62,8 +63,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // машине, а история командной оболочки переживает сессию.
     if let Ok(broker) = std::env::var("IAAM_ADD_BROKER_ACCESS") {
         let key = Key::from_file(&broker_key_path(&config)?)?;
-        let id = provision::add_broker_access(&mut store, &key, &broker, &read_token()?)?;
-        println!("доступ к брокеру {broker} заведён: {id}");
+        // Среда называется явно и умолчания не имеет. Умолчание здесь
+        // означало бы песочный токен, молча записанный боевым: шлюз
+        // ответит отказом на первом же обращении, а по тексту отказа
+        // о среде не догадаться — проверено на живом шлюзе.
+        let environment = broker_environment()?;
+        let id =
+            provision::add_broker_access(&mut store, &key, &broker, environment, &read_token()?)?;
+        println!(
+            "доступ к брокеру {broker} ({}) заведён: {id}",
+            environment.code()
+        );
         return Ok(());
     }
 
@@ -71,7 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // поднимается, а маршруты брокера отвечают 503. Заданный, но
     // нечитаемый ключ — другое дело: это опечатка в настройке, и молчаливый
     // старт скрыл бы её до первого заведения доступа.
-    let broker_key = config.broker_key.as_deref().map(Key::from_file).transpose()?;
+    let broker_key = config
+        .broker_key
+        .as_deref()
+        .map(Key::from_file)
+        .transpose()?;
 
     // Один и тот же адаптер и как хранилище фактов, и как хранилище
     // брокерских доступов: за обоими одно соединение с базой, и второй
@@ -79,7 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let adapter = Arc::new(SqliteAdapter::with_broker_key(store, broker_key));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
-    let services = Arc::new(AppServices::new(adapter, broker, tokens, Arc::new(SystemClock)));
+    let services = Arc::new(AppServices::new(
+        adapter,
+        broker,
+        tokens,
+        Arc::new(SystemClock),
+    ));
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let state = ServerState::new(services, limiter);
 
@@ -104,6 +123,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown())
         .await?;
     Ok(())
+}
+
+/// Среда брокера из окружения. Отсутствие переменной — отказ.
+fn broker_environment() -> Result<Environment, Box<dyn std::error::Error>> {
+    let value = std::env::var("IAAM_BROKER_ENVIRONMENT").map_err(|_| {
+        "переменная IAAM_BROKER_ENVIRONMENT не задана: prod или sandbox. \
+         Токены у сред разные, и выбрать за вас нельзя"
+    })?;
+    Environment::parse(&value)
+        .ok_or_else(|| format!("неизвестная среда брокера {value:?}: бывают prod и sandbox").into())
 }
 
 /// Путь к файлу ключа. Отсутствие переменной — отказ, а не умолчание.
@@ -153,10 +182,12 @@ async fn issue_owner_token(
         // консолью, минуя одноразовый код.
         SoleOwner::None => OwnerId::new_random(),
         SoleOwner::Several => {
-            return Err("владельцев в базе несколько: выбрать за вас, кому выпустить токен, \
+            return Err(
+                "владельцев в базе несколько: выбрать за вас, кому выпустить токен, \
                         нельзя. Это следы поломки в однопользовательской системе — \
                         разберитесь с базой, а не с командой"
-                .into());
+                    .into(),
+            );
         }
     };
     let issued = admin

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use iaam_broker::credentials::{BrokerScope, Key, seal};
+use iaam_broker::environment::Environment;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::ids::{AccountId, OwnerId};
@@ -26,8 +27,8 @@ use zeroize::Zeroizing;
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountView, BrokerAccessView, BrokerVault, IssuedToken, Principal, Recorded, Scope, SoleOwner,
-    Store, TokenAdmin, TokenView,
+    AccountView, BrokerAccessView, BrokerEnvironment, BrokerVault, IssuedToken, Principal,
+    Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 
@@ -273,6 +274,7 @@ impl BrokerVault for SqliteAdapter {
         &self,
         owner: OwnerId,
         broker: String,
+        environment: BrokerEnvironment,
         token: Zeroizing<String>,
     ) -> Result<BrokerAccessView, AppError> {
         let key = self.key()?;
@@ -301,6 +303,12 @@ impl BrokerVault for SqliteAdapter {
             id: Uuid::new_v4(),
             owner,
             broker: code,
+            // Среда приходит снаружи, и это единственное место, где она
+            // называется: дальше её берут из записи. Заведение — момент,
+            // когда человек знает, какой токен держит в руках. Перевод
+            // словаря порта в словарь брокера идёт здесь: адаптер —
+            // единственный, кто знает оба.
+            environment: broker_environment(environment).code().to_owned(),
             // Область прав задаётся здесь, а не приходит снаружи:
             // торговые права не запрашиваются ни при каких условиях (§14).
             scope: BrokerScope::ReadOnly.code().to_owned(),
@@ -313,10 +321,18 @@ impl BrokerVault for SqliteAdapter {
         // вызовом читать нельзя — между ними доступ успевают отозвать.
         let owner_of_access = access.owner;
         let broker_of_access = access.broker.clone();
+        let environment_of_access = access.environment.clone();
         self.blocking(move |store| {
-            store.insert_broker_access(&access).map_err(store_error)?;
+            store
+                .insert_broker_access(&access)
+                .map_err(|error| match error {
+                    iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
+                        what: format!("{what} уже заведён: сначала отзовите действующий"),
+                    },
+                    other => store_error(other),
+                })?;
             let stored = store
-                .find_broker_access(owner_of_access, &broker_of_access)
+                .find_broker_access(owner_of_access, &broker_of_access, &environment_of_access)
                 .map_err(store_error)?
                 .ok_or(AppError::Store(
                     "доступ заведён, но не прочитан обратно".to_owned(),
@@ -324,6 +340,7 @@ impl BrokerVault for SqliteAdapter {
             Ok(BrokerAccessView {
                 id: stored.id,
                 broker: stored.broker.as_str().to_owned(),
+                environment: stored.environment,
                 scope: stored.scope,
                 created_at: stored.created_at,
                 revoked_at: stored.revoked_at,
@@ -344,6 +361,7 @@ impl BrokerVault for SqliteAdapter {
                 .map(|access| BrokerAccessView {
                     id: access.id,
                     broker: access.broker.as_str().to_owned(),
+                    environment: access.environment,
                     scope: access.scope,
                     created_at: access.created_at,
                     revoked_at: access.revoked_at,
@@ -372,6 +390,17 @@ impl BrokerVault for SqliteAdapter {
             })
         })
         .await
+    }
+}
+
+/// Среда порта в среду брокера.
+///
+/// Перевод, а не общий тип: транспорт зовёт порт и про `iaam-broker`
+/// не знает — заслон архитектуры это проверяет.
+const fn broker_environment(environment: BrokerEnvironment) -> Environment {
+    match environment {
+        BrokerEnvironment::Prod => Environment::Prod,
+        BrokerEnvironment::Sandbox => Environment::Sandbox,
     }
 }
 

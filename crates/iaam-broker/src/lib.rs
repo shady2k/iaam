@@ -7,4 +7,5 @@
 //! а связывает их адаптер приложения — как это уже сделано для SQLite.
 
 pub mod credentials;
+pub mod environment;
 pub mod trust;

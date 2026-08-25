@@ -48,6 +48,14 @@ impl CurrencyCode {
             Self::Xau => "XAU",
         }
     }
+
+    /// Разбор ISO-кода без подстановки валюты по умолчанию.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [Self::Rub, Self::Usd, Self::Eur, Self::Cny, Self::Xau]
+            .into_iter()
+            .find(|currency| currency.code() == code)
+    }
 }
 
 /// Проведённая сумма в минимальных единицах валюты.
@@ -257,6 +265,18 @@ mod tests {
         assert_eq!(CurrencyCode::Xau.minor_units(), 4);
     }
 
+    #[test]
+    fn every_currency_survives_a_round_trip_through_its_iso_code() {
+        for currency in [
+            CurrencyCode::Rub,
+            CurrencyCode::Usd,
+            CurrencyCode::Eur,
+            CurrencyCode::Cny,
+            CurrencyCode::Xau,
+        ] {
+            assert_eq!(CurrencyCode::from_code(currency.code()), Some(currency));
+        }
+    }
     #[test]
     fn every_currency_reports_its_iso_code() {
         assert_eq!(CurrencyCode::Rub.code(), "RUB");

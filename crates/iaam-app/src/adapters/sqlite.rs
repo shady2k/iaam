@@ -13,7 +13,8 @@ use iaam_broker::environment::Environment;
 use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
-use iaam_core::ids::{AccountId, ClassificationRuleId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, ClassificationRuleId, InstrumentId, OwnerId, SourceId};
+use iaam_core::instrument::AliasNamespace;
 use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
 use iaam_store::SqliteStore;
@@ -28,9 +29,10 @@ use zeroize::Zeroizing;
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountView, BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment,
-    BrokerVault, ClassificationRuleStore, ClassificationRuleView, IssuedToken, Principal, Recorded,
-    Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    AccountView, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
+    BrokerEnvironment, BrokerVault, ClassificationRuleStore, ClassificationRuleView, CustodyView,
+    InstrumentDirectory, InstrumentView, IssuedToken, Principal, Recorded, Scope, SoleOwner, Store,
+    TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 
@@ -99,6 +101,72 @@ impl SqliteAdapter {
 
 fn store_error(error: iaam_store::StoreError) -> AppError {
     AppError::Store(error.to_string())
+}
+
+/// Три случая резолвинга обязаны остаться различимыми и по эту сторону
+/// порта: слитые в один `NotFound` они перестают отвечать на вопрос
+/// «новая это бумага или испорченная дата» (E3.1, §5.1 спеки задачи).
+fn resolve_error(error: iaam_store::ResolveError) -> AppError {
+    match error {
+        iaam_store::ResolveError::Unknown { namespace, value } => AppError::NotFound {
+            what: "инструмент по коду",
+            id: format!("{namespace}:{value}"),
+        },
+        iaam_store::ResolveError::NotOnDate {
+            namespace,
+            value,
+            on,
+            known_from,
+            known_to,
+        } => AppError::Invalid {
+            field: "on".to_owned(),
+            expected: format!("дата в интервале действия кода {known_from}..{known_to}"),
+            actual: format!("{namespace}:{value} на {on}"),
+        },
+        iaam_store::ResolveError::Ambiguous {
+            namespace,
+            value,
+            on,
+            candidates,
+        } => AppError::DirectoryInvariant {
+            correlation: Uuid::new_v4(),
+            detail: format!(
+                "код {namespace}:{value} на {on} разрешается в {candidates} инструментов: \
+                 триггер instrument_aliases_do_not_overlap пробит"
+            ),
+        },
+        iaam_store::ResolveError::Store(error) => store_error(error),
+    }
+}
+
+fn instrument_view(record: iaam_store::reference::InstrumentRecord) -> InstrumentView {
+    InstrumentView {
+        id: record.id,
+        kind: record.kind.map(|kind| kind.code().to_owned()),
+        symbol: record.symbol,
+        title: record.title,
+        denomination_currency: record.currencies.denomination.code().to_owned(),
+        settlement_currency: record.currencies.settlement.code().to_owned(),
+        quote_currency: record.currencies.quote.code().to_owned(),
+    }
+}
+
+fn alias_view(record: iaam_store::reference::AliasRecord) -> AliasView {
+    AliasView {
+        namespace: record.namespace.code().to_owned(),
+        value: record.value,
+        instrument: record.instrument,
+        valid_from: record.interval.valid_from,
+        valid_to: record.interval.valid_to,
+    }
+}
+
+fn custody_view(record: iaam_store::reference::CustodyRecord) -> CustodyView {
+    CustodyView {
+        id: record.id,
+        title: record.title,
+        institution: record.institution,
+    }
 }
 
 /// Права токена: из хранилища в порт.
@@ -264,6 +332,71 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .record_token_use(&token_hash, &route, &outcome)
+                .map_err(store_error)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl InstrumentDirectory for SqliteAdapter {
+    async fn resolve(
+        &self,
+        namespace: &str,
+        value: &str,
+        on: Date,
+    ) -> Result<InstrumentId, AppError> {
+        let Some(namespace) = AliasNamespace::from_code(namespace) else {
+            return Err(AppError::Invalid {
+                field: "namespace".to_owned(),
+                expected: "isin, moex_secid, ticker, figi или broker_code".to_owned(),
+                actual: namespace.to_owned(),
+            });
+        };
+        let value = value.to_owned();
+        self.blocking(move |store| {
+            store
+                .resolve_instrument(namespace, &value, on)
+                .map_err(resolve_error)
+        })
+        .await
+    }
+
+    async fn instrument(&self, id: InstrumentId) -> Result<Option<InstrumentView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .instrument(id)
+                .map(|found| found.map(instrument_view))
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_instruments(&self) -> Result<Vec<InstrumentView>, AppError> {
+        self.blocking(|store| {
+            store
+                .list_instruments()
+                .map(|rows| rows.into_iter().map(instrument_view).collect())
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_aliases(&self) -> Result<Vec<AliasView>, AppError> {
+        self.blocking(|store| {
+            store
+                .list_aliases()
+                .map(|rows| rows.into_iter().map(alias_view).collect())
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_custody_places(&self, owner: OwnerId) -> Result<Vec<CustodyView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .list_custody_places(owner)
+                .map(|rows| rows.into_iter().map(custody_view).collect())
                 .map_err(store_error)
         })
         .await
@@ -643,5 +776,64 @@ impl TokenAdmin for SqliteAdapter {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_error_preserves_unknown_date_and_ambiguous_distinctions() {
+        let unknown = resolve_error(iaam_store::ResolveError::Unknown {
+            namespace: "isin",
+            value: "RU000A".to_owned(),
+        });
+        let not_on_date = resolve_error(iaam_store::ResolveError::NotOnDate {
+            namespace: "isin",
+            value: "RU000A".to_owned(),
+            on: "2026-08-25".to_owned(),
+            known_from: "2020-01-01".to_owned(),
+            known_to: "2025-12-31".to_owned(),
+        });
+        let ambiguous = resolve_error(iaam_store::ResolveError::Ambiguous {
+            namespace: "ticker",
+            value: "ABC".to_owned(),
+            on: "2026-08-25".to_owned(),
+            candidates: 2,
+        });
+
+        assert_eq!(unknown.code(), "not_found");
+        assert_eq!(not_on_date.code(), "invalid_request");
+        assert_eq!(ambiguous.code(), "directory_invariant_violated");
+        assert!(matches!(
+            &unknown,
+            AppError::NotFound {
+                what: "инструмент по коду",
+                id,
+            } if id == "isin:RU000A"
+        ));
+        assert!(matches!(
+            &not_on_date,
+            AppError::Invalid {
+                field,
+                expected,
+                actual,
+            } if field == "on"
+                && expected == "дата в интервале действия кода 2020-01-01..2025-12-31"
+                && actual == "isin:RU000A на 2026-08-25"
+        ));
+        assert!(matches!(
+            &ambiguous,
+            AppError::DirectoryInvariant { detail, .. }
+                if detail
+                    == "код ticker:ABC на 2026-08-25 разрешается в 2 инструментов: \
+                       триггер instrument_aliases_do_not_overlap пробит"
+        ));
+        let message = ambiguous.to_string();
+        assert!(message.contains("инвариант справочника"));
+        assert!(message.contains("ticker:ABC"));
+        assert!(message.contains("2026-08-25"));
+        assert!(message.contains("2"));
     }
 }

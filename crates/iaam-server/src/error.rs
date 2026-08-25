@@ -146,6 +146,23 @@ impl From<AppError> for ApiFailure {
                     },
                 )
             }
+            AppError::DirectoryInvariant { correlation, .. } => {
+                // Подробности остаются в логе: наружу уходит только код
+                // и идентификатор корреляции.
+                tracing::error!(%correlation, error = %error, "нарушен инвариант справочника");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiError {
+                        code: "directory_invariant_violated".into(),
+                        message: "результат не может быть выдан: нарушен инвариант справочника"
+                            .into(),
+                        field: None,
+                        expected: None,
+                        actual: None,
+                        correlation_id: Some(correlation.to_string()),
+                    },
+                )
+            }
             // Возможность не включена настройкой, а не сломана: повтор
             // запроса её не исправит, поэтому 503 с указанием, что
             // именно задать. Текст называет переменную окружения:

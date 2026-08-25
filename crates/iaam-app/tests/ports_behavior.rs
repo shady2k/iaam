@@ -42,3 +42,25 @@ async fn unavailable_rule_store_reports_configuration_error() {
         }
     ));
 }
+
+/// Отзыв правила проверяется отдельно от чтения списка.
+///
+/// Заглушка обязана отказывать КАЖДЫМ методом, а не только теми, что
+/// возвращают данные. Метод, отвечающий `Ok(())` без настроенного
+/// хранилища, сообщает вызывающему, что правило отозвано, — и правило
+/// продолжает действовать. Это хуже отказа: отказ виден, а мнимый успех
+/// нет.
+#[tokio::test]
+async fn unavailable_rule_store_refuses_to_retire_a_rule() {
+    let error = UnavailableClassificationRuleStore
+        .retire_rule(OwnerId::new_random(), uuid::Uuid::new_v4())
+        .await
+        .expect_err("мнимый успех отзыва оставил бы правило действующим");
+
+    assert!(matches!(
+        error,
+        AppError::NotConfigured {
+            what: "правила классификации"
+        }
+    ));
+}

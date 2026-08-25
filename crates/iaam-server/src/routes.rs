@@ -1266,12 +1266,17 @@ async fn build_directory(
         directory.accounts.insert(account.title, account.id);
     }
     for place in places {
-        directory.custodies.insert(place.title, place.id);
+        directory
+            .custodies
+            .entry(place.title)
+            .or_default()
+            .push(place.id);
     }
     // Псевдонимы кладутся все: разбор документа иначе ходил бы в базу
     // на каждую строку, а строк в отчёте тысячи.
     for alias in aliases {
         directory.instruments.entry(alias.value).or_default().push((
+            alias.namespace,
             iaam_core::instrument::AliasInterval {
                 valid_from: alias.valid_from,
                 valid_to: alias.valid_to,

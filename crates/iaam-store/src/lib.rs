@@ -58,6 +58,12 @@ pub enum StoreError {
     SchemaTooNew { found: u32, supported: u32 },
     #[error("в базе нет записи {what} {id}")]
     NotFound { what: &'static str, id: String },
+    #[error("не найден действующий псевдоним {namespace}:{value} для инструмента {instrument}")]
+    AliasNotFoundForInstrument {
+        namespace: &'static str,
+        value: String,
+        instrument: String,
+    },
     #[error("архивный бандл повреждён: {detail}")]
     BundleCorrupted { detail: String },
     #[error("сохранённый документ {id} не читается: {detail}")]

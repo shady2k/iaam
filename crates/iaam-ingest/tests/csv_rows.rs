@@ -17,6 +17,7 @@ fn directory() -> (Directory, AccountId, InstrumentId) {
     dir.instruments.insert(
         "SBER".into(),
         vec![(
+            "ticker".to_owned(),
             AliasInterval {
                 valid_from: date!(1900 - 01 - 01),
                 valid_to: None,
@@ -141,7 +142,7 @@ fn an_empty_custody_column_falls_back_to_the_default_and_a_named_one_does_not() 
     // легли бы в депозитарий по умолчанию вопреки написанному в файле.
     let (mut dir, _, _) = directory();
     let named = CustodyId::new_random();
-    dir.custodies.insert("НРД".into(), named);
+    dir.custodies.insert("НРД".into(), vec![named]);
     let default = dir.default_custody.expect("умолчание задано");
 
     let document = format!(

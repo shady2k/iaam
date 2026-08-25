@@ -83,7 +83,7 @@ cargo test --workspace
 | Diff-lint | `./scripts/check-diff-lint.sh <база>` | новые `allow`/`expect`/`ignore`/`todo!` и правку файлов политики |
 | Фикстуры | `./scripts/check-fixtures.sh` | правку замороженного эталона и мёртвые фикстуры |
 | Зависимости | `cargo deny check` | уязвимости, лицензии, неизвестные источники |
-| Тесты | `cargo nextest run --workspace --all-features` | регрессии |
+| Тесты | `cargo nextest run --workspace` | регрессии |
 | Покрытие по диффу | `diff-cover lcov.info --fail-under=90` | непокрытый новый код |
 | Мутации | `./scripts/check-mutants.sh` | тесты, проходящие впустую (порог по каждому модулю) |
 

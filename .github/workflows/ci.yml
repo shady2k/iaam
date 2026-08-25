@@ -48,16 +48,28 @@ jobs:
       # nextest изолирует тесты по процессам, что делает видимыми
       # зависимости между ними. Doc-тесты nextest не выполняет — они идут
       # отдельным шагом, иначе молча перестали бы запускаться.
+      #
+      # `--all-features` здесь нет намеренно. Единственная фича воркспейса —
+      # `sandbox` у iaam-broker, и она включает не ещё один разбор образцов,
+      # а живой поход в сеть: без IAAM_DATABASE и IAAM_BROKER_KEY_FILE
+      # crates/iaam-broker/tests/sandbox_live.rs падает, и падает по замыслу
+      # («режим запрошен явно, молча ничего не проверить значит соврать
+      # зелёным прогоном»). Песочницу запускают отдельно и вручную:
+      # `cargo test -p iaam-broker --features sandbox`. Флаг не возвращать —
+      # запрет записан и в docs/deployment.md, и в crates/iaam-broker/Cargo.toml.
       - name: Test
-        run: nix develop -c cargo nextest run --workspace --all-features
+        run: nix develop -c cargo nextest run --workspace
       - name: Doc tests
         run: nix develop -c cargo test --workspace --doc
       # `--branch` требует nightly (проверено на закреплённом stable 1.98.0:
       # «error: the option `Z` is only accepted on the nightly compiler»),
       # поэтому покрытие построчное. Не возвращайте флаг, не сменив тулчейн.
+      # Без `--all-features` по той же причине, что и в шаге Test выше:
+      # фича `sandbox` уводит прогон в сеть. Покрытие её кода не теряется —
+      # его и не было, шаг падал до сбора отчёта.
       - name: Coverage
         run: |
-          nix develop -c cargo llvm-cov --workspace --all-features \
+          nix develop -c cargo llvm-cov --workspace \
             --lcov --output-path lcov.info
       # cargo llvm-cov строит полный отчёт, но не задаёт порог на добавленных
       # строках. Без этого шага «покрытие по диффу» осталось бы артефактом,

@@ -73,17 +73,23 @@ impl SqliteStore {
 
     pub fn upsert_instrument(&self, instrument: &InstrumentRecord) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO instruments (id, symbol, title, currency)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO instruments
+                 (id, kind, symbol, title,
+                  denomination_currency, settlement_currency, quote_currency,
+                  lineage_parent, lineage_reason, created_at)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?4, ?4, NULL, NULL, ?5)
              ON CONFLICT (id) DO UPDATE SET
                  symbol = excluded.symbol,
                  title = excluded.title,
-                 currency = excluded.currency",
+                 denomination_currency = excluded.denomination_currency,
+                 settlement_currency = excluded.settlement_currency,
+                 quote_currency = excluded.quote_currency",
             params![
                 instrument.id.inner().to_string(),
                 instrument.symbol,
                 instrument.title,
                 instrument.currency,
+                now(),
             ],
         )?;
         Ok(())

@@ -37,6 +37,7 @@
 | `crates/iaam-store/src/reference.rs` | изменить: записи, резолвинг, псевдонимы, места хранения | T2, T3 |
 | `crates/iaam-store/src/lib.rs` | изменить: варианты `ResolveError` рядом со `StoreError` | T3 |
 | `crates/iaam-store/tests/instrument_directory.rs` | создать: границы интервала, три ошибки резолвинга | T3 |
+| `crates/iaam-store/tests/snapshots_and_reference.rs` | изменить: адаптация конструктора `InstrumentRecord` к новому типу поля | T3 |
 | `crates/iaam-app/src/ports.rs` | изменить: порт `InstrumentDirectory`, вью-типы | T4 |
 | `crates/iaam-app/src/adapters/sqlite.rs` | изменить: реализация порта, отображение `ResolveError` | T4 |
 | `crates/iaam-ingest/src/csv_source.rs` | изменить: карта интервалов, разрешение на дату строки | T5 |
@@ -745,6 +746,14 @@ git commit -m "feat(store): миграция 0005 — справочник ин�
 - Modify: `crates/iaam-store/src/reference.rs`
 - Modify: `crates/iaam-store/src/lib.rs` (добавить `ResolveError` рядом со `StoreError`)
 - Create: `crates/iaam-store/tests/instrument_directory.rs`
+- Modify: `crates/iaam-store/tests/snapshots_and_reference.rs:348-385` — тест
+  `an_upserted_instrument_reaches_the_table` конструирует `InstrumentRecord`
+  с полем `currency: String`. Смена типа поля обязана дойти и до него.
+  **Это адаптация к типу, а не переписывание теста:** его утверждения —
+  что символ дошёл до таблицы и что повторный вызов не задваивает — про
+  валюту не говорят ничего и остаются буква в букву. Заменить
+  `currency: "RUB".into()` на `currencies: CurrencyRoles::uniform(CurrencyCode::Rub)`,
+  добавить `kind: Some(InstrumentKind::Share)` и `lineage: None`.
 
 **Interfaces:**
 - Consumes: `InstrumentKind`, `AliasNamespace`, `LineageReason`, `CurrencyRoles`, `AliasInterval`, `Lineage` (T1); схему версии 5 (T2).

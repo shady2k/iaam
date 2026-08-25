@@ -45,10 +45,11 @@ const EXPECTED_TAX_TOTAL_MINOR: i64 = 7_500;
 fn directory(account: AccountId, custody: CustodyId, instrument: InstrumentId) -> Directory {
     Directory {
         accounts: [("INVEST-001".to_owned(), account)].into_iter().collect(),
-        custodies: [("НРД".to_owned(), custody)].into_iter().collect(),
+        custodies: [("НРД".to_owned(), vec![custody])].into_iter().collect(),
         instruments: [(
             "BOND-X".to_owned(),
             vec![(
+                "ticker".to_owned(),
                 AliasInterval {
                     valid_from: date!(1900 - 01 - 01),
                     valid_to: None,
@@ -70,11 +71,12 @@ fn directory_with_historical_instrument(
 ) -> Directory {
     Directory {
         accounts: [("INVEST-001".to_owned(), account)].into_iter().collect(),
-        custodies: [("НРД".to_owned(), custody)].into_iter().collect(),
+        custodies: [("НРД".to_owned(), vec![custody])].into_iter().collect(),
         instruments: [(
             "BOND-X".to_owned(),
             vec![
                 (
+                    "ticker".to_owned(),
                     AliasInterval {
                         valid_from: date!(1900 - 01 - 01),
                         valid_to: Some(date!(2026 - 03 - 01)),
@@ -82,6 +84,7 @@ fn directory_with_historical_instrument(
                     first,
                 ),
                 (
+                    "ticker".to_owned(),
                     AliasInterval {
                         valid_from: date!(2026 - 03 - 01),
                         valid_to: None,

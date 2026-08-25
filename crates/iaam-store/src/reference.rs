@@ -246,12 +246,20 @@ impl SqliteStore {
             source,
         } = rename;
         let (namespace, on, instrument, source) = (*namespace, *on, *instrument, *source);
+        let instrument_text = instrument.inner().to_string();
         let transaction = self.conn.transaction()?;
-        transaction.execute(
+        let changed = transaction.execute(
             "UPDATE instrument_aliases SET valid_to = ?1
-             WHERE namespace = ?2 AND value = ?3 AND valid_to IS NULL",
-            params![date_to_text(on), namespace.code(), from],
+             WHERE namespace = ?2 AND value = ?3 AND instrument = ?4 AND valid_to IS NULL",
+            params![date_to_text(on), namespace.code(), from, &instrument_text],
         )?;
+        if changed != 1 {
+            return Err(StoreError::AliasNotFoundForInstrument {
+                namespace: namespace.code(),
+                value: from.clone(),
+                instrument: instrument_text,
+            });
+        }
         transaction.execute(
             "INSERT INTO instrument_aliases
                  (namespace, value, instrument, valid_from, valid_to, source, created_at)

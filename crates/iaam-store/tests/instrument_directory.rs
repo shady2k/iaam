@@ -4,7 +4,7 @@ use iaam_core::ids::{CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
 use iaam_store::reference::{AliasRecord, AliasRename, CustodyRecord, InstrumentRecord};
-use iaam_store::{ResolveError, SqliteStore};
+use iaam_store::{ResolveError, SqliteStore, StoreError};
 use time::macros::date;
 
 fn store_with_one_bond() -> (SqliteStore, InstrumentId) {
@@ -165,6 +165,72 @@ fn the_new_code_does_not_resolve_before_the_change() {
         matches!(anachronism, Err(ResolveError::NotOnDate { .. })),
         "новый код в документе, датированном до смены, — признак порчи данных"
     );
+}
+
+#[test]
+fn renaming_a_missing_code_is_rejected_without_creating_the_new_code() {
+    let (mut store, instrument) = store_with_one_bond();
+
+    let refused = store.rename_alias(&AliasRename {
+        namespace: AliasNamespace::Isin,
+        from: "RU000AOLD001".to_owned(),
+        to: "RU000ANEW002".to_owned(),
+        on: date!(2024 - 01 - 01),
+        instrument,
+        source: SourceId::new_random(),
+    });
+
+    assert!(matches!(
+        refused,
+        Err(StoreError::AliasNotFoundForInstrument { .. })
+    ));
+    assert!(
+        store.list_aliases().expect("список алиасов").is_empty(),
+        "ошибка переименования не должна заводить новый код"
+    );
+}
+
+#[test]
+fn renaming_with_a_foreign_instrument_is_rejected_without_closing_the_old_code() {
+    let (mut store, instrument) = store_with_one_bond();
+    let foreign = InstrumentId::new_random();
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: foreign,
+            kind: Some(InstrumentKind::Bond),
+            symbol: "RU000FOREIGN".to_owned(),
+            title: "Чужой выпуск".to_owned(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("чужой инструмент заведён");
+    store
+        .record_alias(&alias(
+            instrument,
+            "RU000AOLD001",
+            date!(2020 - 01 - 01),
+            None,
+        ))
+        .expect("исходный псевдоним");
+
+    let refused = store.rename_alias(&AliasRename {
+        namespace: AliasNamespace::Isin,
+        from: "RU000AOLD001".to_owned(),
+        to: "RU000ANEW002".to_owned(),
+        on: date!(2024 - 01 - 01),
+        instrument: foreign,
+        source: SourceId::new_random(),
+    });
+
+    assert!(matches!(
+        refused,
+        Err(StoreError::AliasNotFoundForInstrument { .. })
+    ));
+    let aliases = store.list_aliases().expect("список алиасов");
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].instrument, instrument);
+    assert_eq!(aliases[0].value, "RU000AOLD001");
+    assert_eq!(aliases[0].interval.valid_to, None);
 }
 
 #[test]

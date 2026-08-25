@@ -16,6 +16,7 @@ use time::macros::format_description;
 
 use crate::csv_source::{
     Directory, ParsedRow, resolve_instrument, resolve_instrument_without_date,
+    resolve_named_custody,
 };
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::report::sections::{
@@ -638,11 +639,7 @@ fn lookup_custody(
     name: &str,
     field: &'static str,
 ) -> Result<CustodyId, Rejection> {
-    directory
-        .custodies
-        .get(name)
-        .copied()
-        .ok_or_else(|| rejection(field, "имя из справочника", name))
+    resolve_named_custody(name, directory, field)
 }
 
 fn operation(

@@ -10,7 +10,7 @@
 //! чем минимальная единица валюты, **отклоняется**, а не округляется:
 //! округление входных данных — это тихое изменение факта.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
@@ -30,7 +30,7 @@ use crate::verdict::Rejection;
 #[derive(Debug, Clone, Default)]
 pub struct Directory {
     pub accounts: BTreeMap<String, AccountId>,
-    pub custodies: BTreeMap<String, CustodyId>,
+    pub custodies: CustodyNames,
     pub instruments: InstrumentAliases,
     /// Место хранения по умолчанию для счёта без указанного депозитария.
     pub default_custody: Option<CustodyId>,
@@ -42,7 +42,10 @@ pub struct Directory {
 /// в разные годы принадлежит разным выпускам, а один выпуск за свою
 /// жизнь меняет ISIN корпоративным действием (§4.7). Разрешение идёт
 /// на дату строки, а не на «сегодня».
-pub type InstrumentAliases = BTreeMap<String, Vec<(AliasInterval, InstrumentId)>>;
+pub type InstrumentAliases = BTreeMap<String, Vec<(String, AliasInterval, InstrumentId)>>;
+
+/// Названия мест хранения с сохранением всех совпадений.
+pub type CustodyNames = BTreeMap<String, Vec<CustodyId>>;
 
 /// Инструмент по коду на дату строки.
 pub fn resolve_instrument(
@@ -57,28 +60,39 @@ pub fn resolve_instrument(
             actual: code.to_owned(),
         });
     };
-    let matching: Vec<InstrumentId> = candidates
+    let matching: BTreeSet<InstrumentId> = candidates
         .iter()
-        .filter(|(interval, _)| interval.covers(on))
-        .map(|(_, id)| *id)
+        .filter(|(_, interval, _)| interval.covers(on))
+        .map(|(_, _, id)| *id)
         .collect();
-    match matching.as_slice() {
-        [single] => Ok(*single),
+    match matching.len() {
+        1 => Ok(*matching.first().expect("непустое множество")),
         // Код известен, но не на эту дату. Отдельный текст, а не общий
         // отказ: это признак испорченной даты документа, а не новой
         // бумаги, и разбирающийся должен видеть разницу.
-        [] => Err(Rejection {
+        0 => Err(Rejection {
             field: "instrument".to_owned(),
             expected: "код, действующий на дату операции".into(),
             actual: code.to_owned(),
         }),
-        // Пересечение интервалов ловится триггером схемы; сюда попасть
-        // можно только на справочнике, собранном мимо базы.
-        _ => Err(Rejection {
-            field: "instrument".to_owned(),
-            expected: "однозначный код инструмента".into(),
-            actual: code.to_owned(),
-        }),
+        // Несколько пространств могут содержать один и тот же код. Это
+        // безопасно, если они указывают на один выпуск; разные выпуски
+        // требуют явного исправления входных данных.
+        _ => {
+            let namespaces: BTreeSet<&str> = candidates
+                .iter()
+                .filter(|(_, interval, _)| interval.covers(on))
+                .map(|(namespace, _, _)| namespace.as_str())
+                .collect();
+            Err(Rejection {
+                field: "instrument".to_owned(),
+                expected: "один инструмент среди действующих пространств имён".into(),
+                actual: format!(
+                    "{code}: неоднозначность между пространствами имён {}",
+                    namespaces.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            })
+        }
     }
 }
 
@@ -99,7 +113,7 @@ pub fn resolve_instrument_without_date(
         });
     };
     match candidates.as_slice() {
-        [(_, instrument)] => Ok(*instrument),
+        [(_, _, instrument)] => Ok(*instrument),
         [] => Err(Rejection {
             field: "instrument".to_owned(),
             expected: "код, действующий на дату операции".into(),
@@ -258,11 +272,38 @@ fn build_kind(
 /// напрямую и на пустой строке тоже.
 fn resolve_custody(name: Option<&str>, directory: &Directory) -> Result<CustodyId, Rejection> {
     match name {
-        Some(name) if !name.is_empty() => lookup(&directory.custodies, name, "custody"),
+        Some(name) if !name.is_empty() => resolve_named_custody(name, directory, "custody"),
         _ => directory.default_custody.ok_or_else(|| Rejection {
             field: "custody".into(),
             expected: "известное место хранения или значение по умолчанию".into(),
             actual: "не указано".into(),
+        }),
+    }
+}
+
+pub(crate) fn resolve_named_custody(
+    name: &str,
+    directory: &Directory,
+    field: &'static str,
+) -> Result<CustodyId, Rejection> {
+    let Some(candidates) = directory.custodies.get(name) else {
+        return Err(Rejection {
+            field: field.to_owned(),
+            expected: "имя из справочника".into(),
+            actual: name.to_owned(),
+        });
+    };
+    match candidates.as_slice() {
+        [single] => Ok(*single),
+        [] => Err(Rejection {
+            field: field.to_owned(),
+            expected: "имя из справочника".into(),
+            actual: name.to_owned(),
+        }),
+        _ => Err(Rejection {
+            field: field.to_owned(),
+            expected: "однозначное имя из справочника".into(),
+            actual: format!("{name}: название места хранения неоднозначно"),
         }),
     }
 }
@@ -386,6 +427,7 @@ mod tests {
         aliases.insert(
             "SBER".to_owned(),
             vec![(
+                "ticker".to_owned(),
                 AliasInterval {
                     valid_from: date!(2020 - 01 - 01),
                     valid_to: None,
@@ -400,12 +442,135 @@ mod tests {
     }
 
     #[test]
+    fn an_instrument_known_in_multiple_namespaces_resolves_to_the_same_id() {
+        let instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![
+                (
+                    "ticker".to_owned(),
+                    AliasInterval {
+                        valid_from: date!(2020 - 01 - 01),
+                        valid_to: None,
+                    },
+                    instrument,
+                ),
+                (
+                    "broker_code".to_owned(),
+                    AliasInterval {
+                        valid_from: date!(2020 - 01 - 01),
+                        valid_to: None,
+                    },
+                    instrument,
+                ),
+            ],
+        );
+
+        let found = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01));
+
+        assert_eq!(
+            found.expect("коды разных пространств разрешены"),
+            instrument
+        );
+    }
+
+    #[test]
+    fn an_instrument_code_is_rejected_when_namespaces_point_to_different_ids() {
+        let ticker_instrument = InstrumentId::new_random();
+        let broker_instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![
+                (
+                    "ticker".to_owned(),
+                    AliasInterval {
+                        valid_from: date!(2020 - 01 - 01),
+                        valid_to: None,
+                    },
+                    ticker_instrument,
+                ),
+                (
+                    "broker_code".to_owned(),
+                    AliasInterval {
+                        valid_from: date!(2020 - 01 - 01),
+                        valid_to: None,
+                    },
+                    broker_instrument,
+                ),
+            ],
+        );
+
+        let refused = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01))
+            .expect_err("одинаковое значение в разных пространствах неоднозначно");
+
+        assert_eq!(refused.field, "instrument");
+        assert!(refused.actual.contains("SBER"));
+        assert!(refused.actual.contains("ticker"));
+        assert!(refused.actual.contains("broker_code"));
+    }
+
+    #[test]
+    fn an_instrument_with_multiple_namespaces_still_requires_a_date() {
+        let instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![
+                (
+                    "ticker".to_owned(),
+                    AliasInterval {
+                        valid_from: date!(2020 - 01 - 01),
+                        valid_to: None,
+                    },
+                    instrument,
+                ),
+                (
+                    "broker_code".to_owned(),
+                    AliasInterval {
+                        valid_from: date!(2020 - 01 - 01),
+                        valid_to: None,
+                    },
+                    instrument,
+                ),
+            ],
+        );
+
+        let refused = resolve_instrument_without_date(&aliases, "SBER")
+            .expect_err("без даты нельзя выбрать пространство имён");
+
+        assert_eq!(
+            refused.expected,
+            "дата снимка отчёта для выбора кода инструмента"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_custody_title_is_rejected_as_ambiguous() {
+        let first = CustodyId::new_random();
+        let second = CustodyId::new_random();
+        let mut directory = Directory::default();
+        directory
+            .custodies
+            .insert("НРД".into(), vec![first, second]);
+
+        let refused = resolve_custody(Some("НРД"), &directory)
+            .expect_err("одинаковое название места хранения неоднозначно");
+
+        assert_eq!(refused.field, "custody");
+        assert!(refused.actual.contains("НРД"));
+        assert!(refused.actual.contains("неоднозначно"));
+    }
+
+    #[test]
     fn an_instrument_code_is_rejected_on_the_first_day_after_its_interval() {
         let instrument = InstrumentId::new_random();
         let mut aliases = BTreeMap::new();
         aliases.insert(
             "SBER".to_owned(),
             vec![(
+                "ticker".to_owned(),
                 AliasInterval {
                     valid_from: date!(2020 - 01 - 01),
                     valid_to: Some(date!(2024 - 03 - 01)),
@@ -437,6 +602,7 @@ mod tests {
         aliases.insert(
             "SBER".to_owned(),
             vec![(
+                "ticker".to_owned(),
                 AliasInterval {
                     valid_from: date!(2025 - 01 - 01),
                     valid_to: None,
@@ -468,7 +634,7 @@ mod tests {
             default_custody: Some(default),
             ..Directory::default()
         };
-        directory.custodies.insert("НРД".into(), named);
+        directory.custodies.insert("НРД".into(), vec![named]);
 
         assert_eq!(resolve_custody(None, &directory).unwrap(), default);
         assert_eq!(resolve_custody(Some(""), &directory).unwrap(), default);

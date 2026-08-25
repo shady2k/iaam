@@ -15,6 +15,7 @@ use time::macros::format_description;
 
 use crate::csv_source::{
     Directory, ParsedRow, resolve_instrument, resolve_instrument_without_date,
+    resolve_named_custody,
 };
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::report::sections::{
@@ -642,13 +643,8 @@ fn custody_value(
     field: &'static str,
 ) -> Result<CustodyId, Rejection> {
     let name = text_value(cell)?;
-    directory
-        .custodies
-        .get(name)
-        .copied()
-        .ok_or_else(|| rejection(field, "имя из справочника", name))
+    resolve_named_custody(name, directory, field)
 }
-
 fn operation(
     account: iaam_core::ids::AccountId,
     kind: OperationKind,

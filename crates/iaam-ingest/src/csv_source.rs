@@ -654,4 +654,78 @@ mod tests {
         assert_eq!(rejection.field, "custody");
         assert_eq!(rejection.actual, "не указано");
     }
+    #[test]
+    fn a_known_code_outside_its_interval_reports_a_date_specific_rejection() {
+        let instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![(
+                "ticker".to_owned(),
+                AliasInterval {
+                    valid_from: date!(2025 - 01 - 01),
+                    valid_to: None,
+                },
+                instrument,
+            )],
+        );
+
+        let refused = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01))
+            .expect_err("код известен, но не действует на дату");
+
+        assert_eq!(refused.field, "instrument");
+        assert_eq!(
+            refused.expected, "код, действующий на дату операции",
+            "код, известный справочнику, должен отличаться от неизвестного"
+        );
+        assert_eq!(refused.actual, "SBER");
+    }
+
+    #[test]
+    fn an_instrument_without_date_returns_the_only_candidate() {
+        let instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![(
+                "ticker".to_owned(),
+                AliasInterval {
+                    valid_from: date!(2020 - 01 - 01),
+                    valid_to: None,
+                },
+                instrument,
+            )],
+        );
+
+        assert_eq!(
+            resolve_instrument_without_date(&aliases, "SBER").expect("единственный код"),
+            instrument
+        );
+    }
+
+    #[test]
+    fn an_empty_instrument_history_without_date_has_the_date_specific_rejection() {
+        let mut aliases = BTreeMap::new();
+        aliases.insert("SBER".to_owned(), Vec::new());
+
+        let refused = resolve_instrument_without_date(&aliases, "SBER")
+            .expect_err("пустая история инструмента");
+
+        assert_eq!(refused.field, "instrument");
+        assert_eq!(refused.expected, "код, действующий на дату операции");
+        assert_eq!(refused.actual, "SBER");
+    }
+
+    #[test]
+    fn an_empty_custody_history_is_rejected_as_an_unknown_name() {
+        let mut directory = Directory::default();
+        directory.custodies.insert("НРД".into(), Vec::new());
+
+        let refused = resolve_named_custody("НРД", &directory, "custody")
+            .expect_err("пустая история места хранения");
+
+        assert_eq!(refused.field, "custody");
+        assert_eq!(refused.expected, "имя из справочника");
+        assert_eq!(refused.actual, "НРД");
+    }
 }

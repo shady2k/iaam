@@ -299,3 +299,62 @@ fn a_code_never_resolves_to_two_instruments() {
         }
     }
 }
+
+#[test]
+fn instrument_returns_the_stored_record_and_none_for_an_unknown_id() {
+    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let expected = InstrumentRecord {
+        id: InstrumentId::new_random(),
+        kind: Some(InstrumentKind::Bond),
+        symbol: "RU000ATEST01".to_owned(),
+        title: "Тестовый выпуск".to_owned(),
+        currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+        lineage: None,
+    };
+    store
+        .upsert_instrument(&expected)
+        .expect("инструмент заведён");
+
+    assert_eq!(
+        store.instrument(expected.id).expect("чтение инструмента"),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        store
+            .instrument(InstrumentId::new_random())
+            .expect("чтение неизвестного инструмента"),
+        None
+    );
+}
+
+#[test]
+fn list_instruments_returns_all_stored_records_in_symbol_order() {
+    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let later = InstrumentRecord {
+        id: InstrumentId::new_random(),
+        kind: Some(InstrumentKind::Bond),
+        symbol: "ZZZ".to_owned(),
+        title: "Поздний выпуск".to_owned(),
+        currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+        lineage: None,
+    };
+    let earlier = InstrumentRecord {
+        id: InstrumentId::new_random(),
+        kind: Some(InstrumentKind::Bond),
+        symbol: "AAA".to_owned(),
+        title: "Ранний выпуск".to_owned(),
+        currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+        lineage: None,
+    };
+    store
+        .upsert_instrument(&later)
+        .expect("первый инструмент заведён");
+    store
+        .upsert_instrument(&earlier)
+        .expect("второй инструмент заведён");
+
+    assert_eq!(
+        store.list_instruments().expect("список инструментов"),
+        vec![earlier, later]
+    );
+}

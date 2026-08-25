@@ -5,6 +5,8 @@
 //! нарушение инварианта отменяет отчёт целиком: возвращать число
 //! с предупреждением после доказанного нарушения тождества нельзя.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -12,7 +14,7 @@ use super::lots::LotKey;
 use super::state::LedgerState;
 use crate::event::{Event, EventValidationError};
 use crate::ids::EventId;
-use crate::money::Money;
+use crate::money::{Money, Quantity};
 use crate::numeric::NumericError;
 
 /// Проверенный инвариант. Отчёт показывает, что именно было проверено:
@@ -115,41 +117,56 @@ pub fn check(
 
     let mut pairs = 0;
     let mut basis_pairs = 0;
-    for (key, entry) in state.book().iter() {
-        let lots = entry.quantity()?;
+    let keys: BTreeSet<LotKey> = state
+        .book()
+        .iter()
+        .map(|(key, _)| *key)
+        .chain(state.balances().iter_positions().map(|(key, _)| LotKey {
+            account: key.account,
+            instrument: key.instrument,
+        }))
+        .collect();
+    for key in keys {
+        let entry = state.book().entry(&key);
+        let lots = entry
+            .map(|entry| entry.quantity())
+            .transpose()?
+            .unwrap_or_else(Quantity::zero);
         let position = state.balances().quantity_of(key.account, key.instrument)?;
         if lots != position {
             return Err(InvariantViolation::LotsDoNotMatchPosition {
-                key: *key,
+                key,
                 lots: format!("{:?}", lots.0.inner()),
                 position: format!("{:?}", position.0.inner()),
             });
         }
         pairs += 1;
 
-        if let Some(acquired) = entry.acquired_basis() {
-            let remaining = entry
-                .remaining_basis()
-                .map_err(|_| InvariantViolation::BasisNotConserved {
-                    key: *key,
-                    acquired: acquired.amount().raw(),
-                    remaining: 0,
-                    released: 0,
-                })?
-                .unwrap_or_else(|| Money::zero(acquired.currency()));
-            let released = entry
-                .released_basis()
-                .unwrap_or_else(|| Money::zero(acquired.currency()));
-            let sum = remaining.amount().raw() + released.amount().raw();
-            if sum != acquired.amount().raw() {
-                return Err(InvariantViolation::BasisNotConserved {
-                    key: *key,
-                    acquired: acquired.amount().raw(),
-                    remaining: remaining.amount().raw(),
-                    released: released.amount().raw(),
-                });
+        if let Some(entry) = entry {
+            if let Some(acquired) = entry.acquired_basis() {
+                let remaining = entry
+                    .remaining_basis()
+                    .map_err(|_| InvariantViolation::BasisNotConserved {
+                        key,
+                        acquired: acquired.amount().raw(),
+                        remaining: 0,
+                        released: 0,
+                    })?
+                    .unwrap_or_else(|| Money::zero(acquired.currency()));
+                let released = entry
+                    .released_basis()
+                    .unwrap_or_else(|| Money::zero(acquired.currency()));
+                let sum = remaining.amount().raw() + released.amount().raw();
+                if sum != acquired.amount().raw() {
+                    return Err(InvariantViolation::BasisNotConserved {
+                        key,
+                        acquired: acquired.amount().raw(),
+                        remaining: remaining.amount().raw(),
+                        released: released.amount().raw(),
+                    });
+                }
+                basis_pairs += 1;
             }
-            basis_pairs += 1;
         }
     }
     checked.push(CheckedInvariant::LotsMatchPositions { pairs });
@@ -426,6 +443,41 @@ mod tests {
         // неполнота данных: первое отменяет отчёт, второе помечает
         // величину невычислимой.
         assert!(crate::projection::ProjectionError::from(violation).is_invariant_violation());
+    }
+
+    #[test]
+    fn a_position_without_a_single_lot_is_caught() {
+        // Этот случай отдельный: обход только по книге лотов физически
+        // не видит позицию, для которой записи в книге нет вовсе. Тест
+        // служит регрессионным заслоном для обхода по объединению ключей.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        let mut state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let phantom = event_with(
+            account,
+            date!(2025 - 04 - 02),
+            1,
+            EventKind::CashIn { amount: rub(1) },
+            vec![Leg::security(account, custody, instrument, qty(5))],
+        );
+        {
+            let (balances, _, _) = state.parts_mut();
+            balances.apply(&phantom).expect("нога применяется");
+        }
+
+        assert!(state.book().entry(&key).is_none());
+        let verdict = check(&state, &[]);
+        let violation = verdict.expect_err("позиция без лота обязана отменить проекцию");
+        assert!(matches!(
+            violation,
+            InvariantViolation::LotsDoNotMatchPosition { .. }
+        ));
+        assert_eq!(violation.code(), "lots_do_not_match_position");
     }
 
     #[test]

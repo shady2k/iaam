@@ -98,6 +98,9 @@ impl ServerState {
 pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
     let protected = OpenApiRouter::new()
         .routes(routes!(routes::list_accounts, routes::create_account))
+        .routes(routes!(routes::list_instruments, routes::create_instrument))
+        .routes(routes!(routes::get_instrument))
+        .routes(routes!(routes::resolve_instrument))
         .routes(routes!(
             routes::list_broker_access,
             routes::add_broker_access

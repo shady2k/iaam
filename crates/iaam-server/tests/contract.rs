@@ -23,13 +23,15 @@ use iaam_app::ports::{
 use iaam_broker::credentials::Key;
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
+use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
+use iaam_core::money::CurrencyCode;
 use iaam_core::reconciliation::Dimension;
 use iaam_server::auth::hash_token;
 use iaam_server::dto::VerdictDto;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::SqliteStore;
-use iaam_store::reference::AccountRecord;
+use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -319,7 +321,6 @@ fn claim_state(store: SqliteStore) -> ServerState {
     let services = Arc::new(AppServices::new(
         adapter.clone(),
         adapter.clone(),
-        adapter,
         broker,
         tokens,
         Arc::new(FixedClock(date!(2026 - 01 - 01))),
@@ -2133,4 +2134,183 @@ fn verdict_dto_json_contains_every_variant_field() {
             .expect("вердикт сериализуется");
         assert_eq!(actual, expected, "содержимое вердикта {domain:?}");
     }
+}
+
+fn seed_directory(store: &SqliteStore) -> InstrumentId {
+    let instrument = InstrumentId::new_random();
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: "SBER".into(),
+            title: "Сбербанк".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("инструмент");
+    store
+        .record_alias(&AliasRecord {
+            namespace: AliasNamespace::Isin,
+            value: "RU000A0JX0J2".into(),
+            instrument,
+            interval: AliasInterval {
+                valid_from: date!(2020 - 01 - 01),
+                valid_to: None,
+            },
+            source: SourceId::new_random(),
+        })
+        .expect("псевдоним");
+    instrument
+}
+
+fn seeded_harness() -> Harness {
+    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let instrument = seed_directory(&store);
+    let mut harness = harness_with(store);
+    harness.instrument = instrument;
+    harness
+}
+
+fn server_with_one_alias() -> (Router, String, InstrumentId) {
+    let harness = seeded_harness();
+    (harness.router, harness.owner_token, harness.instrument)
+}
+
+fn server_with_one_alias_and_agent_token() -> (Router, String, InstrumentId) {
+    let harness = seeded_harness();
+    (harness.router, harness.agent_token, harness.instrument)
+}
+
+#[tokio::test]
+async fn listing_instruments_returns_the_global_directory() {
+    let (app, token, instrument) = server_with_one_alias();
+    let (status, body) = call(&app, get("/v1/instruments", Some(&token))).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.as_array()
+            .expect("список")
+            .iter()
+            .any(|item| item["id"] == instrument.inner().to_string())
+    );
+}
+
+#[tokio::test]
+async fn resolving_a_known_code_returns_its_instrument() {
+    let (app, token, instrument) = server_with_one_alias();
+    let (status, body) = call(
+        &app,
+        post(
+            "/v1/instruments/resolve",
+            &token,
+            &json!({"namespace": "isin", "value": "RU000A0JX0J2", "on": "2024-03-01"}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["instrument"], instrument.inner().to_string());
+}
+
+#[tokio::test]
+async fn resolving_an_unknown_code_is_a_404() {
+    let (app, token, _) = server_with_one_alias();
+    let (status, _) = call(
+        &app,
+        post(
+            "/v1/instruments/resolve",
+            &token,
+            &json!({"namespace": "isin", "value": "RU000ANOPE00", "on": "2024-03-01"}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn resolving_a_code_outside_its_interval_names_the_known_range() {
+    let (app, token, _) = server_with_one_alias();
+    let (status, body) = call(
+        &app,
+        post(
+            "/v1/instruments/resolve",
+            &token,
+            &json!({"namespace": "isin", "value": "RU000A0JX0J2", "on": "1999-01-01"}),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "известный код вне интервала — не то же самое, что неизвестный код"
+    );
+    assert_eq!(body["field"], "on");
+    assert!(
+        body["expected"]
+            .as_str()
+            .is_some_and(|value| value.contains("2020-01-01"))
+    );
+    assert!(
+        body["actual"]
+            .as_str()
+            .is_some_and(|value| value.contains("1999-01-01"))
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_namespace_is_a_422_naming_the_field() {
+    let (app, token, _) = server_with_one_alias();
+    let (status, body) = call(
+        &app,
+        post(
+            "/v1/instruments/resolve",
+            &token,
+            &json!({"namespace": "cusip", "value": "037833100", "on": "2024-03-01"}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["field"], "namespace");
+}
+
+#[tokio::test]
+async fn the_instrument_dto_does_not_leak_the_alias_source() {
+    let (app, token, instrument) = server_with_one_alias();
+    let (status, body) = call(
+        &app,
+        get(
+            &format!("/v1/instruments/{}", instrument.inner()),
+            Some(&token),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.to_string().contains("source"),
+        "SourceId указывает на документ владельца: наружу он не идёт (§14)"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_token_may_not_write_to_the_directory() {
+    let (app, agent_token, _) = server_with_one_alias_and_agent_token();
+    let (status, _) = call(
+        &app,
+        post(
+            "/v1/instruments",
+            &agent_token,
+            &json!({"symbol": "HACK", "title": "Подменыш", "kind": "share"}),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "справочник глобален: чужая запись портит данные всех владельцев"
+    );
 }

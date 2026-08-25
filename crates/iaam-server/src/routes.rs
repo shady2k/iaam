@@ -21,7 +21,7 @@ use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, st
 use iaam_app::scenarios::reports::{ReturnsQuery, returns};
 use iaam_app::sync::sync_broker as run_sync_broker;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{AccountId, CustodyId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::PROJECTION_VERSION;
@@ -42,12 +42,113 @@ use crate::dto::{
     BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
     ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateTokenRequest, CurrencyDto, DimensionStatusDto, DocumentDto,
-    DocumentParams, EvidenceDto, FxRateDto, HealthDto, IssuedTokenDto, OwnerBalanceRequest,
-    ReconciliationParams, ReconciliationStatusDto, ReturnsReportDto, SubmitOperationsRequest,
-    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    DocumentParams, EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto,
+    OwnerBalanceRequest, ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest,
+    ResolvedInstrumentDto, ReturnsReportDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto,
+    TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
+
+/// Список глобального справочника инструментов.
+#[utoipa::path(
+    get,
+    path = "/v1/instruments",
+    responses((status = 200, description = "Инструменты справочника", body = [InstrumentDto])),
+    security(("bearer" = []))
+)]
+pub async fn list_instruments(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+) -> Result<Json<Vec<InstrumentDto>>, ApiFailure> {
+    let instruments = state.services.directory.list_instruments().await?;
+    Ok(Json(instruments.into_iter().map(instrument_dto).collect()))
+}
+
+/// Один инструмент глобального справочника.
+#[utoipa::path(
+    get,
+    path = "/v1/instruments/{id}",
+    params(("id" = Uuid, Path, description = "Идентификатор инструмента")),
+    responses(
+        (status = 200, description = "Инструмент справочника", body = InstrumentDto),
+        (status = 404, description = "Инструмент неизвестен", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_instrument(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<InstrumentDto>, ApiFailure> {
+    let instrument = state
+        .services
+        .directory
+        .instrument(InstrumentId(id))
+        .await?
+        .ok_or_else(|| iaam_app::error::AppError::NotFound {
+            what: "инструмент",
+            id: id.to_string(),
+        })?;
+    Ok(Json(instrument_dto(instrument)))
+}
+
+/// Разрешение внешнего кода инструмента на дату документа.
+#[utoipa::path(
+    post,
+    path = "/v1/instruments/resolve",
+    request_body = ResolveInstrumentRequest,
+    responses(
+        (status = 200, description = "Инструмент по коду на дату", body = ResolvedInstrumentDto),
+        (status = 404, description = "Код неизвестен", body = ApiError),
+        (status = 422, description = "Код известен, но не на эту дату, либо пространство имён неверно", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn resolve_instrument(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Json(request): Json<ResolveInstrumentRequest>,
+) -> Result<Json<ResolvedInstrumentDto>, ApiFailure> {
+    let instrument = state
+        .services
+        .directory
+        .resolve(&request.namespace, &request.value, request.on)
+        .await?;
+    Ok(Json(ResolvedInstrumentDto {
+        instrument: instrument.inner().to_string(),
+    }))
+}
+
+/// Защита точки записи глобального справочника.
+///
+/// Порт справочника предоставляет только чтение и разрешение кодов.
+/// Поэтому право проверяется до чтения тела, а разрешённая запись останется
+/// невозможной до появления отдельного метода порта.
+#[utoipa::path(
+    post,
+    path = "/v1/instruments",
+    request_body = InstrumentDto,
+    responses(
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 501, description = "Запись не поддерживается портом", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_instrument(
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> Result<StatusCode, ApiFailure> {
+    require_admin(&principal)?;
+    let _ = body;
+    Err(ApiFailure::new(
+        StatusCode::NOT_IMPLEMENTED,
+        ApiError::simple(
+            "not_implemented",
+            "порт справочника не предоставляет запись инструментов",
+        ),
+    ))
+}
 
 /// Загрузка отчёта с построчными исходами.
 #[utoipa::path(
@@ -1009,6 +1110,18 @@ pub async fn returns_report_with_rates(
     };
     let report = returns(&state.services, &principal, &query).await?;
     Ok(Json(ReturnsReportDto::from_domain(&report)))
+}
+
+fn instrument_dto(instrument: iaam_app::ports::InstrumentView) -> InstrumentDto {
+    InstrumentDto {
+        id: instrument.id.inner().to_string(),
+        kind: instrument.kind,
+        symbol: instrument.symbol,
+        title: instrument.title,
+        denomination_currency: instrument.denomination_currency,
+        settlement_currency: instrument.settlement_currency,
+        quote_currency: instrument.quote_currency,
+    }
 }
 
 fn document_dto(document: UploadedDocument) -> DocumentDto {

@@ -2,6 +2,9 @@
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
+# Журнал и разделяемая память SQLite: те же данные, что и в базе.
+*.db-shm
+*.db-wal
 .beads-credential-key
 .beads/proxieddb/
 

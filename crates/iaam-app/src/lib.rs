@@ -22,14 +22,15 @@ pub mod tokens;
 use std::sync::Arc;
 
 use ports::{
-    BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Clock, Store, TokenAdmin,
-    UnavailableBrokerChannelFactory, UnavailableClassificationRuleStore,
+    BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Clock, InstrumentDirectory, Store,
+    TokenAdmin, UnavailableBrokerChannelFactory, UnavailableClassificationRuleStore,
 };
 
 /// Собранные зависимости. Точка сборки создаёт один экземпляр,
 /// обработчики получают `Arc<AppServices>` (§3.2).
 pub struct AppServices {
     pub store: Arc<dyn Store>,
+    pub directory: Arc<dyn InstrumentDirectory>,
     /// Хранилище брокерских доступов. Отдельным полем, а не частью
     /// `store`: за ним стоит ключ шифрования, и его может не быть.
     pub broker: Arc<dyn BrokerVault>,
@@ -48,12 +49,14 @@ impl AppServices {
     #[must_use]
     pub fn new(
         store: Arc<dyn Store>,
+        directory: Arc<dyn InstrumentDirectory>,
         broker: Arc<dyn BrokerVault>,
         tokens: Arc<dyn TokenAdmin>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self::with_ports(
             store,
+            directory,
             broker,
             tokens,
             clock,
@@ -65,6 +68,7 @@ impl AppServices {
     #[must_use]
     pub fn with_ports(
         store: Arc<dyn Store>,
+        directory: Arc<dyn InstrumentDirectory>,
         broker: Arc<dyn BrokerVault>,
         tokens: Arc<dyn TokenAdmin>,
         clock: Arc<dyn Clock>,
@@ -73,6 +77,7 @@ impl AppServices {
     ) -> Self {
         Self {
             store,
+            directory,
             broker,
             tokens,
             clock,

@@ -194,6 +194,7 @@ fn harness_with_factory(
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
     let services = Arc::new(AppServices::with_ports(
+        adapter.clone(),
         adapter,
         broker,
         tokens,
@@ -316,6 +317,8 @@ fn claim_state(store: SqliteStore) -> ServerState {
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
     let services = Arc::new(AppServices::new(
+        adapter.clone(),
+        adapter.clone(),
         adapter,
         broker,
         tokens,

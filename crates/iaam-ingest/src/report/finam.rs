@@ -13,7 +13,9 @@ use rust_decimal::Decimal;
 use time::Date;
 use time::macros::format_description;
 
-use crate::csv_source::{Directory, ParsedRow};
+use crate::csv_source::{
+    Directory, ParsedRow, resolve_instrument, resolve_instrument_without_date,
+};
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::report::sections::{
     CashSection, ControlSections, PositionSection, TotalSection, TurnoverSection,
@@ -83,7 +85,12 @@ impl ReportParser for FinamParser {
             workbook.sheet("Обороты денежных средств"),
             &mut report.sections,
         );
-        parse_positions(workbook.sheet("Позиции"), directory, &mut report.sections);
+        parse_positions(
+            workbook.sheet("Позиции"),
+            directory,
+            report.period.map(|period| period.to),
+            &mut report.sections,
+        );
         parse_totals(workbook.sheet("Сводные итоги"), &mut report.sections);
         report
     }
@@ -149,7 +156,8 @@ fn parse_trades(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
                 .unwrap_or(trade_date);
             let currency = currency_value(cell(row, currency_col))?;
             let account = account_value(directory, cell(row, account_col), "account")?;
-            let instrument = instrument_value(directory, cell(row, instrument_col), "instrument")?;
+            let instrument =
+                instrument_value(directory, cell(row, instrument_col), Some(trade_date))?;
             let custody = custody_value(directory, cell(row, custody_col), "custody")?;
             let quantity = quantity_value(cell(row, quantity_col), "quantity")?;
             let gross_minor = money_value(cell(row, gross_col), "amount", currency)?;
@@ -317,13 +325,7 @@ fn parse_income(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
                 return Err(rejection("type", "Купон или Дивиденд", &kind));
             }
             let instrument = optional_text(cell(row, instrument_col))
-                .map(|name| {
-                    directory
-                        .instruments
-                        .get(name)
-                        .copied()
-                        .ok_or_else(|| rejection("instrument", "имя из справочника", name))
-                })
+                .map(|_| instrument_value(directory, cell(row, instrument_col), Some(date)))
                 .transpose()?;
             let gross_minor = money_value(cell(row, amount_col), "amount", currency)?;
             Ok(operation(
@@ -421,7 +423,12 @@ fn parse_turnovers(sheet: Option<&Sheet>, sections: &mut ControlSections) {
     }
 }
 
-fn parse_positions(sheet: Option<&Sheet>, directory: &Directory, sections: &mut ControlSections) {
+fn parse_positions(
+    sheet: Option<&Sheet>,
+    directory: &Directory,
+    on: Option<Date>,
+    sections: &mut ControlSections,
+) {
     let Some(sheet) = sheet else { return };
     let Some(headers) = headers(sheet) else {
         return;
@@ -435,8 +442,7 @@ fn parse_positions(sheet: Option<&Sheet>, directory: &Directory, sections: &mut 
     let opening_col = column(&headers, "остаток на начало");
     let closing_col = column(&headers, "остаток на конец");
     for row in data_rows(sheet) {
-        let Ok(instrument) = instrument_value(directory, cell(row, instrument_col), "instrument")
-        else {
+        let Ok(instrument) = instrument_value(directory, cell(row, instrument_col), on) else {
             continue;
         };
         let Ok(custody) = custody_value(directory, cell(row, custody_col), "custody") else {
@@ -621,14 +627,13 @@ fn account_value(
 fn instrument_value(
     directory: &Directory,
     cell: &Cell,
-    field: &'static str,
+    on: Option<Date>,
 ) -> Result<InstrumentId, Rejection> {
     let name = text_value(cell)?;
-    directory
-        .instruments
-        .get(name)
-        .copied()
-        .ok_or_else(|| rejection(field, "имя из справочника", name))
+    match on {
+        Some(on) => resolve_instrument(&directory.instruments, name, on),
+        None => resolve_instrument_without_date(&directory.instruments, name),
+    }
 }
 
 fn custody_value(

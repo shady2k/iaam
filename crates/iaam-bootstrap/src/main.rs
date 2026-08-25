@@ -217,6 +217,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
     let services = Arc::new(AppServices::with_ports(
+        adapter.clone(),
         adapter,
         broker,
         tokens,

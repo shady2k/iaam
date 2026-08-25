@@ -6,6 +6,7 @@
 use iaam_core::event::kind::{FeeOrigin, TradeSide};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
+use iaam_core::instrument::AliasInterval;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -45,9 +46,98 @@ fn directory(account: AccountId, custody: CustodyId, instrument: InstrumentId) -
     Directory {
         accounts: [("INVEST-001".to_owned(), account)].into_iter().collect(),
         custodies: [("НРД".to_owned(), custody)].into_iter().collect(),
-        instruments: [("BOND-X".to_owned(), instrument)].into_iter().collect(),
+        instruments: [(
+            "BOND-X".to_owned(),
+            vec![(
+                AliasInterval {
+                    valid_from: date!(1900 - 01 - 01),
+                    valid_to: None,
+                },
+                instrument,
+            )],
+        )]
+        .into_iter()
+        .collect(),
         default_custody: None,
     }
+}
+
+fn directory_with_historical_instrument(
+    account: AccountId,
+    custody: CustodyId,
+    first: InstrumentId,
+    second: InstrumentId,
+) -> Directory {
+    Directory {
+        accounts: [("INVEST-001".to_owned(), account)].into_iter().collect(),
+        custodies: [("НРД".to_owned(), custody)].into_iter().collect(),
+        instruments: [(
+            "BOND-X".to_owned(),
+            vec![
+                (
+                    AliasInterval {
+                        valid_from: date!(1900 - 01 - 01),
+                        valid_to: Some(date!(2026 - 03 - 01)),
+                    },
+                    first,
+                ),
+                (
+                    AliasInterval {
+                        valid_from: date!(2026 - 03 - 01),
+                        valid_to: None,
+                    },
+                    second,
+                ),
+            ],
+        )]
+        .into_iter()
+        .collect(),
+        default_custody: None,
+    }
+}
+
+#[test]
+fn tinkoff_report_resolves_historical_instrument_on_each_report_date() {
+    let workbook = Workbook::open(REPORT).unwrap();
+    let parser = TinkoffParser;
+    let account = AccountId::new_random();
+    let custody = CustodyId::new_random();
+    let first = InstrumentId::new_random();
+    let second = InstrumentId::new_random();
+    let report = parser.parse(
+        &workbook,
+        &directory_with_historical_instrument(account, custody, first, second),
+    );
+
+    let mut instrument_rows = 0;
+    for row in &report.rows {
+        let ParsedRow::Operation(operation) = &row.outcome else {
+            continue;
+        };
+        match &operation.kind {
+            OperationKind::Buy { instrument, .. } | OperationKind::Sell { instrument, .. } => {
+                assert_eq!(*instrument, second);
+                instrument_rows += 1;
+            }
+            OperationKind::Income {
+                instrument: Some(instrument),
+                ..
+            } => {
+                assert_eq!(*instrument, second);
+                instrument_rows += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(instrument_rows, 3);
+    assert!(!report.sections.positions.is_empty());
+    assert!(
+        report
+            .sections
+            .positions
+            .iter()
+            .all(|position| position.instrument == second)
+    );
 }
 
 fn dec(value: i64) -> Dec {

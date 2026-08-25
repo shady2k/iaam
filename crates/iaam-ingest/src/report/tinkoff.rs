@@ -14,7 +14,9 @@ use rust_decimal::Decimal;
 use time::Date;
 use time::macros::format_description;
 
-use crate::csv_source::{Directory, ParsedRow};
+use crate::csv_source::{
+    Directory, ParsedRow, resolve_instrument, resolve_instrument_without_date,
+};
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::report::sections::{
     CashSection, ControlSections, PositionSection, TotalSection, TurnoverSection,
@@ -87,6 +89,7 @@ impl ReportParser for TinkoffParser {
         parse_positions(
             workbook.sheet("Остатки ценных бумаг"),
             directory,
+            report.period.map(|period| period.to),
             &mut report.sections,
         );
         parse_totals(workbook.sheet("Итоги"), &mut report.sections);
@@ -154,7 +157,7 @@ fn parse_trade_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Locate
             let instrument = lookup_instrument(
                 directory,
                 text_value(cell(row, instrument_col))?,
-                "instrument",
+                Some(date),
             )?;
             let custody =
                 lookup_custody(directory, text_value(cell(row, custody_col))?, "custody")?;
@@ -319,7 +322,7 @@ fn parse_income_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Locat
             let account =
                 lookup_account(directory, text_value(cell(row, account_col))?, "account")?;
             let instrument = optional_text(cell(row, instrument_col))
-                .map(|name| lookup_instrument(directory, name, "instrument"))
+                .map(|name| lookup_instrument(directory, name, Some(date)))
                 .transpose()?;
             let gross_minor = money_value(cell(row, amount_col), "amount", currency)?;
             Ok(operation(
@@ -416,7 +419,12 @@ fn parse_turnovers(sheet: Option<&Sheet>, sections: &mut ControlSections) {
     }
 }
 
-fn parse_positions(sheet: Option<&Sheet>, directory: &Directory, sections: &mut ControlSections) {
+fn parse_positions(
+    sheet: Option<&Sheet>,
+    directory: &Directory,
+    on: Option<Date>,
+    sections: &mut ControlSections,
+) {
     let Some(sheet) = sheet else { return };
     let Some(headers) = headers(sheet) else {
         return;
@@ -433,7 +441,7 @@ fn parse_positions(sheet: Option<&Sheet>, directory: &Directory, sections: &mut 
         let Ok(instrument) = lookup_instrument(
             directory,
             text_value(cell(row, instrument_col)).unwrap_or_default(),
-            "instrument",
+            on,
         ) else {
             continue;
         };
@@ -617,13 +625,12 @@ fn lookup_account(
 fn lookup_instrument(
     directory: &Directory,
     name: &str,
-    field: &'static str,
+    on: Option<Date>,
 ) -> Result<InstrumentId, Rejection> {
-    directory
-        .instruments
-        .get(name)
-        .copied()
-        .ok_or_else(|| rejection(field, "имя из справочника", name))
+    match on {
+        Some(on) => resolve_instrument(&directory.instruments, name, on),
+        None => resolve_instrument_without_date(&directory.instruments, name),
+    }
 }
 
 fn lookup_custody(

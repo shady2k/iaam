@@ -8,6 +8,7 @@ pub mod contour;
 pub mod dates;
 pub mod event;
 pub mod ids;
+pub mod instrument;
 pub mod money;
 pub mod numeric;
 pub mod perimeter;

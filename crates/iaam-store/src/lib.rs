@@ -77,6 +77,43 @@ pub enum StoreError {
         source: serde_json::Error,
     },
 }
+/// Почему инструмент не разрешился по внешнему коду.
+///
+/// Три случая различаются намеренно. Слить их в один `NotFound`
+/// означало бы отдать разбирающемуся сообщение, по которому нельзя
+/// отличить новую бумагу от испорченной даты документа.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    #[error("код {value} в пространстве {namespace} неизвестен")]
+    Unknown {
+        namespace: &'static str,
+        value: String,
+    },
+    #[error(
+        "код {value} в пространстве {namespace} известен, но не на {on}: \
+         действует с {known_from} по {known_to}"
+    )]
+    NotOnDate {
+        namespace: &'static str,
+        value: String,
+        on: String,
+        known_from: String,
+        known_to: String,
+    },
+    /// Триггер `instrument_aliases_do_not_overlap` пробит: это дефект
+    /// схемы, а не данных, и молчать о нём нельзя.
+    #[error(
+        "код {value} в пространстве {namespace} на {on} разрешается в {candidates} инструментов"
+    )]
+    Ambiguous {
+        namespace: &'static str,
+        value: String,
+        on: String,
+        candidates: usize,
+    },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
 
 /// Подключение к базе.
 ///

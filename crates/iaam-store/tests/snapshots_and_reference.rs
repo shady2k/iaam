@@ -7,6 +7,7 @@ use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, EventId, InstrumentId, OwnerId, SourceId};
+use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
@@ -354,9 +355,11 @@ fn an_upserted_instrument_reaches_the_table() {
     let store = SqliteStore::open_in_memory().unwrap();
     let instrument = InstrumentRecord {
         id: InstrumentId::new_random(),
+        kind: Some(InstrumentKind::Share),
         symbol: "SBER".into(),
         title: "Сбербанк, обыкновенные".into(),
-        currency: "RUB".into(),
+        currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+        lineage: None,
     };
     store.upsert_instrument(&instrument).unwrap();
 

@@ -1,8 +1,10 @@
 //! Построчный разбор CSV: одна непонятая строка не отменяет документ.
 
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
+use iaam_core::instrument::AliasInterval;
 use iaam_ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_ingest::operation::OperationKind;
+use time::macros::date;
 
 fn directory() -> (Directory, AccountId, InstrumentId) {
     let account = AccountId::new_random();
@@ -12,7 +14,16 @@ fn directory() -> (Directory, AccountId, InstrumentId) {
         ..Directory::default()
     };
     dir.accounts.insert("Брокерский".into(), account);
-    dir.instruments.insert("SBER".into(), instrument);
+    dir.instruments.insert(
+        "SBER".into(),
+        vec![(
+            AliasInterval {
+                valid_from: date!(1900 - 01 - 01),
+                valid_to: None,
+            },
+            instrument,
+        )],
+    );
     (dir, account, instrument)
 }
 

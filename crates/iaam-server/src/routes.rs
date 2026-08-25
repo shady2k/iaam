@@ -1133,18 +1133,38 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 
 /// Справочник имён для разбора CSV.
 ///
-/// Инструменты и места хранения на этапе 1 приходят из того же
-/// справочника счетов: отдельная таблица инструментов заполняется
-/// в E3 вместе с рыночными данными, а до тех пор CSV со сделками
-/// требует явных идентификаторов через API операций.
+/// Счета и принадлежащие владельцу места хранения разрешаются по имени.
+/// Инструменты заранее загружаются со всеми интервалами действия внешних
+/// кодов, чтобы каждая строка документа разрешалась на свою дату.
 async fn build_directory(
     services: &Arc<AppServices>,
     principal: &Principal,
 ) -> Result<Directory, ApiFailure> {
     let accounts = services.store.list_accounts(principal.owner).await?;
+    let places = iaam_app::ports::InstrumentDirectory::list_custody_places(
+        &*services.directory,
+        principal.owner,
+    )
+    .await?;
+    let aliases = iaam_app::ports::InstrumentDirectory::list_aliases(&*services.directory).await?;
+
     let mut directory = Directory::default();
     for account in accounts {
         directory.accounts.insert(account.title, account.id);
+    }
+    for place in places {
+        directory.custodies.insert(place.title, place.id);
+    }
+    // Псевдонимы кладутся все: разбор документа иначе ходил бы в базу
+    // на каждую строку, а строк в отчёте тысячи.
+    for alias in aliases {
+        directory.instruments.entry(alias.value).or_default().push((
+            iaam_core::instrument::AliasInterval {
+                valid_from: alias.valid_from,
+                valid_to: alias.valid_to,
+            },
+            alias.instrument,
+        ));
     }
     Ok(directory)
 }

@@ -73,6 +73,7 @@ fn services() -> AppServices {
     AppServices::new(
         adapter.clone(),
         adapter.clone(),
+        adapter.clone(),
         adapter,
         Arc::new(FixedClock(date!(2026 - 04 - 01))),
     )

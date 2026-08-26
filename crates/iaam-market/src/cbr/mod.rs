@@ -40,3 +40,19 @@ fn dotted(date: Date) -> String {
         date.year()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::date;
+
+    #[test]
+    fn daily_request_uses_the_cbr_dotted_date_format() {
+        let request = daily_request(date!(2026 - 08 - 04));
+
+        assert_eq!(
+            request.url(),
+            "https://www.cbr.ru/scripts/XML_daily.asp?date%5Freq=04%2F08%2F2026"
+        );
+    }
+}

@@ -484,6 +484,52 @@ impl SqliteStore {
             .optional()
             .map_err(StoreError::from)
     }
+    /// Вернуть все опубликованные наблюдения цены инструмента в диапазоне
+    /// на момент знания, не выбирая площадку заранее.
+    pub fn prices_for_instrument_between(
+        &self,
+        instrument_id: &str,
+        window: MarketWindow<'_>,
+    ) -> Result<Vec<PriceRow>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT p.instrument_id, p.board, p.session, p.trade_date,
+                    p.kind, p.observed_at, p.price, p.currency, p.executability
+             FROM price_observations AS p
+             JOIN sync_runs AS r ON r.id = p.sync_run_id
+             WHERE p.source_id = 'moex-iss'
+               AND r.source_id = 'moex-iss'
+               AND r.dataset = 'prices'
+               AND p.instrument_id = ?1
+               AND p.trade_date BETWEEN ?2 AND ?3
+               AND p.observed_at <= ?4
+               AND r.status = 'succeeded'
+             ORDER BY p.trade_date, p.observed_at, p.board, p.session, p.kind",
+        )?;
+        let rows = statement.query_map(
+            params![
+                instrument_id,
+                window.from,
+                window.to,
+                window.knowledge_as_of,
+            ],
+            |row| {
+                Ok(PriceRow {
+                    instrument_id: row.get(0)?,
+                    board: row.get(1)?,
+                    session: row.get(2)?,
+                    trade_date: row.get(3)?,
+                    kind: row.get(4)?,
+                    observed_at: row.get(5)?,
+                    price: row.get(6)?,
+                    currency: row.get(7)?,
+                    executability: row.get(8)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Вернуть опубликованные наблюдения цен в диапазоне на момент знания.
     pub fn prices_between(
         &self,

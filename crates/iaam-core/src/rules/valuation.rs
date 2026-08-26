@@ -285,6 +285,245 @@ mod tests {
         }
     }
 
+    fn candidate_from_origin(
+        instrument: InstrumentId,
+        trade_date: time::Date,
+        observed_at: time::OffsetDateTime,
+        origin: PriceOrigin,
+    ) -> PriceCandidate {
+        let mut candidate = candidate(instrument, trade_date);
+        candidate.observed_at = observed_at;
+        candidate.origin = origin;
+        candidate
+    }
+
+    fn market_candidate(
+        instrument: InstrumentId,
+        venue: &str,
+        kind: &str,
+        trade_date: time::Date,
+        observed_at: time::OffsetDateTime,
+    ) -> PriceCandidate {
+        candidate_from_origin(
+            instrument,
+            trade_date,
+            observed_at,
+            PriceOrigin::Market {
+                venue: venue.to_owned(),
+                kind: kind.to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_fresh_report_price_beats_a_stale_exchange_price() {
+        let query = query(date!(2026 - 08 - 10));
+        let out = policy().select(
+            &query,
+            &[
+                market_candidate(
+                    query.instrument,
+                    "TQBR",
+                    "close",
+                    date!(2026 - 08 - 01),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                ),
+                candidate_from_origin(
+                    query.instrument,
+                    date!(2026 - 08 - 09),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                    PriceOrigin::ReportParsed {
+                        source: crate::ids::SourceId::new_random(),
+                    },
+                ),
+            ],
+        );
+        assert!(matches!(
+            out.selected().expect("цена есть").candidate.origin,
+            PriceOrigin::ReportParsed { .. }
+        ));
+    }
+
+    #[test]
+    fn equal_age_prefers_market_then_report_then_owner() {
+        let query = query(date!(2026 - 08 - 10));
+        let out = policy().select(
+            &query,
+            &[
+                candidate_from_origin(
+                    query.instrument,
+                    date!(2026 - 08 - 09),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                    PriceOrigin::OwnerAsserted,
+                ),
+                candidate_from_origin(
+                    query.instrument,
+                    date!(2026 - 08 - 09),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                    PriceOrigin::ReportParsed {
+                        source: crate::ids::SourceId::new_random(),
+                    },
+                ),
+                market_candidate(
+                    query.instrument,
+                    "TQBR",
+                    "close",
+                    date!(2026 - 08 - 09),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                ),
+            ],
+        );
+        assert!(matches!(
+            out.selected().expect("цена есть").candidate.origin,
+            PriceOrigin::Market { .. }
+        ));
+    }
+
+    #[test]
+    fn two_venues_without_a_directory_preference_are_a_refusal_not_a_guess() {
+        let query = query(date!(2026 - 08 - 10));
+        let out = policy().select(
+            &query,
+            &[
+                market_candidate(
+                    query.instrument,
+                    "TQBR",
+                    "close",
+                    date!(2026 - 08 - 09),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                ),
+                market_candidate(
+                    query.instrument,
+                    "SMAL",
+                    "close",
+                    date!(2026 - 08 - 09),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                ),
+            ],
+        );
+        assert!(out.selected().is_none());
+        assert_eq!(out.uncovered_reason(), Some(UncoveredReason::AmbiguousVenue));
+    }
+
+    #[test]
+    fn price_kind_priority_excludes_weighted_average_and_market_price3() {
+        let query = query(date!(2026 - 08 - 10));
+        let out = policy().select(
+            &query,
+            &[
+                market_candidate(
+                    query.instrument,
+                    "TQBR",
+                    "marketprice3",
+                    date!(2026 - 08 - 10),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                ),
+                market_candidate(
+                    query.instrument,
+                    "TQBR",
+                    "weightedaverage",
+                    date!(2026 - 08 - 10),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                ),
+                market_candidate(
+                    query.instrument,
+                    "TQBR",
+                    "close",
+                    date!(2026 - 08 - 10),
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                ),
+            ],
+        );
+        assert_eq!(
+            out.selected()
+                .expect("Close остаётся допустимым видом")
+                .provenance
+                .price_kind
+                .as_deref(),
+            Some("close")
+        );
+        let out = policy().select(
+            &query,
+            &[market_candidate(
+                query.instrument,
+                "TQBR",
+                "marketprice3",
+                date!(2026 - 08 - 10),
+                datetime!(2026 - 08 - 10 12:00 UTC),
+            )],
+        );
+        assert!(out.selected().is_none());
+    }
+
+    #[test]
+    fn equal_candidates_are_ambiguous_instead_of_ordered_by_incidental_input() {
+        let query = query(date!(2026 - 08 - 10));
+        let out = policy().select(
+            &query,
+            &[
+                candidate_from_origin(
+                    query.instrument,
+                    query.as_of,
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                    PriceOrigin::ReportParsed {
+                        source: crate::ids::SourceId::new_random(),
+                    },
+                ),
+                candidate_from_origin(
+                    query.instrument,
+                    query.as_of,
+                    datetime!(2026 - 08 - 10 12:00 UTC),
+                    PriceOrigin::ReportParsed {
+                        source: crate::ids::SourceId::new_random(),
+                    },
+                ),
+            ],
+        );
+        assert!(out.selected().is_none());
+        assert_eq!(
+            out.uncovered_reason(),
+            Some(UncoveredReason::AmbiguousCandidate)
+        );
+    }
+
+    #[test]
+    fn latest_observed_version_not_after_knowledge_coordinate_wins() {
+        let query = query(date!(2026 - 08 - 10));
+        let out = policy().select(
+            &query,
+            &[
+                candidate_from_origin(
+                    query.instrument,
+                    query.as_of,
+                    datetime!(2026 - 08 - 10 09:00 UTC),
+                    PriceOrigin::ReportParsed {
+                        source: crate::ids::SourceId::new_random(),
+                    },
+                ),
+                candidate_from_origin(
+                    query.instrument,
+                    query.as_of,
+                    datetime!(2026 - 08 - 10 11:00 UTC),
+                    PriceOrigin::ReportParsed {
+                        source: crate::ids::SourceId::new_random(),
+                    },
+                ),
+                candidate_from_origin(
+                    query.instrument,
+                    query.as_of,
+                    datetime!(2026 - 08 - 10 13:00 UTC),
+                    PriceOrigin::ReportParsed {
+                        source: crate::ids::SourceId::new_random(),
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            out.selected().expect("версия до knowledge_as_of").provenance.observed_at,
+            datetime!(2026 - 08 - 10 11:00 UTC)
+        );
+    }
+
     #[test]
     fn an_observation_on_the_valuation_date_is_not_carried_forward() {
         let query = query(date!(2026 - 08 - 10));

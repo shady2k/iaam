@@ -1388,6 +1388,15 @@ grep -rn "reqwest" crates/*/Cargo.toml | grep -v iaam-http && echo "ПРОВАЛ
 - Consumes: таблицы `price_observations`, `fx_observations`, `key_rate_observations`, `sync_runs`, `series_completeness` (миграция 0006, задача 5).
 - Produces: `MarketStore::{begin_run, record_prices, record_fx, record_key_rate, finish_run, complete_through, prices_at_or_before}`; `RunOutcome::{Succeeded, Partial { reason: String }, Failed { reason: String }}`; `SeriesKey { source_id: String, dataset: String, series_key: String }`.
 
+**`iaam-store` НЕ зависит от `iaam-market`.** Это ребро вверх по графу §3.2,
+и заслон архитектуры его ловит: «iaam-store зависит от вышележащих слоёв».
+Хранилище объявляет **свои строковые типы** — `PriceRow`, `FxRow`,
+`KeyRateRow`, — как оно уже делает для остальных таблиц. §3.2 отвечает
+на это прямо: «ответы MOEX — в `iaam-market`, строки таблиц — в
+`iaam-store`. Преобразование в доменные типы происходит на границе».
+Границей служит `iaam-app` — единственный слой, знающий обе крейты;
+преобразование `PriceObservation → PriceRow` пишется там, в задаче 9.
+
 **Acceptance Criteria:**
 - **Повторная запись того же наблюдения с другим значением добавляет строку**, а не заменяет: отчёт по прежней координате продолжает давать прежнее число.
 - **Граница полноты не продвигается при `Partial` и `Failed`.** Это прямой ответ на требование бида `iaam-023.5` «частичная выгрузка не должна выдаваться за полную», и главный инвариант задачи.

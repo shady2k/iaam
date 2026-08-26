@@ -86,8 +86,32 @@ pub struct PriceCandidate {
     pub price: Dec,
     pub currency: CurrencyCode,
     pub trade_date: Date,
+    pub observed_at: OffsetDateTime,
     pub origin: PriceOrigin,
     pub executability: SourceExecutability,
+}
+
+/// Provenance of the policy decision, including every version and threshold
+/// that can change its interpretation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceProvenance {
+    pub price_kind: Option<String>,
+    pub origin: PriceOrigin,
+    pub venue: Option<String>,
+    pub observed_at: OffsetDateTime,
+    pub valuation_policy_version: u32,
+    pub source_priority_version: u32,
+    pub carry_forward_limit: u16,
+    pub price_max_age: u16,
+}
+
+/// Selected candidate with independent policy conclusions and provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedPrice {
+    pub candidate: PriceCandidate,
+    pub selection: PriceSelection,
+    pub freshness: PriceFreshness,
+    pub provenance: PriceProvenance,
 }
 
 /// Запрос выборки цены на дату оценки и в координате знания.
@@ -98,13 +122,6 @@ pub struct PriceQuery {
     pub knowledge_as_of: OffsetDateTime,
 }
 
-/// Выбранный кандидат с независимыми выводами политики.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectedPrice {
-    pub candidate: PriceCandidate,
-    pub selection: PriceSelection,
-    pub freshness: PriceFreshness,
-}
 
 /// Результат разбора старого качества цены.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +205,7 @@ mod tests {
             price: Dec::new(Decimal::from(281)),
             currency: CurrencyCode::Rub,
             trade_date: date!(2026 - 08 - 03),
+            observed_at: datetime!(2026 - 08 - 03 18:00 UTC),
             origin: PriceOrigin::ReportParsed {
                 source: SourceId::new_random(),
             },
@@ -230,6 +248,18 @@ mod tests {
                 days: 40,
             },
             freshness: PriceFreshness::Stale { days: 40 },
+            provenance: PriceProvenance {
+                price_kind: None,
+                origin: PriceOrigin::ReportParsed {
+                    source: SourceId::new_random(),
+                },
+                venue: None,
+                observed_at: datetime!(2026 - 07 - 01 18:00 UTC),
+                valuation_policy_version: 1,
+                source_priority_version: 1,
+                carry_forward_limit: 10,
+                price_max_age: 30,
+            },
         };
         assert!(matches!(
             selected.selection,

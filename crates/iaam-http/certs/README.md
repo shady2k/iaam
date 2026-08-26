@@ -25,6 +25,11 @@ O=The Ministry of Digital Development and Communications, C=RU`,
 диске рядом с программой подменить проще, чем содержимое двоичного
 файла, поэтому `include_str!`, а не чтение при запуске.
 
+**Переезд в `iaam-http`.** Теперь этот файл обслуживает не одного
+потребителя, а единую таблицу назначений HTTP. Он применяется только к
+назначениям, для которых в таблице явно объявлен закреплённый якорь;
+публичные узлы используют общедоступные корни.
+
 Проверку подлинности этим **не отключают**: клиент проверяет цепочку как
 обычно, просто якорь берётся отсюда. Ни `danger_accept_invalid_certs`,
 ни иных послаблений в коде нет и быть не должно.
@@ -36,7 +41,7 @@ O=The Ministry of Digital Development and Communications, C=RU`,
 ```
 curl -sSfL https://gu-st.ru/content/lending/linux_russian_trusted_root_ca_pem.zip -o root.zip
 unzip -p root.zip russian_trusted_root_ca_pem.crt \
-  > crates/iaam-broker/certs/russian-trusted-root-ca.pem
+  > crates/iaam-http/certs/russian-trusted-root-ca.pem
 ```
 
 В том же архиве лежит ГОСТ-вариант корня, а в соседнем

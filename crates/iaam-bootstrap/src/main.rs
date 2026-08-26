@@ -9,6 +9,7 @@ mod provision;
 use std::sync::Arc;
 
 use iaam_app::AppServices;
+use iaam_app::adapters::market::HttpMarketData;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{
     BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Scope, SoleOwner, SystemClock,
@@ -17,6 +18,8 @@ use iaam_app::ports::{
 use iaam_broker::credentials::Key;
 use iaam_broker::environment::Environment;
 use iaam_core::ids::OwnerId;
+use iaam_http::client::HttpClient;
+use iaam_http::resilience::{RateLimiter as MarketRateLimiter, RetryPolicy};
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::SqliteStore;
@@ -207,6 +210,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_deref()
         .map(read_broker_key)
         .transpose()?;
+    let market_store = SqliteStore::open(&config.database)?;
+    let market = Arc::new(HttpMarketData::new(
+        HttpClient::new(),
+        RetryPolicy::new(4, std::time::Duration::from_millis(100)),
+        Arc::new(MarketRateLimiter::new(std::time::Duration::from_millis(
+            100,
+        ))),
+    ));
 
     // Один и тот же адаптер и как хранилище фактов, и как хранилище
     // брокерских доступов: за обоими одно соединение с базой, и второй
@@ -224,6 +235,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         clock: Arc::new(SystemClock),
         channels,
         rules,
+        market,
+        market_store: Arc::new(tokio::sync::Mutex::new(market_store)),
     });
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let state = ServerState::new(services, limiter);

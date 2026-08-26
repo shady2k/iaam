@@ -1419,3 +1419,28 @@ pub struct ResolveInstrumentRequest {
 pub struct ResolvedInstrumentDto {
     pub instrument: String,
 }
+/// Параметры ручной синхронизации рынка.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum MarketSourceDto {
+    Moex {
+        engine: String,
+        market: String,
+        board: String,
+        secid: String,
+        instrument: Uuid,
+    },
+    CbrDaily,
+    CbrDynamic {
+        cbr_currency_id: String,
+        to: CurrencyDto,
+    },
+    CbrKeyRate,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MarketSyncRequest {
+    pub source: MarketSourceDto,
+    pub from: String,
+    pub to: String,
+}

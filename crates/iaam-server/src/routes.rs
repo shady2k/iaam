@@ -19,7 +19,10 @@ use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::ingest::submit_operations;
 use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, statuses};
 use iaam_app::scenarios::reports::{ReturnsQuery, returns};
-use iaam_app::sync::sync_broker as run_sync_broker;
+use iaam_app::sync::{
+    MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
+    sync_market as run_market_sync,
+};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
@@ -31,7 +34,7 @@ use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
 use iaam_core::rules::LotRuleVersion;
 use iaam_core::valuation::{FxSource, FxTable};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::Date;
 use utoipa::IntoParams;
 use uuid::Uuid;
@@ -44,9 +47,9 @@ use crate::dto::{
     ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
-    InstrumentDto, IssuedTokenDto, OwnerBalanceRequest, ReconciliationParams,
-    ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    InstrumentDto, IssuedTokenDto, MarketSourceDto, MarketSyncRequest, OwnerBalanceRequest,
+    ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
+    ReturnsReportDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -494,6 +497,82 @@ pub async fn sync_broker(
     )
     .await?;
     Ok(Json(SyncOutcomeDto::from_domain(outcome)))
+}
+
+/// Ручной запуск синхронизации одной рыночной серии.
+#[utoipa::path(
+    post,
+    path = "/v1/market/sync",
+    request_body = MarketSyncRequest,
+    responses(
+        (status = 200, description = "Результат синхронизации рынка", body = MarketSyncOutcomeDto),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 422, description = "Некорректный диапазон", body = ApiError),
+        (status = 503, description = "Рыночный транспорт не настроен", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn sync_market(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<MarketSyncRequest>,
+) -> Result<Json<MarketSyncOutcomeDto>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let from = parse_query_date("from", &request.from)?;
+    let to = parse_query_date("to", &request.to)?;
+    let source = market_source(request.source);
+    let request = AppMarketSyncRequest { source, from, to };
+    let mut store = state.services.market_store.lock().await;
+    let outcome = run_market_sync(&mut store, state.services.market.as_ref(), request).await?;
+    Ok(Json(MarketSyncOutcomeDto::from_domain(outcome)))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct MarketSyncOutcomeDto {
+    pub status: String,
+    pub rows: usize,
+    pub covered_from: Option<String>,
+    pub covered_to: Option<String>,
+}
+
+impl MarketSyncOutcomeDto {
+    fn from_domain(outcome: iaam_app::sync::MarketSyncResult) -> Self {
+        Self {
+            status: outcome.status().to_owned(),
+            rows: outcome.rows,
+            covered_from: outcome.covered.map(|coverage| coverage.from.to_string()),
+            covered_to: outcome.covered.map(|coverage| coverage.to.to_string()),
+        }
+    }
+}
+
+fn market_source(source: MarketSourceDto) -> MarketSource {
+    match source {
+        MarketSourceDto::Moex {
+            engine,
+            market,
+            board,
+            secid,
+            instrument,
+        } => MarketSource::Moex {
+            engine,
+            market,
+            board,
+            secid,
+            instrument: InstrumentId(instrument),
+        },
+        MarketSourceDto::CbrDaily => MarketSource::CbrDaily,
+        MarketSourceDto::CbrDynamic {
+            cbr_currency_id,
+            to,
+        } => MarketSource::CbrDynamic {
+            cbr_currency_id,
+            to: to.to_domain(),
+        },
+        MarketSourceDto::CbrKeyRate => MarketSource::CbrKeyRate,
+    }
 }
 /// Ротация доступа без возврата переданного секрета.
 #[utoipa::path(

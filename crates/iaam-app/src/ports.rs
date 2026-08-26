@@ -8,6 +8,7 @@ use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
+use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
 use serde_json::Value;
 use std::sync::Arc;
@@ -228,6 +229,37 @@ pub trait Store: Send + Sync {
         route: String,
         outcome: String,
     ) -> Result<(), AppError>;
+}
+/// Ответ источника после транспортной политики.
+///
+/// Транспорт возвращает тело без разбора: кодировку и формат знает
+/// `iaam-market`, а хеш связывает строки наблюдений с исходным ответом.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub raw_hash: String,
+}
+
+/// Исходящий транспорт рыночных источников.
+///
+/// Порт позволяет сценариям тестироваться на замороженных ответах без сети.
+/// `HttpRequest` — описание запроса, а не действие; отправляет его только
+/// адаптер `iaam-app`.
+#[async_trait]
+pub trait MarketData: Send + Sync {
+    async fn send(&self, request: HttpRequest) -> Result<MarketResponse, AppError>;
+}
+/// Явный отказ ручного запуска без настроенного HTTP-адаптера.
+pub struct UnavailableMarketData;
+
+#[async_trait]
+impl MarketData for UnavailableMarketData {
+    async fn send(&self, _request: HttpRequest) -> Result<MarketResponse, AppError> {
+        Err(AppError::NotConfigured {
+            what: "рыночный HTTP-транспорт",
+        })
+    }
 }
 
 /// Часы. Порт, а не `OffsetDateTime::now_utc()` внутри сценария:

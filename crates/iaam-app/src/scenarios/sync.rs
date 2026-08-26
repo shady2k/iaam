@@ -579,7 +579,6 @@ fn executability(value: iaam_market::Executability) -> &'static str {
     match value {
         iaam_market::Executability::Executable => "executable",
         iaam_market::Executability::IndicativePreviousClose => "indicative_previous_close",
-        iaam_market::Executability::Stale => "stale",
     }
 }
 

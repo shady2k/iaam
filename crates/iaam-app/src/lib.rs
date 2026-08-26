@@ -20,6 +20,17 @@ pub mod scenarios;
 pub mod sync;
 pub mod tokens;
 
+/// Типы SQLite-адаптера, нужные точке сборки и её интеграционным стендам.
+///
+/// Сервер не импортирует их напрямую: доступ к данным маршруты получают
+/// через сценарии приложения.
+pub mod storage {
+    pub use iaam_store::SqliteStore;
+    pub use iaam_store::market::{Coverage, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey};
+    pub use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
+    pub use iaam_store::tokens::{TokenRecord, TokenScope};
+}
+
 use std::sync::Arc;
 
 use iaam_store::market::MarketStore;

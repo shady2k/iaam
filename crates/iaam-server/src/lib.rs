@@ -108,7 +108,7 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
     // В рабочем процессе build вызывается внутри tokio runtime. Проверка
     // сохраняет возможность собирать Router в обычном синхронном тесте.
     if tokio::runtime::Handle::try_current().is_ok() {
-        let _ = state.market_scheduler.clone().spawn();
+        std::mem::drop(state.market_scheduler.clone().spawn());
     }
     let protected = OpenApiRouter::new()
         .routes(routes!(routes::list_accounts, routes::create_account))

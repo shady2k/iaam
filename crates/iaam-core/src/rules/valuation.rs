@@ -2,18 +2,18 @@
 
 use std::collections::BTreeSet;
 
-
+use serde::{Deserialize, Serialize};
 use crate::valuation::{
     PriceCandidate, PriceFreshness, PriceOrigin, PriceProvenance, PriceQuery, PriceSelection,
     SelectedPrice, UncoveredReason,
 };
 
 /// Версия политики выбора цены.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ValuationPolicyVersion(pub u32);
 
 /// Версия таблицы приоритетов происхождений.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourcePriorityVersion(pub u32);
 
 /// Результат выбора: отсутствие цены является свойством выборки.
@@ -607,5 +607,29 @@ mod tests {
             &[candidate(query.instrument, date!(2026 - 07 - 10))],
         );
         assert_eq!(out.uncovered_reason(), Some(UncoveredReason::TooOld));
+    }
+    #[test]
+    fn the_provenance_carries_thresholds_versions_and_selected_price_kind() {
+        let query = query(date!(2026 - 08 - 10));
+        let observed_at = datetime!(2026 - 08 - 10 11:00 UTC);
+        let out = policy().select(
+            &query,
+            &[market_candidate(
+                query.instrument,
+                "TQBR",
+                "legalclose",
+                date!(2026 - 08 - 09),
+                observed_at,
+            )],
+        );
+        let provenance = &out.selected().expect("цена есть").provenance;
+        assert_eq!(provenance.price_kind.as_deref(), Some("legalclose"));
+        assert_eq!(provenance.venue.as_deref(), Some("TQBR"));
+        assert!(matches!(provenance.origin, PriceOrigin::Market { .. }));
+        assert_eq!(provenance.observed_at, observed_at);
+        assert_eq!(provenance.valuation_policy_version, 1);
+        assert_eq!(provenance.source_priority_version, 1);
+        assert_eq!(provenance.carry_forward_limit, 10);
+        assert_eq!(provenance.price_max_age, 30);
     }
 }

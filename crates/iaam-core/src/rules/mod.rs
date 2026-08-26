@@ -12,7 +12,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use lot_disposal::{FifoV1, LotDisposalRule};
-use valuation::{ValuationPolicyV1, ValuationPolicyVersion, ValuationRule};
+pub use valuation::{
+    PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,
+    ValuationRule,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LotRuleVersion(pub u32);
@@ -33,7 +36,10 @@ impl RuleRegistry {
         lot_rules.insert(LotRuleVersion(1), Box::new(FifoV1));
         let mut valuation_rules: BTreeMap<ValuationPolicyVersion, Box<dyn ValuationRule>> =
             BTreeMap::new();
-        valuation_rules.insert(ValuationPolicyVersion(1), Box::new(ValuationPolicyV1::default()));
+        valuation_rules.insert(
+            ValuationPolicyVersion(1),
+            Box::new(ValuationPolicyV1::default()),
+        );
         Self {
             lot_rules,
             valuation_rules,
@@ -140,5 +146,19 @@ mod tests {
             out.basis_released,
             Money::new(PostedMinor::new(40_000), CurrencyCode::Rub)
         );
+    }
+    #[test]
+    fn registry_resolves_valuation_v1() {
+        let reg = RuleRegistry::with_defaults();
+        let rule = reg
+            .valuation_rule(ValuationPolicyVersion(1))
+            .expect("политика оценки v1 зарегистрирована");
+        assert_eq!(rule.version(), ValuationPolicyVersion(1));
+    }
+
+    #[test]
+    fn unknown_valuation_policy_version_is_none_not_a_silent_default() {
+        let reg = RuleRegistry::with_defaults();
+        assert!(reg.valuation_rule(ValuationPolicyVersion(2)).is_none());
     }
 }

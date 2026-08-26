@@ -172,9 +172,22 @@ fn a_different_knowledge_time_yields_a_different_inputs_hash() { /* ... */ }
 ### Task 4: Справочная поверхность для агента и веб-UI
 
 **Files:**
+- Modify: `crates/iaam-app/src/ports.rs` (порт чтения справочных рядов)
+- Create: `crates/iaam-app/src/scenarios/market_reference.rs`
 - Modify: `crates/iaam-server/src/routes.rs`, `dto.rs`, `openapi.rs`
 - Modify: `crates/iaam-server/tests/contract.rs`
 - Modify: `docs/agent-skill/SKILL.md`
+
+**`iaam-server` НЕ зависит ни от `iaam-market`, ни от `iaam-store`.**
+Заслон архитектуры это ловит: «iaam-server зависит от адаптеров: iaam-market,
+iaam-store — их место в iaam-bootstrap». В графе §3.2 сервер стоит только
+над `iaam-app`, и это не формальность: обработчики HTTP, знающие адаптеры,
+начнут их оркестрировать, а CLI продублирует ту же оркестрацию.
+
+Значит справочные ряды приходят в сервер **через сценарий `iaam-app`**,
+который отдаёт свои типы. `derive_intervals` из `iaam-market`
+переиспользуется — но зовётся из `iaam-app`, которому эта зависимость
+разрешена, а не из сервера.
 
 **Interfaces:**
 - Produces: `GET /v1/market/key-rate`, `GET /v1/market/fx`, `GET /v1/market/prices` — все с интервалом и provenance.

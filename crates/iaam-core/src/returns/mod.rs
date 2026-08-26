@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use time::{Date, OffsetDateTime, UtcOffset};
 
 use crate::contour::{ContourDefinition, ContourId, ContourVersion};
-use crate::ids::{AccountId, InstrumentId};
+use crate::ids::{AccountId, InstrumentId, SourceId};
 use crate::money::CurrencyCode;
 use crate::numeric::approx::SolverPolicy;
 use crate::numeric::decimal::Dec;
@@ -27,7 +27,12 @@ use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
 use crate::projection::state::LedgerState;
 use crate::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use crate::rules::lot_disposal::RuleId;
-use crate::valuation::{FxSource, FxTable, PriceQuality, ValuationError};
+use crate::rules::{SourcePriorityVersion, ValuationPolicyV1, ValuationRule};
+use crate::valuation::{
+    FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
+    SelectedPrice, SourceExecutability, UncoveredReason, ValuationError,
+    candidate_from_legacy_valuation,
+};
 
 /// Величина, которую система может отказаться вычислить.
 ///
@@ -139,11 +144,6 @@ impl DataQualityStatus {
 pub enum MaterialIssue {
     /// Позиция восстановлена без документированной стоимости (§10.7).
     RestoredWithoutBasis { account: AccountId },
-    /// Цена устарела или является оценкой владельца.
-    PriceNotExecutable {
-        instrument: InstrumentId,
-        quality: PriceQuality,
-    },
     /// Отрицательный денежный остаток — обязательство в NAV (§15.9).
     NegativeCash {
         account: AccountId,
@@ -186,12 +186,48 @@ impl MaterialIssue {
         match self {
             Self::HistoryStartsAt { .. } | Self::NoIndependentSource { .. } => false,
             Self::RestoredWithoutBasis { .. }
-            | Self::PriceNotExecutable { .. }
             | Self::NegativeCash { .. }
             | Self::Discrepancy { .. }
             | Self::UnsupportedFinancing { .. } => true,
         }
     }
+}
+
+/// Позиция без выбранного кандидата и причина отсутствия покрытия.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncoveredPosition {
+    pub account: AccountId,
+    pub custody: Option<crate::ids::CustodyId>,
+    pub instrument: InstrumentId,
+    pub reason: UncoveredReason,
+}
+
+/// Позиция, оставшаяся на вычисленном старым правилом значении.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyDerivedPosition {
+    pub account: AccountId,
+    pub custody: Option<crate::ids::CustodyId>,
+    pub instrument: InstrumentId,
+    pub quality: PriceQuality,
+}
+
+/// Покрытие ценой: только количество позиций, без выдуманного денежного
+/// знаменателя для позиций, которым цена не найдена.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionCoverage {
+    pub evaluated_positions: u32,
+    pub total_positions: u32,
+    pub uncovered: Vec<UncoveredPosition>,
+    pub legacy_derived: Vec<LegacyDerivedPosition>,
+}
+
+/// Доли исполнимости от стоимости **оценённых позиций**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutabilityShares {
+    pub evaluated_positions_value: Dec,
+    pub executable: Dec,
+    pub indicative_previous_close: Dec,
+    pub unknown: Dec,
 }
 
 /// Покрытие стоимости портфеля уровнями достоверности (§10.5).
@@ -218,8 +254,12 @@ pub struct NavCoverage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataQuality {
     pub status: DataQualityStatus,
-    /// Какая доля стоимости портфеля чем подтверждена.
+    /// Сверка денежных и позиционных измерений по счетам.
     pub nav_coverage: NavCoverage,
+    /// Покрытие ценами и причины непокрытых позиций.
+    pub position_coverage: PositionCoverage,
+    /// Доли исполнимости от стоимости оценённых позиций.
+    pub executability: ExecutabilityShares,
     pub material_issues: Vec<MaterialIssue>,
 }
 
@@ -490,20 +530,129 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
     }
 }
 
+#[derive(Debug)]
+enum PositionAssessmentKind {
+    Selected(SelectedPrice),
+    LegacyDerived(PriceQuality),
+    Uncovered(UncoveredReason),
+}
+
+#[derive(Debug)]
+struct PositionAssessment {
+    account: AccountId,
+    custody: Option<crate::ids::CustodyId>,
+    instrument: InstrumentId,
+    quantity: crate::money::Quantity,
+    raw_price: Option<crate::valuation::InstrumentPrice>,
+    kind: PositionAssessmentKind,
+}
+
+fn position_assessments(
+    state: &LedgerState,
+    request: &ReturnsRequest<'_>,
+) -> Vec<PositionAssessment> {
+    let defaults = ValuationPolicyV1::default();
+    let policy = ValuationPolicyV1 {
+        carry_forward_limit: defaults.carry_forward_limit,
+        price_max_age: defaults.price_max_age,
+        source_priority_version: SourcePriorityVersion(request.coordinate.source_priority_version),
+    };
+    let source = SourceId(uuid::Uuid::nil());
+    state
+        .balances()
+        .iter_positions()
+        .filter(|(key, quantity)| request.contour.contains(key.account) && !quantity.0.is_zero())
+        .map(|(key, quantity)| {
+            let observations: Vec<_> = state
+                .prices()
+                .observations_at_or_before(key.instrument, request.as_of)
+                .copied()
+                .collect();
+            let raw_price = observations.first().copied();
+            let mut candidates = Vec::new();
+            let mut legacy_quality = None;
+            for price in &observations {
+                let candidate = PriceCandidate {
+                    instrument: price.instrument,
+                    price: price.price,
+                    currency: price.currency,
+                    trade_date: price.as_of,
+                    observed_at: request.coordinate.knowledge_as_of,
+                    origin: crate::valuation::PriceOrigin::ReportParsed { source },
+                    executability: SourceExecutability::Unknown,
+                };
+                match candidate_from_legacy_valuation(price.quality, candidate) {
+                    LegacyValuationOutcome::Candidate(candidate) => candidates.push(candidate),
+                    LegacyValuationOutcome::LegacyDerived(quality) => {
+                        legacy_quality.get_or_insert(quality);
+                    }
+                }
+            }
+            let kind = if candidates.is_empty() {
+                match legacy_quality {
+                    Some(quality) => PositionAssessmentKind::LegacyDerived(quality),
+                    None => PositionAssessmentKind::Uncovered(UncoveredReason::NoObservation),
+                }
+            } else {
+                let result = policy.select(
+                    &PriceQuery {
+                        instrument: key.instrument,
+                        as_of: request.as_of,
+                        knowledge_as_of: request.coordinate.knowledge_as_of,
+                    },
+                    &candidates,
+                );
+                match result.selected() {
+                    Some(selected) => PositionAssessmentKind::Selected(selected.clone()),
+                    None => PositionAssessmentKind::Uncovered(
+                        result
+                            .uncovered_reason()
+                            .unwrap_or(UncoveredReason::NoObservation),
+                    ),
+                }
+            };
+            PositionAssessment {
+                account: key.account,
+                custody: key.custody,
+                instrument: key.instrument,
+                quantity,
+                raw_price,
+                kind,
+            }
+        })
+        .collect()
+}
+
+fn position_value(
+    assessment: &PositionAssessment,
+    price: Dec,
+    currency: CurrencyCode,
+    request: &ReturnsRequest<'_>,
+) -> Result<Dec, NotComputable> {
+    let local = assessment
+        .quantity
+        .0
+        .checked_mul(price)
+        .map_err(|_| NotComputable::Numeric { code: "numeric" })?;
+    let rate = request
+        .fx
+        .rate(currency, request.report_currency, request.as_of)
+        .ok_or(NotComputable::MissingFxRate {
+            from: currency,
+            to: request.report_currency,
+            date: request.as_of,
+        })?;
+    local
+        .checked_mul(rate)
+        .map_err(|_| NotComputable::Numeric { code: "numeric" })
+}
+
 /// Блок качества данных строится из состояния, реестра сверки и оценки
 /// периметра, а не из желания показать зелёный статус.
 fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
     let mut issues = Vec::new();
     for account in state.coverage().restored_accounts() {
         issues.push(MaterialIssue::RestoredWithoutBasis { account: *account });
-    }
-    for (instrument, price) in state.prices().iter() {
-        if !price.quality.is_complete() {
-            issues.push(MaterialIssue::PriceNotExecutable {
-                instrument: *instrument,
-                quality: price.quality,
-            });
-        }
     }
     for (account, money) in state.balances().negative_cash() {
         issues.push(MaterialIssue::NegativeCash {
@@ -515,9 +664,54 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
         issues.push(MaterialIssue::HistoryStartsAt { date });
     }
 
-    // Стоимость по счетам может не посчитаться — например, без цены.
-    // Тогда взвешивать покрытие нечем, и оно честно остаётся
-    // неизвестным, а не выдаётся за полное.
+    let assessments = position_assessments(state, request);
+    let mut position_coverage = PositionCoverage {
+        evaluated_positions: 0,
+        total_positions: assessments.len() as u32,
+        uncovered: Vec::new(),
+        legacy_derived: Vec::new(),
+    };
+    let mut executability = ExecutabilityAccumulator::default();
+    for assessment in &assessments {
+        match &assessment.kind {
+            PositionAssessmentKind::Selected(selected) => {
+                position_coverage.evaluated_positions += 1;
+                if let Ok(value) = position_value(
+                    assessment,
+                    selected.candidate.price,
+                    selected.candidate.currency,
+                    request,
+                ) {
+                    executability.add(selected.candidate.executability, value);
+                }
+            }
+            PositionAssessmentKind::LegacyDerived(quality) => {
+                position_coverage.evaluated_positions += 1;
+                position_coverage.legacy_derived.push(LegacyDerivedPosition {
+                    account: assessment.account,
+                    custody: assessment.custody,
+                    instrument: assessment.instrument,
+                    quality: *quality,
+                });
+                if let Some(price) = assessment.raw_price {
+                    if let Ok(value) =
+                        position_value(assessment, price.price, price.currency, request)
+                    {
+                        executability.add(SourceExecutability::Unknown, value);
+                    }
+                }
+            }
+            PositionAssessmentKind::Uncovered(reason) => {
+                position_coverage.uncovered.push(UncoveredPosition {
+                    account: assessment.account,
+                    custody: assessment.custody,
+                    instrument: assessment.instrument,
+                    reason: *reason,
+                });
+            }
+        }
+    }
+
     // Стоимость по счетам может не посчитаться — например, без цены.
     // Тогда взвешивать покрытие нечем, и оно честно остаётся
     // неизвестным, а не выдаётся за полное.
@@ -563,7 +757,8 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
     }
     let nav_coverage = shares.finish();
 
-    let material = issues.iter().any(MaterialIssue::is_defect);
+    let material =
+        !position_coverage.uncovered.is_empty() || issues.iter().any(MaterialIssue::is_defect);
     let status = if material {
         DataQualityStatus::Incomplete
     } else if nav_coverage.provisional.is_zero() && nav_coverage.discrepant.is_zero() {
@@ -574,7 +769,50 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
     DataQuality {
         status,
         nav_coverage,
+        position_coverage,
+        executability: executability.finish(),
         material_issues: issues,
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExecutabilityAccumulator {
+    evaluated_positions_value: rust_decimal::Decimal,
+    executable: rust_decimal::Decimal,
+    indicative_previous_close: rust_decimal::Decimal,
+    unknown: rust_decimal::Decimal,
+}
+
+impl ExecutabilityAccumulator {
+    fn add(&mut self, executability: SourceExecutability, value: Dec) {
+        let value = value.inner().abs();
+        self.evaluated_positions_value += value;
+        match executability {
+            SourceExecutability::Executable => self.executable += value,
+            SourceExecutability::IndicativePreviousClose => self.indicative_previous_close += value,
+            SourceExecutability::Unknown => self.unknown += value,
+        }
+    }
+
+    fn finish(self) -> ExecutabilityShares {
+        let total = self.evaluated_positions_value;
+        if total.is_zero() {
+            return ExecutabilityShares {
+                evaluated_positions_value: Dec::zero(),
+                executable: Dec::zero(),
+                indicative_previous_close: Dec::zero(),
+                unknown: Dec::one(),
+            };
+        }
+        let executable = self.executable / total;
+        let indicative_previous_close = self.indicative_previous_close / total;
+        let unknown = rust_decimal::Decimal::ONE - executable - indicative_previous_close;
+        ExecutabilityShares {
+            evaluated_positions_value: Dec::new(total),
+            executable: Dec::new(executable),
+            indicative_previous_close: Dec::new(indicative_previous_close),
+            unknown: Dec::new(unknown),
+        }
     }
 }
 
@@ -847,27 +1085,58 @@ mod tests {
                 .any(|issue| matches!(issue, MaterialIssue::HistoryStartsAt { .. })),
             "начало истории обязано быть названо"
         );
-        assert!(
-            !quality
-                .material_issues
-                .iter()
-                .any(|issue| matches!(issue, MaterialIssue::PriceNotExecutable { .. })),
-            "исполнимая цена проблемой не является"
+    }
+
+
+    #[test]
+    fn executability_shares_are_weighted_by_evaluated_position_value() {
+        let mut shares = ExecutabilityAccumulator::default();
+        shares.add(SourceExecutability::Executable, Dec::new(rust_decimal::Decimal::new(2, 0)));
+        shares.add(
+            SourceExecutability::IndicativePreviousClose,
+            Dec::new(rust_decimal::Decimal::new(1, 0)),
+        );
+        shares.add(SourceExecutability::Unknown, Dec::new(rust_decimal::Decimal::new(1, 0)));
+
+        let shares = shares.finish();
+        assert_eq!(
+            shares.evaluated_positions_value,
+            Dec::new(rust_decimal::Decimal::new(4, 0))
+        );
+        assert_eq!(
+            shares.executable,
+            Dec::new(rust_decimal::Decimal::new(50, 2))
+        );
+        assert_eq!(
+            shares.indicative_previous_close,
+            Dec::new(rust_decimal::Decimal::new(25, 2))
+        );
+        assert_eq!(
+            shares.executable.inner()
+                + shares.indicative_previous_close.inner()
+                + shares.unknown.inner(),
+            rust_decimal::Decimal::ONE
         );
     }
 
     #[test]
-    fn a_price_that_is_not_executable_makes_the_report_incomplete() {
-        // Оценка владельца — не рыночная цена. Стоимость позиции по ней
-        // посчитать можно, но выдавать её как подтверждённую нельзя.
-        let quality = quality_of(PriceQuality::OwnerEstimate);
-        assert_eq!(quality.status, DataQualityStatus::Incomplete);
-        assert!(
-            quality
-                .material_issues
-                .iter()
-                .any(|issue| matches!(issue, MaterialIssue::PriceNotExecutable { .. }))
-        );
+    fn uncovered_positions_have_reasons_but_no_cost_percentage() {
+        let instrument = InstrumentId::new_random();
+        let coverage = PositionCoverage {
+            evaluated_positions: 1,
+            total_positions: 2,
+            uncovered: vec![UncoveredPosition {
+                account: AccountId::new_random(),
+                custody: None,
+                instrument,
+                reason: UncoveredReason::TooOld,
+            }],
+            legacy_derived: Vec::new(),
+        };
+
+        assert_eq!(coverage.evaluated_positions, 1);
+        assert_eq!(coverage.total_positions, 2);
+        assert_eq!(coverage.uncovered[0].reason, UncoveredReason::TooOld);
     }
 
     #[test]

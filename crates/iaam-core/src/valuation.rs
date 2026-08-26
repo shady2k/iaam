@@ -50,15 +50,6 @@ impl PriceQuality {
         }
     }
 
-    /// Оценка считается полной, только если цена исполнима или является
-    /// ценой закрытия. Всё остальное помечает NAV как неполный (§5.4).
-    #[must_use]
-    pub const fn is_complete(self) -> bool {
-        match self {
-            Self::Executable | Self::PreviousClose => true,
-            Self::CarriedForward | Self::Stale | Self::OwnerEstimate => false,
-        }
-    }
 }
 
 /// Цена за единицу инструмента на дату.
@@ -106,6 +97,19 @@ impl PriceBoard {
             .range(..=as_of)
             .next_back()
             .map(|(_, price)| price)
+    }
+
+    /// Все наблюдения инструмента не позже даты оценки, от новых к старым.
+    #[must_use]
+    pub fn observations_at_or_before(
+        &self,
+        instrument: InstrumentId,
+        as_of: Date,
+    ) -> impl DoubleEndedIterator<Item = &InstrumentPrice> {
+        self.prices
+            .get(&instrument)
+            .into_iter()
+            .flat_map(move |prices| prices.range(..=as_of).rev().map(|(_, price)| price))
     }
 
     /// Последнее наблюдение каждого инструмента для совместимости с
@@ -326,16 +330,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_executable_and_closing_prices_count_as_complete() {
-        // Молчаливая подстановка запрещена: перенесённая, устаревшая
-        // и оценочная цена помечают NAV как неполный (§5.4).
-        assert!(PriceQuality::Executable.is_complete());
-        assert!(PriceQuality::PreviousClose.is_complete());
-        assert!(!PriceQuality::CarriedForward.is_complete());
-        assert!(!PriceQuality::Stale.is_complete());
-        assert!(!PriceQuality::OwnerEstimate.is_complete());
-    }
 
     #[test]
     fn the_same_currency_needs_no_rate() {

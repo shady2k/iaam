@@ -359,6 +359,7 @@ mod tests {
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         };
 
         let values = account_values(snapshot.state(), &request).expect("стоимости счетов");

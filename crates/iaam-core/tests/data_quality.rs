@@ -115,6 +115,7 @@ fn report_of(fixture: &Fixture) -> iaam_core::returns::ReturnsReport {
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         },
     )
 }

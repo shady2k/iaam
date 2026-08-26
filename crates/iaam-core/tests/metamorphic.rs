@@ -167,6 +167,7 @@ fn report(events: &[Event], accounts: &[AccountId], as_of: Date) -> ReturnsRepor
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         },
     )
 }

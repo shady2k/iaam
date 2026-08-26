@@ -225,6 +225,7 @@ fn report(
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter,
+            market_prices: &[],
         },
     )
 }

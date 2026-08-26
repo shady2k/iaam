@@ -209,6 +209,7 @@ fn report_of(world: &World, events: &[Event], both_accounts: bool, as_of: Date) 
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         },
     );
     ReportPair {

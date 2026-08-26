@@ -345,6 +345,13 @@ pub struct ReturnsRequest<'a> {
     /// Оценка периметра: без неё отчёт не знает, где отказаться
     /// считать (§11).
     pub perimeter: &'a PerimeterAssessment,
+    /// Кандидаты из рыночного хранилища.
+    ///
+    /// Приходят отдельным входом, а не событиями журнала, — тем же путём,
+    /// каким уже приходят официальные курсы (E3.3, дизайн 2.1). Пустой
+    /// срез означает «биржевых наблюдений нет», а не ошибку: решение о
+    /// покрытии принимает политика.
+    pub market_prices: &'a [PriceCandidate],
 }
 
 /// Ответ на три вопроса этапа 1.
@@ -783,6 +790,16 @@ fn position_assessments(
                     }
                 }
             }
+            candidates.extend(
+                request
+                    .market_prices
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.instrument == key.instrument
+                            && candidate.trade_date <= request.as_of
+                    })
+                    .cloned(),
+            );
             let kind = if candidates.is_empty() {
                 match legacy_quality {
                     Some(quality) => PositionAssessmentKind::LegacyDerived(quality),
@@ -1102,6 +1119,7 @@ mod tests {
             coordinate,
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         };
         returns_report(state, &request)
     }
@@ -1180,6 +1198,7 @@ mod tests {
             coordinate,
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         };
 
         let hash_for_venue = |venue: &str| {
@@ -1347,6 +1366,7 @@ mod tests {
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         };
         data_quality(projection.snapshot().state(), &request)
     }

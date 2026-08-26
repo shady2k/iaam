@@ -4,6 +4,13 @@
 //! качества, а не из рыночных данных: `iaam-market` появляется в E3.
 //! Схема от этого не меняется — меняется источник цены.
 
+pub mod candidate;
+
+pub use candidate::{
+    LegacyValuationOutcome, PriceCandidate, PriceFreshness, PriceOrigin, PriceQuery,
+    PriceSelection, SelectedPrice, SourceExecutability, Uncovered, UncoveredReason,
+    candidate_from_legacy_valuation,
+};
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

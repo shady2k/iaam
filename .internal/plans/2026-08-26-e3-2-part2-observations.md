@@ -28,6 +28,7 @@
 - **Фикстура и тест, который её читает, ложатся ОДНИМ коммитом.** Заслон `check-fixtures.sh` требует, чтобы каждая фикстура из манифеста упоминалась хотя бы одним `.rs`-тестом: фикстура без теста — «мёртвый эталон» и отказ заслона. Манифест обновляется в том же коммите.
 - **Правки файлов политики разрешены владельцем 2026-08-26** для этого эпика: корневой `Cargo.toml` (members), `tests/fixtures` и `MANIFEST.sha256`. Прочие файлы политики не трогать.
 - **Ослабление теста ради прохождения запрещено (§15.7).**
+- **Фильтр `cargo test` совпадает с именем ТЕСТА, а не файла.** `cargo test -p X foo` при отсутствии теста с `foo` в имени печатает «0 passed» и возвращает НОЛЬ — то есть зелёный отчёт без единого выполненного теста. Для интеграционного файла `tests/foo.rs` правильная форма — `--test foo`. Если прогон показал `0 passed; N filtered out`, это не успех, а несостоявшаяся проверка.
 
 ---
 
@@ -1268,7 +1269,7 @@ git commit -m "feat(market): ключевая ставка ЦБ — SOAP, наб
 
 - [ ] **Step 3: Прогнать и убедиться, что падает**
 
-Run: `nix develop -c cargo test -p iaam-store migration_0006`
+Run: `nix develop -c cargo test -p iaam-store --test migration_0006`
 
 - [ ] **Step 4: Написать миграцию**
 
@@ -1282,7 +1283,7 @@ Run: `nix develop -c cargo test -p iaam-store migration_0006`
 
 - [ ] **Step 5: Прогнать тесты и клиппи**
 
-Run: `nix develop -c cargo test -p iaam-store migration_0006`
+Run: `nix develop -c cargo test -p iaam-store --test migration_0006`
 Run: `nix develop -c cargo clippy -p iaam-store --all-targets -- -D warnings`
 
 **Проверь потребителей схемы:** `grep -rn "user_version\|MIGRATIONS" crates/iaam-store/src/` — если версия схемы зашита где-то ещё, обнови и там, и прогони `cargo check -p` по потребителям.

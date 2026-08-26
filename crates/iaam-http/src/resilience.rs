@@ -56,7 +56,7 @@ impl RetryPolicy {
     }
 
     fn backoff(&self, attempt: u32) -> Duration {
-        let factor = 1_u32 << (attempt.max(1).min(16) - 1);
+        let factor = 1_u32 << (attempt.clamp(1, 16) - 1);
         self.base.saturating_mul(factor).min(MAX_BACKOFF)
     }
 }

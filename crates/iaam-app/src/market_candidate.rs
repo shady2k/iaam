@@ -23,6 +23,7 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
         price: observation.price,
         currency: observation.currency,
         trade_date: observation.trade_date.0,
+        observed_at: observation.observed_at.0,
         origin: PriceOrigin::Market {
             venue: observation.venue.board,
             kind: kind.to_owned(),

@@ -91,8 +91,8 @@ pub struct PriceCandidate {
     pub executability: SourceExecutability,
 }
 
-/// Provenance of the policy decision, including every version and threshold
-/// that can change its interpretation.
+/// Основание решения политики: все версии и пороги, способные
+/// изменить его толкование (§6.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceProvenance {
     pub price_kind: Option<String>,
@@ -105,7 +105,7 @@ pub struct PriceProvenance {
     pub price_max_age: u16,
 }
 
-/// Selected candidate with independent policy conclusions and provenance.
+/// Выбранный кандидат с независимыми выводами политики и основанием.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedPrice {
     pub candidate: PriceCandidate,
@@ -121,7 +121,6 @@ pub struct PriceQuery {
     pub as_of: Date,
     pub knowledge_as_of: OffsetDateTime,
 }
-
 
 /// Результат разбора старого качества цены.
 #[derive(Debug, Clone, PartialEq, Eq)]

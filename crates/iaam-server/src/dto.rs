@@ -615,14 +615,6 @@ fn issue(value: &MaterialIssue) -> String {
             "счёт {} восстановлен без документированной стоимости",
             account.inner()
         ),
-        MaterialIssue::PriceNotExecutable {
-            instrument,
-            quality,
-        } => format!(
-            "цена инструмента {} не исполнима: {}",
-            instrument.inner(),
-            quality.code()
-        ),
         MaterialIssue::NegativeCash { account, currency } => format!(
             "отрицательный остаток на счёте {} в {}",
             account.inner(),

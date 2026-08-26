@@ -9,7 +9,7 @@ use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::FxTable;
-use time::Date;
+use time::{Date, OffsetDateTime};
 
 use crate::AppServices;
 use crate::error::AppError;
@@ -130,6 +130,11 @@ fn report_from_projection(
         projection.state(),
         &ReturnsRequest {
             contour: definition,
+            coordinate: iaam_core::returns::KnowledgeCoordinate {
+                knowledge_as_of: OffsetDateTime::now_utc(),
+                source_priority_version: 1,
+                valuation_policy_version: 1,
+            },
             as_of,
             report_currency: query.report_currency,
             fx: &query.fx,

@@ -14,7 +14,8 @@
 pub mod xirr;
 
 use serde::{Deserialize, Serialize};
-use time::Date;
+use sha2::{Digest, Sha256};
+use time::{Date, OffsetDateTime, UtcOffset};
 
 use crate::contour::{ContourDefinition, ContourId, ContourVersion};
 use crate::ids::{AccountId, InstrumentId};
@@ -240,6 +241,28 @@ pub struct AppliedRules {
     pub perimeter_policy: PerimeterPolicy,
 }
 
+/// Координата знания, зафиксированная отчётом (§4).
+///
+/// Это тройка версий и момента знания, а не перечень идентификаторов
+/// наблюдений: append-only журнал и детерминированный выбор восстанавливают
+/// набор входов по одной и той же координате.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeCoordinate {
+    pub knowledge_as_of: OffsetDateTime,
+    pub source_priority_version: u32,
+    pub valuation_policy_version: u32,
+}
+
+impl Default for KnowledgeCoordinate {
+    fn default() -> Self {
+        Self {
+            knowledge_as_of: OffsetDateTime::UNIX_EPOCH,
+            source_priority_version: 1,
+            valuation_policy_version: 1,
+        }
+    }
+}
+
 /// Запрос отчёта.
 #[derive(Debug, Clone, Copy)]
 pub struct ReturnsRequest<'a> {
@@ -248,6 +271,8 @@ pub struct ReturnsRequest<'a> {
     pub report_currency: CurrencyCode,
     pub fx: &'a FxTable,
     pub solver_policy: SolverPolicy,
+    /// Координата набора наблюдений, использованного при расчёте.
+    pub coordinate: KnowledgeCoordinate,
     /// Реестр сверки: без него доля подтверждённого неизвестна (§10.5).
     pub ledger: &'a ReconciliationLedger,
     /// Оценка периметра: без неё отчёт не знает, где отказаться
@@ -261,6 +286,10 @@ pub struct ReturnsReport {
     pub as_of: Date,
     pub history_starts: Option<Date>,
     pub report_currency: CurrencyCode,
+    /// Координата, по которой выбран набор входов отчёта.
+    pub coordinate: KnowledgeCoordinate,
+    /// SHA-256 канонической выборки входов.
+    pub inputs_hash: String,
     /// Внесено в контур за всю историю.
     pub contributed: Computed<Dec>,
     /// Выведено из контура за всю историю.
@@ -277,6 +306,134 @@ impl ReturnsReport {
     /// Ярлык результата. Существует, чтобы никакой потребитель API
     /// не назвал эту величину «доходностью» без оговорки (§16.3).
     pub const XIRR_LABEL: &'static str = "xirr_pre_tax";
+}
+
+#[derive(Serialize)]
+struct SelectedPosition {
+    account: AccountId,
+    custody: Option<crate::ids::CustodyId>,
+    instrument: InstrumentId,
+    quantity: crate::money::Quantity,
+    price: Option<crate::valuation::InstrumentPrice>,
+}
+
+#[derive(Serialize)]
+struct SelectedFx<'a> {
+    source: &'a FxSource,
+    rates: Vec<(CurrencyCode, CurrencyCode, Date, Option<Dec>)>,
+}
+
+#[derive(Serialize)]
+struct SelectedCoordinate {
+    knowledge_as_of: OffsetDateTime,
+    source_priority_version: u32,
+    valuation_policy_version: u32,
+}
+
+#[derive(Serialize)]
+struct SelectedInputs<'a> {
+    coordinate: SelectedCoordinate,
+    as_of: Date,
+    contour: &'a ContourDefinition,
+    report_currency: CurrencyCode,
+    flows: Vec<crate::projection::flows::ExternalFlow>,
+    cash: Vec<(AccountId, crate::money::Money)>,
+    positions: Vec<SelectedPosition>,
+    fx: SelectedFx<'a>,
+}
+
+fn inputs_hash(state: &LedgerState, request: &ReturnsRequest<'_>) -> String {
+    let mut flows: Vec<_> = state
+        .flows()
+        .external()
+        .iter()
+        .filter(|flow| {
+            flow.date <= request.as_of
+                && flow.contour == request.contour.id()
+                && flow.version == request.contour.version()
+        })
+        .copied()
+        .collect();
+    flows.sort_by_key(|flow| (flow.date, flow.event));
+
+    let mut cash: Vec<_> = state
+        .balances()
+        .iter_cash()
+        .filter(|(account, _)| request.contour.contains(*account))
+        .collect();
+    cash.sort_by_key(|(account, money)| (*account, money.currency()));
+
+    let positions: Vec<_> = state
+        .balances()
+        .iter_positions()
+        .filter(|(key, quantity)| request.contour.contains(key.account) && !quantity.0.is_zero())
+        .map(|(key, quantity)| SelectedPosition {
+            account: key.account,
+            custody: key.custody,
+            instrument: key.instrument,
+            quantity,
+            price: state
+                .prices()
+                .price_at_or_before(key.instrument, request.as_of)
+                .copied(),
+        })
+        .collect();
+
+    let mut fx_keys = std::collections::BTreeSet::new();
+    for flow in &flows {
+        fx_keys.insert((flow.amount.currency(), flow.date));
+    }
+    for (_, money) in &cash {
+        fx_keys.insert((money.currency(), request.as_of));
+    }
+    for position in &positions {
+        if let Some(price) = position.price {
+            fx_keys.insert((price.currency, request.as_of));
+        }
+    }
+    let rates = fx_keys
+        .into_iter()
+        .map(|(from, date)| {
+            (
+                from,
+                request.report_currency,
+                date,
+                request.fx.rate(from, request.report_currency, date),
+            )
+        })
+        .collect();
+
+    let selected = SelectedInputs {
+        coordinate: SelectedCoordinate {
+            knowledge_as_of: request.coordinate.knowledge_as_of.to_offset(UtcOffset::UTC),
+            source_priority_version: request.coordinate.source_priority_version,
+            valuation_policy_version: request.coordinate.valuation_policy_version,
+        },
+        as_of: request.as_of,
+        contour: request.contour,
+        report_currency: request.report_currency,
+        flows,
+        cash,
+        positions,
+        fx: SelectedFx {
+            source: request.fx.source(),
+            rates,
+        },
+    };
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&selected, &mut encoded)
+        .unwrap_or_else(|error| panic!("входы отчёта не сериализуются: {error}"));
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"iaam/returns-inputs/v1");
+    hasher.update(encoded);
+    let digest = hasher.finalize();
+    let mut result = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        result.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+        result.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
+    }
+    result
 }
 
 /// Расчёт отчёта.
@@ -314,6 +471,8 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
         as_of: request.as_of,
         history_starts: state.coverage().first_event(),
         report_currency: request.report_currency,
+        coordinate: request.coordinate,
+        inputs_hash: inputs_hash(state, request),
         contributed,
         withdrawn,
         terminal_value,
@@ -478,10 +637,113 @@ mod tests {
     use crate::event::test_support::event_with;
     use crate::ids::{AccountId, InstrumentId};
     use crate::money::{Money, PostedMinor};
+    use crate::projection::lots::LotBook;
     use crate::projection::{ProjectionContext, project};
     use crate::rules::{LotRuleVersion, RuleRegistry};
     use crate::valuation::PriceQuality;
-    use time::macros::date;
+    use time::macros::{date, datetime};
+
+    fn report_for(state: &LedgerState, coordinate: KnowledgeCoordinate) -> ReturnsReport {
+        let contour = ContourDefinition::new(
+            ContourId(uuid::Uuid::nil()),
+            ContourVersion(1),
+            Vec::<AccountId>::new(),
+        );
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate,
+            ledger: &ledger,
+            perimeter: &perimeter,
+        };
+        returns_report(state, &request)
+    }
+
+    #[test]
+    fn the_same_coordinate_yields_the_same_inputs_hash() {
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let coordinate = KnowledgeCoordinate {
+            knowledge_as_of: datetime!(2026-08-26 09:00:00 UTC),
+            source_priority_version: 1,
+            valuation_policy_version: 1,
+        };
+
+        let first = report_for(&state, coordinate);
+        let second = report_for(&state, coordinate);
+        assert_eq!(first.coordinate, coordinate);
+        assert_eq!(second.coordinate, coordinate);
+        assert_eq!(first.inputs_hash, second.inputs_hash);
+        assert_eq!(first.inputs_hash.len(), 64);
+        let equivalent_coordinate = KnowledgeCoordinate {
+            knowledge_as_of: coordinate
+                .knowledge_as_of
+                .to_offset(UtcOffset::from_hms(3, 0, 0).unwrap()),
+            ..coordinate
+        };
+        assert_eq!(
+            first.inputs_hash,
+            report_for(&state, equivalent_coordinate).inputs_hash
+        );
+    }
+
+    #[test]
+    fn a_different_knowledge_time_yields_a_different_inputs_hash() {
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let first = KnowledgeCoordinate {
+            knowledge_as_of: datetime!(2026-08-26 09:00:00 UTC),
+            source_priority_version: 1,
+            valuation_policy_version: 1,
+        };
+        let second = KnowledgeCoordinate {
+            knowledge_as_of: datetime!(2026-08-27 09:00:00 UTC),
+            ..first
+        };
+
+        let first_report = report_for(&state, first);
+        let second_report = report_for(&state, second);
+        assert_eq!(first_report.coordinate, first);
+        assert_eq!(second_report.coordinate, second);
+        assert_ne!(first_report.inputs_hash, second_report.inputs_hash);
+    }
+
+    #[test]
+    fn future_or_foreign_inputs_do_not_change_the_inputs_hash() {
+        let base = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let account = AccountId::new_random();
+        let foreign_contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &foreign_contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let amount = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
+        let future_event = event_with(
+            account,
+            date!(2026 - 09 - 01),
+            1,
+            EventKind::CashIn { amount },
+            vec![Leg::cash(account, amount)],
+        );
+        let future_state = project(&[future_event], &context)
+            .expect("будущее состояние")
+            .snapshot()
+            .state()
+            .clone();
+        let coordinate = KnowledgeCoordinate::default();
+
+        assert_eq!(
+            report_for(&base, coordinate).inputs_hash,
+            report_for(&future_state, coordinate).inputs_hash
+        );
+    }
 
     #[test]
     fn every_data_quality_status_has_a_machine_readable_code() {
@@ -559,6 +821,7 @@ mod tests {
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let request = ReturnsRequest {
             contour: &contour,
+            coordinate: KnowledgeCoordinate::default(),
             as_of: date!(2025 - 03 - 01),
             report_currency: CurrencyCode::Rub,
             fx: &fx,

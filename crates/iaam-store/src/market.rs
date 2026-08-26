@@ -486,8 +486,15 @@ impl SqliteStore {
     }
     /// Вернуть все опубликованные наблюдения цены инструмента в диапазоне
     /// на момент знания, не выбирая площадку заранее.
+    ///
+    /// Площадка и сессия не задаются: какую из них применить — решение
+    /// политики оценки (E3.3), а не запроса. Источник и набор при этом
+    /// остаются параметрами: зашить их значило бы сделать второй источник
+    /// цен невидимым молча.
     pub fn prices_for_instrument_between(
         &self,
+        source_id: &str,
+        dataset: &str,
         instrument_id: &str,
         window: MarketWindow<'_>,
     ) -> Result<Vec<PriceRow>, StoreError> {
@@ -496,17 +503,19 @@ impl SqliteStore {
                     p.kind, p.observed_at, p.price, p.currency, p.executability
              FROM price_observations AS p
              JOIN sync_runs AS r ON r.id = p.sync_run_id
-             WHERE p.source_id = 'moex-iss'
-               AND r.source_id = 'moex-iss'
-               AND r.dataset = 'prices'
-               AND p.instrument_id = ?1
-               AND p.trade_date BETWEEN ?2 AND ?3
-               AND p.observed_at <= ?4
+             WHERE p.source_id = ?1
+               AND r.source_id = ?1
+               AND r.dataset = ?2
+               AND p.instrument_id = ?3
+               AND p.trade_date BETWEEN ?4 AND ?5
+               AND p.observed_at <= ?6
                AND r.status = 'succeeded'
              ORDER BY p.trade_date, p.observed_at, p.board, p.session, p.kind",
         )?;
         let rows = statement.query_map(
             params![
+                source_id,
+                dataset,
                 instrument_id,
                 window.from,
                 window.to,

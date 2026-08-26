@@ -151,6 +151,8 @@ async fn market_price_candidates(
     for instrument in instruments {
         let rows = store
             .prices_for_instrument_between(
+                "moex-iss",
+                "prices",
                 &instrument.inner().to_string(),
                 MarketWindow {
                     from: &from_date,

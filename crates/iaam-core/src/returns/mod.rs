@@ -230,6 +230,22 @@ pub struct ExecutabilityShares {
     pub unknown: Dec,
 }
 
+/// Денежная величина, для которой отсутствие знания нельзя заменить нулём.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmountQualification {
+    Known(Dec),
+    Unknown,
+}
+
+/// Оценка до издержек выхода и до налога.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiquidationEstimate {
+    pub value_before_exit_costs_and_tax: Computed<Dec>,
+    pub executability: ExecutabilityShares,
+    pub exit_costs: AmountQualification,
+    pub tax: AmountQualification,
+}
+
 /// Покрытие стоимости портфеля уровнями достоверности (§10.5).
 ///
 /// Доли считаются по **модулю** стоимости счёта: счёт с отрицательным
@@ -336,6 +352,8 @@ pub struct ReturnsReport {
     pub withdrawn: Computed<Dec>,
     /// Стоимость контура на дату отчёта: деньги плюс позиции по цене.
     pub terminal_value: Computed<Dec>,
+    /// Стоимость до издержек выхода и до налога.
+    pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimate,
     /// Внутренняя норма доходности **до налога**.
     pub xirr: Computed<RateOutcome>,
     pub applied_rules: AppliedRules,
@@ -346,6 +364,8 @@ impl ReturnsReport {
     /// Ярлык результата. Существует, чтобы никакой потребитель API
     /// не назвал эту величину «доходностью» без оговорки (§16.3).
     pub const XIRR_LABEL: &'static str = "xirr_pre_tax";
+    /// Оценка без издержек гипотетического выхода и без налога (§6.2).
+    pub const LIQUIDATION_LABEL: &'static str = "liquidation_value_before_exit_costs_and_tax";
 }
 
 #[derive(Serialize)]
@@ -506,6 +526,13 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
         },
     };
     let rate = xirr::rate(&series, &terminal, request);
+    let data_quality = data_quality(state, request);
+    let liquidation_value_before_exit_costs_and_tax = LiquidationEstimate {
+        value_before_exit_costs_and_tax: terminal_value.clone(),
+        executability: data_quality.executability,
+        exit_costs: AmountQualification::Unknown,
+        tax: AmountQualification::Unknown,
+    };
 
     ReturnsReport {
         as_of: request.as_of,
@@ -516,6 +543,7 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
         contributed,
         withdrawn,
         terminal_value,
+        liquidation_value_before_exit_costs_and_tax,
         xirr: rate,
         applied_rules: AppliedRules {
             contour: request.contour.id(),
@@ -526,7 +554,7 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
             solver_policy: request.solver_policy,
             perimeter_policy: request.perimeter.policy(),
         },
-        data_quality: data_quality(state, request),
+        data_quality,
     }
 }
 
@@ -1137,6 +1165,45 @@ mod tests {
         assert_eq!(coverage.evaluated_positions, 1);
         assert_eq!(coverage.total_positions, 2);
         assert_eq!(coverage.uncovered[0].reason, UncoveredReason::TooOld);
+    }
+
+    #[test]
+    fn liquidation_estimate_keeps_unknown_costs_and_tax_typed() {
+        let estimate = LiquidationEstimate {
+            value_before_exit_costs_and_tax: Computed::Value(Dec::new(
+                rust_decimal::Decimal::new(100, 0),
+            )),
+            executability: ExecutabilityShares {
+                evaluated_positions_value: Dec::new(rust_decimal::Decimal::new(100, 0)),
+                executable: Dec::zero(),
+                indicative_previous_close: Dec::one(),
+                unknown: Dec::zero(),
+            },
+            exit_costs: AmountQualification::Unknown,
+            tax: AmountQualification::Unknown,
+        };
+
+        assert!(matches!(estimate.exit_costs, AmountQualification::Unknown));
+        assert!(matches!(estimate.tax, AmountQualification::Unknown));
+        assert_eq!(ReturnsReport::LIQUIDATION_LABEL, "liquidation_value_before_exit_costs_and_tax");
+    }
+
+    #[test]
+    fn indicative_previous_close_has_zero_executable_share_without_error() {
+        let mut shares = ExecutabilityAccumulator::default();
+        shares.add(
+            SourceExecutability::IndicativePreviousClose,
+            Dec::new(rust_decimal::Decimal::new(100, 0)),
+        );
+        let shares = shares.finish();
+        assert!(shares.executable.is_zero());
+        assert_eq!(shares.indicative_previous_close, Dec::one());
+        assert_eq!(
+            shares.executable.inner()
+                + shares.indicative_previous_close.inner()
+                + shares.unknown.inner(),
+            rust_decimal::Decimal::ONE
+        );
     }
 
     #[test]

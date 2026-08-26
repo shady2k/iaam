@@ -1,0 +1,27 @@
+[package]
+name = "iaam-market"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Доменные типы: валюта, идентификатор инструмента, точные числа.
+iaam-core = { path = "../iaam-core", version = "0.1.0" }
+# Транспорт, доверие и устойчивость. reqwest здесь НЕ объявляется:
+# заслон архитектуры запрещает его вне iaam-http (§3.1).
+iaam-http = { path = "../iaam-http", version = "0.1.0" }
+# MOEX ISS отдаёт JSON.
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+# ЦБ РФ отдаёт XML: и курсы, и SOAP-ответ со ставкой.
+quick-xml = "0.38"
+# ЦБ отдаёт windows-1251. Своя перекодировка — лишнее место для ошибки
+# в том, что уже решено, а from_utf8 на этих байтах просто падает.
+encoding_rs = "0.8"
+time = { version = "0.3", default-features = false, features = ["std", "parsing", "formatting", "macros"] }
+rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
+thiserror = "2"
+
+[lints]
+workspace = true

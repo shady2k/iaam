@@ -1,14 +1,13 @@
 //! Корень доверия шлюза брокера (§14).
 
-use iaam_broker::trust::{
-    RUSSIAN_TRUSTED_ROOT_CA_PEM, certificate_count, tinkoff_client, tls_root,
-};
+use iaam_http::Destination;
+use iaam_http::trust::{Anchors, RUSSIAN_TRUSTED_ROOT_CA_PEM, certificate_count};
 use sha2::{Digest, Sha256};
 
 /// Отпечаток корня, посчитанный **вне программы** (§15.5):
 ///
 /// ```text
-/// sha256sum crates/iaam-broker/certs/russian-trusted-root-ca.pem
+/// sha256sum crates/iaam-http/certs/russian-trusted-root-ca.pem
 /// ```
 ///
 /// Если тест упал, значит якорь доверия подменили. Чинить его
@@ -32,15 +31,27 @@ fn only_the_root_is_embedded() {
 }
 
 #[test]
-fn the_root_parses_into_a_trust_anchor() {
-    // Якорь обязан быть не просто текстом, а разбираемым сертификатом:
-    // текст, который не разобрался, отказал бы уже в бою.
-    assert!(tls_root().is_ok());
+fn a_pinned_anchor_is_used_only_for_the_gateways_that_need_it() {
+    for pinned in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+        assert!(
+            matches!(pinned.anchors(), Anchors::Pinned(_)),
+            "{pinned:?} обязан ходить на вшитом корне: Минцифры нет в общедоступных хранилищах"
+        );
+    }
+    for public in [
+        Destination::FinamApi,
+        Destination::MoexIss,
+        Destination::CbrScripts,
+        Destination::CbrDailyInfo,
+    ] {
+        assert!(
+            matches!(public.anchors(), Anchors::WebRoots),
+            "{public:?} не должен ходить на вшитом корне: он подписан публичным центром"
+        );
+    }
 }
 
 #[test]
-fn the_tinkoff_client_is_built_with_that_root() {
-    // Клиент собирается без обращения к сети: сборка, падающая только
-    // при первом запросе, отложила бы отказ на самое неудобное время.
-    assert!(tinkoff_client().is_ok());
+fn the_pinned_bundle_holds_exactly_one_certificate() {
+    assert_eq!(certificate_count(), 1);
 }

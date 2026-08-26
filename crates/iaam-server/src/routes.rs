@@ -1304,9 +1304,9 @@ pub async fn returns_report(
         contour_version: params.contour_version.map(ContourVersion),
         as_of: parse_as_of(params.as_of.as_deref())?,
         report_currency: params.currency.to_domain(),
-        // Курсы на этапе 1 называет владелец: рыночные данные — E3.
-        // Источник записывается в отчёт, поэтому подмены не происходит.
-        fx: FxTable::new(FxSource::OwnerSupplied),
+        // Официальные курсы читаются сценарием из MarketStore: сервер
+        // не знает ни адаптера, ни формата источника.
+        fx: FxTable::new(FxSource::CbrOfficial),
         lot_rule: LotRuleVersion(1),
     };
     let report = returns(&state.services, &principal, &query).await?;
@@ -1315,8 +1315,8 @@ pub async fn returns_report(
 
 /// Курсы, переданные вместе с запросом отчёта.
 ///
-/// Отдельный обработчик, а не поле запроса `GET`: таблица курсов —
-/// это тело, а тело у `GET` бывает, но им никто не пользуется.
+/// Это явный переход для владельческого источника: ответ помечен
+/// `owner_supplied` и не смешивается с официальным маршрутом выше.
 #[utoipa::path(
     post,
     path = "/v1/reports/returns",

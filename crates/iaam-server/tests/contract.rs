@@ -799,8 +799,23 @@ async fn the_stage_one_question_is_answered_end_to_end() {
     // 2 900,00 рубля денег плюс 100 бумаг по 1 000 = 102 900,00.
     assert_eq!(report["terminal_value"]["value"], "102900.00");
     assert_eq!(report["history_starts"], "2025-01-01");
-    assert_eq!(report["applied_rules"]["fx_source"], "owner_supplied");
+    assert_eq!(report["applied_rules"]["fx_source"], "cbr_official");
     assert_eq!(report["applied_rules"]["day_count"], "act/365");
+    let (status, missing_rate_report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=USD&as_of=2026-01-01"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{missing_rate_report}");
+    for field in ["contributed", "terminal_value", "xirr_pre_tax"] {
+        assert_eq!(
+            missing_rate_report[field]["not_computable"], "missing_fx_rate",
+            "отсутствующий курс не должен превращаться в единицу: {field}"
+        );
+    }
 
     // Ставка получена независимым эталоном (scripts/gen-xirr-fixtures.py),
     // а не выводом проверяемой программы (§15.5).
@@ -823,6 +838,58 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         "0"
     );
     assert_eq!(report["data_quality"]["nav_coverage"]["discrepant"], "0");
+}
+
+#[tokio::test]
+async fn returns_report_loads_official_fx_from_market_store() {
+    let harness = harness();
+    seed_market(&harness).await;
+
+    let contour = json!({
+        "title": "Долларовый отчёт",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("контур")
+        .to_owned();
+
+    let operations = json!({
+        "source_label": "рыночный курс",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "100.00",
+            "currency": "USD",
+            "dates": { "cash_posted": "2026-08-03" },
+            "idempotency_key": "usd-deposit"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-08-03"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["contributed"]["value"], "8000.0000");
+    assert_eq!(report["terminal_value"]["value"], "8000.0000");
+    assert_eq!(report["applied_rules"]["fx_source"], "cbr_official");
 }
 
 #[tokio::test]
@@ -904,9 +971,10 @@ async fn the_report_shape_is_frozen_by_a_snapshot() {
 
     let (status, report) = call(
         &harness.router,
-        get(
+        post(
             &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-01-01"),
-            Some(&harness.owner_token),
+            &harness.owner_token,
+            &json!([]),
         ),
     )
     .await;

@@ -8,7 +8,10 @@ use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, adva
 use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
-use iaam_core::valuation::FxTable;
+use iaam_core::valuation::{FxSource, FxTable};
+use iaam_store::market::{MarketWindow, SeriesKey};
+use rust_decimal::Decimal;
+use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
 use crate::AppServices;
@@ -24,6 +27,11 @@ pub struct ReturnsQuery {
     pub report_currency: CurrencyCode,
     pub fx: FxTable,
     pub lot_rule: LotRuleVersion,
+}
+
+struct ReportInputs<'a> {
+    fx: &'a FxTable,
+    knowledge_as_of: OffsetDateTime,
 }
 
 /// Отчёт по контуру.
@@ -56,6 +64,13 @@ pub async fn returns(
 
     let today = services.clock.today();
     let as_of = query.as_of.unwrap_or(today);
+    let knowledge_as_of = OffsetDateTime::now_utc();
+    let fx = match query.fx.source() {
+        FxSource::CbrOfficial => {
+            official_fx_table(services, query.report_currency, as_of, knowledge_as_of).await?
+        }
+        FxSource::OwnerSupplied => query.fx.clone(),
+    };
     let projection_events = services
         .store
         .load_events_through(principal.owner, as_of)
@@ -95,10 +110,78 @@ pub async fn returns(
     report_from_projection(
         &projection,
         query,
+        ReportInputs {
+            fx: &fx,
+            knowledge_as_of,
+        },
         &definition,
         as_of,
         &reconciliation_events,
     )
+}
+
+async fn official_fx_table(
+    services: &AppServices,
+    report_currency: CurrencyCode,
+    as_of: Date,
+    knowledge_as_of: OffsetDateTime,
+) -> Result<FxTable, AppError> {
+    let knowledge_as_of = knowledge_as_of
+        .format(&Rfc3339)
+        .map_err(|error| AppError::Store(error.to_string()))?;
+    let from_date = Date::MIN.to_string();
+    let to_date = as_of.to_string();
+    let mut table = FxTable::new(FxSource::CbrOfficial);
+    let store = services.market_store.lock().await;
+
+    for from in [
+        CurrencyCode::Rub,
+        CurrencyCode::Usd,
+        CurrencyCode::Eur,
+        CurrencyCode::Cny,
+        CurrencyCode::Xau,
+    ] {
+        if from == report_currency {
+            continue;
+        }
+        let from_code = from.code();
+        let to_code = report_currency.code();
+        let series = SeriesKey {
+            source_id: "cbr".to_owned(),
+            dataset: "fx".to_owned(),
+            series_key: format!("{from_code}:{to_code}"),
+        };
+        let rows = store
+            .fx_between(
+                &series,
+                from_code,
+                to_code,
+                MarketWindow {
+                    from: &from_date,
+                    to: &to_date,
+                    knowledge_as_of: &knowledge_as_of,
+                },
+            )
+            .map_err(|error| AppError::Store(error.to_string()))?;
+        for row in rows {
+            let date = Date::parse(
+                &row.trade_date,
+                time::macros::format_description!("[year]-[month]-[day]"),
+            )
+            .map_err(|error| AppError::Store(error.to_string()))?;
+            let rate = row
+                .unit_rate
+                .parse::<Decimal>()
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            table = table.with_rate(
+                from,
+                report_currency,
+                date,
+                iaam_core::numeric::decimal::Dec::new(rate),
+            );
+        }
+    }
+    Ok(table)
 }
 
 /// Можно ли сохранить снимок, построенный по этому срезу.
@@ -115,10 +198,10 @@ const fn snapshot_may_be_saved(as_of: Date, today: Date) -> bool {
     // для ссылок, но для значения — реализует.
     as_of.ordinal() == today.ordinal() && as_of.year() == today.year()
 }
-
 fn report_from_projection(
     projection: &Projection,
     query: &ReturnsQuery,
+    inputs: ReportInputs<'_>,
     definition: &ContourDefinition,
     as_of: Date,
     reconciliation_events: &[iaam_core::event::Event],
@@ -131,13 +214,13 @@ fn report_from_projection(
         &ReturnsRequest {
             contour: definition,
             coordinate: iaam_core::returns::KnowledgeCoordinate {
-                knowledge_as_of: OffsetDateTime::now_utc(),
+                knowledge_as_of: inputs.knowledge_as_of,
                 source_priority_version: 1,
                 valuation_policy_version: 1,
             },
             as_of,
             report_currency: query.report_currency,
-            fx: &query.fx,
+            fx: inputs.fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
@@ -324,6 +407,10 @@ mod tests {
         let report = report_from_projection(
             &projection,
             &query,
+            ReportInputs {
+                fx: &query.fx,
+                knowledge_as_of: OffsetDateTime::UNIX_EPOCH,
+            },
             &contour,
             date!(2026 - 03 - 31),
             &all_events,

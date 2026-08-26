@@ -17,6 +17,12 @@ expression: report
     "value": "50000.00"
   },
   "data_quality": {
+    "executability": {
+      "evaluated_positions_value": "0",
+      "executable": "0",
+      "indicative_previous_close": "0",
+      "unknown": "1"
+    },
     "material_issues": [
       "история начинается 2025-01-01",
       "по счёту [uuid] нет независимого подтверждения измерения cash"
@@ -27,9 +33,33 @@ expression: report
       "discrepant": "0",
       "provisional": "1"
     },
+    "position_coverage": {
+      "evaluated_positions": 0,
+      "legacy_derived": [],
+      "selected": [],
+      "total_positions": 0,
+      "uncovered": []
+    },
     "status": "mixed"
   },
   "history_starts": "2025-01-01",
+  "liquidation_value_before_exit_costs_and_tax": {
+    "executability": {
+      "evaluated_positions_value": "0",
+      "executable": "0",
+      "indicative_previous_close": "0",
+      "unknown": "1"
+    },
+    "exit_costs": {
+      "qualification": "unknown"
+    },
+    "tax": {
+      "qualification": "unknown"
+    },
+    "value_before_exit_costs_and_tax": {
+      "value": "50000.00"
+    }
+  },
   "report_currency": "RUB",
   "terminal_value": {
     "value": "50000.00"

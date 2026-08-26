@@ -885,6 +885,63 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         "0"
     );
     assert_eq!(report["data_quality"]["nav_coverage"]["discrepant"], "0");
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["evaluated_positions"],
+        1
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["total_positions"],
+        1
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
+            ["price_kind"],
+        Value::Null
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
+            ["origin"]["kind"],
+        "report_parsed"
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
+            ["source_priority_version"],
+        1
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["quantity"],
+        "100"
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
+            ["carry_forward_limit"],
+        10
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
+            ["price_max_age"],
+        30
+    );
+    assert_eq!(
+        report["data_quality"]["executability"]["evaluated_positions_value"],
+        "100000"
+    );
+    assert_eq!(report["data_quality"]["executability"]["executable"], "0");
+    assert_eq!(
+        report["data_quality"]["executability"]["indicative_previous_close"],
+        "1"
+    );
+    assert_eq!(
+        report["liquidation_value_before_exit_costs_and_tax"]["exit_costs"]["qualification"],
+        "unknown"
+    );
+    assert_eq!(
+        report["liquidation_value_before_exit_costs_and_tax"]["tax"]["qualification"],
+        "unknown"
+    );
+    assert!(
+        report["liquidation_value_before_exit_costs_and_tax"]["exit_costs"]["value"].is_null()
+    );
 }
 
 #[tokio::test]
@@ -989,6 +1046,34 @@ async fn the_openapi_document_exposes_only_source_price_qualities() {
         spec["components"]["schemas"]["PriceQualityDto"]["enum"],
         json!(["executable", "previous_close", "owner_estimate"])
     );
+}
+
+#[tokio::test]
+async fn the_openapi_document_declares_report_quality_and_liquidation_fields() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let report_properties = &spec["components"]["schemas"]["ReturnsReportDto"]["properties"];
+    assert!(report_properties["liquidation_value_before_exit_costs_and_tax"].is_object());
+
+    let quality_properties = &spec["components"]["schemas"]["DataQualityDto"]["properties"];
+    assert!(quality_properties["position_coverage"].is_object());
+    assert!(quality_properties["executability"].is_object());
+
+    for schema in [
+        "PositionCoverageDto",
+        "ExecutabilitySharesDto",
+        "LiquidationEstimateDto",
+        "AmountQualificationDto",
+        "PriceProvenanceDto",
+        "PriceOriginDto",
+    ] {
+        assert!(
+            spec["components"]["schemas"][schema].is_object(),
+            "схема {schema} обязана быть в OpenAPI"
+        );
+    }
 }
 
 #[tokio::test]

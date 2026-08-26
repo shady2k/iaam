@@ -9,3 +9,5 @@ ccd713ccbfc6e7119dc486150ffd2aa1f3f9181537d58194488a0c0e039b8329  tests/fixtures
 53b162f69a5d87e3a8314232318a9e85fcbbcff2b3d971ce4823ec1cc0d3716f  tests/fixtures/reports/finam-synthetic.xls
 2dec59a34e9cc4f902e333dcab283bd0149b7ab38ed845c6edd6110c2d1bed36  tests/fixtures/market/moex-iss-history-sber.json
 800e7c7560ae1b533695f3da7d3a9d69b4400d3023d102d4135abc4713807feb  tests/fixtures/market/cbr-keyrate-soap.xml
+55584013d8d743a83982545aa50e62b226fa0b4ddef6d65badd6336bf0048502  tests/fixtures/market/cbr-xml-daily.xml
+0d765f15947c73c94af020800582403ad6b2e94185eb1c7b0e1afc1890d6a49c  tests/fixtures/market/cbr-xml-dynamic-usd.xml

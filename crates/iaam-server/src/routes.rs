@@ -17,11 +17,15 @@ use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::ingest::submit_operations;
+use iaam_app::scenarios::market_reference::{
+    MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
+    list_market_key_rate as read_market_key_rate, list_market_prices as read_market_prices,
+};
 use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, statuses};
 use iaam_app::scenarios::reports::{ReturnsQuery, returns};
 use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
-    sync_market as run_market_sync,
+    sync_market_with_services as run_market_sync,
 };
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
@@ -35,7 +39,7 @@ use iaam_core::rules::LotRuleVersion;
 use iaam_core::valuation::{FxSource, FxTable};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use time::Date;
+use time::{Date, OffsetDateTime};
 use utoipa::IntoParams;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -47,9 +51,10 @@ use crate::dto::{
     ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
-    InstrumentDto, IssuedTokenDto, MarketSourceDto, MarketSyncRequest, OwnerBalanceRequest,
-    ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsReportDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
+    MarketSyncRequest, OwnerBalanceRequest, ReconciliationParams, ReconciliationStatusDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -524,9 +529,144 @@ pub async fn sync_market(
     let to = parse_query_date("to", &request.to)?;
     let source = market_source(request.source);
     let request = AppMarketSyncRequest { source, from, to };
-    let mut store = state.services.market_store.lock().await;
-    let outcome = run_market_sync(&mut store, state.services.market.as_ref(), request).await?;
+    let outcome = run_market_sync(state.services.as_ref(), request).await?;
     Ok(Json(MarketSyncOutcomeDto::from_domain(outcome)))
+}
+
+/// Параметры ряда цен.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketPricesParams {
+    pub instrument: Uuid,
+    pub board: String,
+    pub session: i64,
+    #[param(value_type = String, format = Date)]
+    pub from: String,
+    #[param(value_type = String, format = Date)]
+    pub to: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Параметры ряда курсов.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketFxParams {
+    pub from: CurrencyDto,
+    pub to: CurrencyDto,
+    #[param(value_type = String, format = Date)]
+    pub from_date: String,
+    #[param(value_type = String, format = Date)]
+    pub to_date: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Параметры ряда ключевой ставки.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketKeyRateParams {
+    #[param(value_type = String, format = Date)]
+    pub from: String,
+    #[param(value_type = String, format = Date)]
+    pub to: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Ряд цен с provenance каждой строки.
+#[utoipa::path(
+    get,
+    path = "/v1/market/prices",
+    params(MarketPricesParams),
+    responses(
+        (status = 200, description = "Цены с provenance", body = Vec<MarketPriceDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_prices(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketPricesParams>,
+) -> Result<Json<Vec<MarketPriceDto>>, ApiFailure> {
+    let from = parse_query_date("from", &params.from)?;
+    let to = parse_query_date("to", &params.to)?;
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let views = read_market_prices(
+        state.services.as_ref(),
+        MarketPricesQuery {
+            instrument: InstrumentId(params.instrument),
+            board: params.board,
+            session: params.session,
+            from,
+            to,
+            knowledge_as_of,
+        },
+    )
+    .await?;
+    Ok(Json(views.into_iter().map(market_price_dto).collect()))
+}
+
+/// Ряд официальных курсов с provenance каждой строки.
+#[utoipa::path(
+    get,
+    path = "/v1/market/fx",
+    params(MarketFxParams),
+    responses(
+        (status = 200, description = "Курсы с provenance", body = Vec<MarketFxDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_fx(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketFxParams>,
+) -> Result<Json<Vec<MarketFxDto>>, ApiFailure> {
+    let from = parse_query_date("from_date", &params.from_date)?;
+    let to = parse_query_date("to_date", &params.to_date)?;
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let views = read_market_fx(
+        state.services.as_ref(),
+        MarketFxQuery {
+            from: params.from.to_domain(),
+            to: params.to.to_domain(),
+            from_date: from,
+            to_date: to,
+            knowledge_as_of,
+        },
+    )
+    .await?;
+    Ok(Json(views.into_iter().map(market_fx_dto).collect()))
+}
+
+/// Интервалы официальной ключевой ставки с provenance границ.
+#[utoipa::path(
+    get,
+    path = "/v1/market/key-rate",
+    params(MarketKeyRateParams),
+    responses(
+        (status = 200, description = "Интервалы ставки с provenance", body = Vec<MarketKeyRateDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_key_rate(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketKeyRateParams>,
+) -> Result<Json<Vec<MarketKeyRateDto>>, ApiFailure> {
+    let from = parse_query_date("from", &params.from)?;
+    let to = parse_query_date("to", &params.to)?;
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let views = read_market_key_rate(
+        state.services.as_ref(),
+        MarketKeyRateQuery {
+            from,
+            to,
+            knowledge_as_of,
+        },
+    )
+    .await?;
+    Ok(Json(views.into_iter().map(market_key_rate_dto).collect()))
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -1296,6 +1436,62 @@ fn reconciliation_status_dto(status: &ReconciliationStatus) -> ReconciliationSta
                 outcome: outcome.outcome.code().to_owned(),
             })
             .collect(),
+    }
+}
+
+fn parse_knowledge_as_of(value: Option<&str>) -> Result<OffsetDateTime, ApiFailure> {
+    let Some(value) = value else {
+        return Ok(OffsetDateTime::now_utc());
+    };
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| invalid_field("knowledge_as_of", "RFC 3339", value.to_owned()))
+}
+
+fn market_price_dto(
+    view: iaam_app::scenarios::market_reference::MarketPriceView,
+) -> MarketPriceDto {
+    MarketPriceDto {
+        instrument: view.instrument.inner(),
+        board: view.board,
+        session: view.session,
+        kind: view.kind,
+        value: view.value,
+        currency: view.currency,
+        date: view.date,
+        source: view.source,
+        observed_at: view.observed_at,
+        quality: view.quality,
+        complete_through: view.complete_through,
+    }
+}
+
+fn market_fx_dto(view: iaam_app::scenarios::market_reference::MarketFxView) -> MarketFxDto {
+    MarketFxDto {
+        from: CurrencyDto::from_domain(view.from),
+        to: CurrencyDto::from_domain(view.to),
+        nominal: view.nominal,
+        value: view.value,
+        unit_rate: view.unit_rate,
+        date: view.date,
+        source: view.source,
+        observed_at: view.observed_at,
+        quality: view.quality,
+        complete_through: view.complete_through,
+    }
+}
+
+fn market_key_rate_dto(
+    view: iaam_app::scenarios::market_reference::MarketKeyRateView,
+) -> MarketKeyRateDto {
+    MarketKeyRateDto {
+        value: view.value,
+        from: view.from,
+        until: view.until,
+        source: view.source,
+        observed_at: view.observed_at,
+        quality: view.quality,
+        boundary: view.boundary,
+        complete_through: view.complete_through,
     }
 }
 

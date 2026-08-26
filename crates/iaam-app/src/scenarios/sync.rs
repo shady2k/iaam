@@ -417,6 +417,18 @@ pub async fn sync_market(
     })
 }
 
+/// Синхронизировать рынок через собранные зависимости приложения.
+///
+/// Сервер вызывает этот фасад, а не получает доступ к адаптеру хранилища:
+/// оркестрация источника и записи остаётся в `iaam-app`.
+pub async fn sync_market_with_services(
+    services: &AppServices,
+    request: MarketSyncRequest,
+) -> Result<MarketSyncResult, AppError> {
+    let mut store = services.market_store.lock().await;
+    sync_market(&mut store, services.market.as_ref(), request).await
+}
+
 fn request_for(source: &MarketSource, from: Date, to: Date) -> HttpRequest {
     match source {
         MarketSource::Moex {

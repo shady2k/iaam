@@ -15,9 +15,10 @@ use crate::dto::{
     ClassificationRuleRequest, ComputedDto, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     DataQualityDto, DimensionStatusDto, DocumentDto, EvidenceDto, FeeOriginDto, FxRateDto,
-    HealthDto, IssuedTokenDto, MarketSourceDto, MarketSyncRequest, OperationDatesDto, OperationDto,
-    OperationKindDto, OwnerBalanceRequest, PriceQualityDto, RateDto, ReconciliationStatusDto,
-    ReturnsReportDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, VerdictDto,
+    HealthDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
+    MarketSyncRequest, OperationDatesDto, OperationDto, OperationKindDto, OwnerBalanceRequest,
+    PriceQualityDto, RateDto, ReconciliationStatusDto, ReturnsReportDto, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, VerdictDto,
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
@@ -92,6 +93,9 @@ impl Modify for BearerSecurity {
         ReconciliationStatusDto,
         SyncOutcomeDto,
         MarketSourceDto,
+        MarketPriceDto,
+        MarketFxDto,
+        MarketKeyRateDto,
         MarketSyncRequest,
         MarketSyncOutcomeDto,
         VerdictDto,

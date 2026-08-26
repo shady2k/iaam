@@ -108,7 +108,7 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
     // В рабочем процессе build вызывается внутри tokio runtime. Проверка
     // сохраняет возможность собирать Router в обычном синхронном тесте.
     if tokio::runtime::Handle::try_current().is_ok() {
-        let _ = state.market_scheduler.clone().spawn();
+        std::mem::drop(state.market_scheduler.clone().spawn());
     }
     let protected = OpenApiRouter::new()
         .routes(routes!(routes::list_accounts, routes::create_account))
@@ -136,6 +136,9 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
         .routes(routes!(routes::delete_classification_rule))
         .routes(routes!(routes::sync_broker))
         .routes(routes!(routes::sync_market))
+        .routes(routes!(routes::list_market_key_rate))
+        .routes(routes!(routes::list_market_fx))
+        .routes(routes!(routes::list_market_prices))
         .routes(routes!(routes::update_broker_access))
         .routes(routes!(
             routes::returns_report,

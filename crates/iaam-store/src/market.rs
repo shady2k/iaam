@@ -41,6 +41,14 @@ pub struct PriceVenue {
     pub session: i64,
 }
 
+/// Окно торгового ряда и координата знания для чтения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketWindow<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    pub knowledge_as_of: &'a str,
+}
+
 /// Строка таблицы курсов валют.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FxRow {
@@ -406,6 +414,30 @@ impl SqliteStore {
         value.map_or(Ok(None), |date| parse_date(&date).map(Some))
     }
 
+    /// Вернуть границу, опубликованную не позже момента знания.
+    pub fn complete_through_at_or_before(
+        &self,
+        series: &SeriesKey,
+        knowledge_as_of: &str,
+    ) -> Result<Option<Date>, StoreError> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT complete_through FROM series_completeness
+                 WHERE source_id = ?1 AND dataset = ?2 AND series_key = ?3
+                   AND updated_at <= ?4",
+                params![
+                    &series.source_id,
+                    &series.dataset,
+                    &series.series_key,
+                    knowledge_as_of,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value.map_or(Ok(None), |date| parse_date(&date).map(Some))
+    }
+
     /// Вернуть последнее по знанию опубликованное наблюдение цены.
     pub fn prices_at_or_before(
         &self,
@@ -450,6 +482,151 @@ impl SqliteStore {
                 },
             )
             .optional()
+            .map_err(StoreError::from)
+    }
+    /// Вернуть опубликованные наблюдения цен в диапазоне на момент знания.
+    pub fn prices_between(
+        &self,
+        series: &SeriesKey,
+        instrument_id: &str,
+        venue: &PriceVenue,
+        window: MarketWindow<'_>,
+    ) -> Result<Vec<PriceRow>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT p.instrument_id, p.board, p.session, p.trade_date,
+                    p.kind, p.observed_at, p.price, p.currency, p.executability
+             FROM price_observations AS p
+             JOIN sync_runs AS r ON r.id = p.sync_run_id
+             WHERE p.source_id = ?1
+               AND r.source_id = ?1
+               AND r.dataset = ?2
+               AND r.series_key = ?3
+               AND p.instrument_id = ?4
+               AND p.board = ?5
+               AND p.session = ?6
+               AND p.trade_date BETWEEN ?7 AND ?8
+               AND p.observed_at <= ?9
+               AND r.status = 'succeeded'
+             ORDER BY p.trade_date, p.observed_at, p.kind",
+        )?;
+        let rows = statement.query_map(
+            params![
+                &series.source_id,
+                &series.dataset,
+                &series.series_key,
+                instrument_id,
+                &venue.board,
+                venue.session,
+                window.from,
+                window.to,
+                window.knowledge_as_of,
+            ],
+            |row| {
+                Ok(PriceRow {
+                    instrument_id: row.get(0)?,
+                    board: row.get(1)?,
+                    session: row.get(2)?,
+                    trade_date: row.get(3)?,
+                    kind: row.get(4)?,
+                    observed_at: row.get(5)?,
+                    price: row.get(6)?,
+                    currency: row.get(7)?,
+                    executability: row.get(8)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Вернуть опубликованные наблюдения курса в диапазоне на момент знания.
+    pub fn fx_between(
+        &self,
+        series: &SeriesKey,
+        from_code: &str,
+        to_code: &str,
+        window: MarketWindow<'_>,
+    ) -> Result<Vec<FxRow>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.from_code, f.to_code, f.trade_date, f.observed_at,
+                    f.nominal, f.value, f.unit_rate
+             FROM fx_observations AS f
+             JOIN sync_runs AS r ON r.id = f.sync_run_id
+             WHERE f.source_id = ?1
+               AND r.source_id = ?1
+               AND r.dataset = ?2
+               AND r.series_key = ?3
+               AND f.from_code = ?4
+               AND f.to_code = ?5
+               AND f.trade_date BETWEEN ?6 AND ?7
+               AND f.observed_at <= ?8
+               AND r.status = 'succeeded'
+             ORDER BY f.trade_date, f.observed_at",
+        )?;
+        let rows = statement.query_map(
+            params![
+                &series.source_id,
+                &series.dataset,
+                &series.series_key,
+                from_code,
+                to_code,
+                window.from,
+                window.to,
+                window.knowledge_as_of,
+            ],
+            |row| {
+                Ok(FxRow {
+                    from_code: row.get(0)?,
+                    to_code: row.get(1)?,
+                    trade_date: row.get(2)?,
+                    observed_at: row.get(3)?,
+                    nominal: row.get(4)?,
+                    value: row.get(5)?,
+                    unit_rate: row.get(6)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Вернуть опубликованные наблюдения ключевой ставки в диапазоне.
+    pub fn key_rates_through(
+        &self,
+        series: &SeriesKey,
+        to: &str,
+        knowledge_as_of: &str,
+    ) -> Result<Vec<KeyRateRow>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT k.trade_date, k.observed_at, k.rate
+             FROM key_rate_observations AS k
+             JOIN sync_runs AS r ON r.id = k.sync_run_id
+             WHERE k.source_id = ?1
+               AND r.source_id = ?1
+               AND r.dataset = ?2
+               AND r.series_key = ?3
+               AND k.trade_date <= ?4
+               AND k.observed_at <= ?5
+               AND r.status = 'succeeded'
+             ORDER BY k.trade_date, k.observed_at",
+        )?;
+        let rows = statement.query_map(
+            params![
+                &series.source_id,
+                &series.dataset,
+                &series.series_key,
+                to,
+                knowledge_as_of,
+            ],
+            |row| {
+                Ok(KeyRateRow {
+                    trade_date: row.get(0)?,
+                    observed_at: row.get(1)?,
+                    rate: row.get(2)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
 }

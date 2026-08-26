@@ -14,6 +14,7 @@ iaam-ingest = { path = "../iaam-ingest", version = "0.1.0" }
 # Шифрование брокерского доступа: адаптер хранилища держит шифротекст
 # непрозрачными байтами, а ключ и сам шифр живут здесь.
 iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
+rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
 serde_json = "1"
 # Один и только один механизм асинхронных трейтов (§3.2). Выбран async-trait:
 # порты обязаны быть объектобезопасными (`Arc<dyn Store>`), а RPITIT

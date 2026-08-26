@@ -1,17 +1,17 @@
 //! Преобразование рыночных наблюдений в доменные кандидаты.
-use iaam_core::valuation::{PriceCandidate, PriceOrigin, SourceExecutability};
+use iaam_core::valuation::{PriceCandidate, PriceKind as CorePriceKind, PriceOrigin, SourceExecutability};
 use iaam_market::{Executability, PriceKind, PriceObservation};
 
 /// Преобразует рыночное наблюдение в кандидата доменной оценки.
 #[must_use]
 pub fn candidate_from_market_observation(observation: PriceObservation) -> PriceCandidate {
     let kind = match observation.kind {
-        PriceKind::Close => "close",
-        PriceKind::LegalClose => "legal_close",
-        PriceKind::WeightedAverage => "weighted_average",
-        PriceKind::MarketPrice2 => "market_price_2",
-        PriceKind::MarketPrice3 => "market_price_3",
-        PriceKind::AdmittedQuote => "admitted_quote",
+        PriceKind::Close => CorePriceKind::Close,
+        PriceKind::LegalClose => CorePriceKind::LegalClose,
+        PriceKind::WeightedAverage => CorePriceKind::WeightedAverage,
+        PriceKind::MarketPrice2 => CorePriceKind::MarketPrice2,
+        PriceKind::MarketPrice3 => CorePriceKind::MarketPrice3,
+        PriceKind::AdmittedQuote => CorePriceKind::AdmittedQuote,
     };
     let executability = match observation.executability {
         Executability::Executable => SourceExecutability::Executable,
@@ -26,7 +26,7 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
         observed_at: observation.observed_at.0,
         origin: PriceOrigin::Market {
             venue: observation.venue.board,
-            kind: kind.to_owned(),
+            kind,
         },
         executability,
     }
@@ -36,7 +36,10 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
 mod tests {
     use iaam_core::money::CurrencyCode;
     use iaam_core::numeric::decimal::Dec;
-    use iaam_core::valuation::{PriceOrigin, SourceExecutability};
+    use iaam_core::rules::{ValuationPolicyV1, ValuationRule};
+    use iaam_core::valuation::{
+        PriceKind as CorePriceKind, PriceOrigin, PriceQuery, SourceExecutability,
+    };
     use iaam_market::moex::parse::parse_history;
     use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
     use rust_decimal::Decimal;
@@ -62,9 +65,9 @@ mod tests {
         }
     }
 
-    fn market_kind(candidate: &iaam_core::valuation::PriceCandidate) -> &str {
+    fn market_kind(candidate: &iaam_core::valuation::PriceCandidate) -> CorePriceKind {
         match &candidate.origin {
-            PriceOrigin::Market { kind, .. } => kind,
+            PriceOrigin::Market { kind, .. } => *kind,
             _ => panic!("рыночное наблюдение должно стать Market-кандидатом"),
         }
     }
@@ -86,7 +89,10 @@ mod tests {
             })
             .collect();
 
-        let names: Vec<_> = candidates.iter().map(market_kind).collect();
+        let names: Vec<_> = candidates
+            .iter()
+            .map(|candidate| market_kind(candidate).as_str())
+            .collect();
         assert_eq!(
             names,
             vec![
@@ -154,7 +160,7 @@ mod tests {
         ] {
             let candidate = candidates
                 .iter()
-                .find(|candidate| market_kind(candidate) == kind)
+                .find(|candidate| market_kind(candidate).as_str() == kind)
                 .unwrap_or_else(|| panic!("нет кандидата для {kind}"));
             assert_eq!(candidate.price.inner(), price);
             assert_eq!(candidate.instrument, instrument);
@@ -167,7 +173,53 @@ mod tests {
         assert!(
             !candidates
                 .iter()
-                .any(|candidate| market_kind(candidate) == "admitted_quote")
+                .any(|candidate| market_kind(candidate).as_str() == "admitted_quote")
         );
     }
+    #[test]
+    fn policy_selects_market_price2_when_fixture_legal_close_is_absent() {
+        let instrument = iaam_core::ids::InstrumentId::new_random();
+        let observations = parse_history(
+            FIXTURE,
+            instrument,
+            ObservedAt(datetime!(2026 - 08 - 26 09:00:00 UTC)),
+        )
+        .expect("разбор фикстуры");
+        let mut candidates: Vec<_> = observations
+            .into_iter()
+            .filter(|observation| observation.trade_date == TradeDate(date!(2026 - 08 - 03)))
+            .map(candidate_from_market_observation)
+            .collect();
+        candidates.retain(|candidate| {
+            !matches!(
+                candidate.origin,
+                PriceOrigin::Market {
+                    kind: CorePriceKind::LegalClose,
+                    ..
+                }
+            )
+        });
+
+        let result = ValuationPolicyV1::default().select(
+            &PriceQuery {
+                instrument,
+                as_of: date!(2026 - 08 - 03),
+                knowledge_as_of: datetime!(2026 - 08 - 26 09:00:00 UTC),
+            },
+            &candidates,
+        );
+        let selected = result
+            .selected()
+            .expect("MarketPrice2 должен покрывать строку");
+
+        assert_eq!(selected.provenance.price_kind.as_deref(), Some("market_price_2"));
+        assert!(matches!(
+            selected.candidate.origin,
+            PriceOrigin::Market {
+                kind: CorePriceKind::MarketPrice2,
+                ..
+            }
+        ));
+    }
+
 }

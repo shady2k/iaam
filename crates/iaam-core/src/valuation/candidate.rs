@@ -13,11 +13,37 @@ use crate::numeric::decimal::Dec;
 
 use super::PriceQuality;
 
+/// Колонки рыночной цены MOEX, различаемые политикой оценки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PriceKind {
+    Close,
+    LegalClose,
+    WeightedAverage,
+    MarketPrice2,
+    MarketPrice3,
+    AdmittedQuote,
+}
+
+impl PriceKind {
+    /// Каноническое имя колонки в проводном формате.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Close => "close",
+            Self::LegalClose => "legal_close",
+            Self::WeightedAverage => "weighted_average",
+            Self::MarketPrice2 => "market_price_2",
+            Self::MarketPrice3 => "market_price_3",
+            Self::AdmittedQuote => "admitted_quote",
+        }
+    }
+}
+
 /// Откуда пришёл кандидат. Не выводится: канал известен в точке сборки.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PriceOrigin {
     /// Наблюдение из рыночного источника.
-    Market { venue: String, kind: String },
+    Market { venue: String, kind: PriceKind },
     /// Цена, разобранная из отчёта или другого документа.
     ReportParsed { source: SourceId },
     /// Цена, утверждённая владельцем.
@@ -286,6 +312,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn into_candidate_extracts_only_revaluable_candidates() {
+        let candidate = price();
+        assert_eq!(
+            LegacyValuationOutcome::Candidate(candidate.clone()).into_candidate(),
+            Some(candidate)
+        );
+        assert_eq!(
+            LegacyValuationOutcome::LegacyDerived(PriceQuality::Stale).into_candidate(),
+            None
+        );
+    }
     #[test]
     fn price_query_keeps_evaluation_and_knowledge_coordinates() {
         let query = PriceQuery {

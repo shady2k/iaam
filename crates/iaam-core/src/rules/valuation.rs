@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use crate::valuation::{
-    PriceCandidate, PriceFreshness, PriceOrigin, PriceProvenance, PriceQuery, PriceSelection,
-    SelectedPrice, UncoveredReason,
+    PriceCandidate, PriceFreshness, PriceKind, PriceOrigin, PriceProvenance, PriceQuery,
+    PriceSelection, SelectedPrice, UncoveredReason,
 };
 use serde::{Deserialize, Serialize};
 
@@ -75,15 +75,14 @@ impl ValuationPolicyV1 {
         let PriceOrigin::Market { kind, .. } = origin else {
             return None;
         };
-        match kind.to_ascii_lowercase().as_str() {
-            "legalclose" | "legal_close" | "legalcloseprice" => Some(0),
-            "marketprice2" | "market_price2" => Some(1),
-            "admittedquote" | "admitted_quote" => Some(2),
-            "close" => Some(3),
+        match kind {
+            PriceKind::LegalClose => Some(0),
+            PriceKind::MarketPrice2 => Some(1),
+            PriceKind::AdmittedQuote => Some(2),
+            PriceKind::Close => Some(3),
             // These are deliberately retained by the source but are not
             // candidates in valuation policy v1.
-            "weightedaverage" | "weighted_average" | "marketprice3" | "market_price3" => None,
-            _ => None,
+            PriceKind::WeightedAverage | PriceKind::MarketPrice3 => None,
         }
     }
 
@@ -112,7 +111,9 @@ impl ValuationPolicyV1 {
 
     fn provenance(&self, candidate: &PriceCandidate) -> PriceProvenance {
         let (price_kind, venue) = match &candidate.origin {
-            PriceOrigin::Market { venue, kind } => (Some(kind.clone()), Some(venue.clone())),
+            PriceOrigin::Market { venue, kind } => {
+                (Some(kind.as_str().to_owned()), Some(venue.clone()))
+            }
             PriceOrigin::ReportParsed { .. } | PriceOrigin::OwnerAsserted => (None, None),
         };
         PriceProvenance {
@@ -311,13 +312,22 @@ mod tests {
         trade_date: time::Date,
         observed_at: time::OffsetDateTime,
     ) -> PriceCandidate {
+        let kind = match kind {
+            "close" => PriceKind::Close,
+            "legal_close" | "legalclose" => PriceKind::LegalClose,
+            "weighted_average" | "weightedaverage" => PriceKind::WeightedAverage,
+            "market_price_2" | "marketprice2" => PriceKind::MarketPrice2,
+            "market_price_3" | "marketprice3" => PriceKind::MarketPrice3,
+            "admitted_quote" | "admittedquote" => PriceKind::AdmittedQuote,
+            _ => panic!("неизвестный вид цены: {kind}"),
+        };
         candidate_from_origin(
             instrument,
             trade_date,
             observed_at,
             PriceOrigin::Market {
                 venue: venue.to_owned(),
-                kind: kind.to_owned(),
+                kind,
             },
         )
     }
@@ -385,6 +395,51 @@ mod tests {
             PriceOrigin::Market { .. }
         ));
     }
+    #[test]
+    fn equal_age_origin_priority_is_market_then_report_then_owner() {
+        let query = query(date!(2026 - 08 - 10));
+        let report = candidate_from_origin(
+            query.instrument,
+            date!(2026 - 08 - 09),
+            datetime!(2026 - 08 - 10 12:00 UTC),
+            PriceOrigin::ReportParsed {
+                source: crate::ids::SourceId::new_random(),
+            },
+        );
+        let owner = candidate_from_origin(
+            query.instrument,
+            date!(2026 - 08 - 09),
+            datetime!(2026 - 08 - 10 12:00 UTC),
+            PriceOrigin::OwnerAsserted,
+        );
+        let report_over_owner = policy().select(&query, &[owner, report]);
+        assert!(matches!(
+            report_over_owner.selected().expect("отчёт приоритетнее владельца").candidate.origin,
+            PriceOrigin::ReportParsed { .. }
+        ));
+
+        let market = market_candidate(
+            query.instrument,
+            "TQBR",
+            "close",
+            date!(2026 - 08 - 09),
+            datetime!(2026 - 08 - 10 12:00 UTC),
+        );
+        let report = candidate_from_origin(
+            query.instrument,
+            date!(2026 - 08 - 09),
+            datetime!(2026 - 08 - 10 12:00 UTC),
+            PriceOrigin::ReportParsed {
+                source: crate::ids::SourceId::new_random(),
+            },
+        );
+        let market_over_report = policy().select(&query, &[report, market]);
+        assert!(matches!(
+            market_over_report.selected().expect("биржа приоритетнее отчёта").candidate.origin,
+            PriceOrigin::Market { .. }
+        ));
+    }
+
 
     #[test]
     fn two_venues_without_a_directory_preference_are_a_refusal_not_a_guess() {
@@ -464,6 +519,46 @@ mod tests {
         );
         assert!(out.selected().is_none());
     }
+    #[test]
+    fn price_kind_priority_checks_each_admitted_kind_by_name() {
+        let query = query(date!(2026 - 08 - 10));
+        let selected_kind = |kinds: &[&str]| {
+            let candidates = kinds
+                .iter()
+                .map(|kind| {
+                    market_candidate(
+                        query.instrument,
+                        "TQBR",
+                        kind,
+                        query.as_of,
+                        datetime!(2026 - 08 - 10 12:00 UTC),
+                    )
+                })
+                .collect::<Vec<_>>();
+            policy()
+                .select(&query, &candidates)
+                .selected()
+                .map(|selected| selected.provenance.price_kind.clone())
+        };
+
+        assert_eq!(
+            selected_kind(&["legal_close", "market_price_2", "admitted_quote", "close"]),
+            Some(Some("legal_close".to_owned()))
+        );
+        assert_eq!(
+            selected_kind(&["market_price_2", "admitted_quote", "close"]),
+            Some(Some("market_price_2".to_owned()))
+        );
+        assert_eq!(
+            selected_kind(&["admitted_quote", "close"]),
+            Some(Some("admitted_quote".to_owned()))
+        );
+        assert_eq!(
+            selected_kind(&["close"]),
+            Some(Some("close".to_owned()))
+        );
+    }
+
 
     #[test]
     fn equal_candidates_are_ambiguous_instead_of_ordered_by_incidental_input() {
@@ -639,13 +734,13 @@ mod tests {
             &[market_candidate(
                 query.instrument,
                 "TQBR",
-                "legalclose",
+                "legal_close",
                 date!(2026 - 08 - 09),
                 observed_at,
             )],
         );
         let provenance = &out.selected().expect("цена есть").provenance;
-        assert_eq!(provenance.price_kind.as_deref(), Some("legalclose"));
+        assert_eq!(provenance.price_kind.as_deref(), Some("legal_close"));
         assert_eq!(provenance.venue.as_deref(), Some("TQBR"));
         assert!(matches!(provenance.origin, PriceOrigin::Market { .. }));
         assert_eq!(provenance.observed_at, observed_at);

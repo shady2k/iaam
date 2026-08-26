@@ -862,7 +862,15 @@ impl PriceOriginDto {
         match origin {
             PriceOrigin::Market { venue, kind } => Self::Market {
                 venue: venue.clone(),
-                price_kind: kind.clone(),
+                price_kind: match kind {
+                    iaam_core::valuation::PriceKind::Close => "close",
+                    iaam_core::valuation::PriceKind::LegalClose => "legal_close",
+                    iaam_core::valuation::PriceKind::WeightedAverage => "weighted_average",
+                    iaam_core::valuation::PriceKind::MarketPrice2 => "market_price_2",
+                    iaam_core::valuation::PriceKind::MarketPrice3 => "market_price_3",
+                    iaam_core::valuation::PriceKind::AdmittedQuote => "admitted_quote",
+                }
+                .to_owned(),
             },
             PriceOrigin::ReportParsed { source } => Self::ReportParsed {
                 source: source.inner(),

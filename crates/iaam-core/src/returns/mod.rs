@@ -472,7 +472,15 @@ fn selected_observation(price: &SelectedPrice) -> SelectedObservation {
     let origin = match &price.provenance.origin {
         crate::valuation::PriceOrigin::Market { venue, kind } => SelectedOrigin::Market {
             venue: venue.clone(),
-            price_kind: kind.clone(),
+            price_kind: match kind {
+                crate::valuation::PriceKind::Close => "close",
+                crate::valuation::PriceKind::LegalClose => "legal_close",
+                crate::valuation::PriceKind::WeightedAverage => "weighted_average",
+                crate::valuation::PriceKind::MarketPrice2 => "market_price_2",
+                crate::valuation::PriceKind::MarketPrice3 => "market_price_3",
+                crate::valuation::PriceKind::AdmittedQuote => "admitted_quote",
+            }
+            .to_owned(),
         },
         crate::valuation::PriceOrigin::ReportParsed { source } => {
             SelectedOrigin::ReportParsed { source: *source }
@@ -1199,7 +1207,7 @@ mod tests {
         let hash_for_venue = |venue: &str| {
             let origin = crate::valuation::PriceOrigin::Market {
                 venue: venue.to_owned(),
-                kind: "legal_close".to_owned(),
+                kind: crate::valuation::PriceKind::LegalClose,
             };
             let selected = SelectedPrice {
                 candidate: PriceCandidate {

@@ -7,7 +7,7 @@
 pub mod candidate;
 
 pub use candidate::{
-    LegacyValuationOutcome, PriceCandidate, PriceFreshness, PriceOrigin, PriceProvenance,
+    LegacyValuationOutcome, PriceCandidate, PriceFreshness, PriceKind, PriceOrigin, PriceProvenance,
     PriceQuery, PriceSelection, SelectedPrice, SourceExecutability, Uncovered, UncoveredReason,
     candidate_from_legacy_valuation,
 };

@@ -63,6 +63,41 @@ fn directory(account: AccountId, custody: CustodyId, instrument: InstrumentId) -
     }
 }
 
+#[test]
+fn tinkoff_ticker_column_does_not_resolve_through_broker_code() {
+    let workbook = Workbook::open(REPORT).unwrap();
+    let account = AccountId::new_random();
+    let custody = CustodyId::new_random();
+    let ticker_instrument = InstrumentId::new_random();
+    let broker_instrument = InstrumentId::new_random();
+    let mut directory = directory(account, custody, ticker_instrument);
+    directory.instruments.get_mut("BOND-X").unwrap().push((
+        "broker_code".to_owned(),
+        AliasInterval {
+            valid_from: date!(1900 - 01 - 01),
+            valid_to: None,
+        },
+        broker_instrument,
+    ));
+
+    let report = TinkoffParser.parse(&workbook, &directory);
+    let instruments: Vec<_> = report
+        .rows
+        .iter()
+        .filter_map(|row| match &row.outcome {
+            ParsedRow::Operation(operation) => match &operation.kind {
+                OperationKind::Buy { instrument, .. } | OperationKind::Sell { instrument, .. } => {
+                    Some(instrument)
+                }
+                _ => None,
+            },
+            ParsedRow::Rejected(_) => None,
+        })
+        .collect();
+
+    assert_eq!(instruments, vec![&ticker_instrument, &ticker_instrument]);
+}
+
 fn directory_with_historical_instrument(
     account: AccountId,
     custody: CustodyId,

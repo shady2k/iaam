@@ -30,7 +30,8 @@ use std::path::PathBuf;
 
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open};
 use iaam_broker::environment::Environment;
-use iaam_broker::trust::tinkoff_client;
+use iaam_http::client::HttpClient;
+use iaam_http::{Destination, HttpRequest, RequestBody};
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::SoleOwner;
 use iaam_store::documents::BrokerCode;
@@ -39,6 +40,16 @@ fn required(variable: &str) -> PathBuf {
     PathBuf::from(std::env::var(variable).unwrap_or_else(|_| {
         panic!("режим песочницы запрошен, но {variable} не задана: проверять нечем")
     }))
+}
+
+trait HttpStatusExt {
+    fn is_success(self) -> bool;
+}
+
+impl HttpStatusExt for u16 {
+    fn is_success(self) -> bool {
+        (200..=299).contains(&self)
+    }
 }
 
 #[tokio::test]
@@ -71,16 +82,14 @@ async fn the_sandbox_accepts_the_provisioned_access() {
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))
         .expect("доступ расшифрован");
 
-    let response = tinkoff_client()
-        .expect("клиент собран")
-        .post(format!(
-            "{}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
-            Environment::Sandbox.base_url()
-        ))
-        .header("Content-Type", "application/json")
-        .bearer_auth(token.expose())
-        .body("{}")
-        .send()
+    let request = HttpRequest::post(
+        Destination::TinkoffSandbox,
+        "tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
+        RequestBody::Json("{}".to_owned()),
+    )
+    .with_bearer(token.expose());
+    let response = HttpClient::new()
+        .send(&request)
         .await
         .expect("шлюз ответил");
 
@@ -88,8 +97,8 @@ async fn the_sandbox_accepts_the_provisioned_access() {
     // не отличает сломанный шлюз от негодного токена, а разбираться
     // с этим приходится по одному этому сообщению. Секрета в теле нет:
     // токен туда не возвращается.
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let status = response.status;
+    let body = String::from_utf8(response.body).unwrap_or_default();
     assert!(
         status.is_success(),
         "песочница отклонила заведённый доступ: HTTP {status}: {body}"

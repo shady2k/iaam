@@ -1,6 +1,7 @@
 use crate::credentials::BrokerToken;
 use crate::environment::{Environment, Method};
-use crate::trust::{TrustError, tinkoff_client};
+use iaam_http::client::HttpClient;
+use iaam_http::{Destination, HttpRequest, RequestBody};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -45,9 +46,11 @@ pub enum TinkoffError {
     /// Запрос не удалось превратить в JSON до отправки.
     #[error("не удалось сериализовать запрос к шлюзу Т-Инвестиций")]
     RequestSerialization,
-    /// Не удалось собрать HTTP-клиент с закреплённым корнем доверия.
+    /// Транспорт не довёл запрос: сеть, время ожидания или сборка клиента.
+    ///
+    /// Токена не несёт: `HttpError` его не содержит по построению.
     #[error(transparent)]
-    Trust(#[from] TrustError),
+    Transport(#[from] iaam_http::HttpError),
 }
 
 /// Запрос страницы операций с курсорной пагинацией.
@@ -115,7 +118,7 @@ impl GetOperationsByCursorRequest {
 pub struct TinkoffClient {
     environment: Environment,
     token: BrokerToken,
-    http: reqwest::Client,
+    http: HttpClient,
 }
 
 impl TinkoffClient {
@@ -124,7 +127,7 @@ impl TinkoffClient {
         Ok(Self {
             environment,
             token,
-            http: tinkoff_client()?,
+            http: HttpClient::new(),
         })
     }
 
@@ -162,29 +165,36 @@ impl TinkoffClient {
 
     async fn post(&self, method: Method, path: &str, body: Value) -> Result<String, TinkoffError> {
         ensure_method_available(self.environment, method)?;
-        let response = self
-            .http
-            .post(method_url(self.environment, path))
-            .bearer_auth(self.token.expose())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| TinkoffError::Network)?;
-        let status = response.status().as_u16();
-        let body = response.text().await.map_err(|_| TinkoffError::Network)?;
-        classify_response_with_token(status, &body, self.token.expose())?;
+        // База среды берётся у `Environment`, а не у `Destination`:
+        // песочница и бой — это разные адреса одного назначения,
+        // и якорь доверия у них общий.
+        let request = HttpRequest::post(
+            destination_for(self.environment),
+            path,
+            RequestBody::Json(
+                serde_json::to_string(&body).map_err(|_| TinkoffError::RequestSerialization)?,
+            ),
+        )
+        .with_bearer(self.token.expose());
+        let response = self.http.send(&request).await?;
+        let body = String::from_utf8(response.body).map_err(|_| TinkoffError::MalformedResponse)?;
+        classify_response_with_token(response.status, &body, self.token.expose())?;
         Ok(body)
     }
 }
 
-fn method_url(environment: Environment, path: &str) -> String {
-    format!(
-        "{}/{}",
-        environment.base_url().trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
+/// Среда выбирает назначение, а не приписку к URL.
+///
+/// У песочницы и боя **разные хосты** (`sandbox-invest-public-api.tbank.ru`
+/// против `invest-public-api.tbank.ru`), поэтому подставить одну вместо
+/// другой обрезкой базы нельзя — запрос ушёл не туда и получил бы
+/// правдоподобный ответ из другой среды.
+const fn destination_for(environment: Environment) -> Destination {
+    match environment {
+        Environment::Prod => Destination::TinkoffProd,
+        Environment::Sandbox => Destination::TinkoffSandbox,
+    }
 }
-
 fn ensure_method_available(environment: Environment, method: Method) -> Result<(), TinkoffError> {
     if environment.serves(method) {
         Ok(())
@@ -320,6 +330,14 @@ mod tests {
         assert!(ensure_method_available(Environment::Sandbox, Method::Portfolio).is_ok());
     }
 
+    fn method_url(environment: Environment, path: &str) -> String {
+        HttpRequest::post(
+            destination_for(environment),
+            path,
+            RequestBody::Json("{}".to_owned()),
+        )
+        .url()
+    }
     #[test]
     fn builds_method_url_from_environment_base_url() {
         assert_eq!(

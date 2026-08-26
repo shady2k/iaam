@@ -16,8 +16,8 @@
 use std::env;
 use std::fs;
 
-use iaam_broker::environment::Environment;
-use iaam_broker::trust::tinkoff_client;
+use iaam_http::client::HttpClient;
+use iaam_http::{Destination, HttpRequest, RequestBody};
 
 // Обычный метод по адресу песочницы — рекомендуемый Т-Инвестициями
 // способ. Метод песочницы по этому же адресу даёт `40003`, то есть
@@ -26,24 +26,25 @@ const METHOD: &str = "tinkoff.public.invest.api.contract.v1.UsersService/GetAcco
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = tinkoff_client()?;
-    let mut request = client
-        .post(format!("{}/{METHOD}", Environment::Sandbox.base_url()))
-        .header("Content-Type", "application/json")
-        .body("{}");
+    let client = HttpClient::new();
+    let mut request = HttpRequest::post(
+        Destination::TinkoffSandbox,
+        METHOD,
+        RequestBody::Json("{}".to_owned()),
+    );
 
     match env::var("IAAM_TINKOFF_SANDBOX_TOKEN_FILE") {
         Ok(path) => {
             let token = fs::read_to_string(&path)?;
             println!("токен прочитан из {path}");
-            request = request.bearer_auth(token.trim());
+            request = request.with_bearer(token.trim());
         }
         Err(_) => {
             println!("токена нет: ожидается 401, и он подтвердит только то, что цепочка проверена")
         }
     }
 
-    let response = request.send().await?;
-    println!("HTTP {}", response.status());
+    let response = client.send(&request).await?;
+    println!("HTTP {}", response.status);
     Ok(())
 }

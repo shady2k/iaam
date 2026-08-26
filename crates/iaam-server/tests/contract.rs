@@ -705,6 +705,53 @@ async fn an_invalid_amount_is_reported_as_422_with_field_expected_actual() {
 }
 
 #[tokio::test]
+async fn a_carried_forward_price_is_not_accepted_from_the_api() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "ручной ввод",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "valuation",
+            "instrument": harness.instrument.inner(),
+            "price": "1000",
+            "currency": "RUB",
+            "quality": "carried_forward",
+            "dates": { "cash_posted": "2026-01-01" }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+}
+
+#[tokio::test]
+async fn a_stale_price_is_not_accepted_from_the_api() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "ручной ввод",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "valuation",
+            "instrument": harness.instrument.inner(),
+            "price": "1000",
+            "currency": "RUB",
+            "quality": "stale",
+            "dates": { "cash_posted": "2026-01-01" }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+}
+
+
+#[tokio::test]
 async fn the_stage_one_question_is_answered_end_to_end() {
     // Приёмочный критерий эпика через API: сколько внесено, сколько
     // выведено, какова доходность до налога.
@@ -930,6 +977,17 @@ async fn the_openapi_document_declares_bearer_security() {
     assert!(
         spec["components"]["securitySchemes"]["bearer"].is_object(),
         "спека обязана описывать схему аутентификации"
+    );
+}
+
+#[tokio::test]
+async fn the_openapi_document_exposes_only_source_price_qualities() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        spec["components"]["schemas"]["PriceQualityDto"]["enum"],
+        json!(["executable", "previous_close", "owner_estimate"])
     );
 }
 

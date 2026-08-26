@@ -70,13 +70,18 @@ impl CurrencyDto {
 }
 
 /// Качество цены в транспорте.
+///
+/// Уже вычисленные нами величины — перенос на нерабочий день и
+/// устаревание по порогу — представимым вводом не являются: это выводы
+/// политики оценки, а не то, что утверждает источник. Записать их фактом
+/// значит стереть различие между наблюдением и нашим выводом
+/// (docs/decisions/0002-polnota-ocenki-i-ispolnimost-ceny-dve-osi.md).
+/// Доменный PriceQuality шире: он обязан читать старый журнал.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceQualityDto {
     Executable,
     PreviousClose,
-    CarriedForward,
-    Stale,
     OwnerEstimate,
 }
 
@@ -86,8 +91,6 @@ impl PriceQualityDto {
         match self {
             Self::Executable => PriceQuality::Executable,
             Self::PreviousClose => PriceQuality::PreviousClose,
-            Self::CarriedForward => PriceQuality::CarriedForward,
-            Self::Stale => PriceQuality::Stale,
             Self::OwnerEstimate => PriceQuality::OwnerEstimate,
         }
     }

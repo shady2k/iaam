@@ -970,6 +970,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iaam-http"
+version = "0.1.0"
+dependencies = [
+ "percent-encoding",
+ "reqwest",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "iaam-ingest"
 version = "0.1.0"
 dependencies = [

@@ -15,11 +15,12 @@ use crate::dto::{
     ClassificationRuleRequest, ComputedDto, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     DataQualityDto, DimensionStatusDto, DocumentDto, EvidenceDto, FeeOriginDto, FxRateDto,
-    HealthDto, IssuedTokenDto, OperationDatesDto, OperationDto, OperationKindDto,
-    OwnerBalanceRequest, PriceQualityDto, RateDto, ReconciliationStatusDto, ReturnsReportDto,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    HealthDto, IssuedTokenDto, MarketSourceDto, MarketSyncRequest, OperationDatesDto, OperationDto,
+    OperationKindDto, OwnerBalanceRequest, PriceQualityDto, RateDto, ReconciliationStatusDto,
+    ReturnsReportDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, VerdictDto,
 };
 use crate::error::ApiError;
+use crate::routes::MarketSyncOutcomeDto;
 
 /// Схема аутентификации. Объявляется отдельно: `utoipa` порождает её
 /// из типов, а требование `Bearer` типом не выражается.
@@ -89,8 +90,10 @@ impl Modify for BearerSecurity {
         EvidenceDto,
         OwnerBalanceRequest,
         ReconciliationStatusDto,
-        TokenScopeDto,
         SyncOutcomeDto,
+        MarketSourceDto,
+        MarketSyncRequest,
+        MarketSyncOutcomeDto,
         VerdictDto,
     ))
 )]

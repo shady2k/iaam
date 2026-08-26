@@ -21,9 +21,11 @@ pub mod tokens;
 
 use std::sync::Arc;
 
+use iaam_store::market::MarketStore;
 use ports::{
-    BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Clock, InstrumentDirectory, Store,
-    TokenAdmin, UnavailableBrokerChannelFactory, UnavailableClassificationRuleStore,
+    BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Clock, InstrumentDirectory,
+    MarketData, Store, TokenAdmin, UnavailableBrokerChannelFactory,
+    UnavailableClassificationRuleStore, UnavailableMarketData,
 };
 
 /// Собранные зависимости. Точка сборки создаёт один экземпляр,
@@ -43,6 +45,11 @@ pub struct AppServices {
     pub channels: Arc<dyn BrokerChannelFactory>,
     /// Исторические правила классификации.
     pub rules: Arc<dyn ClassificationRuleStore>,
+    /// HTTP-порт источников рынка. Без адаптера ручной запуск отвечает 503.
+    pub market: Arc<dyn MarketData>,
+    /// Отдельное соединение рынка; блокирующие операции не выполняются
+    /// в async-обработчике напрямую.
+    pub market_store: Arc<tokio::sync::Mutex<MarketStore>>,
 }
 
 impl AppServices {
@@ -68,6 +75,11 @@ impl AppServices {
             clock,
             channels: Arc::new(UnavailableBrokerChannelFactory),
             rules: Arc::new(UnavailableClassificationRuleStore),
+            market: Arc::new(UnavailableMarketData),
+            market_store: Arc::new(tokio::sync::Mutex::new(
+                MarketStore::open_in_memory()
+                    .expect("in-memory market store must be constructible"),
+            )),
         }
     }
 }

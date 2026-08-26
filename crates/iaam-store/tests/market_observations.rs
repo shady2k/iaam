@@ -1,12 +1,9 @@
 //! Инварианты публикации и воспроизводимого чтения рыночных рядов.
+
 use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
-use iaam_core::numeric::decimal::Dec;
-use iaam_market::observation::{
-    Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue,
-};
-use iaam_store::market::{Coverage, RunOutcome, SeriesKey};
+use iaam_store::market::{Coverage, PriceRow, PriceVenue, RunOutcome, SeriesKey};
 use iaam_store::reference::InstrumentRecord;
 use iaam_store::{SqliteStore, StoreError};
 use time::macros::{date, datetime};
@@ -36,24 +33,18 @@ fn series(name: &str) -> SeriesKey {
     }
 }
 
-fn price(instrument: InstrumentId, observed_at: OffsetDateTime, value: &str) -> PriceObservation {
-    PriceObservation {
-        instrument,
-        venue: Venue {
-            board: "TQBR".to_owned(),
-            session: 1,
-        },
-        trade_date: TradeDate(date!(2026 - 08 - 03)),
-        observed_at: ObservedAt(observed_at),
-        kind: PriceKind::Close,
-        price: dec(value),
-        currency: CurrencyCode::Rub,
-        executability: Executability::Executable,
+fn price(instrument: InstrumentId, observed_at: &str, value: &str) -> PriceRow {
+    PriceRow {
+        instrument_id: instrument.inner().to_string(),
+        board: "TQBR".to_owned(),
+        session: 1,
+        trade_date: "2026-08-03".to_owned(),
+        kind: "close".to_owned(),
+        observed_at: observed_at.to_owned(),
+        price: value.to_owned(),
+        currency: "RUB".to_owned(),
+        executability: "executable".to_owned(),
     }
-}
-
-fn dec(value: &str) -> Dec {
-    serde_json::from_str(&format!("\"{value}\"")).expect("десятичное число")
 }
 
 fn lease() -> OffsetDateTime {
@@ -75,7 +66,7 @@ fn a_corrected_price_lands_beside_the_old_one_not_over_it() {
         .record_prices(
             &first,
             "raw-first",
-            &[price(instrument, datetime!(2026-08-03 09:00:00 UTC), "100")],
+            &[price(instrument, "2026-08-03T09:00:00Z", "100")],
         )
         .expect("первая цена");
     store
@@ -101,38 +92,38 @@ fn a_corrected_price_lands_beside_the_old_one_not_over_it() {
         .record_prices(
             &correction,
             "raw-correction",
-            &[price(instrument, datetime!(2026-08-03 10:00:00 UTC), "101")],
+            &[price(instrument, "2026-08-03T10:00:00Z", "101")],
         )
         .expect("исправленная цена");
     store
         .finish_run(&correction, RunOutcome::Succeeded, None)
         .expect("исправляющий запуск опубликован");
 
-    let venue = Venue {
+    let venue = PriceVenue {
         board: "TQBR".to_owned(),
         session: 1,
     };
     let before_correction = store
         .prices_at_or_before(
-            instrument,
+            &instrument.inner().to_string(),
             &venue,
-            date!(2026 - 08 - 03),
-            datetime!(2026-08-03 09:30:00 UTC),
+            "2026-08-03",
+            "2026-08-03T09:30:00Z",
         )
         .expect("чтение до исправления")
         .expect("старая цена существует");
     let after_correction = store
         .prices_at_or_before(
-            instrument,
+            &instrument.inner().to_string(),
             &venue,
-            date!(2026 - 08 - 03),
-            datetime!(2026-08-03 11:00:00 UTC),
+            "2026-08-03",
+            "2026-08-03T11:00:00Z",
         )
         .expect("чтение после исправления")
         .expect("новая цена существует");
 
-    assert_eq!(before_correction.price, dec("100"));
-    assert_eq!(after_correction.price, dec("101"));
+    assert_eq!(before_correction.price, "100");
+    assert_eq!(after_correction.price, "101");
     let rows: i64 = store
         .connection()
         .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
@@ -262,19 +253,19 @@ fn rows_of_an_unfinished_run_are_invisible_to_reads() {
         .record_prices(
             &run,
             "raw",
-            &[price(instrument, datetime!(2026-08-03 09:00:00 UTC), "100")],
+            &[price(instrument, "2026-08-03T09:00:00Z", "100")],
         )
         .expect("незавершённая строка");
 
     let found = store
         .prices_at_or_before(
-            instrument,
-            &Venue {
+            &instrument.inner().to_string(),
+            &PriceVenue {
                 board: "TQBR".to_owned(),
                 session: 1,
             },
-            date!(2026 - 08 - 03),
-            datetime!(2026-08-03 12:00:00 UTC),
+            "2026-08-03",
+            "2026-08-03T12:00:00Z",
         )
         .expect("чтение");
     assert!(found.is_none(), "running не публикуется чтением");
@@ -316,7 +307,7 @@ fn a_read_at_an_earlier_knowledge_time_returns_the_earlier_value() {
         .record_prices(
             &first,
             "raw-1",
-            &[price(instrument, datetime!(2026-08-03 09:00:00 UTC), "100")],
+            &[price(instrument, "2026-08-03T09:00:00Z", "100")],
         )
         .expect("первое наблюдение");
     store
@@ -335,7 +326,7 @@ fn a_read_at_an_earlier_knowledge_time_returns_the_earlier_value() {
         .record_prices(
             &second,
             "raw-2",
-            &[price(instrument, datetime!(2026-08-03 10:00:00 UTC), "101")],
+            &[price(instrument, "2026-08-03T10:00:00Z", "101")],
         )
         .expect("исправленное наблюдение");
     store
@@ -344,31 +335,31 @@ fn a_read_at_an_earlier_knowledge_time_returns_the_earlier_value() {
 
     let value = store
         .prices_at_or_before(
-            instrument,
-            &Venue {
+            &instrument.inner().to_string(),
+            &PriceVenue {
                 board: "TQBR".to_owned(),
                 session: 1,
             },
-            date!(2026 - 08 - 03),
-            datetime!(2026-08-03 09:30:00 UTC),
+            "2026-08-03",
+            "2026-08-03T09:30:00Z",
         )
         .expect("чтение на ранний момент")
         .expect("ранняя цена");
-    assert_eq!(value.price, dec("100"));
+    assert_eq!(value.price, "100");
 
     let later = store
         .prices_at_or_before(
-            instrument,
-            &Venue {
+            &instrument.inner().to_string(),
+            &PriceVenue {
                 board: "TQBR".to_owned(),
                 session: 1,
             },
-            date!(2026 - 08 - 03),
-            datetime!(2026-08-03 11:00:00 UTC),
+            "2026-08-03",
+            "2026-08-03T11:00:00Z",
         )
         .expect("чтение на поздний момент")
         .expect("поздняя цена");
-    assert_eq!(later.price, dec("101"));
+    assert_eq!(later.price, "101");
 }
 
 #[test]

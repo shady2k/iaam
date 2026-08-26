@@ -1,19 +1,15 @@
 //! Запись рыночных наблюдений и атомарная публикация серий.
 //!
-//! Строки сначала принадлежат запуску со статусом `running`. Чтение видит
-//! только строки запусков со статусом `succeeded`, поэтому частичный или
-//! оборванный запуск не может выдать неполный ряд за опубликованный.
+//! Хранилище не знает форматы источников. Оно принимает собственные строковые
+//! строки таблиц; преобразование наблюдений источника выполняется на границе
+//! приложения.
 
-use iaam_core::ids::InstrumentId;
-use iaam_market::observation::{
-    Executability, FxObservation, KeyRateObservation, PriceKind, PriceObservation, Venue,
-};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::{Date, OffsetDateTime, UtcOffset};
+use uuid::Uuid;
 
 use crate::{SqliteStore, StoreError, now};
-use uuid::Uuid;
 
 /// Единица полноты: источник, набор данных и конкретная серия.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +17,48 @@ pub struct SeriesKey {
     pub source_id: String,
     pub dataset: String,
     pub series_key: String,
+}
+
+/// Строка таблицы цен. Все значения источника остаются строками до границы
+/// приложения, чтобы хранилище не зависело от крейты формата источника.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceRow {
+    pub instrument_id: String,
+    pub board: String,
+    pub session: i64,
+    pub trade_date: String,
+    pub kind: String,
+    pub observed_at: String,
+    pub price: String,
+    pub currency: String,
+    pub executability: String,
+}
+
+/// Площадка и сессия для выборки строки цены.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceVenue {
+    pub board: String,
+    pub session: i64,
+}
+
+/// Строка таблицы курсов валют.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FxRow {
+    pub from_code: String,
+    pub to_code: String,
+    pub trade_date: String,
+    pub observed_at: String,
+    pub nominal: u32,
+    pub value: String,
+    pub unit_rate: String,
+}
+
+/// Строка таблицы ключевой ставки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRateRow {
+    pub trade_date: String,
+    pub observed_at: String,
+    pub rate: String,
 }
 
 /// Запуск, удерживающий аренду одной серии.
@@ -150,12 +188,12 @@ impl SqliteStore {
         &mut self,
         run: &RunHandle,
         raw_hash: &str,
-        observations: &[PriceObservation],
+        observations: &[PriceRow],
     ) -> Result<usize, StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_run(&transaction, run, "prices")?;
+        ensure_run(&transaction, run)?;
         for observation in observations {
             transaction.execute(
                 "INSERT INTO price_observations
@@ -163,16 +201,16 @@ impl SqliteStore {
                       observed_at, price, currency, executability, raw_hash, sync_run_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
-                    observation.instrument.inner().to_string(),
-                    &observation.venue.board,
-                    observation.venue.session,
-                    format_date(observation.trade_date.0),
-                    price_kind_code(observation.kind),
+                    &observation.instrument_id,
+                    &observation.board,
+                    observation.session,
+                    &observation.trade_date,
+                    &observation.kind,
                     &run.series.source_id,
-                    format_datetime(observation.observed_at.0)?,
-                    observation.price.inner().to_string(),
-                    observation.currency.code(),
-                    executability_code(observation.executability),
+                    &observation.observed_at,
+                    &observation.price,
+                    &observation.currency,
+                    &observation.executability,
                     raw_hash,
                     &run.id,
                 ],
@@ -195,12 +233,12 @@ impl SqliteStore {
         &mut self,
         run: &RunHandle,
         raw_hash: &str,
-        observations: &[FxObservation],
+        observations: &[FxRow],
     ) -> Result<usize, StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_run(&transaction, run, "fx")?;
+        ensure_run(&transaction, run)?;
         for observation in observations {
             transaction.execute(
                 "INSERT INTO fx_observations
@@ -208,14 +246,14 @@ impl SqliteStore {
                       nominal, value, unit_rate, raw_hash, sync_run_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
-                    observation.from.code(),
-                    observation.to.code(),
-                    format_date(observation.trade_date.0),
+                    &observation.from_code,
+                    &observation.to_code,
+                    &observation.trade_date,
                     &run.series.source_id,
-                    format_datetime(observation.observed_at.0)?,
+                    &observation.observed_at,
                     i64::from(observation.nominal),
-                    observation.value.inner().to_string(),
-                    observation.unit_rate.inner().to_string(),
+                    &observation.value,
+                    &observation.unit_rate,
                     raw_hash,
                     &run.id,
                 ],
@@ -238,22 +276,22 @@ impl SqliteStore {
         &mut self,
         run: &RunHandle,
         raw_hash: &str,
-        observations: &[KeyRateObservation],
+        observations: &[KeyRateRow],
     ) -> Result<usize, StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_run(&transaction, run, "key_rate")?;
+        ensure_run(&transaction, run)?;
         for observation in observations {
             transaction.execute(
                 "INSERT INTO key_rate_observations
                      (trade_date, source_id, observed_at, rate, raw_hash, sync_run_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
-                    format_date(observation.trade_date.0),
+                    &observation.trade_date,
                     &run.series.source_id,
-                    format_datetime(observation.observed_at.0)?,
-                    observation.rate.inner().to_string(),
+                    &observation.observed_at,
+                    &observation.rate,
                     raw_hash,
                     &run.id,
                 ],
@@ -281,7 +319,7 @@ impl SqliteStore {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (requested_from, requested_to) = ensure_run(&transaction, run, "")?;
+        let (requested_from, requested_to) = ensure_run(&transaction, run)?;
         let coverage = coverage.unwrap_or(Coverage {
             from: requested_from,
             to: requested_to,
@@ -371,16 +409,15 @@ impl SqliteStore {
     /// Вернуть последнее по знанию опубликованное наблюдение цены.
     pub fn prices_at_or_before(
         &self,
-        instrument: InstrumentId,
-        venue: &Venue,
-        as_of: Date,
-        knowledge_as_of: OffsetDateTime,
-    ) -> Result<Option<PriceObservation>, StoreError> {
-        let row = self
-            .conn
+        instrument_id: &str,
+        venue: &PriceVenue,
+        as_of: &str,
+        knowledge_as_of: &str,
+    ) -> Result<Option<PriceRow>, StoreError> {
+        self.conn
             .query_row(
-                "SELECT p.trade_date, p.observed_at, p.kind, p.price,
-                        p.currency, p.executability
+                "SELECT p.instrument_id, p.board, p.session, p.trade_date,
+                        p.kind, p.observed_at, p.price, p.currency, p.executability
                  FROM price_observations AS p
                  JOIN sync_runs AS r ON r.id = p.sync_run_id
                  WHERE p.instrument_id = ?1
@@ -392,47 +429,32 @@ impl SqliteStore {
                  ORDER BY p.observed_at DESC
                  LIMIT 1",
                 params![
-                    instrument.inner().to_string(),
+                    instrument_id,
                     &venue.board,
                     venue.session,
-                    format_date(as_of),
-                    format_datetime(knowledge_as_of)?,
+                    as_of,
+                    knowledge_as_of
                 ],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
+                    Ok(PriceRow {
+                        instrument_id: row.get(0)?,
+                        board: row.get(1)?,
+                        session: row.get(2)?,
+                        trade_date: row.get(3)?,
+                        kind: row.get(4)?,
+                        observed_at: row.get(5)?,
+                        price: row.get(6)?,
+                        currency: row.get(7)?,
+                        executability: row.get(8)?,
+                    })
                 },
             )
-            .optional()?;
-        row.map(
-            |(trade_date, observed_at, kind, price, currency, executability)| {
-                Ok(PriceObservation {
-                    instrument,
-                    venue: venue.clone(),
-                    trade_date: crate_date(&trade_date)?,
-                    observed_at: crate_observed_at(&observed_at)?,
-                    kind: parse_price_kind(&kind)?,
-                    price: parse_dec(&price, "price")?,
-                    currency: parse_currency(&currency)?,
-                    executability: parse_executability(&executability)?,
-                })
-            },
-        )
-        .transpose()
+            .optional()
+            .map_err(StoreError::from)
     }
 }
 
-fn ensure_run(
-    transaction: &Transaction<'_>,
-    run: &RunHandle,
-    expected_dataset: &str,
-) -> Result<(Date, Date), StoreError> {
+fn ensure_run(transaction: &Transaction<'_>, run: &RunHandle) -> Result<(Date, Date), StoreError> {
     let row: Option<RunRow> = transaction
         .query_row(
             "SELECT source_id, dataset, series_key, status,
@@ -459,7 +481,6 @@ fn ensure_run(
     if source_id != run.series.source_id
         || dataset != run.series.dataset
         || series_key != run.series.series_key
-        || (!expected_dataset.is_empty() && dataset != expected_dataset)
     {
         return Err(StoreError::RunNotFound);
     }
@@ -483,97 +504,19 @@ fn format_date(date: Date) -> String {
         .expect("ISO-8601 date formatting is infallible")
 }
 
-fn parse_date(value: &str) -> Result<Date, StoreError> {
-    Date::parse(value, &Iso8601::DATE).map_err(|_| StoreError::InvalidValue {
-        field: "date",
-        value: value.to_owned(),
-    })
-}
-
-fn crate_date(value: &str) -> Result<iaam_market::observation::TradeDate, StoreError> {
-    Ok(iaam_market::observation::TradeDate(parse_date(value)?))
-}
-
-fn crate_observed_at(value: &str) -> Result<iaam_market::observation::ObservedAt, StoreError> {
-    OffsetDateTime::parse(value, &Rfc3339)
-        .map(iaam_market::observation::ObservedAt)
-        .map_err(|_| StoreError::InvalidValue {
-            field: "observed_at",
-            value: value.to_owned(),
-        })
-}
-
-fn parse_dec(
-    value: &str,
-    field: &'static str,
-) -> Result<iaam_core::numeric::decimal::Dec, StoreError> {
-    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|_| {
-        StoreError::InvalidValue {
-            field,
-            value: value.to_owned(),
-        }
-    })
-}
-
 fn format_datetime(value: OffsetDateTime) -> Result<String, StoreError> {
     value
         .to_offset(UtcOffset::UTC)
         .format(&Rfc3339)
         .map_err(|_| StoreError::InvalidValue {
-            field: "observed_at",
+            field: "lease_expires_at",
             value: value.to_string(),
         })
 }
 
-fn price_kind_code(kind: PriceKind) -> &'static str {
-    match kind {
-        PriceKind::Close => "close",
-        PriceKind::LegalClose => "legal_close",
-        PriceKind::WeightedAverage => "weighted_average",
-        PriceKind::MarketPrice2 => "market_price_2",
-        PriceKind::MarketPrice3 => "market_price_3",
-        PriceKind::AdmittedQuote => "admitted_quote",
-    }
-}
-
-fn parse_price_kind(value: &str) -> Result<PriceKind, StoreError> {
-    match value {
-        "close" => Ok(PriceKind::Close),
-        "legal_close" => Ok(PriceKind::LegalClose),
-        "weighted_average" => Ok(PriceKind::WeightedAverage),
-        "market_price_2" => Ok(PriceKind::MarketPrice2),
-        "market_price_3" => Ok(PriceKind::MarketPrice3),
-        "admitted_quote" => Ok(PriceKind::AdmittedQuote),
-        value => Err(StoreError::InvalidValue {
-            field: "kind",
-            value: value.to_owned(),
-        }),
-    }
-}
-
-fn executability_code(value: Executability) -> &'static str {
-    match value {
-        Executability::Executable => "executable",
-        Executability::IndicativePreviousClose => "indicative_previous_close",
-        Executability::Stale => "stale",
-    }
-}
-
-fn parse_executability(value: &str) -> Result<Executability, StoreError> {
-    match value {
-        "executable" => Ok(Executability::Executable),
-        "indicative_previous_close" => Ok(Executability::IndicativePreviousClose),
-        "stale" => Ok(Executability::Stale),
-        value => Err(StoreError::InvalidValue {
-            field: "executability",
-            value: value.to_owned(),
-        }),
-    }
-}
-
-fn parse_currency(value: &str) -> Result<iaam_core::money::CurrencyCode, StoreError> {
-    iaam_core::money::CurrencyCode::from_code(value).ok_or_else(|| StoreError::InvalidValue {
-        field: "currency",
+fn parse_date(value: &str) -> Result<Date, StoreError> {
+    Date::parse(value, &Iso8601::DATE).map_err(|_| StoreError::InvalidValue {
+        field: "date",
         value: value.to_owned(),
     })
 }

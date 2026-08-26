@@ -191,6 +191,20 @@ mod tests {
     }
 
     #[test]
+    fn exponential_backoff_uses_the_attempt_index_as_a_zero_based_power() {
+        let policy = policy();
+
+        assert_eq!(
+            policy.decide(1, &Outcome::Status(503)),
+            Retry::After(Duration::from_millis(100))
+        );
+        assert_eq!(
+            policy.decide(3, &Outcome::Status(503)),
+            Retry::After(Duration::from_millis(400))
+        );
+    }
+
+    #[test]
     fn attempts_are_exhausted_rather_than_looping_forever() {
         assert!(matches!(
             policy().decide(4, &Outcome::Status(503)),

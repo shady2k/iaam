@@ -38,3 +38,28 @@ pub enum HttpError {
     #[error("вшитый корень доверия не разобран: {0}")]
     TrustAnchorNotParsed(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_utf8_returns_the_exact_valid_body() {
+        let response = HttpResponse {
+            status: 200,
+            body: "ответ".as_bytes().to_vec(),
+        };
+
+        assert_eq!(response.text_utf8(), Some("ответ"));
+    }
+
+    #[test]
+    fn text_utf8_rejects_invalid_utf8() {
+        let response = HttpResponse {
+            status: 200,
+            body: vec![0xff, 0xfe],
+        };
+
+        assert_eq!(response.text_utf8(), None);
+    }
+}

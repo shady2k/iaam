@@ -8,12 +8,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use reqwest::Client;
-
 use crate::destination::Destination;
 use crate::request::{HttpMethod, HttpRequest};
 use crate::response::{HttpError, HttpResponse};
-use crate::trust::client_for;
+use crate::trust::{ConfiguredClient, client_for};
 
 /// Предел ожидания ответа.
 ///
@@ -23,7 +21,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Клиент исходящих запросов.
 pub struct HttpClient {
-    pool: Mutex<HashMap<Destination, Client>>,
+    pool: Mutex<HashMap<Destination, ConfiguredClient>>,
 }
 
 impl Default for HttpClient {
@@ -40,7 +38,10 @@ impl HttpClient {
         }
     }
 
-    pub(crate) fn client_for(&self, destination: Destination) -> Result<Client, HttpError> {
+    pub(crate) fn client_for(
+        &self,
+        destination: Destination,
+    ) -> Result<ConfiguredClient, HttpError> {
         let mut pool = self
             .pool
             .lock()
@@ -68,8 +69,8 @@ impl HttpClient {
     pub async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let client = self.client_for(request.destination())?;
         let mut builder = match request.method() {
-            HttpMethod::Get => client.get(request.url()),
-            HttpMethod::Post => client.post(request.url()),
+            HttpMethod::Get => client.0.get(request.url()),
+            HttpMethod::Post => client.0.post(request.url()),
         };
         builder = builder.timeout(REQUEST_TIMEOUT);
         if let Some(secret) = request.bearer() {

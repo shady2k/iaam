@@ -8,3 +8,4 @@ ccd713ccbfc6e7119dc486150ffd2aa1f3f9181537d58194488a0c0e039b8329  tests/fixtures
 3024e3f1ca9bb71a1ee48132d8e2b7ae83a75c1925f2a31b460194d5f9506ae5  tests/fixtures/reports/tinkoff-synthetic.xlsx
 53b162f69a5d87e3a8314232318a9e85fcbbcff2b3d971ce4823ec1cc0d3716f  tests/fixtures/reports/finam-synthetic.xls
 2dec59a34e9cc4f902e333dcab283bd0149b7ab38ed845c6edd6110c2d1bed36  tests/fixtures/market/moex-iss-history-sber.json
+800e7c7560ae1b533695f3da7d3a9d69b4400d3023d102d4135abc4713807feb  tests/fixtures/market/cbr-keyrate-soap.xml

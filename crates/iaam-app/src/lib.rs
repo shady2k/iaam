@@ -13,6 +13,7 @@ pub mod adapters;
 pub use iaam_ingest as ingest;
 
 pub mod error;
+pub mod jobs;
 pub mod ports;
 pub mod scenarios;
 #[path = "scenarios/sync.rs"]

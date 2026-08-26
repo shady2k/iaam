@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use axum::routing::get;
 use axum::{Json, Router, middleware};
 use iaam_app::AppServices;
+use iaam_app::jobs::{MarketScheduler, MarketSyncJob};
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -31,6 +32,8 @@ use crate::rate_limit::RateLimiter;
 pub struct ServerState {
     pub services: Arc<AppServices>,
     pub limiter: Arc<RateLimiter>,
+    /// Планировщик рыночных серий. Другие виды заданий сюда не попадают.
+    pub market_scheduler: Arc<MarketScheduler>,
     /// Код присвоения экземпляра. `None` — присваивать нечего:
     /// владелец либо уже есть, либо код уже использован.
     ///
@@ -45,10 +48,16 @@ impl ServerState {
     #[must_use]
     pub fn new(services: Arc<AppServices>, limiter: Arc<RateLimiter>) -> Self {
         Self {
+            market_scheduler: Arc::new(MarketScheduler::new(services.clone())),
             services,
             limiter,
             claim: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Зарегистрировать одну рыночную серию до запуска сервера.
+    pub fn register_market_job(&self, job: Arc<MarketSyncJob>) {
+        self.market_scheduler.register(job);
     }
 
     /// Взвести код присвоения. Зовётся при старте — см. `claim::arm`.
@@ -96,6 +105,11 @@ impl ServerState {
 /// защищённый маршрут ему нечем. Вместо токена его пускает одноразовый
 /// код, прочитанный с консоли, — см. `claim`.
 pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
+    // В рабочем процессе build вызывается внутри tokio runtime. Проверка
+    // сохраняет возможность собирать Router в обычном синхронном тесте.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let _ = state.market_scheduler.clone().spawn();
+    }
     let protected = OpenApiRouter::new()
         .routes(routes!(routes::list_accounts, routes::create_account))
         .routes(routes!(routes::list_instruments, routes::create_instrument))

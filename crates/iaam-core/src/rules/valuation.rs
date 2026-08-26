@@ -414,7 +414,11 @@ mod tests {
         );
         let report_over_owner = policy().select(&query, &[owner, report]);
         assert!(matches!(
-            report_over_owner.selected().expect("отчёт приоритетнее владельца").candidate.origin,
+            report_over_owner
+                .selected()
+                .expect("отчёт приоритетнее владельца")
+                .candidate
+                .origin,
             PriceOrigin::ReportParsed { .. }
         ));
 
@@ -435,11 +439,14 @@ mod tests {
         );
         let market_over_report = policy().select(&query, &[report, market]);
         assert!(matches!(
-            market_over_report.selected().expect("биржа приоритетнее отчёта").candidate.origin,
+            market_over_report
+                .selected()
+                .expect("биржа приоритетнее отчёта")
+                .candidate
+                .origin,
             PriceOrigin::Market { .. }
         ));
     }
-
 
     #[test]
     fn two_venues_without_a_directory_preference_are_a_refusal_not_a_guess() {
@@ -553,12 +560,8 @@ mod tests {
             selected_kind(&["admitted_quote", "close"]),
             Some(Some("admitted_quote".to_owned()))
         );
-        assert_eq!(
-            selected_kind(&["close"]),
-            Some(Some("close".to_owned()))
-        );
+        assert_eq!(selected_kind(&["close"]), Some(Some("close".to_owned())));
     }
-
 
     #[test]
     fn equal_candidates_are_ambiguous_instead_of_ordered_by_incidental_input() {

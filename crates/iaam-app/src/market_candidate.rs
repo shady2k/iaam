@@ -1,5 +1,7 @@
 //! Преобразование рыночных наблюдений в доменные кандидаты.
-use iaam_core::valuation::{PriceCandidate, PriceKind as CorePriceKind, PriceOrigin, SourceExecutability};
+use iaam_core::valuation::{
+    PriceCandidate, PriceKind as CorePriceKind, PriceOrigin, SourceExecutability,
+};
 use iaam_market::{Executability, PriceKind, PriceObservation};
 
 /// Преобразует рыночное наблюдение в кандидата доменной оценки.
@@ -212,7 +214,10 @@ mod tests {
             .selected()
             .expect("MarketPrice2 должен покрывать строку");
 
-        assert_eq!(selected.provenance.price_kind.as_deref(), Some("market_price_2"));
+        assert_eq!(
+            selected.provenance.price_kind.as_deref(),
+            Some("market_price_2")
+        );
         assert!(matches!(
             selected.candidate.origin,
             PriceOrigin::Market {
@@ -221,5 +226,4 @@ mod tests {
             }
         ));
     }
-
 }

@@ -805,12 +805,13 @@ git commit -m "feat(market): MOEX ISS — запрос истории и раз�
 
 **Interfaces:**
 - Consumes: `FxObservation`, `TradeDate`, `ObservedAt`, `MarketError` (задача 1); `HttpRequest`, `Destination::CbrScripts`.
-- Produces: `daily_request(on: Date) -> HttpRequest`; `dynamic_request(from: Date, till: Date, cbr_currency_id: &str) -> HttpRequest`; `decode_cp1251(bytes: &[u8]) -> String`; `parse_daily(xml: &str, observed_at) -> Result<Vec<FxObservation>, MarketError>`; `parse_dynamic(xml: &str, to: CurrencyCode, observed_at) -> Result<Vec<FxObservation>, MarketError>`.
+- Produces: `daily_request(on: Date) -> HttpRequest`; `dynamic_request(from: Date, till: Date, cbr_currency_id: &str) -> HttpRequest`; `decode_cp1251(bytes: &[u8]) -> String`; `parse_daily_raw(xml: &str) -> Result<Vec<CbrRate>, MarketError>` где `CbrRate { char_code: String, nominal: u32, value: Decimal, unit_rate: Decimal, date: Date }`; `parse_daily(xml: &str, observed_at) -> Result<Vec<FxObservation>, MarketError>`; `parse_dynamic(xml: &str, to: CurrencyCode, observed_at) -> Result<Vec<FxObservation>, MarketError>`.
 
 **Acceptance Criteria:**
 - **Байты декодируются из `windows-1251`.** Ответ ЦБ объявляет эту кодировку в прологе; `String::from_utf8` на нём падает, а lossy-декодирование испортило бы названия валют.
 - **Десятичная запятая разбирается как запятая.** `85,1293` — это значение; `parse::<Decimal>()` на нём падает, а `replace(',', '.')` без осознания того, что это конвенция источника, — случайность, а не решение.
 - `Nominal` и `VunitRate` хранятся **оба**: расхождение между ними сигналит о порче разбора.
+- **Разбор двухслойный.** Сырой слой (`CbrRate`) держит `CharCode` строкой и проверяется независимо от того, какие валюты знает ядро; отображение в `CurrencyCode` — отдельный шаг, пропускающий незнакомые валюты. Слой не украшение: у всех валют, которые ядро знает, номинал ЦБ равен единице, и без сырого слоя работу с номиналом нечем проверить. Добавлять валюту в исчерпаемое перечисление ядра ради теста **запрещено** — это ломает сборку у всех потребителей и является отдельным решением владельца.
 - Дата ЦБ приходит как `DD.MM.YYYY`, а не ISO.
 - Ряд идёт по рабочим дням: выходных в нём нет, и отсутствие дня — не ошибка разбора.
 - Обе фикстуры и тесты ложатся одним коммитом; манифест обновлён.
@@ -866,16 +867,48 @@ mod tests {
 
     #[test]
     fn nominal_and_unit_rate_are_both_kept() {
+        // Проверяется на СЫРОМ слое, а не на наблюдениях, и это не обход:
+        // у всех валют, которые знает ядро (RUB, USD, EUR, CNY), номинал
+        // ЦБ равен единице, и различие value/unit_rate на них ненаблюдаемо.
+        // Номинал больше единицы есть у иены (100) и лиры (10) — валют,
+        // которых в ядре нет. Сырой слой существует именно поэтому:
+        // разбор обязан быть проверяем независимо от того, какие валюты
+        // система учитывает сегодня.
         let text = decode_cp1251(DAILY);
-        let rates = parse_daily(&text, observed()).expect("разбор");
-        let jpy = rates
+        let raw = parse_daily_raw(&text).expect("разбор");
+        let jpy = raw
             .iter()
-            .find(|r| r.from == CurrencyCode::Jpy)
+            .find(|r| r.char_code == "JPY")
             .expect("иена есть в справочнике ЦБ");
-        // ЦБ публикует иену за 100 единиц. Голое значение без номинала
-        // неинтерпретируемо, а unit_rate — независимая проверка разбора.
-        assert!(jpy.nominal > 1, "номинал иены обязан быть больше единицы");
-        assert_ne!(jpy.value, jpy.unit_rate, "значение за номинал и за единицу совпали");
+        assert_eq!(jpy.nominal, 100, "ЦБ публикует иену за сто единиц");
+        assert_ne!(
+            jpy.value, jpy.unit_rate,
+            "значение за номинал и за единицу совпали — номинал потерян"
+        );
+    }
+
+    #[test]
+    fn a_currency_the_core_does_not_know_is_skipped_not_an_error() {
+        // Справочник ЦБ содержит десятки валют, которых система
+        // не учитывает. Объявить их ошибкой значило бы уронить разбор
+        // всего ответа из-за валюты, которая никому не нужна.
+        let text = decode_cp1251(DAILY);
+        let raw = parse_daily_raw(&text).expect("разбор");
+        let observations = parse_daily(&text, observed()).expect("разбор");
+        assert!(
+            raw.len() > observations.len(),
+            "в справочнике ЦБ больше валют, чем знает ядро: {} против {}",
+            raw.len(),
+            observations.len()
+        );
+        assert!(
+            raw.iter().any(|r| r.char_code == "JPY"),
+            "иена в сыром слое есть"
+        );
+        assert!(
+            observations.iter().all(|o| o.from != CurrencyCode::Rub),
+            "рубль не является исходной валютой в котировках ЦБ"
+        );
     }
 
     #[test]

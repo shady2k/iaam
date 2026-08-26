@@ -378,6 +378,39 @@ mod tests {
     }
 
     #[test]
+    fn mixed_decimal_separators_report_a_malformed_number() {
+        let error = parse_cbr_decimal("85,1293.").expect_err("смешанные разделители недопустимы");
+
+        match error {
+            MarketError::Malformed(message) => {
+                assert!(
+                    message.starts_with("число 85,1293.:"),
+                    "ожидалась ошибка разбора числа, получено: {message}"
+                );
+            }
+            other => panic!("ожидалась ошибка числа, получено: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_nominal_is_rejected_as_an_invalid_cbr_record() {
+        let error = RateBuilder {
+            char_code: Some("USD".to_owned()),
+            nominal: Some(0),
+            value: Some(Decimal::ONE),
+            unit_rate: Some(Decimal::ONE),
+            date: Some(date!(2026 - 08 - 04)),
+        }
+        .finish()
+        .expect_err("нулевой номинал не является записью ЦБ");
+
+        assert_eq!(
+            error,
+            MarketError::Malformed("у записи ЦБ отсутствует номинал".to_owned())
+        );
+    }
+
+    #[test]
     fn nominal_and_unit_rate_are_both_kept() {
         // Проверяется на СЫРОМ слое, а не на наблюдениях, и это не обход:
         // у всех валют, которые знает ядро (RUB, USD, EUR, CNY), номинал
@@ -408,6 +441,19 @@ mod tests {
         let raw = parse_daily_raw(&text).expect("разбор");
         let observations = parse_daily(&text, observed()).expect("разбор");
         assert!(
+            !observations.is_empty(),
+            "дневной ответ должен дать известные валюты, а не только пропуски"
+        );
+        for expected in [CurrencyCode::Usd, CurrencyCode::Eur, CurrencyCode::Cny] {
+            assert!(
+                observations
+                    .iter()
+                    .any(|observation| observation.from == expected),
+                "известная валюта {expected:?} не попала в наблюдения"
+            );
+        }
+
+        assert!(
             raw.len() > observations.len(),
             "в справочнике ЦБ больше валют, чем знает ядро: {} против {}",
             raw.len(),
@@ -421,6 +467,52 @@ mod tests {
             observations.iter().all(|o| o.from != CurrencyCode::Rub),
             "рубль не является исходной валютой в котировках ЦБ"
         );
+    }
+
+    #[test]
+    fn every_supported_iso_currency_maps_to_its_domain_code() {
+        let cases = [
+            ("RUB", CurrencyCode::Rub),
+            ("USD", CurrencyCode::Usd),
+            ("EUR", CurrencyCode::Eur),
+            ("CNY", CurrencyCode::Cny),
+            ("XAU", CurrencyCode::Xau),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(
+                currency_from_iso(source),
+                Some(expected),
+                "код источника {source} должен быть известен ядру"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_iso_currency_is_not_mapped() {
+        assert_eq!(currency_from_iso("JPY"), None);
+    }
+
+    #[test]
+    fn every_supported_cbr_id_maps_to_its_domain_code() {
+        let cases = [
+            ("R01235", CurrencyCode::Usd),
+            ("R01239", CurrencyCode::Eur),
+            ("R01375", CurrencyCode::Cny),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(
+                currency_from_cbr_id(source),
+                Some(expected),
+                "идентификатор ЦБ {source} должен быть известен ядру"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_cbr_id_is_not_mapped() {
+        assert_eq!(currency_from_cbr_id("R99999"), None);
     }
 
     #[test]

@@ -240,6 +240,16 @@ mod tests {
     }
 
     #[test]
+    fn the_soap_envelope_uses_iso_dates_for_both_bounds() {
+        let request = key_rate_request(date!(2026 - 02 - 01), date!(2026 - 04 - 30));
+        let body = request.body().expect("SOAP-запрос должен иметь тело");
+        let payload = body.payload();
+
+        assert!(payload.contains("<fromDate>2026-02-01T00:00:00</fromDate>"));
+        assert!(payload.contains("<ToDate>2026-04-30T00:00:00</ToDate>"));
+    }
+
+    #[test]
     fn the_source_gives_business_day_observations_not_intervals() {
         let observations = parse_key_rate(FIXTURE, observed()).expect("разбор");
         assert_eq!(observations.len(), 63);
@@ -250,6 +260,26 @@ mod tests {
             )),
             "в ряду только рабочие дни"
         );
+    }
+
+    #[test]
+    fn rate_elements_outside_key_rate_records_are_ignored() {
+        let xml = r#"
+            <Envelope>
+                <Rate>not-a-rate</Rate>
+                <KeyRate>
+                    <KR>
+                        <DT>2026-08-04T00:00:00+03:00</DT>
+                        <Rate>16.00</Rate>
+                    </KR>
+                </KeyRate>
+            </Envelope>
+        "#;
+
+        let observations = parse_key_rate(xml, observed()).expect("разбор");
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].trade_date, TradeDate(date!(2026 - 08 - 04)));
     }
 
     #[test]

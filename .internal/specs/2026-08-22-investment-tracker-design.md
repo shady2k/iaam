@@ -128,25 +128,31 @@ ScenarioInput {
 #### Граф зависимостей
 
 ```
-                    iaam-core
-                 ↑      ↑      ↑
-          iaam-store  iaam-market  iaam-ingest
-                 ↖      ↑      ↗
-                    iaam-app
-                    ↑        ↑
-              iaam-server  iaam-cli
+                            iaam-core
+                         ↑      ↑      ↑
+                  iaam-store  iaam-market  iaam-ingest
+                         ↖      ↑      ↗
+                            iaam-app
+                            ↑        ↑
+                      iaam-server  iaam-cli
+
+  iaam-http ← iaam-market,  iaam-http ← iaam-broker
 ```
 
 | Крейта | Зависит от | Ответственность |
 |---|---|---|
 | `iaam-core` | — | доменные типы, журнал, проекции, лоты, доходность, налоги, тождество результата |
 | `iaam-store` | core | SQLite, миграции, архивный бандл |
-| `iaam-market` | core (только доменные типы) | MOEX, ЦБ РФ, кэш, устойчивость, история цен |
+| `iaam-market` | core (только доменные типы) + iaam-http | MOEX, ЦБ РФ, кэш, устойчивость, история цен |
 | `iaam-ingest` | core | разбор источников, сверка, статусы достоверности |
 | `iaam-app` | core + store + market + ingest | сценарии, порты, снимки, кэш |
 | `iaam-server` | app | axum, REST, OpenAPI, аутентификация |
 | `iaam-cli` | app | локальные команды |
+| `iaam-http` | — | исходящий HTTP, якоря доверия, повторы и задержки, ограничение частоты |
+| `iaam-broker` | core + iaam-http | описание запросов брокеров, разбор отчётов и выгрузок |
 
+
+**`iaam-broker` отсутствовал в графе:** он появился в E2 и не попал в документ; это исправление старой дыры, а не следствие E3.2.
 **`iaam-server` не зависит напрямую от `iaam-store` и `iaam-market`** — кроме сборки конкретных реализаций в точке сборки. Иначе заявленная взаимозаменяемость транспорта фиктивна: обработчики HTTP начнут оркестрировать адаптеры, а CLI продублирует эту оркестрацию.
 
 #### Никакого общего крейта «shared» / «common» / «utils»

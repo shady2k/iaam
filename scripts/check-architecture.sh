@@ -225,6 +225,23 @@ for crate_dir in crates/*/src; do
   fi
 done
 
+# --- 11. Транспорт живёт в одной крейте ---
+# §3.1 и раздел 2.1 дизайна E3.2: крейты источников описывают запрос
+# и разбирают ответ, но HTTP не знают. Проверяются МАНИФЕСТЫ, а не
+# исходники: объявленная и пока неиспользованная зависимость —
+# это разрешение воспользоваться ею завтра, без единой правки заслона.
+for manifest in crates/*/Cargo.toml; do
+  [ -f "$manifest" ] || continue
+  case "$manifest" in
+    crates/iaam-http/Cargo.toml) continue ;;
+  esac
+  hits=$(grep -n '^[[:space:]]*reqwest[[:space:]]*=' "$manifest" || true)
+  if [ -n "$hits" ]; then
+    err "$manifest объявляет reqwest: исходящий HTTP живёт только в iaam-http (§3.1)"
+    echo "$hits" >&2
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "" >&2
   echo "Архитектурные заслоны не пройдены. Правьте код, а не заслон." >&2

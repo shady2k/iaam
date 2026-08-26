@@ -5,6 +5,7 @@
 //! приходит из `iaam-core`.
 
 pub mod adapters;
+pub mod market_candidate;
 /// Типы приёмки, доступные транспорту.
 ///
 /// `iaam-server` не зависит от `iaam-ingest` напрямую — это запрещено

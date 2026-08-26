@@ -259,6 +259,7 @@ mod tests {
     use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
     use crate::projection::{ProjectionContext, project};
     use crate::reconciliation::ReconciliationLedger;
+    use crate::returns::KnowledgeCoordinate;
     use crate::rules::{LotRuleVersion, RuleRegistry};
     use crate::valuation::{FxSource, FxTable};
     use time::macros::date;
@@ -351,6 +352,7 @@ mod tests {
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let request = ReturnsRequest {
             contour: &requested_contour,
+            coordinate: KnowledgeCoordinate::default(),
             as_of: date!(2026 - 01 - 04),
             report_currency: CurrencyCode::Rub,
             fx: &fx,

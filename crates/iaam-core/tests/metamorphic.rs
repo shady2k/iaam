@@ -160,6 +160,7 @@ fn report(events: &[Event], accounts: &[AccountId], as_of: Date) -> ReturnsRepor
         projection.state(),
         &ReturnsRequest {
             contour: &contour,
+            coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
             as_of,
             report_currency: CurrencyCode::Rub,
             fx: &fx,

@@ -218,6 +218,7 @@ fn report(
         projection.state(),
         &ReturnsRequest {
             contour,
+            coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
             as_of,
             report_currency: CurrencyCode::Rub,
             fx: &fx,

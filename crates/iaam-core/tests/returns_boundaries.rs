@@ -104,6 +104,7 @@ fn a_flow_on_the_report_date_is_included() {
     );
     let request = ReturnsRequest {
         contour: &fixture.contour,
+        coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,
@@ -134,6 +135,7 @@ fn a_slice_containing_events_after_the_report_date_is_refused() {
     );
     let request = ReturnsRequest {
         contour: &fixture.contour,
+        coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,
@@ -168,6 +170,7 @@ fn a_slice_ending_exactly_on_the_report_date_is_accepted() {
     );
     let request = ReturnsRequest {
         contour: &fixture.contour,
+        coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,

@@ -207,6 +207,7 @@ fn single_account_answers_the_three_questions_of_stage_one() {
     );
     let request = ReturnsRequest {
         contour: &contour,
+        coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
         as_of: date!(2026 - 01 - 01),
         report_currency: CurrencyCode::Rub,
         fx: &fx,

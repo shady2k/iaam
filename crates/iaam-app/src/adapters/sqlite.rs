@@ -21,7 +21,7 @@ use iaam_store::SqliteStore;
 use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
 use iaam_store::documents::BrokerCode;
 use iaam_store::events::Appended;
-use iaam_store::reference::AccountRecord;
+use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
 use uuid::Uuid;
@@ -29,10 +29,10 @@ use zeroize::Zeroizing;
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountView, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
+    AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
     BrokerEnvironment, BrokerVault, ClassificationRuleStore, ClassificationRuleView, CustodyView,
-    InstrumentDirectory, InstrumentView, IssuedToken, Principal, Recorded, Scope, SoleOwner, Store,
-    TokenAdmin, TokenView,
+    InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal, Recorded, Scope,
+    SoleOwner, Store, TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 
@@ -340,6 +340,52 @@ impl Store for SqliteAdapter {
 
 #[async_trait]
 impl InstrumentDirectory for SqliteAdapter {
+    async fn record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError> {
+        let InstrumentUpsert {
+            id,
+            kind,
+            symbol,
+            title,
+            currencies,
+            lineage,
+        } = record;
+        self.blocking(move |store| {
+            store
+                .upsert_instrument(&InstrumentRecord {
+                    id,
+                    kind,
+                    symbol,
+                    title,
+                    currencies,
+                    lineage,
+                })
+                .map_err(store_error)?;
+            Ok(id)
+        })
+        .await
+    }
+
+    async fn record_alias(&self, alias: AliasUpsert) -> Result<(), AppError> {
+        let AliasUpsert {
+            namespace,
+            value,
+            instrument,
+            interval,
+            source,
+        } = alias;
+        self.blocking(move |store| {
+            store
+                .record_alias(&AliasRecord {
+                    namespace,
+                    value,
+                    instrument,
+                    interval,
+                    source,
+                })
+                .map_err(store_error)
+        })
+        .await
+    }
     async fn resolve(
         &self,
         namespace: &str,

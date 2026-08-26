@@ -2491,3 +2491,42 @@ async fn an_agent_token_may_not_write_to_the_directory() {
         "справочник глобален: чужая запись портит данные всех владельцев"
     );
 }
+
+#[tokio::test]
+async fn an_owner_can_record_an_instrument_in_directory() {
+    let harness = harness();
+    let instrument = Uuid::new_v4().to_string();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/instruments",
+            &harness.owner_token,
+            &json!({
+                "id": instrument,
+                "kind": "share",
+                "symbol": "GAZP",
+                "title": "Газпром",
+                "denomination_currency": "RUB",
+                "settlement_currency": "RUB",
+                "quote_currency": "RUB",
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["id"], instrument);
+    assert_eq!(body["symbol"], "GAZP");
+
+    let (status, stored) = call(
+        &harness.router,
+        get(
+            &format!("/v1/instruments/{instrument}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored["title"], "Газпром");
+    assert_eq!(stored["quote_currency"], "RUB");
+}

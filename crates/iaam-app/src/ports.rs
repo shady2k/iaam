@@ -110,6 +110,31 @@ pub struct CustodyView {
     pub institution: Option<String>,
 }
 
+/// Данные инструмента от разрешённого источника записи.
+///
+/// Идентификатор назначает вызывающий: синхронизация сначала разрешает
+/// существующий внешний код, а для новой бумаги создаёт идентификатор и
+/// затем связывает его с псевдонимами.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentUpsert {
+    pub id: InstrumentId,
+    pub kind: Option<iaam_core::instrument::InstrumentKind>,
+    pub symbol: String,
+    pub title: String,
+    pub currencies: iaam_core::instrument::CurrencyRoles,
+    pub lineage: Option<iaam_core::instrument::Lineage>,
+}
+
+/// Псевдоним инструмента от разрешённого источника записи.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasUpsert {
+    pub namespace: iaam_core::instrument::AliasNamespace,
+    pub value: String,
+    pub instrument: InstrumentId,
+    pub interval: iaam_core::instrument::AliasInterval,
+    pub source: iaam_core::ids::SourceId,
+}
+
 /// Справочник инструментов (§4.5, §4.7).
 #[async_trait]
 pub trait InstrumentDirectory: Send + Sync {
@@ -134,6 +159,15 @@ pub trait InstrumentDirectory: Send + Sync {
     /// Отдаются целиком, одним запросом: разбор документа иначе ходил бы
     /// в базу на каждую строку.
     async fn list_aliases(&self) -> Result<Vec<AliasView>, AppError>;
+
+    /// Создать или обновить инструмент и вернуть его идентификатор.
+    ///
+    /// Запись нужна синхронизации источников и администратору; агентский
+    /// токен не получает этот метод через HTTP-маршрут (§7, §14).
+    async fn record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError>;
+
+    /// Записать внешний код инструмента с интервалом действия.
+    async fn record_alias(&self, alias: AliasUpsert) -> Result<(), AppError>;
 
     async fn list_custody_places(&self, owner: OwnerId) -> Result<Vec<CustodyView>, AppError>;
 }

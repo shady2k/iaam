@@ -10,6 +10,9 @@ rust-version.workspace = true
 # деньги. Ядро — единственная крейта, которую этому адаптеру знать можно;
 # соседние адаптеры запрещены заслоном архитектуры (§3.2).
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
+# Исходящий HTTP, доверие и устойчивость живут в одной крейте:
+# описание запроса и разбор ответа транспорта не знают (§3.1).
+iaam-http = { path = "../iaam-http", version = "0.1.0" }
 # Даты интервала и момента утверждения. Своя арифметика календаря
 # в разборе — лишнее место для ошибки.
 time = { version = "0.3", default-features = false, features = ["std", "parsing", "formatting", "macros"] }
@@ -24,9 +27,6 @@ base64 = { version = "0.23", default-features = false, features = ["std"] }
 # оставшаяся в освобождённой памяти, — это тот же секрет.
 zeroize = { version = "1", features = ["alloc"] }
 thiserror = "2"
-# HTTP-клиент шлюза брокера. rustls без встроенных корней: клиент
-# доверяет ровно тому, что ему дали, и ничему больше.
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -37,8 +37,6 @@ serde_json = "1"
 sandbox = []
 
 [dev-dependencies]
-# Отпечаток вшитого корня доверия проверяется тестом.
-sha2 = "0.11"
 # Для примера живой проверки и для тестов режима песочницы.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Режим песочницы берёт заведённый доступ из базы, а не из переменной

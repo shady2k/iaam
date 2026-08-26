@@ -24,11 +24,11 @@ use time::{Duration, OffsetDateTime};
 
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open};
 use iaam_broker::environment::Environment;
-use iaam_broker::trust::tinkoff_client;
+use iaam_http::client::HttpClient;
+use iaam_http::{Destination, HttpRequest, RequestBody};
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::SoleOwner;
 use iaam_store::documents::BrokerCode;
-use reqwest::Client;
 use serde_json::{Value, json};
 
 const BROKER: &str = "tinkoff";
@@ -74,14 +74,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))?;
-    let client = tinkoff_client()?;
-    let base_url = Environment::Sandbox.base_url();
+    let client = HttpClient::new();
 
     // Запрашиваем только действующие счета: закрытый счёт не подходит для
     // следующих вызовов и сделал бы запись образцов случайной.
     let accounts = fetch_raw(
         &client,
-        base_url,
+        Destination::TinkoffSandbox,
         ACCOUNTS_METHOD,
         token.expose(),
         json!({"status": "ACCOUNT_STATUS_OPEN"}),
@@ -92,7 +91,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let portfolio = fetch_raw(
         &client,
-        base_url,
+        Destination::TinkoffSandbox,
         PORTFOLIO_METHOD,
         token.expose(),
         json!({"accountId": account_id.as_str()}),
@@ -102,7 +101,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let operations = fetch_raw(
         &client,
-        base_url,
+        Destination::TinkoffSandbox,
         OPERATIONS_METHOD,
         token.expose(),
         json!({
@@ -163,26 +162,25 @@ fn interval(days: u64) -> Result<(String, String), io::Error> {
 }
 
 async fn fetch_raw(
-    client: &Client,
-    base_url: &str,
+    client: &HttpClient,
+    destination: Destination,
     method: &str,
     token: &str,
     body: Value,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let response = client
-        .post(format!("{base_url}/{method}"))
-        .header("Content-Type", "application/json")
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
+    let request = HttpRequest::post(
+        destination,
+        method,
+        RequestBody::Json(serde_json::to_string(&body)?),
+    )
+    .with_bearer(token);
+    let response = client.send(&request).await?;
+    if !(200..=299).contains(&response.status) {
         // Тело отказа не попадает ни в файл, ни в ошибку: шлюз не обязан
         // отделять диагностические данные от данных владельца.
-        return Err(io::Error::other(format!("{method} вернул HTTP {status}")).into());
+        return Err(io::Error::other(format!("{method} вернул HTTP {}", response.status)).into());
     }
-    Ok(response.bytes().await?.to_vec())
+    Ok(response.body)
 }
 
 fn account_id(body: &[u8]) -> Result<String, Box<dyn Error>> {

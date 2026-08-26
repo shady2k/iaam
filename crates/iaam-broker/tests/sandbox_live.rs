@@ -42,14 +42,14 @@ fn required(variable: &str) -> PathBuf {
     }))
 }
 
-trait HttpStatusExt {
-    fn is_success(self) -> bool;
-}
-
-impl HttpStatusExt for u16 {
-    fn is_success(self) -> bool {
-        (200..=299).contains(&self)
-    }
+/// Успешен ли код ответа.
+///
+/// Свободная функция, а не метод трейта `is_*` на `u16`: клиппи требует,
+/// чтобы `is_*` брал `self` по ссылке, а брать по ссылке двухбайтовое
+/// число незачем. `reqwest::StatusCode::is_success` больше недоступен —
+/// транспорт отдаёт код числом.
+const fn status_is_success(status: u16) -> bool {
+    status >= 200 && status <= 299
 }
 
 #[tokio::test]
@@ -100,7 +100,7 @@ async fn the_sandbox_accepts_the_provisioned_access() {
     let status = response.status;
     let body = String::from_utf8(response.body).unwrap_or_default();
     assert!(
-        status.is_success(),
+        status_is_success(status),
         "песочница отклонила заведённый доступ: HTTP {status}: {body}"
     );
 }

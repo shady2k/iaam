@@ -243,7 +243,7 @@ fn rfc3339_midnight(date: time::Date) -> String {
 fn tinkoff_error(error: TinkoffError) -> BrokerError {
     let detail = error.to_string();
     match error {
-        TinkoffError::Network | TinkoffError::RateLimited | TinkoffError::Trust(_) => {
+        TinkoffError::Network | TinkoffError::RateLimited | TinkoffError::Transport(_) => {
             BrokerError::Unreachable {
                 broker: BROKER.to_owned(),
                 detail,

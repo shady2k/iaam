@@ -1354,3 +1354,179 @@ grep -rn "reqwest" crates/*/Cargo.toml | grep -v iaam-http && echo "ПРОВАЛ
 ## Что остаётся на задачи 6–9
 
 Пишется после того, как задачи 1–5 лягут в код, чтобы опираться на реальные сигнатуры: запись наблюдений и границы полноты, атомарная публикация единицы, путь записи в справочник (`iaam-z9n`), пространство имён кода (`iaam-h9n`), сценарий синхронизации и ручной запуск.
+
+---
+
+# Задачи 6–9
+
+Написаны после сдачи задач 1–5, по реальным сигнатурам. Ссылки на код ниже
+указывают на то, что действительно лежит в ветке `e3-market-data`.
+
+**Порядок и параллельность второй половины.** Задачи 6, 7 и 8 независимы
+по файлам и идут **параллельно**: хранилище, приложение с транспортом,
+приёмка. Задача 9 идёт последней: она правит `crates/iaam-app/src/ports.rs`,
+который в это же время правит задача 7, и параллельный запуск дал бы гонку
+за один файл.
+
+**Конфликт манифеста фикстур — ожидаемый, а не случайный.** Любые две
+задачи, добавляющие эталон, дописывают строку в конец
+`tests/fixtures/MANIFEST.sha256`. В части 2 это дало два конфликта подряд.
+Разрешение всегда одно: оставить обе строки и **сверить суммы с файлами**
+(`sha256sum -c tests/fixtures/MANIFEST.sha256`), а не принять строки на веру.
+Разрешает координатор при слиянии; воркеру трогать чужие строки запрещено.
+
+---
+
+### Task 6: Запись наблюдений, единицы полноты, атомарная публикация
+
+**Files:**
+- Create: `crates/iaam-store/src/market.rs`
+- Modify: `crates/iaam-store/src/lib.rs` (объявить модуль)
+- Create: `crates/iaam-store/tests/market_observations.rs`
+
+**Interfaces:**
+- Consumes: таблицы `price_observations`, `fx_observations`, `key_rate_observations`, `sync_runs`, `series_completeness` (миграция 0006, задача 5).
+- Produces: `MarketStore::{begin_run, record_prices, record_fx, record_key_rate, finish_run, complete_through, prices_at_or_before}`; `RunOutcome::{Succeeded, Partial { reason: String }, Failed { reason: String }}`; `SeriesKey { source_id: String, dataset: String, series_key: String }`.
+
+**Acceptance Criteria:**
+- **Повторная запись того же наблюдения с другим значением добавляет строку**, а не заменяет: отчёт по прежней координате продолжает давать прежнее число.
+- **Граница полноты не продвигается при `Partial` и `Failed`.** Это прямой ответ на требование бида `iaam-023.5` «частичная выгрузка не должна выдаваться за полную», и главный инвариант задачи.
+- Публикация атомарна **внутри единицы** `(источник, набор, серия)`: строки незавершённого запуска в выборку не попадают.
+- Отказ одной серии не задерживает публикацию других: глобального поколения нет.
+- Аренда не даёт двум запускам работать над одной серией одновременно.
+- `prices_at_or_before(instrument, venue, as_of, knowledge_as_of)` отдаёт **последнее по знанию** наблюдение не позже `as_of` — и не видит наблюдений с `observed_at` позже `knowledge_as_of`.
+
+- [ ] **Step 1: Прочитать образец**
+
+`crates/iaam-store/src/reference.rs` и `crates/iaam-store/src/events.rs` — как крейта устроена: соединение, транзакции, отображение строк, ошибки. **Следуй образцу**, а не изобретай.
+
+- [ ] **Step 2: Написать падающие тесты**
+
+`crates/iaam-store/tests/market_observations.rs`. Обязательные тесты, каждый именем говорит, что охраняет:
+
+```rust
+#[test]
+fn a_corrected_price_lands_beside_the_old_one_not_over_it() { /* ... */ }
+
+#[test]
+fn a_partial_run_does_not_advance_the_completeness_boundary() {
+    // Прямой ответ на iaam-023.5: частичная выгрузка не выдаётся
+    // за полную. Граница остаётся там, где была после последнего
+    // ПОЛНОГО запуска.
+}
+
+#[test]
+fn a_failed_series_does_not_hold_back_other_series() {
+    // Глобального поколения нет намеренно: иначе одна упавшая бумага
+    // заморозила бы свежие цены по всем остальным.
+}
+
+#[test]
+fn rows_of_an_unfinished_run_are_invisible_to_reads() { /* ... */ }
+
+#[test]
+fn a_second_run_on_the_same_series_is_refused_while_the_lease_holds() { /* ... */ }
+
+#[test]
+fn a_read_at_an_earlier_knowledge_time_returns_the_earlier_value() {
+    // Это исполняемая формулировка воспроизводимости (раздел 4 спеки):
+    // добавление наблюдения с более поздним observed_at не меняет ответ
+    // на меньший knowledge_as_of.
+}
+```
+
+Прогон: `nix develop -c cargo test -p iaam-store --test market_observations` — **именно `--test`**, фильтр по имени файла даёт ноль прогнанных.
+
+- [ ] **Step 3–5: Реализовать, прогнать, клиппи**
+
+Ключевое в реализации: `record_*` пишут строки с `sync_run_id` незавершённого запуска; чтение отбирает только строки, чей запуск `succeeded`. `finish_run` в **одной транзакции** проставляет статус, покрытый диапазон и — только при `Succeeded` — двигает `complete_through`.
+
+- [ ] **Step 6: Коммит**
+
+```bash
+nix develop -c cargo fmt --all
+git add crates/iaam-store
+git commit -m "feat(store): запись наблюдений, единицы полноты, атомарная публикация"
+```
+
+---
+
+### Task 7: Путь записи в справочник инструментов (`iaam-z9n`)
+
+**Files:**
+- Modify: `crates/iaam-app/src/ports.rs` (метод записи в `InstrumentDirectory`, строка 115)
+- Modify: `crates/iaam-app/src/adapters/sqlite.rs` (реализация, строка 343 рядом)
+- Modify: `crates/iaam-server/src/routes.rs` (маршрут, строка 134 — сейчас отвечает 501)
+- Modify: `crates/iaam-server/src/openapi.rs`, `dto.rs`
+- Modify: `crates/iaam-server/tests/contract.rs`
+
+**Interfaces:**
+- Produces: `InstrumentDirectory::record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError>` и `record_alias(&self, alias: AliasUpsert) -> Result<(), AppError>`.
+
+**Acceptance Criteria:**
+- **Метод порта спроектирован под синхронизацию источника**, а не под ручной ввод: бид `iaam-z9n` и раздел 7 дизайна E3.1 называют разрешённые пути записи — синхронизация и админ-токен.
+- `POST /v1/instruments` **либо работает, либо исчезает вместе с описанием в OpenAPI**. Объявленной и неработающей операции не остаётся.
+- Контрактный тест проверяет **успешный путь**, а не только отказ по правам.
+- Отказ агентскому токену сохраняется: запись — не агентское действие.
+- `async_trait` в `iaam-app` разрешён (правило 10 заслона), в других крейтах — нет.
+
+- [ ] **Step 1: Прочитать бид и раздел спеки**
+
+`bd show iaam-z9n` недоступен воркеру — критерии перенесены сюда целиком, выше. Прочитай `.internal/specs/2026-08-25-e3-1-instrument-reference-design.md`, раздел 7.
+
+- [ ] **Step 2: Падающий контрактный тест на успешный путь**
+
+В `crates/iaam-server/tests/contract.rs` — по образцу соседних тестов маршрутов. Существующий тест на 403 для агентского токена **не трогать**: он охраняет отказ, который остаётся в силе.
+
+- [ ] **Step 3–5: Реализовать, прогнать, клиппи**
+
+**Проверь потребителей:** добавление метода в трейт `InstrumentDirectory` ломает все его реализации. `grep -rn "impl InstrumentDirectory" crates/` и прогони `cargo check -p` по каждой крейте, где найдётся. Тестовые заглушки трейта тоже сломаются — их надо дополнить, а не удалить.
+
+- [ ] **Step 6: Коммит**
+
+---
+
+### Task 8: Пространство имён кода в разборщиках (`iaam-h9n`)
+
+**Files:**
+- Modify: `crates/iaam-ingest/src/csv_source.rs` (строки 82–92 — сбор кандидатов по всем пространствам)
+- Modify: разборщики отчётов брокеров в `crates/iaam-ingest/src/`
+
+**Acceptance Criteria:**
+- **Разрешение принимает пространство имён, когда колонка отчёта его задаёт.** Порт это уже умеет: `InstrumentDirectory::resolve(namespace, value, on)`, `crates/iaam-app/src/ports.rs:121`. Не пользуется им приёмка.
+- Тикер из колонки тикеров **не может** разрешиться через `broker_code`.
+- **Отказ по неоднозначности остаётся** для случаев, где колонка пространства не задаёт. Существующие тесты `an_instrument_known_in_multiple_namespaces_resolves_to_the_same_id` и `an_instrument_code_is_rejected_when_namespaces_point_to_different_ids` (`csv_source.rs:445`, `:479`) **не ослабляются**: они охраняют защиту, которая нужна и дальше.
+
+**Почему это делается сейчас.** Сегодняшнее поведение — защита, а не решение: система отказывается там, где могла бы ответить точно, потому что не пользуется знанием, которое у неё уже есть. Пока псевдонимы заводились вручную, коллизии были теоретическими. MOEX ISS заводит `SECID` и `ISIN` в одной выгрузке, и они станут обычным делом.
+
+- [ ] **Step 1: Прочитать существующее поведение**
+
+`crates/iaam-ingest/src/csv_source.rs:75–95` — как собираются кандидаты и как формулируется отказ. **Сохрани форму отказа**: она читается в вердикте приёмки.
+
+- [ ] **Step 2–6: Тест, реализация, прогон, клиппи, коммит**
+
+---
+
+### Task 9: Сценарий синхронизации и ручной запуск
+
+**Files:**
+- Modify: `crates/iaam-app/src/ports.rs` (порт `MarketData`)
+- Create: `crates/iaam-app/src/adapters/market.rs`
+- Create: `crates/iaam-app/src/scenarios/sync.rs`
+- Modify: `crates/iaam-server/src/routes.rs` (маршрут ручного запуска)
+
+**Interfaces:**
+- Consumes: `MarketStore` (задача 6), `iaam-market` целиком, `iaam-http::HttpClient`, `RetryPolicy`, `RateLimiter`.
+
+**Acceptance Criteria:**
+- Сценарий **не ходит в сеть в тестах**: транспорт приходит через порт, и тест подставляет заглушку, отдающую замороженный эталон.
+- Частичный отказ источника завершает запуск как `Partial` и **не двигает границу полноты**.
+- Повторный запуск того же диапазона не меняет ни одного ответа отчёта.
+- Ретраи и ограничение частоты берутся из `iaam-http::resilience`, а не пишутся заново.
+- Ручной запуск существует маршрутом; расписание — часть 3, здесь его нет.
+
+**Идёт последней:** правит `crates/iaam-app/src/ports.rs`, который в это же время правит задача 7.
+
+- [ ] **Step 1–6: по образцу `crates/iaam-app/src/scenarios/ingest.rs`**
+
+Сценарии приёмки уже устроены нужным образом — порты, заглушки в тестах, отсутствие сети. Повторяй, а не изобретай.

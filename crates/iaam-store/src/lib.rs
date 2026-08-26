@@ -6,6 +6,8 @@
 //! останавливает исполнитель (§3.2).
 
 pub mod broker_access;
+pub mod market;
+
 pub mod bundle;
 pub mod documents;
 pub mod events;
@@ -72,10 +74,20 @@ pub enum StoreError {
     RowNumberOutOfRange { row: u64 },
     /// Действующая запись уже есть. Отдельно от `Sqlite`, потому что
     /// это ответ на вопрос владельца, а не сбой: текст «UNIQUE
-    /// constraint failed» отправляет искать поломку там, где её нет,
-    /// да ещё и рассказывает наружу устройство схемы.
     #[error("{what} уже заведён: сначала отзовите действующий")]
     AlreadyExists { what: &'static str },
+    #[error("недопустимое значение {field}: {value}")]
+    InvalidValue { field: &'static str, value: String },
+    #[error("запуск синхронизации уже выполняется для {source_id}/{dataset}/{series_key}")]
+    LeaseHeld {
+        source_id: String,
+        dataset: String,
+        series_key: String,
+    },
+    #[error("аренда запуска синхронизации истекла")]
+    LeaseExpired,
+    #[error("запуск синхронизации не найден или токен аренды неверен")]
+    RunNotFound,
     #[error("поле {field} правила классификации не является JSON: {source}")]
     RuleNotJson {
         field: &'static str,

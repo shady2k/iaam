@@ -15,8 +15,8 @@ use time::Date;
 use time::macros::format_description;
 
 use crate::csv_source::{
-    Directory, ParsedRow, resolve_instrument, resolve_instrument_without_date,
-    resolve_named_custody,
+    Directory, ParsedRow, resolve_instrument_in_namespace,
+    resolve_instrument_in_namespace_without_date, resolve_named_custody,
 };
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::report::sections::{
@@ -157,6 +157,7 @@ fn parse_trade_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Locate
                 lookup_account(directory, text_value(cell(row, account_col))?, "account")?;
             let instrument = lookup_instrument(
                 directory,
+                "ticker",
                 text_value(cell(row, instrument_col))?,
                 Some(date),
             )?;
@@ -323,7 +324,7 @@ fn parse_income_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Locat
             let account =
                 lookup_account(directory, text_value(cell(row, account_col))?, "account")?;
             let instrument = optional_text(cell(row, instrument_col))
-                .map(|name| lookup_instrument(directory, name, Some(date)))
+                .map(|name| lookup_instrument(directory, "ticker", name, Some(date)))
                 .transpose()?;
             let gross_minor = money_value(cell(row, amount_col), "amount", currency)?;
             Ok(operation(
@@ -441,6 +442,7 @@ fn parse_positions(
     for row in data_rows(sheet) {
         let Ok(instrument) = lookup_instrument(
             directory,
+            "ticker",
             text_value(cell(row, instrument_col)).unwrap_or_default(),
             on,
         ) else {
@@ -625,12 +627,15 @@ fn lookup_account(
 
 fn lookup_instrument(
     directory: &Directory,
+    namespace: &str,
     name: &str,
     on: Option<Date>,
 ) -> Result<InstrumentId, Rejection> {
     match on {
-        Some(on) => resolve_instrument(&directory.instruments, name, on),
-        None => resolve_instrument_without_date(&directory.instruments, name),
+        Some(on) => resolve_instrument_in_namespace(&directory.instruments, namespace, name, on),
+        None => {
+            resolve_instrument_in_namespace_without_date(&directory.instruments, namespace, name)
+        }
     }
 }
 

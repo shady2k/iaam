@@ -3,7 +3,9 @@
 use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
-use iaam_store::market::{Coverage, PriceRow, PriceVenue, RunOutcome, SeriesKey};
+use iaam_store::market::{
+    Coverage, FxRow, KeyRateRow, PriceRow, PriceVenue, RunOutcome, SeriesKey,
+};
 use iaam_store::reference::InstrumentRecord;
 use iaam_store::{SqliteStore, StoreError};
 use time::macros::{date, datetime};
@@ -26,9 +28,13 @@ fn store_with_instrument() -> (SqliteStore, InstrumentId) {
 }
 
 fn series(name: &str) -> SeriesKey {
+    series_with_dataset("prices", name)
+}
+
+fn series_with_dataset(dataset: &str, name: &str) -> SeriesKey {
     SeriesKey {
         source_id: "moex-iss".to_owned(),
-        dataset: "prices".to_owned(),
+        dataset: dataset.to_owned(),
         series_key: name.to_owned(),
     }
 }
@@ -47,8 +53,214 @@ fn price(instrument: InstrumentId, observed_at: &str, value: &str) -> PriceRow {
     }
 }
 
+fn fx(observed_at: &str, value: &str) -> FxRow {
+    FxRow {
+        from_code: "USD".to_owned(),
+        to_code: "RUB".to_owned(),
+        trade_date: "2026-08-03".to_owned(),
+        observed_at: observed_at.to_owned(),
+        nominal: 1,
+        value: value.to_owned(),
+        unit_rate: value.to_owned(),
+    }
+}
+
+fn key_rate(observed_at: &str, rate: &str) -> KeyRateRow {
+    KeyRateRow {
+        trade_date: "2026-08-03".to_owned(),
+        observed_at: observed_at.to_owned(),
+        rate: rate.to_owned(),
+    }
+}
+
 fn lease() -> OffsetDateTime {
     datetime!(2026-08-27 00:00:00 UTC)
+}
+
+#[test]
+fn record_fx_reports_exact_number_of_rows_inserted() {
+    let (mut store, _) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series_with_dataset("fx", "USD/RUB"),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("запуск курсов");
+    let rows = [
+        fx("2026-08-03T09:00:00Z", "80"),
+        fx("2026-08-03T10:00:00Z", "81"),
+    ];
+
+    let inserted = store
+        .record_fx(&run, "raw-fx", &rows)
+        .expect("курсы записаны");
+
+    assert_eq!(inserted, 2);
+}
+
+#[test]
+fn record_key_rate_reports_exact_number_of_rows_inserted() {
+    let (mut store, _) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series_with_dataset("key-rate", "CBR"),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("запуск ключевой ставки");
+    let rows = [
+        key_rate("2026-08-03T09:00:00Z", "18"),
+        key_rate("2026-08-03T10:00:00Z", "17.5"),
+    ];
+
+    let inserted = store
+        .record_key_rate(&run, "raw-key-rate", &rows)
+        .expect("ключевая ставка записана");
+
+    assert_eq!(inserted, 2);
+}
+
+#[test]
+fn a_foreign_lease_token_is_refused_for_a_fresh_run() {
+    let (mut store, _) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series_with_dataset("fx", "USD/RUB"),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("свежая аренда");
+    let mut foreign = run.clone();
+    foreign.lease_token = "foreign-token".to_owned();
+
+    let result = store.record_fx(&foreign, "raw-foreign", &[fx("2026-08-03T09:00:00Z", "80")]);
+
+    assert!(matches!(result, Err(StoreError::RunNotFound)));
+    store
+        .finish_run(
+            &run,
+            RunOutcome::Failed {
+                reason: "cleanup".to_owned(),
+            },
+            None,
+        )
+        .expect("исходная аренда осталась действующей");
+}
+
+#[test]
+fn a_dataset_mismatch_is_refused_even_when_the_other_run_identity_fields_match() {
+    let (mut store, _) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series_with_dataset("fx", "USD/RUB"),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("запуск курсов");
+    let mut wrong_dataset = run.clone();
+    wrong_dataset.series.dataset = "other-dataset".to_owned();
+
+    let result = store.record_fx(
+        &wrong_dataset,
+        "raw-wrong-dataset",
+        &[fx("2026-08-03T09:00:00Z", "80")],
+    );
+
+    assert!(matches!(result, Err(StoreError::RunNotFound)));
+    store
+        .finish_run(
+            &run,
+            RunOutcome::Failed {
+                reason: "cleanup".to_owned(),
+            },
+            None,
+        )
+        .expect("исходный запуск остался незавершённым");
+}
+
+#[test]
+fn a_series_key_mismatch_is_refused_even_when_the_other_run_identity_fields_match() {
+    let (mut store, _) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series_with_dataset("fx", "USD/RUB"),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("запуск курсов");
+    let mut wrong_series = run.clone();
+    wrong_series.series.series_key = "EUR/RUB".to_owned();
+
+    let result = store.record_fx(
+        &wrong_series,
+        "raw-wrong-series",
+        &[fx("2026-08-03T09:00:00Z", "80")],
+    );
+
+    assert!(matches!(result, Err(StoreError::RunNotFound)));
+    store
+        .finish_run(
+            &run,
+            RunOutcome::Failed {
+                reason: "cleanup".to_owned(),
+            },
+            None,
+        )
+        .expect("исходный запуск остался незавершённым");
+}
+
+#[test]
+fn an_expired_lease_is_refused_by_recording() {
+    let (mut store, _) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series_with_dataset("fx", "USD/RUB"),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
+        .expect("активная аренда");
+    store
+        .connection()
+        .execute(
+            "UPDATE sync_runs SET lease_expires_at = '2026-08-01T00:00:00Z' WHERE id = ?1",
+            [&run.id],
+        )
+        .expect("тестовая просрочка");
+
+    let result = store.record_fx(&run, "raw-expired", &[fx("2026-08-03T09:00:00Z", "80")]);
+
+    assert!(matches!(result, Err(StoreError::LeaseExpired)));
+}
+
+#[test]
+fn a_missing_lease_is_refused_by_recording() {
+    let (mut store, _) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series_with_dataset("fx", "USD/RUB"),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            OffsetDateTime::now_utc() + Duration::hours(1),
+        )
+        .expect("активная аренда");
+    store
+        .connection()
+        .execute(
+            "UPDATE sync_runs SET lease_expires_at = NULL WHERE id = ?1",
+            [&run.id],
+        )
+        .expect("тестовая аренда удалена");
+
+    let result = store.record_fx(&run, "raw-missing-lease", &[]);
+
+    assert!(matches!(result, Err(StoreError::LeaseExpired)));
 }
 
 #[test]

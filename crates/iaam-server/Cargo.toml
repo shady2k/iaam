@@ -11,6 +11,8 @@ rust-version.workspace = true
 # iaam-bootstrap. Проверяется заслоном архитектуры (§3.2).
 iaam-app = { path = "../iaam-app", version = "0.1.0" }
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
+iaam-market = { path = "../iaam-market", version = "0.1.0" }
+iaam-store = { path = "../iaam-store", version = "0.1.0" }
 axum = "0.8"
 rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
 serde = { version = "1", features = ["derive"] }

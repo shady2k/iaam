@@ -32,12 +32,13 @@ use iaam_server::dto::VerdictDto;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::SqliteStore;
+use iaam_store::market::{Coverage, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey};
 use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use serde_json::{Value, json};
 use std::time::Duration;
-use time::Date;
 use time::macros::date;
+use time::{Date, Duration as TimeDuration, OffsetDateTime};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -150,6 +151,7 @@ struct Harness {
     account: AccountId,
     instrument: InstrumentId,
     custody: CustodyId,
+    market_store: Arc<tokio::sync::Mutex<SqliteStore>>,
 }
 
 fn harness() -> Harness {
@@ -283,6 +285,9 @@ fn harness_with_factory(
         channel_factory.unwrap_or_else(|| adapter.clone());
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
+    let market_store = Arc::new(tokio::sync::Mutex::new(
+        SqliteStore::open_in_memory().expect("market store"),
+    ));
     let services = Arc::new(AppServices {
         store: adapter.clone(),
         directory: adapter,
@@ -292,9 +297,7 @@ fn harness_with_factory(
         channels,
         rules,
         market: Arc::new(UnavailableMarketData),
-        market_store: Arc::new(tokio::sync::Mutex::new(
-            SqliteStore::open_in_memory().expect("market store"),
-        )),
+        market_store: market_store.clone(),
     });
     let state = ServerState::new(
         services,
@@ -312,7 +315,158 @@ fn harness_with_factory(
         account,
         instrument: InstrumentId::new_random(),
         custody: CustodyId::new_random(),
+        market_store,
     }
+}
+
+async fn seed_market(harness: &Harness) {
+    let mut store = harness.market_store.lock().await;
+    let lease_expires_at = OffsetDateTime::now_utc() + TimeDuration::days(1);
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: harness.instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: "SBER".into(),
+            title: "Сбербанк".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("инструмент рынка");
+
+    let price_series = SeriesKey {
+        source_id: "moex-iss".into(),
+        dataset: "prices".into(),
+        series_key: format!("{}:TQBR:1", harness.instrument.inner()),
+    };
+    let price_run = store
+        .begin_run(
+            price_series,
+            date!(2026 - 08 - 01),
+            date!(2026 - 08 - 03),
+            lease_expires_at,
+        )
+        .expect("запуск цен");
+    store
+        .record_prices(
+            &price_run,
+            &"a".repeat(64),
+            &[
+                PriceRow {
+                    instrument_id: harness.instrument.inner().to_string(),
+                    board: "TQBR".into(),
+                    session: 1,
+                    trade_date: "2026-08-01".into(),
+                    kind: "close".into(),
+                    observed_at: "2026-08-20T00:00:00Z".into(),
+                    price: "100.00".into(),
+                    currency: "RUB".into(),
+                    executability: "executable".into(),
+                },
+                PriceRow {
+                    instrument_id: harness.instrument.inner().to_string(),
+                    board: "TQBR".into(),
+                    session: 1,
+                    trade_date: "2026-08-03".into(),
+                    kind: "close".into(),
+                    observed_at: "2026-08-20T00:00:00Z".into(),
+                    price: "101.00".into(),
+                    currency: "RUB".into(),
+                    executability: "indicative_previous_close".into(),
+                },
+            ],
+        )
+        .expect("строки цен");
+    store
+        .finish_run(
+            &price_run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 01),
+                to: date!(2026 - 08 - 03),
+            }),
+        )
+        .expect("публикация цен");
+
+    let fx_series = SeriesKey {
+        source_id: "cbr".into(),
+        dataset: "fx".into(),
+        series_key: "USD:RUB".into(),
+    };
+    let fx_run = store
+        .begin_run(
+            fx_series,
+            date!(2026 - 08 - 01),
+            date!(2026 - 08 - 03),
+            lease_expires_at,
+        )
+        .expect("запуск курсов");
+    store
+        .record_fx(
+            &fx_run,
+            &"b".repeat(64),
+            &[FxRow {
+                from_code: "USD".into(),
+                to_code: "RUB".into(),
+                trade_date: "2026-08-03".into(),
+                observed_at: "2026-08-20T00:00:00Z".into(),
+                nominal: 1,
+                value: "80.00".into(),
+                unit_rate: "80.00".into(),
+            }],
+        )
+        .expect("строка курса");
+    store
+        .finish_run(
+            &fx_run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 01),
+                to: date!(2026 - 08 - 03),
+            }),
+        )
+        .expect("публикация курса");
+
+    let key_rate_series = SeriesKey {
+        source_id: "cbr".into(),
+        dataset: "key_rate".into(),
+        series_key: "key_rate".into(),
+    };
+    let key_rate_run = store
+        .begin_run(
+            key_rate_series,
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 10),
+            lease_expires_at,
+        )
+        .expect("запуск ставки");
+    store
+        .record_key_rate(
+            &key_rate_run,
+            &"c".repeat(64),
+            &[
+                KeyRateRow {
+                    trade_date: "2026-08-03".into(),
+                    observed_at: "2026-08-20T00:00:00Z".into(),
+                    rate: "18.00".into(),
+                },
+                KeyRateRow {
+                    trade_date: "2026-08-10".into(),
+                    observed_at: "2026-08-20T00:00:00Z".into(),
+                    rate: "17.00".into(),
+                },
+            ],
+        )
+        .expect("строки ставки");
+    store
+        .finish_run(
+            &key_rate_run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 03),
+                to: date!(2026 - 08 - 10),
+            }),
+        )
+        .expect("публикация ставки");
 }
 
 async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
@@ -2533,4 +2687,64 @@ async fn an_owner_can_record_an_instrument_in_directory() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(stored["title"], "Газпром");
     assert_eq!(stored["quote_currency"], "RUB");
+}
+
+#[tokio::test]
+async fn market_reference_routes_require_auth_and_preserve_provenance() {
+    let harness = harness();
+    seed_market(&harness).await;
+
+    let prices_path = format!(
+        "/v1/market/prices?instrument={}&board=TQBR&session=1&from=2026-08-01&to=2026-08-03&knowledge_as_of=2099-01-01T00:00:00Z",
+        harness.instrument.inner()
+    );
+    let fx_path = "/v1/market/fx?from=USD&to=RUB&from_date=2026-08-01&to_date=2026-08-03&knowledge_as_of=2099-01-01T00:00:00Z";
+    let key_rate_path =
+        "/v1/market/key-rate?from=2026-08-03&to=2026-08-10&knowledge_as_of=2099-01-01T00:00:00Z";
+
+    for token in [&harness.owner_token, &harness.agent_token] {
+        let (status, prices) = call(&harness.router, get(&prices_path, Some(token))).await;
+        assert_eq!(status, StatusCode::OK);
+        let prices = prices.as_array().expect("массив цен");
+        assert_eq!(prices.len(), 2);
+        for price in prices {
+            for field in ["value", "date", "source", "observed_at", "quality"] {
+                assert!(price.get(field).is_some(), "у цены нет {field}: {price}");
+            }
+            assert_eq!(price["source"], "moex-iss");
+            assert_eq!(price["complete_through"], "2026-08-03");
+        }
+
+        let (status, fx) = call(&harness.router, get(fx_path, Some(token))).await;
+        assert_eq!(status, StatusCode::OK);
+        let fx = fx.as_array().expect("массив курсов");
+        assert_eq!(fx.len(), 1);
+        for field in [
+            "value",
+            "date",
+            "source",
+            "observed_at",
+            "quality",
+            "complete_through",
+        ] {
+            assert!(fx[0].get(field).is_some(), "у курса нет {field}: {}", fx[0]);
+        }
+        assert_eq!(fx[0]["source"], "cbr");
+        assert_eq!(fx[0]["quality"], "official");
+
+        let (status, key_rates) = call(&harness.router, get(key_rate_path, Some(token))).await;
+        assert_eq!(status, StatusCode::OK);
+        let key_rates = key_rates.as_array().expect("массив интервалов ставки");
+        assert_eq!(key_rates.len(), 2);
+        assert_eq!(key_rates[0]["observed_at"], "2026-08-20T00:00:00Z");
+        assert_eq!(key_rates[0]["quality"], "observed");
+        assert_eq!(key_rates[1]["boundary"], "inferred_across_non_trading_days");
+        assert_eq!(key_rates[1]["quality"], "inferred");
+        assert_eq!(key_rates[1]["complete_through"], "2026-08-10");
+    }
+
+    for path in [prices_path.as_str(), fx_path, key_rate_path] {
+        let (status, _) = call(&harness.router, get(path, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "маршрут открыт: {path}");
+    }
 }

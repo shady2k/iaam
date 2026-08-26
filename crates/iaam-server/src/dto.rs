@@ -1006,6 +1006,64 @@ pub struct FxRateDto {
     pub rate: String,
 }
 
+/// Наблюдение цены с полным происхождением.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketPriceDto {
+    pub instrument: Uuid,
+    pub board: String,
+    pub session: i64,
+    pub kind: String,
+    pub value: String,
+    pub currency: String,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub date: Date,
+    pub source: String,
+    pub observed_at: String,
+    pub quality: String,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub complete_through: Option<Date>,
+}
+
+/// Наблюдение курса с полным происхождением.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketFxDto {
+    pub from: CurrencyDto,
+    pub to: CurrencyDto,
+    pub nominal: u32,
+    pub value: String,
+    pub unit_rate: String,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub date: Date,
+    pub source: String,
+    pub observed_at: String,
+    pub quality: String,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub complete_through: Option<Date>,
+}
+
+/// Интервал ключевой ставки, выведенный из дневных наблюдений.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketKeyRateDto {
+    pub value: String,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub until: Option<Date>,
+    pub source: String,
+    pub observed_at: String,
+    pub quality: String,
+    pub boundary: String,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub complete_through: Option<Date>,
+}
+
 /// Состояние сервиса.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthDto {

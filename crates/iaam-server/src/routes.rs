@@ -33,9 +33,12 @@ use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
 use iaam_core::rules::LotRuleVersion;
 use iaam_core::valuation::{FxSource, FxTable};
+use iaam_market::cbr::key_rate::{Boundary, RateInterval, derive_intervals};
+use iaam_market::{KeyRateObservation, ObservedAt, TradeDate};
+use iaam_store::market::{FxRow, KeyRateRow, MarketWindow, PriceRow, PriceVenue, SeriesKey};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use time::Date;
+use time::{Date, OffsetDateTime};
 use utoipa::IntoParams;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -47,9 +50,10 @@ use crate::dto::{
     ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
-    InstrumentDto, IssuedTokenDto, MarketSourceDto, MarketSyncRequest, OwnerBalanceRequest,
-    ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsReportDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
+    MarketSyncRequest, OwnerBalanceRequest, ReconciliationParams, ReconciliationStatusDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -527,6 +531,197 @@ pub async fn sync_market(
     let mut store = state.services.market_store.lock().await;
     let outcome = run_market_sync(&mut store, state.services.market.as_ref(), request).await?;
     Ok(Json(MarketSyncOutcomeDto::from_domain(outcome)))
+}
+
+/// Параметры ряда цен.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketPricesParams {
+    pub instrument: Uuid,
+    pub board: String,
+    pub session: i64,
+    #[param(value_type = String, format = Date)]
+    pub from: String,
+    #[param(value_type = String, format = Date)]
+    pub to: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Параметры ряда курсов.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketFxParams {
+    pub from: CurrencyDto,
+    pub to: CurrencyDto,
+    #[param(value_type = String, format = Date)]
+    pub from_date: String,
+    #[param(value_type = String, format = Date)]
+    pub to_date: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Параметры ряда ключевой ставки.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketKeyRateParams {
+    #[param(value_type = String, format = Date)]
+    pub from: String,
+    #[param(value_type = String, format = Date)]
+    pub to: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Ряд цен с provenance каждой строки.
+#[utoipa::path(
+    get,
+    path = "/v1/market/prices",
+    params(MarketPricesParams),
+    responses(
+        (status = 200, description = "Цены с provenance", body = Vec<MarketPriceDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_prices(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketPricesParams>,
+) -> Result<Json<Vec<MarketPriceDto>>, ApiFailure> {
+    let from = parse_query_date("from", &params.from)?;
+    let to = parse_query_date("to", &params.to)?;
+    if to < from {
+        return Err(invalid_field("to", "дата не раньше from", params.to));
+    }
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let series = SeriesKey {
+        source_id: "moex-iss".into(),
+        dataset: "prices".into(),
+        series_key: format!("{}:{}:{}", params.instrument, params.board, params.session),
+    };
+    let store = state.services.market_store.lock().await;
+    let complete_through = store
+        .complete_through_at_or_before(&series, &knowledge_as_of)
+        .map_err(market_store_failure)?;
+    let rows = store
+        .prices_between(
+            &series,
+            &params.instrument.to_string(),
+            &PriceVenue {
+                board: params.board,
+                session: params.session,
+            },
+            MarketWindow {
+                from: &from.to_string(),
+                to: &to.to_string(),
+                knowledge_as_of: &knowledge_as_of,
+            },
+        )
+        .map_err(market_store_failure)?;
+    rows.into_iter()
+        .map(|row| market_price_dto(row, complete_through))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+/// Ряд официальных курсов с provenance каждой строки.
+#[utoipa::path(
+    get,
+    path = "/v1/market/fx",
+    params(MarketFxParams),
+    responses(
+        (status = 200, description = "Курсы с provenance", body = Vec<MarketFxDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_fx(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketFxParams>,
+) -> Result<Json<Vec<MarketFxDto>>, ApiFailure> {
+    let from = parse_query_date("from_date", &params.from_date)?;
+    let to = parse_query_date("to_date", &params.to_date)?;
+    if to < from {
+        return Err(invalid_field(
+            "to_date",
+            "дата не раньше from_date",
+            params.to_date,
+        ));
+    }
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let from_code = params.from.to_domain().code().to_owned();
+    let to_code = params.to.to_domain().code().to_owned();
+    let series = SeriesKey {
+        source_id: "cbr".into(),
+        dataset: "fx".into(),
+        series_key: format!("{from_code}:{to_code}"),
+    };
+    let store = state.services.market_store.lock().await;
+    let complete_through = store
+        .complete_through_at_or_before(&series, &knowledge_as_of)
+        .map_err(market_store_failure)?;
+    let rows = store
+        .fx_between(
+            &series,
+            &from_code,
+            &to_code,
+            MarketWindow {
+                from: &from.to_string(),
+                to: &to.to_string(),
+                knowledge_as_of: &knowledge_as_of,
+            },
+        )
+        .map_err(market_store_failure)?;
+    rows.into_iter()
+        .map(|row| market_fx_dto(row, complete_through))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+/// Интервалы официальной ключевой ставки с provenance границ.
+#[utoipa::path(
+    get,
+    path = "/v1/market/key-rate",
+    params(MarketKeyRateParams),
+    responses(
+        (status = 200, description = "Интервалы ставки с provenance", body = Vec<MarketKeyRateDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_key_rate(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketKeyRateParams>,
+) -> Result<Json<Vec<MarketKeyRateDto>>, ApiFailure> {
+    let from = parse_query_date("from", &params.from)?;
+    let to = parse_query_date("to", &params.to)?;
+    if to < from {
+        return Err(invalid_field("to", "дата не раньше from", params.to));
+    }
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let series = SeriesKey {
+        source_id: "cbr".into(),
+        dataset: "key_rate".into(),
+        series_key: "key_rate".into(),
+    };
+    let store = state.services.market_store.lock().await;
+    let complete_through = store
+        .complete_through_at_or_before(&series, &knowledge_as_of)
+        .map_err(market_store_failure)?;
+    let rows = store
+        .key_rates_through(&series, &to.to_string(), &knowledge_as_of)
+        .map_err(market_store_failure)?;
+    let observations = rows
+        .iter()
+        .map(key_rate_observation)
+        .collect::<Result<Vec<_>, _>>()?;
+    derive_intervals(&observations)
+        .into_iter()
+        .filter(|interval| interval.from <= to && interval.until.is_none_or(|until| until > from))
+        .map(|interval| market_key_rate_dto(interval, &observations, from, to, complete_through))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -1297,6 +1492,160 @@ fn reconciliation_status_dto(status: &ReconciliationStatus) -> ReconciliationSta
             })
             .collect(),
     }
+}
+
+fn market_store_failure(error: iaam_store::StoreError) -> ApiFailure {
+    ApiFailure::from(iaam_app::error::AppError::Store(error.to_string()))
+}
+
+fn parse_knowledge_as_of(value: Option<&str>) -> Result<String, ApiFailure> {
+    let Some(value) = value else {
+        return OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|error| {
+                market_store_failure(iaam_store::StoreError::InvalidValue {
+                    field: "knowledge_as_of",
+                    value: error.to_string(),
+                })
+            });
+    };
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| invalid_field("knowledge_as_of", "RFC 3339", value.to_owned()))?
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| {
+            market_store_failure(iaam_store::StoreError::InvalidValue {
+                field: "knowledge_as_of",
+                value: error.to_string(),
+            })
+        })
+}
+
+fn stored_date(value: &str) -> Result<Date, ApiFailure> {
+    Date::parse(
+        value,
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .map_err(|error| {
+        market_store_failure(iaam_store::StoreError::InvalidValue {
+            field: "trade_date",
+            value: error.to_string(),
+        })
+    })
+}
+
+fn stored_observed_at(value: &str) -> Result<OffsetDateTime, ApiFailure> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map_err(|error| {
+        market_store_failure(iaam_store::StoreError::InvalidValue {
+            field: "observed_at",
+            value: error.to_string(),
+        })
+    })
+}
+
+fn format_observed_at(value: OffsetDateTime) -> Result<String, ApiFailure> {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| {
+            market_store_failure(iaam_store::StoreError::InvalidValue {
+                field: "observed_at",
+                value: error.to_string(),
+            })
+        })
+}
+
+fn market_price_dto(
+    row: PriceRow,
+    complete_through: Option<Date>,
+) -> Result<MarketPriceDto, ApiFailure> {
+    let instrument = row.instrument_id.parse::<Uuid>().map_err(|error| {
+        market_store_failure(iaam_store::StoreError::InvalidValue {
+            field: "instrument_id",
+            value: error.to_string(),
+        })
+    })?;
+    Ok(MarketPriceDto {
+        instrument,
+        board: row.board,
+        session: row.session,
+        kind: row.kind,
+        value: row.price,
+        currency: row.currency,
+        date: stored_date(&row.trade_date)?,
+        source: "moex-iss".into(),
+        observed_at: row.observed_at,
+        quality: row.executability,
+        complete_through,
+    })
+}
+
+fn market_fx_dto(row: FxRow, complete_through: Option<Date>) -> Result<MarketFxDto, ApiFailure> {
+    let from = CurrencyCode::from_code(&row.from_code)
+        .ok_or_else(|| invalid_field("from", "известный код валюты", row.from_code.clone()))?;
+    let to = CurrencyCode::from_code(&row.to_code)
+        .ok_or_else(|| invalid_field("to", "известный код валюты", row.to_code.clone()))?;
+    Ok(MarketFxDto {
+        from: CurrencyDto::from_domain(from),
+        to: CurrencyDto::from_domain(to),
+        nominal: row.nominal,
+        value: row.value,
+        unit_rate: row.unit_rate,
+        date: stored_date(&row.trade_date)?,
+        source: "cbr".into(),
+        observed_at: row.observed_at,
+        quality: "official".into(),
+        complete_through,
+    })
+}
+
+fn key_rate_observation(row: &KeyRateRow) -> Result<KeyRateObservation, ApiFailure> {
+    let rate = row.rate.parse::<Decimal>().map_err(|error| {
+        market_store_failure(iaam_store::StoreError::InvalidValue {
+            field: "rate",
+            value: error.to_string(),
+        })
+    })?;
+    Ok(KeyRateObservation {
+        trade_date: TradeDate(stored_date(&row.trade_date)?),
+        observed_at: ObservedAt(stored_observed_at(&row.observed_at)?),
+        rate: Dec::new(rate),
+    })
+}
+
+fn market_key_rate_dto(
+    interval: RateInterval,
+    observations: &[KeyRateObservation],
+    _requested_from: Date,
+    _requested_to: Date,
+    complete_through: Option<Date>,
+) -> Result<MarketKeyRateDto, ApiFailure> {
+    let observation = observations
+        .iter()
+        .filter(|observation| {
+            observation.trade_date.0 == interval.from && observation.rate == interval.rate
+        })
+        .max_by_key(|observation| observation.observed_at)
+        .ok_or_else(|| {
+            market_store_failure(iaam_store::StoreError::InvalidValue {
+                field: "key_rate",
+                value: "интервал не имеет исходного наблюдения".into(),
+            })
+        })?;
+    let inferred = matches!(interval.boundary, Boundary::InferredAcrossNonTradingDays);
+    Ok(MarketKeyRateDto {
+        value: interval.rate.inner().to_string(),
+        from: interval.from,
+        until: interval.until,
+        source: "cbr".into(),
+        observed_at: format_observed_at(observation.observed_at.0)?,
+        quality: if inferred { "inferred" } else { "observed" }.into(),
+        boundary: if inferred {
+            "inferred_across_non_trading_days"
+        } else {
+            "observed"
+        }
+        .into(),
+        complete_through,
+    })
 }
 
 fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure> {

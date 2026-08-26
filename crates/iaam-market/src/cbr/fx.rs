@@ -307,7 +307,7 @@ fn attribute(start: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>, Marke
             .map_err(|error| MarketError::Malformed(format!("атрибут XML ЦБ: {error}")))?;
         if attribute.key.as_ref() == key {
             return attribute
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(|value| Some(value.into_owned()))
                 .map_err(|error| MarketError::Malformed(format!("атрибут XML ЦБ: {error}")));
         }

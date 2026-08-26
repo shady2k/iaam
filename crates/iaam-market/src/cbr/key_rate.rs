@@ -81,12 +81,14 @@ pub fn parse_key_rate(
                 let value = reader
                     .read_text(element.name())
                     .map_err(|error| MarketError::Malformed(format!("DT: {error}")))?;
+                let value = decode_text(&value)?;
                 current_date = Some(parse_key_rate_date(&value)?);
             }
             Ok(Event::Start(element)) if in_kr && element.local_name().as_ref() == b"Rate" => {
                 let value = reader
                     .read_text(element.name())
                     .map_err(|error| MarketError::Malformed(format!("Rate: {error}")))?;
+                let value = decode_text(&value)?;
                 current_rate = Some(parse_key_rate_decimal(&value)?);
             }
             Ok(Event::End(element)) if element.local_name().as_ref() == b"KR" => {
@@ -135,6 +137,19 @@ fn parse_key_rate_decimal(value: &str) -> Result<Dec, MarketError> {
     Decimal::from_str(value.trim())
         .map(Dec::new)
         .map_err(|error| MarketError::Malformed(format!("ставка {value}: {error}")))
+}
+
+/// Текст элемента в строку.
+///
+/// В `quick-xml` 0.41 `read_text` отдаёт `BytesText`, а не строку:
+/// декодирование стало явным шагом. Версия поднята с 0.38 из-за
+/// RUSTSEC-2026-0194 и RUSTSEC-2026-0195 — квадратичное время на
+/// дубликатах атрибутов и неограниченное выделение памяти под
+/// объявления пространств имён.
+fn decode_text(value: &quick_xml::events::BytesText<'_>) -> Result<String, MarketError> {
+    core::str::from_utf8(value.as_ref())
+        .map(str::to_owned)
+        .map_err(|error| MarketError::Malformed(format!("текст элемента: {error}")))
 }
 
 /// Как получена левая граница интервала.

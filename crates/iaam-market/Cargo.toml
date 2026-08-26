@@ -15,7 +15,7 @@ iaam-http = { path = "../iaam-http", version = "0.1.0" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # ЦБ РФ отдаёт XML: и курсы, и SOAP-ответ со ставкой.
-quick-xml = "0.38"
+quick-xml = "0.41"
 # ЦБ отдаёт windows-1251. Своя перекодировка — лишнее место для ошибки
 # в том, что уже решено, а from_utf8 на этих байтах просто падает.
 encoding_rs = "0.8"

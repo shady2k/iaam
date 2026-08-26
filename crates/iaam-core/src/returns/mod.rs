@@ -211,12 +211,23 @@ pub struct LegacyDerivedPosition {
     pub quality: PriceQuality,
 }
 
+/// Позиция с выбранным кандидатом и полным основанием решения политики.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluatedPosition {
+    pub account: AccountId,
+    pub custody: Option<crate::ids::CustodyId>,
+    pub instrument: InstrumentId,
+    pub quantity: crate::money::Quantity,
+    pub price: SelectedPrice,
+}
+
 /// Покрытие ценой: только количество позиций, без выдуманного денежного
 /// знаменателя для позиций, которым цена не найдена.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionCoverage {
     pub evaluated_positions: u32,
     pub total_positions: u32,
+    pub selected: Vec<EvaluatedPosition>,
     pub uncovered: Vec<UncoveredPosition>,
     pub legacy_derived: Vec<LegacyDerivedPosition>,
 }
@@ -374,7 +385,131 @@ struct SelectedPosition {
     custody: Option<crate::ids::CustodyId>,
     instrument: InstrumentId,
     quantity: crate::money::Quantity,
-    price: Option<crate::valuation::InstrumentPrice>,
+    valuation: PositionValuation,
+}
+
+#[derive(Serialize)]
+enum PositionValuation {
+    Selected(SelectedObservation),
+    LegacyDerived {
+        quality: PriceQuality,
+        price: Option<crate::valuation::InstrumentPrice>,
+    },
+    Uncovered {
+        reason: &'static str,
+    },
+}
+
+#[derive(Serialize)]
+struct SelectedObservation {
+    instrument: InstrumentId,
+    price: Dec,
+    currency: CurrencyCode,
+    trade_date: Date,
+    observed_at: OffsetDateTime,
+    executability: &'static str,
+    selection: SelectedSelection,
+    freshness: SelectedFreshness,
+    provenance: SelectedProvenance,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SelectedSelection {
+    AsObserved,
+    CarriedForward { observed_on: Date, days: u16 },
+    LegacyDerived { quality: PriceQuality },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SelectedFreshness {
+    Fresh,
+    Stale { days: u16 },
+}
+
+#[derive(Serialize)]
+struct SelectedProvenance {
+    price_kind: Option<String>,
+    origin: SelectedOrigin,
+    venue: Option<String>,
+    observed_at: OffsetDateTime,
+    valuation_policy_version: u32,
+    source_priority_version: u32,
+    carry_forward_limit: u16,
+    price_max_age: u16,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SelectedOrigin {
+    Market {
+        venue: String,
+        price_kind: String,
+    },
+    ReportParsed { source: SourceId },
+    OwnerAsserted,
+}
+
+fn selected_observation(price: &SelectedPrice) -> SelectedObservation {
+    let selection = match price.selection {
+        crate::valuation::PriceSelection::AsObserved => SelectedSelection::AsObserved,
+        crate::valuation::PriceSelection::CarriedForward { observed_on, days } => {
+            SelectedSelection::CarriedForward { observed_on, days }
+        }
+        crate::valuation::PriceSelection::LegacyDerived { quality } => {
+            SelectedSelection::LegacyDerived { quality }
+        }
+    };
+    let freshness = match price.freshness {
+        crate::valuation::PriceFreshness::Fresh => SelectedFreshness::Fresh,
+        crate::valuation::PriceFreshness::Stale { days } => SelectedFreshness::Stale { days },
+    };
+    let origin = match &price.provenance.origin {
+        crate::valuation::PriceOrigin::Market { venue, kind } => {
+            SelectedOrigin::Market {
+                venue: venue.clone(),
+                price_kind: kind.clone(),
+            }
+        }
+        crate::valuation::PriceOrigin::ReportParsed { source } => {
+            SelectedOrigin::ReportParsed { source: *source }
+        }
+        crate::valuation::PriceOrigin::OwnerAsserted => SelectedOrigin::OwnerAsserted,
+    };
+    SelectedObservation {
+        instrument: price.candidate.instrument,
+        price: price.candidate.price,
+        currency: price.candidate.currency,
+        trade_date: price.candidate.trade_date,
+        observed_at: price.candidate.observed_at,
+        executability: match price.candidate.executability {
+            SourceExecutability::Executable => "executable",
+            SourceExecutability::IndicativePreviousClose => "indicative_previous_close",
+            SourceExecutability::Unknown => "unknown",
+        },
+        selection,
+        freshness,
+        provenance: SelectedProvenance {
+            price_kind: price.provenance.price_kind.clone(),
+            origin,
+            venue: price.provenance.venue.clone(),
+            observed_at: price.provenance.observed_at,
+            valuation_policy_version: price.provenance.valuation_policy_version,
+            source_priority_version: price.provenance.source_priority_version,
+            carry_forward_limit: price.provenance.carry_forward_limit,
+            price_max_age: price.provenance.price_max_age,
+        },
+    }
+}
+
+fn uncovered_reason_code(reason: UncoveredReason) -> &'static str {
+    match reason {
+        UncoveredReason::NoObservation => "no_observation",
+        UncoveredReason::TooOld => "too_old",
+        UncoveredReason::AmbiguousVenue => "ambiguous_venue",
+        UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
+    }
 }
 
 #[derive(Serialize)]
@@ -403,6 +538,14 @@ struct SelectedInputs<'a> {
 }
 
 fn inputs_hash(state: &LedgerState, request: &ReturnsRequest<'_>) -> String {
+    inputs_hash_with_assessments(state, request, position_assessments(state, request))
+}
+
+fn inputs_hash_with_assessments(
+    state: &LedgerState,
+    request: &ReturnsRequest<'_>,
+    assessments: Vec<PositionAssessment>,
+) -> String {
     let mut flows: Vec<_> = state
         .flows()
         .external()
@@ -423,19 +566,38 @@ fn inputs_hash(state: &LedgerState, request: &ReturnsRequest<'_>) -> String {
         .collect();
     cash.sort_by_key(|(account, money)| (*account, money.currency()));
 
-    let positions: Vec<_> = state
-        .balances()
-        .iter_positions()
-        .filter(|(key, quantity)| request.contour.contains(key.account) && !quantity.0.is_zero())
-        .map(|(key, quantity)| SelectedPosition {
-            account: key.account,
-            custody: key.custody,
-            instrument: key.instrument,
-            quantity,
-            price: state
-                .prices()
-                .price_at_or_before(key.instrument, request.as_of)
-                .copied(),
+    let positions: Vec<_> = assessments
+        .into_iter()
+        .map(|assessment| {
+            let PositionAssessment {
+                account,
+                custody,
+                instrument,
+                quantity,
+                raw_price,
+                kind,
+            } = assessment;
+            let valuation = match kind {
+                PositionAssessmentKind::Selected(selected) => {
+                    PositionValuation::Selected(selected_observation(&selected))
+                }
+                PositionAssessmentKind::LegacyDerived(quality) => {
+                    PositionValuation::LegacyDerived {
+                        quality,
+                        price: raw_price,
+                    }
+                }
+                PositionAssessmentKind::Uncovered(reason) => PositionValuation::Uncovered {
+                    reason: uncovered_reason_code(reason),
+                },
+            };
+            SelectedPosition {
+                account,
+                custody,
+                instrument,
+                quantity,
+                valuation,
+            }
         })
         .collect();
 
@@ -447,8 +609,13 @@ fn inputs_hash(state: &LedgerState, request: &ReturnsRequest<'_>) -> String {
         fx_keys.insert((money.currency(), request.as_of));
     }
     for position in &positions {
-        if let Some(price) = position.price {
-            fx_keys.insert((price.currency, request.as_of));
+        let currency = match &position.valuation {
+            PositionValuation::Selected(observation) => Some(observation.currency),
+            PositionValuation::LegacyDerived { price, .. } => price.map(|price| price.currency),
+            PositionValuation::Uncovered { .. } => None,
+        };
+        if let Some(currency) = currency {
+            fx_keys.insert((currency, request.as_of));
         }
     }
     let rates = fx_keys
@@ -696,6 +863,7 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
     let mut position_coverage = PositionCoverage {
         evaluated_positions: 0,
         total_positions: assessments.len() as u32,
+        selected: Vec::new(),
         uncovered: Vec::new(),
         legacy_derived: Vec::new(),
     };
@@ -704,6 +872,13 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
         match &assessment.kind {
             PositionAssessmentKind::Selected(selected) => {
                 position_coverage.evaluated_positions += 1;
+                position_coverage.selected.push(EvaluatedPosition {
+                    account: assessment.account,
+                    custody: assessment.custody,
+                    instrument: assessment.instrument,
+                    quantity: assessment.quantity,
+                    price: selected.clone(),
+                });
                 if let Ok(value) = position_value(
                     assessment,
                     selected.candidate.price,
@@ -979,6 +1154,84 @@ mod tests {
     }
 
     #[test]
+    fn a_source_correction_inside_the_window_changes_inputs_hash() {
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(
+            ContourId::new_random(),
+            ContourVersion(1),
+            [account],
+        );
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let coordinate = KnowledgeCoordinate {
+            knowledge_as_of: datetime!(2026-08-26 09:00:00 UTC),
+            source_priority_version: 1,
+            valuation_policy_version: 1,
+        };
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate,
+            ledger: &ledger,
+            perimeter: &perimeter,
+        };
+
+        let hash_for_venue = |venue: &str| {
+            let origin = crate::valuation::PriceOrigin::Market {
+                venue: venue.to_owned(),
+                kind: "legal_close".to_owned(),
+            };
+            let selected = SelectedPrice {
+                candidate: PriceCandidate {
+                    instrument,
+                    price: Dec::new(rust_decimal::Decimal::from(100)),
+                    currency: CurrencyCode::Rub,
+                    trade_date: date!(2026 - 08 - 26),
+                    observed_at: datetime!(2026-08-26 08:00:00 UTC),
+                    origin: origin.clone(),
+                    executability: SourceExecutability::Executable,
+                },
+                selection: crate::valuation::PriceSelection::AsObserved,
+                freshness: crate::valuation::PriceFreshness::Fresh,
+                provenance: crate::valuation::PriceProvenance {
+                    price_kind: Some("legal_close".to_owned()),
+                    origin,
+                    venue: Some(venue.to_owned()),
+                    observed_at: datetime!(2026-08-26 08:00:00 UTC),
+                    valuation_policy_version: coordinate.valuation_policy_version,
+                    source_priority_version: coordinate.source_priority_version,
+                    carry_forward_limit: 10,
+                    price_max_age: 30,
+                },
+            };
+            inputs_hash_with_assessments(
+                &state,
+                &request,
+                vec![PositionAssessment {
+                    account,
+                    custody: None,
+                    instrument,
+                    quantity: crate::money::Quantity(Dec::one()),
+                    raw_price: None,
+                    kind: PositionAssessmentKind::Selected(selected),
+                }],
+            )
+        };
+
+        assert_ne!(
+            hash_for_venue("moex"),
+            hash_for_venue("corrected-source"),
+            "исправление provenance выбранного наблюдения внутри окна обязано менять хеш"
+        );
+    }
+
+    #[test]
     fn future_or_foreign_inputs_do_not_change_the_inputs_hash() {
         let base = LedgerState::new(LotBook::new(LotRuleVersion(1)));
         let account = AccountId::new_random();
@@ -1153,6 +1406,7 @@ mod tests {
         let coverage = PositionCoverage {
             evaluated_positions: 1,
             total_positions: 2,
+            selected: Vec::new(),
             uncovered: vec![UncoveredPosition {
                 account: AccountId::new_random(),
                 custody: None,

@@ -19,11 +19,18 @@ use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::returns::{Computed, DataQuality, MaterialIssue, NotComputable, ReturnsReport};
-use iaam_core::valuation::PriceQuality;
+use iaam_core::returns::{
+    AmountQualification, Computed, DataQuality, EvaluatedPosition, ExecutabilityShares,
+    LiquidationEstimate, MaterialIssue, NotComputable, PositionCoverage, ReturnsReport,
+    UncoveredPosition,
+};
+use iaam_core::valuation::{
+    PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, SelectedPrice,
+    SourceExecutability,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use time::Date;
+use time::{Date, OffsetDateTime};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -573,6 +580,130 @@ pub struct RateDto {
     pub detail: Option<String>,
 }
 
+
+/// Выбранная цена позиции с выводами политики и provenance.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SelectedPriceDto {
+    pub instrument: Uuid,
+    pub price: String,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub trade_date: Date,
+    pub observed_at: String,
+    pub executability: String,
+    pub selection: PriceSelectionDto,
+    pub freshness: PriceFreshnessDto,
+    pub provenance: PriceProvenanceDto,
+}
+
+/// Способ, которым политика выбрала наблюдение.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceSelectionDto {
+    AsObserved,
+    CarriedForward {
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date)]
+        observed_on: Date,
+        days: u16,
+    },
+    LegacyDerived { quality: String },
+}
+
+/// Свежесть выбранного наблюдения относительно порога политики.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceFreshnessDto {
+    Fresh,
+    Stale { days: u16 },
+}
+
+/// Происхождение выбранного наблюдения.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceOriginDto {
+    Market { venue: String, price_kind: String },
+    ReportParsed { source: Uuid },
+    OwnerAsserted,
+}
+
+/// Основание выбора: вид источника, площадка, версии и оба порога.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PriceProvenanceDto {
+    pub price_kind: Option<String>,
+    pub origin: PriceOriginDto,
+    pub venue: Option<String>,
+    pub observed_at: String,
+    pub valuation_policy_version: u32,
+    pub source_priority_version: u32,
+    pub carry_forward_limit: u16,
+    pub price_max_age: u16,
+}
+
+/// Позиция, оценённая выбранным наблюдением.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EvaluatedPositionDto {
+    pub account: Uuid,
+    pub custody: Option<Uuid>,
+    pub instrument: Uuid,
+    pub quantity: String,
+    pub price: SelectedPriceDto,
+}
+
+/// Позиция без выбранной цены и причина отказа.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UncoveredPositionDto {
+    pub account: Uuid,
+    pub custody: Option<Uuid>,
+    pub instrument: Uuid,
+    pub reason: String,
+}
+
+/// Позиция, оставшаяся на старом вычисленном качестве.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LegacyDerivedPositionDto {
+    pub account: Uuid,
+    pub custody: Option<Uuid>,
+    pub instrument: Uuid,
+    pub quality: String,
+}
+
+/// Покрытие ценами без выдуманного процента стоимости.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PositionCoverageDto {
+    pub evaluated_positions: u32,
+    pub total_positions: u32,
+    pub selected: Vec<EvaluatedPositionDto>,
+    pub uncovered: Vec<UncoveredPositionDto>,
+    pub legacy_derived: Vec<LegacyDerivedPositionDto>,
+}
+
+/// Доли исполнимости от стоимости оценённых позиций.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecutabilitySharesDto {
+    pub evaluated_positions_value: String,
+    pub executable: String,
+    pub indicative_previous_close: String,
+    pub unknown: String,
+}
+
+/// Денежная величина с явным квалификатором знания.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AmountQualificationDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub qualification: String,
+}
+
+/// Оценка до издержек выхода и до налога.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LiquidationEstimateDto {
+    pub value_before_exit_costs_and_tax: ComputedDto,
+    pub executability: ExecutabilitySharesDto,
+    pub exit_costs: AmountQualificationDto,
+    pub tax: AmountQualificationDto,
+}
 /// Доли стоимости портфеля по уровням достоверности (§10.5).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NavCoverageDto {
@@ -587,6 +718,8 @@ pub struct NavCoverageDto {
 pub struct DataQualityDto {
     pub status: String,
     pub nav_coverage: NavCoverageDto,
+    pub position_coverage: PositionCoverageDto,
+    pub executability: ExecutabilitySharesDto,
     pub material_issues: Vec<String>,
 }
 
@@ -604,8 +737,201 @@ impl DataQualityDto {
                 provisional: quality.nav_coverage.provisional.inner().to_string(),
                 discrepant: quality.nav_coverage.discrepant.inner().to_string(),
             },
+            position_coverage: PositionCoverageDto::from_domain(&quality.position_coverage),
+            executability: ExecutabilitySharesDto::from_domain(&quality.executability),
             material_issues: quality.material_issues.iter().map(issue).collect(),
         }
+    }
+}
+
+impl PositionCoverageDto {
+    fn from_domain(coverage: &PositionCoverage) -> Self {
+        Self {
+            evaluated_positions: coverage.evaluated_positions,
+            total_positions: coverage.total_positions,
+            selected: coverage
+                .selected
+                .iter()
+                .map(EvaluatedPositionDto::from_domain)
+                .collect(),
+            uncovered: coverage
+                .uncovered
+                .iter()
+                .map(UncoveredPositionDto::from_domain)
+                .collect(),
+            legacy_derived: coverage
+                .legacy_derived
+                .iter()
+                .map(LegacyDerivedPositionDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+impl EvaluatedPositionDto {
+    fn from_domain(position: &EvaluatedPosition) -> Self {
+        Self {
+            account: position.account.inner(),
+            custody: position.custody.map(|custody| custody.inner()),
+            instrument: position.instrument.inner(),
+            quantity: position.quantity.0.inner().to_string(),
+            price: SelectedPriceDto::from_domain(&position.price),
+        }
+    }
+}
+
+impl UncoveredPositionDto {
+    fn from_domain(position: &UncoveredPosition) -> Self {
+        Self {
+            account: position.account.inner(),
+            custody: position.custody.map(|custody| custody.inner()),
+            instrument: position.instrument.inner(),
+            reason: uncovered_reason(position.reason).to_owned(),
+        }
+    }
+}
+
+impl LegacyDerivedPositionDto {
+    fn from_domain(position: &iaam_core::returns::LegacyDerivedPosition) -> Self {
+        Self {
+            account: position.account.inner(),
+            custody: position.custody.map(|custody| custody.inner()),
+            instrument: position.instrument.inner(),
+            quality: position.quality.code().to_owned(),
+        }
+    }
+}
+
+impl SelectedPriceDto {
+    fn from_domain(price: &SelectedPrice) -> Self {
+        Self {
+            instrument: price.candidate.instrument.inner(),
+            price: price.candidate.price.inner().to_string(),
+            currency: CurrencyDto::from_domain(price.candidate.currency),
+            trade_date: price.candidate.trade_date,
+            observed_at: format_timestamp(price.candidate.observed_at),
+            executability: executability(price.candidate.executability).to_owned(),
+            selection: PriceSelectionDto::from_domain(price.selection),
+            freshness: PriceFreshnessDto::from_domain(price.freshness),
+            provenance: PriceProvenanceDto::from_domain(&price.provenance),
+        }
+    }
+}
+
+impl PriceSelectionDto {
+    fn from_domain(selection: PriceSelection) -> Self {
+        match selection {
+            PriceSelection::AsObserved => Self::AsObserved,
+            PriceSelection::CarriedForward { observed_on, days } => {
+                Self::CarriedForward { observed_on, days }
+            }
+            PriceSelection::LegacyDerived { quality } => {
+                Self::LegacyDerived {
+                    quality: quality.code().to_owned(),
+                }
+            }
+        }
+    }
+}
+
+impl PriceFreshnessDto {
+    fn from_domain(freshness: PriceFreshness) -> Self {
+        match freshness {
+            PriceFreshness::Fresh => Self::Fresh,
+            PriceFreshness::Stale { days } => Self::Stale { days },
+        }
+    }
+}
+
+impl PriceProvenanceDto {
+    fn from_domain(provenance: &PriceProvenance) -> Self {
+        Self {
+            price_kind: provenance.price_kind.clone(),
+            origin: PriceOriginDto::from_domain(&provenance.origin),
+            venue: provenance.venue.clone(),
+            observed_at: format_timestamp(provenance.observed_at),
+            valuation_policy_version: provenance.valuation_policy_version,
+            source_priority_version: provenance.source_priority_version,
+            carry_forward_limit: provenance.carry_forward_limit,
+            price_max_age: provenance.price_max_age,
+        }
+    }
+}
+
+impl PriceOriginDto {
+    fn from_domain(origin: &PriceOrigin) -> Self {
+        match origin {
+            PriceOrigin::Market { venue, kind } => Self::Market {
+                venue: venue.clone(),
+                price_kind: kind.clone(),
+            },
+            PriceOrigin::ReportParsed { source } => Self::ReportParsed {
+                source: source.inner(),
+            },
+            PriceOrigin::OwnerAsserted => Self::OwnerAsserted,
+        }
+    }
+}
+
+impl ExecutabilitySharesDto {
+    fn from_domain(shares: &ExecutabilityShares) -> Self {
+        Self {
+            evaluated_positions_value: shares.evaluated_positions_value.inner().to_string(),
+            executable: shares.executable.inner().to_string(),
+            indicative_previous_close: shares.indicative_previous_close.inner().to_string(),
+            unknown: shares.unknown.inner().to_string(),
+        }
+    }
+}
+
+impl AmountQualificationDto {
+    fn from_domain(amount: AmountQualification) -> Self {
+        match amount {
+            AmountQualification::Known(value) => Self {
+                value: Some(value.inner().to_string()),
+                qualification: "known".to_owned(),
+            },
+            AmountQualification::Unknown => Self {
+                value: None,
+                qualification: "unknown".to_owned(),
+            },
+        }
+    }
+}
+
+impl LiquidationEstimateDto {
+    fn from_domain(estimate: &LiquidationEstimate) -> Self {
+        Self {
+            value_before_exit_costs_and_tax: ComputedDto::from_dec(
+                &estimate.value_before_exit_costs_and_tax,
+            ),
+            executability: ExecutabilitySharesDto::from_domain(&estimate.executability),
+            exit_costs: AmountQualificationDto::from_domain(estimate.exit_costs),
+            tax: AmountQualificationDto::from_domain(estimate.tax),
+        }
+    }
+}
+
+fn format_timestamp(value: OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("временная метка provenance должна форматироваться")
+}
+
+fn executability(value: SourceExecutability) -> &'static str {
+    match value {
+        SourceExecutability::Executable => "executable",
+        SourceExecutability::IndicativePreviousClose => "indicative_previous_close",
+        SourceExecutability::Unknown => "unknown",
+    }
+}
+
+fn uncovered_reason(value: iaam_core::valuation::UncoveredReason) -> &'static str {
+    match value {
+        iaam_core::valuation::UncoveredReason::NoObservation => "no_observation",
+        iaam_core::valuation::UncoveredReason::TooOld => "too_old",
+        iaam_core::valuation::UncoveredReason::AmbiguousVenue => "ambiguous_venue",
+        iaam_core::valuation::UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
     }
 }
 
@@ -655,6 +981,8 @@ pub struct ReturnsReportDto {
     pub contributed: ComputedDto,
     pub withdrawn: ComputedDto,
     pub terminal_value: ComputedDto,
+    /// Оценка до гипотетических издержек выхода и до налога.
+    pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto,
     /// **Доходность до налога.** Имя поля содержит оговорку намеренно:
     /// налоги появляются в E5, и до тех пор называть эту величину
     /// «доходностью» без уточнения нельзя (§16.3).
@@ -710,6 +1038,10 @@ impl ReturnsReportDto {
             contributed: ComputedDto::from_dec(&report.contributed),
             withdrawn: ComputedDto::from_dec(&report.withdrawn),
             terminal_value: ComputedDto::from_dec(&report.terminal_value),
+            liquidation_value_before_exit_costs_and_tax:
+                LiquidationEstimateDto::from_domain(
+                    &report.liquidation_value_before_exit_costs_and_tax,
+                ),
             xirr_pre_tax: rate,
             applied_rules: AppliedRulesDto {
                 contour: report.applied_rules.contour.0,

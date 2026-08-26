@@ -1387,6 +1387,23 @@ pub struct InstrumentDto {
     pub quote_currency: String,
 }
 
+/// Данные для записи инструмента администратором или синхронизацией.
+///
+/// Идентификатор можно не передавать: тогда его назначает сервер. Поля
+/// валюты обязательны, потому что отсутствие валюты нельзя отличить от
+/// неизвестного значения в сохранённом справочнике.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateInstrumentRequest {
+    #[serde(default)]
+    pub id: Option<Uuid>,
+    pub kind: Option<String>,
+    pub symbol: String,
+    pub title: String,
+    pub denomination_currency: String,
+    pub settlement_currency: String,
+    pub quote_currency: String,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ResolveInstrumentRequest {
     pub namespace: String,

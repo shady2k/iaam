@@ -13,11 +13,11 @@ use crate::dto::{
     AccountDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerAccessUpdateRequest,
     BrokerEnvironmentDto, BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
     ClassificationRuleRequest, ComputedDto, ContourVersionDto, CreateAccountRequest,
-    CreateContourVersionRequest, CreateTokenRequest, CurrencyDto, DataQualityDto,
-    DimensionStatusDto, DocumentDto, EvidenceDto, FeeOriginDto, FxRateDto, HealthDto,
-    IssuedTokenDto, OperationDatesDto, OperationDto, OperationKindDto, OwnerBalanceRequest,
-    PriceQualityDto, RateDto, ReconciliationStatusDto, ReturnsReportDto, SubmitOperationsRequest,
-    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    DataQualityDto, DimensionStatusDto, DocumentDto, EvidenceDto, FeeOriginDto, FxRateDto,
+    HealthDto, IssuedTokenDto, OperationDatesDto, OperationDto, OperationKindDto,
+    OwnerBalanceRequest, PriceQualityDto, RateDto, ReconciliationStatusDto, ReturnsReportDto,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::ApiError;
 
@@ -63,6 +63,7 @@ impl Modify for BearerSecurity {
         ContourVersionDto,
         CreateAccountRequest,
         CreateContourVersionRequest,
+        CreateInstrumentRequest,
         CreateTokenRequest,
         CurrencyDto,
         DataQualityDto,

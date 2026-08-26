@@ -22,7 +22,8 @@ use iaam_app::scenarios::reports::{ReturnsQuery, returns};
 use iaam_app::sync::sync_broker as run_sync_broker;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
-use iaam_core::money::{PostedMinor, Quantity};
+use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
+use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::PROJECTION_VERSION;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
@@ -41,11 +42,11 @@ use crate::dto::{
     AccountDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerAccessUpdateRequest,
     BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
     ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
-    CreateContourVersionRequest, CreateTokenRequest, CurrencyDto, DimensionStatusDto, DocumentDto,
-    DocumentParams, EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto,
-    OwnerBalanceRequest, ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsReportDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto,
-    TokenScopeDto, VerdictDto,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
+    InstrumentDto, IssuedTokenDto, OwnerBalanceRequest, ReconciliationParams,
+    ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -120,34 +121,71 @@ pub async fn resolve_instrument(
     }))
 }
 
-/// Защита точки записи глобального справочника.
+/// Запись инструмента в глобальный справочник.
 ///
-/// Порт справочника предоставляет только чтение и разрешение кодов.
-/// Поэтому право проверяется до чтения тела, а разрешённая запись останется
-/// невозможной до появления отдельного метода порта.
+/// Право проверяется до разбора тела: агентский токен должен получить 403
+/// даже для тела, которое само по себе некорректно (§7, §14).
 #[utoipa::path(
     post,
     path = "/v1/instruments",
-    request_body = InstrumentDto,
+    request_body = CreateInstrumentRequest,
     responses(
+        (status = 201, description = "Инструмент записан", body = InstrumentDto),
         (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 501, description = "Запись не поддерживается портом", body = ApiError)
+        (status = 422, description = "Некорректные данные инструмента", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_instrument(
+    State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     body: Bytes,
-) -> Result<StatusCode, ApiFailure> {
+) -> Result<(StatusCode, Json<InstrumentDto>), ApiFailure> {
     require_admin(&principal)?;
-    let _ = body;
-    Err(ApiFailure::new(
-        StatusCode::NOT_IMPLEMENTED,
-        ApiError::simple(
-            "not_implemented",
-            "порт справочника не предоставляет запись инструментов",
-        ),
-    ))
+    let request: CreateInstrumentRequest = serde_json::from_slice(&body)
+        .map_err(|error| invalid_field("body", "JSON-объект инструмента", error.to_string()))?;
+    let id = InstrumentId(request.id.unwrap_or_else(Uuid::new_v4));
+    let kind = request
+        .kind
+        .as_deref()
+        .map(|kind| {
+            InstrumentKind::from_code(kind).ok_or_else(|| {
+                invalid_field(
+                    "kind",
+                    "share, depositary_receipt, bond, etf, mutual_fund, currency, crypto, \
+                     real_estate, private_share или loan",
+                    kind.to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    let currencies = CurrencyRoles {
+        denomination: parse_currency("denomination_currency", &request.denomination_currency)?,
+        settlement: parse_currency("settlement_currency", &request.settlement_currency)?,
+        quote: parse_currency("quote_currency", &request.quote_currency)?,
+    };
+    let id = state
+        .services
+        .directory
+        .record_instrument(iaam_app::ports::InstrumentUpsert {
+            id,
+            kind,
+            symbol: request.symbol,
+            title: request.title,
+            currencies,
+            lineage: None,
+        })
+        .await?;
+    let instrument = state
+        .services
+        .directory
+        .instrument(id)
+        .await?
+        .ok_or_else(|| iaam_app::error::AppError::NotFound {
+            what: "записанный инструмент",
+            id: id.inner().to_string(),
+        })?;
+    Ok((StatusCode::CREATED, Json(instrument_dto(instrument))))
 }
 
 /// Загрузка отчёта с построчными исходами.
@@ -1188,6 +1226,11 @@ fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure
         time::macros::format_description!("[year]-[month]-[day]"),
     )
     .map_err(|_| invalid_field(field, "ГГГГ-ММ-ДД", value.to_owned()))
+}
+
+fn parse_currency(field: &'static str, value: &str) -> Result<CurrencyCode, ApiFailure> {
+    CurrencyCode::from_code(value)
+        .ok_or_else(|| invalid_field(field, "RUB, USD, EUR, CNY или XAU", value.to_owned()))
 }
 
 fn invalid_field(field: impl Into<String>, expected: &str, actual: String) -> ApiFailure {

@@ -94,7 +94,7 @@ impl AccountValue {
 }
 
 /// Стоимость контура **по счетам** на дату отчёта: деньги плюс позиции
-/// по последней цене.
+/// по последней цене, наблюдавшейся не позже даты отчёта.
 ///
 /// Это **ликвидационная** оценка в упрощённом виде (§5.1): комиссий
 /// закрытия и налога к уплате в ней нет, потому что ни того, ни другого
@@ -127,7 +127,7 @@ pub fn account_values(
         }
         let price = state
             .prices()
-            .latest(key.instrument)
+            .price_at_or_before(key.instrument, request.as_of)
             .ok_or(NotComputable::MissingPrice {
                 instrument: key.instrument,
             })?;

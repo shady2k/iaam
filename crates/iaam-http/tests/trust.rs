@@ -27,7 +27,7 @@ fn the_embedded_root_is_the_frozen_one() {
 fn only_the_root_is_embedded() {
     // Промежуточный сертификат сервер присылает сам. Лишний якорь —
     // это лишнее доверие и вторая дата истечения.
-    assert_eq!(certificate_count(), 1);
+    assert_eq!(certificate_count(RUSSIAN_TRUSTED_ROOT_CA_PEM), 1);
 }
 
 #[test]
@@ -52,6 +52,17 @@ fn a_pinned_anchor_is_used_only_for_the_gateways_that_need_it() {
 }
 
 #[test]
-fn the_pinned_bundle_holds_exactly_one_certificate() {
-    assert_eq!(certificate_count(), 1);
+fn certificate_count_matches_the_number_of_pem_certificates() {
+    assert_eq!(certificate_count(""), 0);
+    assert_eq!(
+        certificate_count("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----"),
+        1
+    );
+    assert_eq!(
+        certificate_count(
+            "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n\
+             -----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----"
+        ),
+        2
+    );
 }

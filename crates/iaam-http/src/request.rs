@@ -228,6 +228,37 @@ mod tests {
     }
 
     #[test]
+    fn request_body_payload_preserves_json_and_xml_contents() {
+        let json = RequestBody::Json(r#"{"cursor":7}"#.to_owned());
+        let xml = RequestBody::Xml("<Envelope/>".to_owned());
+
+        assert_eq!(json.payload(), r#"{"cursor":7}"#);
+        assert_eq!(xml.payload(), "<Envelope/>");
+    }
+
+    #[test]
+    fn secret_expose_returns_the_original_token() {
+        let secret = Secret::new("token-value");
+
+        assert_eq!(secret.expose(), "token-value");
+    }
+
+    #[test]
+    fn a_bearer_request_retains_its_token_for_transport() {
+        let request = HttpRequest::get(Destination::MoexIss, "/").with_bearer("bearer-token");
+
+        assert_eq!(request.bearer().map(Secret::expose), Some("bearer-token"));
+    }
+
+    #[test]
+    fn secret_debug_is_redacted_but_not_empty() {
+        assert_eq!(
+            format!("{:?}", Secret::new("token-value")),
+            "Secret(<скрыт>)"
+        );
+    }
+
+    #[test]
     fn the_sandbox_is_a_different_host_not_a_different_path() {
         assert_ne!(
             Destination::TinkoffProd.base_url(),

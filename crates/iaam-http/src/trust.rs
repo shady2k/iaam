@@ -26,15 +26,15 @@ use crate::response::HttpError;
 /// а якорь доверия — ровно то, что подменяют в первую очередь.
 pub const RUSSIAN_TRUSTED_ROOT_CA_PEM: &str = include_str!("../certs/russian-trusted-root-ca.pem");
 
-/// Сколько сертификатов лежит в вшитой связке.
-///
-/// Ровно один: промежуточный сертификат сервер присылает сам, а лишний
-/// якорь — это лишнее доверие и вторая дата истечения.
+/// Считает сертификаты в произвольной PEM-связке.
+fn certificate_count_in_pem(pem: &str) -> usize {
+    pem.matches("BEGIN CERTIFICATE").count()
+}
+
+/// Сколько сертификатов лежит в PEM-связке.
 #[must_use]
-pub fn certificate_count() -> usize {
-    RUSSIAN_TRUSTED_ROOT_CA_PEM
-        .matches("BEGIN CERTIFICATE")
-        .count()
+pub fn certificate_count(pem: &str) -> usize {
+    certificate_count_in_pem(pem)
 }
 
 /// Откуда берётся якорь для назначения.
@@ -45,6 +45,10 @@ pub enum Anchors {
     /// Ровно один вшитый корень; веб-корни выключены.
     Pinned(&'static str),
 }
+
+/// Клиент, собранный с выбранной политикой доверия.
+#[derive(Clone)]
+pub(crate) struct ConfiguredClient(pub(crate) Client);
 
 /// Якорь доверия назначения.
 ///
@@ -67,10 +71,15 @@ impl Destination {
     }
 }
 
+fn client_anchors(destination: Destination) -> Anchors {
+    destination.anchors()
+}
+
 /// Собирает клиента под якорь назначения.
-pub(crate) fn client_for(destination: Destination) -> Result<Client, HttpError> {
+pub(crate) fn client_for(destination: Destination) -> Result<ConfiguredClient, HttpError> {
+    let anchors = client_anchors(destination);
     let builder = Client::builder().tls_backend_rustls();
-    let builder = match destination.anchors() {
+    let builder = match anchors {
         Anchors::WebRoots => builder,
         Anchors::Pinned(pem) => {
             let root = Certificate::from_pem(pem.as_bytes())
@@ -81,7 +90,40 @@ pub(crate) fn client_for(destination: Destination) -> Result<Client, HttpError> 
             builder.tls_certs_only([root])
         }
     };
-    builder
+    let client = builder
         .build()
-        .map_err(|error| HttpError::ClientNotBuilt(error.to_string()))
+        .map_err(|error| HttpError::ClientNotBuilt(error.to_string()))?;
+    Ok(ConfiguredClient(client))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn certificate_count_counts_each_certificate_in_a_pem_bundle() {
+        assert_eq!(certificate_count_in_pem(""), 0);
+        assert_eq!(
+            certificate_count_in_pem(
+                "-----BEGIN CERTIFICATE-----\nfirst\n-----END CERTIFICATE-----"
+            ),
+            1
+        );
+        assert_eq!(
+            certificate_count_in_pem(
+                "-----BEGIN CERTIFICATE-----\nfirst\n-----END CERTIFICATE-----\n\
+                 -----BEGIN CERTIFICATE-----\nsecond\n-----END CERTIFICATE-----"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn client_build_uses_the_destination_trust_policy() {
+        assert_eq!(
+            client_anchors(Destination::TinkoffProd),
+            Anchors::Pinned(RUSSIAN_TRUSTED_ROOT_CA_PEM)
+        );
+        assert_eq!(client_anchors(Destination::MoexIss), Anchors::WebRoots);
+    }
 }

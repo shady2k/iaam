@@ -5,23 +5,24 @@
 //! Реестр закрытый: плагины в рантайме не нужны.
 
 pub mod lot_disposal;
+pub mod valuation;
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use lot_disposal::{FifoV1, LotDisposalRule};
+use valuation::{ValuationPolicyV1, ValuationPolicyVersion, ValuationRule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LotRuleVersion(pub u32);
 
 /// Реестр версионированных доменных правил.
 ///
-/// На этапе 1 содержит только списание лотов. Налоговые правила
-/// (`TaxRuleSet`, ключ `(TaxYear, TaxBaseKind)`) добавляются в эпике E5
-/// по той же схеме.
+/// Реестр хранит независимые наборы правил: списание лотов и выбор цены.
 pub struct RuleRegistry {
     lot_rules: BTreeMap<LotRuleVersion, Box<dyn LotDisposalRule>>,
+    valuation_rules: BTreeMap<ValuationPolicyVersion, Box<dyn ValuationRule>>,
 }
 
 impl RuleRegistry {
@@ -30,7 +31,21 @@ impl RuleRegistry {
     pub fn with_defaults() -> Self {
         let mut lot_rules: BTreeMap<LotRuleVersion, Box<dyn LotDisposalRule>> = BTreeMap::new();
         lot_rules.insert(LotRuleVersion(1), Box::new(FifoV1));
-        Self { lot_rules }
+        let mut valuation_rules: BTreeMap<ValuationPolicyVersion, Box<dyn ValuationRule>> =
+            BTreeMap::new();
+        valuation_rules.insert(ValuationPolicyVersion(1), Box::new(ValuationPolicyV1::default()));
+        Self {
+            lot_rules,
+            valuation_rules,
+        }
+    }
+
+    #[must_use]
+    pub fn valuation_rule(
+        &self,
+        version: ValuationPolicyVersion,
+    ) -> Option<&dyn ValuationRule> {
+        self.valuation_rules.get(&version).map(|rule| rule.as_ref())
     }
 
     #[must_use]

@@ -15,8 +15,8 @@ use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use iaam_store::market::{Coverage, PriceRow, RunOutcome, SeriesKey};
 use iaam_store::reference::InstrumentRecord;
-use time::{Date, Duration};
 use time::macros::date;
+use time::{Date, Duration};
 use uuid::Uuid;
 
 struct FixedClock(Date);
@@ -110,7 +110,12 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
         })
         .unwrap_or_else(|error| panic!("insert market instrument: {error}"));
     let run = store
-        .begin_run(series, from, to, time::OffsetDateTime::now_utc() + Duration::hours(1))
+        .begin_run(
+            series,
+            from,
+            to,
+            time::OffsetDateTime::now_utc() + Duration::hours(1),
+        )
         .unwrap_or_else(|error| panic!("begin market run: {error}"));
     store
         .record_prices(
@@ -130,11 +135,7 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
         )
         .unwrap_or_else(|error| panic!("record market price: {error}"));
     store
-        .finish_run(
-            &run,
-            RunOutcome::Succeeded,
-            Some(Coverage { from, to }),
-        )
+        .finish_run(&run, RunOutcome::Succeeded, Some(Coverage { from, to }))
         .unwrap_or_else(|error| panic!("finish market run: {error}"));
 }
 

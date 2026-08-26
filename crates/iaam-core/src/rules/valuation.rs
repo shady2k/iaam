@@ -2,11 +2,11 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
 use crate::valuation::{
     PriceCandidate, PriceFreshness, PriceOrigin, PriceProvenance, PriceQuery, PriceSelection,
     SelectedPrice, UncoveredReason,
 };
+use serde::{Deserialize, Serialize};
 
 /// Версия политики выбора цены.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -178,20 +178,27 @@ impl ValuationRule for ValuationPolicyV1 {
             };
         }
 
-        let min_age = matching.iter().map(|(age, _)| *age).min().expect("not empty");
+        let min_age = matching
+            .iter()
+            .map(|(age, _)| *age)
+            .min()
+            .expect("not empty");
         matching.retain(|(age, _)| *age == min_age);
         let min_origin = matching
             .iter()
-            .map(|(_, candidate)| Self::origin_rank(&candidate.origin, self.source_priority_version))
+            .map(|(_, candidate)| {
+                Self::origin_rank(&candidate.origin, self.source_priority_version)
+            })
             .min()
             .expect("not empty");
         matching.retain(|(_, candidate)| {
             Self::origin_rank(&candidate.origin, self.source_priority_version) == min_origin
         });
 
-        if matching.iter().all(|(_, candidate)| {
-            matches!(candidate.origin, PriceOrigin::Market { .. })
-        }) {
+        if matching
+            .iter()
+            .all(|(_, candidate)| matches!(candidate.origin, PriceOrigin::Market { .. }))
+        {
             let venues: BTreeSet<&str> = matching
                 .iter()
                 .filter_map(|(_, candidate)| match &candidate.origin {
@@ -402,7 +409,10 @@ mod tests {
             ],
         );
         assert!(out.selected().is_none());
-        assert_eq!(out.uncovered_reason(), Some(UncoveredReason::AmbiguousVenue));
+        assert_eq!(
+            out.uncovered_reason(),
+            Some(UncoveredReason::AmbiguousVenue)
+        );
     }
 
     #[test]
@@ -519,7 +529,10 @@ mod tests {
             ],
         );
         assert_eq!(
-            out.selected().expect("версия до knowledge_as_of").provenance.observed_at,
+            out.selected()
+                .expect("версия до knowledge_as_of")
+                .provenance
+                .observed_at,
             datetime!(2026 - 08 - 10 11:00 UTC)
         );
     }
@@ -527,7 +540,10 @@ mod tests {
     #[test]
     fn an_observation_on_the_valuation_date_is_not_carried_forward() {
         let query = query(date!(2026 - 08 - 10));
-        let out = policy().select(&query, &[candidate(query.instrument, date!(2026 - 08 - 10))]);
+        let out = policy().select(
+            &query,
+            &[candidate(query.instrument, date!(2026 - 08 - 10))],
+        );
         let picked = out.selected().expect("цена есть");
         assert_eq!(picked.selection, PriceSelection::AsObserved);
         assert_eq!(picked.freshness, PriceFreshness::Fresh);
@@ -536,7 +552,10 @@ mod tests {
     #[test]
     fn a_price_can_be_carried_forward_and_stale_at_the_same_time() {
         let query = query(date!(2026 - 08 - 10));
-        let out = policy().select(&query, &[candidate(query.instrument, date!(2026 - 07 - 11))]);
+        let out = policy().select(
+            &query,
+            &[candidate(query.instrument, date!(2026 - 07 - 11))],
+        );
         let picked = out.selected().expect("30 дней ещё в окне");
         assert_eq!(
             picked.selection,
@@ -551,7 +570,10 @@ mod tests {
     #[test]
     fn a_price_older_than_the_search_window_is_not_returned_at_all() {
         let query = query(date!(2026 - 08 - 10));
-        let out = policy().select(&query, &[candidate(query.instrument, date!(2026 - 07 - 10))]);
+        let out = policy().select(
+            &query,
+            &[candidate(query.instrument, date!(2026 - 07 - 10))],
+        );
         assert!(out.selected().is_none());
         assert_eq!(out.uncovered_reason(), Some(UncoveredReason::TooOld));
     }

@@ -271,12 +271,13 @@ mod tests {
     fn source_quality_maps_to_source_executability() {
         let executable = candidate_from_legacy_valuation(PriceQuality::Executable, price());
         assert_eq!(
-            executable.candidate().map(|candidate| candidate.executability),
+            executable
+                .candidate()
+                .map(|candidate| candidate.executability),
             Some(SourceExecutability::Executable)
         );
 
-        let previous_close =
-            candidate_from_legacy_valuation(PriceQuality::PreviousClose, price());
+        let previous_close = candidate_from_legacy_valuation(PriceQuality::PreviousClose, price());
         assert_eq!(
             previous_close
                 .candidate()

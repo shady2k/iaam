@@ -49,7 +49,6 @@ impl PriceQuality {
             Self::OwnerEstimate => "owner_estimate",
         }
     }
-
 }
 
 /// Цена за единицу инструмента на дату.
@@ -329,7 +328,6 @@ mod tests {
                 .is_none()
         );
     }
-
 
     #[test]
     fn the_same_currency_needs_no_rate() {

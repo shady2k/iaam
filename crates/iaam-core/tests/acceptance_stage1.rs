@@ -214,7 +214,7 @@ fn single_account_answers_the_three_questions_of_stage_one() {
         solver_policy: SolverPolicy::returns_default(),
         ledger: &ledger,
         perimeter: &perimeter,
-            market_prices: &[],
+        market_prices: &[],
     };
     let report = returns_report(state, &request);
 

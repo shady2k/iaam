@@ -18,8 +18,8 @@ use crate::dto::{
     ExecutabilitySharesDto, FeeOriginDto, FxRateDto, HealthDto, IssuedTokenDto,
     LegacyDerivedPositionDto, LiquidationEstimateDto, MarketFxDto, MarketKeyRateDto,
     MarketPriceDto, MarketSourceDto, MarketSyncRequest, OperationDatesDto, OperationDto,
-    OperationKindDto, OwnerBalanceRequest, PriceFreshnessDto, PriceOriginDto, PriceProvenanceDto,
-    PriceQualityDto, PriceSelectionDto, PositionCoverageDto, RateDto, ReconciliationStatusDto,
+    OperationKindDto, OwnerBalanceRequest, PositionCoverageDto, PriceFreshnessDto, PriceOriginDto,
+    PriceProvenanceDto, PriceQualityDto, PriceSelectionDto, RateDto, ReconciliationStatusDto,
     ReturnsReportDto, SelectedPriceDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto,
     UncoveredPositionDto, VerdictDto,
 };

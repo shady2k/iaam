@@ -580,7 +580,6 @@ pub struct RateDto {
     pub detail: Option<String>,
 }
 
-
 /// Выбранная цена позиции с выводами политики и provenance.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SelectedPriceDto {
@@ -608,7 +607,9 @@ pub enum PriceSelectionDto {
         observed_on: Date,
         days: u16,
     },
-    LegacyDerived { quality: String },
+    LegacyDerived {
+        quality: String,
+    },
 }
 
 /// Свежесть выбранного наблюдения относительно порога политики.
@@ -825,11 +826,9 @@ impl PriceSelectionDto {
             PriceSelection::CarriedForward { observed_on, days } => {
                 Self::CarriedForward { observed_on, days }
             }
-            PriceSelection::LegacyDerived { quality } => {
-                Self::LegacyDerived {
-                    quality: quality.code().to_owned(),
-                }
-            }
+            PriceSelection::LegacyDerived { quality } => Self::LegacyDerived {
+                quality: quality.code().to_owned(),
+            },
         }
     }
 }
@@ -1038,10 +1037,9 @@ impl ReturnsReportDto {
             contributed: ComputedDto::from_dec(&report.contributed),
             withdrawn: ComputedDto::from_dec(&report.withdrawn),
             terminal_value: ComputedDto::from_dec(&report.terminal_value),
-            liquidation_value_before_exit_costs_and_tax:
-                LiquidationEstimateDto::from_domain(
-                    &report.liquidation_value_before_exit_costs_and_tax,
-                ),
+            liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto::from_domain(
+                &report.liquidation_value_before_exit_costs_and_tax,
+            ),
             xirr_pre_tax: rate,
             applied_rules: AppliedRulesDto {
                 contour: report.applied_rules.contour.0,

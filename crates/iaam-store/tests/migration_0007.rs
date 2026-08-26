@@ -63,7 +63,12 @@ fn insert_price(conn: &Connection, observed_at: &str, price: &str, executability
               observed_at, price, currency, executability, raw_hash, sync_run_id)
          VALUES ('instrument-1', 'TQBR', 1, '2026-08-01', 'close', 'moex-iss',
                  ?1, ?2, 'RUB', ?3, ?4, 'run-1')",
-        (observed_at, price, executability, format!("hash-{observed_at}")),
+        (
+            observed_at,
+            price,
+            executability,
+            format!("hash-{observed_at}"),
+        ),
     )
     .expect("наблюдение цены");
 }
@@ -103,12 +108,7 @@ fn price_rows(conn: &Connection) -> Vec<PriceRow> {
 fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
     let conn = database_at_version_six();
     insert_sync_run(&conn);
-    insert_price(
-        &conn,
-        "2026-08-02T09:00:00Z",
-        "100.00",
-        "executable",
-    );
+    insert_price(&conn, "2026-08-02T09:00:00Z", "100.00", "executable");
     insert_price(
         &conn,
         "2026-08-03T09:00:00Z",
@@ -169,7 +169,10 @@ fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
             [],
         )
         .expect_err("изменение наблюдения должно быть запрещено");
-    assert!(err.to_string().contains("append-only"), "ошибка триггера: {err}");
+    assert!(
+        err.to_string().contains("append-only"),
+        "ошибка триггера: {err}"
+    );
 
     let err = conn
         .execute(
@@ -178,7 +181,10 @@ fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
             [],
         )
         .expect_err("удаление наблюдения должно быть запрещено");
-    assert!(err.to_string().contains("append-only"), "ошибка триггера: {err}");
+    assert!(
+        err.to_string().contains("append-only"),
+        "ошибка триггера: {err}"
+    );
 
     assert_eq!(price_rows(&conn), before, "триггеры не изменили историю");
 }

@@ -750,7 +750,6 @@ async fn a_stale_price_is_not_accepted_from_the_api() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
 }
 
-
 #[tokio::test]
 async fn the_stage_one_question_is_answered_end_to_end() {
     // Приёмочный критерий эпика через API: сколько внесено, сколько
@@ -894,18 +893,16 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         1
     );
     assert_eq!(
-        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
-            ["price_kind"],
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["price_kind"],
         Value::Null
     );
     assert_eq!(
-        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
-            ["origin"]["kind"],
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["origin"]
+            ["kind"],
         "report_parsed"
     );
     assert_eq!(
-        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
-            ["source_priority_version"],
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["source_priority_version"],
         1
     );
     assert_eq!(
@@ -913,13 +910,11 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         "100"
     );
     assert_eq!(
-        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
-            ["carry_forward_limit"],
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["carry_forward_limit"],
         10
     );
     assert_eq!(
-        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]
-            ["price_max_age"],
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["price_max_age"],
         30
     );
     assert_eq!(
@@ -939,9 +934,7 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         report["liquidation_value_before_exit_costs_and_tax"]["tax"]["qualification"],
         "unknown"
     );
-    assert!(
-        report["liquidation_value_before_exit_costs_and_tax"]["exit_costs"]["value"].is_null()
-    );
+    assert!(report["liquidation_value_before_exit_costs_and_tax"]["exit_costs"]["value"].is_null());
 }
 
 #[tokio::test]

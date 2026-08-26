@@ -450,10 +450,7 @@ struct SelectedProvenance {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SelectedOrigin {
-    Market {
-        venue: String,
-        price_kind: String,
-    },
+    Market { venue: String, price_kind: String },
     ReportParsed { source: SourceId },
     OwnerAsserted,
 }
@@ -473,12 +470,10 @@ fn selected_observation(price: &SelectedPrice) -> SelectedObservation {
         crate::valuation::PriceFreshness::Stale { days } => SelectedFreshness::Stale { days },
     };
     let origin = match &price.provenance.origin {
-        crate::valuation::PriceOrigin::Market { venue, kind } => {
-            SelectedOrigin::Market {
-                venue: venue.clone(),
-                price_kind: kind.clone(),
-            }
-        }
+        crate::valuation::PriceOrigin::Market { venue, kind } => SelectedOrigin::Market {
+            venue: venue.clone(),
+            price_kind: kind.clone(),
+        },
         crate::valuation::PriceOrigin::ReportParsed { source } => {
             SelectedOrigin::ReportParsed { source: *source }
         }
@@ -734,7 +729,9 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
 
 #[derive(Debug)]
 enum PositionAssessmentKind {
-    Selected(SelectedPrice),
+    /// Кандидат в боксе: без него перечисление раздувается до размера
+    /// самого большого варианта на каждой позиции (clippy::large_enum_variant).
+    Selected(Box<SelectedPrice>),
     LegacyDerived(PriceQuality),
     Uncovered(UncoveredReason),
 }
@@ -815,7 +812,7 @@ fn position_assessments(
                     &candidates,
                 );
                 match result.selected() {
-                    Some(selected) => PositionAssessmentKind::Selected(selected.clone()),
+                    Some(selected) => PositionAssessmentKind::Selected(Box::new(selected.clone())),
                     None => PositionAssessmentKind::Uncovered(
                         result
                             .uncovered_reason()
@@ -894,7 +891,7 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
                     custody: assessment.custody,
                     instrument: assessment.instrument,
                     quantity: assessment.quantity,
-                    price: selected.clone(),
+                    price: (**selected).clone(),
                 });
                 if let Ok(value) = position_value(
                     assessment,
@@ -907,12 +904,14 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
             }
             PositionAssessmentKind::LegacyDerived(quality) => {
                 position_coverage.evaluated_positions += 1;
-                position_coverage.legacy_derived.push(LegacyDerivedPosition {
-                    account: assessment.account,
-                    custody: assessment.custody,
-                    instrument: assessment.instrument,
-                    quality: *quality,
-                });
+                position_coverage
+                    .legacy_derived
+                    .push(LegacyDerivedPosition {
+                        account: assessment.account,
+                        custody: assessment.custody,
+                        instrument: assessment.instrument,
+                        quality: *quality,
+                    });
                 if let Some(price) = assessment.raw_price {
                     if let Ok(value) =
                         position_value(assessment, price.price, price.currency, request)
@@ -1176,11 +1175,7 @@ mod tests {
         let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let contour = ContourDefinition::new(
-            ContourId::new_random(),
-            ContourVersion(1),
-            [account],
-        );
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let ledger = ReconciliationLedger::default();
         let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
@@ -1238,7 +1233,7 @@ mod tests {
                     instrument,
                     quantity: crate::money::Quantity(Dec::one()),
                     raw_price: None,
-                    kind: PositionAssessmentKind::Selected(selected),
+                    kind: PositionAssessmentKind::Selected(Box::new(selected)),
                 }],
             )
         };
@@ -1388,16 +1383,21 @@ mod tests {
         );
     }
 
-
     #[test]
     fn executability_shares_are_weighted_by_evaluated_position_value() {
         let mut shares = ExecutabilityAccumulator::default();
-        shares.add(SourceExecutability::Executable, Dec::new(rust_decimal::Decimal::new(2, 0)));
+        shares.add(
+            SourceExecutability::Executable,
+            Dec::new(rust_decimal::Decimal::new(2, 0)),
+        );
         shares.add(
             SourceExecutability::IndicativePreviousClose,
             Dec::new(rust_decimal::Decimal::new(1, 0)),
         );
-        shares.add(SourceExecutability::Unknown, Dec::new(rust_decimal::Decimal::new(1, 0)));
+        shares.add(
+            SourceExecutability::Unknown,
+            Dec::new(rust_decimal::Decimal::new(1, 0)),
+        );
 
         let shares = shares.finish();
         assert_eq!(
@@ -1444,9 +1444,9 @@ mod tests {
     #[test]
     fn liquidation_estimate_keeps_unknown_costs_and_tax_typed() {
         let estimate = LiquidationEstimate {
-            value_before_exit_costs_and_tax: Computed::Value(Dec::new(
-                rust_decimal::Decimal::new(100, 0),
-            )),
+            value_before_exit_costs_and_tax: Computed::Value(Dec::new(rust_decimal::Decimal::new(
+                100, 0,
+            ))),
             executability: ExecutabilityShares {
                 evaluated_positions_value: Dec::new(rust_decimal::Decimal::new(100, 0)),
                 executable: Dec::zero(),
@@ -1459,7 +1459,10 @@ mod tests {
 
         assert!(matches!(estimate.exit_costs, AmountQualification::Unknown));
         assert!(matches!(estimate.tax, AmountQualification::Unknown));
-        assert_eq!(ReturnsReport::LIQUIDATION_LABEL, "liquidation_value_before_exit_costs_and_tax");
+        assert_eq!(
+            ReturnsReport::LIQUIDATION_LABEL,
+            "liquidation_value_before_exit_costs_and_tax"
+        );
     }
 
     #[test]

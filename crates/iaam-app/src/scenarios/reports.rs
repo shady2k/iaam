@@ -9,11 +9,9 @@ use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable, PriceCandidate};
-use iaam_store::market::{MarketWindow, PriceRow};
+use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
 use iaam_store::market::SeriesKey;
-use iaam_market::{
-    Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue,
-};
+use iaam_store::market::{MarketWindow, PriceRow};
 use rust_decimal::Decimal;
 use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::{Date, OffsetDateTime};
@@ -224,7 +222,6 @@ fn market_candidate_from_row(row: PriceRow) -> Result<PriceCandidate, AppError> 
         },
     ))
 }
-
 
 async fn official_fx_table(
     services: &AppServices,

@@ -32,7 +32,6 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use iaam_core::money::CurrencyCode;
@@ -45,8 +44,7 @@ mod tests {
 
     use super::candidate_from_market_observation;
 
-    const FIXTURE: &str =
-        include_str!("../../../tests/fixtures/market/moex-iss-history-sber.json");
+    const FIXTURE: &str = include_str!("../../../tests/fixtures/market/moex-iss-history-sber.json");
 
     fn observation(kind: PriceKind, executability: Executability) -> PriceObservation {
         PriceObservation {
@@ -83,10 +81,9 @@ mod tests {
         ];
         let candidates: Vec<_> = kinds
             .into_iter()
-            .map(|kind| candidate_from_market_observation(observation(
-                kind,
-                Executability::Executable,
-            )))
+            .map(|kind| {
+                candidate_from_market_observation(observation(kind, Executability::Executable))
+            })
             .collect();
 
         let names: Vec<_> = candidates.iter().map(market_kind).collect();
@@ -125,10 +122,7 @@ mod tests {
             Executability::IndicativePreviousClose,
         ));
 
-        assert_eq!(
-            executable.executability,
-            SourceExecutability::Executable
-        );
+        assert_eq!(executable.executability, SourceExecutability::Executable);
         assert_eq!(
             indicative.executability,
             SourceExecutability::IndicativePreviousClose
@@ -170,8 +164,10 @@ mod tests {
                 SourceExecutability::IndicativePreviousClose
             );
         }
-        assert!(!candidates
-            .iter()
-            .any(|candidate| market_kind(candidate) == "admitted_quote"));
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| market_kind(candidate) == "admitted_quote")
+        );
     }
 }

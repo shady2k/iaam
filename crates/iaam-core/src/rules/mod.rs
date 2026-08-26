@@ -47,10 +47,7 @@ impl RuleRegistry {
     }
 
     #[must_use]
-    pub fn valuation_rule(
-        &self,
-        version: ValuationPolicyVersion,
-    ) -> Option<&dyn ValuationRule> {
+    pub fn valuation_rule(&self, version: ValuationPolicyVersion) -> Option<&dyn ValuationRule> {
         self.valuation_rules.get(&version).map(|rule| rule.as_ref())
     }
 

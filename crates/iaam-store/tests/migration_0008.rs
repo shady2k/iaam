@@ -74,7 +74,11 @@ fn an_existing_observation_migrates_to_an_undecided_basis() {
     let version: u32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("версия схемы");
-    assert_eq!(version, 8);
+    // Сверяется с константой, а не с цифрой 8: этот тест про то, что
+    // миграция 0008 делает со старой строкой, а не про то, сколько
+    // миграций в проекте всего. Вшитая цифра краснела бы у каждой
+    // следующей схемы, ничего о ней не проверяя.
+    assert_eq!(version, iaam_store::schema::SCHEMA_VERSION);
 }
 
 #[test]

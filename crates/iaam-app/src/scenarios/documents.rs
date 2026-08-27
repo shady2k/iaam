@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::{Principal, Recorded};
+use crate::ports::Principal;
 /// Один исход загрузки с номером строки исходного листа.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentRowVerdict {
@@ -217,33 +217,11 @@ async fn submit_rows(
             "report:{document_hash}:row:{}",
             located.locator.row
         ));
-        if let Err(error) = normalized.event.validate_structure() {
-            rows.push(DocumentRowVerdict {
-                row: located.locator.row,
-                verdict: Verdict::Rejected {
-                    rejection: iaam_ingest::Rejection {
-                        field: "operation".into(),
-                        expected: "форма события, соответствующая его типу".into(),
-                        actual: error.to_string(),
-                    },
-                },
-            });
-            continue;
-        }
-        let recorded = services.store.append_events(vec![normalized.event]).await?;
-        let verdict = match recorded.first() {
-            Some(Recorded::Inserted { id }) => Verdict::Provisional { event: *id },
-            Some(Recorded::Duplicate { existing }) => Verdict::Duplicate {
-                existing: *existing,
-            },
-            None => Verdict::Rejected {
-                rejection: iaam_ingest::Rejection {
-                    field: "storage".into(),
-                    expected: "запись события".into(),
-                    actual: "хранилище не вернуло результата".into(),
-                },
-            },
-        };
+        // Форма, запись и вердикт — общий низ приёмки: своя копия здесь
+        // разошлась бы с операциями молча (`scenarios/ingest.rs`).
+        let verdict =
+            crate::scenarios::ingest::record_candidate(services, normalized.event, "operation")
+                .await?;
         rows.push(DocumentRowVerdict {
             row: located.locator.row,
             verdict,

@@ -19,6 +19,7 @@ pub use observation::{
     Executability, FxObservation, KeyRateObservation, ObservedAt, PriceKind, PriceObservation,
     TradeDate, Venue,
 };
+pub use schedule::terms::{DefaultFlags, IssueTerms};
 pub use schedule::{
     CouponAmount, CouponPeriod, Knowledge, OfferWindow, PrincipalRepayment, ScheduleSnapshot,
 };

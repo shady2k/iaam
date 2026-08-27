@@ -618,6 +618,12 @@ fn describe(reason: &NotComputable) -> String {
                 instrument.inner()
             )
         }
+        NotComputable::OverlappingScheduleCoverage { instrument } => {
+            format!(
+                "дата отчёта покрыта несколькими периодами графика инструмента {}",
+                instrument.inner()
+            )
+        }
         NotComputable::ExitNotExecutable => "нет исполнимого выхода для реализации НКД".to_owned(),
     }
 }
@@ -1948,6 +1954,23 @@ mod tests {
             dto.detail
                 .as_deref()
                 .is_some_and(|detail| detail.contains("наблюдения НКД"))
+        );
+    }
+    #[test]
+    fn overlapping_accrual_serialises_with_a_distinct_reason() {
+        let instrument = InstrumentId::new_random();
+        let dto = ComputedDto::from_dec(&Computed::NotComputable {
+            reason: NotComputable::OverlappingScheduleCoverage { instrument },
+        });
+
+        assert_eq!(
+            dto.not_computable.as_deref(),
+            Some("overlapping_schedule_coverage")
+        );
+        assert!(
+            dto.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("несколькими периодами"))
         );
     }
 

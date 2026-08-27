@@ -23,6 +23,8 @@ pub struct AccruedInterestRuleVersion(pub u32);
 pub enum AccruedInterestError {
     #[error("дата вне покрытия графика")]
     OutsideCoverage,
+    #[error("дата покрыта несколькими периодами")]
+    OverlappingCoverage,
     #[error("сумма купона периода не определена")]
     CouponUndetermined,
     #[error(transparent)]
@@ -59,10 +61,16 @@ impl AccruedInterestRule for AccruedInterestV1 {
         // купон начислен целиком и принадлежит прошедшему периоду, а
         // следующий период стартует с нуля — инвариант замкнутой цепи
         // (completeness.rs) это гарантирует.
-        let period = periods
+        let covering: Vec<_> = periods
             .iter()
-            .find(|period| period.period_start <= as_of && as_of < period.accrual_end)
+            .filter(|period| period.period_start <= as_of && as_of < period.accrual_end)
+            .collect();
+        let period = covering
+            .first()
             .ok_or(AccruedInterestError::OutsideCoverage)?;
+        if covering.len() > 1 {
+            return Err(AccruedInterestError::OverlappingCoverage);
+        }
         let coupon = period
             .coupon_per_unit
             .as_ref()
@@ -155,6 +163,27 @@ mod tests {
         assert!(matches!(
             rule.accrued_per_unit(&ofz_periods(), date!(2026 - 01 - 01)),
             Err(AccruedInterestError::OutsideCoverage)
+        ));
+    }
+    #[test]
+    fn overlapping_periods_are_refused_instead_of_ordered_by_input() {
+        let periods = vec![
+            AccrualPeriod {
+                period_start: date!(2026 - 01 - 01),
+                accrual_end: date!(2026 - 03 - 01),
+                payment_date: date!(2026 - 03 - 01),
+                coupon_per_unit: Some(PerUnitAmount::new(dec("10"), CurrencyCode::Rub)),
+            },
+            AccrualPeriod {
+                period_start: date!(2026 - 02 - 01),
+                accrual_end: date!(2026 - 04 - 01),
+                payment_date: date!(2026 - 04 - 01),
+                coupon_per_unit: Some(PerUnitAmount::new(dec("20"), CurrencyCode::Rub)),
+            },
+        ];
+        assert!(matches!(
+            AccruedInterestV1.accrued_per_unit(&periods, date!(2026 - 02 - 15)),
+            Err(AccruedInterestError::OverlappingCoverage)
         ));
     }
 

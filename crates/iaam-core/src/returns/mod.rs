@@ -114,6 +114,8 @@ pub enum NotComputable {
     CouponUndetermined { instrument: InstrumentId },
     /// Дата отчёта вне покрытия графика.
     OutsideScheduleCoverage { instrument: InstrumentId },
+    /// Дата отчёта покрыта несколькими периодами графика.
+    OverlappingScheduleCoverage { instrument: InstrumentId },
     /// Исполнимого выхода нет: реализовать НКД сегодня нельзя.
     ExitNotExecutable,
 }
@@ -138,6 +140,7 @@ impl NotComputable {
             Self::AccruedObservationMissing { .. } => "accrued_observation_missing",
             Self::CouponUndetermined { .. } => "coupon_undetermined",
             Self::OutsideScheduleCoverage { .. } => "outside_schedule_coverage",
+            Self::OverlappingScheduleCoverage { .. } => "overlapping_schedule_coverage",
             Self::ExitNotExecutable => "exit_not_executable",
         }
     }
@@ -783,6 +786,9 @@ fn accrued_error(error: AccruedInterestError, instrument: InstrumentId) -> NotCo
     match error {
         AccruedInterestError::OutsideCoverage => {
             NotComputable::OutsideScheduleCoverage { instrument }
+        }
+        AccruedInterestError::OverlappingCoverage => {
+            NotComputable::OverlappingScheduleCoverage { instrument }
         }
         AccruedInterestError::CouponUndetermined => {
             NotComputable::CouponUndetermined { instrument }
@@ -2133,6 +2139,16 @@ mod tests {
         assert_eq!(DataQualityStatus::Clean.code(), "clean");
         assert_eq!(DataQualityStatus::Mixed.code(), "mixed");
         assert_eq!(DataQualityStatus::Incomplete.code(), "incomplete");
+    }
+    #[test]
+    fn overlapping_accrual_is_a_distinct_not_computable_reason() {
+        let instrument = InstrumentId::new_random();
+        let reason = accrued_error(AccruedInterestError::OverlappingCoverage, instrument);
+        assert_eq!(
+            reason,
+            NotComputable::OverlappingScheduleCoverage { instrument }
+        );
+        assert_eq!(reason.code(), "overlapping_schedule_coverage");
     }
     #[test]
     fn shares_add_accumulates_weights_before_normalizing() {

@@ -19,7 +19,7 @@ use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{Verdict, normalize};
 use iaam_market::cbr::key_rate::key_rate_request;
 use iaam_market::cbr::{daily_request, dynamic_request};
-use iaam_market::moex::history_request;
+use iaam_market::moex::{HistoryQuery, history_request};
 use iaam_market::{FxObservation, KeyRateObservation, PriceKind, PriceObservation};
 use iaam_store::market::{
     Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
@@ -437,7 +437,15 @@ fn request_for(source: &MarketSource, from: Date, to: Date) -> HttpRequest {
             board,
             secid,
             ..
-        } => history_request(engine, market, board, secid, from, to, 0),
+        } => history_request(HistoryQuery {
+            engine,
+            market,
+            board,
+            secid,
+            from,
+            till: to,
+            start: 0,
+        }),
         MarketSource::CbrDaily => daily_request(to),
         MarketSource::CbrDynamic {
             cbr_currency_id, ..

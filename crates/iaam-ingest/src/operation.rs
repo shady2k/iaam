@@ -394,6 +394,9 @@ fn build(
                 EventKind::Income {
                     instrument: *instrument,
                     gross,
+                    // Вид дохода приходит из канала в E3.4.1.T11;
+                    // до тех пор источник его не называл.
+                    kind: None,
                 },
                 vec![Leg::cash(account, gross)],
             ))

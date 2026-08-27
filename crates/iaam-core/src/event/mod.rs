@@ -103,6 +103,8 @@ pub enum EventValidationError {
         kind: LegKind,
         field: &'static str,
     },
+    #[error("форма события {event} ещё не проверяется")]
+    NotYetValidated { event: &'static str },
     #[error(transparent)]
     Numeric(#[from] crate::numeric::NumericError),
     #[error(transparent)]
@@ -138,13 +140,17 @@ pub struct Event {
 ///
 /// Версия 2 отличалась от версии 1 добавленным вариантом
 /// [`EventKind::Valuation`]; версия 3 отличается от версии 2
-/// добавленным вариантом [`EventKind::ControlAssertion`]. Уже
-/// записанные факты прежних версий читаются без изменений — новый
-/// вариант в них просто не встречается, — но программа, знающая только
-/// версию 2, не разберёт контрольное утверждение и потому не должна
-/// притворяться, что разобрала. Оставить прежний номер значило бы, что
-/// одна версия обозначает две несовместимые схемы (§4.1).
-pub const SCHEMA_VERSION: u32 = 3;
+/// добавленным вариантом [`EventKind::ControlAssertion`]; версия 4 —
+/// вариантами [`EventKind::CorporateAction`] и
+/// [`EventKind::OfferExercise`], а также видом дохода в
+/// [`EventKind::Income`] (§4.7). Уже записанные факты прежних версий
+/// читаются без изменений — новых вариантов в них просто не
+/// встречается, а `Income` без вида читается как «вид не утверждался»,
+/// — но программа, знающая только версию 3, не разберёт корпоративное
+/// действие и потому не должна притворяться, что разобрала. Оставить
+/// прежний номер значило бы, что одна версия обозначает две
+/// несовместимые схемы (§4.1).
+pub const SCHEMA_VERSION: u32 = 4;
 
 impl Event {
     /// Сумма денежного эффекта всех ног в указанной валюте.
@@ -219,6 +225,12 @@ impl Event {
             EventKind::Valuation { price, .. } => self.validate_valuation(name, *price),
             EventKind::ControlAssertion { period, claim } => {
                 self.validate_control_assertion(name, *period, *claim)
+            }
+            // Промежуточное состояние: форма новых фактов проверяется
+            // в E3.4.1.T8. Отказ, а не `Ok(())`: событие, форму которого
+            // никто не проверил, не является проверенным.
+            EventKind::CorporateAction { .. } | EventKind::OfferExercise { .. } => {
+                Err(EventValidationError::NotYetValidated { event: name })
             }
         }
     }
@@ -1027,6 +1039,7 @@ mod tests {
             EventKind::Income {
                 instrument: Some(InstrumentId::new_random()),
                 gross: rub(120_000),
+                kind: None,
             },
             vec![Leg::cash(acc, rub(120_000))],
             acc,
@@ -1037,6 +1050,7 @@ mod tests {
             EventKind::Income {
                 instrument: None,
                 gross: rub(-120_000),
+                kind: None,
             },
             vec![Leg::cash(acc, rub(-120_000))],
             acc,
@@ -1780,7 +1794,9 @@ mod tests {
         //
         // 1 → 2: добавлен `EventKind::Valuation`.
         // 2 → 3: добавлен `EventKind::ControlAssertion` (§10.3).
-        assert_eq!(SCHEMA_VERSION, 3);
+        // 3 → 4: добавлены `EventKind::CorporateAction` и
+        //        `EventKind::OfferExercise`, а `Income` получил вид (§4.7).
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 
     #[test]

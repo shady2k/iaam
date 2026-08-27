@@ -42,6 +42,8 @@ pub enum LotError {
         event: EventId,
         instrument: InstrumentId,
     },
+    #[error("книга лотов ещё не применяет факт {kind} события {event:?}")]
+    NotYetApplied { event: EventId, kind: &'static str },
     #[error(transparent)]
     Disposal(#[from] DisposalError),
     #[error(transparent)]
@@ -245,6 +247,16 @@ impl LotBook {
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. } => Ok(()),
+            // Промежуточное состояние: типы факта уже включены
+            // в `EventKind`, применение появляется в E3.4.1.T9.
+            // Отказ, а не `Ok(())`: принять факт и молча его не
+            // применить — ровно то, чего этот эпик не допускает.
+            EventKind::CorporateAction { .. } | EventKind::OfferExercise { .. } => {
+                Err(LotError::NotYetApplied {
+                    event: event.id,
+                    kind: event.kind.discriminant(),
+                })
+            }
         }
     }
 

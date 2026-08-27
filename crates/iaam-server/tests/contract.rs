@@ -585,11 +585,12 @@ async fn health_is_public_and_reports_versions() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Версия 3: вариант события ControlAssertion добавлен после версии 2
-    // (та добавляла Valuation), и одна версия не может обозначать две
-    // схемы (§4.1). Внешний агент читает эту цифру, чтобы понять, разберёт
-    // ли он ответ, — поэтому она закреплена здесь, а не выводится из кода.
-    assert_eq!(body["schema_version"], 3);
+    // Версия 4: после ControlAssertion (версия 3) добавлены
+    // CorporateAction и OfferExercise, а Income получил вид дохода
+    // (§4.7); одна версия не может обозначать две схемы (§4.1). Внешний
+    // агент читает эту цифру, чтобы понять, разберёт ли он ответ, —
+    // поэтому она закреплена здесь, а не выводится из кода.
+    assert_eq!(body["schema_version"], 4);
     assert_eq!(body["projection_version"], 1);
 }
 

@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use iaam_core::event::Event;
+use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::kind::{EventKind, TradeSide};
+use iaam_core::event::offer::OfferExerciseAction;
 use iaam_core::ids::InstrumentId;
 use iaam_core::numeric::decimal::Dec;
 use time::{Date, Duration, OffsetDateTime, Time};
@@ -145,6 +147,13 @@ impl ScheduleState {
     }
 }
 
+/// Смена знака количества. `i64::MIN`-подобного случая у `Dec` нет,
+/// но отказ отрицания молча оставил бы количество прежним, поэтому
+/// он вынесен в одно место.
+fn negated(quantity: Dec) -> Dec {
+    quantity.checked_neg().unwrap_or(quantity)
+}
+
 /// Инструменты, у которых итоговое количество не равно нулю.
 ///
 /// Это чистая проекция только для выбора расписания. Отчётная проекция
@@ -153,24 +162,60 @@ impl ScheduleState {
 pub fn active_instruments(events: &[Event]) -> BTreeSet<InstrumentId> {
     let mut quantities = BTreeMap::<InstrumentId, Dec>::new();
     for event in events {
-        let (instrument, delta) = match &event.kind {
+        // Список пар, а не одна пара: замещение двигает количество сразу
+        // по двум бумагам, и свести его к одной значило бы оставить
+        // предшественника вечно активным.
+        let deltas: Vec<(InstrumentId, Dec)> = match &event.kind {
             EventKind::Trade {
                 side,
                 instrument,
                 quantity,
                 ..
-            } => (
+            } => vec![(
                 *instrument,
                 match side {
                     TradeSide::Buy => quantity.0,
-                    TradeSide::Sell => quantity.0.checked_neg().unwrap_or(quantity.0),
+                    TradeSide::Sell => negated(quantity.0),
                 },
-            ),
+            )],
             EventKind::OpeningPosition {
                 instrument,
                 quantity,
                 ..
-            } => (*instrument, quantity.0),
+            } => vec![(*instrument, quantity.0)],
+            EventKind::CorporateAction { action } => match action {
+                // Амортизация выплачивает деньги, но количество бумаг
+                // не меняет (§6.5): нулевая дельта, а не пропуск.
+                CorporateAction::PartialRedemption { instrument, .. } => {
+                    vec![(*instrument, Dec::zero())]
+                }
+                CorporateAction::Redemption {
+                    instrument,
+                    quantity,
+                    ..
+                } => vec![(*instrument, negated(quantity.0))],
+                CorporateAction::Conversion {
+                    predecessor,
+                    successor,
+                    quantity_in,
+                    quantity_out,
+                    ..
+                } => vec![
+                    (*predecessor, negated(quantity_in.0)),
+                    (*successor, quantity_out.0),
+                ],
+            },
+            EventKind::OfferExercise { action } => match action {
+                // Подача и отзыв заявки бумаг не двигают.
+                OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {
+                    Vec::new()
+                }
+                OfferExerciseAction::Settled {
+                    instrument,
+                    quantity,
+                    ..
+                } => vec![(*instrument, negated(quantity.0))],
+            },
             EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
@@ -178,10 +223,12 @@ pub fn active_instruments(events: &[Event]) -> BTreeSet<InstrumentId> {
             | EventKind::Fee { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
-            | EventKind::ControlAssertion { .. } => continue,
+            | EventKind::ControlAssertion { .. } => Vec::new(),
         };
-        let current = quantities.entry(instrument).or_insert_with(Dec::zero);
-        *current = current.checked_add(delta).unwrap_or(*current);
+        for (instrument, delta) in deltas {
+            let current = quantities.entry(instrument).or_insert_with(Dec::zero);
+            *current = current.checked_add(delta).unwrap_or(*current);
+        }
     }
     quantities
         .into_iter()
@@ -460,6 +507,168 @@ mod tests {
     use super::*;
     use time::macros::date;
     use time::{OffsetDateTime, Time, UtcOffset};
+
+    use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+    use iaam_core::event::leg::Leg;
+    use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+    use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
+    use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId, SourceId};
+    use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use rust_decimal::Decimal;
+
+    fn qty(n: i64) -> Quantity {
+        Quantity(Dec::new(Decimal::from(n)))
+    }
+
+    fn rub(minor: i64) -> Money {
+        Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
+    }
+
+    fn event_of(kind: EventKind, legs: Vec<Leg>) -> Event {
+        let account = AccountId::new_random();
+        let day = date!(2026 - 06 - 15);
+        Event {
+            id: EventId::new_random(),
+            schema_version: SCHEMA_VERSION,
+            owner: OwnerId::new_random(),
+            account,
+            kind,
+            dates: EventDates::for_cash(CashPostedDate(day)),
+            order: EffectiveOrder::new(day, 0),
+            legs,
+            provenance: Provenance::new(
+                SourceId::new_random(),
+                RawHash::parse(&"c".repeat(64)).unwrap(),
+                ParserVersion("test/1".into()),
+            ),
+            relation: Relation::None,
+            confidence: Confidence::Known,
+            idempotency_key: None,
+        }
+    }
+
+    fn bought(instrument: InstrumentId, quantity: i64) -> Event {
+        event_of(
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity: qty(quantity),
+                gross: rub(-1_000_000),
+                fee: None,
+                accrued_interest: None,
+            },
+            Vec::new(),
+        )
+    }
+
+    fn amortised(instrument: InstrumentId) -> Event {
+        event_of(
+            EventKind::CorporateAction {
+                action: CorporateAction::PartialRedemption {
+                    instrument,
+                    custody: CustodyId::new_random(),
+                    quantity: qty(10),
+                    principal_returned_per_unit: PerUnitAmount::new(
+                        Dec::new(Decimal::from(200)),
+                        CurrencyCode::Rub,
+                    ),
+                    compensation: rub(2_000),
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn amortisation_does_not_change_the_position_count() {
+        // §6.5: амортизация выплачивает деньги, но количество бумаг
+        // не уменьшает. Отрицательная дельта закрыла бы синхронизацию
+        // цены живой бумаги.
+        let instrument = InstrumentId::new_random();
+        let events = vec![bought(instrument, 10), amortised(instrument)];
+        assert!(active_instruments(&events).contains(&instrument));
+    }
+
+    #[test]
+    fn a_redeemed_bond_stops_being_active() {
+        let instrument = InstrumentId::new_random();
+        let redeemed = event_of(
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption {
+                    instrument,
+                    custody: CustodyId::new_random(),
+                    quantity: qty(10),
+                    principal_returned_per_unit: PerUnitAmount::new(
+                        Dec::new(Decimal::from(800)),
+                        CurrencyCode::Rub,
+                    ),
+                    compensation: rub(8_000),
+                    effective_date: date!(2026 - 12 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            Vec::new(),
+        );
+        let events = vec![bought(instrument, 10), redeemed];
+        assert!(!active_instruments(&events).contains(&instrument));
+    }
+
+    #[test]
+    fn a_conversion_moves_the_count_from_predecessor_to_successor() {
+        // Замещение двигает количество по двум бумагам сразу: свести его
+        // к одной значило бы оставить предшественника вечно активным.
+        let predecessor = InstrumentId::new_random();
+        let successor = InstrumentId::new_random();
+        let converted = event_of(
+            EventKind::CorporateAction {
+                action: CorporateAction::Conversion {
+                    predecessor,
+                    successor,
+                    custody: CustodyId::new_random(),
+                    ratio: Dec::one(),
+                    quantity_in: qty(10),
+                    quantity_out: qty(10),
+                    fractional:
+                        iaam_core::event::corporate_action::FractionalTreatment::NotApplicable,
+                    compensation: None,
+                    effective_date: date!(2026 - 09 - 01),
+                    record_date: None,
+                    grounds: None,
+                    basis_transfer:
+                        iaam_core::event::corporate_action::BasisTransferRule::CarryOver,
+                },
+            },
+            Vec::new(),
+        );
+        let active = active_instruments(&[bought(predecessor, 10), converted]);
+        assert!(!active.contains(&predecessor));
+        assert!(active.contains(&successor));
+    }
+
+    #[test]
+    fn a_settled_offer_removes_the_bought_back_quantity() {
+        let instrument = InstrumentId::new_random();
+        let settled = event_of(
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Settled {
+                    submission: iaam_core::event::offer::OfferSubmissionId::new_random(),
+                    instrument,
+                    custody: CustodyId::new_random(),
+                    quantity: qty(10),
+                    gross: rub(1_000_000),
+                    fee: None,
+                    accrued_interest: None,
+                },
+            },
+            Vec::new(),
+        );
+        let events = vec![bought(instrument, 10), settled];
+        assert!(!active_instruments(&events).contains(&instrument));
+    }
 
     #[test]
     fn daily_run_is_due_only_after_close_and_once_per_date() {

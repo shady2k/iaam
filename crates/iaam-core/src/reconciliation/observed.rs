@@ -545,6 +545,7 @@ mod tests {
             EventKind::Income {
                 instrument: None,
                 gross: rub(10_000),
+                kind: None,
             },
             vec![
                 Leg::cash(account, rub(10_000)),
@@ -583,6 +584,7 @@ mod tests {
                 EventKind::Income {
                     instrument: None,
                     gross: rub(4_000),
+                    kind: None,
                 },
                 vec![Leg::cash(account, rub(4_000))],
             ),

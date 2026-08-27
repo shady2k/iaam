@@ -103,6 +103,7 @@ fn scene(channel: &TestChannel) -> Scene {
         EventKind::Income {
             instrument: None,
             gross: rub(4_000),
+            kind: None,
         },
         vec![Leg::cash(account, rub(4_000))],
     );

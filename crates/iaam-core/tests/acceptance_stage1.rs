@@ -129,6 +129,7 @@ fn journal(fixture: &mut Fixture) -> Vec<Event> {
                 EventKind::Income {
                     instrument: Some(instrument),
                     gross: dividend,
+                    kind: None,
                 },
                 EventDates::for_cash(CashPostedDate(date!(2025 - 07 - 01))),
                 vec![Leg::cash(account, dividend)],

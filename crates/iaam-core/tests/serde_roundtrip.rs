@@ -6,7 +6,7 @@
 //! в текстовое поле и читает обратно.
 
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates, TradeDate};
-use iaam_core::event::kind::{EventKind, FeeOrigin, TradeSide};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RowLocator};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
@@ -104,6 +104,7 @@ fn every_kind() -> Vec<Event> {
             EventKind::Income {
                 instrument: Some(instrument),
                 gross: rub(700),
+                kind: Some(IncomeKind::Coupon),
             },
             vec![Leg::cash(account, rub(700))],
         ),

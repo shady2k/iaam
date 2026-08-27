@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::corporate_action::CorporateAction;
+use super::offer::OfferExerciseAction;
 use crate::ids::{AccountId, InstrumentId, TransferId};
 use crate::money::{CurrencyCode, Money, Quantity};
 use crate::numeric::decimal::Dec;
@@ -109,6 +111,21 @@ pub enum TradeSide {
     Sell,
 }
 
+/// Вид выплаченного дохода.
+///
+/// Варианта `Other` нет намеренно: мешок, по которому нельзя принять
+/// решение, не отличается от незнания, а §4.9 требует именно различимого
+/// незнания — его выражает `None` в самом поле.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IncomeKind {
+    /// Купон по облигации.
+    Coupon,
+    /// Дивиденд по долевой бумаге.
+    Dividend,
+    /// Выплаченные проценты по вкладу (на него обопрётся E3.5).
+    DepositInterest,
+}
+
 /// Тип события. Исчерпаемый — `#[non_exhaustive]` намеренно **не**
 /// применяется: внешних потребителей у ядра нет, а исчерпаемость даёт
 /// проверку полноты разбора (§15.1).
@@ -145,6 +162,14 @@ pub enum EventKind {
     Income {
         instrument: Option<InstrumentId>,
         gross: Money,
+        /// Вид дохода, если источник его назвал.
+        ///
+        /// `#[serde(default)]` обязателен: журнал append-only, и уже
+        /// записанные выплаты этого поля не содержат. `None` означает
+        /// «не утверждалось», а не «дивиденд»: подстановка вида задним
+        /// числом объявила бы известным то, чего никто не сказал (§4.9).
+        #[serde(default)]
+        kind: Option<IncomeKind>,
     },
     /// Комиссия, не привязанная к сделке.
     Fee { amount: Money, origin: FeeOrigin },
@@ -188,6 +213,17 @@ pub enum EventKind {
         period: AssertionPeriod,
         claim: ControlClaim,
     },
+    /// Корпоративное действие по бумаге: амортизация, погашение,
+    /// замещение (§4.7).
+    ///
+    /// Одним вариантом с типизированным семейством внутри, а не тремя
+    /// вариантами `EventKind`: члены семейства разделяют идентичность
+    /// («что решил эмитент по этой бумаге») и обрабатываются вместе
+    /// везде, где важно именно это.
+    CorporateAction { action: CorporateAction },
+    /// Исполнение оферты — право владельца, а не решение эмитента,
+    /// поэтому отдельный вариант, а не член корпоративного действия.
+    OfferExercise { action: OfferExerciseAction },
 }
 
 /// Происхождение комиссии. Нужно уже на этапе 1, потому что проценты
@@ -220,6 +256,8 @@ impl EventKind {
             Self::OpeningCash { .. } => "opening_cash",
             Self::Valuation { .. } => "valuation",
             Self::ControlAssertion { .. } => "control_assertion",
+            Self::CorporateAction { .. } => "corporate_action",
+            Self::OfferExercise { .. } => "offer_exercise",
         }
     }
 
@@ -244,7 +282,14 @@ impl EventKind {
             | Self::OpeningPosition { .. }
             | Self::OpeningCash { .. }
             | Self::Valuation { .. }
-            | Self::ControlAssertion { .. } => FlowEndpoints::WithinAccount,
+            | Self::ControlAssertion { .. }
+            // Деньги не приходят в контур извне: бумага уже внутри, и
+            // амортизация возвращает вложенное, а не приносит новое.
+            // `InboundFromOutside` завысил бы внесённое в контур и
+            // испортил XIRR — ровно так же, как испортил бы его купон,
+            // который здесь классифицирован так же.
+            | Self::CorporateAction { .. }
+            | Self::OfferExercise { .. } => FlowEndpoints::WithinAccount,
         }
     }
 }
@@ -265,10 +310,100 @@ pub enum FlowEndpoints {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::offer::OfferSubmissionId;
     use crate::money::{CurrencyCode, PostedMinor};
 
     fn rub(minor: i64) -> Money {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
+    }
+
+    fn per_unit(text: &str) -> crate::money::PerUnitAmount {
+        crate::money::PerUnitAmount::new(
+            Dec::new(rust_decimal::Decimal::from_str_exact(text).unwrap()),
+            CurrencyCode::Rub,
+        )
+    }
+
+    fn amortisation() -> EventKind {
+        EventKind::CorporateAction {
+            action: CorporateAction::PartialRedemption {
+                instrument: InstrumentId::new_random(),
+                custody: crate::ids::CustodyId::new_random(),
+                quantity: Quantity::zero(),
+                principal_returned_per_unit: per_unit("200"),
+                compensation: rub(2_000_000),
+                effective_date: time::macros::date!(2026 - 06 - 15),
+                record_date: None,
+                grounds: None,
+            },
+        }
+    }
+
+    fn offer_settled() -> EventKind {
+        EventKind::OfferExercise {
+            action: OfferExerciseAction::Settled {
+                submission: OfferSubmissionId::new_random(),
+                instrument: InstrumentId::new_random(),
+                custody: crate::ids::CustodyId::new_random(),
+                quantity: Quantity::zero(),
+                gross: rub(1_000_000),
+                fee: None,
+                accrued_interest: None,
+            },
+        }
+    }
+
+    #[test]
+    fn the_new_variants_name_themselves() {
+        assert_eq!(amortisation().discriminant(), "corporate_action");
+        assert_eq!(offer_settled().discriminant(), "offer_exercise");
+    }
+
+    #[test]
+    fn the_new_variants_move_money_within_the_account() {
+        // Деньги не приходят в контур извне: бумага уже внутри.
+        // `InboundFromOutside` завысил бы внесённое в контур и испортил
+        // XIRR — ровно так же, как испортил бы его купон.
+        assert_eq!(
+            amortisation().flow_endpoints(),
+            FlowEndpoints::WithinAccount
+        );
+        assert_eq!(
+            offer_settled().flow_endpoints(),
+            FlowEndpoints::WithinAccount
+        );
+    }
+
+    #[test]
+    fn an_income_written_before_the_kind_existed_reads_as_not_asserted() {
+        // Значение снимается с сегодняшнего Income и лишается поля kind —
+        // ровно то, что лежит в уже записанном журнале. Форму JSON
+        // не сочиняем: у EventKind нет rename_all.
+        let income = EventKind::Income {
+            instrument: Some(InstrumentId::new_random()),
+            gross: rub(1_000_000),
+            kind: Some(IncomeKind::Coupon),
+        };
+        let mut value = serde_json::to_value(&income).unwrap();
+        value
+            .get_mut("Income")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("вариант сериализуется объектом")
+            .remove("kind");
+        let restored: EventKind = serde_json::from_value(value).unwrap();
+        assert!(matches!(restored, EventKind::Income { kind: None, .. }));
+    }
+
+    #[test]
+    fn every_income_kind_survives_a_json_round_trip() {
+        for kind in [
+            IncomeKind::Coupon,
+            IncomeKind::Dividend,
+            IncomeKind::DepositInterest,
+        ] {
+            let text = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<IncomeKind>(&text).unwrap(), kind);
+        }
     }
 
     fn trade(side: TradeSide) -> EventKind {
@@ -319,7 +454,8 @@ mod tests {
         assert_eq!(
             EventKind::Income {
                 instrument: None,
-                gross: rub(1)
+                gross: rub(1),
+                kind: None,
             }
             .discriminant(),
             "income"
@@ -416,7 +552,8 @@ mod tests {
         assert_eq!(
             EventKind::Income {
                 instrument: None,
-                gross: rub(100_000)
+                gross: rub(100_000),
+                kind: None,
             }
             .flow_endpoints(),
             FlowEndpoints::WithinAccount

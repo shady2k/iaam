@@ -5,6 +5,7 @@ pub mod correction;
 pub mod kind;
 pub mod leg;
 pub mod legs;
+pub mod offer;
 pub mod provenance;
 
 use serde::{Deserialize, Serialize};

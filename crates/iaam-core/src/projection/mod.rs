@@ -11,6 +11,7 @@ pub mod balances;
 pub mod flows;
 pub mod invariants;
 pub mod lots;
+pub mod offers;
 pub mod state;
 
 use serde::{Deserialize, Serialize};

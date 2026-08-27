@@ -22,8 +22,8 @@ use iaam_app::ports::{
 };
 use iaam_app::storage::SqliteStore;
 use iaam_app::storage::{
-    AccountRecord, AliasRecord, Coverage, FxRow, InstrumentRecord, KeyRateRow, PriceRow,
-    RunOutcome, SeriesKey, TokenRecord, TokenScope,
+    AccountRecord, AliasRecord, BrokerCode, Coverage, FxRow, InstrumentRecord, KeyRateRow,
+    PriceRow, RunOutcome, SeriesKey, TokenRecord, TokenScope,
 };
 use iaam_broker::credentials::Key;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -3291,4 +3291,45 @@ async fn a_read_only_token_may_not_sync_the_market() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
     assert_eq!(response["code"], "forbidden");
+}
+
+/// Заведённый доступ без словаря отклонил бы первую же выгрузку целиком,
+/// и владелец пошёл бы разбираться с брокером вместо настройки. Словарь
+/// заселяется тем же действием, и сети для этого не нужно: контракт
+/// перечисляет коды, но не сообщает, во что они превращаются у нас.
+#[tokio::test]
+async fn provisioning_an_access_fills_the_channel_dictionary() {
+    let (harness, path) = harness_on_disk();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &add_broker_access_body(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let store = SqliteStore::open(&path).expect("второе соединение");
+    let broker = BrokerCode::parse("tinkoff").expect("код брокера");
+    let dictionary = store.broker_operation_kinds(&broker).expect("словарь");
+    assert_eq!(
+        dictionary.get("OPERATION_TYPE_COUPON").map(String::as_str),
+        Some("coupon"),
+        "словарь не заселён"
+    );
+    // Синоним теряется незаметнее прочего: он не ломает ни один
+    // очевидный случай, а половина выгрузки перестаёт разбираться.
+    assert_eq!(
+        dictionary.get("OPERATION_TYPE_DIV_EXT").map(String::as_str),
+        Some("dividend"),
+        "синоним потерян при заселении"
+    );
+    assert!(
+        dictionary.len() >= 35,
+        "заселено меньше, чем знал прежний разбор: {}",
+        dictionary.len()
+    );
 }

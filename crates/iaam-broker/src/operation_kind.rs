@@ -175,3 +175,23 @@ impl OperationKindDictionary {
         self.entries.is_empty()
     }
 }
+
+/// Начальный словарь канала по коду брокера.
+///
+/// Возвращает `None` для брокера, о котором знания нет: пустая таблица
+/// означала бы «у этого канала видов операций не бывает», а это другое
+/// утверждение, и заведение доступа приняло бы его молча.
+#[must_use]
+pub fn seed_for(broker: &str) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
+    match broker {
+        "tinkoff" => Some((
+            crate::tinkoff::dictionary_seed::TINKOFF_SEED_NAME,
+            crate::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS,
+        )),
+        "finam" => Some((
+            crate::finam::dictionary_seed::FINAM_SEED_NAME,
+            crate::finam::dictionary_seed::FINAM_OPERATION_KINDS,
+        )),
+        _ => None,
+    }
+}

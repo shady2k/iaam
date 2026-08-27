@@ -20,6 +20,7 @@ use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
+use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::documents::BrokerCode;
 use iaam_store::events::Appended;
 use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
@@ -513,6 +514,38 @@ impl BrokerVault for SqliteAdapter {
                     },
                     other => store_error(other),
                 })?;
+
+            // Словарь видов операций заселяется здесь, в тот же момент
+            // и той же задачей: заведённый доступ без словаря отклонит
+            // первую же выгрузку целиком, и владелец пойдёт разбираться
+            // с брокером вместо настройки.
+            //
+            // Сети этот шаг не требует: контракт перечисляет коды, но
+            // не сообщает, во что они превращаются у нас, — заселять
+            // приходится собственным знанием (`dictionary_seed`).
+            // Сверка с контрактом существует отдельно и зовётся явно.
+            //
+            // Пополнение существующие строки не трогает: заведение
+            // доступа заново не имеет права отменить решение владельца.
+            let Some((dictionary, entries)) =
+                iaam_broker::operation_kind::seed_for(broker_of_access.as_str())
+            else {
+                return Err(AppError::Invalid {
+                    field: "broker".to_owned(),
+                    expected: "брокер, для которого известен словарь видов операций".to_owned(),
+                    actual: broker_of_access.as_str().to_owned(),
+                });
+            };
+            let entries: Vec<BrokerOperationKind> = entries
+                .iter()
+                .map(|(source_kind, kind)| BrokerOperationKind {
+                    source_kind: (*source_kind).to_owned(),
+                    kind: (*kind).to_owned(),
+                })
+                .collect();
+            store
+                .extend_broker_operation_kinds(&broker_of_access, dictionary, &entries)
+                .map_err(store_error)?;
             let stored = store
                 .find_broker_access(owner_of_access, &broker_of_access, &environment_of_access)
                 .map_err(store_error)?

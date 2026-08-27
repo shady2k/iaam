@@ -27,6 +27,7 @@ pub mod tokens;
 /// через сценарии приложения.
 pub mod storage {
     pub use iaam_store::SqliteStore;
+    pub use iaam_store::documents::BrokerCode;
     pub use iaam_store::market::{Coverage, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey};
     pub use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
     pub use iaam_store::tokens::{TokenRecord, TokenScope};

@@ -4,7 +4,7 @@ use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
 use iaam_store::market::{
-    Coverage, FxRow, KeyRateRow, PriceRow, PriceVenue, RunOutcome, SeriesKey,
+    AccruedInterestRow, Coverage, FxRow, KeyRateRow, PriceRow, PriceVenue, RunOutcome, SeriesKey,
 };
 use iaam_store::reference::InstrumentRecord;
 use iaam_store::{SqliteStore, StoreError};
@@ -511,6 +511,67 @@ fn rows_of_an_unfinished_run_are_invisible_to_reads() {
         )
         .expect("чтение");
     assert!(found.is_none(), "running не публикуется чтением");
+}
+
+#[test]
+fn accrued_interest_is_invisible_before_its_knowledge_coordinate() {
+    // Наблюдение, записанное позже координаты, обязано быть невидимым:
+    // иначе отчёт «на вчера» пересчитается от завтрашнего знания.
+    let (mut store, instrument) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series("SBER:TQOB:3"),
+            date!(2026 - 08 - 20),
+            date!(2026 - 08 - 20),
+            lease(),
+        )
+        .unwrap();
+    store
+        .record_accrued_interest(
+            &run,
+            "hash",
+            &[AccruedInterestRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQOB".to_owned(),
+                session: 3,
+                trade_date: "2026-08-20".to_owned(),
+                observed_at: "2026-08-27T12:00:00Z".to_owned(),
+                per_unit: "15.17".to_owned(),
+                currency: "RUB".to_owned(),
+            }],
+        )
+        .unwrap();
+    store
+        .finish_run(&run, RunOutcome::Succeeded, None)
+        .unwrap();
+
+    let venue = PriceVenue {
+        board: "TQOB".to_owned(),
+        session: 3,
+    };
+    assert!(
+        store
+            .accrued_interest_at_or_before(
+                &instrument.inner().to_string(),
+                &venue,
+                "2026-08-20",
+                "2026-08-26T00:00:00Z",
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .accrued_interest_at_or_before(
+                &instrument.inner().to_string(),
+                &venue,
+                "2026-08-20",
+                "2026-08-27T12:00:00Z",
+            )
+            .unwrap()
+            .map(|row| row.per_unit),
+        Some("15.17".to_owned())
+    );
 }
 
 #[test]

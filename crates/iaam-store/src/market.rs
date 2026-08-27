@@ -39,6 +39,19 @@ pub struct PriceRow {
     pub executability: String,
 }
 
+/// Строка наблюдения НКД. Значения строками, как и везде в хранилище.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccruedInterestRow {
+    pub instrument_id: String,
+    pub board: String,
+    pub session: i64,
+    pub trade_date: String,
+    pub observed_at: String,
+    /// На одну бумагу.
+    pub per_unit: String,
+    pub currency: String,
+}
+
 /// Площадка и сессия для выборки строки цены.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceVenue {
@@ -227,6 +240,49 @@ impl SqliteStore {
                     &observation.quotation_basis,
                     &observation.basis_evidence,
                     &observation.executability,
+                    raw_hash,
+                    &run.id,
+                ],
+            )?;
+        }
+        let count = i64::try_from(observations.len()).map_err(|_| StoreError::InvalidValue {
+            field: "rows",
+            value: observations.len().to_string(),
+        })?;
+        transaction.execute(
+            "UPDATE sync_runs SET pages = pages + 1, rows = rows + ?1 WHERE id = ?2",
+            params![count, &run.id],
+        )?;
+        transaction.commit()?;
+        Ok(observations.len())
+    }
+
+    /// Записать страницу наблюдений НКД в незавершённый запуск.
+    pub fn record_accrued_interest(
+        &mut self,
+        run: &RunHandle,
+        raw_hash: &str,
+        observations: &[AccruedInterestRow],
+    ) -> Result<usize, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_run(&transaction, run)?;
+        for observation in observations {
+            transaction.execute(
+                "INSERT INTO accrued_interest_observations
+                     (instrument_id, board, session, trade_date, source_id,
+                      observed_at, per_unit, currency, raw_hash, sync_run_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    &observation.instrument_id,
+                    &observation.board,
+                    observation.session,
+                    &observation.trade_date,
+                    &run.series.source_id,
+                    &observation.observed_at,
+                    &observation.per_unit,
+                    &observation.currency,
                     raw_hash,
                     &run.id,
                 ],
@@ -489,6 +545,51 @@ impl SqliteStore {
                         quotation_basis: row.get(8)?,
                         basis_evidence: row.get(9)?,
                         executability: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Вернуть последнее по знанию опубликованное наблюдение НКД.
+    pub fn accrued_interest_at_or_before(
+        &self,
+        instrument_id: &str,
+        venue: &PriceVenue,
+        as_of: &str,
+        knowledge_as_of: &str,
+    ) -> Result<Option<AccruedInterestRow>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT a.instrument_id, a.board, a.session, a.trade_date,
+                        a.observed_at, a.per_unit, a.currency
+                 FROM accrued_interest_observations AS a
+                 JOIN sync_runs AS r ON r.id = a.sync_run_id
+                 WHERE a.instrument_id = ?1
+                   AND a.board = ?2
+                   AND a.session = ?3
+                   AND a.trade_date <= ?4
+                   AND a.observed_at <= ?5
+                   AND r.status = 'succeeded'
+                 ORDER BY a.observed_at DESC, a.trade_date DESC
+                 LIMIT 1",
+                params![
+                    instrument_id,
+                    &venue.board,
+                    venue.session,
+                    as_of,
+                    knowledge_as_of,
+                ],
+                |row| {
+                    Ok(AccruedInterestRow {
+                        instrument_id: row.get(0)?,
+                        board: row.get(1)?,
+                        session: row.get(2)?,
+                        trade_date: row.get(3)?,
+                        observed_at: row.get(4)?,
+                        per_unit: row.get(5)?,
+                        currency: row.get(6)?,
                     })
                 },
             )

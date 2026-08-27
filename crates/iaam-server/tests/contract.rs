@@ -2923,6 +2923,13 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
             }
             assert_eq!(price["source"], "moex-iss");
             assert_eq!(price["complete_through"], "2026-08-03");
+            // Доказательство основания котировки — это то, чем цена
+            // отличается от догадки (§10.2). Потерянное по дороге,
+            // оно не оставляет следа: ответ выглядит так же.
+            assert_eq!(
+                price["basis_evidence"], "test:contract",
+                "основание цены не доехало: {price}"
+            );
         }
 
         let (status, fx) = call(&harness.router, get(fx_path, Some(token))).await;
@@ -3262,4 +3269,24 @@ async fn an_offer_application_and_its_withdrawal_are_recorded() {
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
     assert_eq!(response[1]["verdict"], "provisional", "{response}");
+}
+
+/// Синхронизация рынка пишет в журнал наблюдений, поэтому read-only
+/// токену она закрыта. Проверка на месте, но без теста её снятие
+/// неотличимо от рабочего кода: ответ на владельческий токен тот же.
+#[tokio::test]
+async fn a_read_only_token_may_not_sync_the_market() {
+    let harness = harness();
+    let body = json!({
+        "source": { "source": "cbr_daily" },
+        "from": "2026-08-01",
+        "to": "2026-08-03"
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/market/sync", &harness.readonly_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(response["code"], "forbidden");
 }

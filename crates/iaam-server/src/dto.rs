@@ -1607,6 +1607,66 @@ mod tests {
         }
     }
 
+    /// Квалификатор исполнимости переводится в строку API, и строка
+    /// эта — контракт: по ней внешний агент решает, можно ли цене
+    /// верить. Пустая строка вместо `indicative_previous_close`
+    /// выглядит как ответ, а не как отказ.
+    ///
+    /// Ожидаемое имя задаётся здесь ОТДЕЛЬНЫМ исчерпывающим `match`,
+    /// а не берётся из проверяемой функции: тест, зовущий её же,
+    /// согласится с любым её ответом. Новый член ломает сборку теста.
+    #[test]
+    fn every_executability_names_itself_in_the_api() {
+        fn expected(value: SourceExecutability) -> &'static str {
+            match value {
+                SourceExecutability::Executable => "executable",
+                SourceExecutability::IndicativePreviousClose => "indicative_previous_close",
+                SourceExecutability::Unknown => "unknown",
+            }
+        }
+        for value in [
+            SourceExecutability::Executable,
+            SourceExecutability::IndicativePreviousClose,
+            SourceExecutability::Unknown,
+        ] {
+            assert_eq!(executability(value), expected(value));
+        }
+    }
+
+    /// Причина, по которой позиция осталась без цены, — это то, что
+    /// владелец увидит вместо суммы. Подменить её пустой строкой
+    /// значит показать «цены нет» без объяснения, почему.
+    #[test]
+    fn every_uncovered_reason_names_itself_in_the_api() {
+        use iaam_core::valuation::UncoveredReason;
+        fn expected(value: UncoveredReason) -> &'static str {
+            match value {
+                UncoveredReason::NoObservation => "no_observation",
+                UncoveredReason::TooOld => "too_old",
+                UncoveredReason::AmbiguousVenue => "ambiguous_venue",
+                UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
+            }
+        }
+        for value in [
+            UncoveredReason::NoObservation,
+            UncoveredReason::TooOld,
+            UncoveredReason::AmbiguousVenue,
+            UncoveredReason::AmbiguousCandidate,
+        ] {
+            assert_eq!(uncovered_reason(value), expected(value));
+        }
+    }
+
+    /// Время наблюдения уходит в отчёт строкой. Пустая строка на месте
+    /// метки времени не отличима от «наблюдение без времени», а такого
+    /// наблюдения не бывает: по этой метке решают, свежая ли цена.
+    #[test]
+    fn a_timestamp_travels_as_rfc_3339_in_utc() {
+        let value =
+            OffsetDateTime::from_unix_timestamp(1_787_000_000).expect("метка времени представима");
+        assert_eq!(format_timestamp(value), "2026-08-17T20:53:20Z");
+    }
+
     /// Сумма без валюты не бывает: если бы валюта была необязательной,
     /// пропущенное поле пришлось бы чем-то заменять — и заменялось бы
     /// оно рублём, потому что так удобнее.

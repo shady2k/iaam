@@ -12,6 +12,8 @@ use time::Date;
 use crate::money::PerUnitAmount;
 use crate::numeric::decimal::Dec;
 
+pub mod finality;
+
 /// Купонный период: начисление и платёж — разные даты.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccrualPeriod {

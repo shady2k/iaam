@@ -1,4 +1,12 @@
 //! Преобразование рыночных наблюдений в доменные кандидаты.
+use crate::error::AppError;
+use iaam_core::bond::{AccrualPeriod, PrincipalReturn};
+use iaam_core::money::{CurrencyCode, PerUnitAmount};
+use iaam_core::numeric::decimal::Dec;
+use iaam_store::schedule::StoredSnapshot;
+use rust_decimal::Decimal;
+use time::format_description::well_known::Iso8601;
+use time::Date;
 use iaam_core::valuation::{
     PriceCandidate, PriceKind as CorePriceKind, PriceOrigin, SourceExecutability,
 };
@@ -36,6 +44,74 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
     }
 }
 
+/// Преобразует строки снимка графика в доменные купонные периоды.
+pub fn accrual_periods_from_snapshot(
+    snapshot: &StoredSnapshot,
+) -> Result<Vec<AccrualPeriod>, AppError> {
+    snapshot
+        .coupon_periods
+        .iter()
+        .map(|row| {
+            let period_start = Date::parse(&row.period_start, &Iso8601::DEFAULT)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let accrual_end = Date::parse(&row.accrual_end, &Iso8601::DEFAULT)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let payment_date = Date::parse(&row.payment_date, &Iso8601::DEFAULT)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+
+            let coupon_per_unit = match row.amount_status.as_str() {
+                "amount_fixed" => {
+                    let amount_per_unit = row.amount_per_unit.as_deref().ok_or_else(|| {
+                        AppError::Store(
+                            "известная сумма купона не содержит amount_per_unit".to_owned(),
+                        )
+                    })?;
+                    let amount_currency = row.amount_currency.as_deref().ok_or_else(|| {
+                        AppError::Store(
+                            "известная сумма купона не содержит amount_currency".to_owned(),
+                        )
+                    })?;
+                    let amount = Decimal::from_str_exact(amount_per_unit)
+                        .map_err(|error| AppError::Store(error.to_string()))?;
+                    let currency = CurrencyCode::from_code(amount_currency).ok_or_else(|| {
+                        AppError::Store(format!("неизвестная валюта купона: {amount_currency}"))
+                    })?;
+                    Some(PerUnitAmount::new(Dec::new(amount), currency))
+                }
+                _ => None,
+            };
+
+            Ok(AccrualPeriod {
+                period_start,
+                accrual_end,
+                payment_date,
+                coupon_per_unit,
+            })
+        })
+        .collect()
+}
+
+/// Преобразует строки снимка графика в доменные возвраты номинала.
+pub fn principal_returns_from_snapshot(
+    snapshot: &StoredSnapshot,
+) -> Result<Vec<PrincipalReturn>, AppError> {
+    snapshot
+        .principal_repayments
+        .iter()
+        .map(|row| {
+            let repayment_date = Date::parse(&row.repayment_date, &Iso8601::DEFAULT)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let share_percent = Decimal::from_str_exact(&row.share_percent)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+
+            Ok(PrincipalReturn {
+                repayment_date,
+                share_percent: Dec::new(share_percent),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use iaam_core::money::CurrencyCode;
@@ -46,10 +122,36 @@ mod tests {
     };
     use iaam_market::moex::parse::{MarketSegment, parse_history};
     use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
+    use iaam_store::schedule::{CouponPeriodRow, StoredSnapshot};
     use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 
-    use super::candidate_from_market_observation;
+    use super::{
+        accrual_periods_from_snapshot, candidate_from_market_observation,
+    };
+
+    #[test]
+    fn a_row_without_a_fixed_amount_translates_to_none_not_zero() {
+        let snapshot = StoredSnapshot {
+            snapshot_id: "s1".to_owned(),
+            observed_at: "2026-08-27T12:00:00Z".to_owned(),
+            coupon_periods: vec![CouponPeriodRow {
+                period_start: "2026-06-03".to_owned(),
+                accrual_end: "2026-12-02".to_owned(),
+                payment_date: "2026-12-02".to_owned(),
+                record_date: None,
+                amount_status: "undetermined".to_owned(),
+                amount_per_unit: None,
+                amount_currency: None,
+                rate_percent: None,
+                source_entry_id: None,
+            }],
+            principal_repayments: Vec::new(),
+            offer_windows: Vec::new(),
+        };
+        let periods = accrual_periods_from_snapshot(&snapshot).unwrap();
+        assert!(periods[0].coupon_per_unit.is_none());
+    }
 
     const FIXTURE: &str = include_str!("../../../tests/fixtures/market/moex-iss-history-sber.json");
 

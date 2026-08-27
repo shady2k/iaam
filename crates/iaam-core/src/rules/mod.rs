@@ -6,6 +6,7 @@
 
 pub mod amortisation;
 pub mod lot_disposal;
+pub mod quotation;
 pub mod valuation;
 
 use std::collections::BTreeMap;
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
 use lot_disposal::{FifoV1, LotDisposalRule};
+pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,
     ValuationRule,
@@ -32,6 +34,7 @@ pub struct RuleRegistry {
     /// выбор владельца, амортизация — событие выпуска, и общая версия
     /// связала бы два независимых решения.
     amortisation_rules: BTreeMap<AmortisationRuleVersion, Box<dyn AmortisationRule>>,
+    quotation_rules: BTreeMap<QuotationRuleVersion, Box<dyn QuotationRule>>,
 }
 
 impl RuleRegistry {
@@ -49,10 +52,14 @@ impl RuleRegistry {
         let mut amortisation_rules: BTreeMap<AmortisationRuleVersion, Box<dyn AmortisationRule>> =
             BTreeMap::new();
         amortisation_rules.insert(AmortisationRuleVersion(1), Box::new(ProRataV1));
+        let mut quotation_rules: BTreeMap<QuotationRuleVersion, Box<dyn QuotationRule>> =
+            BTreeMap::new();
+        quotation_rules.insert(QuotationRuleVersion(1), Box::new(QuotationV1));
         Self {
             lot_rules,
             valuation_rules,
             amortisation_rules,
+            quotation_rules,
         }
     }
 
@@ -87,6 +94,17 @@ impl RuleRegistry {
     #[must_use]
     pub fn latest_disposal_version(&self) -> Option<LotRuleVersion> {
         self.lot_rules.keys().next_back().copied()
+    }
+
+    #[must_use]
+    pub fn quotation_rule(&self, version: QuotationRuleVersion) -> Option<&dyn QuotationRule> {
+        self.quotation_rules.get(&version).map(|rule| rule.as_ref())
+    }
+
+    /// Наибольшая доступная версия правила пересчёта котировки.
+    #[must_use]
+    pub fn latest_quotation_version(&self) -> Option<QuotationRuleVersion> {
+        self.quotation_rules.keys().next_back().copied()
     }
 }
 

@@ -8,6 +8,7 @@
 use iaam_core::ids::InstrumentId;
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::valuation::QuotationBasis;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use time::Date;
@@ -45,6 +46,37 @@ pub(crate) fn currency_of(code: &str) -> Result<CurrencyCode, MarketError> {
     }
 }
 
+/// Сегмент ISS, из которого взята строка котировки.
+///
+/// Это те же `engine` и `market`, из которых собран путь запроса
+/// (`super::history_request`), поэтому основание известно адаптеру заранее.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketSegment<'a> {
+    pub engine: &'a str,
+    pub market: &'a str,
+}
+
+impl MarketSegment<'_> {
+    /// Основание котировки и признак, по которому оно выведено.
+    ///
+    /// Таблица описывает пары пути запроса, а не род инструмента.
+    /// Незнакомая пара остаётся неизвестной, чтобы не выдать догадку
+    /// за доказанное денежное значение.
+    #[must_use]
+    pub fn quotation_basis(self) -> (QuotationBasis, String) {
+        let basis = match (self.engine, self.market) {
+            ("stock", "bonds") => QuotationBasis::PercentOfRemainingFace,
+            ("stock", "shares") => QuotationBasis::MoneyPerUnit,
+            _ => QuotationBasis::Unknown,
+        };
+        (basis, self.evidence())
+    }
+
+    fn evidence(self) -> String {
+        format!("iss:engines/{}/markets/{}", self.engine, self.market)
+    }
+}
+
 /// Разбор страницы истории в наблюдения.
 ///
 /// `observed_at` приходит **снаружи**: в ответе ISS момента наблюдения
@@ -53,7 +85,9 @@ pub fn parse_history(
     body: &str,
     instrument: InstrumentId,
     observed_at: ObservedAt,
+    segment: MarketSegment<'_>,
 ) -> Result<Vec<PriceObservation>, MarketError> {
+    let (basis, basis_evidence) = segment.quotation_basis();
     let root: Value =
         serde_json::from_str(body).map_err(|error| MarketError::Malformed(error.to_string()))?;
     let block = root
@@ -115,8 +149,8 @@ pub fn parse_history(
                 kind,
                 price: Dec::new(price),
                 currency,
-                basis: iaam_core::valuation::QuotationBasis::Unknown,
-                basis_evidence: String::new(),
+                basis,
+                basis_evidence: basis_evidence.clone(),
                 // Дневная история даёт цену закрытия, а не исполнимый bid.
                 // Помечать её исполнимой значило бы выдать ориентир
                 // за цену выхода (§5.1, §5.3).
@@ -189,6 +223,16 @@ fn parse_date(value: &str) -> Result<Date, MarketError> {
 mod tests {
     use super::*;
     use iaam_core::money::CurrencyCode;
+    use iaam_core::valuation::QuotationBasis;
+
+    const BONDS: MarketSegment<'static> = MarketSegment {
+        engine: "stock",
+        market: "bonds",
+    };
+    const SHARES: MarketSegment<'static> = MarketSegment {
+        engine: "stock",
+        market: "shares",
+    };
     use time::macros::{date, datetime};
 
     const FIXTURE: &str =
@@ -221,7 +265,7 @@ mod tests {
     #[test]
     fn one_row_yields_one_observation_per_non_empty_price_column() {
         let observations =
-            parse_history(FIXTURE, instrument(), observed()).expect("разбор фикстуры");
+            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("разбор фикстуры");
         let first_day: Vec<_> = observations
             .iter()
             .filter(|o| o.trade_date == TradeDate(date!(2026 - 08 - 03)))
@@ -243,7 +287,7 @@ mod tests {
     #[test]
     fn the_venue_and_session_travel_with_the_observation() {
         let observations =
-            parse_history(FIXTURE, instrument(), observed()).expect("разбор фикстуры");
+            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("разбор фикстуры");
         let first = observations.first().expect("хотя бы одно наблюдение");
         assert_eq!(first.venue.board, "TQBR");
         assert_eq!(first.venue.session, 3);
@@ -256,7 +300,7 @@ mod tests {
         // системой: доверить его источнику значит сделать ось знания
         // подделываемой ответом.
         let observations =
-            parse_history(FIXTURE, instrument(), observed()).expect("разбор фикстуры");
+            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("разбор фикстуры");
         assert!(observations.iter().all(|o| o.observed_at == observed()));
     }
 
@@ -264,8 +308,42 @@ mod tests {
     fn a_short_page_is_a_refusal_not_a_shorter_series() {
         let truncated = FIXTURE.replace("[0, 15, 100]", "[0, 40, 100]");
         assert!(matches!(
-            parse_history(&truncated, instrument(), observed()),
+            parse_history(&truncated, instrument(), observed(), SHARES),
             Err(MarketError::Truncated { got: 15, total: 40 })
         ));
+    }
+    #[test]
+    fn the_bond_market_quotes_in_percent_of_remaining_face() {
+        let (basis, evidence) = BONDS.quotation_basis();
+        assert_eq!(basis, QuotationBasis::PercentOfRemainingFace);
+        assert_eq!(evidence, "iss:engines/stock/markets/bonds");
+    }
+
+    #[test]
+    fn the_share_market_quotes_in_money_per_unit() {
+        assert_eq!(SHARES.quotation_basis().0, QuotationBasis::MoneyPerUnit);
+    }
+
+    #[test]
+    fn an_unfamiliar_market_does_not_default_to_money_per_unit() {
+        // Неизвестный рынок котирует неизвестно как, а не по умолчанию деньгами.
+        let segment = MarketSegment {
+            engine: "currency",
+            market: "selt",
+        };
+        assert_eq!(segment.quotation_basis().0, QuotationBasis::Unknown);
+    }
+
+    #[test]
+    fn the_basis_comes_from_the_segment_not_from_the_response_body() {
+        // Основание задаётся рынком, а не содержимым строки ответа.
+        let instrument = InstrumentId::new_random();
+        let observed_at = ObservedAt(datetime!(2026-08-21 19:00:00 UTC));
+        let as_shares = parse_history(FIXTURE, instrument, observed_at, SHARES).unwrap();
+        let as_bonds = parse_history(FIXTURE, instrument, observed_at, BONDS).unwrap();
+
+        assert_eq!(as_shares[0].basis, QuotationBasis::MoneyPerUnit);
+        assert_eq!(as_bonds[0].basis, QuotationBasis::PercentOfRemainingFace);
+        assert_eq!(as_shares[0].price, as_bonds[0].price, "цена не меняется");
     }
 }

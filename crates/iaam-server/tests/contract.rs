@@ -361,6 +361,8 @@ async fn seed_market(harness: &Harness) {
                     observed_at: "2026-08-20T00:00:00Z".into(),
                     price: "100.00".into(),
                     currency: "RUB".into(),
+                    quotation_basis: "money_per_unit".into(),
+                    basis_evidence: "test:contract".into(),
                     executability: "executable".into(),
                 },
                 PriceRow {
@@ -372,6 +374,8 @@ async fn seed_market(harness: &Harness) {
                     observed_at: "2026-08-20T00:00:00Z".into(),
                     price: "101.00".into(),
                     currency: "RUB".into(),
+                    quotation_basis: "money_per_unit".into(),
+                    basis_evidence: "test:contract".into(),
                     executability: "indicative_previous_close".into(),
                 },
             ],

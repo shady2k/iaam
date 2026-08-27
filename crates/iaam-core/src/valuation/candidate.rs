@@ -176,6 +176,11 @@ pub struct PriceProvenance {
     pub price_kind: Option<String>,
     pub origin: PriceOrigin,
     pub venue: Option<String>,
+    /// Единица, в которой источник назвал цену. Без неё след аудита
+    /// не объясняет, откуда взялась денежная стоимость позиции.
+    pub quotation_basis: QuotationBasis,
+    /// Признак, по которому основание выведено.
+    pub basis_evidence: String,
     pub observed_at: OffsetDateTime,
     pub valuation_policy_version: u32,
     pub source_priority_version: u32,
@@ -368,6 +373,8 @@ mod tests {
                     source: SourceId::new_random(),
                 },
                 venue: None,
+                quotation_basis: QuotationBasis::Unknown,
+                basis_evidence: String::new(),
                 observed_at: datetime!(2026 - 07 - 01 18:00 UTC),
                 valuation_policy_version: 1,
                 source_priority_version: 1,

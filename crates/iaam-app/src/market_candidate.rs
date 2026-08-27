@@ -44,7 +44,7 @@ mod tests {
     use iaam_core::valuation::{
         PriceKind as CorePriceKind, PriceOrigin, PriceQuery, SourceExecutability,
     };
-    use iaam_market::moex::parse::parse_history;
+    use iaam_market::moex::parse::{MarketSegment, parse_history};
     use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
     use rust_decimal::Decimal;
     use time::macros::{date, datetime};
@@ -148,6 +148,10 @@ mod tests {
             FIXTURE,
             instrument,
             ObservedAt(datetime!(2026 - 08 - 26 09:00:00 UTC)),
+            MarketSegment {
+                engine: "stock",
+                market: "shares",
+            },
         )
         .expect("разбор фикстуры");
         let candidates: Vec<_> = observations
@@ -189,6 +193,10 @@ mod tests {
             FIXTURE,
             instrument,
             ObservedAt(datetime!(2026 - 08 - 26 09:00:00 UTC)),
+            MarketSegment {
+                engine: "stock",
+                market: "shares",
+            },
         )
         .expect("разбор фикстуры");
         let mut candidates: Vec<_> = observations

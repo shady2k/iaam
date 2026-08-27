@@ -9,9 +9,9 @@ use rusqlite::Connection;
 use crate::StoreError;
 
 /// Версия схемы, которую понимает эта сборка.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
-const MIGRATIONS: [(u32, &str); 7] = [
+const MIGRATIONS: [(u32, &str); 8] = [
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_sources_and_rules.sql")),
     (3, include_str!("../migrations/0003_broker_access.sql")),
@@ -28,6 +28,7 @@ const MIGRATIONS: [(u32, &str); 7] = [
         7,
         include_str!("../migrations/0007_executability_without_stale.sql"),
     ),
+    (8, include_str!("../migrations/0008_quotation_basis.sql")),
 ];
 
 /// Применение недостающих миграций.

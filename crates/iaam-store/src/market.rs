@@ -31,6 +31,11 @@ pub struct PriceRow {
     pub observed_at: String,
     pub price: String,
     pub currency: String,
+    /// Код основания котировки. Строкой, как и остальные значения
+    /// источника: хранилище не зависит от крейта формата.
+    pub quotation_basis: String,
+    /// Признак, по которому основание выведено.
+    pub basis_evidence: String,
     pub executability: String,
 }
 
@@ -206,8 +211,9 @@ impl SqliteStore {
             transaction.execute(
                 "INSERT INTO price_observations
                      (instrument_id, board, session, trade_date, kind, source_id,
-                      observed_at, price, currency, executability, raw_hash, sync_run_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                      observed_at, price, currency, quotation_basis, basis_evidence,
+                      executability, raw_hash, sync_run_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     &observation.instrument_id,
                     &observation.board,
@@ -218,6 +224,8 @@ impl SqliteStore {
                     &observation.observed_at,
                     &observation.price,
                     &observation.currency,
+                    &observation.quotation_basis,
+                    &observation.basis_evidence,
                     &observation.executability,
                     raw_hash,
                     &run.id,
@@ -449,7 +457,8 @@ impl SqliteStore {
         self.conn
             .query_row(
                 "SELECT p.instrument_id, p.board, p.session, p.trade_date,
-                        p.kind, p.observed_at, p.price, p.currency, p.executability
+                        p.kind, p.observed_at, p.price, p.currency,
+                        p.quotation_basis, p.basis_evidence, p.executability
                  FROM price_observations AS p
                  JOIN sync_runs AS r ON r.id = p.sync_run_id
                  WHERE p.instrument_id = ?1
@@ -477,7 +486,9 @@ impl SqliteStore {
                         observed_at: row.get(5)?,
                         price: row.get(6)?,
                         currency: row.get(7)?,
-                        executability: row.get(8)?,
+                        quotation_basis: row.get(8)?,
+                        basis_evidence: row.get(9)?,
+                        executability: row.get(10)?,
                     })
                 },
             )
@@ -500,7 +511,8 @@ impl SqliteStore {
     ) -> Result<Vec<PriceRow>, StoreError> {
         let mut statement = self.conn.prepare(
             "SELECT p.instrument_id, p.board, p.session, p.trade_date,
-                    p.kind, p.observed_at, p.price, p.currency, p.executability
+                    p.kind, p.observed_at, p.price, p.currency,
+                    p.quotation_basis, p.basis_evidence, p.executability
              FROM price_observations AS p
              JOIN sync_runs AS r ON r.id = p.sync_run_id
              WHERE p.source_id = ?1
@@ -531,7 +543,9 @@ impl SqliteStore {
                     observed_at: row.get(5)?,
                     price: row.get(6)?,
                     currency: row.get(7)?,
-                    executability: row.get(8)?,
+                    quotation_basis: row.get(8)?,
+                    basis_evidence: row.get(9)?,
+                    executability: row.get(10)?,
                 })
             },
         )?;
@@ -549,7 +563,8 @@ impl SqliteStore {
     ) -> Result<Vec<PriceRow>, StoreError> {
         let mut statement = self.conn.prepare(
             "SELECT p.instrument_id, p.board, p.session, p.trade_date,
-                    p.kind, p.observed_at, p.price, p.currency, p.executability
+                    p.kind, p.observed_at, p.price, p.currency,
+                    p.quotation_basis, p.basis_evidence, p.executability
              FROM price_observations AS p
              JOIN sync_runs AS r ON r.id = p.sync_run_id
              WHERE p.source_id = ?1
@@ -586,7 +601,9 @@ impl SqliteStore {
                     observed_at: row.get(5)?,
                     price: row.get(6)?,
                     currency: row.get(7)?,
-                    executability: row.get(8)?,
+                    quotation_basis: row.get(8)?,
+                    basis_evidence: row.get(9)?,
+                    executability: row.get(10)?,
                 })
             },
         )?;

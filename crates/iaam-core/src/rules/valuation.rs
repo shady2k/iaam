@@ -120,6 +120,8 @@ impl ValuationPolicyV1 {
             price_kind,
             origin: candidate.origin.clone(),
             venue,
+            quotation_basis: candidate.basis,
+            basis_evidence: candidate.basis_evidence.clone(),
             observed_at: candidate.observed_at,
             valuation_policy_version: Self::VERSION.0,
             source_priority_version: self.source_priority_version.0,
@@ -734,19 +736,24 @@ mod tests {
     fn the_provenance_carries_thresholds_versions_and_selected_price_kind() {
         let query = query(date!(2026 - 08 - 10));
         let observed_at = datetime!(2026 - 08 - 10 11:00 UTC);
-        let out = policy().select(
-            &query,
-            &[market_candidate(
-                query.instrument,
-                "TQBR",
-                "legal_close",
-                date!(2026 - 08 - 09),
-                observed_at,
-            )],
+        let mut candidate = market_candidate(
+            query.instrument,
+            "TQBR",
+            "legal_close",
+            date!(2026 - 08 - 09),
+            observed_at,
         );
+        candidate.basis = crate::valuation::QuotationBasis::PercentOfRemainingFace;
+        candidate.basis_evidence = "iss:engines/stock/markets/bonds".to_owned();
+        let out = policy().select(&query, &[candidate]);
         let provenance = &out.selected().expect("цена есть").provenance;
         assert_eq!(provenance.price_kind.as_deref(), Some("legal_close"));
         assert_eq!(provenance.venue.as_deref(), Some("TQBR"));
+        assert_eq!(
+            provenance.quotation_basis,
+            crate::valuation::QuotationBasis::PercentOfRemainingFace
+        );
+        assert_eq!(provenance.basis_evidence, "iss:engines/stock/markets/bonds");
         assert!(matches!(provenance.origin, PriceOrigin::Market { .. }));
         assert_eq!(provenance.observed_at, observed_at);
         assert_eq!(provenance.valuation_policy_version, 1);

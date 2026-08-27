@@ -783,8 +783,11 @@ fn position_assessments(
                     instrument: price.instrument,
                     price: price.price,
                     currency: price.currency,
-                    basis: crate::valuation::QuotationBasis::Unknown,
-                    basis_evidence: String::new(),
+                    // §10.3: цена владельца — деньги за единицу
+                    // по определению, а не по догадке. Ввод процента
+                    // номинала через `EventKind::Valuation` запрещён.
+                    basis: crate::valuation::QuotationBasis::MoneyPerUnit,
+                    basis_evidence: "journal:valuation".to_owned(),
                     trade_date: price.as_of,
                     observed_at: request.coordinate.knowledge_as_of,
                     origin: crate::valuation::PriceOrigin::ReportParsed { source },
@@ -1098,12 +1101,11 @@ mod tests {
     use super::*;
     use crate::numeric::xirr::SolverRefusal;
 
-    use crate::contour::{ContourId, ContourVersion};
     use crate::event::kind::EventKind;
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
-    use crate::ids::{AccountId, InstrumentId};
-    use crate::money::{Money, PostedMinor};
+    use crate::ids::{AccountId, CustodyId, InstrumentId};
+    use crate::money::{Money, PostedMinor, Quantity};
     use crate::projection::lots::LotBook;
     use crate::projection::{ProjectionContext, project};
     use crate::rules::{LotRuleVersion, RuleRegistry};
@@ -1229,6 +1231,8 @@ mod tests {
                     price_kind: Some("legal_close".to_owned()),
                     origin,
                     venue: Some(venue.to_owned()),
+                    quotation_basis: crate::valuation::QuotationBasis::Unknown,
+                    basis_evidence: String::new(),
                     observed_at: datetime!(2026-08-26 08:00:00 UTC),
                     valuation_policy_version: coordinate.valuation_policy_version,
                     source_priority_version: coordinate.source_priority_version,
@@ -1255,6 +1259,75 @@ mod tests {
             hash_for_venue("corrected-source"),
             "исправление provenance выбранного наблюдения внутри окна обязано менять хеш"
         );
+    }
+
+    #[test]
+    fn an_owner_valuation_is_money_per_unit_by_contract_not_by_guess() {
+        // §10.3: журнальная цена владельца — деньги за единицу
+        // по определению, а не процент номинала.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let quantity = Quantity(Dec::new(rust_decimal::Decimal::from(10)));
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let opening = event_with(
+            account,
+            date!(2026 - 08 - 02),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity,
+                cost_basis: None,
+                assertions: Default::default(),
+            },
+            vec![Leg::security(account, custody, instrument, quantity)],
+        );
+        let valuation = event_with(
+            account,
+            date!(2026 - 08 - 03),
+            2,
+            EventKind::Valuation {
+                instrument,
+                price: Dec::new(rust_decimal::Decimal::from(98)),
+                currency: CurrencyCode::Rub,
+                quality: PriceQuality::OwnerEstimate,
+            },
+            vec![],
+        );
+        let state = project(&[opening, valuation], &context)
+            .expect("проекция владельческой оценки")
+            .snapshot()
+            .state()
+            .clone();
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 03),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+        };
+        let assessments = position_assessments(&state, &request);
+        let PositionAssessmentKind::Selected(selected) = &assessments[0].kind else {
+            panic!("владельческая оценка обязана быть выбрана");
+        };
+        assert_eq!(
+            selected.candidate.basis,
+            crate::valuation::QuotationBasis::MoneyPerUnit
+        );
+        assert_eq!(selected.candidate.basis_evidence, "journal:valuation");
     }
 
     #[test]

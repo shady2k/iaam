@@ -50,6 +50,30 @@ fn price(instrument: InstrumentId, observed_at: &str, value: &str) -> PriceRow {
         price: value.to_owned(),
         currency: "RUB".to_owned(),
         executability: "executable".to_owned(),
+        quotation_basis: "unknown".to_owned(),
+        basis_evidence: String::new(),
+    }
+}
+
+fn bond_price(
+    instrument: InstrumentId,
+    observed_at: &str,
+    value: &str,
+    quotation_basis: &str,
+    basis_evidence: &str,
+) -> PriceRow {
+    PriceRow {
+        instrument_id: instrument.inner().to_string(),
+        board: "TQBR".to_owned(),
+        session: 1,
+        trade_date: "2026-08-03".to_owned(),
+        kind: "close".to_owned(),
+        observed_at: observed_at.to_owned(),
+        price: value.to_owned(),
+        currency: "RUB".to_owned(),
+        quotation_basis: quotation_basis.to_owned(),
+        basis_evidence: basis_evidence.to_owned(),
+        executability: "executable".to_owned(),
     }
 }
 
@@ -621,4 +645,62 @@ fn an_expired_lease_is_replaced_and_old_token_cannot_finish() {
     store
         .finish_run(&replacement, RunOutcome::Succeeded, None)
         .expect("новый запуск завершён");
+}
+
+#[test]
+fn the_quotation_basis_survives_a_round_trip_through_every_read_path() {
+    // Основание, потерянное на одном из путей чтения, обнаружится
+    // не отказом, а заниженной в номинал/100 раз стоимостью позиции.
+    let (mut store, instrument) = store_with_instrument();
+    let series = series_with_dataset("moex", "SBER");
+    let run = store
+        .begin_run(
+            series.clone(),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("запуск цен");
+    let row = bond_price(
+        instrument,
+        "2026-08-03T19:00:00Z",
+        "98.5",
+        "percent_of_remaining_face",
+        "iss:engines/stock/markets/bonds",
+    );
+    store.record_prices(&run, "raw-basis", &[row]).unwrap();
+    store.finish_run(&run, RunOutcome::Succeeded, None).unwrap();
+
+    let venue = PriceVenue {
+        board: "TQBR".to_owned(),
+        session: 1,
+    };
+    let window = iaam_store::market::MarketWindow {
+        from: "2026-08-03",
+        to: "2026-08-03",
+        knowledge_as_of: "2026-08-04T00:00:00Z",
+    };
+    let instrument_id = instrument.inner().to_string();
+    let assert_basis = |row: &PriceRow| {
+        assert_eq!(row.quotation_basis, "percent_of_remaining_face");
+        assert_eq!(row.basis_evidence, "iss:engines/stock/markets/bonds");
+    };
+
+    let at_or_before = store
+        .prices_at_or_before(&instrument_id, &venue, "2026-08-03", "2026-08-04T00:00:00Z")
+        .unwrap()
+        .unwrap();
+    assert_basis(&at_or_before);
+
+    let by_instrument = store
+        .prices_for_instrument_between("moex-iss", "moex", &instrument_id, window)
+        .unwrap();
+    assert_eq!(by_instrument.len(), 1);
+    assert_basis(&by_instrument[0]);
+
+    let by_series = store
+        .prices_between(&series, &instrument_id, &venue, window)
+        .unwrap();
+    assert_eq!(by_series.len(), 1);
+    assert_basis(&by_series[0]);
 }

@@ -458,12 +458,22 @@ fn parse_response(
     observed_at: iaam_market::ObservedAt,
 ) -> Result<ParsedObservations, AppError> {
     match source {
-        MarketSource::Moex { instrument, .. } => {
+        MarketSource::Moex {
+            instrument,
+            engine,
+            market,
+            ..
+        } => {
             let body = core::str::from_utf8(body)
                 .map_err(|error| AppError::Store(format!("ответ MOEX не UTF-8: {error}")))?;
-            iaam_market::moex::parse::parse_history(body, *instrument, observed_at)
-                .map(ParsedObservations::Prices)
-                .map_err(|error| AppError::Store(error.to_string()))
+            iaam_market::moex::parse::parse_history(
+                body,
+                *instrument,
+                observed_at,
+                iaam_market::moex::parse::MarketSegment { engine, market },
+            )
+            .map(ParsedObservations::Prices)
+            .map_err(|error| AppError::Store(error.to_string()))
         }
         MarketSource::CbrDaily => {
             let body = iaam_market::cbr::fx::decode_cp1251(body);
@@ -532,6 +542,8 @@ fn price_row(observation: &PriceObservation) -> PriceRow {
             .unwrap_or_else(|_| observation.observed_at.0.to_string()),
         price: observation.price.inner().to_string(),
         currency: observation.currency.code().to_owned(),
+        quotation_basis: observation.basis.code().to_owned(),
+        basis_evidence: observation.basis_evidence.clone(),
         executability: executability(observation.executability).to_owned(),
     }
 }

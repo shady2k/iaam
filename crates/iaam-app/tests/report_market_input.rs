@@ -130,6 +130,8 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
                 observed_at: "2026-08-26T09:00:00Z".to_owned(),
                 price: "281.39".to_owned(),
                 currency: "RUB".to_owned(),
+                quotation_basis: "money_per_unit".to_owned(),
+                basis_evidence: "test:market".to_owned(),
                 executability: "indicative_previous_close".to_owned(),
             }],
         )

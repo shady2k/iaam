@@ -249,9 +249,93 @@ impl Money {
     }
 }
 
+/// Денежная величина **на одну единицу** — расчётная, а не проведённая.
+///
+/// Номинал выпуска и купон на бумагу договорные, а не списанные со счёта:
+/// [`Money`] хранит minor units, и номинал 333.3333 в нём потерял бы два
+/// знака. Отдельный тип не даёт сложить расчётную величину с проведённой
+/// суммой — по §3.4 это разные вещи.
+///
+/// Валютного инварианта внутри нет намеренно: величина одна, смешивать
+/// нечего. Валютные сверки живут там, где встречаются две величины, —
+/// в состоянии номинала лота и в правиле амортизации.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerUnitAmount {
+    value: Dec,
+    currency: CurrencyCode,
+}
+
+impl PerUnitAmount {
+    /// Тривиальная упаковка двух независимых полей — проверять при
+    /// сборке нечего, как и у [`Money::new`].
+    #[must_use]
+    pub const fn new(value: Dec, currency: CurrencyCode) -> Self {
+        Self { value, currency }
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> Dec {
+        self.value
+    }
+
+    #[must_use]
+    pub const fn currency(&self) -> CurrencyCode {
+        self.currency
+    }
+
+    /// Всего по позиции. Возвращает [`Dec`], а не [`Money`]: результат
+    /// остаётся расчётным, пока его не провели по счёту (§3.4).
+    pub fn checked_mul_quantity(&self, quantity: Quantity) -> Result<Dec, NumericError> {
+        self.value.checked_mul(quantity.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dec(text: &str) -> Dec {
+        Dec::new(Decimal::from_str_exact(text).unwrap())
+    }
+
+    // --- Величина на единицу ---
+
+    #[test]
+    fn per_unit_amount_multiplied_by_quantity_stays_a_calculated_value() {
+        let nominal = PerUnitAmount::new(dec("1000.0000"), CurrencyCode::Rub);
+        assert_eq!(
+            nominal.checked_mul_quantity(Quantity(dec("3"))).unwrap(),
+            dec("3000.0000")
+        );
+    }
+
+    #[test]
+    fn per_unit_amount_keeps_precision_finer_than_a_minor_unit() {
+        // Минимальная единица рубля — копейка; номинал 333.3333 в `Money`
+        // потерял бы два знака (§3.4).
+        assert_eq!(
+            PerUnitAmount::new(dec("333.3333"), CurrencyCode::Rub).value(),
+            dec("333.3333")
+        );
+    }
+
+    #[test]
+    fn per_unit_amount_carries_its_own_currency() {
+        assert_eq!(
+            PerUnitAmount::new(dec("1000"), CurrencyCode::Usd).currency(),
+            CurrencyCode::Usd
+        );
+    }
+
+    #[test]
+    fn per_unit_amount_survives_a_json_round_trip() {
+        let nominal = PerUnitAmount::new(dec("1000.0000"), CurrencyCode::Rub);
+        let text = serde_json::to_string(&nominal).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PerUnitAmount>(&text).unwrap(),
+            nominal
+        );
+    }
 
     // --- Валюта ---
 

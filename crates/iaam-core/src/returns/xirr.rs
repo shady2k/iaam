@@ -330,6 +330,8 @@ mod tests {
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
         };
 
         let values = account_values(&state, &request).expect("стоимость позиции");
@@ -438,6 +440,8 @@ mod tests {
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
             perimeter: &perimeter,
             market_prices: &[],
         };

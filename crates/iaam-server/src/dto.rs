@@ -23,9 +23,9 @@ use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::returns::{
-    AmountQualification, Computed, DataQuality, EvaluatedPosition, ExecutabilityShares,
-    LiquidationEstimate, MaterialIssue, NotComputable, PositionCoverage, ReturnsReport,
-    UncoveredPosition,
+    AmountQualification, BondPositionAttributes, Computed, DataQuality, EvaluatedPosition,
+    ExecutabilityShares, LiquidationEstimate, MaterialIssue, NotComputable, PositionCoverage,
+    ReturnsReport, UncoveredPosition,
 };
 use iaam_core::valuation::{
     PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, QuotationBasis,
@@ -600,6 +600,18 @@ fn describe(reason: &NotComputable) -> String {
             "на счёте {} присутствует финансирование вне периметра",
             account.inner()
         ),
+        NotComputable::ScheduleMissing { instrument } => {
+            format!("нет графика выпуска инструмента {}", instrument.inner())
+        }
+        NotComputable::CouponUndetermined { instrument } => {
+            format!("не определена сумма купона инструмента {}", instrument.inner())
+        }
+        NotComputable::OutsideScheduleCoverage { instrument } => {
+            format!("дата отчёта вне покрытия графика инструмента {}", instrument.inner())
+        }
+        NotComputable::ExitNotExecutable => {
+            "нет исполнимого выхода для реализации НКД".to_owned()
+        }
     }
 }
 
@@ -783,6 +795,25 @@ pub struct LiquidationEstimateDto {
     pub executability: ExecutabilitySharesDto,
     pub exit_costs: AmountQualificationDto,
     pub tax: AmountQualificationDto,
+    pub accrued_interest_payable_on_termination: ComputedDto,
+}
+/// Атрибуты облигационной позиции (§5.1).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BondPositionAttributesDto {
+    pub account: Uuid,
+    pub custody: Option<Uuid>,
+    pub instrument: Uuid,
+    pub accrued_interest: ComputedDto,
+    pub accrued_interest_payable_on_termination: ComputedDto,
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub next_posting_date: Option<Date>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_principal_return_finality: Option<String>,
 }
 /// Доли стоимости портфеля по уровням достоверности (§10.5).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -997,8 +1028,40 @@ impl LiquidationEstimateDto {
             executability: ExecutabilitySharesDto::from_domain(&estimate.executability),
             exit_costs: AmountQualificationDto::from_domain(estimate.exit_costs),
             tax: AmountQualificationDto::from_domain(estimate.tax),
+            accrued_interest_payable_on_termination: ComputedDto::from_dec(
+                &estimate.accrued_interest_payable_on_termination,
+            ),
         }
     }
+}
+
+impl BondPositionAttributesDto {
+    fn from_domain(attributes: &BondPositionAttributes) -> Self {
+        Self {
+            account: attributes.account.0,
+            custody: attributes.custody.map(|custody| custody.0),
+            instrument: attributes.instrument.0,
+            accrued_interest: ComputedDto::from_dec(&attributes.accrued_interest),
+            accrued_interest_payable_on_termination: ComputedDto::from_dec(
+                &attributes.accrued_interest_payable_on_termination,
+            ),
+            next_posting_date: attributes.next_posting_date,
+            next_principal_return_finality: attributes
+                .next_principal_return_finality
+                .map(principal_return_finality),
+        }
+    }
+}
+
+fn principal_return_finality(
+    value: iaam_core::bond::finality::PrincipalReturnFinality,
+) -> String {
+    match value {
+        iaam_core::bond::finality::PrincipalReturnFinality::Final => "final",
+        iaam_core::bond::finality::PrincipalReturnFinality::Partial => "partial",
+        iaam_core::bond::finality::PrincipalReturnFinality::Unknown => "unknown",
+    }
+    .to_owned()
 }
 
 fn format_timestamp(value: OffsetDateTime) -> String {
@@ -1050,6 +1113,20 @@ fn issue(value: &MaterialIssue) -> String {
             "на счёте {} присутствует финансирование вне периметра",
             account.inner()
         ),
+        MaterialIssue::AccruedInterestMismatch {
+            instrument,
+            computed,
+            observed,
+            currency,
+            date,
+        } => format!(
+            "НКД инструмента {} расходится: расчёт {} против наблюдения {} {} на {}",
+            instrument.inner(),
+            computed.inner(),
+            observed.inner(),
+            currency.code(),
+            date
+        ),
     }
 }
 
@@ -1072,6 +1149,8 @@ pub struct ReturnsReportDto {
     pub terminal_value: ComputedDto,
     /// Оценка до гипотетических издержек выхода и до налога.
     pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto,
+    /// Атрибуты облигационных позиций (§5.1).
+    pub bond_attributes: Vec<BondPositionAttributesDto>,
     /// **Доходность до налога.** Имя поля содержит оговорку намеренно:
     /// налоги появляются в E5, и до тех пор называть эту величину
     /// «доходностью» без уточнения нельзя (§16.3).
@@ -1130,6 +1209,11 @@ impl ReturnsReportDto {
             liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto::from_domain(
                 &report.liquidation_value_before_exit_costs_and_tax,
             ),
+            bond_attributes: report
+                .bond_attributes
+                .iter()
+                .map(BondPositionAttributesDto::from_domain)
+                .collect(),
             xirr_pre_tax: rate,
             applied_rules: AppliedRulesDto {
                 contour: report.applied_rules.contour.0,
@@ -1842,6 +1926,33 @@ mod tests {
             printed.contains("домашний агент"),
             "метка секретом не является и обязана оставаться видимой: {printed}"
         );
+    }
+
+    #[test]
+    fn an_unknown_termination_value_serialises_with_a_reason_not_a_zero() {
+        let dto = BondPositionAttributesDto::from_domain(&BondPositionAttributes {
+            account: AccountId::new_random(),
+            custody: None,
+            instrument: InstrumentId::new_random(),
+            accrued_interest: Computed::Value(Dec::new(
+                Decimal::from_str_exact("15.17").unwrap(),
+            )),
+            accrued_interest_payable_on_termination: Computed::NotComputable {
+                reason: NotComputable::ExitNotExecutable,
+            },
+            next_posting_date: Some(time::macros::date!(2026 - 12 - 02)),
+            next_principal_return_finality: Some(
+                iaam_core::bond::finality::PrincipalReturnFinality::Final,
+            ),
+        });
+        let json = serde_json::to_value(&dto).unwrap();
+        assert!(json["accrued_interest_payable_on_termination"]["value"].is_null());
+        assert_eq!(
+            json["accrued_interest_payable_on_termination"]["not_computable"],
+            "exit_not_executable"
+        );
+        assert_eq!(json["next_posting_date"], "2026-12-02");
+        assert_eq!(json["next_principal_return_finality"], "final");
     }
 
     #[test]

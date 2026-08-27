@@ -13,10 +13,18 @@
 
 pub mod xirr;
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use time::{Date, OffsetDateTime, UtcOffset};
 
+use crate::bond::{
+    finality::{finality_of, PrincipalReturnFinality},
+    posting::next_posting_date,
+    BondSchedule,
+};
 use crate::contour::{ContourDefinition, ContourId, ContourVersion};
 use crate::ids::{AccountId, InstrumentId, SourceId};
 use crate::money::CurrencyCode;
@@ -30,7 +38,10 @@ use crate::projection::state::LedgerState;
 use crate::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use crate::rules::lot_disposal::RuleId;
 use crate::rules::quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
-use crate::rules::{SourcePriorityVersion, ValuationPolicyV1, ValuationRule};
+use crate::rules::{
+    AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
+    SourcePriorityVersion, ValuationPolicyV1, ValuationRule,
+};
 use crate::valuation::QuotationBasis;
 use crate::valuation::{
     FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
@@ -95,6 +106,14 @@ pub enum NotComputable {
     /// На счёте финансирование вне периметра: экономику система
     /// не достраивает (§11).
     UnsupportedFinancing { account: AccountId },
+    /// Снимка графика выпуска на координату знания отсутствует.
+    ScheduleMissing { instrument: InstrumentId },
+    /// Сумма купона текущего периода не определена.
+    CouponUndetermined { instrument: InstrumentId },
+    /// Дата отчёта вне покрытия графика.
+    OutsideScheduleCoverage { instrument: InstrumentId },
+    /// Исполнимого выхода нет: реализовать НКД сегодня нельзя.
+    ExitNotExecutable,
 }
 
 impl NotComputable {
@@ -113,6 +132,10 @@ impl NotComputable {
             Self::StateNewerThanReport { .. } => "state_newer_than_report",
             Self::Numeric { .. } => "numeric",
             Self::UnsupportedFinancing { .. } => "unsupported_financing",
+            Self::ScheduleMissing { .. } => "schedule_missing",
+            Self::CouponUndetermined { .. } => "coupon_undetermined",
+            Self::OutsideScheduleCoverage { .. } => "outside_schedule_coverage",
+            Self::ExitNotExecutable => "exit_not_executable",
         }
     }
 }
@@ -176,6 +199,14 @@ pub enum MaterialIssue {
     },
     /// На счёте присутствует финансирование вне периметра (§11).
     UnsupportedFinancing { account: AccountId },
+    /// Расчётный и наблюдённый НКД разошлись больше допуска.
+    AccruedInterestMismatch {
+        instrument: InstrumentId,
+        computed: Dec,
+        observed: Dec,
+        currency: CurrencyCode,
+        date: Date,
+    },
 }
 
 impl MaterialIssue {
@@ -198,6 +229,7 @@ impl MaterialIssue {
     pub const fn is_defect(&self) -> bool {
         match self {
             Self::HistoryStartsAt { .. } | Self::NoIndependentSource { .. } => false,
+            Self::AccruedInterestMismatch { .. } => false,
             Self::RestoredWithoutBasis { .. }
             | Self::NegativeCash { .. }
             | Self::Discrepancy { .. }
@@ -232,6 +264,21 @@ pub struct EvaluatedPosition {
     pub instrument: InstrumentId,
     pub quantity: crate::money::Quantity,
     pub price: SelectedPrice,
+}
+/// Атрибуты облигационной позиции (§5.1: атрибуты, не оценочная база).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BondPositionAttributes {
+    pub account: AccountId,
+    pub custody: Option<crate::ids::CustodyId>,
+    pub instrument: InstrumentId,
+    /// Начисленный на дату доход по позиции: НКД на бумагу × количество.
+    pub accrued_interest: Computed<Dec>,
+    /// Фактически реализуемая сегодня сумма (§4.2). Не договорная.
+    pub accrued_interest_payable_on_termination: Computed<Dec>,
+    /// Ближайшая любая выплата.
+    pub next_posting_date: Option<Date>,
+    /// Окончателен ли ближайший возврат номинала, если он и есть.
+    pub next_principal_return_finality: Option<PrincipalReturnFinality>,
 }
 
 /// Покрытие ценой: только количество позиций, без выдуманного денежного
@@ -268,6 +315,11 @@ pub struct LiquidationEstimate {
     pub executability: ExecutabilityShares,
     pub exit_costs: AmountQualification,
     pub tax: AmountQualification,
+    /// Реализуемый сегодня НКД по всем облигационным позициям.
+    ///
+    /// `NotComputable` здесь делает неполноценной именно эту оценку,
+    /// но не переносит неизвестность в `terminal_value` (§4.2).
+    pub accrued_interest_payable_on_termination: Computed<Dec>,
 }
 
 /// Покрытие стоимости портфеля уровнями достоверности (§10.5).
@@ -302,7 +354,6 @@ pub struct DataQuality {
     pub executability: ExecutabilityShares,
     pub material_issues: Vec<MaterialIssue>,
 }
-
 /// Что именно применялось при расчёте. Без этого цифру не воспроизвести
 /// (§3.2, §6.1).
 ///
@@ -321,6 +372,8 @@ pub struct AppliedRules {
     pub perimeter_policy: PerimeterPolicy,
     /// Версия единого правила пересчёта котировки в деньги.
     pub quotation_rule: QuotationRuleVersion,
+    /// Версия правила расчёта НКД.
+    pub accrued_interest_rule: AccruedInterestRuleVersion,
 }
 
 /// Координата знания, зафиксированная отчётом (§4).
@@ -367,6 +420,10 @@ pub struct ReturnsRequest<'a> {
     /// срез означает «биржевых наблюдений нет», а не ошибку: решение о
     /// покрытии принимает политика.
     pub market_prices: &'a [PriceCandidate],
+    /// График выплат на координату знания, по инструменту.
+    pub bond_schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
+    /// Наблюдённый НКД на одну бумагу, по инструменту.
+    pub accrued_observations: &'a BTreeMap<InstrumentId, PerUnitAmount>,
 }
 
 /// Ответ на три вопроса этапа 1.
@@ -390,6 +447,8 @@ pub struct ReturnsReport {
     /// Внутренняя норма доходности **до налога**.
     pub xirr: Computed<RateOutcome>,
     pub applied_rules: AppliedRules,
+    /// Атрибуты облигационных позиций (§4 спеки E3.4.4).
+    pub bond_attributes: Vec<BondPositionAttributes>,
     pub data_quality: DataQuality,
 }
 
@@ -570,6 +629,9 @@ struct SelectedInputs<'a> {
     cash: Vec<(AccountId, crate::money::Money)>,
     positions: Vec<SelectedPosition>,
     fx: SelectedFx<'a>,
+    bond_schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
+    accrued_observations: &'a BTreeMap<InstrumentId, PerUnitAmount>,
+    accrued_interest_rule: AccruedInterestRuleVersion,
 }
 
 fn inputs_hash(state: &LedgerState, request: &ReturnsRequest<'_>) -> String {
@@ -682,6 +744,9 @@ fn inputs_hash_with_assessments(
             source: request.fx.source(),
             rates,
         },
+        bond_schedules: request.bond_schedules,
+        accrued_observations: request.accrued_observations,
+        accrued_interest_rule: accrued_interest_rule().0,
     };
     let mut encoded = Vec::new();
     ciborium::into_writer(&selected, &mut encoded)
@@ -706,6 +771,220 @@ pub(crate) const fn quotation_rule() -> (QuotationRuleVersion, QuotationV1) {
     (QuotationRuleVersion(1), QuotationV1)
 }
 
+/// Правило расчёта НКД, применяемое отчётом.
+pub(crate) const fn accrued_interest_rule() -> (
+    AccruedInterestRuleVersion,
+    AccruedInterestV1,
+) {
+    (AccruedInterestRuleVersion(1), AccruedInterestV1)
+}
+
+fn accrued_error(error: AccruedInterestError, instrument: InstrumentId) -> NotComputable {
+    match error {
+        AccruedInterestError::OutsideCoverage => {
+            NotComputable::OutsideScheduleCoverage { instrument }
+        }
+        AccruedInterestError::CouponUndetermined => {
+            NotComputable::CouponUndetermined { instrument }
+        }
+        AccruedInterestError::Numeric(_) => NotComputable::Numeric { code: "numeric" },
+    }
+}
+
+fn accrued_per_unit(
+    request: &ReturnsRequest<'_>,
+    rule: &dyn AccruedInterestRule,
+    instrument: InstrumentId,
+) -> Result<PerUnitAmount, NotComputable> {
+    let schedule = request
+        .bond_schedules
+        .get(&instrument)
+        .ok_or(NotComputable::ScheduleMissing { instrument })?;
+    rule.accrued_per_unit(&schedule.periods, request.as_of)
+        .map_err(|error| accrued_error(error, instrument))
+}
+
+fn position_amount(
+    per_unit: PerUnitAmount,
+    quantity: crate::money::Quantity,
+    request: &ReturnsRequest<'_>,
+) -> Computed<Dec> {
+    let local = match per_unit.checked_mul_quantity(quantity) {
+        Ok(value) => value,
+        Err(_) => {
+            return Computed::NotComputable {
+                reason: NotComputable::Numeric { code: "numeric" },
+            };
+        }
+    };
+    let Some(rate) = request
+        .fx
+        .rate(per_unit.currency(), request.report_currency, request.as_of)
+    else {
+        return Computed::NotComputable {
+            reason: NotComputable::MissingFxRate {
+                from: per_unit.currency(),
+                to: request.report_currency,
+                date: request.as_of,
+            },
+        };
+    };
+    match local.checked_mul(rate) {
+        Ok(value) => Computed::Value(value),
+        Err(_) => Computed::NotComputable {
+            reason: NotComputable::Numeric { code: "numeric" },
+        },
+    }
+}
+
+fn selected_executability(assessment: &PositionAssessment) -> Option<SourceExecutability> {
+    match &assessment.kind {
+        PositionAssessmentKind::Selected(selected) => Some(selected.candidate.executability),
+        PositionAssessmentKind::LegacyDerived(_) | PositionAssessmentKind::Uncovered(_) => None,
+    }
+}
+
+fn bond_position_attributes(
+    state: &LedgerState,
+    request: &ReturnsRequest<'_>,
+    rule: &dyn AccruedInterestRule,
+) -> Vec<BondPositionAttributes> {
+    position_assessments(state, request)
+        .into_iter()
+        .map(|assessment| {
+            let accrued = match accrued_per_unit(request, rule, assessment.instrument) {
+                Ok(per_unit) => position_amount(per_unit, assessment.quantity, request),
+                Err(reason) => Computed::NotComputable { reason },
+            };
+            let payable_observation = request
+                .accrued_observations
+                .get(&assessment.instrument)
+                .map(|per_unit| position_amount(*per_unit, assessment.quantity, request))
+                .unwrap_or_else(|| Computed::NotComputable {
+                    reason: NotComputable::ScheduleMissing {
+                        instrument: assessment.instrument,
+                    },
+                });
+            let payable = payable_on_termination(
+                &payable_observation,
+                selected_executability(&assessment).unwrap_or(SourceExecutability::Unknown),
+            );
+            let (next_posting_date, next_principal_return_finality) = request
+                .bond_schedules
+                .get(&assessment.instrument)
+                .map(|schedule| {
+                    let next = next_posting_date(
+                        &schedule.periods,
+                        &schedule.principal_returns,
+                        &[],
+                        request.as_of,
+                    );
+                    let finality = next.and_then(|date| {
+                        finality_of(&schedule.principal_returns)
+                            .ok()?
+                            .into_iter()
+                            .find(|(item, _)| item.repayment_date == date)
+                            .map(|(_, finality)| finality)
+                    });
+                    (next, finality)
+                })
+                .unwrap_or((None, None));
+            BondPositionAttributes {
+                account: assessment.account,
+                custody: assessment.custody,
+                instrument: assessment.instrument,
+                accrued_interest: accrued,
+                accrued_interest_payable_on_termination: payable,
+                next_posting_date,
+                next_principal_return_finality,
+            }
+        })
+        .collect()
+}
+
+/// Материально ли расхождение расчёта НКД с наблюдением.
+///
+/// Допуск — одна минорная единица валюты: расхождение в копейку
+/// объясняется округлением, а не ошибкой правила.
+fn accrued_mismatch_is_material(
+    computed: Dec,
+    observed: Dec,
+    currency: CurrencyCode,
+) -> bool {
+    let Ok(difference) = computed.checked_sub(observed) else {
+        return true;
+    };
+    let tolerance = Dec::new(Decimal::new(1, currency.minor_units()));
+    difference.inner().abs() > tolerance.inner()
+}
+
+fn accrued_mismatch_issues(
+    assessments: &[PositionAssessment],
+    request: &ReturnsRequest<'_>,
+    rule: &dyn AccruedInterestRule,
+) -> Vec<MaterialIssue> {
+    assessments
+        .iter()
+        .filter_map(|assessment| {
+            let computed = accrued_per_unit(request, rule, assessment.instrument).ok()?;
+            let observed = request.accrued_observations.get(&assessment.instrument)?;
+            let material = computed.currency() != observed.currency()
+                || accrued_mismatch_is_material(
+                    computed.value(),
+                    observed.value(),
+                    observed.currency(),
+                );
+            material.then_some(MaterialIssue::AccruedInterestMismatch {
+                instrument: assessment.instrument,
+                computed: computed.value(),
+                observed: observed.value(),
+                currency: observed.currency(),
+                date: request.as_of,
+            })
+        })
+        .collect()
+}
+
+/// Реализуемая при выходе сумма (§4.2).
+///
+/// НКД становится реализуемым только при цене, которую источник объявил
+/// исполнимой. Индикативное закрытие и отсутствие выбранной цены — отказ,
+/// а не нулевой результат и не гарантия ликвидности.
+fn payable_on_termination(
+    accrued: &Computed<Dec>,
+    executability: SourceExecutability,
+) -> Computed<Dec> {
+    match executability {
+        SourceExecutability::Executable => accrued.clone(),
+        SourceExecutability::IndicativePreviousClose | SourceExecutability::Unknown => {
+            Computed::NotComputable {
+                reason: NotComputable::ExitNotExecutable,
+            }
+        }
+    }
+}
+
+fn aggregate_payable_on_termination(
+    attributes: &[BondPositionAttributes],
+) -> Computed<Dec> {
+    let mut total = Dec::zero();
+    for attribute in attributes {
+        let Computed::Value(value) = &attribute.accrued_interest_payable_on_termination else {
+            return attribute.accrued_interest_payable_on_termination.clone();
+        };
+        total = match total.checked_add(*value) {
+            Ok(value) => value,
+            Err(_) => {
+                return Computed::NotComputable {
+                    reason: NotComputable::Numeric { code: "numeric" },
+                };
+            }
+        };
+    }
+    Computed::Value(total)
+}
+
+
 /// Расчёт отчёта.
 ///
 /// Ядро не ходит за данными: цены и курсы приходят готовыми, границы
@@ -714,6 +993,7 @@ pub(crate) const fn quotation_rule() -> (QuotationRuleVersion, QuotationV1) {
 #[must_use]
 pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsReport {
     let (quotation_rule_version, _) = quotation_rule();
+    let (accrued_interest_rule_version, accrued_interest_rule) = accrued_interest_rule();
     let series = xirr::flow_series(state, request);
     let terminal = xirr::terminal_value(state, request);
     let (contributed, withdrawn) = match &series {
@@ -737,12 +1017,15 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
         },
     };
     let rate = xirr::rate(&series, &terminal, request);
+    let bond_attributes = bond_position_attributes(state, request, &accrued_interest_rule);
     let data_quality = data_quality(state, request);
     let liquidation_value_before_exit_costs_and_tax = LiquidationEstimate {
         value_before_exit_costs_and_tax: terminal_value.clone(),
         executability: data_quality.executability,
         exit_costs: AmountQualification::Unknown,
         tax: AmountQualification::Unknown,
+        accrued_interest_payable_on_termination:
+            aggregate_payable_on_termination(&bond_attributes),
     };
 
     ReturnsReport {
@@ -765,7 +1048,9 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
             solver_policy: request.solver_policy,
             perimeter_policy: request.perimeter.policy(),
             quotation_rule: quotation_rule_version,
+            accrued_interest_rule: accrued_interest_rule_version,
         },
+        bond_attributes,
         data_quality,
     }
 }
@@ -980,6 +1265,12 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
     }
 
     let assessments = position_assessments(state, request);
+    let (_, accrued_rule) = accrued_interest_rule();
+    issues.extend(accrued_mismatch_issues(
+        &assessments,
+        request,
+        &accrued_rule,
+    ));
     let mut position_coverage = PositionCoverage {
         evaluated_positions: 0,
         total_positions: assessments.len() as u32,
@@ -1220,6 +1511,9 @@ mod tests {
     use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 
+    static EMPTY_BOND_SCHEDULES: BTreeMap<InstrumentId, BondSchedule> = BTreeMap::new();
+    static EMPTY_ACCRUED_OBSERVATIONS: BTreeMap<InstrumentId, PerUnitAmount> = BTreeMap::new();
+
     fn report_for(state: &LedgerState, coordinate: KnowledgeCoordinate) -> ReturnsReport {
         let contour = ContourDefinition::new(
             ContourId(uuid::Uuid::nil()),
@@ -1239,6 +1533,8 @@ mod tests {
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: &[],
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
         };
         returns_report(state, &request)
     }
@@ -1279,6 +1575,8 @@ mod tests {
             ledger,
             perimeter,
             market_prices: &[],
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
         }
     }
 
@@ -1496,6 +1794,8 @@ mod tests {
             solver_policy: SolverPolicy::returns_default(),
             coordinate,
             ledger: &ledger,
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
             perimeter: &perimeter,
             market_prices: &[],
         };
@@ -1577,6 +1877,8 @@ mod tests {
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: &[],
+            bond_schedules: &BTreeMap::new(),
+            accrued_observations: &BTreeMap::new(),
         };
 
         let hash_for_basis = |basis: QuotationBasis| {
@@ -1688,6 +1990,8 @@ mod tests {
             solver_policy: SolverPolicy::returns_default(),
             coordinate: KnowledgeCoordinate::default(),
             ledger: &ledger,
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
             perimeter: &perimeter,
             market_prices: &[],
         };
@@ -1817,6 +2121,8 @@ mod tests {
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
             perimeter: &perimeter,
             market_prices: &[],
         };
@@ -1912,6 +2218,7 @@ mod tests {
             },
             exit_costs: AmountQualification::Unknown,
             tax: AmountQualification::Unknown,
+            accrued_interest_payable_on_termination: Computed::Value(Dec::zero()),
         };
 
         assert!(matches!(estimate.exit_costs, AmountQualification::Unknown));
@@ -1938,6 +2245,59 @@ mod tests {
                 + shares.unknown.inner(),
             rust_decimal::Decimal::ONE
         );
+    }
+
+    #[test]
+    fn a_kopeck_of_disagreement_with_the_exchange_is_rounding_not_an_issue() {
+        assert!(!accrued_mismatch_is_material(
+            dec("15.17"),
+            dec("15.18"),
+            CurrencyCode::Rub
+        ));
+    }
+
+    #[test]
+    fn a_real_disagreement_names_both_numbers() {
+        assert!(accrued_mismatch_is_material(
+            dec("15.17"),
+            dec("22.40"),
+            CurrencyCode::Rub
+        ));
+    }
+
+    #[test]
+    fn termination_value_without_an_executable_exit_is_unknown_not_the_accrual() {
+        let value = payable_on_termination(
+            &Computed::Value(dec("15.17")),
+            SourceExecutability::IndicativePreviousClose,
+        );
+        assert!(matches!(
+            value,
+            Computed::NotComputable {
+                reason: NotComputable::ExitNotExecutable
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_termination_values_make_only_their_aggregate_unknown() {
+        let attributes = vec![BondPositionAttributes {
+            account: AccountId::new_random(),
+            custody: None,
+            instrument: InstrumentId::new_random(),
+            accrued_interest: Computed::Value(dec("15.17")),
+            accrued_interest_payable_on_termination: Computed::NotComputable {
+                reason: NotComputable::ExitNotExecutable,
+            },
+            next_posting_date: None,
+            next_principal_return_finality: None,
+        }];
+        assert!(matches!(
+            aggregate_payable_on_termination(&attributes),
+            Computed::NotComputable {
+                reason: NotComputable::ExitNotExecutable
+            }
+        ));
     }
 
     #[test]

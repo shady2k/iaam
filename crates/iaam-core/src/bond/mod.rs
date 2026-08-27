@@ -40,6 +40,16 @@ pub struct PrincipalReturn {
     /// Доля ПЕРВОНАЧАЛЬНОГО номинала, в процентах.
     pub share_percent: Dec,
 }
+/// График выплат облигации на координату знания.
+///
+/// Это компактный доменный вход ядра, а не зеркало структуры источника:
+/// перевод снимка в него выполняет слой приложения.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BondSchedule {
+    pub periods: Vec<AccrualPeriod>,
+    pub principal_returns: Vec<PrincipalReturn>,
+}
+
 
 #[cfg(test)]
 mod tests {

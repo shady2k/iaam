@@ -235,8 +235,8 @@ impl MaterialIssue {
     pub const fn is_defect(&self) -> bool {
         match self {
             Self::HistoryStartsAt { .. } | Self::NoIndependentSource { .. } => false,
-            Self::AccruedInterestMismatch { .. } => false,
-            Self::RestoredWithoutBasis { .. }
+            Self::AccruedInterestMismatch { .. }
+            | Self::RestoredWithoutBasis { .. }
             | Self::NegativeCash { .. }
             | Self::Discrepancy { .. }
             | Self::UnsupportedFinancing { .. } => true,
@@ -2368,6 +2368,139 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn an_accrued_interest_mismatch_is_a_defect() {
+        let issue = MaterialIssue::AccruedInterestMismatch {
+            instrument: InstrumentId::new_random(),
+            computed: dec("15.17"),
+            observed: dec("22.40"),
+            currency: CurrencyCode::Rub,
+            date: date!(2026 - 08 - 26),
+        };
+        assert!(issue.is_defect());
+    }
+    #[test]
+    fn a_report_with_an_accrued_mismatch_is_not_clean() {
+        let account = AccountId::new_random();
+        let custody = CustodyId::new_random();
+        let instrument = InstrumentId::new_random();
+        let quantity = Quantity(dec("10"));
+        let opening = event_with(
+            account,
+            date!(2026 - 08 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity,
+                cost_basis: Some(Money::new(PostedMinor::new(100_000), CurrencyCode::Rub)),
+                assertions: Default::default(),
+            },
+            vec![Leg::security(account, custody, instrument, quantity)],
+        );
+        let valuation = event_with(
+            account,
+            date!(2026 - 08 - 26),
+            2,
+            EventKind::Valuation {
+                instrument,
+                price: dec("100"),
+                currency: CurrencyCode::Rub,
+                quality: PriceQuality::OwnerEstimate,
+            },
+            vec![],
+        );
+        let period = crate::reconciliation::claim::AssertionPeriod::between(
+            date!(2026 - 08 - 01),
+            date!(2026 - 08 - 31),
+        )
+        .unwrap();
+        let assertion = |sequence, claim| {
+            event_with(
+                account,
+                date!(2026 - 08 - 26),
+                sequence,
+                EventKind::ControlAssertion { period, claim },
+                vec![],
+            )
+        };
+        let events = vec![
+            opening,
+            valuation,
+            assertion(
+                3,
+                crate::reconciliation::claim::ControlClaim::PositionQuantity {
+                    instrument,
+                    custody,
+                    quantity,
+                    at: crate::reconciliation::claim::BalancePoint::Closing,
+                },
+            ),
+            assertion(
+                4,
+                crate::reconciliation::claim::ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(0),
+                    at: crate::reconciliation::claim::BalancePoint::Closing,
+                },
+            ),
+        ];
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let state = project(&events, &context)
+            .unwrap()
+            .snapshot()
+            .state()
+            .clone();
+        let ledger = ReconciliationLedger::build(&events).unwrap();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let mut schedules = BTreeMap::new();
+        schedules.insert(
+            instrument,
+            BondSchedule {
+                periods: vec![crate::bond::AccrualPeriod {
+                    period_start: date!(2026 - 08 - 01),
+                    accrual_end: date!(2026 - 09 - 01),
+                    payment_date: date!(2026 - 09 - 01),
+                    coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
+                }],
+                principal_returns: vec![],
+            },
+        );
+        let mut accrued = BTreeMap::new();
+        accrued.insert(
+            instrument,
+            PerUnitAmount::new(dec("22.40"), CurrencyCode::Rub),
+        );
+        let report = returns_report(
+            &state,
+            &ReturnsRequest {
+                contour: &contour,
+                as_of: date!(2026 - 08 - 26),
+                report_currency: CurrencyCode::Rub,
+                fx: &fx,
+                solver_policy: SolverPolicy::returns_default(),
+                coordinate: KnowledgeCoordinate::default(),
+                ledger: &ledger,
+                perimeter: &perimeter,
+                market_prices: &[],
+                bond_schedules: &schedules,
+                accrued_observations: &accrued,
+            },
+        );
+        assert_ne!(report.data_quality.status, DataQualityStatus::Clean);
+        assert!(report
+            .data_quality
+            .material_issues
+            .iter()
+            .any(|issue| matches!(issue, MaterialIssue::AccruedInterestMismatch { .. })));
+    }
     #[test]
     fn termination_value_without_an_executable_exit_is_unknown_not_the_accrual() {
         let value = payable_on_termination(

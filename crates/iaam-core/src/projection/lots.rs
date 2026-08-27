@@ -21,7 +21,7 @@ use crate::ids::{AccountId, EventId, InstrumentId};
 use crate::money::{Money, MoneyError, Quantity};
 use crate::numeric::NumericError;
 use crate::rules::lot_disposal::{
-    DisposalError, DisposalInput, DisposalResult, Lot, LotId, RuleId,
+    DisposalError, DisposalInput, DisposalResult, Lot, LotId, PrincipalState, RuleId,
 };
 use crate::rules::{LotRuleVersion, RuleRegistry};
 
@@ -291,6 +291,9 @@ impl LotBook {
                     acquired: event.dates.trade,
                     quantity,
                     cost_basis: basis,
+                    // Номинал сюда придёт из справочника в E3.4;
+                    // подставлять ноль запрещено (§4.9).
+                    principal: PrincipalState::Unknown,
                 });
                 Ok(())
             }
@@ -332,6 +335,7 @@ impl LotBook {
                         acquired: event.dates.trade,
                         quantity,
                         cost_basis: basis,
+                        principal: PrincipalState::Unknown,
                     },
                 );
             }

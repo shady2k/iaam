@@ -9,7 +9,9 @@ use iaam_core::dates::TradeDate;
 use iaam_core::ids::InstrumentId;
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::rules::lot_disposal::{DisposalInput, FifoV1, Lot, LotDisposalRule, LotId};
+use iaam_core::rules::lot_disposal::{
+    DisposalInput, FifoV1, Lot, LotDisposalRule, LotId, PrincipalState,
+};
 use iaam_oracle::lots_reference::{RefLot, dispose_fifo_rational};
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -49,6 +51,7 @@ fn to_core_lots(items: &[RefLotJson]) -> Vec<Lot> {
             acquired: Some(TradeDate(date!(2026 - 01 - 01))),
             quantity: qty(l.quantity),
             cost_basis: Money::new(PostedMinor::new(l.basis_minor), CurrencyCode::Rub),
+            principal: PrincipalState::Unknown,
         })
         .collect()
 }

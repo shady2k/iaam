@@ -114,7 +114,7 @@ mod tests {
         use crate::ids::InstrumentId;
         use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
         use crate::numeric::decimal::Dec;
-        use lot_disposal::{DisposalInput, Lot, LotId};
+        use lot_disposal::{DisposalInput, Lot, LotId, PrincipalState};
         use rust_decimal::Decimal;
         use time::macros::date;
 
@@ -130,6 +130,7 @@ mod tests {
             acquired: Some(TradeDate(date!(2026 - 01 - 10))),
             quantity: Quantity(Dec::new(Decimal::from(10))),
             cost_basis: Money::new(PostedMinor::new(100_000), CurrencyCode::Rub),
+            principal: PrincipalState::Unknown,
         }];
         let out = rule
             .apply(&DisposalInput {

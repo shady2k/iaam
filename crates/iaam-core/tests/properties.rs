@@ -16,7 +16,9 @@ use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::AliasInterval;
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::rules::lot_disposal::{DisposalInput, FifoV1, Lot, LotDisposalRule, LotId};
+use iaam_core::rules::lot_disposal::{
+    DisposalInput, FifoV1, Lot, LotDisposalRule, LotId, PrincipalState,
+};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 use time::macros::date;
@@ -38,6 +40,7 @@ fn tie_rounding_preserves_total_basis() {
         acquired: None,
         quantity: Quantity(Dec::new(Decimal::from(2))),
         cost_basis: Money::new(PostedMinor::new(5), CurrencyCode::Rub),
+        principal: PrincipalState::Unknown,
     }];
 
     let out = FifoV1
@@ -85,6 +88,7 @@ proptest! {
                 acquired: Some(TradeDate(date!(2026 - 01 - 01))),
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                principal: PrincipalState::Unknown,
             })
             .collect();
 
@@ -127,6 +131,7 @@ proptest! {
                 acquired: None,
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                principal: PrincipalState::Unknown,
             })
             .collect();
 
@@ -161,6 +166,7 @@ proptest! {
                 acquired: None,
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                principal: PrincipalState::Unknown,
             })
             .collect();
 

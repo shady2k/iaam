@@ -5,6 +5,7 @@
 //! это другой источник, и смешивать их в одной серии нельзя.
 
 pub mod bondization;
+pub mod description;
 pub mod dictionary_seed;
 pub mod parse;
 

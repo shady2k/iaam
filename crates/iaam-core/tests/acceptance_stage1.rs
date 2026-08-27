@@ -216,6 +216,8 @@ fn single_account_answers_the_three_questions_of_stage_one() {
         ledger: &ledger,
         perimeter: &perimeter,
         market_prices: &[],
+        bond_schedules: &std::collections::BTreeMap::new(),
+        accrued_observations: &std::collections::BTreeMap::new(),
     };
     let report = returns_report(state, &request);
 

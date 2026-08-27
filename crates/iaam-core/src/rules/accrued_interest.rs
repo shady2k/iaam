@@ -11,8 +11,8 @@ use time::Date;
 
 use crate::bond::AccrualPeriod;
 use crate::money::PerUnitAmount;
-use crate::numeric::decimal::Dec;
 use crate::numeric::NumericError;
+use crate::numeric::decimal::Dec;
 
 /// Версия правила НКД.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

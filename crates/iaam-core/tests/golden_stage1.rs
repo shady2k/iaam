@@ -210,6 +210,8 @@ fn report_of(world: &World, events: &[Event], both_accounts: bool, as_of: Date) 
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
         },
     );
     ReportPair {

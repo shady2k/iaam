@@ -116,6 +116,8 @@ fn report_of(fixture: &Fixture) -> iaam_core::returns::ReturnsReport {
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
         },
     )
 }

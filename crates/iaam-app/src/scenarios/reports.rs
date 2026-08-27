@@ -227,8 +227,9 @@ async fn market_price_candidates(
                 .per_unit
                 .parse::<Decimal>()
                 .map_err(|error| AppError::Store(error.to_string()))?;
-            let currency = CurrencyCode::from_code(&row.currency)
-                .ok_or_else(|| AppError::Store(format!("неизвестная валюта НКД: {}", row.currency)))?;
+            let currency = CurrencyCode::from_code(&row.currency).ok_or_else(|| {
+                AppError::Store(format!("неизвестная валюта НКД: {}", row.currency))
+            })?;
             accrued_observations.insert(instrument, PerUnitAmount::new(Dec::new(value), currency));
             break;
         }
@@ -269,8 +270,12 @@ fn market_candidate_from_row(row: PriceRow) -> Result<PriceCandidate, AppError> 
         .map_err(|error| AppError::Store(error.to_string()))?;
     let currency = CurrencyCode::from_code(&row.currency)
         .ok_or_else(|| AppError::Store(format!("неизвестная валюта цены: {}", row.currency)))?;
-    let basis = QuotationBasis::from_code(&row.quotation_basis)
-        .ok_or_else(|| AppError::Store(format!("неизвестное основание цены: {}", row.quotation_basis)))?;
+    let basis = QuotationBasis::from_code(&row.quotation_basis).ok_or_else(|| {
+        AppError::Store(format!(
+            "неизвестное основание цены: {}",
+            row.quotation_basis
+        ))
+    })?;
     let executability = match row.executability.as_str() {
         "executable" => Executability::Executable,
         "indicative_previous_close" => Executability::IndicativePreviousClose,

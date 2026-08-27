@@ -299,6 +299,8 @@ fn the_stage_two_question_is_answered_step_by_step() {
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
         },
     );
     assert_eq!(
@@ -353,6 +355,8 @@ fn a_wrong_figure_in_one_document_is_reported_as_a_discrepancy() {
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
         },
     );
     assert!(

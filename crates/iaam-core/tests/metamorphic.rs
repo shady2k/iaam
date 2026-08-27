@@ -168,6 +168,8 @@ fn report(events: &[Event], accounts: &[AccountId], as_of: Date) -> ReturnsRepor
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
         },
     )
 }

@@ -227,6 +227,8 @@ fn report(
             ledger: &ledger,
             perimeter,
             market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
         },
     )
 }

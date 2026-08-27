@@ -607,14 +607,18 @@ fn describe(reason: &NotComputable) -> String {
             format!("нет наблюдения НКД инструмента {}", instrument.inner())
         }
         NotComputable::CouponUndetermined { instrument } => {
-            format!("не определена сумма купона инструмента {}", instrument.inner())
+            format!(
+                "не определена сумма купона инструмента {}",
+                instrument.inner()
+            )
         }
         NotComputable::OutsideScheduleCoverage { instrument } => {
-            format!("дата отчёта вне покрытия графика инструмента {}", instrument.inner())
+            format!(
+                "дата отчёта вне покрытия графика инструмента {}",
+                instrument.inner()
+            )
         }
-        NotComputable::ExitNotExecutable => {
-            "нет исполнимого выхода для реализации НКД".to_owned()
-        }
+        NotComputable::ExitNotExecutable => "нет исполнимого выхода для реализации НКД".to_owned(),
     }
 }
 
@@ -1056,9 +1060,7 @@ impl BondPositionAttributesDto {
     }
 }
 
-fn principal_return_finality(
-    value: iaam_core::bond::finality::PrincipalReturnFinality,
-) -> String {
+fn principal_return_finality(value: iaam_core::bond::finality::PrincipalReturnFinality) -> String {
     match value {
         iaam_core::bond::finality::PrincipalReturnFinality::Final => "final",
         iaam_core::bond::finality::PrincipalReturnFinality::Partial => "partial",
@@ -1955,9 +1957,7 @@ mod tests {
             account: AccountId::new_random(),
             custody: None,
             instrument: InstrumentId::new_random(),
-            accrued_interest: Computed::Value(Dec::new(
-                Decimal::from_str_exact("15.17").unwrap(),
-            )),
+            accrued_interest: Computed::Value(Dec::new(Decimal::from_str_exact("15.17").unwrap())),
             accrued_interest_payable_on_termination: Computed::NotComputable {
                 reason: NotComputable::ExitNotExecutable,
             },

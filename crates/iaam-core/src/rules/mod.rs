@@ -14,11 +14,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
-use lot_disposal::{FifoV1, LotDisposalRule};
 pub use accrued_interest::{
     AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
 };
+use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
+use lot_disposal::{FifoV1, LotDisposalRule};
 
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 pub use valuation::{
@@ -41,7 +41,6 @@ pub struct RuleRegistry {
     amortisation_rules: BTreeMap<AmortisationRuleVersion, Box<dyn AmortisationRule>>,
     quotation_rules: BTreeMap<QuotationRuleVersion, Box<dyn QuotationRule>>,
     accrued_interest_rules: BTreeMap<AccruedInterestRuleVersion, Box<dyn AccruedInterestRule>>,
-
 }
 
 impl RuleRegistry {
@@ -74,7 +73,6 @@ impl RuleRegistry {
             amortisation_rules,
             quotation_rules,
             accrued_interest_rules,
-
         }
     }
 

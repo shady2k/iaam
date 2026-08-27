@@ -684,8 +684,7 @@ mod market_tests {
         // ACCINT приходит в той же строке, что и CLOSE. Второй запрос
         // за ним был бы лишним обращением к источнику и второй
         // координатой знания на одну и ту же строку.
-        let body =
-            std::fs::read("../../tests/fixtures/market/moex-iss-history-ofz.json").unwrap();
+        let body = std::fs::read("../../tests/fixtures/market/moex-iss-history-ofz.json").unwrap();
         let parsed = parse_response(
             &MarketSource::Moex {
                 instrument: iaam_core::ids::InstrumentId::new_random(),

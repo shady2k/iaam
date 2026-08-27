@@ -541,9 +541,7 @@ fn accrued_interest_is_invisible_before_its_knowledge_coordinate() {
             }],
         )
         .unwrap();
-    store
-        .finish_run(&run, RunOutcome::Succeeded, None)
-        .unwrap();
+    store.finish_run(&run, RunOutcome::Succeeded, None).unwrap();
 
     let venue = PriceVenue {
         board: "TQOB".to_owned(),

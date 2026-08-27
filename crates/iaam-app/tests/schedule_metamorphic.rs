@@ -6,9 +6,7 @@ use async_trait::async_trait;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
-use iaam_app::ports::{
-    AccountView, Clock, OutboundHttp, OutboundResponse, Principal, Scope,
-};
+use iaam_app::ports::{AccountView, Clock, OutboundHttp, OutboundResponse, Principal, Scope};
 use iaam_app::scenarios::reports::{ReturnsQuery, returns};
 use iaam_app::scenarios::schedule::{SOURCE_ID, ScheduleSyncRequest, sync_schedule};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
@@ -17,9 +15,9 @@ use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::FxSource;
+use iaam_http::HttpRequest;
 use iaam_ingest::operation::{OperationDates, OperationKind};
 use iaam_ingest::{SubmittedOperation, normalize};
-use iaam_http::HttpRequest;
 use iaam_store::SqliteStore;
 use iaam_store::market::{Coverage, PriceRow, RunOutcome, SeriesKey};
 use iaam_store::market_source_codes::SourceCodeEntry;
@@ -110,7 +108,13 @@ impl Clock for FixedClock {
     }
 }
 
-fn fixture_services() -> (AppServices, OwnerId, AccountId, InstrumentId, ContourDefinition) {
+fn fixture_services() -> (
+    AppServices,
+    OwnerId,
+    AccountId,
+    InstrumentId,
+    ContourDefinition,
+) {
     let adapter = Arc::new(SqliteAdapter::new(
         SqliteStore::open_in_memory().expect("база приложения"),
     ));
@@ -180,7 +184,11 @@ async fn seed_report_position(
     )
     .expect("нормализация")
     .event;
-    services.store.append_events(vec![event]).await.expect("событие");
+    services
+        .store
+        .append_events(vec![event])
+        .await
+        .expect("событие");
 }
 
 async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {

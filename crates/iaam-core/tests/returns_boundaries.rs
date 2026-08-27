@@ -112,6 +112,8 @@ fn a_flow_on_the_report_date_is_included() {
         ledger: &ledger,
         perimeter: &perimeter,
         market_prices: &[],
+        bond_schedules: &std::collections::BTreeMap::new(),
+        accrued_observations: &std::collections::BTreeMap::new(),
     };
 
     let series = flow_series(fixture.projection.state(), &request).expect("ряд потоков");
@@ -144,6 +146,8 @@ fn a_slice_containing_events_after_the_report_date_is_refused() {
         ledger: &ledger,
         perimeter: &perimeter,
         market_prices: &[],
+        bond_schedules: &std::collections::BTreeMap::new(),
+        accrued_observations: &std::collections::BTreeMap::new(),
     };
 
     assert!(matches!(
@@ -180,6 +184,8 @@ fn a_slice_ending_exactly_on_the_report_date_is_accepted() {
         ledger: &ledger,
         perimeter: &perimeter,
         market_prices: &[],
+        bond_schedules: &std::collections::BTreeMap::new(),
+        accrued_observations: &std::collections::BTreeMap::new(),
     };
     assert!(flow_series(fixture.projection.state(), &request).is_ok());
     assert!(terminal_value(fixture.projection.state(), &request).is_ok());

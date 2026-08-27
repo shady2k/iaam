@@ -15,15 +15,15 @@ pub mod xirr;
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{Date, OffsetDateTime, UtcOffset};
 
 use crate::bond::{
-    finality::{finality_of, PrincipalReturnFinality},
-    posting::next_posting_date,
     BondSchedule,
+    finality::{PrincipalReturnFinality, finality_of},
+    posting::next_posting_date,
 };
 use crate::contour::{ContourDefinition, ContourId, ContourVersion};
 use crate::ids::{AccountId, InstrumentId, SourceId};
@@ -775,10 +775,7 @@ pub(crate) const fn quotation_rule() -> (QuotationRuleVersion, QuotationV1) {
 }
 
 /// Правило расчёта НКД, применяемое отчётом.
-pub(crate) const fn accrued_interest_rule() -> (
-    AccruedInterestRuleVersion,
-    AccruedInterestV1,
-) {
+pub(crate) const fn accrued_interest_rule() -> (AccruedInterestRuleVersion, AccruedInterestV1) {
     (AccruedInterestRuleVersion(1), AccruedInterestV1)
 }
 
@@ -916,11 +913,7 @@ fn bond_position_attributes(
 ///
 /// Допуск — одна минорная единица валюты: расхождение в копейку
 /// объясняется округлением, а не ошибкой правила.
-fn accrued_mismatch_is_material(
-    computed: Dec,
-    observed: Dec,
-    currency: CurrencyCode,
-) -> bool {
+fn accrued_mismatch_is_material(computed: Dec, observed: Dec, currency: CurrencyCode) -> bool {
     let Ok(difference) = computed.checked_sub(observed) else {
         return true;
     };
@@ -974,9 +967,7 @@ fn payable_on_termination(
     }
 }
 
-fn aggregate_payable_on_termination(
-    attributes: &[BondPositionAttributes],
-) -> Computed<Dec> {
+fn aggregate_payable_on_termination(attributes: &[BondPositionAttributes]) -> Computed<Dec> {
     let mut total = Dec::zero();
     for attribute in attributes {
         let Computed::Value(value) = &attribute.accrued_interest_payable_on_termination else {
@@ -993,7 +984,6 @@ fn aggregate_payable_on_termination(
     }
     Computed::Value(total)
 }
-
 
 /// Расчёт отчёта.
 ///
@@ -1034,8 +1024,7 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
         executability: data_quality.executability,
         exit_costs: AmountQualification::Unknown,
         tax: AmountQualification::Unknown,
-        accrued_interest_payable_on_termination:
-            aggregate_payable_on_termination(&bond_attributes),
+        accrued_interest_payable_on_termination: aggregate_payable_on_termination(&bond_attributes),
     };
 
     ReturnsReport {
@@ -1589,9 +1578,7 @@ mod tests {
             accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
         }
     }
-    fn report_with_market_basis(
-        basis: QuotationBasis,
-    ) -> (ReturnsReport, InstrumentId) {
+    fn report_with_market_basis(basis: QuotationBasis) -> (ReturnsReport, InstrumentId) {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
@@ -1666,8 +1653,7 @@ mod tests {
 
     #[test]
     fn a_bond_without_a_schedule_keeps_a_schedule_missing_attribute() {
-        let (report, instrument) =
-            report_with_market_basis(QuotationBasis::PercentOfRemainingFace);
+        let (report, instrument) = report_with_market_basis(QuotationBasis::PercentOfRemainingFace);
 
         let attributes = report
             .bond_attributes
@@ -1680,8 +1666,6 @@ mod tests {
             } if actual == instrument
         ));
     }
-
-
 
     #[test]
     fn a_bond_quoted_in_percent_is_valued_through_its_remaining_face() {
@@ -2437,8 +2421,7 @@ mod tests {
     }
     #[test]
     fn a_missing_accrued_observation_has_its_own_reason() {
-        let (report, instrument) =
-            report_with_market_basis(QuotationBasis::PercentOfRemainingFace);
+        let (report, instrument) = report_with_market_basis(QuotationBasis::PercentOfRemainingFace);
 
         let attributes = report
             .bond_attributes
@@ -2451,5 +2434,4 @@ mod tests {
             } if actual == instrument
         ));
     }
-
 }

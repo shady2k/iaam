@@ -85,6 +85,9 @@ mod tests {
 
     #[test]
     fn nothing_ahead_is_none_not_a_far_future_guess() {
-        assert_eq!(next_posting_date(&[], &[], &[], date!(2026 - 08 - 20)), None);
+        assert_eq!(
+            next_posting_date(&[], &[], &[], date!(2026 - 08 - 20)),
+            None
+        );
     }
 }

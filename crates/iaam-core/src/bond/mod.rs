@@ -50,7 +50,6 @@ pub struct BondSchedule {
     pub principal_returns: Vec<PrincipalReturn>,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

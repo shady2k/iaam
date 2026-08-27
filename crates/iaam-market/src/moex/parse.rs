@@ -204,11 +204,10 @@ pub fn parse_accrued_interest(
             .map_err(|error| MarketError::Malformed(error.to_string()))?;
         // Валюта НКД — валюта номинала (FACEUNIT), а не валюта расчётов
         // площадки (CURRENCYID). В одной строке они различаются.
-        let currency = currency_of(
-            get("FACEUNIT")
-                .and_then(Value::as_str)
-                .ok_or_else(|| MarketError::Malformed("строка с ACCINT без FACEUNIT".to_owned()))?,
-        )?;
+        let currency =
+            currency_of(get("FACEUNIT").and_then(Value::as_str).ok_or_else(|| {
+                MarketError::Malformed("строка с ACCINT без FACEUNIT".to_owned())
+            })?)?;
         let trade_date = TradeDate(parse_date(
             get("TRADEDATE")
                 .and_then(Value::as_str)

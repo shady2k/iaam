@@ -3,14 +3,14 @@ use crate::error::AppError;
 use iaam_core::bond::{AccrualPeriod, PrincipalReturn};
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::decimal::Dec;
-use iaam_store::schedule::StoredSnapshot;
-use rust_decimal::Decimal;
-use time::format_description::well_known::Iso8601;
-use time::Date;
 use iaam_core::valuation::{
     PriceCandidate, PriceKind as CorePriceKind, PriceOrigin, SourceExecutability,
 };
 use iaam_market::{Executability, PriceKind, PriceObservation};
+use iaam_store::schedule::StoredSnapshot;
+use rust_decimal::Decimal;
+use time::Date;
+use time::format_description::well_known::Iso8601;
 
 /// Преобразует рыночное наблюдение в кандидата доменной оценки.
 #[must_use]
@@ -126,9 +126,7 @@ mod tests {
     use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 
-    use super::{
-        accrual_periods_from_snapshot, candidate_from_market_observation,
-    };
+    use super::{accrual_periods_from_snapshot, candidate_from_market_observation};
 
     #[test]
     fn a_row_without_a_fixed_amount_translates_to_none_not_zero() {

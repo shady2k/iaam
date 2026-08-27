@@ -13,6 +13,7 @@ expression: report
     "solver_rate_tolerance": "0.0000000001"
   },
   "as_of": "2026-01-01",
+  "bond_attributes": [],
   "contributed": {
     "value": "50000.00"
   },
@@ -44,6 +45,9 @@ expression: report
   },
   "history_starts": "2025-01-01",
   "liquidation_value_before_exit_costs_and_tax": {
+    "accrued_interest_payable_on_termination": {
+      "value": "0"
+    },
     "executability": {
       "evaluated_positions_value": "0",
       "executable": "0",

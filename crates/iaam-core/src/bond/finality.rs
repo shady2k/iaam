@@ -13,8 +13,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::bond::PrincipalReturn;
-use crate::numeric::decimal::Dec;
 use crate::numeric::NumericError;
+use crate::numeric::decimal::Dec;
 
 /// Окончателен ли возврат номинала.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

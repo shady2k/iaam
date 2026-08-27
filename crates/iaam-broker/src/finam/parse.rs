@@ -1,4 +1,9 @@
 use iaam_core::event::provenance::ParserVersion;
+
+// Реэкспорт, чтобы `tinkoff::ChannelOperationKind` и
+// `finam::ChannelOperationKind` продолжали означать один и тот же тип:
+// имя у каналов привычное, а тип за ним теперь общий.
+pub use crate::operation_kind::ChannelOperationKind;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
@@ -43,19 +48,6 @@ pub enum ParseError {
 pub struct ChannelMoney {
     pub amount: PostedMinor,
     pub currency: CurrencyCode,
-}
-
-/// Классифицированный вид транзакции Finam.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelOperationKind {
-    Buy,
-    Sell,
-    Deposit,
-    Withdrawal,
-    Dividend,
-    Coupon,
-    Commission,
-    Other(String),
 }
 
 /// Транзакция, полученная из Finam API.

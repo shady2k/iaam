@@ -157,6 +157,25 @@ fn operation_to_submitted(
         ChannelOperationKind::Transfer => {
             return Err(unparsable("перевод не содержит счёт получателя"));
         }
+        // Амортизация и погашение — корпоративные действия, а не
+        // операции владельца: у них своя форма и свой вход
+        // (POST /v1/ingest/journal-events). Отказ здесь называет
+        // НЕДОСТАЮЩЕЕ, а не «непонятный вид»: канал сообщает сумму
+        // выплаты, но не возвращённый номинал на единицу и не место
+        // хранения, а без них факт не построить, и подстановка
+        // догадки записала бы в append-only журнал то, чего не было.
+        ChannelOperationKind::BondAmortisation => {
+            return Err(unparsable(
+                "амортизация облигации: канал не сообщает возвращённый номинал на единицу \
+                 и место хранения — факт вводится через журнальный вход",
+            ));
+        }
+        ChannelOperationKind::BondRedemption => {
+            return Err(unparsable(
+                "погашение облигации: канал не сообщает возвращённый номинал на единицу \
+                 и место хранения — факт вводится через журнальный вход",
+            ));
+        }
         ChannelOperationKind::Other(kind) => {
             return Err(unparsable(format!("неподдержанный вид операции: {kind}")));
         }
@@ -313,6 +332,53 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    /// Амортизация и погашение — корпоративные действия, и канал
+    /// данных для них не даёт. Отказ обязан называть НЕДОСТАЮЩЕЕ:
+    /// «неподдержанный вид» отправил бы владельца искать поддержку
+    /// вида, которая есть, вместо данных, которых нет.
+    #[test]
+    fn a_bond_repayment_is_refused_by_naming_what_the_channel_does_not_report() {
+        use iaam_broker::operation_kind::ChannelOperationKind;
+        use iaam_broker::tinkoff::ChannelOperation;
+
+        for kind in [
+            ChannelOperationKind::BondAmortisation,
+            ChannelOperationKind::BondRedemption,
+        ] {
+            let operation = ChannelOperation {
+                date: None,
+                broker_account_id: "счёт".to_owned(),
+                operation_id: "1".to_owned(),
+                parent_operation_id: None,
+                cursor: "c".to_owned(),
+                kind: kind.clone(),
+                state: "OPERATION_STATE_EXECUTED".to_owned(),
+                instrument_uid: None,
+                figi: None,
+                quantity: None,
+                payment: None,
+                price: None,
+                commission: None,
+                deduplication_key: "k".to_owned(),
+                parser_version: iaam_core::event::provenance::ParserVersion("тест".to_owned()),
+                raw: serde_json::Value::Null,
+                rejection: None,
+            };
+            let account = AccountId(Uuid::from_u128(1));
+            let error = operation_to_submitted(account, operation)
+                .expect_err("корпоративное действие каналом не строится");
+            let text = error.to_string();
+            assert!(
+                text.contains("номинал на единицу"),
+                "отказ не называет недостающее: {text}"
+            );
+            assert!(
+                text.contains("журнальный вход"),
+                "отказ не называет, куда факт вводится: {text}"
+            );
+        }
     }
 
     fn income_kind_of(operation_type: &str) -> Option<IncomeKind> {

@@ -1,4 +1,9 @@
 use iaam_core::event::provenance::ParserVersion;
+
+// Реэкспорт, чтобы `tinkoff::ChannelOperationKind` и
+// `finam::ChannelOperationKind` продолжали означать один и тот же тип:
+// имя у каналов привычное, а тип за ним теперь общий.
+pub use crate::operation_kind::ChannelOperationKind;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 use serde::Deserialize;
@@ -64,29 +69,6 @@ impl ChannelMoney {
     pub fn magnitude(self) -> Option<PostedMinor> {
         self.amount.raw().checked_abs().map(PostedMinor::new)
     }
-}
-
-/// Смысл операции, выделенный из имени enum T-Invest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelOperationKind {
-    /// Покупка инструмента.
-    Buy,
-    /// Продажа инструмента.
-    Sell,
-    /// Дивидендная выплата.
-    Dividend,
-    /// Купонная выплата.
-    Coupon,
-    /// Комиссия брокера или сервиса.
-    Commission,
-    /// Пополнение счёта.
-    Deposit,
-    /// Вывод денег или бумаг.
-    Withdrawal,
-    /// Перевод между счетами или депозитариями.
-    Transfer,
-    /// Вид, который клиент ещё не классифицирует.
-    Other(String),
 }
 
 /// Операция, полученная из REST-канала T-Invest.

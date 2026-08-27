@@ -106,6 +106,18 @@ impl CorporateAction {
             | Self::Conversion { effective_date, .. } => *effective_date,
         }
     }
+
+    /// Дата фиксации реестра. Необязательна у каждого члена: источник
+    /// её сообщает не всегда, а выдумать её нечем — `None` означает
+    /// «не утверждалось», а не «совпадает с датой вступления в силу».
+    #[must_use]
+    pub const fn record_date(&self) -> Option<Date> {
+        match self {
+            Self::PartialRedemption { record_date, .. }
+            | Self::Redemption { record_date, .. }
+            | Self::Conversion { record_date, .. } => *record_date,
+        }
+    }
 }
 
 /// Что сделали с дробной частью при замещении.

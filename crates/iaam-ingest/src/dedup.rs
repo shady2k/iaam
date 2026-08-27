@@ -32,6 +32,7 @@ use iaam_core::ids::{AccountId, EventId};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::journal_event::{JournalFact, SubmittedJournalEvent};
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation};
 
 /// Версия канонической формы отпечатка.
@@ -286,6 +287,45 @@ pub fn fingerprint(operation: &SubmittedOperation) -> RawHash {
     // отказать; но подставлять заглушку в случае отказа нельзя —
     // отпечаток без хеша не должен существовать.
     RawHash::parse(&hex).unwrap_or_else(|| unreachable_hash())
+}
+
+/// Отпечаток журнального факта (§10.6, третий уровень).
+///
+/// Отдельная функция, а не общая с операциями: канонические формы
+/// разные, и объединение их одним `enum` сделало бы формат операции
+/// зависимым от появления второй семьи. Отпечаток — это формат, и он
+/// не должен меняться от того, что рядом завели новый вход.
+#[must_use]
+pub fn fingerprint_journal_event(submitted: &SubmittedJournalEvent) -> RawHash {
+    let digest = Sha256::digest(canonical_journal_form(submitted).as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    RawHash::parse(&hex).unwrap_or_else(|| unreachable_hash())
+}
+
+/// Каноническая форма журнального факта.
+///
+/// Ключ идемпотентности и идентификатор факта в источнике в неё
+/// **не входят** — по той же причине, что и у операций: они называют
+/// подачу, а не факт.
+#[must_use]
+pub fn canonical_journal_form(submitted: &SubmittedJournalEvent) -> String {
+    let canonical = CanonicalJournalEvent {
+        v: CANONICAL_VERSION,
+        account: submitted.account,
+        fact: &submitted.fact,
+    };
+    serde_json::to_string(&canonical).unwrap_or_else(|_| unrepresentable_operation())
+}
+
+/// Каноническая форма журнального факта. Даты внутри самого факта
+/// и сериализуются его собственным представлением: именно им факт
+/// уходит в хранилище (`iaam-store/src/events.rs`), и вторая запись
+/// того же факта другой формой разошлась бы с первой.
+#[derive(Serialize)]
+struct CanonicalJournalEvent<'a> {
+    v: u8,
+    account: AccountId,
+    fact: &'a JournalFact,
 }
 
 /// Каноническая форма. Поля в порядке объявления — этот порядок и есть

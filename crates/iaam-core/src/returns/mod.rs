@@ -108,6 +108,8 @@ pub enum NotComputable {
     UnsupportedFinancing { account: AccountId },
     /// Снимка графика выпуска на координату знания отсутствует.
     ScheduleMissing { instrument: InstrumentId },
+    /// Наблюдение НКД на дату выхода отсутствует.
+    AccruedObservationMissing { instrument: InstrumentId },
     /// Сумма купона текущего периода не определена.
     CouponUndetermined { instrument: InstrumentId },
     /// Дата отчёта вне покрытия графика.
@@ -133,6 +135,7 @@ impl NotComputable {
             Self::Numeric { .. } => "numeric",
             Self::UnsupportedFinancing { .. } => "unsupported_financing",
             Self::ScheduleMissing { .. } => "schedule_missing",
+            Self::AccruedObservationMissing { .. } => "accrued_observation_missing",
             Self::CouponUndetermined { .. } => "coupon_undetermined",
             Self::OutsideScheduleCoverage { .. } => "outside_schedule_coverage",
             Self::ExitNotExecutable => "exit_not_executable",
@@ -868,7 +871,7 @@ fn bond_position_attributes(
                 .get(&assessment.instrument)
                 .map(|per_unit| position_amount(*per_unit, assessment.quantity, request))
                 .unwrap_or_else(|| Computed::NotComputable {
-                    reason: NotComputable::ScheduleMissing {
+                    reason: NotComputable::AccruedObservationMissing {
                         instrument: assessment.instrument,
                     },
                 });
@@ -2432,4 +2435,21 @@ mod tests {
             Some("no_external_flows")
         );
     }
+    #[test]
+    fn a_missing_accrued_observation_has_its_own_reason() {
+        let (report, instrument) =
+            report_with_market_basis(QuotationBasis::PercentOfRemainingFace);
+
+        let attributes = report
+            .bond_attributes
+            .first()
+            .expect("облигация должна иметь атрибуты");
+        assert!(matches!(
+            attributes.accrued_interest_payable_on_termination,
+            Computed::NotComputable {
+                reason: NotComputable::AccruedObservationMissing { instrument: actual }
+            } if actual == instrument
+        ));
+    }
+
 }

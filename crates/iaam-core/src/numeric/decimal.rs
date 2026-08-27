@@ -34,6 +34,23 @@ impl Dec {
     pub const fn max_scale() -> u32 {
         MAX_SCALE
     }
+    /// Округление до знака после запятой, половина — от нуля.
+    ///
+    /// Отдельный метод, а не `Decimal::round_dp` на месте: правило НКД
+    /// округляет до минорной единицы валюты, и стратегия округления —
+    /// часть версионированного правила, а не вкус вызывающего.
+    pub fn checked_round_to_scale(self, scale: u32) -> Result<Self, NumericError> {
+        if scale > Self::max_scale() {
+            return Err(NumericError::ScaleTooLarge {
+                scale,
+                max: Self::max_scale(),
+            });
+        }
+        Ok(Self::new(self.0.round_dp_with_strategy(
+            scale,
+            rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+        )))
+    }
 
     #[must_use]
     pub const fn one() -> Self {
@@ -295,5 +312,28 @@ mod tests {
     fn ordering_follows_the_underlying_decimal() {
         assert!(dec("1.10") < dec("1.20"));
         assert!(dec("-1.0") < dec("0"));
+    }
+    #[test]
+    fn rounding_to_a_scale_matches_the_kopeck_of_the_source() {
+        // Числа взяты из живой сверки с MOEX: линейный расчёт даёт
+        // 0.70571 и 17.99571, источник печатает 0.71 и 18.00.
+        let value = Dec::new(Decimal::from_str_exact("0.70571").unwrap());
+        assert_eq!(
+            value.checked_round_to_scale(2).unwrap(),
+            Dec::new(Decimal::from_str_exact("0.71").unwrap())
+        );
+        let value = Dec::new(Decimal::from_str_exact("17.99571").unwrap());
+        assert_eq!(
+            value.checked_round_to_scale(2).unwrap(),
+            Dec::new(Decimal::from_str_exact("18.00").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_scale_beyond_the_limit_is_refused_not_truncated() {
+        // Молчаливое усечение до max_scale дало бы число, о котором
+        // вызывающий думает, что оно точнее, чем есть.
+        let value = Dec::new(Decimal::from_str_exact("1.5").unwrap());
+        assert!(value.checked_round_to_scale(Dec::max_scale() + 1).is_err());
     }
 }

@@ -5,6 +5,7 @@
 //! типы портов.
 
 use async_trait::async_trait;
+use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::{
     ChannelMoney, ChannelOperation, ChannelOperationKind, GetOperationsByCursorRequest, ParseError,
     TINKOFF_PARSER_VERSION, TinkoffClient, TinkoffError, parse_operations, parse_portfolio,
@@ -27,13 +28,27 @@ const BROKER: &str = "tinkoff";
 pub struct TinkoffChannel {
     client: TinkoffClient,
     source: SourceId,
+    /// Словарь видов операций этого канала. Приезжает из хранилища
+    /// готовым: разбор в `iaam-broker` про хранилище не знает, и
+    /// связывает их этот адаптер — тем же приёмом, что уже сделан
+    /// для SQLite.
+    dictionary: OperationKindDictionary,
 }
 
 impl TinkoffChannel {
-    /// Создаёт канал с уже настроенным HTTP-клиентом и источником данных.
+    /// Создаёт канал с уже настроенным HTTP-клиентом, источником данных
+    /// и словарём видов операций.
     #[must_use]
-    pub fn new(client: TinkoffClient, source: SourceId) -> Self {
-        Self { client, source }
+    pub fn new(
+        client: TinkoffClient,
+        source: SourceId,
+        dictionary: OperationKindDictionary,
+    ) -> Self {
+        Self {
+            client,
+            source,
+            dictionary,
+        }
     }
 }
 
@@ -54,7 +69,7 @@ impl BrokerChannel for TinkoffChannel {
             .await
             .map_err(tinkoff_error)?;
         let operations = parse_operations(&body).map_err(parse_error)?;
-        adapt_operations(account, operations)
+        adapt_operations(account, operations, &self.dictionary)
     }
 
     async fn fetch_portfolio(
@@ -82,7 +97,16 @@ impl BrokerChannel for TinkoffChannel {
 fn adapt_operations(
     account: AccountId,
     operations: Vec<ChannelOperation>,
+    dictionary: &OperationKindDictionary,
 ) -> Result<ParsedOperations, BrokerError> {
+    // Пустой словарь — это ненастроенный канал, а не непонятный брокер.
+    // Без этой проверки владелец получил бы отказ про каждый код
+    // по отдельности и пошёл бы разбираться с брокером вместо настройки.
+    if dictionary.is_empty() && !operations.is_empty() {
+        return Err(unparsable(
+            "словарь видов операций канала пуст: разбирать выгрузку нечем",
+        ));
+    }
     let mut accepted = Vec::new();
     let mut quarantined = Vec::new();
     for operation in operations {
@@ -92,7 +116,8 @@ fn adapt_operations(
                 reason: format!("{rejection:?}: {rejection}"),
             });
         } else {
-            accepted.push(operation_to_submitted(account, operation)?);
+            let kind = dictionary.kind_of(&operation.source_kind);
+            accepted.push(operation_to_submitted(account, operation, kind)?);
         }
     }
     Ok(ParsedOperations {
@@ -104,11 +129,12 @@ fn adapt_operations(
 fn operation_to_submitted(
     account: AccountId,
     operation: ChannelOperation,
+    kind: ChannelOperationKind,
 ) -> Result<SubmittedOperation, BrokerError> {
     if let Some(rejection) = operation.rejection.as_ref() {
         return Err(unparsable(format!("строка отклонена: {rejection}")));
     }
-    let kind = match operation.kind.clone() {
+    let kind = match kind {
         ChannelOperationKind::Buy => trade_kind(account, &operation, true)?,
         ChannelOperationKind::Sell => trade_kind(account, &operation, false)?,
         // Схлопывать купон и дивиденд в один приход нельзя: журнал
@@ -312,6 +338,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{adapt_operations, operation_to_submitted};
+    use iaam_broker::operation_kind::OperationKindDictionary;
 
     use iaam_core::event::kind::IncomeKind;
 
@@ -353,7 +380,7 @@ mod tests {
                 operation_id: "1".to_owned(),
                 parent_operation_id: None,
                 cursor: "c".to_owned(),
-                kind: kind.clone(),
+                source_kind: "не важно: вид передаётся отдельно".to_owned(),
                 state: "OPERATION_STATE_EXECUTED".to_owned(),
                 instrument_uid: None,
                 figi: None,
@@ -367,7 +394,7 @@ mod tests {
                 rejection: None,
             };
             let account = AccountId(Uuid::from_u128(1));
-            let error = operation_to_submitted(account, operation)
+            let error = operation_to_submitted(account, operation, kind.clone())
                 .expect_err("корпоративное действие каналом не строится");
             let text = error.to_string();
             assert!(
@@ -381,11 +408,30 @@ mod tests {
         }
     }
 
+    /// Словарь канала в тестах заводится явно: классификация — данные,
+    /// и тест, полагающийся на вшитый список, проверял бы список,
+    /// которого больше нет.
+    fn dictionary() -> OperationKindDictionary {
+        let (dictionary, unreadable) = OperationKindDictionary::build([
+            ("OPERATION_TYPE_BUY", "buy"),
+            ("OPERATION_TYPE_SELL", "sell"),
+            ("OPERATION_TYPE_COUPON", "coupon"),
+            ("OPERATION_TYPE_DIVIDEND", "dividend"),
+            ("OPERATION_TYPE_DIV_EXT", "dividend"),
+            ("OPERATION_TYPE_BROKER_FEE", "commission"),
+            ("OPERATION_TYPE_INPUT", "deposit"),
+            ("OPERATION_TYPE_OUTPUT", "withdrawal"),
+        ]);
+        assert!(unreadable.is_empty(), "{unreadable:?}");
+        dictionary
+    }
+
     fn income_kind_of(operation_type: &str) -> Option<IncomeKind> {
         let operations = parse_operations(&income_operation(operation_type)).expect("разбор");
         let account = AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888));
         let operation = operations.into_iter().next().expect("одна операция");
-        let submitted = operation_to_submitted(account, operation).expect("операция принята");
+        let kind = dictionary().kind_of(&operation.source_kind);
+        let submitted = operation_to_submitted(account, operation, kind).expect("операция принята");
         match submitted.kind {
             OperationKind::Income { kind, .. } => kind,
             other => panic!("ожидался приход дохода, получено {other:?}"),
@@ -422,7 +468,8 @@ mod tests {
             parse_operations(&income_operation("OPERATION_TYPE_SOMETHING_NEW")).expect("разбор");
         let account = AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888));
         let operation = operations.into_iter().next().expect("одна операция");
-        assert!(operation_to_submitted(account, operation).is_err());
+        let kind = dictionary().kind_of(&operation.source_kind);
+        assert!(operation_to_submitted(account, operation, kind).is_err());
     }
 
     #[test]
@@ -448,7 +495,8 @@ mod tests {
             .into_iter()
             .next()
             .ok_or("fixture did not contain an operation")?;
-        let submitted = operation_to_submitted(account, operation)?;
+        let kind = dictionary().kind_of(&operation.source_kind);
+        let submitted = operation_to_submitted(account, operation, kind)?;
 
         assert_eq!(submitted.account, account);
         assert_eq!(
@@ -480,7 +528,7 @@ mod tests {
             "../../../../tests/fixtures/api/tinkoff-operations.json"
         ))?;
         let account = AccountId(Uuid::parse_str("d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4")?);
-        let parsed = adapt_operations(account, operations)?;
+        let parsed = adapt_operations(account, operations, &dictionary())?;
 
         assert_eq!(parsed.accepted.len(), 2);
         assert_eq!(parsed.quarantined.len(), 2);

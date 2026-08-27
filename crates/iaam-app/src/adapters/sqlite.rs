@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
+use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
@@ -652,9 +653,29 @@ impl BrokerChannelFactory for SqliteAdapter {
             })?;
         let client = TinkoffClient::new(environment, token)
             .map_err(|error| AppError::Store(format!("клиент брокера не создан: {error}")))?;
+        // Словарь читается здесь, а не в разборе: `iaam-broker` про
+        // хранилище не знает намеренно (см. его `lib.rs`), и связывает
+        // их адаптер — тем же приёмом, что уже сделан для SQLite.
+        let code = code.clone();
+        let rows = self
+            .blocking(move |store| store.broker_operation_kinds(&code).map_err(store_error))
+            .await?;
+        let (dictionary, unreadable) = OperationKindDictionary::build(rows);
+        // Строка словаря, которую эта сборка не понимает, означает, что
+        // база новее кода. Молча её отбросив, канал превратил бы
+        // известный код брокера в неизвестный — то есть выдал бы отказ
+        // импорта, из текста которого о рассинхронизации не догадаться.
+        if let Some(first) = unreadable.first() {
+            return Err(AppError::Invalid {
+                field: "broker_operation_kinds".to_owned(),
+                expected: "вид операции, известный этой сборке".to_owned(),
+                actual: format!("{} -> {}", first.source_kind, first.kind),
+            });
+        }
         Ok(Arc::new(crate::adapters::tinkoff::TinkoffChannel::new(
             client,
             SourceId(access.id),
+            dictionary,
         )))
     }
 }

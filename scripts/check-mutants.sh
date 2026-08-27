@@ -189,6 +189,12 @@ MODULES=(
   "crates/iaam-core/src/event/legs.rs"
   "crates/iaam-core/src/rules/amortisation.rs"
   "crates/iaam-core/src/projection/offers.rs"
+  # График выплат (E3.4 часть 2). Ошибка в инвариантах полноты не меняет
+  # ни одной суммы — она меняет то, что система считает полным графиком,
+  # и усечённый ряд молча укорачивает W_T.
+  "crates/iaam-market/src/schedule/completeness.rs"
+  "crates/iaam-market/src/moex/bondization.rs"
+  "crates/iaam-app/src/scenarios/schedule.rs"
   # observation.rs в список НЕ входит намеренно: там одни объявления
   # типов, мутировать в них нечего, и `cargo mutants --list` даёт ноль.
   # Заслон такой модуль объявляет отказом — и правильно: ноль мутантов

@@ -202,12 +202,14 @@ fn report_of(world: &World, events: &[Event], both_accounts: bool, as_of: Date) 
         projection.state(),
         &ReturnsRequest {
             contour: &contour,
+            coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
             as_of,
             report_currency: CurrencyCode::Rub,
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         },
     );
     ReportPair {

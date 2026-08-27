@@ -108,6 +108,7 @@ fn imported_report(owner: OwnerId, account: AccountId, channel: &TestChannel) ->
         EventKind::Income {
             instrument: None,
             gross: rub(4_000),
+            kind: None,
         },
         vec![Leg::cash(account, rub(4_000))],
     );
@@ -218,12 +219,14 @@ fn report(
         projection.state(),
         &ReturnsRequest {
             contour,
+            coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
             as_of,
             report_currency: CurrencyCode::Rub,
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter,
+            market_prices: &[],
         },
     )
 }

@@ -305,8 +305,14 @@ fn finam_report_preserves_rows_operations_period_controls_and_repo_quarantine() 
                 instrument: actual_instrument,
                 gross_minor,
                 currency,
+                kind,
             } => {
                 assert_eq!(*currency, CurrencyCode::Rub);
+                // Отчёт Финама называет вид словом, и слово доходит
+                // до операции: лист «Выплаты» принимает только купон
+                // и дивиденд, поэтому «не утверждалось» здесь было бы
+                // потерей, а не честностью.
+                assert!(kind.is_some(), "вид дохода потерян отчётом");
                 incomes.push((*actual_instrument, *gross_minor));
             }
             other => panic!("неожиданный вид операции: {other:?}"),

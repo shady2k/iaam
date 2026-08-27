@@ -129,6 +129,7 @@ fn journal(fixture: &mut Fixture) -> Vec<Event> {
                 EventKind::Income {
                     instrument: Some(instrument),
                     gross: dividend,
+                    kind: None,
                 },
                 EventDates::for_cash(CashPostedDate(date!(2025 - 07 - 01))),
                 vec![Leg::cash(account, dividend)],
@@ -207,12 +208,14 @@ fn single_account_answers_the_three_questions_of_stage_one() {
     );
     let request = ReturnsRequest {
         contour: &contour,
+        coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
         as_of: date!(2026 - 01 - 01),
         report_currency: CurrencyCode::Rub,
         fx: &fx,
         solver_policy: SolverPolicy::returns_default(),
         ledger: &ledger,
         perimeter: &perimeter,
+        market_prices: &[],
     };
     let report = returns_report(state, &request);
 

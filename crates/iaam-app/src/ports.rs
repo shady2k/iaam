@@ -8,7 +8,9 @@ use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
+use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
+use iaam_store::documents::BrokerCode;
 use serde_json::Value;
 use std::sync::Arc;
 use time::Date;
@@ -110,6 +112,31 @@ pub struct CustodyView {
     pub institution: Option<String>,
 }
 
+/// Данные инструмента от разрешённого источника записи.
+///
+/// Идентификатор назначает вызывающий: синхронизация сначала разрешает
+/// существующий внешний код, а для новой бумаги создаёт идентификатор и
+/// затем связывает его с псевдонимами.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentUpsert {
+    pub id: InstrumentId,
+    pub kind: Option<iaam_core::instrument::InstrumentKind>,
+    pub symbol: String,
+    pub title: String,
+    pub currencies: iaam_core::instrument::CurrencyRoles,
+    pub lineage: Option<iaam_core::instrument::Lineage>,
+}
+
+/// Псевдоним инструмента от разрешённого источника записи.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasUpsert {
+    pub namespace: iaam_core::instrument::AliasNamespace,
+    pub value: String,
+    pub instrument: InstrumentId,
+    pub interval: iaam_core::instrument::AliasInterval,
+    pub source: iaam_core::ids::SourceId,
+}
+
 /// Справочник инструментов (§4.5, §4.7).
 #[async_trait]
 pub trait InstrumentDirectory: Send + Sync {
@@ -134,6 +161,15 @@ pub trait InstrumentDirectory: Send + Sync {
     /// Отдаются целиком, одним запросом: разбор документа иначе ходил бы
     /// в базу на каждую строку.
     async fn list_aliases(&self) -> Result<Vec<AliasView>, AppError>;
+
+    /// Создать или обновить инструмент и вернуть его идентификатор.
+    ///
+    /// Запись нужна синхронизации источников и администратору; агентский
+    /// токен не получает этот метод через HTTP-маршрут (§7, §14).
+    async fn record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError>;
+
+    /// Записать внешний код инструмента с интервалом действия.
+    async fn record_alias(&self, alias: AliasUpsert) -> Result<(), AppError>;
 
     async fn list_custody_places(&self, owner: OwnerId) -> Result<Vec<CustodyView>, AppError>;
 }
@@ -194,6 +230,73 @@ pub trait Store: Send + Sync {
         route: String,
         outcome: String,
     ) -> Result<(), AppError>;
+}
+/// Ответ источника после транспортной политики.
+///
+/// Транспорт возвращает тело без разбора: кодировку и формат знает
+/// `iaam-market`, а хеш связывает строки наблюдений с исходным ответом.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub raw_hash: String,
+}
+
+/// Исходящий HTTP.
+///
+/// Порт общий, а не «рыночный»: узел запроса называет сам `HttpRequest`
+/// своим `Destination`, и рынок был лишь первым, кто этим портом
+/// воспользовался. Имя по первому пользователю заставляло бы каждого
+/// следующего либо врать в тексте отказа, либо заводить второй такой же
+/// порт.
+///
+/// Порт позволяет сценариям тестироваться на замороженных ответах без сети.
+/// `HttpRequest` — описание запроса, а не действие; отправляет его только
+/// адаптер `iaam-app`.
+#[async_trait]
+pub trait OutboundHttp: Send + Sync {
+    async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError>;
+}
+/// Явный отказ ручного запуска без настроенного HTTP-адаптера.
+pub struct UnavailableOutboundHttp;
+
+#[async_trait]
+impl OutboundHttp for UnavailableOutboundHttp {
+    async fn send(&self, _request: HttpRequest) -> Result<OutboundResponse, AppError> {
+        Err(AppError::NotConfigured {
+            what: "исходящий HTTP-транспорт",
+        })
+    }
+}
+
+/// Словарь видов операций канала.
+///
+/// Отдельный порт, а не метод `Store`: словарь читают и пополняют
+/// совсем другие сценарии, чем журнал событий, и складывать их
+/// в один трейт значило бы выдавать право на журнал вместе с правом
+/// на справочник.
+#[async_trait]
+pub trait BrokerDictionary: Send + Sync {
+    /// Весь словарь канала: код источника -> имя вида.
+    async fn operation_kinds(
+        &self,
+        broker: &BrokerCode,
+    ) -> Result<std::collections::BTreeMap<String, String>, AppError>;
+}
+
+/// Отказ там, где словарь не подключён.
+pub struct UnavailableBrokerDictionary;
+
+#[async_trait]
+impl BrokerDictionary for UnavailableBrokerDictionary {
+    async fn operation_kinds(
+        &self,
+        _broker: &BrokerCode,
+    ) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+        Err(AppError::NotConfigured {
+            what: "словарь видов операций канала",
+        })
+    }
 }
 
 /// Часы. Порт, а не `OffsetDateTime::now_utc()` внутри сценария:

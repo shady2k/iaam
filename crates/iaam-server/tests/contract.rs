@@ -18,7 +18,12 @@ use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
-    ParsedOperations, TokenAdmin,
+    ParsedOperations, TokenAdmin, UnavailableOutboundHttp,
+};
+use iaam_app::storage::SqliteStore;
+use iaam_app::storage::{
+    AccountRecord, AliasRecord, BrokerCode, Coverage, FxRow, InstrumentRecord, KeyRateRow,
+    PriceRow, RunOutcome, SeriesKey, TokenRecord, TokenScope,
 };
 use iaam_broker::credentials::Key;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -31,13 +36,10 @@ use iaam_server::auth::hash_token;
 use iaam_server::dto::VerdictDto;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
-use iaam_store::SqliteStore;
-use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
-use iaam_store::tokens::{TokenRecord, TokenScope};
 use serde_json::{Value, json};
 use std::time::Duration;
-use time::Date;
 use time::macros::date;
+use time::{Date, Duration as TimeDuration, OffsetDateTime};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -150,6 +152,7 @@ struct Harness {
     account: AccountId,
     instrument: InstrumentId,
     custody: CustodyId,
+    market_store: Arc<tokio::sync::Mutex<SqliteStore>>,
 }
 
 fn harness() -> Harness {
@@ -283,6 +286,10 @@ fn harness_with_factory(
         channel_factory.unwrap_or_else(|| adapter.clone());
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
+    let market_store = Arc::new(tokio::sync::Mutex::new(
+        SqliteStore::open_in_memory().expect("market store"),
+    ));
+    let broker_dictionary: Arc<dyn iaam_app::ports::BrokerDictionary> = adapter.clone();
     let services = Arc::new(AppServices {
         store: adapter.clone(),
         directory: adapter,
@@ -291,6 +298,9 @@ fn harness_with_factory(
         clock: Arc::new(FixedClock(date!(2026 - 01 - 01))),
         channels,
         rules,
+        http: Arc::new(UnavailableOutboundHttp),
+        broker_dictionary,
+        market_store: market_store.clone(),
     });
     let state = ServerState::new(
         services,
@@ -308,7 +318,162 @@ fn harness_with_factory(
         account,
         instrument: InstrumentId::new_random(),
         custody: CustodyId::new_random(),
+        market_store,
     }
+}
+
+async fn seed_market(harness: &Harness) {
+    let mut store = harness.market_store.lock().await;
+    let lease_expires_at = OffsetDateTime::now_utc() + TimeDuration::days(1);
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: harness.instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: "SBER".into(),
+            title: "Сбербанк".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("инструмент рынка");
+
+    let price_series = SeriesKey {
+        source_id: "moex-iss".into(),
+        dataset: "prices".into(),
+        series_key: format!("{}:TQBR:1", harness.instrument.inner()),
+    };
+    let price_run = store
+        .begin_run(
+            price_series,
+            date!(2026 - 08 - 01),
+            date!(2026 - 08 - 03),
+            lease_expires_at,
+        )
+        .expect("запуск цен");
+    store
+        .record_prices(
+            &price_run,
+            &"a".repeat(64),
+            &[
+                PriceRow {
+                    instrument_id: harness.instrument.inner().to_string(),
+                    board: "TQBR".into(),
+                    session: 1,
+                    trade_date: "2026-08-01".into(),
+                    kind: "close".into(),
+                    observed_at: "2026-08-20T00:00:00Z".into(),
+                    price: "100.00".into(),
+                    currency: "RUB".into(),
+                    quotation_basis: "money_per_unit".into(),
+                    basis_evidence: "test:contract".into(),
+                    executability: "executable".into(),
+                },
+                PriceRow {
+                    instrument_id: harness.instrument.inner().to_string(),
+                    board: "TQBR".into(),
+                    session: 1,
+                    trade_date: "2026-08-03".into(),
+                    kind: "close".into(),
+                    observed_at: "2026-08-20T00:00:00Z".into(),
+                    price: "101.00".into(),
+                    currency: "RUB".into(),
+                    quotation_basis: "money_per_unit".into(),
+                    basis_evidence: "test:contract".into(),
+                    executability: "indicative_previous_close".into(),
+                },
+            ],
+        )
+        .expect("строки цен");
+    store
+        .finish_run(
+            &price_run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 01),
+                to: date!(2026 - 08 - 03),
+            }),
+        )
+        .expect("публикация цен");
+
+    let fx_series = SeriesKey {
+        source_id: "cbr".into(),
+        dataset: "fx".into(),
+        series_key: "USD:RUB".into(),
+    };
+    let fx_run = store
+        .begin_run(
+            fx_series,
+            date!(2026 - 08 - 01),
+            date!(2026 - 08 - 03),
+            lease_expires_at,
+        )
+        .expect("запуск курсов");
+    store
+        .record_fx(
+            &fx_run,
+            &"b".repeat(64),
+            &[FxRow {
+                from_code: "USD".into(),
+                to_code: "RUB".into(),
+                trade_date: "2026-08-03".into(),
+                observed_at: "2026-08-20T00:00:00Z".into(),
+                nominal: 1,
+                value: "80.00".into(),
+                unit_rate: "80.00".into(),
+            }],
+        )
+        .expect("строка курса");
+    store
+        .finish_run(
+            &fx_run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 01),
+                to: date!(2026 - 08 - 03),
+            }),
+        )
+        .expect("публикация курса");
+
+    let key_rate_series = SeriesKey {
+        source_id: "cbr".into(),
+        dataset: "key_rate".into(),
+        series_key: "key_rate".into(),
+    };
+    let key_rate_run = store
+        .begin_run(
+            key_rate_series,
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 10),
+            lease_expires_at,
+        )
+        .expect("запуск ставки");
+    store
+        .record_key_rate(
+            &key_rate_run,
+            &"c".repeat(64),
+            &[
+                KeyRateRow {
+                    trade_date: "2026-08-03".into(),
+                    observed_at: "2026-08-20T00:00:00Z".into(),
+                    rate: "18.00".into(),
+                },
+                KeyRateRow {
+                    trade_date: "2026-08-10".into(),
+                    observed_at: "2026-08-20T00:00:00Z".into(),
+                    rate: "17.00".into(),
+                },
+            ],
+        )
+        .expect("строки ставки");
+    store
+        .finish_run(
+            &key_rate_run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 03),
+                to: date!(2026 - 08 - 10),
+            }),
+        )
+        .expect("публикация ставки");
 }
 
 async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
@@ -426,11 +591,12 @@ async fn health_is_public_and_reports_versions() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Версия 3: вариант события ControlAssertion добавлен после версии 2
-    // (та добавляла Valuation), и одна версия не может обозначать две
-    // схемы (§4.1). Внешний агент читает эту цифру, чтобы понять, разберёт
-    // ли он ответ, — поэтому она закреплена здесь, а не выводится из кода.
-    assert_eq!(body["schema_version"], 3);
+    // Версия 4: после ControlAssertion (версия 3) добавлены
+    // CorporateAction и OfferExercise, а Income получил вид дохода
+    // (§4.7); одна версия не может обозначать две схемы (§4.1). Внешний
+    // агент читает эту цифру, чтобы понять, разберёт ли он ответ, —
+    // поэтому она закреплена здесь, а не выводится из кода.
+    assert_eq!(body["schema_version"], 4);
     assert_eq!(body["projection_version"], 1);
 }
 
@@ -546,6 +712,52 @@ async fn an_invalid_amount_is_reported_as_422_with_field_expected_actual() {
 }
 
 #[tokio::test]
+async fn a_carried_forward_price_is_not_accepted_from_the_api() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "ручной ввод",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "valuation",
+            "instrument": harness.instrument.inner(),
+            "price": "1000",
+            "currency": "RUB",
+            "quality": "carried_forward",
+            "dates": { "cash_posted": "2026-01-01" }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+}
+
+#[tokio::test]
+async fn a_stale_price_is_not_accepted_from_the_api() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "ручной ввод",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "valuation",
+            "instrument": harness.instrument.inner(),
+            "price": "1000",
+            "currency": "RUB",
+            "quality": "stale",
+            "dates": { "cash_posted": "2026-01-01" }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+}
+
+#[tokio::test]
 async fn the_stage_one_question_is_answered_end_to_end() {
     // Приёмочный критерий эпика через API: сколько внесено, сколько
     // выведено, какова доходность до налога.
@@ -640,8 +852,23 @@ async fn the_stage_one_question_is_answered_end_to_end() {
     // 2 900,00 рубля денег плюс 100 бумаг по 1 000 = 102 900,00.
     assert_eq!(report["terminal_value"]["value"], "102900.00");
     assert_eq!(report["history_starts"], "2025-01-01");
-    assert_eq!(report["applied_rules"]["fx_source"], "owner_supplied");
+    assert_eq!(report["applied_rules"]["fx_source"], "cbr_official");
     assert_eq!(report["applied_rules"]["day_count"], "act/365");
+    let (status, missing_rate_report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=USD&as_of=2026-01-01"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{missing_rate_report}");
+    for field in ["contributed", "terminal_value", "xirr_pre_tax"] {
+        assert_eq!(
+            missing_rate_report[field]["not_computable"], "missing_fx_rate",
+            "отсутствующий курс не должен превращаться в единицу: {field}"
+        );
+    }
 
     // Ставка получена независимым эталоном (scripts/gen-xirr-fixtures.py),
     // а не выводом проверяемой программы (§15.5).
@@ -664,6 +891,109 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         "0"
     );
     assert_eq!(report["data_quality"]["nav_coverage"]["discrepant"], "0");
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["evaluated_positions"],
+        1
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["total_positions"],
+        1
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["price_kind"],
+        Value::Null
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["origin"]
+            ["kind"],
+        "report_parsed"
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["source_priority_version"],
+        1
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["quantity"],
+        "100"
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["carry_forward_limit"],
+        10
+    );
+    assert_eq!(
+        report["data_quality"]["position_coverage"]["selected"][0]["price"]["provenance"]["price_max_age"],
+        30
+    );
+    assert_eq!(
+        report["data_quality"]["executability"]["evaluated_positions_value"],
+        "100000"
+    );
+    assert_eq!(report["data_quality"]["executability"]["executable"], "0");
+    assert_eq!(
+        report["data_quality"]["executability"]["indicative_previous_close"],
+        "1"
+    );
+    assert_eq!(
+        report["liquidation_value_before_exit_costs_and_tax"]["exit_costs"]["qualification"],
+        "unknown"
+    );
+    assert_eq!(
+        report["liquidation_value_before_exit_costs_and_tax"]["tax"]["qualification"],
+        "unknown"
+    );
+    assert!(report["liquidation_value_before_exit_costs_and_tax"]["exit_costs"]["value"].is_null());
+}
+
+#[tokio::test]
+async fn returns_report_loads_official_fx_from_market_store() {
+    let harness = harness();
+    seed_market(&harness).await;
+
+    let contour = json!({
+        "title": "Долларовый отчёт",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("контур")
+        .to_owned();
+
+    let operations = json!({
+        "source_label": "рыночный курс",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "100.00",
+            "currency": "USD",
+            "dates": { "cash_posted": "2026-08-03" },
+            "idempotency_key": "usd-deposit"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-08-03"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["contributed"]["value"], "8000.0000");
+    assert_eq!(report["terminal_value"]["value"], "8000.0000");
+    assert_eq!(report["applied_rules"]["fx_source"], "cbr_official");
 }
 
 #[tokio::test]
@@ -708,6 +1038,45 @@ async fn the_openapi_document_declares_bearer_security() {
 }
 
 #[tokio::test]
+async fn the_openapi_document_exposes_only_source_price_qualities() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        spec["components"]["schemas"]["PriceQualityDto"]["enum"],
+        json!(["executable", "previous_close", "owner_estimate"])
+    );
+}
+
+#[tokio::test]
+async fn the_openapi_document_declares_report_quality_and_liquidation_fields() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let report_properties = &spec["components"]["schemas"]["ReturnsReportDto"]["properties"];
+    assert!(report_properties["liquidation_value_before_exit_costs_and_tax"].is_object());
+
+    let quality_properties = &spec["components"]["schemas"]["DataQualityDto"]["properties"];
+    assert!(quality_properties["position_coverage"].is_object());
+    assert!(quality_properties["executability"].is_object());
+
+    for schema in [
+        "PositionCoverageDto",
+        "ExecutabilitySharesDto",
+        "LiquidationEstimateDto",
+        "AmountQualificationDto",
+        "PriceProvenanceDto",
+        "PriceOriginDto",
+    ] {
+        assert!(
+            spec["components"]["schemas"][schema].is_object(),
+            "схема {schema} обязана быть в OpenAPI"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_report_shape_is_frozen_by_a_snapshot() {
     // Поштучные проверки полей ловят неверное значение, но не ловят
     // исчезнувшее поле и не ловят появление лишнего. Снапшот ловит
@@ -745,9 +1114,10 @@ async fn the_report_shape_is_frozen_by_a_snapshot() {
 
     let (status, report) = call(
         &harness.router,
-        get(
+        post(
             &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-01-01"),
-            Some(&harness.owner_token),
+            &harness.owner_token,
+            &json!([]),
         ),
     )
     .await;
@@ -2489,5 +2859,477 @@ async fn an_agent_token_may_not_write_to_the_directory() {
         status,
         StatusCode::FORBIDDEN,
         "справочник глобален: чужая запись портит данные всех владельцев"
+    );
+}
+
+#[tokio::test]
+async fn an_owner_can_record_an_instrument_in_directory() {
+    let harness = harness();
+    let instrument = Uuid::new_v4().to_string();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/instruments",
+            &harness.owner_token,
+            &json!({
+                "id": instrument,
+                "kind": "share",
+                "symbol": "GAZP",
+                "title": "Газпром",
+                "denomination_currency": "RUB",
+                "settlement_currency": "RUB",
+                "quote_currency": "RUB",
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["id"], instrument);
+    assert_eq!(body["symbol"], "GAZP");
+
+    let (status, stored) = call(
+        &harness.router,
+        get(
+            &format!("/v1/instruments/{instrument}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored["title"], "Газпром");
+    assert_eq!(stored["quote_currency"], "RUB");
+}
+
+#[tokio::test]
+async fn market_reference_routes_require_auth_and_preserve_provenance() {
+    let harness = harness();
+    seed_market(&harness).await;
+
+    let prices_path = format!(
+        "/v1/market/prices?instrument={}&board=TQBR&session=1&from=2026-08-01&to=2026-08-03&knowledge_as_of=2099-01-01T00:00:00Z",
+        harness.instrument.inner()
+    );
+    let fx_path = "/v1/market/fx?from=USD&to=RUB&from_date=2026-08-01&to_date=2026-08-03&knowledge_as_of=2099-01-01T00:00:00Z";
+    let key_rate_path =
+        "/v1/market/key-rate?from=2026-08-03&to=2026-08-10&knowledge_as_of=2099-01-01T00:00:00Z";
+
+    for token in [&harness.owner_token, &harness.agent_token] {
+        let (status, prices) = call(&harness.router, get(&prices_path, Some(token))).await;
+        assert_eq!(status, StatusCode::OK);
+        let prices = prices.as_array().expect("массив цен");
+        assert_eq!(prices.len(), 2);
+        for price in prices {
+            for field in ["value", "date", "source", "observed_at", "quality"] {
+                assert!(price.get(field).is_some(), "у цены нет {field}: {price}");
+            }
+            assert_eq!(price["source"], "moex-iss");
+            assert_eq!(price["complete_through"], "2026-08-03");
+            // Доказательство основания котировки — это то, чем цена
+            // отличается от догадки (§10.2). Потерянное по дороге,
+            // оно не оставляет следа: ответ выглядит так же.
+            assert_eq!(
+                price["basis_evidence"], "test:contract",
+                "основание цены не доехало: {price}"
+            );
+        }
+
+        let (status, fx) = call(&harness.router, get(fx_path, Some(token))).await;
+        assert_eq!(status, StatusCode::OK);
+        let fx = fx.as_array().expect("массив курсов");
+        assert_eq!(fx.len(), 1);
+        for field in [
+            "value",
+            "date",
+            "source",
+            "observed_at",
+            "quality",
+            "complete_through",
+        ] {
+            assert!(fx[0].get(field).is_some(), "у курса нет {field}: {}", fx[0]);
+        }
+        assert_eq!(fx[0]["source"], "cbr");
+        assert_eq!(fx[0]["quality"], "official");
+
+        let (status, key_rates) = call(&harness.router, get(key_rate_path, Some(token))).await;
+        assert_eq!(status, StatusCode::OK);
+        let key_rates = key_rates.as_array().expect("массив интервалов ставки");
+        assert_eq!(key_rates.len(), 2);
+        assert_eq!(key_rates[0]["observed_at"], "2026-08-20T00:00:00Z");
+        assert_eq!(key_rates[0]["quality"], "observed");
+        assert_eq!(key_rates[1]["boundary"], "inferred_across_non_trading_days");
+        assert_eq!(key_rates[1]["quality"], "inferred");
+        assert_eq!(key_rates[1]["complete_through"], "2026-08-10");
+    }
+
+    for path in [prices_path.as_str(), fx_path, key_rate_path] {
+        let (status, _) = call(&harness.router, get(path, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "маршрут открыт: {path}");
+    }
+}
+
+// --- Журнальные факты: корпоративные действия и оферта -----------------
+
+#[tokio::test]
+async fn an_amortisation_is_recorded_through_the_journal_route() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                "compensation": { "amount": "1000.00", "currency": "RUB" },
+                "effective_date": "2026-05-20",
+                "record_date": "2026-05-18"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+#[tokio::test]
+async fn an_offer_settlement_is_recorded_through_the_journal_route() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "offer_exercise",
+            "day": "2026-04-20",
+            "action": {
+                "type": "settled",
+                "submission": Uuid::new_v4(),
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "5",
+                "gross": { "amount": "5000.00", "currency": "RUB" },
+                "fee": { "amount": "10.00", "currency": "RUB" }
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+/// Один непонятый факт не отменяет соседний (§10.1) — и номер строки
+/// в ответе называет именно тот факт, который отклонён.
+#[tokio::test]
+async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [
+            {
+                "account": harness.account.inner(),
+                "type": "corporate_action",
+                "action": {
+                    "type": "partial_redemption",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "не число",
+                    "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                    "compensation": { "amount": "1000.00", "currency": "RUB" },
+                    "effective_date": "2026-05-20"
+                }
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "corporate_action",
+                "action": {
+                    "type": "partial_redemption",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "10",
+                    "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                    "compensation": { "amount": "1000.00", "currency": "RUB" },
+                    "effective_date": "2026-05-20"
+                }
+            }
+        ]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["row"], 1, "{response}");
+    assert_eq!(response[0]["verdict"], "rejected", "{response}");
+    assert_eq!(response[0]["field"], "quantity", "{response}");
+    assert_eq!(response[1]["row"], 2, "{response}");
+    assert_eq!(response[1]["verdict"], "provisional", "{response}");
+}
+
+/// Нулевая выплата — не «амортизация на ноль», а брак источника. Отказ
+/// обязан случиться до записи: журнал append-only.
+#[tokio::test]
+async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "0", "currency": "RUB" },
+                "compensation": { "amount": "0.00", "currency": "RUB" },
+                "effective_date": "2026-05-20"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "rejected", "{response}");
+    assert_eq!(response[0]["field"], "fact", "{response}");
+}
+
+#[tokio::test]
+async fn a_read_only_token_may_not_submit_journal_events() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "offer_exercise",
+            "day": "2026-04-10",
+            "action": {
+                "type": "cancelled",
+                "submission": Uuid::new_v4(),
+                "quantity": "5"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.readonly_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(response["code"], "forbidden");
+}
+
+/// Круг через JSON по каждому оставшемуся члену: разбор, что не прошёл
+/// ни одного факта, отличается от разобранного только тем, что ошибку
+/// в нём никто не увидит.
+#[tokio::test]
+async fn a_redemption_is_recorded_through_the_journal_route() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "1000", "currency": "RUB" },
+                "compensation": { "amount": "10000.00", "currency": "RUB" },
+                "effective_date": "2026-06-01",
+                "grounds": "решение эмитента"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+#[tokio::test]
+async fn a_conversion_is_recorded_through_the_journal_route() {
+    let harness = harness();
+    let successor = Uuid::new_v4();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "conversion",
+                "predecessor": harness.instrument.inner(),
+                "successor": successor,
+                "custody": harness.custody.inner(),
+                "ratio": "1",
+                "quantity_in": "10",
+                "quantity_out": "10",
+                "fractional": "not_applicable",
+                "effective_date": "2026-07-01",
+                "basis_transfer": "carry_over"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+/// Выкупленная деньгами дробь добавляет денежную ногу — и валюта
+/// компенсации приезжает вместе с суммой, а не отдельным полем.
+#[tokio::test]
+async fn a_cash_compensated_fraction_travels_with_its_currency() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "conversion",
+                "predecessor": harness.instrument.inner(),
+                "successor": Uuid::new_v4(),
+                "custody": harness.custody.inner(),
+                "ratio": "1.5",
+                "quantity_in": "11",
+                "quantity_out": "16",
+                "fractional": "cash_compensated",
+                "compensation": { "amount": "50.00", "currency": "RUB" },
+                "effective_date": "2026-07-01",
+                "record_date": "2026-06-28",
+                "basis_transfer": "restart"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+#[tokio::test]
+async fn an_offer_application_and_its_withdrawal_are_recorded() {
+    let harness = harness();
+    let submission = Uuid::new_v4();
+    let body = json!({
+        "source_label": "тест",
+        "events": [
+            {
+                "account": harness.account.inner(),
+                "type": "offer_exercise",
+                "day": "2026-04-10",
+                "action": {
+                    "type": "submitted",
+                    "submission": submission,
+                    "window": Uuid::new_v4(),
+                    "instrument": harness.instrument.inner(),
+                    "quantity": "5"
+                }
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "offer_exercise",
+                "day": "2026-04-12",
+                "action": {
+                    "type": "cancelled",
+                    "submission": submission,
+                    "quantity": "5"
+                }
+            }
+        ]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+    assert_eq!(response[1]["verdict"], "provisional", "{response}");
+}
+
+/// Синхронизация рынка пишет в журнал наблюдений, поэтому read-only
+/// токену она закрыта. Проверка на месте, но без теста её снятие
+/// неотличимо от рабочего кода: ответ на владельческий токен тот же.
+#[tokio::test]
+async fn a_read_only_token_may_not_sync_the_market() {
+    let harness = harness();
+    let body = json!({
+        "source": { "source": "cbr_daily" },
+        "from": "2026-08-01",
+        "to": "2026-08-03"
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/market/sync", &harness.readonly_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(response["code"], "forbidden");
+}
+
+/// Заведённый доступ без словаря отклонил бы первую же выгрузку целиком,
+/// и владелец пошёл бы разбираться с брокером вместо настройки. Словарь
+/// заселяется тем же действием, и сети для этого не нужно: контракт
+/// перечисляет коды, но не сообщает, во что они превращаются у нас.
+#[tokio::test]
+async fn provisioning_an_access_fills_the_channel_dictionary() {
+    let (harness, path) = harness_on_disk();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/broker-access",
+            &harness.owner_token,
+            &add_broker_access_body(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let store = SqliteStore::open(&path).expect("второе соединение");
+    let broker = BrokerCode::parse("tinkoff").expect("код брокера");
+    let dictionary = store.broker_operation_kinds(&broker).expect("словарь");
+    assert_eq!(
+        dictionary.get("OPERATION_TYPE_COUPON").map(String::as_str),
+        Some("coupon"),
+        "словарь не заселён"
+    );
+    // Синоним теряется незаметнее прочего: он не ломает ни один
+    // очевидный случай, а половина выгрузки перестаёт разбираться.
+    assert_eq!(
+        dictionary.get("OPERATION_TYPE_DIV_EXT").map(String::as_str),
+        Some("dividend"),
+        "синоним потерян при заселении"
+    );
+    assert!(
+        dictionary.len() >= 35,
+        "заселено меньше, чем знал прежний разбор: {}",
+        dictionary.len()
     );
 }

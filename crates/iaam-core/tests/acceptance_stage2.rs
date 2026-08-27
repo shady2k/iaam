@@ -103,6 +103,7 @@ fn scene(channel: &TestChannel) -> Scene {
         EventKind::Income {
             instrument: None,
             gross: rub(4_000),
+            kind: None,
         },
         vec![Leg::cash(account, rub(4_000))],
     );
@@ -290,12 +291,14 @@ fn the_stage_two_question_is_answered_step_by_step() {
         projection.state(),
         &ReturnsRequest {
             contour: &scene.contour,
+            coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
             as_of: date!(2026 - 03 - 31),
             report_currency: CurrencyCode::Rub,
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         },
     );
     assert_eq!(
@@ -342,12 +345,14 @@ fn a_wrong_figure_in_one_document_is_reported_as_a_discrepancy() {
         projection.state(),
         &ReturnsRequest {
             contour: &scene.contour,
+            coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
             as_of: date!(2026 - 03 - 31),
             report_currency: CurrencyCode::Rub,
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         },
     );
     assert!(

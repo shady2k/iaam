@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
+use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
@@ -19,9 +20,10 @@ use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
+use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::documents::BrokerCode;
 use iaam_store::events::Appended;
-use iaam_store::reference::AccountRecord;
+use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
 use uuid::Uuid;
@@ -29,10 +31,10 @@ use zeroize::Zeroizing;
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountView, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
+    AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
     BrokerEnvironment, BrokerVault, ClassificationRuleStore, ClassificationRuleView, CustodyView,
-    InstrumentDirectory, InstrumentView, IssuedToken, Principal, Recorded, Scope, SoleOwner, Store,
-    TokenAdmin, TokenView,
+    InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal, Recorded, Scope,
+    SoleOwner, Store, TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 
@@ -340,6 +342,52 @@ impl Store for SqliteAdapter {
 
 #[async_trait]
 impl InstrumentDirectory for SqliteAdapter {
+    async fn record_instrument(&self, record: InstrumentUpsert) -> Result<InstrumentId, AppError> {
+        let InstrumentUpsert {
+            id,
+            kind,
+            symbol,
+            title,
+            currencies,
+            lineage,
+        } = record;
+        self.blocking(move |store| {
+            store
+                .upsert_instrument(&InstrumentRecord {
+                    id,
+                    kind,
+                    symbol,
+                    title,
+                    currencies,
+                    lineage,
+                })
+                .map_err(store_error)?;
+            Ok(id)
+        })
+        .await
+    }
+
+    async fn record_alias(&self, alias: AliasUpsert) -> Result<(), AppError> {
+        let AliasUpsert {
+            namespace,
+            value,
+            instrument,
+            interval,
+            source,
+        } = alias;
+        self.blocking(move |store| {
+            store
+                .record_alias(&AliasRecord {
+                    namespace,
+                    value,
+                    instrument,
+                    interval,
+                    source,
+                })
+                .map_err(store_error)
+        })
+        .await
+    }
     async fn resolve(
         &self,
         namespace: &str,
@@ -466,6 +514,38 @@ impl BrokerVault for SqliteAdapter {
                     },
                     other => store_error(other),
                 })?;
+
+            // Словарь видов операций заселяется здесь, в тот же момент
+            // и той же задачей: заведённый доступ без словаря отклонит
+            // первую же выгрузку целиком, и владелец пойдёт разбираться
+            // с брокером вместо настройки.
+            //
+            // Сети этот шаг не требует: контракт перечисляет коды, но
+            // не сообщает, во что они превращаются у нас, — заселять
+            // приходится собственным знанием (`dictionary_seed`).
+            // Сверка с контрактом существует отдельно и зовётся явно.
+            //
+            // Пополнение существующие строки не трогает: заведение
+            // доступа заново не имеет права отменить решение владельца.
+            let Some((dictionary, entries)) =
+                iaam_broker::operation_kind::seed_for(broker_of_access.as_str())
+            else {
+                return Err(AppError::Invalid {
+                    field: "broker".to_owned(),
+                    expected: "брокер, для которого известен словарь видов операций".to_owned(),
+                    actual: broker_of_access.as_str().to_owned(),
+                });
+            };
+            let entries: Vec<BrokerOperationKind> = entries
+                .iter()
+                .map(|(source_kind, kind)| BrokerOperationKind {
+                    source_kind: (*source_kind).to_owned(),
+                    kind: (*kind).to_owned(),
+                })
+                .collect();
+            store
+                .extend_broker_operation_kinds(&broker_of_access, dictionary, &entries)
+                .map_err(store_error)?;
             let stored = store
                 .find_broker_access(owner_of_access, &broker_of_access, &environment_of_access)
                 .map_err(store_error)?
@@ -534,6 +614,18 @@ struct ChannelAccess {
     scope: String,
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
+}
+
+#[async_trait]
+impl crate::ports::BrokerDictionary for SqliteAdapter {
+    async fn operation_kinds(
+        &self,
+        broker: &BrokerCode,
+    ) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+        let broker = broker.clone();
+        self.blocking(move |store| store.broker_operation_kinds(&broker).map_err(store_error))
+            .await
+    }
 }
 
 #[async_trait]
@@ -606,9 +698,29 @@ impl BrokerChannelFactory for SqliteAdapter {
             })?;
         let client = TinkoffClient::new(environment, token)
             .map_err(|error| AppError::Store(format!("клиент брокера не создан: {error}")))?;
+        // Словарь читается здесь, а не в разборе: `iaam-broker` про
+        // хранилище не знает намеренно (см. его `lib.rs`), и связывает
+        // их адаптер — тем же приёмом, что уже сделан для SQLite.
+        let code = code.clone();
+        let rows = self
+            .blocking(move |store| store.broker_operation_kinds(&code).map_err(store_error))
+            .await?;
+        let (dictionary, unreadable) = OperationKindDictionary::build(rows);
+        // Строка словаря, которую эта сборка не понимает, означает, что
+        // база новее кода. Молча её отбросив, канал превратил бы
+        // известный код брокера в неизвестный — то есть выдал бы отказ
+        // импорта, из текста которого о рассинхронизации не догадаться.
+        if let Some(first) = unreadable.first() {
+            return Err(AppError::Invalid {
+                field: "broker_operation_kinds".to_owned(),
+                expected: "вид операции, известный этой сборке".to_owned(),
+                actual: format!("{} -> {}", first.source_kind, first.kind),
+            });
+        }
         Ok(Arc::new(crate::adapters::tinkoff::TinkoffChannel::new(
             client,
             SourceId(access.id),
+            dictionary,
         )))
     }
 }

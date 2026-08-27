@@ -13,6 +13,7 @@ path = "src/main.rs"
 # Единственная крейта, которой позволено знать про всё: собрать конкретные
 # адаптеры где-то нужно, но это не повод давать транспорту знать про SQLite.
 iaam-app = { path = "../iaam-app", version = "0.1.0" }
+iaam-http = { path = "../iaam-http", version = "0.1.0" }
 iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
 iaam-server = { path = "../iaam-server", version = "0.1.0" }

@@ -270,7 +270,14 @@ pub const fn classification_of(event: &Event) -> Option<Classification> {
         | EventKind::OpeningPosition { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::Valuation { .. }
-        | EventKind::ControlAssertion { .. } => None,
+        | EventKind::ControlAssertion { .. }
+        // Корпоративное действие и оферта — факты, а не решения
+        // владельца, и пересчёту правилами не подлежат. `Income` здесь
+        // была бы правдоподобной и молчаливой ошибкой: амортизация —
+        // возврат собственного капитала (§6.5), и отнести её к доходу
+        // значит завысить доход на весь возвращённый номинал.
+        | EventKind::CorporateAction { .. }
+        | EventKind::OfferExercise { .. } => None,
     }
 }
 

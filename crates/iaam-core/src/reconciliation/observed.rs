@@ -301,6 +301,152 @@ mod tests {
         AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31)).unwrap()
     }
 
+    fn qty(units: i64) -> Quantity {
+        Quantity(Dec::new(Decimal::from(units)))
+    }
+
+    fn per_unit(text: &str) -> crate::money::PerUnitAmount {
+        crate::money::PerUnitAmount::new(
+            Dec::new(Decimal::from_str_exact(text).unwrap()),
+            CurrencyCode::Rub,
+        )
+    }
+
+    /// Позиция по облигации на начало марта плюс корпоративное действие.
+    ///
+    /// Открывающая позиция нужна, чтобы у среза было что показывать:
+    /// амортизация количества не двигает, и без неё сравнивать нечего.
+    fn bond_events(
+        account: AccountId,
+        instrument: InstrumentId,
+        custody: CustodyId,
+        action: crate::event::corporate_action::CorporateAction,
+        action_legs: Vec<Leg>,
+    ) -> Vec<Event> {
+        vec![
+            event_with(
+                account,
+                date!(2026 - 02 - 10),
+                1,
+                EventKind::OpeningPosition {
+                    instrument,
+                    quantity: qty(10),
+                    cost_basis: Some(rub(1_000_000)),
+                    assertions: crate::event::kind::OpeningAssertions::default(),
+                },
+                vec![Leg::security(account, custody, instrument, qty(10))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 15),
+                1,
+                EventKind::CorporateAction { action },
+                action_legs,
+            ),
+        ]
+    }
+
+    #[test]
+    fn amortisation_moves_cash_but_not_the_position_count() {
+        // §6.5: выплата есть, выбытия нет. Изменение количества здесь
+        // означало бы расхождение с брокерским отчётом на ровном месте.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let events = bond_events(
+            account,
+            instrument,
+            custody,
+            crate::event::corporate_action::CorporateAction::PartialRedemption {
+                instrument,
+                custody,
+                quantity: qty(10),
+                principal_returned_per_unit: per_unit("200"),
+                compensation: rub(200_000),
+                effective_date: date!(2026 - 03 - 15),
+                record_date: None,
+                grounds: None,
+            },
+            vec![Leg::principal(account, instrument, rub(200_000))],
+        );
+
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(
+            observed.turnover(CurrencyCode::Rub).map(|t| t.debit),
+            Some(PostedMinor::new(200_000)),
+            "нога Principal обязана попасть в оборот: она уже денежная"
+        );
+        assert_eq!(
+            observed.position_at(BalancePoint::Closing, instrument, custody),
+            Some(qty(10)),
+            "амортизация не выводит бумагу из позиции"
+        );
+    }
+
+    #[test]
+    fn amortisation_is_not_counted_as_income() {
+        // Возврат собственного капитала доходом не является (§6.5).
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let events = bond_events(
+            account,
+            instrument,
+            custody,
+            crate::event::corporate_action::CorporateAction::PartialRedemption {
+                instrument,
+                custody,
+                quantity: qty(10),
+                principal_returned_per_unit: per_unit("200"),
+                compensation: rub(200_000),
+                effective_date: date!(2026 - 03 - 15),
+                record_date: None,
+                grounds: None,
+            },
+            vec![Leg::principal(account, instrument, rub(200_000))],
+        );
+
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(observed.income(CurrencyCode::Rub), None);
+    }
+
+    #[test]
+    fn a_redemption_moves_both_the_cash_and_the_position() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let events = bond_events(
+            account,
+            instrument,
+            custody,
+            crate::event::corporate_action::CorporateAction::Redemption {
+                instrument,
+                custody,
+                quantity: qty(10),
+                principal_returned_per_unit: per_unit("1000"),
+                compensation: rub(1_000_000),
+                effective_date: date!(2026 - 03 - 15),
+                record_date: None,
+                grounds: None,
+            },
+            vec![
+                Leg::principal(account, instrument, rub(1_000_000)),
+                Leg::security(account, custody, instrument, qty(-10)),
+            ],
+        );
+
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(
+            observed.turnover(CurrencyCode::Rub).map(|t| t.debit),
+            Some(PostedMinor::new(1_000_000))
+        );
+        assert_eq!(
+            observed.position_at(BalancePoint::Closing, instrument, custody),
+            Some(qty(0)),
+            "погашенная бумага не остаётся в позиции"
+        );
+    }
+
     #[test]
     fn opening_excludes_the_period_and_closing_includes_it() {
         // Остаток на начало марта — это состояние до первого мартовского
@@ -545,6 +691,7 @@ mod tests {
             EventKind::Income {
                 instrument: None,
                 gross: rub(10_000),
+                kind: None,
             },
             vec![
                 Leg::cash(account, rub(10_000)),
@@ -583,6 +730,7 @@ mod tests {
                 EventKind::Income {
                     instrument: None,
                     gross: rub(4_000),
+                    kind: None,
                 },
                 vec![Leg::cash(account, rub(4_000))],
             ),

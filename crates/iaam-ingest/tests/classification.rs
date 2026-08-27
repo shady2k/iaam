@@ -3,20 +3,22 @@
 use std::collections::BTreeMap;
 
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::kind::{EventKind, FeeOrigin, TradeSide};
 use iaam_core::event::leg::Leg;
+use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, InstrumentId, OwnerId, SourceId,
     TransferId,
 };
-use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
+use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_ingest::classification::{
     Basis, Classification, ClassificationResult, ClassificationRule, ClassificationSubject,
-    Correction, CorrectionStep, Counterparty, Movement, Question, RuleMatcher, classify,
-    recompute_plan,
+    Correction, CorrectionStep, Counterparty, Movement, Question, RuleMatcher, classification_of,
+    classify, recompute_plan,
 };
 use rust_decimal::Decimal;
 use time::macros::date;
@@ -529,4 +531,81 @@ fn an_ambiguous_subject_is_left_alone_by_the_recompute() {
     .unwrap();
 
     assert_eq!(plan, vec![]);
+}
+
+// --- корпоративные действия не являются решениями владельца ---
+
+fn amortisation_event(journal: &Journal) -> Event {
+    let instrument = InstrumentId::new_random();
+    let compensation = Money::new(PostedMinor::new(2_000_000), CurrencyCode::Rub);
+    journal.event(
+        EventKind::CorporateAction {
+            action: CorporateAction::PartialRedemption {
+                instrument,
+                custody: CustodyId::new_random(),
+                quantity: Quantity(Dec::new(Decimal::from(100))),
+                principal_returned_per_unit: PerUnitAmount::new(
+                    Dec::new(Decimal::from(200)),
+                    CurrencyCode::Rub,
+                ),
+                compensation,
+                effective_date: date!(2026 - 06 - 15),
+                record_date: None,
+                grounds: None,
+            },
+        },
+        vec![Leg::principal(journal.account, instrument, compensation)],
+    )
+}
+
+#[test]
+fn amortisation_is_not_classified_as_income() {
+    // Ошибка правдоподобна и молчалива: амортизация — возврат
+    // собственного капитала (§6.5), и отнесение её к доходу завысило бы
+    // доход на всю сумму возвращённого номинала.
+    let journal = Journal::start();
+    assert_ne!(
+        classification_of(&amortisation_event(&journal)),
+        Some(Classification::Income)
+    );
+}
+
+#[test]
+fn a_corporate_action_carries_no_classification_at_all() {
+    // Не «другая классификация», а её отсутствие: факт эмитента
+    // пересчёту правилами владельца не подлежит.
+    let journal = Journal::start();
+    assert_eq!(classification_of(&amortisation_event(&journal)), None);
+}
+
+#[test]
+fn a_settled_offer_carries_no_classification_either() {
+    let journal = Journal::start();
+    let instrument = InstrumentId::new_random();
+    let gross = Money::new(PostedMinor::new(1_000_000), CurrencyCode::Rub);
+    let custody = CustodyId::new_random();
+    let quantity = Quantity(Dec::new(Decimal::from(10)));
+    let event = journal.event(
+        EventKind::OfferExercise {
+            action: OfferExerciseAction::Settled {
+                submission: OfferSubmissionId::new_random(),
+                instrument,
+                custody,
+                quantity,
+                gross,
+                fee: None,
+                accrued_interest: None,
+            },
+        },
+        vec![
+            Leg::cash(journal.account, gross),
+            Leg::security(
+                journal.account,
+                custody,
+                instrument,
+                Quantity(Dec::new(Decimal::from(-10))),
+            ),
+        ],
+    );
+    assert_eq!(classification_of(&event), None);
 }

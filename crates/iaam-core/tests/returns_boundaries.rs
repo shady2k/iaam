@@ -104,12 +104,14 @@ fn a_flow_on_the_report_date_is_included() {
     );
     let request = ReturnsRequest {
         contour: &fixture.contour,
+        coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,
         solver_policy: SolverPolicy::returns_default(),
         ledger: &ledger,
         perimeter: &perimeter,
+        market_prices: &[],
     };
 
     let series = flow_series(fixture.projection.state(), &request).expect("ряд потоков");
@@ -134,12 +136,14 @@ fn a_slice_containing_events_after_the_report_date_is_refused() {
     );
     let request = ReturnsRequest {
         contour: &fixture.contour,
+        coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,
         solver_policy: SolverPolicy::returns_default(),
         ledger: &ledger,
         perimeter: &perimeter,
+        market_prices: &[],
     };
 
     assert!(matches!(
@@ -168,12 +172,14 @@ fn a_slice_ending_exactly_on_the_report_date_is_accepted() {
     );
     let request = ReturnsRequest {
         contour: &fixture.contour,
+        coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
         as_of,
         report_currency: CurrencyCode::Rub,
         fx: &fx,
         solver_policy: SolverPolicy::returns_default(),
         ledger: &ledger,
         perimeter: &perimeter,
+        market_prices: &[],
     };
     assert!(flow_series(fixture.projection.state(), &request).is_ok());
     assert!(terminal_value(fixture.projection.state(), &request).is_ok());

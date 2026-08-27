@@ -1,18 +1,25 @@
 //! Envelope события журнала (§4.1).
 
+pub mod corporate_action;
 pub mod correction;
 pub mod kind;
 pub mod leg;
+pub mod legs;
+pub mod offer;
 pub mod provenance;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::dates::{EffectiveOrder, EventDates};
-use crate::ids::{AccountId, EventId, InstrumentId, OwnerId};
+use crate::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId};
 use crate::money::{CurrencyCode, Money, MoneyError, Quantity};
+use crate::numeric::decimal::Dec;
+use corporate_action::{CorporateAction, FractionalTreatment};
 use kind::{EventKind, TradeSide};
 use leg::{Leg, LegKind};
+use legs::LegExpectation;
+use offer::OfferExerciseAction;
 use provenance::Provenance;
 
 /// Уверенность в записанном факте (§4.9).
@@ -81,6 +88,25 @@ pub enum EventValidationError {
         field: &'static str,
         value: String,
     },
+    #[error("для {event} лишняя нога: ожидалось ног {expected}, найдено {found}")]
+    UnexpectedLeg {
+        event: &'static str,
+        expected: usize,
+        found: usize,
+    },
+    #[error("для {event} не хватает ноги {kind:?}: ожидалось ног {expected}, найдено {found}")]
+    MissingLeg {
+        event: &'static str,
+        kind: LegKind,
+        expected: usize,
+        found: usize,
+    },
+    #[error("для {event} нога {kind:?} не совпала с ожиданием по полю {field}")]
+    LegMismatch {
+        event: &'static str,
+        kind: LegKind,
+        field: &'static str,
+    },
     #[error(transparent)]
     Numeric(#[from] crate::numeric::NumericError),
     #[error(transparent)]
@@ -116,13 +142,17 @@ pub struct Event {
 ///
 /// Версия 2 отличалась от версии 1 добавленным вариантом
 /// [`EventKind::Valuation`]; версия 3 отличается от версии 2
-/// добавленным вариантом [`EventKind::ControlAssertion`]. Уже
-/// записанные факты прежних версий читаются без изменений — новый
-/// вариант в них просто не встречается, — но программа, знающая только
-/// версию 2, не разберёт контрольное утверждение и потому не должна
-/// притворяться, что разобрала. Оставить прежний номер значило бы, что
-/// одна версия обозначает две несовместимые схемы (§4.1).
-pub const SCHEMA_VERSION: u32 = 3;
+/// добавленным вариантом [`EventKind::ControlAssertion`]; версия 4 —
+/// вариантами [`EventKind::CorporateAction`] и
+/// [`EventKind::OfferExercise`], а также видом дохода в
+/// [`EventKind::Income`] (§4.7). Уже записанные факты прежних версий
+/// читаются без изменений — новых вариантов в них просто не
+/// встречается, а `Income` без вида читается как «вид не утверждался»,
+/// — но программа, знающая только версию 3, не разберёт корпоративное
+/// действие и потому не должна притворяться, что разобрала. Оставить
+/// прежний номер значило бы, что одна версия обозначает две
+/// несовместимые схемы (§4.1).
+pub const SCHEMA_VERSION: u32 = 4;
 
 impl Event {
     /// Сумма денежного эффекта всех ног в указанной валюте.
@@ -198,6 +228,8 @@ impl Event {
             EventKind::ControlAssertion { period, claim } => {
                 self.validate_control_assertion(name, *period, *claim)
             }
+            EventKind::CorporateAction { action } => self.validate_corporate_action(name, action),
+            EventKind::OfferExercise { action } => self.validate_offer_exercise(name, action),
         }
     }
 
@@ -346,6 +378,140 @@ impl Event {
         }
     }
 
+    /// Форма корпоративного действия (§4.7).
+    ///
+    /// Ноги перечисляются **ровно**: посторонняя нога отклоняется так же,
+    /// как недостающая, — событие с движением, которого оно не называет,
+    /// не является тем событием, которым назвалось.
+    fn validate_corporate_action(
+        &self,
+        name: &'static str,
+        action: &CorporateAction,
+    ) -> Result<(), EventValidationError> {
+        match action {
+            // Амортизация выплачивает деньги, но количество бумаг
+            // не меняет (§6.5). Отсюда **одна** нога `Principal` и ни
+            // одной бумажной: «количество не уменьшается» становится
+            // инвариантом формы, а не обещанием.
+            //
+            // Пары «Cash + Principal» здесь нет намеренно: `Principal`
+            // уже входит в `cash_effect()` (`leg.rs`), и пара дала бы
+            // двойной денежный эффект.
+            CorporateAction::PartialRedemption {
+                instrument,
+                quantity,
+                compensation,
+                ..
+            } => {
+                require_positive(name, "compensation", compensation.amount().raw())?;
+                require_positive_quantity(name, "quantity", *quantity)?;
+                self.expect_legs(
+                    name,
+                    &[principal_leg(self.account, *instrument, *compensation)],
+                )
+            }
+            // Погашение возвращает номинал целиком, и бумага выбывает.
+            // Обнулить остаток и оставить количество — позиция
+            // из погашенных бумаг, которой не существует.
+            CorporateAction::Redemption {
+                instrument,
+                custody,
+                quantity,
+                compensation,
+                ..
+            } => {
+                require_positive(name, "compensation", compensation.amount().raw())?;
+                require_positive_quantity(name, "quantity", *quantity)?;
+                self.expect_legs(
+                    name,
+                    &[
+                        principal_leg(self.account, *instrument, *compensation),
+                        security_leg(
+                            self.account,
+                            *custody,
+                            *instrument,
+                            Quantity(quantity.0.checked_neg()?),
+                        ),
+                    ],
+                )
+            }
+            CorporateAction::Conversion {
+                predecessor,
+                successor,
+                custody,
+                ratio,
+                quantity_in,
+                quantity_out,
+                fractional,
+                compensation,
+                ..
+            } => {
+                require_positive_quantity(name, "quantity_in", *quantity_in)?;
+                require_positive_quantity(name, "quantity_out", *quantity_out)?;
+                require_positive_quantity(name, "ratio", Quantity(*ratio))?;
+                require_conversion_ratio(name, *ratio, *quantity_in, *quantity_out, *fractional)?;
+                require_fraction_compensation(name, *fractional, *compensation)?;
+                let mut expected = vec![
+                    security_leg(
+                        self.account,
+                        *custody,
+                        *predecessor,
+                        Quantity(quantity_in.0.checked_neg()?),
+                    ),
+                    security_leg(self.account, *custody, *successor, *quantity_out),
+                ];
+                if let Some(compensation) = compensation {
+                    expected.push(cash_leg(self.account, *compensation));
+                }
+                self.expect_legs(name, &expected)
+            }
+        }
+    }
+
+    /// Форма факта оферты (§3.5).
+    fn validate_offer_exercise(
+        &self,
+        name: &'static str,
+        action: &OfferExerciseAction,
+    ) -> Result<(), EventValidationError> {
+        require_positive_quantity(name, "quantity", action.quantity())?;
+        match action {
+            // Подача и отзыв ног не имеют: ни денег, ни бумаг они
+            // не двигают — как контрольное утверждение. Отсутствие ног —
+            // тоже форма, и проверяется она наравне с остальными.
+            OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {
+                self.expect_legs(name, &[])
+            }
+            // Выкуп: деньги и отрицательное количество. Ноги `Principal`
+            // нет — бумага выбывает, а не возвращает номинал.
+            OfferExerciseAction::Settled {
+                submission: _,
+                instrument,
+                custody,
+                quantity,
+                gross,
+                fee,
+                accrued_interest,
+            } => {
+                require_positive(name, "gross", gross.amount().raw())?;
+                let settlement =
+                    trade_settlement(TradeSide::Sell, *gross, *fee, *accrued_interest)?;
+                self.expect_legs(
+                    name,
+                    &[
+                        cash_leg(self.account, settlement),
+                        security_leg(
+                            self.account,
+                            *custody,
+                            *instrument,
+                            Quantity(quantity.0.checked_neg()?),
+                        ),
+                    ],
+                )
+            }
+        }
+    }
+
     /// Восстановленная позиция описывает только бумагу: денег в этом
     /// событии не двигалось, иначе восстановление остатка выглядело бы
     /// как реальная покупка (§10.7).
@@ -470,6 +636,99 @@ impl Event {
 /// Тело плюс НКД, затем комиссия: при покупке она увеличивает списание,
 /// при продаже уменьшает приход. Знак задаётся направлением сделки —
 /// покупка списывает деньги, продажа зачисляет.
+/// Ожидание ноги непогашенного номинала.
+fn principal_leg(account: AccountId, instrument: InstrumentId, money: Money) -> LegExpectation {
+    LegExpectation {
+        kind: LegKind::Principal,
+        account,
+        instrument: Some(instrument),
+        custody: None,
+        money: Some(money),
+        quantity: None,
+    }
+}
+
+/// Ожидание бумажной ноги со знаком.
+fn security_leg(
+    account: AccountId,
+    custody: CustodyId,
+    instrument: InstrumentId,
+    quantity: Quantity,
+) -> LegExpectation {
+    LegExpectation {
+        kind: LegKind::SecurityQuantity,
+        account,
+        instrument: Some(instrument),
+        custody: Some(custody),
+        money: None,
+        quantity: Some(quantity),
+    }
+}
+
+/// Ожидание денежной ноги.
+fn cash_leg(account: AccountId, money: Money) -> LegExpectation {
+    LegExpectation {
+        kind: LegKind::Cash,
+        account,
+        instrument: None,
+        custody: None,
+        money: Some(money),
+        quantity: None,
+    }
+}
+
+/// Коэффициент замещения сверяется с парой количеств.
+///
+/// Без сверки коэффициент — необязательная подпись под числами, а E5
+/// именно по нему будет переносить налоговую стоимость. Дробная часть
+/// учитывается по тому, что с ней сделали: при выкупе или отбрасывании
+/// дроби количество преемника округлено вниз, и требовать точного
+/// равенства значило бы отвергать корректные замещения.
+fn require_conversion_ratio(
+    name: &'static str,
+    ratio: Dec,
+    quantity_in: Quantity,
+    quantity_out: Quantity,
+    fractional: FractionalTreatment,
+) -> Result<(), EventValidationError> {
+    let implied = ratio.checked_mul(quantity_in.0)?;
+    let expected = match fractional {
+        FractionalTreatment::NotApplicable => implied,
+        FractionalTreatment::CashCompensated | FractionalTreatment::RoundedDown => {
+            Dec::new(implied.inner().floor())
+        }
+    };
+    if quantity_out.0 == expected {
+        Ok(())
+    } else {
+        Err(EventValidationError::LegDoesNotMatchEvent {
+            kind: name,
+            field: "ratio",
+        })
+    }
+}
+
+/// Компенсация дробей есть тогда и только тогда, когда дробь выкупили.
+fn require_fraction_compensation(
+    name: &'static str,
+    fractional: FractionalTreatment,
+    compensation: Option<Money>,
+) -> Result<(), EventValidationError> {
+    let expected = match fractional {
+        FractionalTreatment::CashCompensated => true,
+        // Дробь отброшена или её не возникло — платить не за что.
+        FractionalTreatment::RoundedDown | FractionalTreatment::NotApplicable => false,
+    };
+    if compensation.is_some() == expected {
+        Ok(())
+    } else {
+        Err(EventValidationError::LegDoesNotMatchEvent {
+            kind: name,
+            field: "compensation",
+        })
+    }
+}
+
 fn trade_settlement(
     side: TradeSide,
     gross: Money,
@@ -732,6 +991,451 @@ mod tests {
         Quantity(crate::numeric::decimal::Dec::new(
             rust_decimal::Decimal::from(units),
         ))
+    }
+
+    // --- форма новых фактов (§4.7, §3.5) ---
+
+    struct Bond {
+        account: AccountId,
+        instrument: InstrumentId,
+        custody: CustodyId,
+    }
+
+    impl Bond {
+        fn new() -> Self {
+            Self {
+                account: AccountId::new_random(),
+                instrument: InstrumentId::new_random(),
+                custody: CustodyId::new_random(),
+            }
+        }
+
+        fn per_unit(text: &str) -> crate::money::PerUnitAmount {
+            crate::money::PerUnitAmount::new(
+                crate::numeric::decimal::Dec::new(
+                    rust_decimal::Decimal::from_str_exact(text).unwrap(),
+                ),
+                CurrencyCode::Rub,
+            )
+        }
+
+        fn amortisation(&self, legs: Vec<Leg>) -> Event {
+            event(
+                EventKind::CorporateAction {
+                    action: CorporateAction::PartialRedemption {
+                        instrument: self.instrument,
+                        custody: self.custody,
+                        quantity: qty(10),
+                        principal_returned_per_unit: Self::per_unit("200"),
+                        compensation: rub(100_000),
+                        effective_date: date!(2026 - 06 - 15),
+                        record_date: None,
+                        grounds: None,
+                    },
+                },
+                legs,
+                self.account,
+            )
+        }
+
+        fn redemption(&self, legs: Vec<Leg>) -> Event {
+            event(
+                EventKind::CorporateAction {
+                    action: CorporateAction::Redemption {
+                        instrument: self.instrument,
+                        custody: self.custody,
+                        quantity: qty(10),
+                        principal_returned_per_unit: Self::per_unit("800"),
+                        compensation: rub(1_000_000),
+                        effective_date: date!(2026 - 12 - 15),
+                        record_date: None,
+                        grounds: None,
+                    },
+                },
+                legs,
+                self.account,
+            )
+        }
+
+        fn offer_settled(&self, legs: Vec<Leg>) -> Event {
+            event(
+                EventKind::OfferExercise {
+                    action: offer::OfferExerciseAction::Settled {
+                        submission: offer::OfferSubmissionId::new_random(),
+                        instrument: self.instrument,
+                        custody: self.custody,
+                        quantity: qty(10),
+                        gross: rub(1_000_000),
+                        fee: None,
+                        accrued_interest: None,
+                    },
+                },
+                legs,
+                self.account,
+            )
+        }
+    }
+
+    #[test]
+    fn amortisation_carries_one_principal_leg_and_nothing_else() {
+        let bond = Bond::new();
+        assert_eq!(
+            bond.amortisation(vec![Leg::principal(
+                bond.account,
+                bond.instrument,
+                rub(100_000)
+            )])
+            .validate_structure(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn amortisation_with_a_security_quantity_leg_is_rejected() {
+        // §6.5: амортизация выплачивает деньги, но количество не меняет.
+        let bond = Bond::new();
+        assert!(
+            bond.amortisation(vec![
+                Leg::principal(bond.account, bond.instrument, rub(100_000)),
+                Leg::security(bond.account, bond.custody, bond.instrument, qty(-10)),
+            ])
+            .validate_structure()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn amortisation_with_a_cash_leg_is_rejected() {
+        // `Principal` уже денежная нога: пара дала бы двойной эффект.
+        let bond = Bond::new();
+        assert!(
+            bond.amortisation(vec![
+                Leg::principal(bond.account, bond.instrument, rub(100_000)),
+                Leg::cash(bond.account, rub(100_000)),
+            ])
+            .validate_structure()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_principal_leg_for_another_bond_is_rejected() {
+        let bond = Bond::new();
+        assert!(
+            bond.amortisation(vec![Leg::principal(
+                bond.account,
+                InstrumentId::new_random(),
+                rub(100_000),
+            )])
+            .validate_structure()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_principal_leg_of_another_amount_is_rejected() {
+        let bond = Bond::new();
+        assert!(
+            bond.amortisation(vec![Leg::principal(
+                bond.account,
+                bond.instrument,
+                rub(99_999)
+            )])
+            .validate_structure()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn final_redemption_carries_the_principal_and_the_leaving_quantity() {
+        let bond = Bond::new();
+        assert_eq!(
+            bond.redemption(vec![
+                Leg::principal(bond.account, bond.instrument, rub(1_000_000)),
+                Leg::security(bond.account, bond.custody, bond.instrument, qty(-10)),
+            ])
+            .validate_structure(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn final_redemption_without_a_security_leg_is_rejected() {
+        // Обнулить номинал и оставить количество — позиция
+        // из погашенных бумаг, которой не существует.
+        let bond = Bond::new();
+        assert!(
+            bond.redemption(vec![Leg::principal(
+                bond.account,
+                bond.instrument,
+                rub(1_000_000)
+            )])
+            .validate_structure()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn final_redemption_with_a_positive_security_leg_is_rejected() {
+        // Знак — не описка: положительное количество означает приход
+        // бумаги, то есть противоположное движение.
+        let bond = Bond::new();
+        assert!(
+            bond.redemption(vec![
+                Leg::principal(bond.account, bond.instrument, rub(1_000_000)),
+                Leg::security(bond.account, bond.custody, bond.instrument, qty(10)),
+            ])
+            .validate_structure()
+            .is_err()
+        );
+    }
+
+    /// Стороны замещения. Отдельная структура: порог
+    /// `too-many-arguments-threshold = 6` действует и в тестах.
+    #[derive(Debug, Clone, Copy)]
+    struct Swap {
+        account: AccountId,
+        predecessor: InstrumentId,
+        successor: InstrumentId,
+        custody: CustodyId,
+    }
+
+    impl Swap {
+        fn new() -> Self {
+            Self {
+                account: AccountId::new_random(),
+                predecessor: InstrumentId::new_random(),
+                successor: InstrumentId::new_random(),
+                custody: CustodyId::new_random(),
+            }
+        }
+    }
+
+    fn conversion(
+        swap: Swap,
+        ratio: &str,
+        quantity_out: i64,
+        fractional: corporate_action::FractionalTreatment,
+        compensation: Option<Money>,
+        legs: Vec<Leg>,
+    ) -> Event {
+        event(
+            EventKind::CorporateAction {
+                action: CorporateAction::Conversion {
+                    predecessor: swap.predecessor,
+                    successor: swap.successor,
+                    custody: swap.custody,
+                    ratio: crate::numeric::decimal::Dec::new(
+                        rust_decimal::Decimal::from_str_exact(ratio).unwrap(),
+                    ),
+                    quantity_in: qty(10),
+                    quantity_out: qty(quantity_out),
+                    fractional,
+                    compensation,
+                    effective_date: date!(2026 - 09 - 01),
+                    record_date: None,
+                    grounds: None,
+                    basis_transfer: corporate_action::BasisTransferRule::CarryOver,
+                },
+            },
+            legs,
+            swap.account,
+        )
+    }
+
+    #[test]
+    fn a_conversion_moves_the_quantity_between_two_instruments() {
+        let swap = Swap::new();
+        assert_eq!(
+            conversion(
+                swap,
+                "1.5",
+                15,
+                corporate_action::FractionalTreatment::NotApplicable,
+                None,
+                vec![
+                    Leg::security(swap.account, swap.custody, swap.predecessor, qty(-10)),
+                    Leg::security(swap.account, swap.custody, swap.successor, qty(15)),
+                ],
+            )
+            .validate_structure(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_conversion_whose_ratio_contradicts_the_quantities_is_rejected() {
+        // Коэффициент — не подпись под числами: E5 переносит по нему
+        // налоговую стоимость.
+        let swap = Swap::new();
+        assert_eq!(
+            conversion(
+                swap,
+                "2",
+                15,
+                corporate_action::FractionalTreatment::NotApplicable,
+                None,
+                vec![
+                    Leg::security(swap.account, swap.custody, swap.predecessor, qty(-10)),
+                    Leg::security(swap.account, swap.custody, swap.successor, qty(15)),
+                ],
+            )
+            .validate_structure(),
+            Err(EventValidationError::LegDoesNotMatchEvent {
+                kind: "corporate_action",
+                field: "ratio",
+            })
+        );
+    }
+
+    #[test]
+    fn a_rounded_down_conversion_may_end_below_the_exact_ratio() {
+        let swap = Swap::new();
+        assert_eq!(
+            conversion(
+                swap,
+                "1.55",
+                15,
+                corporate_action::FractionalTreatment::RoundedDown,
+                None,
+                vec![
+                    Leg::security(swap.account, swap.custody, swap.predecessor, qty(-10)),
+                    Leg::security(swap.account, swap.custody, swap.successor, qty(15)),
+                ],
+            )
+            .validate_structure(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_cash_leg_without_a_bought_out_fraction_is_rejected() {
+        // Деньги в замещении бывают только компенсацией дроби.
+        let swap = Swap::new();
+        assert!(
+            conversion(
+                swap,
+                "1.5",
+                15,
+                corporate_action::FractionalTreatment::NotApplicable,
+                None,
+                vec![
+                    Leg::security(swap.account, swap.custody, swap.predecessor, qty(-10)),
+                    Leg::security(swap.account, swap.custody, swap.successor, qty(15)),
+                    Leg::cash(swap.account, rub(500)),
+                ],
+            )
+            .validate_structure()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_bought_out_fraction_without_compensation_is_rejected() {
+        let swap = Swap::new();
+        assert_eq!(
+            conversion(
+                swap,
+                "1.55",
+                15,
+                corporate_action::FractionalTreatment::CashCompensated,
+                None,
+                vec![
+                    Leg::security(swap.account, swap.custody, swap.predecessor, qty(-10)),
+                    Leg::security(swap.account, swap.custody, swap.successor, qty(15)),
+                ],
+            )
+            .validate_structure(),
+            Err(EventValidationError::LegDoesNotMatchEvent {
+                kind: "corporate_action",
+                field: "compensation",
+            })
+        );
+    }
+
+    #[test]
+    fn a_bought_out_fraction_carries_its_cash_leg() {
+        let swap = Swap::new();
+        assert_eq!(
+            conversion(
+                swap,
+                "1.55",
+                15,
+                corporate_action::FractionalTreatment::CashCompensated,
+                Some(rub(500)),
+                vec![
+                    Leg::security(swap.account, swap.custody, swap.predecessor, qty(-10)),
+                    Leg::security(swap.account, swap.custody, swap.successor, qty(15)),
+                    Leg::cash(swap.account, rub(500)),
+                ],
+            )
+            .validate_structure(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_submitted_offer_moves_nothing() {
+        let bond = Bond::new();
+        let submitted = event(
+            EventKind::OfferExercise {
+                action: offer::OfferExerciseAction::Submitted {
+                    submission: offer::OfferSubmissionId::new_random(),
+                    window: offer::OfferWindowId::new_random(),
+                    instrument: bond.instrument,
+                    quantity: qty(10),
+                },
+            },
+            Vec::new(),
+            bond.account,
+        );
+        assert_eq!(submitted.validate_structure(), Ok(()));
+    }
+
+    #[test]
+    fn a_submitted_offer_with_a_leg_is_rejected() {
+        let bond = Bond::new();
+        let submitted = event(
+            EventKind::OfferExercise {
+                action: offer::OfferExerciseAction::Submitted {
+                    submission: offer::OfferSubmissionId::new_random(),
+                    window: offer::OfferWindowId::new_random(),
+                    instrument: bond.instrument,
+                    quantity: qty(10),
+                },
+            },
+            vec![Leg::cash(bond.account, rub(1))],
+            bond.account,
+        );
+        assert!(submitted.validate_structure().is_err());
+    }
+
+    #[test]
+    fn a_settled_offer_carries_cash_and_the_leaving_quantity() {
+        let bond = Bond::new();
+        assert_eq!(
+            bond.offer_settled(vec![
+                Leg::cash(bond.account, rub(1_000_000)),
+                Leg::security(bond.account, bond.custody, bond.instrument, qty(-10)),
+            ])
+            .validate_structure(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_settled_offer_has_no_principal_leg() {
+        // Бумага выбывает, а не возвращает номинал.
+        let bond = Bond::new();
+        assert!(
+            bond.offer_settled(vec![
+                Leg::cash(bond.account, rub(1_000_000)),
+                Leg::security(bond.account, bond.custody, bond.instrument, qty(-10)),
+                Leg::principal(bond.account, bond.instrument, rub(1)),
+            ])
+            .validate_structure()
+            .is_err()
+        );
     }
 
     fn security_leg(account: AccountId, instrument: InstrumentId, quantity: Quantity) -> Leg {
@@ -1005,6 +1709,7 @@ mod tests {
             EventKind::Income {
                 instrument: Some(InstrumentId::new_random()),
                 gross: rub(120_000),
+                kind: None,
             },
             vec![Leg::cash(acc, rub(120_000))],
             acc,
@@ -1015,6 +1720,7 @@ mod tests {
             EventKind::Income {
                 instrument: None,
                 gross: rub(-120_000),
+                kind: None,
             },
             vec![Leg::cash(acc, rub(-120_000))],
             acc,
@@ -1758,7 +2464,9 @@ mod tests {
         //
         // 1 → 2: добавлен `EventKind::Valuation`.
         // 2 → 3: добавлен `EventKind::ControlAssertion` (§10.3).
-        assert_eq!(SCHEMA_VERSION, 3);
+        // 3 → 4: добавлены `EventKind::CorporateAction` и
+        //        `EventKind::OfferExercise`, а `Income` получил вид (§4.7).
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 
     #[test]

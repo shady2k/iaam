@@ -5,9 +5,7 @@
 
 use std::error::Error;
 
-use iaam_broker::tinkoff::{
-    ChannelOperationKind, ParseError, TINKOFF_PARSER_VERSION, parse_operations, parse_portfolio,
-};
+use iaam_broker::tinkoff::{ParseError, TINKOFF_PARSER_VERSION, parse_operations, parse_portfolio};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::money::{CurrencyCode, PostedMinor};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
@@ -22,7 +20,9 @@ fn parses_operations_without_sharing_report_parser_code() -> Result<(), Box<dyn 
         .iter()
         .find(|operation| operation.operation_id == "06896b3e-038c-4970-85f2-fd5fc2dfb306")
         .ok_or("образец не содержит покупки SBER")?;
-    assert_eq!(operation.kind, ChannelOperationKind::Buy);
+    // Разбор больше не классифицирует: он доносит слово источника
+    // нетронутым, а во что оно превращается, решает словарь канала.
+    assert_eq!(operation.source_kind, "OPERATION_TYPE_BUY");
     assert_eq!(
         operation.broker_account_id,
         "d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4"

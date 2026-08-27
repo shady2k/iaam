@@ -5,6 +5,7 @@
 //! приходит из `iaam-core`.
 
 pub mod adapters;
+pub mod market_candidate;
 /// Типы приёмки, доступные транспорту.
 ///
 /// `iaam-server` не зависит от `iaam-ingest` напрямую — это запрещено
@@ -13,17 +14,32 @@ pub mod adapters;
 pub use iaam_ingest as ingest;
 
 pub mod error;
+pub mod jobs;
 pub mod ports;
 pub mod scenarios;
 #[path = "scenarios/sync.rs"]
 pub mod sync;
 pub mod tokens;
 
+/// Типы SQLite-адаптера, нужные точке сборки и её интеграционным стендам.
+///
+/// Сервер не импортирует их напрямую: доступ к данным маршруты получают
+/// через сценарии приложения.
+pub mod storage {
+    pub use iaam_store::SqliteStore;
+    pub use iaam_store::documents::BrokerCode;
+    pub use iaam_store::market::{Coverage, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey};
+    pub use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
+    pub use iaam_store::tokens::{TokenRecord, TokenScope};
+}
+
 use std::sync::Arc;
 
+use iaam_store::market::MarketStore;
 use ports::{
-    BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Clock, InstrumentDirectory, Store,
-    TokenAdmin, UnavailableBrokerChannelFactory, UnavailableClassificationRuleStore,
+    BrokerChannelFactory, BrokerDictionary, BrokerVault, ClassificationRuleStore, Clock,
+    InstrumentDirectory, OutboundHttp, Store, TokenAdmin, UnavailableBrokerChannelFactory,
+    UnavailableBrokerDictionary, UnavailableClassificationRuleStore, UnavailableOutboundHttp,
 };
 
 /// Собранные зависимости. Точка сборки создаёт один экземпляр,
@@ -43,6 +59,13 @@ pub struct AppServices {
     pub channels: Arc<dyn BrokerChannelFactory>,
     /// Исторические правила классификации.
     pub rules: Arc<dyn ClassificationRuleStore>,
+    /// Исходящий HTTP. Без адаптера ручной запуск отвечает 503.
+    pub http: Arc<dyn OutboundHttp>,
+    /// Словарь видов операций канала.
+    pub broker_dictionary: Arc<dyn BrokerDictionary>,
+    /// Отдельное соединение рынка; блокирующие операции не выполняются
+    /// в async-обработчике напрямую.
+    pub market_store: Arc<tokio::sync::Mutex<MarketStore>>,
 }
 
 impl AppServices {
@@ -68,6 +91,12 @@ impl AppServices {
             clock,
             channels: Arc::new(UnavailableBrokerChannelFactory),
             rules: Arc::new(UnavailableClassificationRuleStore),
+            http: Arc::new(UnavailableOutboundHttp),
+            broker_dictionary: Arc::new(UnavailableBrokerDictionary),
+            market_store: Arc::new(tokio::sync::Mutex::new(
+                MarketStore::open_in_memory()
+                    .expect("in-memory market store must be constructible"),
+            )),
         }
     }
 }

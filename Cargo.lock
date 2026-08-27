@@ -903,9 +903,12 @@ dependencies = [
  "async-trait",
  "iaam-broker",
  "iaam-core",
+ "iaam-http",
  "iaam-ingest",
+ "iaam-market",
  "iaam-store",
  "rand 0.10.2",
+ "rust_decimal",
  "serde_json",
  "sha2",
  "thiserror",
@@ -924,6 +927,7 @@ dependencies = [
  "iaam-app",
  "iaam-broker",
  "iaam-core",
+ "iaam-http",
  "iaam-server",
  "iaam-store",
  "thiserror",
@@ -941,11 +945,10 @@ dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
  "iaam-core",
+ "iaam-http",
  "iaam-store",
- "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
  "time",
  "tokio",
@@ -970,6 +973,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iaam-http"
+version = "0.1.0"
+dependencies = [
+ "percent-encoding",
+ "reqwest",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "iaam-ingest"
 version = "0.1.0"
 dependencies = [
@@ -983,6 +998,21 @@ dependencies = [
  "thiserror",
  "time",
  "uuid",
+]
+
+[[package]]
+name = "iaam-market"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+ "iaam-core",
+ "iaam-http",
+ "quick-xml",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
 ]
 
 [[package]]
@@ -1006,7 +1036,6 @@ dependencies = [
  "iaam-app",
  "iaam-broker",
  "iaam-core",
- "iaam-store",
  "insta",
  "rust_decimal",
  "serde",

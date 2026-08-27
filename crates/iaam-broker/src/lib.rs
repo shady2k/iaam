@@ -9,5 +9,5 @@
 pub mod credentials;
 pub mod environment;
 pub mod finam;
+pub mod operation_kind;
 pub mod tinkoff;
-pub mod trust;

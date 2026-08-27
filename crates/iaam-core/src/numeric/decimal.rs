@@ -91,6 +91,21 @@ impl Dec {
             .ok_or(NumericError::Overflow)
     }
 
+    /// Деление с отказом на нуле. У `Decimal` штатное деление на ноль
+    /// паникует, а `checked_div` возвращает `None` и на нуле, и на
+    /// переполнении — два разных отказа под одним ответом. Ноль
+    /// отделён явно: «делили на ноль» и «результат не представим» —
+    /// разные диагнозы для того, кто читает отказ расчёта.
+    pub fn checked_div(self, other: Self) -> Result<Self, NumericError> {
+        if other.0.is_zero() {
+            return Err(NumericError::DivisionByZero);
+        }
+        self.0
+            .checked_div(other.0)
+            .map(Self)
+            .ok_or(NumericError::Overflow)
+    }
+
     /// Перевод в точный режим. Возможен без потерь: десятичная дробь
     /// с масштабом `s` — это рациональное число со знаменателем `10^s`.
     pub fn to_exact(&self) -> Result<Exact, NumericError> {
@@ -114,6 +129,19 @@ mod tests {
 
     fn dec(s: &str) -> Dec {
         Dec::new(Decimal::from_str(s).unwrap())
+    }
+
+    #[test]
+    fn dividing_by_zero_is_an_error_not_a_panic() {
+        assert_eq!(
+            dec("1").checked_div(dec("0")),
+            Err(NumericError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn division_is_the_inverse_of_multiplication_where_it_is_exact() {
+        assert_eq!(dec("200").checked_div(dec("1000")).unwrap(), dec("0.2"));
     }
 
     #[test]

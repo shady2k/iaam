@@ -1,4 +1,9 @@
 use iaam_core::event::provenance::ParserVersion;
+
+// Реэкспорт, чтобы `tinkoff::ChannelOperationKind` и
+// `finam::ChannelOperationKind` продолжали означать один и тот же тип:
+// имя у каналов привычное, а тип за ним теперь общий.
+pub use crate::operation_kind::ChannelOperationKind;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
@@ -45,25 +50,14 @@ pub struct ChannelMoney {
     pub currency: CurrencyCode,
 }
 
-/// Классифицированный вид транзакции Finam.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelOperationKind {
-    Buy,
-    Sell,
-    Deposit,
-    Withdrawal,
-    Dividend,
-    Coupon,
-    Commission,
-    Other(String),
-}
-
 /// Транзакция, полученная из Finam API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelOperation {
     pub date: Option<Date>,
     pub operation_id: String,
-    pub kind: ChannelOperationKind,
+    /// Как вид операции назвал сам канал. Во что она превращается,
+    /// решает словарь канала, а он живёт в данных.
+    pub source_kind: String,
     pub symbol: Option<String>,
     pub quantity: Option<Quantity>,
     pub payment: Option<ChannelMoney>,
@@ -192,7 +186,10 @@ fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {
     ChannelOperation {
         date: timestamp,
         operation_id: operation_id.clone(),
-        kind: operation_kind(&category),
+        // Приведение к верхнему регистру и обрезка — свойство ЭТОГО
+        // канала, а не словаря: Finam пишет вид как придётся, и словарь,
+        // которому пришлось бы знать про регистр, стал бы кодом.
+        source_kind: category.trim().to_ascii_uppercase(),
         symbol: nonempty(item.symbol),
         quantity,
         payment,
@@ -211,7 +208,7 @@ fn rejected_operation(raw: Value, reason: ParseError) -> ChannelOperation {
     ChannelOperation {
         date: None,
         operation_id: String::new(),
-        kind: ChannelOperationKind::Other("unparsed".to_owned()),
+        source_kind: String::new(),
         symbol: None,
         quantity: None,
         payment: None,
@@ -223,19 +220,6 @@ fn rejected_operation(raw: Value, reason: ParseError) -> ChannelOperation {
         parser_version: ParserVersion(FINAM_PARSER_VERSION.to_owned()),
         raw,
         rejection: Some(reason),
-    }
-}
-
-fn operation_kind(value: &str) -> ChannelOperationKind {
-    match value.trim().to_ascii_uppercase().as_str() {
-        "BUY" | "PURCHASE" | "TRADE_BUY" => ChannelOperationKind::Buy,
-        "SELL" | "TRADE_SELL" => ChannelOperationKind::Sell,
-        "DEPOSIT" | "CASH_DEPOSIT" | "INPUT" => ChannelOperationKind::Deposit,
-        "WITHDRAWAL" | "CASH_WITHDRAWAL" | "OUTPUT" => ChannelOperationKind::Withdrawal,
-        "DIVIDEND" => ChannelOperationKind::Dividend,
-        "COUPON" | "INTEREST" => ChannelOperationKind::Coupon,
-        "COMMISSION" | "FEE" => ChannelOperationKind::Commission,
-        other => ChannelOperationKind::Other(other.to_owned()),
     }
 }
 

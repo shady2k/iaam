@@ -8,13 +8,15 @@ use std::collections::BTreeMap;
 
 use time::Date;
 
-use super::{Computed, NotComputable, ReturnsRequest};
+use super::{Computed, NotComputable, ReturnsRequest, quotation_error, quotation_rule};
 use crate::ids::AccountId;
 use crate::money::CurrencyCode;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverFlow, solve};
 use crate::projection::flows::FlowDirection;
 use crate::projection::state::LedgerState;
+use crate::rules::quotation::QuotationRule;
+use crate::valuation::QuotationBasis;
 use crate::valuation::convert;
 
 /// Ряд потоков в валюте отчёта.
@@ -94,7 +96,7 @@ impl AccountValue {
 }
 
 /// Стоимость контура **по счетам** на дату отчёта: деньги плюс позиции
-/// по последней цене.
+/// по последней цене, наблюдавшейся не позже даты отчёта.
 ///
 /// Это **ликвидационная** оценка в упрощённом виде (§5.1): комиссий
 /// закрытия и налога к уплате в ней нет, потому что ни того, ни другого
@@ -111,6 +113,7 @@ pub fn account_values(
 ) -> Result<BTreeMap<AccountId, AccountValue>, NotComputable> {
     guard_state_not_newer(state, request.as_of)?;
     let mut values: BTreeMap<AccountId, AccountValue> = BTreeMap::new();
+    let (_, rule) = quotation_rule();
 
     for (account, money) in state.balances().iter_cash() {
         if !request.contour.contains(account) {
@@ -127,12 +130,20 @@ pub fn account_values(
         }
         let price = state
             .prices()
-            .latest(key.instrument)
+            .price_at_or_before(key.instrument, request.as_of)
             .ok_or(NotComputable::MissingPrice {
                 instrument: key.instrument,
             })?;
-        let local = mul(quantity.0, price.price)?;
-        let converted = in_report_currency(local, price.currency, request)?;
+        let (money_per_unit, currency) = rule
+            .money_per_unit(
+                QuotationBasis::MoneyPerUnit,
+                price.price,
+                price.currency,
+                None,
+            )
+            .map_err(|error| quotation_error(error, key.instrument))?;
+        let local = mul(quantity.0, money_per_unit)?;
+        let converted = in_report_currency(local, currency, request)?;
         let slot = values.entry(key.account).or_default();
         slot.positions = add(slot.positions, converted)?;
     }
@@ -259,9 +270,79 @@ mod tests {
     use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
     use crate::projection::{ProjectionContext, project};
     use crate::reconciliation::ReconciliationLedger;
+    use crate::returns::KnowledgeCoordinate;
     use crate::rules::{LotRuleVersion, RuleRegistry};
-    use crate::valuation::{FxSource, FxTable};
+    use crate::valuation::{FxSource, FxTable, PriceQuality};
     use time::macros::date;
+
+    #[test]
+    fn an_owner_valuation_reaches_xirr_as_money_per_unit() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let quantity = qty(10);
+        let opening = event_with(
+            account,
+            date!(2026 - 08 - 02),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity,
+                cost_basis: None,
+                assertions: Default::default(),
+            },
+            vec![Leg::security(account, custody, instrument, quantity)],
+        );
+        let valuation = event_with(
+            account,
+            date!(2026 - 08 - 03),
+            2,
+            EventKind::Valuation {
+                instrument,
+                price: Dec::new(rust_decimal::Decimal::from(98)),
+                currency: CurrencyCode::Rub,
+                quality: PriceQuality::OwnerEstimate,
+            },
+            vec![],
+        );
+        let state = project(&[opening, valuation], &context)
+            .expect("проекция владельческой оценки")
+            .snapshot()
+            .state()
+            .clone();
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 03),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+        };
+
+        let values = account_values(&state, &request).expect("стоимость позиции");
+
+        assert_eq!(
+            values[&account].positions,
+            Dec::new(rust_decimal::Decimal::from(980))
+        );
+        assert_eq!(
+            terminal_value(&state, &request).unwrap(),
+            values[&account].total().unwrap(),
+        );
+    }
 
     fn rub(minor: i64) -> Money {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
@@ -351,12 +432,14 @@ mod tests {
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let request = ReturnsRequest {
             contour: &requested_contour,
+            coordinate: KnowledgeCoordinate::default(),
             as_of: date!(2026 - 01 - 04),
             report_currency: CurrencyCode::Rub,
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         };
 
         let values = account_values(snapshot.state(), &request).expect("стоимости счетов");

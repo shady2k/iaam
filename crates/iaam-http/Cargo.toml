@@ -1,0 +1,26 @@
+[package]
+name = "iaam-http"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Единственное место в дереве, где объявлен HTTP-клиент. rustls без
+# встроенных корней там, где якорь задан явно; веб-корни там, где узел
+# публичный. Выбор делает таблица назначений, а не клиент.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+thiserror = "2"
+# Экранирование значений строки запроса. Своя реализация процентного
+# кодирования — лишнее место для ошибки в том, что уже решено.
+percent-encoding = "2"
+# Секрет зануляется при уничтожении: копия токена, оставшаяся
+# в освобождённой памяти, — это тот же токен.
+zeroize = { version = "1", features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+sha2 = "0.11"
+
+[lints]
+workspace = true

@@ -108,12 +108,14 @@ fn report_of(fixture: &Fixture) -> iaam_core::returns::ReturnsReport {
         projection.state(),
         &ReturnsRequest {
             contour: &fixture.contour,
+            coordinate: iaam_core::returns::KnowledgeCoordinate::default(),
             as_of: date!(2026 - 03 - 31),
             report_currency: CurrencyCode::Rub,
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
             ledger: &ledger,
             perimeter: &perimeter,
+            market_prices: &[],
         },
     )
 }

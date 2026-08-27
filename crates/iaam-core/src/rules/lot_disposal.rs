@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::dates::TradeDate;
 use crate::ids::InstrumentId;
-use crate::money::{Money, MoneyError, PostedMinor, Quantity};
+use crate::money::{Money, MoneyError, PerUnitAmount, PostedMinor, Quantity};
 use crate::numeric::decimal::Dec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -38,6 +38,112 @@ pub struct Lot {
     pub acquired: Option<TradeDate>,
     pub quantity: Quantity,
     pub cost_basis: Money,
+    /// Непогашенный номинал — только у долговой бумаги; у акции его нет
+    /// и не бывает, поэтому умолчание `Unknown` здесь честно.
+    ///
+    /// `#[serde(default)]` обязателен: снимки проекций и архивы записаны
+    /// до E3.4 и этого поля не содержат. Без умолчания старый архив
+    /// перестал бы открываться.
+    #[serde(default)]
+    pub principal: PrincipalState,
+}
+
+/// Состояние непогашенного номинала лота (§6.5).
+///
+/// Величины — **на одну бумагу**: непогашенный номинал лота равен
+/// `quantity × remaining_per_unit`, поэтому частичное списание лота
+/// ничего не пересчитывает. При размерности «на лот» каждое списание
+/// требовало бы пересчёта, а значит и повода ошибиться.
+///
+/// Один тип вместо двух независимых `Option`: пара полей допускала бы
+/// «номинал неизвестен, остаток известен», две валюты и остаток больше
+/// первоначального — состояния, которых не бывает.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PrincipalState {
+    /// Номинал неизвестен: бумага заведена до того, как справочник его
+    /// узнал, — или это вовсе не долговая бумага. Подставлять ноль
+    /// запрещено (§4.9).
+    #[default]
+    Unknown,
+    Known {
+        original_per_unit: PerUnitAmount,
+        remaining_per_unit: PerUnitAmount,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PrincipalError {
+    #[error("непогашенный остаток номинала больше первоначального")]
+    RemainingAboveOriginal,
+    #[error("номинал и остаток номинала в разных валютах")]
+    CurrencyMismatch,
+    #[error("номинал не может быть отрицательным")]
+    Negative,
+    #[error("номинал неизвестен: уменьшать нечего")]
+    Unknown,
+}
+
+impl PrincipalState {
+    /// Известный номинал с проверкой инвариантов.
+    ///
+    /// Конструктор, а не публичные поля варианта: собранное вручную
+    /// `Known` обошло бы все три проверки.
+    pub fn known(
+        original_per_unit: PerUnitAmount,
+        remaining_per_unit: PerUnitAmount,
+    ) -> Result<Self, PrincipalError> {
+        if original_per_unit.currency() != remaining_per_unit.currency() {
+            return Err(PrincipalError::CurrencyMismatch);
+        }
+        if original_per_unit.value().is_negative() || remaining_per_unit.value().is_negative() {
+            return Err(PrincipalError::Negative);
+        }
+        if remaining_per_unit.value() > original_per_unit.value() {
+            return Err(PrincipalError::RemainingAboveOriginal);
+        }
+        Ok(Self::Known {
+            original_per_unit,
+            remaining_per_unit,
+        })
+    }
+
+    /// Остаток после возврата части номинала. Первоначальный номинал
+    /// не меняется: доля возврата считается от него в E5.
+    ///
+    /// Неизвестный номинал отказывает, а не остаётся собой: принять факт
+    /// амортизации и молча его не применить — ровно то, чего этот план
+    /// не допускает.
+    pub fn reduced_by(self, returned_per_unit: PerUnitAmount) -> Result<Self, PrincipalError> {
+        let Self::Known {
+            original_per_unit,
+            remaining_per_unit,
+        } = self
+        else {
+            return Err(PrincipalError::Unknown);
+        };
+        if remaining_per_unit.currency() != returned_per_unit.currency() {
+            return Err(PrincipalError::CurrencyMismatch);
+        }
+        let left = remaining_per_unit
+            .value()
+            .checked_sub(returned_per_unit.value())
+            .map_err(|_| PrincipalError::Negative)?;
+        Self::known(
+            original_per_unit,
+            PerUnitAmount::new(left, remaining_per_unit.currency()),
+        )
+    }
+
+    /// Остаток на одну бумагу, если он известен.
+    #[must_use]
+    pub const fn remaining_per_unit(&self) -> Option<PerUnitAmount> {
+        match self {
+            Self::Unknown => None,
+            Self::Known {
+                remaining_per_unit, ..
+            } => Some(*remaining_per_unit),
+        }
+    }
 }
 
 /// Идентификатор версии правила. Входит в результат и в след аудита.
@@ -198,7 +304,11 @@ impl LotDisposalRule for FifoV1 {
 /// Округление — половина к чётному, однократно, на границе представления
 /// в минимальных единицах (§6.6). Остаток от округления остаётся
 /// в невыбывшей части: суммарная стоимость лота сохраняется.
-fn split_basis(total: Money, taken_qty: Decimal, lot_qty: Decimal) -> Result<Money, DisposalError> {
+pub(crate) fn split_basis(
+    total: Money,
+    taken_qty: Decimal,
+    lot_qty: Decimal,
+) -> Result<Money, DisposalError> {
     debug_assert!(!lot_qty.is_zero(), "количество лота не может быть нулевым");
     let minor = Decimal::from(total.amount().raw());
     let scaled = (minor * taken_qty) / lot_qty;
@@ -221,6 +331,122 @@ mod tests {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
     }
 
+    fn per_unit(text: &str) -> PerUnitAmount {
+        PerUnitAmount::new(
+            Dec::new(Decimal::from_str_exact(text).unwrap()),
+            CurrencyCode::Rub,
+        )
+    }
+
+    fn usd_per_unit(text: &str) -> PerUnitAmount {
+        PerUnitAmount::new(
+            Dec::new(Decimal::from_str_exact(text).unwrap()),
+            CurrencyCode::Usd,
+        )
+    }
+
+    // --- Непогашенный номинал ---
+
+    #[test]
+    fn a_remaining_principal_above_the_original_is_refused() {
+        assert_eq!(
+            PrincipalState::known(per_unit("1000"), per_unit("1200")).unwrap_err(),
+            PrincipalError::RemainingAboveOriginal
+        );
+    }
+
+    #[test]
+    fn principal_in_two_currencies_is_refused() {
+        assert_eq!(
+            PrincipalState::known(per_unit("1000"), usd_per_unit("500")).unwrap_err(),
+            PrincipalError::CurrencyMismatch
+        );
+    }
+
+    #[test]
+    fn a_negative_principal_is_refused_on_either_side() {
+        assert_eq!(
+            PrincipalState::known(per_unit("-1000"), per_unit("-1000")).unwrap_err(),
+            PrincipalError::Negative
+        );
+        assert_eq!(
+            PrincipalState::known(per_unit("1000"), per_unit("-1")).unwrap_err(),
+            PrincipalError::Negative
+        );
+    }
+
+    #[test]
+    fn a_fully_amortised_principal_is_a_valid_state() {
+        // Ноль остатка — не ошибка: бумага погашена, и это факт.
+        let state = PrincipalState::known(per_unit("1000"), per_unit("0")).unwrap();
+        assert_eq!(
+            state,
+            PrincipalState::Known {
+                original_per_unit: per_unit("1000"),
+                remaining_per_unit: per_unit("0"),
+            }
+        );
+    }
+
+    #[test]
+    fn an_amortisation_lowers_the_remaining_principal_and_keeps_the_original() {
+        let state = PrincipalState::known(per_unit("1000"), per_unit("1000")).unwrap();
+        assert_eq!(
+            state.reduced_by(per_unit("200")).unwrap(),
+            PrincipalState::Known {
+                original_per_unit: per_unit("1000"),
+                remaining_per_unit: per_unit("800"),
+            }
+        );
+    }
+
+    #[test]
+    fn an_amortisation_larger_than_the_remaining_principal_is_refused() {
+        let state = PrincipalState::known(per_unit("1000"), per_unit("200")).unwrap();
+        assert_eq!(
+            state.reduced_by(per_unit("201")).unwrap_err(),
+            PrincipalError::Negative
+        );
+    }
+
+    #[test]
+    fn an_amortisation_in_another_currency_is_refused() {
+        let state = PrincipalState::known(per_unit("1000"), per_unit("1000")).unwrap();
+        assert_eq!(
+            state.reduced_by(usd_per_unit("200")).unwrap_err(),
+            PrincipalError::CurrencyMismatch
+        );
+    }
+
+    #[test]
+    fn an_unknown_principal_cannot_be_amortised_silently() {
+        // Пропустить уменьшение неизвестного номинала значило бы принять
+        // факт и не применить его — ровно то, что запрещено (§4.9).
+        assert_eq!(
+            PrincipalState::Unknown
+                .reduced_by(per_unit("200"))
+                .unwrap_err(),
+            PrincipalError::Unknown
+        );
+    }
+
+    #[test]
+    fn a_lot_written_before_principal_existed_reads_as_unknown() {
+        // Снимки проекций и архивы записаны до E3.4 и этого поля
+        // не содержат: без serde(default) старый архив не открылся бы.
+        let value = serde_json::json!({
+            "id": LotId::new_random(),
+            "instrument": InstrumentId::new_random(),
+            "acquired": null,
+            "quantity": qty(10),
+            "cost_basis": rub(100_000),
+        });
+        assert_eq!(
+            serde_json::from_value::<Lot>(value).unwrap().principal,
+            PrincipalState::Unknown
+        );
+    }
+
     fn qty(n: i64) -> Quantity {
         Quantity(Dec::new(Decimal::from(n)))
     }
@@ -236,6 +462,7 @@ mod tests {
                 acquired: Some(TradeDate(date!(2026 - 01 - 10))),
                 quantity: qty(10),
                 cost_basis: rub(100_000), // 10 шт по 100 ₽
+                principal: PrincipalState::Unknown,
             },
             Lot {
                 id: LotId::new_random(),
@@ -243,6 +470,7 @@ mod tests {
                 acquired: Some(TradeDate(date!(2026 - 02 - 10))),
                 quantity: qty(10),
                 cost_basis: rub(90_000), // 10 шт по 90 ₽
+                principal: PrincipalState::Unknown,
             },
         ]
     }
@@ -256,6 +484,7 @@ mod tests {
             acquired: Some(TradeDate(date!(2026 - 03 - 10))),
             quantity: qty(quantity),
             cost_basis: rub(basis_minor),
+            principal: PrincipalState::Unknown,
         }]
     }
 

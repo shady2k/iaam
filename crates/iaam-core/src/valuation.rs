@@ -4,6 +4,13 @@
 //! качества, а не из рыночных данных: `iaam-market` появляется в E3.
 //! Схема от этого не меняется — меняется источник цены.
 
+pub mod candidate;
+
+pub use candidate::{
+    LegacyValuationOutcome, PriceCandidate, PriceFreshness, PriceKind, PriceOrigin,
+    PriceProvenance, PriceQuery, PriceSelection, QuotationBasis, SelectedPrice,
+    SourceExecutability, Uncovered, UncoveredReason, candidate_from_legacy_valuation,
+};
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -42,16 +49,6 @@ impl PriceQuality {
             Self::OwnerEstimate => "owner_estimate",
         }
     }
-
-    /// Оценка считается полной, только если цена исполнима или является
-    /// ценой закрытия. Всё остальное помечает NAV как неполный (§5.4).
-    #[must_use]
-    pub const fn is_complete(self) -> bool {
-        match self {
-            Self::Executable | Self::PreviousClose => true,
-            Self::CarriedForward | Self::Stale | Self::OwnerEstimate => false,
-        }
-    }
 }
 
 /// Цена за единицу инструмента на дату.
@@ -64,10 +61,11 @@ pub struct InstrumentPrice {
     pub as_of: Date,
 }
 
-/// Последние известные цены. Заполняется проекцией из событий `Valuation`.
+/// Набор наблюдений цен по инструментам и датам. Заполняется проекцией
+/// из событий `Valuation`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceBoard {
-    latest: BTreeMap<InstrumentId, InstrumentPrice>,
+    prices: BTreeMap<InstrumentId, BTreeMap<Date, InstrumentPrice>>,
 }
 
 impl PriceBoard {
@@ -76,37 +74,62 @@ impl PriceBoard {
         Self::default()
     }
 
-    /// Запись цены. Более ранняя оценка не затирает более позднюю:
-    /// порядок применения событий задаёт `EffectiveOrder`, но событие
-    /// оценки может прийти задним числом.
+    /// Запись цены. Несколько наблюдений одного инструмента сохраняются
+    /// по своим датам: более раннее наблюдение не должно исчезать при
+    /// появлении более позднего.
     pub fn record(&mut self, price: InstrumentPrice) {
-        self.latest
+        self.prices
             .entry(price.instrument)
-            .and_modify(|existing| {
-                if price.as_of >= existing.as_of {
-                    *existing = price;
-                }
-            })
-            .or_insert(price);
+            .or_default()
+            .insert(price.as_of, price);
     }
 
+    /// Цена инструмента на указанную дату или последнее наблюдение до неё.
     #[must_use]
-    pub fn latest(&self, instrument: InstrumentId) -> Option<&InstrumentPrice> {
-        self.latest.get(&instrument)
+    pub fn price_at_or_before(
+        &self,
+        instrument: InstrumentId,
+        as_of: Date,
+    ) -> Option<&InstrumentPrice> {
+        self.prices
+            .get(&instrument)?
+            .range(..=as_of)
+            .next_back()
+            .map(|(_, price)| price)
     }
 
+    /// Все наблюдения инструмента не позже даты оценки, от новых к старым.
+    #[must_use]
+    pub fn observations_at_or_before(
+        &self,
+        instrument: InstrumentId,
+        as_of: Date,
+    ) -> impl DoubleEndedIterator<Item = &InstrumentPrice> {
+        self.prices
+            .get(&instrument)
+            .into_iter()
+            .flat_map(move |prices| prices.range(..=as_of).rev().map(|(_, price)| price))
+    }
+
+    /// Последнее наблюдение каждого инструмента для совместимости с
+    /// потребителями, которым нужен список текущих цен.
     pub fn iter(&self) -> impl Iterator<Item = (&InstrumentId, &InstrumentPrice)> {
-        self.latest.iter()
+        self.prices.iter().filter_map(|(instrument, prices)| {
+            prices
+                .iter()
+                .next_back()
+                .map(|(_, price)| (instrument, price))
+        })
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.latest.len()
+        self.prices.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.latest.is_empty()
+        self.prices.is_empty()
     }
 }
 
@@ -239,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_price_replaces_an_earlier_one_and_an_earlier_one_does_not() {
+    fn a_later_price_is_selected_and_an_earlier_one_is_retained() {
         let instrument = InstrumentId::new_random();
         let mut board = PriceBoard::new();
         let mut early = price(date!(2026 - 01 - 05), 100, PriceQuality::PreviousClose);
@@ -249,19 +272,61 @@ mod tests {
 
         board.record(late);
         board.record(early);
-        assert_eq!(board.latest(instrument).unwrap().price, late.price);
+        assert_eq!(
+            board
+                .price_at_or_before(instrument, date!(2026 - 02 - 05))
+                .unwrap()
+                .price,
+            late.price
+        );
         assert_eq!(board.len(), 1);
     }
 
     #[test]
-    fn only_executable_and_closing_prices_count_as_complete() {
-        // Молчаливая подстановка запрещена: перенесённая, устаревшая
-        // и оценочная цена помечают NAV как неполный (§5.4).
-        assert!(PriceQuality::Executable.is_complete());
-        assert!(PriceQuality::PreviousClose.is_complete());
-        assert!(!PriceQuality::CarriedForward.is_complete());
-        assert!(!PriceQuality::Stale.is_complete());
-        assert!(!PriceQuality::OwnerEstimate.is_complete());
+    fn a_price_observed_after_the_report_date_is_not_used() {
+        let instrument = InstrumentId::new_random();
+        let mut board = PriceBoard::new();
+        let mut early = price(date!(2025 - 12 - 31), 100, PriceQuality::PreviousClose);
+        early.instrument = instrument;
+        let mut late = price(date!(2026 - 08 - 01), 200, PriceQuality::Executable);
+        late.instrument = instrument;
+
+        board.record(early);
+        board.record(late);
+
+        let chosen = board
+            .price_at_or_before(instrument, date!(2025 - 12 - 31))
+            .expect("цена на дату");
+        assert_eq!(chosen.as_of, date!(2025 - 12 - 31));
+    }
+
+    #[test]
+    fn a_gap_falls_back_to_the_latest_earlier_observation() {
+        let instrument = InstrumentId::new_random();
+        let mut board = PriceBoard::new();
+        let mut earlier = price(date!(2026 - 01 - 05), 100, PriceQuality::PreviousClose);
+        earlier.instrument = instrument;
+        board.record(earlier);
+
+        let chosen = board
+            .price_at_or_before(instrument, date!(2026 - 01 - 06))
+            .expect("более ранняя цена");
+        assert_eq!(chosen.as_of, date!(2026 - 01 - 05));
+    }
+
+    #[test]
+    fn an_instrument_without_any_earlier_observation_has_no_price() {
+        let instrument = InstrumentId::new_random();
+        let mut board = PriceBoard::new();
+        let mut later = price(date!(2026 - 01 - 05), 100, PriceQuality::PreviousClose);
+        later.instrument = instrument;
+        board.record(later);
+
+        assert!(
+            board
+                .price_at_or_before(instrument, date!(2026 - 01 - 04))
+                .is_none()
+        );
     }
 
     #[test]

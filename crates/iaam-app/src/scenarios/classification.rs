@@ -177,7 +177,15 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         | EventKind::OpeningPosition { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::Valuation { .. }
-        | EventKind::ControlAssertion { .. } => return None,
+        | EventKind::ControlAssertion { .. }
+        // Корпоративное действие и оферта субъектом классификации
+        // не становятся. Отдать их как приход означало бы спросить
+        // владельца «этот приход — доход?» про амортизацию и записать
+        // его ответ правилом: возврат собственного капитала (§6.5)
+        // навсегда учёлся бы доходом. Та же причина, по которой
+        // `classification_of` возвращает по ним `None`.
+        | EventKind::CorporateAction { .. }
+        | EventKind::OfferExercise { .. } => return None,
     };
     Some(ClassificationSubject {
         account: event.account,
@@ -186,4 +194,98 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         source_kind: Some(event.kind.discriminant().to_owned()),
         movement,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::event::leg::Leg;
+    use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId};
+    use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+    use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
+    use iaam_core::ids::{CustodyId, InstrumentId, SourceId};
+    use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use iaam_core::numeric::decimal::Dec;
+    use rust_decimal::Decimal;
+    use time::macros::date;
+
+    fn rub(minor: i64) -> Money {
+        Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
+    }
+
+    fn event_of(account: AccountId, kind: EventKind, legs: Vec<Leg>) -> Event {
+        let day = date!(2026 - 06 - 15);
+        Event {
+            id: EventId::new_random(),
+            schema_version: SCHEMA_VERSION,
+            owner: OwnerId::new_random(),
+            account,
+            kind,
+            dates: EventDates::for_cash(CashPostedDate(day)),
+            order: EffectiveOrder::new(day, 0),
+            legs,
+            provenance: Provenance::new(
+                SourceId::new_random(),
+                RawHash::parse(&"e".repeat(64)).unwrap(),
+                ParserVersion("test/1".into()),
+            ),
+            relation: Relation::None,
+            confidence: Confidence::Known,
+            idempotency_key: None,
+        }
+    }
+
+    #[test]
+    fn an_amortisation_is_not_offered_to_the_owner_as_an_inflow() {
+        // Отдать амортизацию субъектом с `Movement::In` означало бы
+        // спросить владельца «этот приход — доход?» и записать его ответ
+        // правилом: возврат собственного капитала (§6.5) навсегда
+        // учёлся бы доходом.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let compensation = rub(2_000_000);
+        let event = event_of(
+            account,
+            EventKind::CorporateAction {
+                action: CorporateAction::PartialRedemption {
+                    instrument,
+                    custody: CustodyId::new_random(),
+                    quantity: Quantity(Dec::new(Decimal::from(100))),
+                    principal_returned_per_unit: PerUnitAmount::new(
+                        Dec::new(Decimal::from(200)),
+                        CurrencyCode::Rub,
+                    ),
+                    compensation,
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![Leg::principal(account, instrument, compensation)],
+        );
+        assert!(subject(&event).is_none());
+    }
+
+    #[test]
+    fn a_settled_offer_is_not_offered_to_the_owner_either() {
+        let account = AccountId::new_random();
+        let event = event_of(
+            account,
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Settled {
+                    submission: OfferSubmissionId::new_random(),
+                    instrument: InstrumentId::new_random(),
+                    custody: CustodyId::new_random(),
+                    quantity: Quantity(Dec::new(Decimal::from(10))),
+                    gross: rub(1_000_000),
+                    fee: None,
+                    accrued_interest: None,
+                },
+            },
+            Vec::new(),
+        );
+        assert!(subject(&event).is_none());
+    }
 }

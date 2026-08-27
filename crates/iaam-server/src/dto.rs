@@ -10,20 +10,30 @@
 
 use std::fmt;
 
+use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, ClassificationRuleView, IssuedToken, Scope, TokenView,
 };
-use iaam_core::event::kind::FeeOrigin;
+use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
+use iaam_core::event::kind::{FeeOrigin, IncomeKind};
+use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
-use iaam_core::money::CurrencyCode;
+use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::returns::{Computed, DataQuality, MaterialIssue, NotComputable, ReturnsReport};
-use iaam_core::valuation::PriceQuality;
+use iaam_core::returns::{
+    AmountQualification, Computed, DataQuality, EvaluatedPosition, ExecutabilityShares,
+    LiquidationEstimate, MaterialIssue, NotComputable, PositionCoverage, ReturnsReport,
+    UncoveredPosition,
+};
+use iaam_core::valuation::{
+    PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, QuotationBasis,
+    SelectedPrice, SourceExecutability,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use time::Date;
+use time::{Date, OffsetDateTime};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -70,13 +80,18 @@ impl CurrencyDto {
 }
 
 /// Качество цены в транспорте.
+///
+/// Уже вычисленные нами величины — перенос на нерабочий день и
+/// устаревание по порогу — представимым вводом не являются: это выводы
+/// политики оценки, а не то, что утверждает источник. Записать их фактом
+/// значит стереть различие между наблюдением и нашим выводом
+/// (docs/decisions/0002-polnota-ocenki-i-ispolnimost-ceny-dve-osi.md).
+/// Доменный PriceQuality шире: он обязан читать старый журнал.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceQualityDto {
     Executable,
     PreviousClose,
-    CarriedForward,
-    Stale,
     OwnerEstimate,
 }
 
@@ -86,9 +101,31 @@ impl PriceQualityDto {
         match self {
             Self::Executable => PriceQuality::Executable,
             Self::PreviousClose => PriceQuality::PreviousClose,
-            Self::CarriedForward => PriceQuality::CarriedForward,
-            Self::Stale => PriceQuality::Stale,
             Self::OwnerEstimate => PriceQuality::OwnerEstimate,
+        }
+    }
+}
+
+/// Вид дохода в транспорте.
+///
+/// Варианта «прочее» нет — как и в ядре: мешок, по которому нельзя
+/// принять решение, не отличается от незнания, а незнание выражается
+/// отсутствием поля.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IncomeKindDto {
+    Coupon,
+    Dividend,
+    DepositInterest,
+}
+
+impl IncomeKindDto {
+    #[must_use]
+    pub const fn to_domain(self) -> IncomeKind {
+        match self {
+            Self::Coupon => IncomeKind::Coupon,
+            Self::Dividend => IncomeKind::Dividend,
+            Self::DepositInterest => IncomeKind::DepositInterest,
         }
     }
 }
@@ -194,6 +231,11 @@ pub enum OperationKindDto {
         instrument: Option<Uuid>,
         amount: String,
         currency: CurrencyDto,
+        /// Вид дохода. Отсутствие поля означает «не утверждалось»:
+        /// без него API продолжил бы терять вид у журнала, который
+        /// его уже умеет хранить.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<IncomeKindDto>,
     },
     Fee {
         amount: String,
@@ -344,10 +386,12 @@ impl OperationDto {
                 instrument,
                 amount,
                 currency,
+                kind,
             } => OperationKind::Income {
                 instrument: instrument.map(InstrumentId),
                 gross_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
+                kind: kind.map(IncomeKindDto::to_domain),
             },
             OperationKindDto::Fee {
                 amount,
@@ -528,6 +572,24 @@ fn describe(reason: &NotComputable) -> String {
         NotComputable::MissingFxRate { from, to, date } => {
             format!("нет курса {}→{} на {date}", from.code(), to.code())
         }
+        NotComputable::QuotationBasisUnknown { instrument } => {
+            format!(
+                "неизвестно основание котировки инструмента {}",
+                instrument.inner()
+            )
+        }
+        NotComputable::RemainingFaceUnknown { instrument } => {
+            format!(
+                "неизвестен остаточный номинал инструмента {}",
+                instrument.inner()
+            )
+        }
+        NotComputable::RemainingFaceAmbiguous { instrument } => {
+            format!(
+                "неоднозначен остаточный номинал инструмента {}",
+                instrument.inner()
+            )
+        }
         NotComputable::SolverRefused { refusal } => refusal.to_string(),
         NotComputable::NoExternalFlows => "нет потоков, пересекающих границу контура".into(),
         NotComputable::StateNewerThanReport { last_event, as_of } => {
@@ -570,6 +632,158 @@ pub struct RateDto {
     pub detail: Option<String>,
 }
 
+/// Выбранная цена позиции с выводами политики и provenance.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SelectedPriceDto {
+    pub instrument: Uuid,
+    pub price: String,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub trade_date: Date,
+    pub observed_at: String,
+    pub executability: String,
+    pub selection: PriceSelectionDto,
+    pub freshness: PriceFreshnessDto,
+    pub provenance: PriceProvenanceDto,
+}
+
+/// Способ, которым политика выбрала наблюдение.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceSelectionDto {
+    AsObserved,
+    CarriedForward {
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date)]
+        observed_on: Date,
+        days: u16,
+    },
+    LegacyDerived {
+        quality: String,
+    },
+}
+
+/// Свежесть выбранного наблюдения относительно порога политики.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceFreshnessDto {
+    Fresh,
+    Stale { days: u16 },
+}
+
+/// Происхождение выбранного наблюдения.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PriceOriginDto {
+    Market { venue: String, price_kind: String },
+    ReportParsed { source: Uuid },
+    OwnerAsserted,
+}
+
+/// Единица, в которой источник назвал цену.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotationBasisDto {
+    MoneyPerUnit,
+    PercentOfRemainingFace,
+    /// Источник основания не доказал: цена этой строки в деньги
+    /// не пересчитывается.
+    #[default]
+    Unknown,
+}
+
+impl QuotationBasisDto {
+    #[must_use]
+    pub const fn from_domain(basis: QuotationBasis) -> Self {
+        match basis {
+            QuotationBasis::MoneyPerUnit => Self::MoneyPerUnit,
+            QuotationBasis::PercentOfRemainingFace => Self::PercentOfRemainingFace,
+            QuotationBasis::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Основание выбора: вид источника, площадка, версии и оба порога.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PriceProvenanceDto {
+    pub price_kind: Option<String>,
+    pub origin: PriceOriginDto,
+    pub venue: Option<String>,
+    #[serde(default)]
+    pub quotation_basis: QuotationBasisDto,
+    #[serde(default)]
+    pub basis_evidence: Option<String>,
+    pub observed_at: String,
+    pub valuation_policy_version: u32,
+    pub source_priority_version: u32,
+    pub carry_forward_limit: u16,
+    pub price_max_age: u16,
+}
+
+/// Позиция, оценённая выбранным наблюдением.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EvaluatedPositionDto {
+    pub account: Uuid,
+    pub custody: Option<Uuid>,
+    pub instrument: Uuid,
+    pub quantity: String,
+    pub price: SelectedPriceDto,
+}
+
+/// Позиция без выбранной цены и причина отказа.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UncoveredPositionDto {
+    pub account: Uuid,
+    pub custody: Option<Uuid>,
+    pub instrument: Uuid,
+    pub reason: String,
+}
+
+/// Позиция, оставшаяся на старом вычисленном качестве.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LegacyDerivedPositionDto {
+    pub account: Uuid,
+    pub custody: Option<Uuid>,
+    pub instrument: Uuid,
+    pub quality: String,
+}
+
+/// Покрытие ценами без выдуманного процента стоимости.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PositionCoverageDto {
+    pub evaluated_positions: u32,
+    pub total_positions: u32,
+    pub selected: Vec<EvaluatedPositionDto>,
+    pub uncovered: Vec<UncoveredPositionDto>,
+    pub legacy_derived: Vec<LegacyDerivedPositionDto>,
+}
+
+/// Доли исполнимости от стоимости оценённых позиций.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExecutabilitySharesDto {
+    pub evaluated_positions_value: String,
+    pub executable: String,
+    pub indicative_previous_close: String,
+    pub unknown: String,
+}
+
+/// Денежная величина с явным квалификатором знания.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AmountQualificationDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub qualification: String,
+}
+
+/// Оценка до издержек выхода и до налога.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LiquidationEstimateDto {
+    pub value_before_exit_costs_and_tax: ComputedDto,
+    pub executability: ExecutabilitySharesDto,
+    pub exit_costs: AmountQualificationDto,
+    pub tax: AmountQualificationDto,
+}
 /// Доли стоимости портфеля по уровням достоверности (§10.5).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NavCoverageDto {
@@ -584,6 +798,8 @@ pub struct NavCoverageDto {
 pub struct DataQualityDto {
     pub status: String,
     pub nav_coverage: NavCoverageDto,
+    pub position_coverage: PositionCoverageDto,
+    pub executability: ExecutabilitySharesDto,
     pub material_issues: Vec<String>,
 }
 
@@ -601,8 +817,210 @@ impl DataQualityDto {
                 provisional: quality.nav_coverage.provisional.inner().to_string(),
                 discrepant: quality.nav_coverage.discrepant.inner().to_string(),
             },
+            position_coverage: PositionCoverageDto::from_domain(&quality.position_coverage),
+            executability: ExecutabilitySharesDto::from_domain(&quality.executability),
             material_issues: quality.material_issues.iter().map(issue).collect(),
         }
+    }
+}
+
+impl PositionCoverageDto {
+    fn from_domain(coverage: &PositionCoverage) -> Self {
+        Self {
+            evaluated_positions: coverage.evaluated_positions,
+            total_positions: coverage.total_positions,
+            selected: coverage
+                .selected
+                .iter()
+                .map(EvaluatedPositionDto::from_domain)
+                .collect(),
+            uncovered: coverage
+                .uncovered
+                .iter()
+                .map(UncoveredPositionDto::from_domain)
+                .collect(),
+            legacy_derived: coverage
+                .legacy_derived
+                .iter()
+                .map(LegacyDerivedPositionDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+impl EvaluatedPositionDto {
+    fn from_domain(position: &EvaluatedPosition) -> Self {
+        Self {
+            account: position.account.inner(),
+            custody: position.custody.map(|custody| custody.inner()),
+            instrument: position.instrument.inner(),
+            quantity: position.quantity.0.inner().to_string(),
+            price: SelectedPriceDto::from_domain(&position.price),
+        }
+    }
+}
+
+impl UncoveredPositionDto {
+    fn from_domain(position: &UncoveredPosition) -> Self {
+        Self {
+            account: position.account.inner(),
+            custody: position.custody.map(|custody| custody.inner()),
+            instrument: position.instrument.inner(),
+            reason: uncovered_reason(position.reason).to_owned(),
+        }
+    }
+}
+
+impl LegacyDerivedPositionDto {
+    fn from_domain(position: &iaam_core::returns::LegacyDerivedPosition) -> Self {
+        Self {
+            account: position.account.inner(),
+            custody: position.custody.map(|custody| custody.inner()),
+            instrument: position.instrument.inner(),
+            quality: position.quality.code().to_owned(),
+        }
+    }
+}
+
+impl SelectedPriceDto {
+    fn from_domain(price: &SelectedPrice) -> Self {
+        Self {
+            instrument: price.candidate.instrument.inner(),
+            price: price.candidate.price.inner().to_string(),
+            currency: CurrencyDto::from_domain(price.candidate.currency),
+            trade_date: price.candidate.trade_date,
+            observed_at: format_timestamp(price.candidate.observed_at),
+            executability: executability(price.candidate.executability).to_owned(),
+            selection: PriceSelectionDto::from_domain(price.selection),
+            freshness: PriceFreshnessDto::from_domain(price.freshness),
+            provenance: PriceProvenanceDto::from_domain(&price.provenance),
+        }
+    }
+}
+
+impl PriceSelectionDto {
+    fn from_domain(selection: PriceSelection) -> Self {
+        match selection {
+            PriceSelection::AsObserved => Self::AsObserved,
+            PriceSelection::CarriedForward { observed_on, days } => {
+                Self::CarriedForward { observed_on, days }
+            }
+            PriceSelection::LegacyDerived { quality } => Self::LegacyDerived {
+                quality: quality.code().to_owned(),
+            },
+        }
+    }
+}
+
+impl PriceFreshnessDto {
+    fn from_domain(freshness: PriceFreshness) -> Self {
+        match freshness {
+            PriceFreshness::Fresh => Self::Fresh,
+            PriceFreshness::Stale { days } => Self::Stale { days },
+        }
+    }
+}
+
+impl PriceProvenanceDto {
+    fn from_domain(provenance: &PriceProvenance) -> Self {
+        Self {
+            price_kind: provenance.price_kind.clone(),
+            origin: PriceOriginDto::from_domain(&provenance.origin),
+            venue: provenance.venue.clone(),
+            quotation_basis: QuotationBasisDto::from_domain(provenance.quotation_basis),
+            basis_evidence: (!provenance.basis_evidence.is_empty())
+                .then(|| provenance.basis_evidence.clone()),
+            observed_at: format_timestamp(provenance.observed_at),
+            valuation_policy_version: provenance.valuation_policy_version,
+            source_priority_version: provenance.source_priority_version,
+            carry_forward_limit: provenance.carry_forward_limit,
+            price_max_age: provenance.price_max_age,
+        }
+    }
+}
+
+impl PriceOriginDto {
+    fn from_domain(origin: &PriceOrigin) -> Self {
+        match origin {
+            PriceOrigin::Market { venue, kind } => Self::Market {
+                venue: venue.clone(),
+                price_kind: match kind {
+                    iaam_core::valuation::PriceKind::Close => "close",
+                    iaam_core::valuation::PriceKind::LegalClose => "legal_close",
+                    iaam_core::valuation::PriceKind::WeightedAverage => "weighted_average",
+                    iaam_core::valuation::PriceKind::MarketPrice2 => "market_price_2",
+                    iaam_core::valuation::PriceKind::MarketPrice3 => "market_price_3",
+                    iaam_core::valuation::PriceKind::AdmittedQuote => "admitted_quote",
+                }
+                .to_owned(),
+            },
+            PriceOrigin::ReportParsed { source } => Self::ReportParsed {
+                source: source.inner(),
+            },
+            PriceOrigin::OwnerAsserted => Self::OwnerAsserted,
+        }
+    }
+}
+
+impl ExecutabilitySharesDto {
+    fn from_domain(shares: &ExecutabilityShares) -> Self {
+        Self {
+            evaluated_positions_value: shares.evaluated_positions_value.inner().to_string(),
+            executable: shares.executable.inner().to_string(),
+            indicative_previous_close: shares.indicative_previous_close.inner().to_string(),
+            unknown: shares.unknown.inner().to_string(),
+        }
+    }
+}
+
+impl AmountQualificationDto {
+    fn from_domain(amount: AmountQualification) -> Self {
+        match amount {
+            AmountQualification::Known(value) => Self {
+                value: Some(value.inner().to_string()),
+                qualification: "known".to_owned(),
+            },
+            AmountQualification::Unknown => Self {
+                value: None,
+                qualification: "unknown".to_owned(),
+            },
+        }
+    }
+}
+
+impl LiquidationEstimateDto {
+    fn from_domain(estimate: &LiquidationEstimate) -> Self {
+        Self {
+            value_before_exit_costs_and_tax: ComputedDto::from_dec(
+                &estimate.value_before_exit_costs_and_tax,
+            ),
+            executability: ExecutabilitySharesDto::from_domain(&estimate.executability),
+            exit_costs: AmountQualificationDto::from_domain(estimate.exit_costs),
+            tax: AmountQualificationDto::from_domain(estimate.tax),
+        }
+    }
+}
+
+fn format_timestamp(value: OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("временная метка provenance должна форматироваться")
+}
+
+fn executability(value: SourceExecutability) -> &'static str {
+    match value {
+        SourceExecutability::Executable => "executable",
+        SourceExecutability::IndicativePreviousClose => "indicative_previous_close",
+        SourceExecutability::Unknown => "unknown",
+    }
+}
+
+fn uncovered_reason(value: iaam_core::valuation::UncoveredReason) -> &'static str {
+    match value {
+        iaam_core::valuation::UncoveredReason::NoObservation => "no_observation",
+        iaam_core::valuation::UncoveredReason::TooOld => "too_old",
+        iaam_core::valuation::UncoveredReason::AmbiguousVenue => "ambiguous_venue",
+        iaam_core::valuation::UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
     }
 }
 
@@ -611,14 +1029,6 @@ fn issue(value: &MaterialIssue) -> String {
         MaterialIssue::RestoredWithoutBasis { account } => format!(
             "счёт {} восстановлен без документированной стоимости",
             account.inner()
-        ),
-        MaterialIssue::PriceNotExecutable {
-            instrument,
-            quality,
-        } => format!(
-            "цена инструмента {} не исполнима: {}",
-            instrument.inner(),
-            quality.code()
         ),
         MaterialIssue::NegativeCash { account, currency } => format!(
             "отрицательный остаток на счёте {} в {}",
@@ -660,6 +1070,8 @@ pub struct ReturnsReportDto {
     pub contributed: ComputedDto,
     pub withdrawn: ComputedDto,
     pub terminal_value: ComputedDto,
+    /// Оценка до гипотетических издержек выхода и до налога.
+    pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto,
     /// **Доходность до налога.** Имя поля содержит оговорку намеренно:
     /// налоги появляются в E5, и до тех пор называть эту величину
     /// «доходностью» без уточнения нельзя (§16.3).
@@ -715,6 +1127,9 @@ impl ReturnsReportDto {
             contributed: ComputedDto::from_dec(&report.contributed),
             withdrawn: ComputedDto::from_dec(&report.withdrawn),
             terminal_value: ComputedDto::from_dec(&report.terminal_value),
+            liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto::from_domain(
+                &report.liquidation_value_before_exit_costs_and_tax,
+            ),
             xirr_pre_tax: rate,
             applied_rules: AppliedRulesDto {
                 contour: report.applied_rules.contour.0,
@@ -1006,6 +1421,68 @@ pub struct FxRateDto {
     pub rate: String,
 }
 
+/// Наблюдение цены с полным происхождением.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketPriceDto {
+    pub instrument: Uuid,
+    pub board: String,
+    pub session: i64,
+    pub kind: String,
+    pub value: String,
+    pub currency: String,
+    #[serde(default)]
+    pub quotation_basis: QuotationBasisDto,
+    #[serde(default)]
+    pub basis_evidence: Option<String>,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub date: Date,
+    pub source: String,
+    pub observed_at: String,
+    pub quality: String,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub complete_through: Option<Date>,
+}
+
+/// Наблюдение курса с полным происхождением.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketFxDto {
+    pub from: CurrencyDto,
+    pub to: CurrencyDto,
+    pub nominal: u32,
+    pub value: String,
+    pub unit_rate: String,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub date: Date,
+    pub source: String,
+    pub observed_at: String,
+    pub quality: String,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub complete_through: Option<Date>,
+}
+
+/// Интервал ключевой ставки, выведенный из дневных наблюдений.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketKeyRateDto {
+    pub value: String,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub until: Option<Date>,
+    pub source: String,
+    pub observed_at: String,
+    pub quality: String,
+    pub boundary: String,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub complete_through: Option<Date>,
+}
+
 /// Состояние сервиса.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthDto {
@@ -1019,6 +1496,250 @@ mod tests {
     use super::*;
     use iaam_core::ids::{EventId, InstrumentId};
     use iaam_core::numeric::xirr::SolverRefusal;
+
+    fn amount(value: &str) -> AmountDto {
+        AmountDto {
+            amount: value.to_owned(),
+            currency: CurrencyDto::Rub,
+        }
+    }
+
+    /// Имя члена в JSON — часть контракта: по нему внешний агент
+    /// выбирает разбор. `match` исчерпывающий, поэтому новый член
+    /// обязан сломать сборку, а не тихо появиться безымянным (§15.1).
+    fn corporate_action_tag(action: &CorporateActionDto) -> &'static str {
+        match action {
+            CorporateActionDto::PartialRedemption { .. } => "partial_redemption",
+            CorporateActionDto::Redemption { .. } => "redemption",
+            CorporateActionDto::Conversion { .. } => "conversion",
+        }
+    }
+
+    fn offer_tag(action: &OfferExerciseDto) -> &'static str {
+        match action {
+            OfferExerciseDto::Submitted { .. } => "submitted",
+            OfferExerciseDto::Cancelled { .. } => "cancelled",
+            OfferExerciseDto::Settled { .. } => "settled",
+        }
+    }
+
+    #[test]
+    fn every_corporate_action_member_names_itself_in_json() {
+        let redemption_fields = || CorporateActionDto::Redemption {
+            instrument: Uuid::new_v4(),
+            custody: Uuid::new_v4(),
+            quantity: "10".into(),
+            principal_returned_per_unit: amount("1000"),
+            compensation: amount("10000.00"),
+            effective_date: time::macros::date!(2026 - 06 - 01),
+            record_date: None,
+            grounds: None,
+        };
+        let members = [
+            CorporateActionDto::PartialRedemption {
+                instrument: Uuid::new_v4(),
+                custody: Uuid::new_v4(),
+                quantity: "10".into(),
+                principal_returned_per_unit: amount("100"),
+                compensation: amount("1000.00"),
+                effective_date: time::macros::date!(2026 - 05 - 20),
+                record_date: Some(time::macros::date!(2026 - 05 - 18)),
+                grounds: None,
+            },
+            redemption_fields(),
+            CorporateActionDto::Conversion {
+                predecessor: Uuid::new_v4(),
+                successor: Uuid::new_v4(),
+                custody: Uuid::new_v4(),
+                ratio: "1".into(),
+                quantity_in: "10".into(),
+                quantity_out: "10".into(),
+                fractional: FractionalTreatmentDto::NotApplicable,
+                compensation: None,
+                effective_date: time::macros::date!(2026 - 07 - 01),
+                record_date: None,
+                grounds: None,
+                basis_transfer: BasisTransferRuleDto::CarryOver,
+            },
+        ];
+        for member in &members {
+            let json = serde_json::to_value(member).expect("член представим в JSON");
+            assert_eq!(json["type"], corporate_action_tag(member));
+            // Разбор обратно обязан пройти: имя, которое сериализуется,
+            // но не разбирается, — это контракт только на бумаге.
+            let parsed: CorporateActionDto =
+                serde_json::from_value(json).expect("член разбирается обратно");
+            assert_eq!(corporate_action_tag(&parsed), corporate_action_tag(member));
+            member.to_domain().expect("член доезжает до домена");
+        }
+    }
+
+    #[test]
+    fn every_offer_member_names_itself_in_json() {
+        let members = [
+            OfferExerciseDto::Submitted {
+                submission: Uuid::new_v4(),
+                window: Uuid::new_v4(),
+                instrument: Uuid::new_v4(),
+                quantity: "5".into(),
+            },
+            OfferExerciseDto::Cancelled {
+                submission: Uuid::new_v4(),
+                quantity: "5".into(),
+            },
+            OfferExerciseDto::Settled {
+                submission: Uuid::new_v4(),
+                instrument: Uuid::new_v4(),
+                custody: Uuid::new_v4(),
+                quantity: "5".into(),
+                gross: amount("5000.00"),
+                fee: Some(amount("10.00")),
+                accrued_interest: Some(amount("20.00")),
+            },
+        ];
+        for member in &members {
+            let json = serde_json::to_value(member).expect("член представим в JSON");
+            assert_eq!(json["type"], offer_tag(member));
+            let parsed: OfferExerciseDto =
+                serde_json::from_value(json).expect("член разбирается обратно");
+            assert_eq!(offer_tag(&parsed), offer_tag(member));
+            member.to_domain().expect("член доезжает до домена");
+        }
+    }
+
+    /// Квалификатор исполнимости переводится в строку API, и строка
+    /// эта — контракт: по ней внешний агент решает, можно ли цене
+    /// верить. Пустая строка вместо `indicative_previous_close`
+    /// выглядит как ответ, а не как отказ.
+    ///
+    /// Ожидаемое имя задаётся здесь ОТДЕЛЬНЫМ исчерпывающим `match`,
+    /// а не берётся из проверяемой функции: тест, зовущий её же,
+    /// согласится с любым её ответом. Новый член ломает сборку теста.
+    #[test]
+    fn every_executability_names_itself_in_the_api() {
+        fn expected(value: SourceExecutability) -> &'static str {
+            match value {
+                SourceExecutability::Executable => "executable",
+                SourceExecutability::IndicativePreviousClose => "indicative_previous_close",
+                SourceExecutability::Unknown => "unknown",
+            }
+        }
+        for value in [
+            SourceExecutability::Executable,
+            SourceExecutability::IndicativePreviousClose,
+            SourceExecutability::Unknown,
+        ] {
+            assert_eq!(executability(value), expected(value));
+        }
+    }
+
+    /// Причина, по которой позиция осталась без цены, — это то, что
+    /// владелец увидит вместо суммы. Подменить её пустой строкой
+    /// значит показать «цены нет» без объяснения, почему.
+    #[test]
+    fn every_uncovered_reason_names_itself_in_the_api() {
+        use iaam_core::valuation::UncoveredReason;
+        fn expected(value: UncoveredReason) -> &'static str {
+            match value {
+                UncoveredReason::NoObservation => "no_observation",
+                UncoveredReason::TooOld => "too_old",
+                UncoveredReason::AmbiguousVenue => "ambiguous_venue",
+                UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
+            }
+        }
+        for value in [
+            UncoveredReason::NoObservation,
+            UncoveredReason::TooOld,
+            UncoveredReason::AmbiguousVenue,
+            UncoveredReason::AmbiguousCandidate,
+        ] {
+            assert_eq!(uncovered_reason(value), expected(value));
+        }
+    }
+
+    /// Время наблюдения уходит в отчёт строкой. Пустая строка на месте
+    /// метки времени не отличима от «наблюдение без времени», а такого
+    /// наблюдения не бывает: по этой метке решают, свежая ли цена.
+    #[test]
+    fn a_timestamp_travels_as_rfc_3339_in_utc() {
+        let value =
+            OffsetDateTime::from_unix_timestamp(1_787_000_000).expect("метка времени представима");
+        assert_eq!(format_timestamp(value), "2026-08-17T20:53:20Z");
+    }
+
+    /// Сумма без валюты не бывает: если бы валюта была необязательной,
+    /// пропущенное поле пришлось бы чем-то заменять — и заменялось бы
+    /// оно рублём, потому что так удобнее.
+    #[test]
+    fn an_amount_without_a_currency_is_not_representable() {
+        let raw = serde_json::json!({ "amount": "100.00" });
+        assert!(serde_json::from_value::<AmountDto>(raw).is_err());
+    }
+
+    fn income_operation(kind: Option<IncomeKindDto>) -> OperationDto {
+        OperationDto {
+            account: Uuid::from_u128(3),
+            kind: OperationKindDto::Income {
+                instrument: Some(Uuid::from_u128(7)),
+                amount: "1200.00".to_owned(),
+                currency: CurrencyDto::Rub,
+                kind,
+            },
+            dates: OperationDatesDto::default(),
+            idempotency_key: None,
+            source_operation_id: None,
+        }
+    }
+
+    #[test]
+    fn the_api_does_not_drop_the_income_kind() {
+        // Журнал вид уже хранит: потерять его в транспорте значит
+        // оставить внешнего агента без того, что система знает.
+        assert!(matches!(
+            income_operation(Some(IncomeKindDto::Coupon))
+                .to_domain()
+                .unwrap()
+                .kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::Coupon),
+                ..
+            }
+        ));
+        assert!(matches!(
+            income_operation(Some(IncomeKindDto::DepositInterest))
+                .to_domain()
+                .unwrap()
+                .kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::DepositInterest),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_income_without_a_kind_stays_without_one() {
+        // Отсутствие поля означает «не утверждалось», а не «дивиденд».
+        assert!(matches!(
+            income_operation(None).to_domain().unwrap().kind,
+            OperationKind::Income { kind: None, .. }
+        ));
+    }
+
+    #[test]
+    fn an_income_kind_survives_a_json_round_trip() {
+        let dto = income_operation(Some(IncomeKindDto::Dividend));
+        let text = serde_json::to_string(&dto).unwrap();
+        assert!(text.contains(r#""kind":"dividend""#), "{text}");
+        let restored: OperationDto = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            restored.to_domain().unwrap().kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::Dividend),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn every_verdict_reaches_the_wire_with_the_field_that_explains_it() {
@@ -1178,6 +1899,32 @@ mod tests {
         assert_ne!(
             detail, "нет потоков, пересекающих границу контура",
             "разные причины обязаны объясняться по-разному"
+        );
+    }
+
+    #[test]
+    fn the_wire_explains_where_the_money_came_from() {
+        let provenance = PriceProvenance {
+            price_kind: Some("legal_close".to_owned()),
+            origin: PriceOrigin::OwnerAsserted,
+            venue: Some("moex".to_owned()),
+            quotation_basis: iaam_core::valuation::QuotationBasis::PercentOfRemainingFace,
+            basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
+            observed_at: time::macros::datetime!(2026-08-26 08:00:00 UTC),
+            valuation_policy_version: 1,
+            source_priority_version: 1,
+            carry_forward_limit: 10,
+            price_max_age: 30,
+        };
+
+        let dto = PriceProvenanceDto::from_domain(&provenance);
+        assert_eq!(
+            dto.quotation_basis,
+            QuotationBasisDto::PercentOfRemainingFace
+        );
+        assert_eq!(
+            dto.basis_evidence.as_deref(),
+            Some("iss:engines/stock/markets/bonds")
         );
     }
 }
@@ -1387,6 +2134,23 @@ pub struct InstrumentDto {
     pub quote_currency: String,
 }
 
+/// Данные для записи инструмента администратором или синхронизацией.
+///
+/// Идентификатор можно не передавать: тогда его назначает сервер. Поля
+/// валюты обязательны, потому что отсутствие валюты нельзя отличить от
+/// неизвестного значения в сохранённом справочнике.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateInstrumentRequest {
+    #[serde(default)]
+    pub id: Option<Uuid>,
+    pub kind: Option<String>,
+    pub symbol: String,
+    pub title: String,
+    pub denomination_currency: String,
+    pub settlement_currency: String,
+    pub quote_currency: String,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ResolveInstrumentRequest {
     pub namespace: String,
@@ -1401,4 +2165,405 @@ pub struct ResolveInstrumentRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResolvedInstrumentDto {
     pub instrument: String,
+}
+/// Параметры ручной синхронизации рынка.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum MarketSourceDto {
+    Moex {
+        engine: String,
+        market: String,
+        board: String,
+        secid: String,
+        instrument: Uuid,
+    },
+    CbrDaily,
+    CbrDynamic {
+        cbr_currency_id: String,
+        to: CurrencyDto,
+    },
+    CbrKeyRate,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MarketSyncRequest {
+    pub source: MarketSourceDto,
+    pub from: String,
+    pub to: String,
+}
+
+// ---------------------------------------------------------------------
+// Журнальные факты: корпоративные действия и оферта (§4.7, §3.5).
+//
+// Отдельный вход, а не новые члены `OperationKindDto`. Причина
+// механическая: у корпоративного действия дата фиксации реестра — часть
+// факта, а операционная модель дат её выразить не умеет вовсе
+// (`OperationDates` жёстко проставляет `entitlement: None`).
+//
+// Приёма произвольного `EventKind` здесь нет: вход принимает ровно те
+// семьи, которые перечислены ниже.
+// ---------------------------------------------------------------------
+
+/// Сумма с валютой в транспорте.
+///
+/// Вложенным объектом, а не парой полей рядом: у замещения компенсация
+/// необязательна, и плоская пара потребовала бы необязательной валюты —
+/// то есть состояния «валюта без суммы», которого не бывает.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AmountDto {
+    /// Десятичное число строкой: двоичная плавающая точка теряет копейки.
+    #[schema(example = "1000.00")]
+    pub amount: String,
+    pub currency: CurrencyDto,
+}
+
+impl AmountDto {
+    fn to_money(&self, field: &str) -> Result<Money, Rejection> {
+        Ok(Money::new(
+            PostedMinor::new(minor(&self.amount, self.currency, field)?),
+            self.currency.to_domain(),
+        ))
+    }
+
+    /// Величина на одну бумагу: не деньги счёта, а номинал, поэтому
+    /// минорными единицами не меряется и округлению не подлежит.
+    fn to_per_unit(&self, field: &str) -> Result<PerUnitAmount, Rejection> {
+        Ok(PerUnitAmount::new(
+            Dec::new(decimal(&self.amount, field)?),
+            self.currency.to_domain(),
+        ))
+    }
+}
+
+/// Что сделали с дробной частью при замещении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FractionalTreatmentDto {
+    CashCompensated,
+    RoundedDown,
+    NotApplicable,
+}
+
+impl FractionalTreatmentDto {
+    #[must_use]
+    pub const fn to_domain(self) -> FractionalTreatment {
+        match self {
+            Self::CashCompensated => FractionalTreatment::CashCompensated,
+            Self::RoundedDown => FractionalTreatment::RoundedDown,
+            Self::NotApplicable => FractionalTreatment::NotApplicable,
+        }
+    }
+}
+
+/// Правило переноса налоговой стоимости при замещении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BasisTransferRuleDto {
+    CarryOver,
+    Restart,
+}
+
+impl BasisTransferRuleDto {
+    #[must_use]
+    pub const fn to_domain(self) -> BasisTransferRule {
+        match self {
+            Self::CarryOver => BasisTransferRule::CarryOver,
+            Self::Restart => BasisTransferRule::Restart,
+        }
+    }
+}
+
+/// Корпоративное действие в транспорте. Величины **положительные**:
+/// знак выбытия ставит приёмка, а не клиент.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CorporateActionDto {
+    /// Амортизация: номинал уменьшается, деньги приходят, количество
+    /// бумаг не меняется.
+    PartialRedemption {
+        instrument: Uuid,
+        custody: Uuid,
+        quantity: String,
+        principal_returned_per_unit: AmountDto,
+        compensation: AmountDto,
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date, example = "2026-05-20")]
+        effective_date: Date,
+        #[serde(
+            default,
+            with = "iso_date::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schema(value_type = Option<String>, format = Date)]
+        record_date: Option<Date>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grounds: Option<String>,
+    },
+    /// Окончательное погашение: номинал возвращён целиком, бумага
+    /// выбывает.
+    Redemption {
+        instrument: Uuid,
+        custody: Uuid,
+        quantity: String,
+        principal_returned_per_unit: AmountDto,
+        compensation: AmountDto,
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date)]
+        effective_date: Date,
+        #[serde(
+            default,
+            with = "iso_date::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schema(value_type = Option<String>, format = Date)]
+        record_date: Option<Date>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grounds: Option<String>,
+    },
+    /// Замещение: бумага предшественника меняется на бумагу преемника.
+    Conversion {
+        predecessor: Uuid,
+        successor: Uuid,
+        custody: Uuid,
+        /// Сколько бумаг преемника приходится на одну бумагу
+        /// предшественника.
+        ratio: String,
+        quantity_in: String,
+        quantity_out: String,
+        fractional: FractionalTreatmentDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compensation: Option<AmountDto>,
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date)]
+        effective_date: Date,
+        #[serde(
+            default,
+            with = "iso_date::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schema(value_type = Option<String>, format = Date)]
+        record_date: Option<Date>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grounds: Option<String>,
+        basis_transfer: BasisTransferRuleDto,
+    },
+}
+
+impl CorporateActionDto {
+    fn to_domain(&self) -> Result<CorporateAction, Rejection> {
+        Ok(match self {
+            Self::PartialRedemption {
+                instrument,
+                custody,
+                quantity,
+                principal_returned_per_unit,
+                compensation,
+                effective_date,
+                record_date,
+                grounds,
+            } => CorporateAction::PartialRedemption {
+                instrument: InstrumentId(*instrument),
+                custody: CustodyId(*custody),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+                principal_returned_per_unit: principal_returned_per_unit
+                    .to_per_unit("principal_returned_per_unit")?,
+                compensation: compensation.to_money("compensation")?,
+                effective_date: *effective_date,
+                record_date: *record_date,
+                grounds: grounds.clone(),
+            },
+            Self::Redemption {
+                instrument,
+                custody,
+                quantity,
+                principal_returned_per_unit,
+                compensation,
+                effective_date,
+                record_date,
+                grounds,
+            } => CorporateAction::Redemption {
+                instrument: InstrumentId(*instrument),
+                custody: CustodyId(*custody),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+                principal_returned_per_unit: principal_returned_per_unit
+                    .to_per_unit("principal_returned_per_unit")?,
+                compensation: compensation.to_money("compensation")?,
+                effective_date: *effective_date,
+                record_date: *record_date,
+                grounds: grounds.clone(),
+            },
+            Self::Conversion {
+                predecessor,
+                successor,
+                custody,
+                ratio,
+                quantity_in,
+                quantity_out,
+                fractional,
+                compensation,
+                effective_date,
+                record_date,
+                grounds,
+                basis_transfer,
+            } => CorporateAction::Conversion {
+                predecessor: InstrumentId(*predecessor),
+                successor: InstrumentId(*successor),
+                custody: CustodyId(*custody),
+                ratio: Dec::new(decimal(ratio, "ratio")?),
+                quantity_in: Quantity(Dec::new(decimal(quantity_in, "quantity_in")?)),
+                quantity_out: Quantity(Dec::new(decimal(quantity_out, "quantity_out")?)),
+                fractional: fractional.to_domain(),
+                compensation: match compensation {
+                    Some(amount) => Some(amount.to_money("compensation")?),
+                    None => None,
+                },
+                effective_date: *effective_date,
+                record_date: *record_date,
+                grounds: grounds.clone(),
+                basis_transfer: basis_transfer.to_domain(),
+            },
+        })
+    }
+}
+
+/// Факт оферты в транспорте.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OfferExerciseDto {
+    /// Поданная заявка: ни денег, ни бумаг она не двигает.
+    Submitted {
+        submission: Uuid,
+        window: Uuid,
+        instrument: Uuid,
+        quantity: String,
+    },
+    /// Отзыв заявки целиком или частично.
+    Cancelled { submission: Uuid, quantity: String },
+    /// Совершённый выкуп: бумага выбывает за деньги.
+    Settled {
+        submission: Uuid,
+        instrument: Uuid,
+        custody: Uuid,
+        quantity: String,
+        gross: AmountDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fee: Option<AmountDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accrued_interest: Option<AmountDto>,
+    },
+}
+
+impl OfferExerciseDto {
+    fn to_domain(&self) -> Result<OfferExerciseAction, Rejection> {
+        Ok(match self {
+            Self::Submitted {
+                submission,
+                window,
+                instrument,
+                quantity,
+            } => OfferExerciseAction::Submitted {
+                submission: OfferSubmissionId(*submission),
+                window: OfferWindowId(*window),
+                instrument: InstrumentId(*instrument),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+            },
+            Self::Cancelled {
+                submission,
+                quantity,
+            } => OfferExerciseAction::Cancelled {
+                submission: OfferSubmissionId(*submission),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+            },
+            Self::Settled {
+                submission,
+                instrument,
+                custody,
+                quantity,
+                gross,
+                fee,
+                accrued_interest,
+            } => OfferExerciseAction::Settled {
+                submission: OfferSubmissionId(*submission),
+                instrument: InstrumentId(*instrument),
+                custody: CustodyId(*custody),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+                gross: gross.to_money("gross")?,
+                fee: match fee {
+                    Some(amount) => Some(amount.to_money("fee")?),
+                    None => None,
+                },
+                accrued_interest: match accrued_interest {
+                    Some(amount) => Some(amount.to_money("accrued_interest")?),
+                    None => None,
+                },
+            },
+        })
+    }
+}
+
+/// Журнальный факт: корпоративное действие или оферта.
+///
+/// Две семьи под одной крышей — это общий канал приёмки, а не общая
+/// природа: корпоративное действие решает эмитент, оферту предъявляет
+/// владелец (`iaam-core/src/event/offer.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JournalFactDto {
+    /// Даты внутри самого факта: дата вступления в силу — часть его
+    /// идентичности, а не свойство подачи.
+    CorporateAction { action: CorporateActionDto },
+    /// У оферты собственной даты нет, поэтому день присылает клиент:
+    /// выдумать его приёмке нечем.
+    OfferExercise {
+        action: OfferExerciseDto,
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date, example = "2026-04-20")]
+        day: Date,
+    },
+}
+
+/// Один журнальный факт в пачке.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JournalEventDto {
+    pub account: Uuid,
+    /// Плоско, как у операции: клиент одного API не должен помнить,
+    /// что у одного входа вид факта лежит в корне, а у соседнего —
+    /// во вложенном объекте.
+    #[serde(flatten)]
+    pub fact: JournalFactDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_operation_id: Option<String>,
+}
+
+impl JournalEventDto {
+    /// Единственное место, где транспорт журнального факта встречается
+    /// с доменом. Отказ возвращается с полем, ожидаемым и полученным —
+    /// это тело ответа `422` (§13).
+    pub fn to_domain(&self) -> Result<SubmittedJournalEvent, Rejection> {
+        let fact = match &self.fact {
+            JournalFactDto::CorporateAction { action } => {
+                JournalFact::CorporateAction(action.to_domain()?)
+            }
+            JournalFactDto::OfferExercise { action, day } => JournalFact::OfferExercise {
+                action: action.to_domain()?,
+                day: *day,
+            },
+        };
+        Ok(SubmittedJournalEvent {
+            account: AccountId(self.account),
+            fact,
+            idempotency_key: self.idempotency_key.clone(),
+            source_operation_id: self.source_operation_id.clone(),
+        })
+    }
+}
+
+/// Запрос приёмки журнальных фактов.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubmitJournalEventsRequest {
+    /// Метка источника: ручной ввод, конкретный агент, конкретный файл.
+    pub source_label: String,
+    pub events: Vec<JournalEventDto>,
 }

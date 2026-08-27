@@ -3,7 +3,7 @@
 //! Формат Финама разбирается отдельными функциями и отдельными признаками
 //! листов. Общими с другими каналами остаются только типы результата.
 
-use iaam_core::event::kind::FeeOrigin;
+use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::{ParserVersion, RawHash, RowLocator};
 use iaam_core::ids::{CustodyId, InstrumentId};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
@@ -322,9 +322,14 @@ fn parse_income(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
             let currency = currency_value(cell(row, currency_col))?;
             let account = account_value(directory, cell(row, account_col), "account")?;
             let kind = text_value(cell(row, kind_col))?.to_lowercase();
-            if kind != "купон" && kind != "дивиденд" {
-                return Err(rejection("type", "Купон или Дивиденд", &kind));
-            }
+            // Отчёт называет вид словом, и слово это — единственное
+            // место, где он вообще есть. Потерять его здесь значит
+            // потерять навсегда: событие журнала неизменяемо.
+            let income_kind = match kind.as_str() {
+                "купон" => IncomeKind::Coupon,
+                "дивиденд" => IncomeKind::Dividend,
+                other => return Err(rejection("type", "Купон или Дивиденд", other)),
+            };
             let instrument = optional_text(cell(row, instrument_col))
                 .map(|_| instrument_value(directory, cell(row, instrument_col), Some(date)))
                 .transpose()?;
@@ -335,6 +340,7 @@ fn parse_income(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
                     instrument,
                     gross_minor,
                     currency,
+                    kind: Some(income_kind),
                 },
                 date,
                 date,

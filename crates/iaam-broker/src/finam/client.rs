@@ -1,10 +1,10 @@
 use crate::credentials::BrokerToken;
+use iaam_http::client::HttpClient;
+use iaam_http::{Destination, HttpRequest};
 use serde_json::Value;
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time};
-
-const BASE_URL: &str = "https://api.finam.ru";
 
 /// Ошибки HTTP-доступа к Finam Trade API.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -26,7 +26,7 @@ pub enum FinamError {
 /// HTTP-клиент Finam, возвращающий сырые тела ответов.
 pub struct FinamClient {
     token: BrokerToken,
-    http: reqwest::Client,
+    http: HttpClient,
 }
 
 impl FinamClient {
@@ -35,7 +35,7 @@ impl FinamClient {
     pub fn new(token: BrokerToken) -> Self {
         Self {
             token,
-            http: reqwest::Client::new(),
+            http: HttpClient::new(),
         }
     }
 
@@ -63,25 +63,18 @@ impl FinamClient {
     }
 
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<String, FinamError> {
-        let url = if query.is_empty() {
-            format!("{BASE_URL}{path}")
-        } else {
-            let query = query
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join("&");
-            format!("{BASE_URL}{path}?{query}")
-        };
+        let mut request =
+            HttpRequest::get(Destination::FinamApi, path).with_bearer(self.token.expose());
+        for (key, value) in query {
+            request = request.with_query(key, value);
+        }
         let response = self
             .http
-            .get(url)
-            .bearer_auth(self.token.expose())
-            .send()
+            .send(&request)
             .await
             .map_err(|_| FinamError::Network)?;
-        let status = response.status().as_u16();
-        let body = response.text().await.map_err(|_| FinamError::Network)?;
+        let status = response.status;
+        let body = String::from_utf8(response.body).map_err(|_| FinamError::MalformedResponse)?;
         classify_response(status, &body, self.token.expose())?;
         Ok(body)
     }

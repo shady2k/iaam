@@ -12,17 +12,28 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
+use iaam_app::ingest::journal_event::normalize_journal_event;
+use iaam_app::ingest::operation::NormalizationContext;
 use iaam_app::ingest::{Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
-use iaam_app::scenarios::ingest::submit_operations;
+use iaam_app::scenarios::ingest::{submit_candidates, submit_operations};
+use iaam_app::scenarios::market_reference::{
+    MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
+    list_market_key_rate as read_market_key_rate, list_market_prices as read_market_prices,
+};
 use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, statuses};
 use iaam_app::scenarios::reports::{ReturnsQuery, returns};
-use iaam_app::sync::sync_broker as run_sync_broker;
+use iaam_app::sync::{
+    MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
+    sync_market_with_services as run_market_sync,
+};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::Event;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
-use iaam_core::money::{PostedMinor, Quantity};
+use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
+use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::PROJECTION_VERSION;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
@@ -30,8 +41,8 @@ use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
 use iaam_core::rules::LotRuleVersion;
 use iaam_core::valuation::{FxSource, FxTable};
 use rust_decimal::Decimal;
-use serde::Deserialize;
-use time::Date;
+use serde::{Deserialize, Serialize};
+use time::{Date, OffsetDateTime};
 use utoipa::IntoParams;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -41,11 +52,13 @@ use crate::dto::{
     AccountDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerAccessUpdateRequest,
     BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
     ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
-    CreateContourVersionRequest, CreateTokenRequest, CurrencyDto, DimensionStatusDto, DocumentDto,
-    DocumentParams, EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto,
-    OwnerBalanceRequest, ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsReportDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto,
-    TokenScopeDto, VerdictDto,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
+    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
+    MarketSyncRequest, OwnerBalanceRequest, QuotationBasisDto, ReconciliationParams,
+    ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -120,34 +133,71 @@ pub async fn resolve_instrument(
     }))
 }
 
-/// Защита точки записи глобального справочника.
+/// Запись инструмента в глобальный справочник.
 ///
-/// Порт справочника предоставляет только чтение и разрешение кодов.
-/// Поэтому право проверяется до чтения тела, а разрешённая запись останется
-/// невозможной до появления отдельного метода порта.
+/// Право проверяется до разбора тела: агентский токен должен получить 403
+/// даже для тела, которое само по себе некорректно (§7, §14).
 #[utoipa::path(
     post,
     path = "/v1/instruments",
-    request_body = InstrumentDto,
+    request_body = CreateInstrumentRequest,
     responses(
+        (status = 201, description = "Инструмент записан", body = InstrumentDto),
         (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 501, description = "Запись не поддерживается портом", body = ApiError)
+        (status = 422, description = "Некорректные данные инструмента", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_instrument(
+    State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     body: Bytes,
-) -> Result<StatusCode, ApiFailure> {
+) -> Result<(StatusCode, Json<InstrumentDto>), ApiFailure> {
     require_admin(&principal)?;
-    let _ = body;
-    Err(ApiFailure::new(
-        StatusCode::NOT_IMPLEMENTED,
-        ApiError::simple(
-            "not_implemented",
-            "порт справочника не предоставляет запись инструментов",
-        ),
-    ))
+    let request: CreateInstrumentRequest = serde_json::from_slice(&body)
+        .map_err(|error| invalid_field("body", "JSON-объект инструмента", error.to_string()))?;
+    let id = InstrumentId(request.id.unwrap_or_else(Uuid::new_v4));
+    let kind = request
+        .kind
+        .as_deref()
+        .map(|kind| {
+            InstrumentKind::from_code(kind).ok_or_else(|| {
+                invalid_field(
+                    "kind",
+                    "share, depositary_receipt, bond, etf, mutual_fund, currency, crypto, \
+                     real_estate, private_share или loan",
+                    kind.to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    let currencies = CurrencyRoles {
+        denomination: parse_currency("denomination_currency", &request.denomination_currency)?,
+        settlement: parse_currency("settlement_currency", &request.settlement_currency)?,
+        quote: parse_currency("quote_currency", &request.quote_currency)?,
+    };
+    let id = state
+        .services
+        .directory
+        .record_instrument(iaam_app::ports::InstrumentUpsert {
+            id,
+            kind,
+            symbol: request.symbol,
+            title: request.title,
+            currencies,
+            lineage: None,
+        })
+        .await?;
+    let instrument = state
+        .services
+        .directory
+        .instrument(id)
+        .await?
+        .ok_or_else(|| iaam_app::error::AppError::NotFound {
+            what: "записанный инструмент",
+            id: id.inner().to_string(),
+        })?;
+    Ok((StatusCode::CREATED, Json(instrument_dto(instrument))))
 }
 
 /// Загрузка отчёта с построчными исходами.
@@ -456,6 +506,217 @@ pub async fn sync_broker(
     )
     .await?;
     Ok(Json(SyncOutcomeDto::from_domain(outcome)))
+}
+
+/// Ручной запуск синхронизации одной рыночной серии.
+#[utoipa::path(
+    post,
+    path = "/v1/market/sync",
+    request_body = MarketSyncRequest,
+    responses(
+        (status = 200, description = "Результат синхронизации рынка", body = MarketSyncOutcomeDto),
+        (status = 403, description = "Недостаточно прав", body = ApiError),
+        (status = 422, description = "Некорректный диапазон", body = ApiError),
+        (status = 503, description = "Рыночный транспорт не настроен", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn sync_market(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<MarketSyncRequest>,
+) -> Result<Json<MarketSyncOutcomeDto>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let from = parse_query_date("from", &request.from)?;
+    let to = parse_query_date("to", &request.to)?;
+    let source = market_source(request.source);
+    let request = AppMarketSyncRequest { source, from, to };
+    let outcome = run_market_sync(state.services.as_ref(), request).await?;
+    Ok(Json(MarketSyncOutcomeDto::from_domain(outcome)))
+}
+
+/// Параметры ряда цен.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketPricesParams {
+    pub instrument: Uuid,
+    pub board: String,
+    pub session: i64,
+    #[param(value_type = String, format = Date)]
+    pub from: String,
+    #[param(value_type = String, format = Date)]
+    pub to: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Параметры ряда курсов.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketFxParams {
+    pub from: CurrencyDto,
+    pub to: CurrencyDto,
+    #[param(value_type = String, format = Date)]
+    pub from_date: String,
+    #[param(value_type = String, format = Date)]
+    pub to_date: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Параметры ряда ключевой ставки.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MarketKeyRateParams {
+    #[param(value_type = String, format = Date)]
+    pub from: String,
+    #[param(value_type = String, format = Date)]
+    pub to: String,
+    #[serde(default)]
+    pub knowledge_as_of: Option<String>,
+}
+
+/// Ряд цен с provenance каждой строки.
+#[utoipa::path(
+    get,
+    path = "/v1/market/prices",
+    params(MarketPricesParams),
+    responses(
+        (status = 200, description = "Цены с provenance", body = Vec<MarketPriceDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_prices(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketPricesParams>,
+) -> Result<Json<Vec<MarketPriceDto>>, ApiFailure> {
+    let from = parse_query_date("from", &params.from)?;
+    let to = parse_query_date("to", &params.to)?;
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let views = read_market_prices(
+        state.services.as_ref(),
+        MarketPricesQuery {
+            instrument: InstrumentId(params.instrument),
+            board: params.board,
+            session: params.session,
+            from,
+            to,
+            knowledge_as_of,
+        },
+    )
+    .await?;
+    Ok(Json(views.into_iter().map(market_price_dto).collect()))
+}
+
+/// Ряд официальных курсов с provenance каждой строки.
+#[utoipa::path(
+    get,
+    path = "/v1/market/fx",
+    params(MarketFxParams),
+    responses(
+        (status = 200, description = "Курсы с provenance", body = Vec<MarketFxDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_fx(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketFxParams>,
+) -> Result<Json<Vec<MarketFxDto>>, ApiFailure> {
+    let from = parse_query_date("from_date", &params.from_date)?;
+    let to = parse_query_date("to_date", &params.to_date)?;
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let views = read_market_fx(
+        state.services.as_ref(),
+        MarketFxQuery {
+            from: params.from.to_domain(),
+            to: params.to.to_domain(),
+            from_date: from,
+            to_date: to,
+            knowledge_as_of,
+        },
+    )
+    .await?;
+    Ok(Json(views.into_iter().map(market_fx_dto).collect()))
+}
+
+/// Интервалы официальной ключевой ставки с provenance границ.
+#[utoipa::path(
+    get,
+    path = "/v1/market/key-rate",
+    params(MarketKeyRateParams),
+    responses(
+        (status = 200, description = "Интервалы ставки с provenance", body = Vec<MarketKeyRateDto>),
+        (status = 422, description = "Некорректный диапазон", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_market_key_rate(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+    Query(params): Query<MarketKeyRateParams>,
+) -> Result<Json<Vec<MarketKeyRateDto>>, ApiFailure> {
+    let from = parse_query_date("from", &params.from)?;
+    let to = parse_query_date("to", &params.to)?;
+    let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
+    let views = read_market_key_rate(
+        state.services.as_ref(),
+        MarketKeyRateQuery {
+            from,
+            to,
+            knowledge_as_of,
+        },
+    )
+    .await?;
+    Ok(Json(views.into_iter().map(market_key_rate_dto).collect()))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct MarketSyncOutcomeDto {
+    pub status: String,
+    pub rows: usize,
+    pub covered_from: Option<String>,
+    pub covered_to: Option<String>,
+}
+
+impl MarketSyncOutcomeDto {
+    fn from_domain(outcome: iaam_app::sync::MarketSyncResult) -> Self {
+        Self {
+            status: outcome.status().to_owned(),
+            rows: outcome.rows,
+            covered_from: outcome.covered.map(|coverage| coverage.from.to_string()),
+            covered_to: outcome.covered.map(|coverage| coverage.to.to_string()),
+        }
+    }
+}
+
+fn market_source(source: MarketSourceDto) -> MarketSource {
+    match source {
+        MarketSourceDto::Moex {
+            engine,
+            market,
+            board,
+            secid,
+            instrument,
+        } => MarketSource::Moex {
+            engine,
+            market,
+            board,
+            secid,
+            instrument: InstrumentId(instrument),
+        },
+        MarketSourceDto::CbrDaily => MarketSource::CbrDaily,
+        MarketSourceDto::CbrDynamic {
+            cbr_currency_id,
+            to,
+        } => MarketSource::CbrDynamic {
+            cbr_currency_id,
+            to: to.to_domain(),
+        },
+        MarketSourceDto::CbrKeyRate => MarketSource::CbrKeyRate,
+    }
 }
 /// Ротация доступа без возврата переданного секрета.
 #[utoipa::path(
@@ -958,6 +1219,61 @@ pub async fn ingest_operations(
     Ok(Json(verdicts))
 }
 
+/// Приёмка журнальных фактов: корпоративных действий и оферты.
+#[utoipa::path(
+    post,
+    path = "/v1/ingest/journal-events",
+    request_body = SubmitJournalEventsRequest,
+    responses(
+        (status = 200, description = "Вердикт по каждому факту", body = Vec<VerdictDto>),
+        (status = 403, description = "Недостаточно прав", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn ingest_journal_events(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<SubmitJournalEventsRequest>,
+) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let source = SourceId::new_random();
+
+    // Разбор DTO даёт вердикт на элемент: один непонятый факт
+    // не отменяет остальные (§10.1). Порядок ответа — порядок пачки,
+    // поэтому номер строки едет вместе с кандидатом.
+    let context = NormalizationContext {
+        owner: principal.owner,
+        source,
+    };
+    let mut verdicts: Vec<VerdictDto> = Vec::with_capacity(request.events.len());
+    let mut accepted: Vec<usize> = Vec::new();
+    let mut candidates: Vec<Result<Event, Rejection>> = Vec::new();
+    for (index, event) in request.events.iter().enumerate() {
+        match event
+            .to_domain()
+            .and_then(|submitted| normalize_journal_event(&submitted, context))
+        {
+            Ok(normalized) => {
+                accepted.push(index + 1);
+                candidates.push(Ok(normalized.event));
+            }
+            Err(rejection) => verdicts.push(VerdictDto::from_domain(
+                index + 1,
+                &Verdict::Rejected { rejection },
+            )),
+        }
+    }
+
+    let outcomes = submit_candidates(&state.services, &principal, "fact", candidates).await?;
+    for (row, verdict) in accepted.iter().zip(outcomes.iter()) {
+        verdicts.push(VerdictDto::from_domain(*row, verdict));
+    }
+    verdicts.sort_by_key(|verdict| verdict.row);
+    Ok(Json(verdicts))
+}
+
 /// Приёмка CSV.
 #[utoipa::path(
     post,
@@ -1047,9 +1363,9 @@ pub async fn returns_report(
         contour_version: params.contour_version.map(ContourVersion),
         as_of: parse_as_of(params.as_of.as_deref())?,
         report_currency: params.currency.to_domain(),
-        // Курсы на этапе 1 называет владелец: рыночные данные — E3.
-        // Источник записывается в отчёт, поэтому подмены не происходит.
-        fx: FxTable::new(FxSource::OwnerSupplied),
+        // Официальные курсы читаются сценарием из MarketStore: сервер
+        // не знает ни адаптера, ни формата источника.
+        fx: FxTable::new(FxSource::CbrOfficial),
         lot_rule: LotRuleVersion(1),
     };
     let report = returns(&state.services, &principal, &query).await?;
@@ -1058,8 +1374,8 @@ pub async fn returns_report(
 
 /// Курсы, переданные вместе с запросом отчёта.
 ///
-/// Отдельный обработчик, а не поле запроса `GET`: таблица курсов —
-/// это тело, а тело у `GET` бывает, но им никто не пользуется.
+/// Это явный переход для владельческого источника: ответ помечен
+/// `owner_supplied` и не смешивается с официальным маршрутом выше.
 #[utoipa::path(
     post,
     path = "/v1/reports/returns",
@@ -1182,12 +1498,75 @@ fn reconciliation_status_dto(status: &ReconciliationStatus) -> ReconciliationSta
     }
 }
 
+fn parse_knowledge_as_of(value: Option<&str>) -> Result<OffsetDateTime, ApiFailure> {
+    let Some(value) = value else {
+        return Ok(OffsetDateTime::now_utc());
+    };
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| invalid_field("knowledge_as_of", "RFC 3339", value.to_owned()))
+}
+
+fn market_price_dto(
+    view: iaam_app::scenarios::market_reference::MarketPriceView,
+) -> MarketPriceDto {
+    MarketPriceDto {
+        instrument: view.instrument.inner(),
+        board: view.board,
+        session: view.session,
+        kind: view.kind,
+        value: view.value,
+        currency: view.currency,
+        quotation_basis: QuotationBasisDto::from_domain(view.quotation_basis),
+        basis_evidence: (!view.basis_evidence.is_empty()).then_some(view.basis_evidence),
+        date: view.date,
+        source: view.source,
+        observed_at: view.observed_at,
+        quality: view.quality,
+        complete_through: view.complete_through,
+    }
+}
+
+fn market_fx_dto(view: iaam_app::scenarios::market_reference::MarketFxView) -> MarketFxDto {
+    MarketFxDto {
+        from: CurrencyDto::from_domain(view.from),
+        to: CurrencyDto::from_domain(view.to),
+        nominal: view.nominal,
+        value: view.value,
+        unit_rate: view.unit_rate,
+        date: view.date,
+        source: view.source,
+        observed_at: view.observed_at,
+        quality: view.quality,
+        complete_through: view.complete_through,
+    }
+}
+
+fn market_key_rate_dto(
+    view: iaam_app::scenarios::market_reference::MarketKeyRateView,
+) -> MarketKeyRateDto {
+    MarketKeyRateDto {
+        value: view.value,
+        from: view.from,
+        until: view.until,
+        source: view.source,
+        observed_at: view.observed_at,
+        quality: view.quality,
+        boundary: view.boundary,
+        complete_through: view.complete_through,
+    }
+}
+
 fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure> {
     Date::parse(
         value,
         time::macros::format_description!("[year]-[month]-[day]"),
     )
     .map_err(|_| invalid_field(field, "ГГГГ-ММ-ДД", value.to_owned()))
+}
+
+fn parse_currency(field: &'static str, value: &str) -> Result<CurrencyCode, ApiFailure> {
+    CurrencyCode::from_code(value)
+        .ok_or_else(|| invalid_field(field, "RUB, USD, EUR, CNY или XAU", value.to_owned()))
 }
 
 fn invalid_field(field: impl Into<String>, expected: &str, actual: String) -> ApiFailure {

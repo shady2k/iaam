@@ -4,8 +4,11 @@
 //! попадающее в ответ API, приходит из `iaam-core` (§3.1, §13).
 
 pub mod ingest;
+pub mod market_reference;
 pub mod reports;
+pub mod schedule;
 
+pub mod broker_dictionary;
 pub mod classification;
 pub mod documents;
 pub mod reconciliation;

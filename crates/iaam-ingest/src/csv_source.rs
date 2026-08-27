@@ -96,6 +96,87 @@ pub fn resolve_instrument(
     }
 }
 
+/// Инструмент по коду из названного пространства имён на дату.
+///
+/// Явное пространство не допускает fallback в другой namespace: отчёт,
+/// назвавший тикер, не должен случайно подобрать `broker_code`.
+pub(crate) fn resolve_instrument_in_namespace(
+    aliases: &InstrumentAliases,
+    namespace: &str,
+    code: &str,
+    on: Date,
+) -> Result<InstrumentId, Rejection> {
+    let Some(candidates) = aliases.get(code) else {
+        return Err(Rejection {
+            field: "instrument".to_owned(),
+            expected: "код инструмента из справочника".into(),
+            actual: code.to_owned(),
+        });
+    };
+    if !candidates
+        .iter()
+        .any(|(candidate_namespace, _, _)| candidate_namespace == namespace)
+    {
+        return Err(Rejection {
+            field: "instrument".to_owned(),
+            expected: "код инструмента из справочника".into(),
+            actual: code.to_owned(),
+        });
+    }
+    let matching: BTreeSet<InstrumentId> = candidates
+        .iter()
+        .filter(|(candidate_namespace, interval, _)| {
+            candidate_namespace == namespace && interval.covers(on)
+        })
+        .map(|(_, _, id)| *id)
+        .collect();
+    match matching.len() {
+        1 => Ok(*matching.first().expect("непустое множество")),
+        0 => Err(Rejection {
+            field: "instrument".to_owned(),
+            expected: "код, действующий на дату операции".into(),
+            actual: code.to_owned(),
+        }),
+        _ => Err(Rejection {
+            field: "instrument".to_owned(),
+            expected: "один инструмент среди действующих пространств имён".into(),
+            actual: format!("{code}: неоднозначность в пространстве имён {namespace}"),
+        }),
+    }
+}
+
+/// Инструмент по коду из названного пространства без даты снимка.
+pub(crate) fn resolve_instrument_in_namespace_without_date(
+    aliases: &InstrumentAliases,
+    namespace: &str,
+    code: &str,
+) -> Result<InstrumentId, Rejection> {
+    let Some(candidates) = aliases.get(code) else {
+        return Err(Rejection {
+            field: "instrument".to_owned(),
+            expected: "код инструмента из справочника".into(),
+            actual: code.to_owned(),
+        });
+    };
+    let namespaced: Vec<_> = candidates
+        .iter()
+        .filter(|(candidate_namespace, _, _)| candidate_namespace == namespace)
+        .collect();
+    match namespaced.as_slice() {
+        [(_, _, instrument)] => Ok(*instrument),
+        [] => Err(Rejection {
+            field: "instrument".to_owned(),
+            expected: "код инструмента из справочника".into(),
+            actual: code.to_owned(),
+        }),
+        _ => Err(Rejection {
+            field: "instrument".to_owned(),
+            expected: "дата снимка отчёта для выбора кода инструмента".into(),
+            actual: code.to_owned(),
+        }),
+    }
+}
+
 /// Инструмент для снимка без даты: допустим только единственный псевдоним.
 ///
 /// Если отчёт не назвал дату снимка, несколько исторических вариантов
@@ -235,6 +316,9 @@ fn build_kind(
             },
             gross_minor: minor(row.amount.as_deref(), "amount", currency)?,
             currency,
+            // У строки CSV колонки вида дохода нет: источник его
+            // не называл, и подставить вид было бы выдумкой (§4.9).
+            kind: None,
         }),
         "fee" => Ok(OperationKind::Fee {
             amount_minor: minor(row.amount.as_deref(), "amount", currency)?,
@@ -439,6 +523,30 @@ mod tests {
         let found = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01));
 
         assert_eq!(found.expect("код разрешён"), instrument);
+    }
+    #[test]
+    fn an_explicit_namespace_does_not_fall_back_to_other_namespaces() {
+        let broker_instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![(
+                "broker_code".to_owned(),
+                AliasInterval {
+                    valid_from: date!(2020 - 01 - 01),
+                    valid_to: None,
+                },
+                broker_instrument,
+            )],
+        );
+
+        let refused =
+            resolve_instrument_in_namespace(&aliases, "ticker", "SBER", date!(2024 - 03 - 01))
+                .expect_err("тикер не должен искать в broker_code");
+
+        assert_eq!(refused.field, "instrument");
+        assert_eq!(refused.expected, "код инструмента из справочника");
+        assert_eq!(refused.actual, "SBER");
     }
 
     #[test]

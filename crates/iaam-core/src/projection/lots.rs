@@ -15,13 +15,19 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::dates::TradeDate;
 use crate::event::Event;
+use crate::event::corporate_action::{BasisTransferRule, CorporateAction};
 use crate::event::kind::{EventKind, TradeSide};
+use crate::event::offer::OfferExerciseAction;
 use crate::ids::{AccountId, EventId, InstrumentId};
-use crate::money::{Money, MoneyError, Quantity};
+use crate::money::{Money, MoneyError, PerUnitAmount, Quantity};
 use crate::numeric::NumericError;
+use crate::numeric::decimal::Dec;
+use crate::rules::amortisation::{AmortisationError, AmortisationRuleVersion};
 use crate::rules::lot_disposal::{
-    DisposalError, DisposalInput, DisposalResult, Lot, LotId, RuleId,
+    DisposalError, DisposalInput, DisposalResult, Lot, LotId, PrincipalError, PrincipalState,
+    RuleId,
 };
 use crate::rules::{LotRuleVersion, RuleRegistry};
 
@@ -42,6 +48,17 @@ pub enum LotError {
         event: EventId,
         instrument: InstrumentId,
     },
+    #[error("в реестре нет правила амортизации версии {version:?}")]
+    UnknownAmortisationRule { version: AmortisationRuleVersion },
+    #[error(
+        "событие названо на количество {declared:?}, а на счёте по этой бумаге {held:?}: \
+         корпоративное действие касается всей позиции, и расхождение — брак источника"
+    )]
+    QuantityMismatch { held: Quantity, declared: Quantity },
+    #[error(transparent)]
+    Amortisation(#[from] AmortisationError),
+    #[error(transparent)]
+    Principal(#[from] PrincipalError),
     #[error(transparent)]
     Disposal(#[from] DisposalError),
     #[error(transparent)]
@@ -55,6 +72,10 @@ pub enum LotError {
 pub enum BasisGap {
     /// Позиция восстановлена без документированной стоимости (§10.7).
     RestoredWithoutBasis,
+    /// Номинал бумаги неизвестен, поэтому долю возвращённой при
+    /// амортизации стоимости считать не от чего (§4.9). Факт применён,
+    /// реализованный результат — невычислим.
+    PrincipalUnknown,
 }
 
 impl BasisGap {
@@ -62,6 +83,7 @@ impl BasisGap {
     pub const fn code(self) -> &'static str {
         match self {
             Self::RestoredWithoutBasis => "restored_without_basis",
+            Self::PrincipalUnknown => "principal_unknown",
         }
     }
 }
@@ -142,6 +164,52 @@ impl InstrumentLots {
         Money::sum(&amounts, first.cost_basis.currency()).map(Some)
     }
 
+    /// Партии для правки внутри модуля.
+    ///
+    /// Метод-аксессор, а не прямой доступ к приватному полю: правка
+    /// партий — операция книги, и её место видно по вызовам.
+    fn lots_mut(&mut self) -> &mut [Lot] {
+        &mut self.lots
+    }
+
+    /// Отметить разрыв в стоимости. Реализованный результат при этом
+    /// становится невычислимым: один разрыв делает невычислимым весь
+    /// инструмент, а не «почти всё».
+    fn mark_basis_gap(&mut self, gap: BasisGap) {
+        self.gap = Some(gap);
+        self.realized = None;
+    }
+
+    /// Прибавить реализованный результат, если он ещё вычислим.
+    fn add_realised(&mut self, amount: Money) -> Result<(), MoneyError> {
+        if self.gap.is_some() {
+            return Ok(());
+        }
+        self.realized = Some(match self.realized {
+            Some(previous) => previous.try_add(amount)?,
+            None => amount,
+        });
+        Ok(())
+    }
+
+    /// Прибавить списанную стоимость: тождество «приобретено = осталось
+    /// плюс списано» проверяется инвариантом проекции.
+    fn add_released_basis(&mut self, amount: Money) -> Result<(), MoneyError> {
+        self.released_basis = Some(match self.released_basis {
+            Some(previous) => previous.try_add(amount)?,
+            None => amount,
+        });
+        Ok(())
+    }
+
+    fn add_acquired_basis(&mut self, amount: Money) -> Result<(), MoneyError> {
+        self.acquired_basis = Some(match self.acquired_basis {
+            Some(previous) => previous.try_add(amount)?,
+            None => amount,
+        });
+        Ok(())
+    }
+
     /// Суммарное количество: партии плюс восстановленный остаток.
     pub fn quantity(&self) -> Result<Quantity, NumericError> {
         self.lots
@@ -163,12 +231,49 @@ struct TradeFacts {
     fee: Option<Money>,
 }
 
+/// Факты амортизации, нужные книге лотов.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AmortisationFacts {
+    instrument: InstrumentId,
+    quantity: Quantity,
+    returned_per_unit: PerUnitAmount,
+    compensation: Money,
+}
+
+/// Факты замещения, нужные книге лотов.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ConversionFacts {
+    predecessor: InstrumentId,
+    successor: InstrumentId,
+    ratio: Dec,
+    quantity_in: Quantity,
+    quantity_out: Quantity,
+    basis_transfer: BasisTransferRule,
+    effective_date: time::Date,
+}
+
 /// Книга лотов и применённое правило.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LotBook {
     entries: BTreeMap<LotKey, InstrumentLots>,
     rule_version: LotRuleVersion,
     applied_rule: Option<RuleId>,
+    /// Версия правила амортизации. Отдельная от версии списания:
+    /// списание лотов — выбор владельца, амортизация — событие выпуска.
+    ///
+    /// `#[serde(default)]` обязателен: снимки проекций записаны до E3.4
+    /// и этого поля не содержат.
+    #[serde(default = "default_amortisation_version")]
+    amortisation_version: AmortisationRuleVersion,
+}
+
+/// Версия правила амортизации в снимке, записанном до E3.4.
+///
+/// Единица, а не «неизвестно»: до E3.4 амортизация не применялась вовсе,
+/// поэтому продолжение такого снимка ничего не пересчитывает задним
+/// числом — оно применяет правило к фактам, которых раньше не было.
+fn default_amortisation_version() -> AmortisationRuleVersion {
+    AmortisationRuleVersion(1)
 }
 
 impl LotBook {
@@ -178,7 +283,20 @@ impl LotBook {
             entries: BTreeMap::new(),
             rule_version,
             applied_rule: None,
+            amortisation_version: default_amortisation_version(),
         }
+    }
+
+    /// Книга с явно выбранной версией правила амортизации.
+    #[must_use]
+    pub fn with_amortisation_version(mut self, version: AmortisationRuleVersion) -> Self {
+        self.amortisation_version = version;
+        self
+    }
+
+    #[must_use]
+    pub const fn amortisation_version(&self) -> AmortisationRuleVersion {
+        self.amortisation_version
     }
 
     #[must_use]
@@ -245,6 +363,10 @@ impl LotBook {
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. } => Ok(()),
+            EventKind::CorporateAction { action } => {
+                self.apply_corporate_action(event, action, rules)
+            }
+            EventKind::OfferExercise { action } => self.apply_offer_exercise(event, action, rules),
         }
     }
 
@@ -291,6 +413,9 @@ impl LotBook {
                     acquired: event.dates.trade,
                     quantity,
                     cost_basis: basis,
+                    // Номинал сюда придёт из справочника в E3.4;
+                    // подставлять ноль запрещено (§4.9).
+                    principal: PrincipalState::Unknown,
                 });
                 Ok(())
             }
@@ -301,6 +426,276 @@ impl LotBook {
                 };
                 self.dispose(event, key, quantity, proceeds, rules)
             }
+        }
+    }
+
+    /// Корпоративное действие по бумаге (§4.7).
+    ///
+    /// Диспетчер исчерпывающий: новый член семейства обязан сломать
+    /// сборку здесь, а не молча оставить лоты прежними.
+    fn apply_corporate_action(
+        &mut self,
+        event: &Event,
+        action: &CorporateAction,
+        rules: &RuleRegistry,
+    ) -> Result<(), LotError> {
+        match action {
+            CorporateAction::PartialRedemption {
+                instrument,
+                quantity,
+                principal_returned_per_unit,
+                compensation,
+                ..
+            } => self.apply_amortisation(
+                event,
+                AmortisationFacts {
+                    instrument: *instrument,
+                    quantity: *quantity,
+                    returned_per_unit: *principal_returned_per_unit,
+                    compensation: *compensation,
+                },
+                rules,
+            ),
+            // Погашение возвращает номинал целиком и выводит бумагу
+            // из позиции: это выбытие всей позиции, и считается оно тем
+            // же путём, что продажа. Порядок списания при полном выбытии
+            // безразличен, поэтому выбор правила владельцем ничего
+            // не меняет — но след аудита остаётся тот же.
+            CorporateAction::Redemption {
+                instrument,
+                quantity,
+                compensation,
+                ..
+            } => {
+                let key = LotKey {
+                    account: event.account,
+                    instrument: *instrument,
+                };
+                self.require_whole_position(event, key, *quantity)?;
+                self.dispose(event, key, *quantity, *compensation, rules)
+            }
+            CorporateAction::Conversion {
+                predecessor,
+                successor,
+                ratio,
+                quantity_in,
+                quantity_out,
+                basis_transfer,
+                effective_date,
+                ..
+            } => self.apply_conversion(
+                event,
+                ConversionFacts {
+                    predecessor: *predecessor,
+                    successor: *successor,
+                    ratio: *ratio,
+                    quantity_in: *quantity_in,
+                    quantity_out: *quantity_out,
+                    basis_transfer: *basis_transfer,
+                    effective_date: *effective_date,
+                },
+            ),
+        }
+    }
+
+    /// Исполнение оферты (§3.5).
+    fn apply_offer_exercise(
+        &mut self,
+        event: &Event,
+        action: &OfferExerciseAction,
+        rules: &RuleRegistry,
+    ) -> Result<(), LotError> {
+        match action {
+            // Заявка и её отзыв лотов не двигают: бумага остаётся
+            // у владельца, пока выкуп не состоялся. Их состояние ведёт
+            // отдельная проекция `super::offers::OfferBook`.
+            OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => Ok(()),
+            // Выкуп — выбытие: бумага уходит, деньги приходят.
+            OfferExerciseAction::Settled {
+                instrument,
+                quantity,
+                gross,
+                fee,
+                accrued_interest,
+                ..
+            } => {
+                let key = LotKey {
+                    account: event.account,
+                    instrument: *instrument,
+                };
+                let mut proceeds = *gross;
+                if let Some(interest) = accrued_interest {
+                    proceeds = proceeds.try_add(*interest)?;
+                }
+                if let Some(fee) = fee {
+                    proceeds = proceeds.try_sub(*fee)?;
+                }
+                self.dispose(event, key, *quantity, proceeds, rules)
+            }
+        }
+    }
+
+    /// Амортизация: остаток номинала уменьшается, количество — нет (§6.5).
+    ///
+    /// Целимся по паре «счёт и бумага»: [`LotKey`] намеренно не различает
+    /// место хранения, и custody из события — факт о выплате, а не ключ
+    /// выборки лотов.
+    fn apply_amortisation(
+        &mut self,
+        event: &Event,
+        facts: AmortisationFacts,
+        rules: &RuleRegistry,
+    ) -> Result<(), LotError> {
+        let key = LotKey {
+            account: event.account,
+            instrument: facts.instrument,
+        };
+        self.require_whole_position(event, key, facts.quantity)?;
+        let rule = rules.amortisation_rule(self.amortisation_version).ok_or(
+            LotError::UnknownAmortisationRule {
+                version: self.amortisation_version,
+            },
+        )?;
+        let entry = self
+            .entries
+            .get(&key)
+            .ok_or(LotError::SaleWithoutPosition {
+                event: event.id,
+                instrument: facts.instrument,
+            })?;
+
+        // Считаем на копии и подменяем целиком: иначе отказ на втором
+        // лоте оставил бы первый уже изменённым, а половина применённого
+        // факта хуже неприменённого.
+        let mut next = entry.clone();
+        let mut returned_total = Money::zero(facts.compensation.currency());
+        let mut principal_unknown = false;
+        for lot in next.lots_mut() {
+            match rule.basis_returned(lot, facts.returned_per_unit) {
+                Ok(returned) => {
+                    lot.cost_basis = lot.cost_basis.try_sub(returned)?;
+                    returned_total = returned_total.try_add(returned)?;
+                    lot.principal = lot.principal.reduced_by(facts.returned_per_unit)?;
+                }
+                // Номинал неизвестен — факт всё равно применяется,
+                // а реализованный результат становится невычислимым
+                // (§4.9). Уменьшать нечего: остаток и был неизвестен.
+                Err(AmortisationError::UnknownPrincipal) => principal_unknown = true,
+                Err(other) => return Err(other.into()),
+            }
+        }
+        if principal_unknown {
+            next.mark_basis_gap(BasisGap::PrincipalUnknown);
+        }
+        if !returned_total.is_zero() {
+            next.add_released_basis(returned_total)?;
+        }
+        // Возврат собственного капитала доходом не является: при
+        // компенсации, равной возвращённой стоимости, реализуется ноль.
+        next.add_realised(facts.compensation.try_sub(returned_total)?)?;
+        self.entries.insert(key, next);
+        Ok(())
+    }
+
+    /// Замещение: партии предшественника становятся партиями преемника.
+    fn apply_conversion(&mut self, event: &Event, facts: ConversionFacts) -> Result<(), LotError> {
+        let from = LotKey {
+            account: event.account,
+            instrument: facts.predecessor,
+        };
+        self.require_whole_position(event, from, facts.quantity_in)?;
+        let source = self
+            .entries
+            .get(&from)
+            .ok_or(LotError::SaleWithoutPosition {
+                event: event.id,
+                instrument: facts.predecessor,
+            })?
+            .clone();
+
+        let mut moved = Vec::with_capacity(source.lots().len());
+        let mut assigned = Dec::zero();
+        let mut carried = Vec::with_capacity(source.lots().len());
+        for (index, lot) in source.lots().iter().enumerate() {
+            let last = index + 1 == source.lots().len();
+            // Последней партии достаётся остаток: дробь округляли
+            // на уровне всего замещения, и раскладывать её обратно
+            // по партиям нечем. Так сумма партий равна количеству
+            // из факта точно, а не почти.
+            let quantity = if last {
+                Quantity(facts.quantity_out.0.checked_sub(assigned)?)
+            } else {
+                Quantity(lot.quantity.0.checked_mul(facts.ratio)?)
+            };
+            assigned = assigned.checked_add(quantity.0)?;
+            carried.push(lot.cost_basis);
+            moved.push(Lot {
+                id: lot.id,
+                instrument: facts.successor,
+                acquired: match facts.basis_transfer {
+                    // Срок владения переходит целиком: замещение
+                    // не является приобретением (§16.1).
+                    BasisTransferRule::CarryOver => lot.acquired,
+                    // Замещение приравнено к продаже и покупке.
+                    BasisTransferRule::Restart => Some(TradeDate(facts.effective_date)),
+                },
+                quantity,
+                // Стоимость переносится как есть. Компенсация дробей
+                // из неё **не** вычитается: как она влияет на базу —
+                // правило E5, и решать за него часть 1 не вправе.
+                cost_basis: lot.cost_basis,
+                // Номинал преемника — свойство другого выпуска, и
+                // вывести его из номинала предшественника нечем.
+                // Подставить прежний значило бы выдумать (§4.9).
+                principal: PrincipalState::Unknown,
+            });
+        }
+        let currency = match carried.first() {
+            Some(first) => first.currency(),
+            // Позиция без партий: замещать нечего, но и ошибки нет —
+            // количество уже сверено с фактом.
+            None => return Ok(()),
+        };
+        let carried_total = Money::sum(&carried, currency)?;
+
+        let mut source = source;
+        source.lots.clear();
+        source.add_released_basis(carried_total)?;
+        self.entries.insert(from, source);
+
+        let to = LotKey {
+            account: event.account,
+            instrument: facts.successor,
+        };
+        let target = self.entries.entry(to).or_default();
+        target.add_acquired_basis(carried_total)?;
+        target.lots.extend(moved);
+        Ok(())
+    }
+
+    /// Корпоративное действие касается всей позиции по бумаге на счёте.
+    ///
+    /// Расхождение — брак источника, а не повод уменьшить номинал
+    /// пропорционально: масштабирование выдало бы испорченные данные
+    /// за корректный расчёт.
+    fn require_whole_position(
+        &self,
+        event: &Event,
+        key: LotKey,
+        declared: Quantity,
+    ) -> Result<(), LotError> {
+        let entry = self
+            .entries
+            .get(&key)
+            .ok_or(LotError::SaleWithoutPosition {
+                event: event.id,
+                instrument: key.instrument,
+            })?;
+        let held = entry.quantity()?;
+        if held == declared {
+            Ok(())
+        } else {
+            Err(LotError::QuantityMismatch { held, declared })
         }
     }
 
@@ -332,6 +727,7 @@ impl LotBook {
                         acquired: event.dates.trade,
                         quantity,
                         cost_basis: basis,
+                        principal: PrincipalState::Unknown,
                     },
                 );
             }
@@ -424,6 +820,362 @@ mod tests {
 
     fn qty(units: i64) -> Quantity {
         Quantity(Dec::new(Decimal::from(units)))
+    }
+
+    // --- корпоративные действия и оферта ---
+
+    fn per_unit(text: &str) -> PerUnitAmount {
+        PerUnitAmount::new(
+            Dec::new(Decimal::from_str_exact(text).unwrap()),
+            CurrencyCode::Rub,
+        )
+    }
+
+    fn dec(text: &str) -> Dec {
+        Dec::new(Decimal::from_str_exact(text).unwrap())
+    }
+
+    /// Позиция по облигации, собранная напрямую: событие покупки
+    /// номинала не знает, а тесту он нужен как исходное состояние.
+    struct Bond {
+        account: AccountId,
+        instrument: InstrumentId,
+        custody: CustodyId,
+    }
+
+    impl Bond {
+        fn new() -> Self {
+            Self {
+                account: AccountId::new_random(),
+                instrument: InstrumentId::new_random(),
+                custody: CustodyId::new_random(),
+            }
+        }
+
+        fn key(&self) -> LotKey {
+            LotKey {
+                account: self.account,
+                instrument: self.instrument,
+            }
+        }
+
+        fn amortisation(&self, units: i64, returned: &str, compensation: i64) -> Event {
+            event_with(
+                self.account,
+                date!(2026 - 06 - 15),
+                5,
+                EventKind::CorporateAction {
+                    action: CorporateAction::PartialRedemption {
+                        instrument: self.instrument,
+                        custody: self.custody,
+                        quantity: qty(units),
+                        principal_returned_per_unit: per_unit(returned),
+                        compensation: rub(compensation),
+                        effective_date: date!(2026 - 06 - 15),
+                        record_date: None,
+                        grounds: None,
+                    },
+                },
+                vec![Leg::principal(
+                    self.account,
+                    self.instrument,
+                    rub(compensation),
+                )],
+            )
+        }
+    }
+
+    fn bond_lot(bond: &Bond, units: i64, principal: PrincipalState, basis: i64) -> Lot {
+        Lot {
+            id: LotId::new_random(),
+            instrument: bond.instrument,
+            acquired: Some(crate::dates::TradeDate(date!(2024 - 03 - 01))),
+            quantity: qty(units),
+            cost_basis: rub(basis),
+            principal,
+        }
+    }
+
+    fn book_with_lots(bond: &Bond, lots: Vec<Lot>) -> LotBook {
+        let mut book = LotBook::new(LotRuleVersion(1));
+        let acquired: Vec<Money> = lots.iter().map(|lot| lot.cost_basis).collect();
+        let entry = book.entries.entry(bond.key()).or_default();
+        entry.acquired_basis = Money::sum(&acquired, CurrencyCode::Rub).ok();
+        entry.lots = lots;
+        book
+    }
+
+    fn remaining_principal(entry: &InstrumentLots) -> Option<PerUnitAmount> {
+        entry.lots().first()?.principal.remaining_per_unit()
+    }
+
+    fn known(original: &str, remaining: &str) -> PrincipalState {
+        PrincipalState::known(per_unit(original), per_unit(remaining)).unwrap()
+    }
+
+    #[test]
+    fn amortisation_reduces_principal_and_leaves_the_quantity_alone() {
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
+        );
+
+        book.apply(&bond.amortisation(10, "200", 200_000), &rules)
+            .unwrap();
+
+        let entry = book.entry(&bond.key()).unwrap();
+        assert_eq!(entry.quantity().unwrap(), qty(10));
+        assert_eq!(remaining_principal(entry), Some(per_unit("800")));
+    }
+
+    #[test]
+    fn an_amortisation_for_a_different_quantity_is_an_error_not_a_scaling() {
+        // Амортизация касается всех бумаг на счёте. Несовпадение — брак
+        // источника, а не повод уменьшить номинал пропорционально.
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
+        );
+
+        assert!(matches!(
+            book.apply(&bond.amortisation(4, "200", 80_000), &rules),
+            Err(LotError::QuantityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_amortisation_returning_exactly_the_basis_realises_nothing() {
+        // §6.5: возврат собственного капитала доходом не является.
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
+        );
+
+        book.apply(&bond.amortisation(10, "200", 200_000), &rules)
+            .unwrap();
+
+        let entry = book.entry(&bond.key()).unwrap();
+        assert_eq!(entry.realized(), Some(rub(0)));
+        assert_eq!(entry.released_basis(), Some(rub(200_000)));
+        assert_eq!(entry.remaining_basis().unwrap(), Some(rub(800_000)));
+    }
+
+    #[test]
+    fn an_amortisation_paying_above_the_returned_basis_realises_the_difference() {
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        // Куплена с дисконтом: стоимость 900 000 при номинале 1000 × 10.
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 900_000)],
+        );
+
+        book.apply(&bond.amortisation(10, "200", 200_000), &rules)
+            .unwrap();
+
+        // Возвращена пятая часть стоимости — 180 000; выплачено 200 000.
+        let entry = book.entry(&bond.key()).unwrap();
+        assert_eq!(entry.released_basis(), Some(rub(180_000)));
+        assert_eq!(entry.realized(), Some(rub(20_000)));
+    }
+
+    #[test]
+    fn an_unknown_principal_records_a_basis_gap_instead_of_failing() {
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, PrincipalState::Unknown, 1_000_000)],
+        );
+
+        book.apply(&bond.amortisation(10, "200", 200_000), &rules)
+            .unwrap();
+
+        let entry = book.entry(&bond.key()).unwrap();
+        assert_eq!(entry.gap(), Some(BasisGap::PrincipalUnknown));
+        assert_eq!(entry.realized(), None);
+        // Количество и стоимость не тронуты: считать было не от чего.
+        assert_eq!(entry.quantity().unwrap(), qty(10));
+        assert_eq!(entry.remaining_basis().unwrap(), Some(rub(1_000_000)));
+    }
+
+    #[test]
+    fn a_failure_on_the_second_lot_leaves_the_first_untouched() {
+        // Половина применённого факта хуже неприменённого.
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let usd_principal = PrincipalState::known(
+            PerUnitAmount::new(dec("1000"), CurrencyCode::Usd),
+            PerUnitAmount::new(dec("1000"), CurrencyCode::Usd),
+        )
+        .unwrap();
+        let mut book = book_with_lots(
+            &bond,
+            vec![
+                bond_lot(&bond, 10, known("1000", "1000"), 1_000_000),
+                bond_lot(&bond, 10, usd_principal, 1_000_000),
+            ],
+        );
+        let before = book.clone();
+
+        assert!(
+            book.apply(&bond.amortisation(20, "200", 400_000), &rules)
+                .is_err()
+        );
+        assert_eq!(book, before);
+    }
+
+    #[test]
+    fn an_amortisation_on_another_account_leaves_this_book_alone() {
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
+        );
+        let elsewhere = Bond {
+            account: AccountId::new_random(),
+            instrument: bond.instrument,
+            custody: bond.custody,
+        };
+
+        // Позиции на том счёте нет вовсе: факт к этой книге не относится.
+        assert!(matches!(
+            book.apply(&elsewhere.amortisation(10, "200", 200_000), &rules),
+            Err(LotError::SaleWithoutPosition { .. })
+        ));
+        assert_eq!(
+            remaining_principal(book.entry(&bond.key()).unwrap()),
+            Some(per_unit("1000"))
+        );
+    }
+
+    #[test]
+    fn the_projection_uses_the_actual_payment_not_the_announced_schedule() {
+        // Фактическая выплата меньше объявленной: берётся факт.
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
+        );
+
+        book.apply(&bond.amortisation(10, "150", 150_000), &rules)
+            .unwrap();
+
+        assert_eq!(
+            remaining_principal(book.entry(&bond.key()).unwrap()),
+            Some(per_unit("850"))
+        );
+    }
+
+    #[test]
+    fn a_redemption_empties_the_position_and_releases_the_whole_basis() {
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "800"), 800_000)],
+        );
+        let redemption = event_with(
+            bond.account,
+            date!(2026 - 12 - 15),
+            6,
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption {
+                    instrument: bond.instrument,
+                    custody: bond.custody,
+                    quantity: qty(10),
+                    principal_returned_per_unit: per_unit("800"),
+                    compensation: rub(800_000),
+                    effective_date: date!(2026 - 12 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![
+                Leg::principal(bond.account, bond.instrument, rub(800_000)),
+                Leg::security(bond.account, bond.custody, bond.instrument, qty(-10)),
+            ],
+        );
+
+        book.apply(&redemption, &rules).unwrap();
+
+        let entry = book.entry(&bond.key()).unwrap();
+        assert_eq!(entry.quantity().unwrap(), qty(0));
+        assert_eq!(entry.released_basis(), Some(rub(800_000)));
+        assert_eq!(entry.realized(), Some(rub(0)));
+    }
+
+    #[test]
+    fn a_submitted_offer_leaves_the_lots_alone() {
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
+        );
+        let before = book.clone();
+        let submitted = event_with(
+            bond.account,
+            date!(2026 - 07 - 01),
+            7,
+            EventKind::OfferExercise {
+                action: crate::event::offer::OfferExerciseAction::Submitted {
+                    submission: crate::event::offer::OfferSubmissionId::new_random(),
+                    window: crate::event::offer::OfferWindowId::new_random(),
+                    instrument: bond.instrument,
+                    quantity: qty(10),
+                },
+            },
+            Vec::new(),
+        );
+
+        book.apply(&submitted, &rules).unwrap();
+        assert_eq!(book, before);
+    }
+
+    #[test]
+    fn a_settled_offer_disposes_the_bought_back_quantity() {
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
+        );
+        let settled = event_with(
+            bond.account,
+            date!(2026 - 07 - 15),
+            8,
+            EventKind::OfferExercise {
+                action: crate::event::offer::OfferExerciseAction::Settled {
+                    submission: crate::event::offer::OfferSubmissionId::new_random(),
+                    instrument: bond.instrument,
+                    custody: bond.custody,
+                    quantity: qty(4),
+                    gross: rub(420_000),
+                    fee: None,
+                    accrued_interest: None,
+                },
+            },
+            vec![
+                Leg::cash(bond.account, rub(420_000)),
+                Leg::security(bond.account, bond.custody, bond.instrument, qty(-4)),
+            ],
+        );
+
+        book.apply(&settled, &rules).unwrap();
+
+        let entry = book.entry(&bond.key()).unwrap();
+        assert_eq!(entry.quantity().unwrap(), qty(6));
+        assert_eq!(entry.released_basis(), Some(rub(400_000)));
+        assert_eq!(entry.realized(), Some(rub(20_000)));
     }
 
     struct Trade {

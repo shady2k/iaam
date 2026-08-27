@@ -4,9 +4,7 @@
 
 use std::error::Error;
 
-use iaam_broker::finam::{
-    ChannelOperationKind, FINAM_PARSER_VERSION, ParseError, parse_operations, parse_portfolio,
-};
+use iaam_broker::finam::{FINAM_PARSER_VERSION, ParseError, parse_operations, parse_portfolio};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::money::{CurrencyCode, PostedMinor};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
@@ -21,7 +19,9 @@ fn parses_synthetic_transactions_and_keeps_rejected_rows() -> Result<(), Box<dyn
         .iter()
         .find(|operation| operation.operation_id == "FINAM-TRADE-001")
         .ok_or("synthetic fixture does not contain the buy")?;
-    assert_eq!(buy.kind, ChannelOperationKind::Buy);
+    // Разбор доносит слово источника, приведённое к верхнему регистру:
+    // это свойство канала, а не словаря. Классифицирует словарь.
+    assert_eq!(buy.source_kind, "BUY");
     assert_eq!(buy.quantity_as_decimal(), Some("1".to_owned()));
     assert_eq!(
         buy.payment.as_ref().map(|money| money.amount),

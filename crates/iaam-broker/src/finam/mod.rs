@@ -5,6 +5,7 @@
 //! парсером канала.
 
 mod client;
+pub mod dictionary_seed;
 pub mod parse;
 
 pub use client::{FinamClient, FinamError};

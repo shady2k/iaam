@@ -16,7 +16,10 @@ use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::AliasInterval;
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::rules::lot_disposal::{DisposalInput, FifoV1, Lot, LotDisposalRule, LotId};
+use iaam_core::rules::lot_disposal::{
+    DisposalInput, FifoV1, Lot, LotDisposalRule, LotId, PrincipalState,
+};
+use iaam_core::rules::quotation::QuotationRule;
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 use time::macros::date;
@@ -38,6 +41,7 @@ fn tie_rounding_preserves_total_basis() {
         acquired: None,
         quantity: Quantity(Dec::new(Decimal::from(2))),
         cost_basis: Money::new(PostedMinor::new(5), CurrencyCode::Rub),
+        principal: PrincipalState::Unknown,
     }];
 
     let out = FifoV1
@@ -85,6 +89,7 @@ proptest! {
                 acquired: Some(TradeDate(date!(2026 - 01 - 01))),
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                principal: PrincipalState::Unknown,
             })
             .collect();
 
@@ -127,6 +132,7 @@ proptest! {
                 acquired: None,
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                principal: PrincipalState::Unknown,
             })
             .collect();
 
@@ -161,6 +167,7 @@ proptest! {
                 acquired: None,
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                principal: PrincipalState::Unknown,
             })
             .collect();
 
@@ -276,6 +283,47 @@ mod projection_properties {
                 None
             );
         }
+    }
+}
+
+proptest! {
+    /// При зафиксированных котировке, количестве и курсе стоимость
+    /// позиции по процентному основанию линейна по непогашенному
+    /// номиналу. Между датами меняются цена и амортизация, поэтому без
+    /// этой оговорки свойство было бы неверным.
+    #[test]
+    fn value_is_linear_in_the_remaining_face_at_a_fixed_quote(
+        quote in 1_i64..20_000,
+        face in 1_i64..1_000_000,
+        multiplier in 2_i64..10,
+    ) {
+        let value_at = |remaining_face: i64| {
+            let quote = Dec::new(Decimal::from(quote));
+            let face = iaam_core::money::PerUnitAmount::new(
+                Dec::new(Decimal::from(remaining_face)),
+                CurrencyCode::Rub,
+            );
+            let (money_per_unit, _) = iaam_core::rules::quotation::QuotationV1
+                .money_per_unit(
+                    iaam_core::valuation::QuotationBasis::PercentOfRemainingFace,
+                    quote,
+                    CurrencyCode::Rub,
+                    Some(face),
+                )
+                .expect("остаточный номинал зафиксирован");
+            money_per_unit
+                .checked_mul(Dec::new(Decimal::from(7)))
+                .expect("фиксированное количество помещается в Decimal")
+        };
+
+        let single = value_at(face);
+        let scaled = value_at(face * multiplier);
+        let factor = Dec::new(Decimal::from(multiplier));
+        prop_assert_eq!(
+            scaled,
+            single.checked_mul(factor).unwrap(),
+            "при зафиксированных входах стоимость масштабируется вместе с номиналом"
+        );
     }
 }
 

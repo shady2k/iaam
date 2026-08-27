@@ -1,4 +1,9 @@
 use iaam_core::event::provenance::ParserVersion;
+
+// Реэкспорт, чтобы `tinkoff::ChannelOperationKind` и
+// `finam::ChannelOperationKind` продолжали означать один и тот же тип:
+// имя у каналов привычное, а тип за ним теперь общий.
+pub use crate::operation_kind::ChannelOperationKind;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 use serde::Deserialize;
@@ -66,29 +71,6 @@ impl ChannelMoney {
     }
 }
 
-/// Смысл операции, выделенный из имени enum T-Invest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelOperationKind {
-    /// Покупка инструмента.
-    Buy,
-    /// Продажа инструмента.
-    Sell,
-    /// Дивидендная выплата.
-    Dividend,
-    /// Купонная выплата.
-    Coupon,
-    /// Комиссия брокера или сервиса.
-    Commission,
-    /// Пополнение счёта.
-    Deposit,
-    /// Вывод денег или бумаг.
-    Withdrawal,
-    /// Перевод между счетами или депозитариями.
-    Transfer,
-    /// Вид, который клиент ещё не классифицирует.
-    Other(String),
-}
-
 /// Операция, полученная из REST-канала T-Invest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelOperation {
@@ -102,8 +84,11 @@ pub struct ChannelOperation {
     pub parent_operation_id: Option<String>,
     /// Курсор, которым шлюз обозначил строку.
     pub cursor: String,
-    /// Классифицированный вид операции.
-    pub kind: ChannelOperationKind,
+    /// Как вид операции назвал сам канал: `OPERATION_TYPE_COUPON`
+    /// и подобное. Множество открыто и принадлежит брокеру, поэтому
+    /// строка, а не перечисление: во что она превращается, решает
+    /// словарь канала (`OperationKindDictionary`), а он живёт в данных.
+    pub source_kind: String,
     /// Исходное состояние поручения.
     pub state: String,
     /// UID инструмента, если операция его содержит.
@@ -265,7 +250,7 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         operation_id: operation_id.clone(),
         parent_operation_id: nonempty(item.parent_operation_id),
         cursor,
-        kind: operation_kind(&operation_type),
+        source_kind: operation_type.clone(),
         state,
         instrument_uid: nonempty(item.instrument_uid),
         figi: nonempty(item.figi),
@@ -287,7 +272,7 @@ fn rejected_operation(raw: Value, reason: ParseError) -> ChannelOperation {
         operation_id: String::new(),
         parent_operation_id: None,
         cursor: String::new(),
-        kind: ChannelOperationKind::Other("unparsed".to_owned()),
+        source_kind: String::new(),
         state: String::new(),
         instrument_uid: None,
         figi: None,
@@ -481,47 +466,6 @@ fn parse_date(value: &str, field: &'static str) -> Result<Date, ParseError> {
     OffsetDateTime::parse(value, &Rfc3339)
         .map(|timestamp| timestamp.date())
         .map_err(|_| ParseError::InvalidTimestamp { field })
-}
-
-fn operation_kind(value: &str) -> ChannelOperationKind {
-    match value {
-        "OPERATION_TYPE_BUY"
-        | "OPERATION_TYPE_BUY_CARD"
-        | "OPERATION_TYPE_BUY_MARGIN"
-        | "OPERATION_TYPE_DELIVERY_BUY" => ChannelOperationKind::Buy,
-        "OPERATION_TYPE_SELL"
-        | "OPERATION_TYPE_SELL_CARD"
-        | "OPERATION_TYPE_SELL_MARGIN"
-        | "OPERATION_TYPE_DELIVERY_SELL" => ChannelOperationKind::Sell,
-        "OPERATION_TYPE_DIVIDEND" | "OPERATION_TYPE_DIV_EXT" => ChannelOperationKind::Dividend,
-        "OPERATION_TYPE_COUPON" => ChannelOperationKind::Coupon,
-        "OPERATION_TYPE_BROKER_FEE"
-        | "OPERATION_TYPE_SERVICE_FEE"
-        | "OPERATION_TYPE_MARGIN_FEE"
-        | "OPERATION_TYPE_SUCCESS_FEE"
-        | "OPERATION_TYPE_TRACK_MFEE"
-        | "OPERATION_TYPE_TRACK_PFEE"
-        | "OPERATION_TYPE_CASH_FEE"
-        | "OPERATION_TYPE_OUT_FEE"
-        | "OPERATION_TYPE_OUT_STAMP_DUTY"
-        | "OPERATION_TYPE_OUTPUT_PENALTY"
-        | "OPERATION_TYPE_ADVICE_FEE"
-        | "OPERATION_TYPE_OVER_COM" => ChannelOperationKind::Commission,
-        "OPERATION_TYPE_INPUT"
-        | "OPERATION_TYPE_INPUT_SECURITIES"
-        | "OPERATION_TYPE_INPUT_SWIFT"
-        | "OPERATION_TYPE_INPUT_ACQUIRING"
-        | "OPERATION_TYPE_INP_MULTI" => ChannelOperationKind::Deposit,
-        "OPERATION_TYPE_OUTPUT"
-        | "OPERATION_TYPE_OUTPUT_SECURITIES"
-        | "OPERATION_TYPE_OUTPUT_SWIFT"
-        | "OPERATION_TYPE_OUTPUT_ACQUIRING"
-        | "OPERATION_TYPE_OUT_MULTI" => ChannelOperationKind::Withdrawal,
-        "OPERATION_TYPE_TRANS_IIS_BS" | "OPERATION_TYPE_TRANS_BS_BS" => {
-            ChannelOperationKind::Transfer
-        }
-        _ => ChannelOperationKind::Other(value.to_owned()),
-    }
 }
 
 fn required(value: Option<String>, field: &'static str) -> Result<String, ParseError> {

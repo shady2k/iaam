@@ -4,6 +4,7 @@
 //! неизменяемый вход, поэтому чистота функционального ядра сохраняется.
 //! Реестр закрытый: плагины в рантайме не нужны.
 
+pub mod amortisation;
 pub mod lot_disposal;
 pub mod valuation;
 
@@ -11,6 +12,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
 use lot_disposal::{FifoV1, LotDisposalRule};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,
@@ -26,6 +28,10 @@ pub struct LotRuleVersion(pub u32);
 pub struct RuleRegistry {
     lot_rules: BTreeMap<LotRuleVersion, Box<dyn LotDisposalRule>>,
     valuation_rules: BTreeMap<ValuationPolicyVersion, Box<dyn ValuationRule>>,
+    /// Отдельная карта, а не расширение `lot_rules`: списание лотов —
+    /// выбор владельца, амортизация — событие выпуска, и общая версия
+    /// связала бы два независимых решения.
+    amortisation_rules: BTreeMap<AmortisationRuleVersion, Box<dyn AmortisationRule>>,
 }
 
 impl RuleRegistry {
@@ -40,10 +46,30 @@ impl RuleRegistry {
             ValuationPolicyVersion(1),
             Box::new(ValuationPolicyV1::default()),
         );
+        let mut amortisation_rules: BTreeMap<AmortisationRuleVersion, Box<dyn AmortisationRule>> =
+            BTreeMap::new();
+        amortisation_rules.insert(AmortisationRuleVersion(1), Box::new(ProRataV1));
         Self {
             lot_rules,
             valuation_rules,
+            amortisation_rules,
         }
+    }
+
+    #[must_use]
+    pub fn amortisation_rule(
+        &self,
+        version: AmortisationRuleVersion,
+    ) -> Option<&dyn AmortisationRule> {
+        self.amortisation_rules
+            .get(&version)
+            .map(|rule| rule.as_ref())
+    }
+
+    /// Наибольшая доступная версия правила амортизации.
+    #[must_use]
+    pub fn latest_amortisation_version(&self) -> Option<AmortisationRuleVersion> {
+        self.amortisation_rules.keys().next_back().copied()
     }
 
     #[must_use]

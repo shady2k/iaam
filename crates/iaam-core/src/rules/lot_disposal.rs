@@ -304,7 +304,11 @@ impl LotDisposalRule for FifoV1 {
 /// Округление — половина к чётному, однократно, на границе представления
 /// в минимальных единицах (§6.6). Остаток от округления остаётся
 /// в невыбывшей части: суммарная стоимость лота сохраняется.
-fn split_basis(total: Money, taken_qty: Decimal, lot_qty: Decimal) -> Result<Money, DisposalError> {
+pub(crate) fn split_basis(
+    total: Money,
+    taken_qty: Decimal,
+    lot_qty: Decimal,
+) -> Result<Money, DisposalError> {
     debug_assert!(!lot_qty.is_zero(), "количество лота не может быть нулевым");
     let minor = Decimal::from(total.amount().raw());
     let scaled = (minor * taken_qty) / lot_qty;

@@ -6,6 +6,7 @@
 //! останавливает исполнитель (§3.2).
 
 pub mod broker_access;
+pub mod broker_operation_kinds;
 pub mod market;
 
 pub mod bundle;

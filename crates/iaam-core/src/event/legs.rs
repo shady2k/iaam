@@ -435,6 +435,54 @@ mod tests {
     }
 
     #[test]
+    fn two_expectations_and_one_matching_leg_report_a_missing_leg() {
+        // Каждое ожидание по отдельности выполнимо, но одновременно —
+        // нет: одна нога не может закрыть две ноги.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let event = with_legs(
+            account,
+            vec![Leg::principal(account, instrument, rub(100_000))],
+        );
+        let expectation = principal_expectation(account, instrument, rub(100_000));
+
+        assert_eq!(
+            event.expect_legs("x", &[expectation.clone(), expectation]),
+            Err(EventValidationError::MissingLeg {
+                event: "x",
+                kind: LegKind::Principal,
+                expected: 2,
+                found: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn equal_counts_that_do_not_pair_up_report_an_unexpected_leg() {
+        // Ног столько же, сколько ожиданий, но раскладки нет: обе
+        // претендуют на одну ногу, а вторая осталась лишней.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let event = with_legs(
+            account,
+            vec![
+                Leg::principal(account, instrument, rub(100_000)),
+                Leg::cash(account, rub(1)),
+            ],
+        );
+        let expectation = principal_expectation(account, instrument, rub(100_000));
+
+        assert_eq!(
+            event.expect_legs("x", &[expectation.clone(), expectation]),
+            Err(EventValidationError::UnexpectedLeg {
+                event: "x",
+                expected: 2,
+                found: 2,
+            })
+        );
+    }
+
+    #[test]
     fn an_unfilled_expectation_field_is_not_checked() {
         // Незаполненное поле — «не проверяется», а не «обязано быть пустым».
         let account = AccountId::new_random();

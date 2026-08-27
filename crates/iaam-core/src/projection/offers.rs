@@ -328,6 +328,40 @@ mod tests {
     }
 
     #[test]
+    fn the_book_reports_the_whole_state_of_a_submission() {
+        // Отозванное и исполненное — разные исходы, и различать их
+        // придётся отчёту: одного остатка для этого мало.
+        let submission = OfferSubmissionId::new_random();
+        let window = OfferWindowId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut book = OfferBook::default();
+        book.apply(&OfferExerciseAction::Submitted {
+            submission,
+            window,
+            instrument,
+            quantity: qty("10"),
+        })
+        .unwrap();
+        book.apply(&cancelled(submission, qty("1"))).unwrap();
+        book.apply(&settled(submission, qty("6"))).unwrap();
+
+        let state = book.submission(submission).expect("заявка известна");
+        assert_eq!(state.window, window);
+        assert_eq!(state.instrument, instrument);
+        assert_eq!(state.submitted, qty("10"));
+        assert_eq!(state.cancelled, qty("1"));
+        assert_eq!(state.settled, qty("6"));
+        assert_eq!(state.outstanding(), qty("3"));
+    }
+
+    #[test]
+    fn a_submission_nobody_filed_has_no_state_at_all() {
+        // «Нет заявки» и «по заявке ничего не осталось» — разные вещи.
+        let book = OfferBook::default();
+        assert!(book.submission(OfferSubmissionId::new_random()).is_none());
+    }
+
+    #[test]
     fn the_book_survives_a_json_round_trip() {
         // Книга попадает в снимок проекции наравне с остальными.
         let submission = OfferSubmissionId::new_random();

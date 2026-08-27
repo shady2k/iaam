@@ -112,7 +112,7 @@ impl ValuationPolicyV1 {
     fn provenance(&self, candidate: &PriceCandidate) -> PriceProvenance {
         let (price_kind, venue) = match &candidate.origin {
             PriceOrigin::Market { venue, kind } => {
-                (Some(kind.as_str().to_owned()), Some(venue.clone()))
+                (Some(kind.as_str().to_owned()), Some(venue.board.clone()))
             }
             PriceOrigin::ReportParsed { .. } | PriceOrigin::OwnerAsserted => (None, None),
         };
@@ -202,10 +202,10 @@ impl ValuationRule for ValuationPolicyV1 {
             .iter()
             .all(|(_, candidate)| matches!(candidate.origin, PriceOrigin::Market { .. }))
         {
-            let venues: BTreeSet<&str> = matching
+            let venues: BTreeSet<&crate::valuation::Venue> = matching
                 .iter()
                 .filter_map(|(_, candidate)| match &candidate.origin {
-                    PriceOrigin::Market { venue, .. } => Some(venue.as_str()),
+                    PriceOrigin::Market { venue, .. } => Some(venue),
                     _ => None,
                 })
                 .collect();
@@ -330,10 +330,54 @@ mod tests {
             trade_date,
             observed_at,
             PriceOrigin::Market {
-                venue: venue.to_owned(),
+                venue: crate::valuation::Venue {
+                    board: venue.to_owned(),
+                    session: 0,
+                },
                 kind,
             },
         )
+    }
+    fn market_candidate_with_session(
+        instrument: InstrumentId,
+        session: i64,
+        trade_date: time::Date,
+    ) -> PriceCandidate {
+        let mut candidate = market_candidate(
+            instrument,
+            "TQBR",
+            "legal_close",
+            trade_date,
+            datetime!(2026 - 08 - 26 09:00 UTC),
+        );
+        let PriceOrigin::Market { venue, .. } = &mut candidate.origin else {
+            unreachable!();
+        };
+        venue.session = session;
+        candidate
+    }
+
+    #[test]
+    fn same_board_different_sessions_are_ambiguous_venues() {
+        let instrument = instrument();
+        let query = PriceQuery {
+            instrument,
+            as_of: date!(2026 - 08 - 26),
+            knowledge_as_of: datetime!(2026 - 08 - 26 12:00 UTC),
+        };
+        let result = policy().select(
+            &query,
+            &[
+                market_candidate_with_session(instrument, 3, date!(2026 - 08 - 26)),
+                market_candidate_with_session(instrument, 4, date!(2026 - 08 - 26)),
+            ],
+        );
+
+        assert!(result.selected().is_none());
+        assert_eq!(
+            result.uncovered_reason(),
+            Some(UncoveredReason::AmbiguousVenue)
+        );
     }
 
     #[test]

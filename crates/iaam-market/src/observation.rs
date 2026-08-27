@@ -57,18 +57,11 @@ pub enum PriceKind {
     AdmittedQuote,
 }
 
-/// Режим торгов.
+/// Режим торгов из идентичности рыночного наблюдения.
 ///
-/// Входит в идентичность наблюдения: один `SECID` торгуется в разных
-/// режимах и валютах, и без режима две цены одного дня выглядят как
-/// исправление одной.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Venue {
-    /// Код режима торгов ISS, например `TQBR`.
-    pub board: String,
-    /// Номер торговой сессии: основная и вечерняя различаются.
-    pub session: i64,
-}
+/// Тип принадлежит core, чтобы кандидаты оценки и рыночные наблюдения
+/// не могли расходиться по представлению площадки.
+pub use iaam_core::valuation::Venue;
 
 /// Наблюдение цены инструмента.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -13,7 +13,9 @@ use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, adva
 use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
-use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis};
+use iaam_core::valuation::{
+    FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue,
+};
 use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
 use iaam_store::market::SeriesKey;
 use iaam_store::market::{MarketWindow, PriceRow, PriceVenue};
@@ -41,8 +43,8 @@ struct ReportInputs<'a> {
     market_prices: &'a [PriceCandidate],
     /// График на координату знания, по инструменту.
     schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
-    /// Наблюдённый НКД на одну бумагу, по инструменту.
-    accrued_observations: &'a BTreeMap<InstrumentId, PerUnitAmount>,
+    /// Наблюдённый НКД на одну бумагу, с привязкой к площадке и дате сделки.
+    accrued_observations: &'a BTreeMap<(InstrumentId, CoreVenue, Date), PerUnitAmount>,
     knowledge_as_of: OffsetDateTime,
 }
 
@@ -141,7 +143,7 @@ const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
 struct ReportMarketInputs {
     candidates: Vec<PriceCandidate>,
     schedules: BTreeMap<InstrumentId, BondSchedule>,
-    accrued_observations: BTreeMap<InstrumentId, PerUnitAmount>,
+    accrued_observations: BTreeMap<(InstrumentId, CoreVenue, Date), PerUnitAmount>,
 }
 
 async fn market_price_candidates(
@@ -230,8 +232,19 @@ async fn market_price_candidates(
             let currency = CurrencyCode::from_code(&row.currency).ok_or_else(|| {
                 AppError::Store(format!("неизвестная валюта НКД: {}", row.currency))
             })?;
-            accrued_observations.insert(instrument, PerUnitAmount::new(Dec::new(value), currency));
-            break;
+            let trade_date = Date::parse(&row.trade_date, &Iso8601::DATE)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            accrued_observations.insert(
+                (
+                    instrument,
+                    CoreVenue {
+                        board: venue.board.clone(),
+                        session: venue.session,
+                    },
+                    trade_date,
+                ),
+                PerUnitAmount::new(Dec::new(value), currency),
+            );
         }
     }
     Ok(ReportMarketInputs {

@@ -37,7 +37,7 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
         trade_date: observation.trade_date.0,
         observed_at: observation.observed_at.0,
         origin: PriceOrigin::Market {
-            venue: observation.venue.board,
+            venue: observation.venue,
             kind,
         },
         executability,
@@ -176,6 +176,16 @@ mod tests {
             PriceOrigin::Market { kind, .. } => *kind,
             _ => panic!("рыночное наблюдение должно стать Market-кандидатом"),
         }
+    }
+    #[test]
+    fn market_candidate_preserves_the_full_venue_identity() {
+        let candidate =
+            candidate_from_market_observation(observation(PriceKind::Close, Executability::Executable));
+        let PriceOrigin::Market { venue, .. } = candidate.origin else {
+            panic!("рыночное наблюдение должно стать Market-кандидатом");
+        };
+        assert_eq!(venue.board, "TQBR");
+        assert_eq!(venue.session, 3);
     }
 
     #[test]

@@ -618,6 +618,12 @@ fn describe(reason: &NotComputable) -> String {
                 instrument.inner()
             )
         }
+        NotComputable::OverlappingScheduleCoverage { instrument } => {
+            format!(
+                "дата отчёта покрыта несколькими периодами графика инструмента {}",
+                instrument.inner()
+            )
+        }
         NotComputable::ExitNotExecutable => "нет исполнимого выхода для реализации НКД".to_owned(),
     }
 }
@@ -981,7 +987,7 @@ impl PriceOriginDto {
     fn from_domain(origin: &PriceOrigin) -> Self {
         match origin {
             PriceOrigin::Market { venue, kind } => Self::Market {
-                venue: venue.clone(),
+                venue: venue.board.clone(),
                 price_kind: match kind {
                     iaam_core::valuation::PriceKind::Close => "close",
                     iaam_core::valuation::PriceKind::LegalClose => "legal_close",
@@ -1121,15 +1127,19 @@ fn issue(value: &MaterialIssue) -> String {
         MaterialIssue::AccruedInterestMismatch {
             instrument,
             computed,
+            computed_currency,
             observed,
-            currency,
+            observed_currency,
+            quantity,
             date,
         } => format!(
-            "НКД инструмента {} расходится: расчёт {} против наблюдения {} {} на {}",
+            "НКД инструмента {} расходится: расчёт {} {} против наблюдения {} {} для количества {} на {}",
             instrument.inner(),
             computed.inner(),
+            computed_currency.code(),
             observed.inner(),
-            currency.code(),
+            observed_currency.code(),
+            quantity.0.inner(),
             date
         ),
     }
@@ -1949,6 +1959,39 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.contains("наблюдения НКД"))
         );
+    }
+    #[test]
+    fn overlapping_accrual_serialises_with_a_distinct_reason() {
+        let instrument = InstrumentId::new_random();
+        let dto = ComputedDto::from_dec(&Computed::NotComputable {
+            reason: NotComputable::OverlappingScheduleCoverage { instrument },
+        });
+
+        assert_eq!(
+            dto.not_computable.as_deref(),
+            Some("overlapping_schedule_coverage")
+        );
+        assert!(
+            dto.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("несколькими периодами"))
+        );
+    }
+    #[test]
+    fn an_accrued_mismatch_issue_names_totals_currencies_and_quantity() {
+        let text = issue(&MaterialIssue::AccruedInterestMismatch {
+            instrument: InstrumentId::new_random(),
+            computed: Dec::new(Decimal::new(1_517, 2)),
+            computed_currency: CurrencyCode::Usd,
+            observed: Dec::new(Decimal::new(2_240, 2)),
+            observed_currency: CurrencyCode::Rub,
+            quantity: iaam_core::money::Quantity(Dec::new(Decimal::new(100, 0))),
+            date: time::macros::date!(2026 - 08 - 26),
+        });
+
+        assert!(text.contains("15.17 USD"));
+        assert!(text.contains("22.40 RUB"));
+        assert!(text.contains("100"));
     }
 
     #[test]

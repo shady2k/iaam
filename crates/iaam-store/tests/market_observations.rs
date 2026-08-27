@@ -73,8 +73,14 @@ fn key_rate(observed_at: &str, rate: &str) -> KeyRateRow {
     }
 }
 
+/// Аренда, заведомо действующая на момент прогона.
+///
+/// Абсолютный момент здесь был бы бомбой замедленного действия:
+/// `begin_run` отказывает при `lease_expires_at <= now_utc()`, и записанная
+/// дата однажды наступает — весь файл падает с `LeaseExpired` без единой
+/// правки кода. Так уже случилось (iaam-816).
 fn lease() -> OffsetDateTime {
-    datetime!(2026-08-27 00:00:00 UTC)
+    OffsetDateTime::now_utc() + Duration::hours(1)
 }
 
 #[test]

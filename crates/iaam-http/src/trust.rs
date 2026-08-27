@@ -64,9 +64,14 @@ impl Destination {
             Self::TinkoffProd | Self::TinkoffSandbox => {
                 Anchors::Pinned(RUSSIAN_TRUSTED_ROOT_CA_PEM)
             }
-            Self::FinamApi | Self::MoexIss | Self::CbrScripts | Self::CbrDailyInfo => {
-                Anchors::WebRoots
-            }
+            Self::FinamApi
+            | Self::MoexIss
+            | Self::CbrScripts
+            | Self::CbrDailyInfo
+            // Контракт лежит у стороннего хостинга, и вшитый корень
+            // шлюза к нему отношения не имеет: обычные корни — это
+            // ровно то доверие, которое здесь уместно.
+            | Self::TinvestContract => Anchors::WebRoots,
         }
     }
 }

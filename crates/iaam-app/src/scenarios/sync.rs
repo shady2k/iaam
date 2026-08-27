@@ -341,7 +341,7 @@ impl MarketSyncResult {
 /// превращаются в строковые строки таблиц.
 pub async fn sync_market(
     store: &mut MarketStore,
-    transport: &dyn crate::ports::MarketData,
+    transport: &dyn crate::ports::OutboundHttp,
     request: MarketSyncRequest,
 ) -> Result<MarketSyncResult, AppError> {
     if request.to < request.from {
@@ -426,7 +426,7 @@ pub async fn sync_market_with_services(
     request: MarketSyncRequest,
 ) -> Result<MarketSyncResult, AppError> {
     let mut store = services.market_store.lock().await;
-    sync_market(&mut store, services.market.as_ref(), request).await
+    sync_market(&mut store, services.http.as_ref(), request).await
 }
 
 fn request_for(source: &MarketSource, from: Date, to: Date) -> HttpRequest {
@@ -641,7 +641,7 @@ fn partial(
 #[cfg(test)]
 mod market_tests {
     use super::*;
-    use crate::ports::{MarketData, MarketResponse};
+    use crate::ports::{OutboundHttp, OutboundResponse};
     use async_trait::async_trait;
     use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
     use iaam_core::money::CurrencyCode;
@@ -654,9 +654,9 @@ mod market_tests {
     }
 
     #[async_trait]
-    impl MarketData for FixtureTransport {
-        async fn send(&self, _request: HttpRequest) -> Result<MarketResponse, AppError> {
-            Ok(MarketResponse {
+    impl OutboundHttp for FixtureTransport {
+        async fn send(&self, _request: HttpRequest) -> Result<OutboundResponse, AppError> {
+            Ok(OutboundResponse {
                 status: self.status,
                 raw_hash: "fixture-hash".to_owned(),
                 body: self.body.clone(),

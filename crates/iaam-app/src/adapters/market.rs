@@ -14,16 +14,16 @@ use iaam_http::{HttpError, HttpRequest};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
-use crate::ports::{MarketData, MarketResponse};
+use crate::ports::{OutboundHttp, OutboundResponse};
 
 /// Реализация рыночного транспорта поверх общего HTTP-клиента.
-pub struct HttpMarketData {
+pub struct HttpOutbound {
     client: HttpClient,
     retry: RetryPolicy,
     limiter: Arc<RateLimiter>,
 }
 
-impl HttpMarketData {
+impl HttpOutbound {
     #[must_use]
     pub fn new(client: HttpClient, retry: RetryPolicy, limiter: Arc<RateLimiter>) -> Self {
         Self {
@@ -35,8 +35,8 @@ impl HttpMarketData {
 }
 
 #[async_trait]
-impl MarketData for HttpMarketData {
-    async fn send(&self, request: HttpRequest) -> Result<MarketResponse, AppError> {
+impl OutboundHttp for HttpOutbound {
+    async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError> {
         let mut attempt = 1;
         loop {
             let wait = self.limiter.delay_before_next(Instant::now());
@@ -46,7 +46,7 @@ impl MarketData for HttpMarketData {
 
             match self.client.send(&request).await {
                 Ok(response) if (200..300).contains(&response.status) => {
-                    return Ok(MarketResponse {
+                    return Ok(OutboundResponse {
                         status: response.status,
                         raw_hash: hash(&response.body),
                         body: response.body,

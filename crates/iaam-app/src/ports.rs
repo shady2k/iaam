@@ -10,6 +10,7 @@ use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
 use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
+use iaam_store::documents::BrokerCode;
 use serde_json::Value;
 use std::sync::Arc;
 use time::Date;
@@ -235,29 +236,65 @@ pub trait Store: Send + Sync {
 /// Транспорт возвращает тело без разбора: кодировку и формат знает
 /// `iaam-market`, а хеш связывает строки наблюдений с исходным ответом.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarketResponse {
+pub struct OutboundResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub raw_hash: String,
 }
 
-/// Исходящий транспорт рыночных источников.
+/// Исходящий HTTP.
+///
+/// Порт общий, а не «рыночный»: узел запроса называет сам `HttpRequest`
+/// своим `Destination`, и рынок был лишь первым, кто этим портом
+/// воспользовался. Имя по первому пользователю заставляло бы каждого
+/// следующего либо врать в тексте отказа, либо заводить второй такой же
+/// порт.
 ///
 /// Порт позволяет сценариям тестироваться на замороженных ответах без сети.
 /// `HttpRequest` — описание запроса, а не действие; отправляет его только
 /// адаптер `iaam-app`.
 #[async_trait]
-pub trait MarketData: Send + Sync {
-    async fn send(&self, request: HttpRequest) -> Result<MarketResponse, AppError>;
+pub trait OutboundHttp: Send + Sync {
+    async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError>;
 }
 /// Явный отказ ручного запуска без настроенного HTTP-адаптера.
-pub struct UnavailableMarketData;
+pub struct UnavailableOutboundHttp;
 
 #[async_trait]
-impl MarketData for UnavailableMarketData {
-    async fn send(&self, _request: HttpRequest) -> Result<MarketResponse, AppError> {
+impl OutboundHttp for UnavailableOutboundHttp {
+    async fn send(&self, _request: HttpRequest) -> Result<OutboundResponse, AppError> {
         Err(AppError::NotConfigured {
-            what: "рыночный HTTP-транспорт",
+            what: "исходящий HTTP-транспорт",
+        })
+    }
+}
+
+/// Словарь видов операций канала.
+///
+/// Отдельный порт, а не метод `Store`: словарь читают и пополняют
+/// совсем другие сценарии, чем журнал событий, и складывать их
+/// в один трейт значило бы выдавать право на журнал вместе с правом
+/// на справочник.
+#[async_trait]
+pub trait BrokerDictionary: Send + Sync {
+    /// Весь словарь канала: код источника -> имя вида.
+    async fn operation_kinds(
+        &self,
+        broker: &BrokerCode,
+    ) -> Result<std::collections::BTreeMap<String, String>, AppError>;
+}
+
+/// Отказ там, где словарь не подключён.
+pub struct UnavailableBrokerDictionary;
+
+#[async_trait]
+impl BrokerDictionary for UnavailableBrokerDictionary {
+    async fn operation_kinds(
+        &self,
+        _broker: &BrokerCode,
+    ) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+        Err(AppError::NotConfigured {
+            what: "словарь видов операций канала",
         })
     }
 }

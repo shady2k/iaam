@@ -18,7 +18,7 @@ use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
-    ParsedOperations, TokenAdmin, UnavailableMarketData,
+    ParsedOperations, TokenAdmin, UnavailableOutboundHttp,
 };
 use iaam_app::storage::SqliteStore;
 use iaam_app::storage::{
@@ -289,6 +289,7 @@ fn harness_with_factory(
     let market_store = Arc::new(tokio::sync::Mutex::new(
         SqliteStore::open_in_memory().expect("market store"),
     ));
+    let broker_dictionary: Arc<dyn iaam_app::ports::BrokerDictionary> = adapter.clone();
     let services = Arc::new(AppServices {
         store: adapter.clone(),
         directory: adapter,
@@ -297,7 +298,8 @@ fn harness_with_factory(
         clock: Arc::new(FixedClock(date!(2026 - 01 - 01))),
         channels,
         rules,
-        market: Arc::new(UnavailableMarketData),
+        http: Arc::new(UnavailableOutboundHttp),
+        broker_dictionary,
         market_store: market_store.clone(),
     });
     let state = ServerState::new(

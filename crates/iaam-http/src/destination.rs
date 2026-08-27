@@ -19,18 +19,31 @@ pub enum Destination {
     CbrScripts,
     /// SOAP-сервис ЦБ: ключевая ставка и прочие датированные ряды.
     CbrDailyInfo,
+    /// Опубликованный контракт T-Invest API.
+    ///
+    /// Не шлюз брокера, а исходный текст контракта: по нему сверяется
+    /// словарь видов операций. Отдельное назначение, потому что это
+    /// другой хост и другой якорь доверия — вшитый корень шлюза здесь
+    /// не при чём, а ходить в чужой репозиторий с ним значило бы
+    /// утверждать, что это тот же узел.
+    ///
+    /// Читается только на чтение и только текст: ответ не влияет
+    /// ни на одну сумму — он лишь называет коды, о которых стоит
+    /// спросить владельца.
+    TinvestContract,
 }
 
 impl Destination {
     /// Все назначения. Существует ради тестов, проходящих по таблице
     /// целиком: тест, перечисляющий варианты вручную, устаревает молча.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::TinkoffProd,
         Self::TinkoffSandbox,
         Self::FinamApi,
         Self::MoexIss,
         Self::CbrScripts,
         Self::CbrDailyInfo,
+        Self::TinvestContract,
     ];
 
     /// База узла.
@@ -46,6 +59,7 @@ impl Destination {
             Self::FinamApi => "https://api.finam.ru",
             Self::MoexIss => "https://iss.moex.com",
             Self::CbrScripts | Self::CbrDailyInfo => "https://www.cbr.ru",
+            Self::TinvestContract => "https://raw.githubusercontent.com",
         }
     }
 }

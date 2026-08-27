@@ -388,7 +388,7 @@ impl MarketSyncJob {
             to,
         };
         let mut store = self.services.market_store.lock().await;
-        sync_market(&mut store, self.services.market.as_ref(), request).await
+        sync_market(&mut store, self.services.http.as_ref(), request).await
     }
 }
 

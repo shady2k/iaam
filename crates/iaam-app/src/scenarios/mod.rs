@@ -7,6 +7,7 @@ pub mod ingest;
 pub mod market_reference;
 pub mod reports;
 
+pub mod broker_dictionary;
 pub mod classification;
 pub mod documents;
 pub mod reconciliation;

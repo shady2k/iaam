@@ -584,6 +584,18 @@ struct ChannelAccess {
 }
 
 #[async_trait]
+impl crate::ports::BrokerDictionary for SqliteAdapter {
+    async fn operation_kinds(
+        &self,
+        broker: &BrokerCode,
+    ) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+        let broker = broker.clone();
+        self.blocking(move |store| store.broker_operation_kinds(&broker).map_err(store_error))
+            .await
+    }
+}
+
+#[async_trait]
 impl BrokerChannelFactory for SqliteAdapter {
     async fn open(&self, owner: OwnerId, broker: &str) -> Result<Arc<dyn BrokerChannel>, AppError> {
         let code = BrokerCode::parse(broker).ok_or_else(|| AppError::Invalid {

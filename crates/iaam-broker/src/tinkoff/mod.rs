@@ -1,4 +1,5 @@
 mod client;
+pub mod contract;
 pub mod parse;
 
 pub use client::{GetOperationsByCursorRequest, TinkoffClient, TinkoffError};

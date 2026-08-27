@@ -9,7 +9,7 @@ mod provision;
 use std::sync::Arc;
 
 use iaam_app::AppServices;
-use iaam_app::adapters::market::HttpMarketData;
+use iaam_app::adapters::market::HttpOutbound;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{
     BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Scope, SoleOwner, SystemClock,
@@ -211,7 +211,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(read_broker_key)
         .transpose()?;
     let market_store = SqliteStore::open(&config.database)?;
-    let market = Arc::new(HttpMarketData::new(
+    let http = Arc::new(HttpOutbound::new(
         HttpClient::new(),
         RetryPolicy::new(4, std::time::Duration::from_millis(100)),
         Arc::new(MarketRateLimiter::new(std::time::Duration::from_millis(
@@ -226,6 +226,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let channels: Arc<dyn BrokerChannelFactory> = adapter.clone();
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
+    let broker_dictionary: Arc<dyn iaam_app::ports::BrokerDictionary> = adapter.clone();
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
     let services = Arc::new(AppServices {
         store: adapter.clone(),
@@ -235,7 +236,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         clock: Arc::new(SystemClock),
         channels,
         rules,
-        market,
+        http,
+        broker_dictionary,
         market_store: Arc::new(tokio::sync::Mutex::new(market_store)),
     });
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));

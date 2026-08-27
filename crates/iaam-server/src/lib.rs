@@ -124,6 +124,7 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
         .routes(routes!(routes::revoke_token))
         .routes(routes!(routes::create_contour_version))
         .routes(routes!(routes::ingest_operations))
+        .routes(routes!(routes::ingest_journal_events))
         .routes(routes!(routes::ingest_csv))
         .routes(routes!(routes::upload_document))
         .routes(routes!(routes::reparse_document))

@@ -12,11 +12,13 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
+use iaam_app::ingest::journal_event::normalize_journal_event;
+use iaam_app::ingest::operation::NormalizationContext;
 use iaam_app::ingest::{Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
-use iaam_app::scenarios::ingest::submit_operations;
+use iaam_app::scenarios::ingest::{submit_candidates, submit_operations};
 use iaam_app::scenarios::market_reference::{
     MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
     list_market_key_rate as read_market_key_rate, list_market_prices as read_market_prices,
@@ -28,6 +30,7 @@ use iaam_app::sync::{
     sync_market_with_services as run_market_sync,
 };
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::Event;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
@@ -54,7 +57,8 @@ use crate::dto::{
     InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
     MarketSyncRequest, OwnerBalanceRequest, QuotationBasisDto, ReconciliationParams,
     ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -1209,6 +1213,61 @@ pub async fn ingest_operations(
         .collect();
     let outcomes = submit_operations(&state.services, &principal, source, &domain).await?;
     for ((row, _), verdict) in accepted.iter().zip(outcomes.iter()) {
+        verdicts.push(VerdictDto::from_domain(*row, verdict));
+    }
+    verdicts.sort_by_key(|verdict| verdict.row);
+    Ok(Json(verdicts))
+}
+
+/// Приёмка журнальных фактов: корпоративных действий и оферты.
+#[utoipa::path(
+    post,
+    path = "/v1/ingest/journal-events",
+    request_body = SubmitJournalEventsRequest,
+    responses(
+        (status = 200, description = "Вердикт по каждому факту", body = Vec<VerdictDto>),
+        (status = 403, description = "Недостаточно прав", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn ingest_journal_events(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<SubmitJournalEventsRequest>,
+) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let source = SourceId::new_random();
+
+    // Разбор DTO даёт вердикт на элемент: один непонятый факт
+    // не отменяет остальные (§10.1). Порядок ответа — порядок пачки,
+    // поэтому номер строки едет вместе с кандидатом.
+    let context = NormalizationContext {
+        owner: principal.owner,
+        source,
+    };
+    let mut verdicts: Vec<VerdictDto> = Vec::with_capacity(request.events.len());
+    let mut accepted: Vec<usize> = Vec::new();
+    let mut candidates: Vec<Result<Event, Rejection>> = Vec::new();
+    for (index, event) in request.events.iter().enumerate() {
+        match event
+            .to_domain()
+            .and_then(|submitted| normalize_journal_event(&submitted, context))
+        {
+            Ok(normalized) => {
+                accepted.push(index + 1);
+                candidates.push(Ok(normalized.event));
+            }
+            Err(rejection) => verdicts.push(VerdictDto::from_domain(
+                index + 1,
+                &Verdict::Rejected { rejection },
+            )),
+        }
+    }
+
+    let outcomes = submit_candidates(&state.services, &principal, "fact", candidates).await?;
+    for (row, verdict) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(VerdictDto::from_domain(*row, verdict));
     }
     verdicts.sort_by_key(|verdict| verdict.row);

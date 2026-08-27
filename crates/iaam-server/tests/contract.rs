@@ -2958,3 +2958,168 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "маршрут открыт: {path}");
     }
 }
+
+// --- Журнальные факты: корпоративные действия и оферта -----------------
+
+#[tokio::test]
+async fn an_amortisation_is_recorded_through_the_journal_route() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                "compensation": { "amount": "1000.00", "currency": "RUB" },
+                "effective_date": "2026-05-20",
+                "record_date": "2026-05-18"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+#[tokio::test]
+async fn an_offer_settlement_is_recorded_through_the_journal_route() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "offer_exercise",
+            "day": "2026-04-20",
+            "action": {
+                "type": "settled",
+                "submission": Uuid::new_v4(),
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "5",
+                "gross": { "amount": "5000.00", "currency": "RUB" },
+                "fee": { "amount": "10.00", "currency": "RUB" }
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+/// Один непонятый факт не отменяет соседний (§10.1) — и номер строки
+/// в ответе называет именно тот факт, который отклонён.
+#[tokio::test]
+async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [
+            {
+                "account": harness.account.inner(),
+                "type": "corporate_action",
+                "action": {
+                    "type": "partial_redemption",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "не число",
+                    "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                    "compensation": { "amount": "1000.00", "currency": "RUB" },
+                    "effective_date": "2026-05-20"
+                }
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "corporate_action",
+                "action": {
+                    "type": "partial_redemption",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "10",
+                    "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                    "compensation": { "amount": "1000.00", "currency": "RUB" },
+                    "effective_date": "2026-05-20"
+                }
+            }
+        ]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["row"], 1, "{response}");
+    assert_eq!(response[0]["verdict"], "rejected", "{response}");
+    assert_eq!(response[0]["field"], "quantity", "{response}");
+    assert_eq!(response[1]["row"], 2, "{response}");
+    assert_eq!(response[1]["verdict"], "provisional", "{response}");
+}
+
+/// Нулевая выплата — не «амортизация на ноль», а брак источника. Отказ
+/// обязан случиться до записи: журнал append-only.
+#[tokio::test]
+async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "0", "currency": "RUB" },
+                "compensation": { "amount": "0.00", "currency": "RUB" },
+                "effective_date": "2026-05-20"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "rejected", "{response}");
+    assert_eq!(response[0]["field"], "fact", "{response}");
+}
+
+#[tokio::test]
+async fn a_read_only_token_may_not_submit_journal_events() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "offer_exercise",
+            "day": "2026-04-10",
+            "action": {
+                "type": "cancelled",
+                "submission": Uuid::new_v4(),
+                "quantity": "5"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.readonly_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(response["code"], "forbidden");
+}

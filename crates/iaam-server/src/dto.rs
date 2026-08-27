@@ -10,14 +10,17 @@
 
 use std::fmt;
 
+use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, ClassificationRuleView, IssuedToken, Scope, TokenView,
 };
+use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
+use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
-use iaam_core::money::CurrencyCode;
+use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::returns::{
     AmountQualification, Computed, DataQuality, EvaluatedPosition, ExecutabilityShares,
@@ -2008,4 +2011,380 @@ pub struct MarketSyncRequest {
     pub source: MarketSourceDto,
     pub from: String,
     pub to: String,
+}
+
+// ---------------------------------------------------------------------
+// Журнальные факты: корпоративные действия и оферта (§4.7, §3.5).
+//
+// Отдельный вход, а не новые члены `OperationKindDto`. Причина
+// механическая: у корпоративного действия дата фиксации реестра — часть
+// факта, а операционная модель дат её выразить не умеет вовсе
+// (`OperationDates` жёстко проставляет `entitlement: None`).
+//
+// Приёма произвольного `EventKind` здесь нет: вход принимает ровно те
+// семьи, которые перечислены ниже.
+// ---------------------------------------------------------------------
+
+/// Сумма с валютой в транспорте.
+///
+/// Вложенным объектом, а не парой полей рядом: у замещения компенсация
+/// необязательна, и плоская пара потребовала бы необязательной валюты —
+/// то есть состояния «валюта без суммы», которого не бывает.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AmountDto {
+    /// Десятичное число строкой: двоичная плавающая точка теряет копейки.
+    #[schema(example = "1000.00")]
+    pub amount: String,
+    pub currency: CurrencyDto,
+}
+
+impl AmountDto {
+    fn to_money(&self, field: &str) -> Result<Money, Rejection> {
+        Ok(Money::new(
+            PostedMinor::new(minor(&self.amount, self.currency, field)?),
+            self.currency.to_domain(),
+        ))
+    }
+
+    /// Величина на одну бумагу: не деньги счёта, а номинал, поэтому
+    /// минорными единицами не меряется и округлению не подлежит.
+    fn to_per_unit(&self, field: &str) -> Result<PerUnitAmount, Rejection> {
+        Ok(PerUnitAmount::new(
+            Dec::new(decimal(&self.amount, field)?),
+            self.currency.to_domain(),
+        ))
+    }
+}
+
+/// Что сделали с дробной частью при замещении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FractionalTreatmentDto {
+    CashCompensated,
+    RoundedDown,
+    NotApplicable,
+}
+
+impl FractionalTreatmentDto {
+    #[must_use]
+    pub const fn to_domain(self) -> FractionalTreatment {
+        match self {
+            Self::CashCompensated => FractionalTreatment::CashCompensated,
+            Self::RoundedDown => FractionalTreatment::RoundedDown,
+            Self::NotApplicable => FractionalTreatment::NotApplicable,
+        }
+    }
+}
+
+/// Правило переноса налоговой стоимости при замещении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BasisTransferRuleDto {
+    CarryOver,
+    Restart,
+}
+
+impl BasisTransferRuleDto {
+    #[must_use]
+    pub const fn to_domain(self) -> BasisTransferRule {
+        match self {
+            Self::CarryOver => BasisTransferRule::CarryOver,
+            Self::Restart => BasisTransferRule::Restart,
+        }
+    }
+}
+
+/// Корпоративное действие в транспорте. Величины **положительные**:
+/// знак выбытия ставит приёмка, а не клиент.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CorporateActionDto {
+    /// Амортизация: номинал уменьшается, деньги приходят, количество
+    /// бумаг не меняется.
+    PartialRedemption {
+        instrument: Uuid,
+        custody: Uuid,
+        quantity: String,
+        principal_returned_per_unit: AmountDto,
+        compensation: AmountDto,
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date, example = "2026-05-20")]
+        effective_date: Date,
+        #[serde(
+            default,
+            with = "iso_date::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schema(value_type = Option<String>, format = Date)]
+        record_date: Option<Date>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grounds: Option<String>,
+    },
+    /// Окончательное погашение: номинал возвращён целиком, бумага
+    /// выбывает.
+    Redemption {
+        instrument: Uuid,
+        custody: Uuid,
+        quantity: String,
+        principal_returned_per_unit: AmountDto,
+        compensation: AmountDto,
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date)]
+        effective_date: Date,
+        #[serde(
+            default,
+            with = "iso_date::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schema(value_type = Option<String>, format = Date)]
+        record_date: Option<Date>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grounds: Option<String>,
+    },
+    /// Замещение: бумага предшественника меняется на бумагу преемника.
+    Conversion {
+        predecessor: Uuid,
+        successor: Uuid,
+        custody: Uuid,
+        /// Сколько бумаг преемника приходится на одну бумагу
+        /// предшественника.
+        ratio: String,
+        quantity_in: String,
+        quantity_out: String,
+        fractional: FractionalTreatmentDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compensation: Option<AmountDto>,
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date)]
+        effective_date: Date,
+        #[serde(
+            default,
+            with = "iso_date::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schema(value_type = Option<String>, format = Date)]
+        record_date: Option<Date>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grounds: Option<String>,
+        basis_transfer: BasisTransferRuleDto,
+    },
+}
+
+impl CorporateActionDto {
+    fn to_domain(&self) -> Result<CorporateAction, Rejection> {
+        Ok(match self {
+            Self::PartialRedemption {
+                instrument,
+                custody,
+                quantity,
+                principal_returned_per_unit,
+                compensation,
+                effective_date,
+                record_date,
+                grounds,
+            } => CorporateAction::PartialRedemption {
+                instrument: InstrumentId(*instrument),
+                custody: CustodyId(*custody),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+                principal_returned_per_unit: principal_returned_per_unit
+                    .to_per_unit("principal_returned_per_unit")?,
+                compensation: compensation.to_money("compensation")?,
+                effective_date: *effective_date,
+                record_date: *record_date,
+                grounds: grounds.clone(),
+            },
+            Self::Redemption {
+                instrument,
+                custody,
+                quantity,
+                principal_returned_per_unit,
+                compensation,
+                effective_date,
+                record_date,
+                grounds,
+            } => CorporateAction::Redemption {
+                instrument: InstrumentId(*instrument),
+                custody: CustodyId(*custody),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+                principal_returned_per_unit: principal_returned_per_unit
+                    .to_per_unit("principal_returned_per_unit")?,
+                compensation: compensation.to_money("compensation")?,
+                effective_date: *effective_date,
+                record_date: *record_date,
+                grounds: grounds.clone(),
+            },
+            Self::Conversion {
+                predecessor,
+                successor,
+                custody,
+                ratio,
+                quantity_in,
+                quantity_out,
+                fractional,
+                compensation,
+                effective_date,
+                record_date,
+                grounds,
+                basis_transfer,
+            } => CorporateAction::Conversion {
+                predecessor: InstrumentId(*predecessor),
+                successor: InstrumentId(*successor),
+                custody: CustodyId(*custody),
+                ratio: Dec::new(decimal(ratio, "ratio")?),
+                quantity_in: Quantity(Dec::new(decimal(quantity_in, "quantity_in")?)),
+                quantity_out: Quantity(Dec::new(decimal(quantity_out, "quantity_out")?)),
+                fractional: fractional.to_domain(),
+                compensation: match compensation {
+                    Some(amount) => Some(amount.to_money("compensation")?),
+                    None => None,
+                },
+                effective_date: *effective_date,
+                record_date: *record_date,
+                grounds: grounds.clone(),
+                basis_transfer: basis_transfer.to_domain(),
+            },
+        })
+    }
+}
+
+/// Факт оферты в транспорте.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OfferExerciseDto {
+    /// Поданная заявка: ни денег, ни бумаг она не двигает.
+    Submitted {
+        submission: Uuid,
+        window: Uuid,
+        instrument: Uuid,
+        quantity: String,
+    },
+    /// Отзыв заявки целиком или частично.
+    Cancelled { submission: Uuid, quantity: String },
+    /// Совершённый выкуп: бумага выбывает за деньги.
+    Settled {
+        submission: Uuid,
+        instrument: Uuid,
+        custody: Uuid,
+        quantity: String,
+        gross: AmountDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fee: Option<AmountDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accrued_interest: Option<AmountDto>,
+    },
+}
+
+impl OfferExerciseDto {
+    fn to_domain(&self) -> Result<OfferExerciseAction, Rejection> {
+        Ok(match self {
+            Self::Submitted {
+                submission,
+                window,
+                instrument,
+                quantity,
+            } => OfferExerciseAction::Submitted {
+                submission: OfferSubmissionId(*submission),
+                window: OfferWindowId(*window),
+                instrument: InstrumentId(*instrument),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+            },
+            Self::Cancelled {
+                submission,
+                quantity,
+            } => OfferExerciseAction::Cancelled {
+                submission: OfferSubmissionId(*submission),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+            },
+            Self::Settled {
+                submission,
+                instrument,
+                custody,
+                quantity,
+                gross,
+                fee,
+                accrued_interest,
+            } => OfferExerciseAction::Settled {
+                submission: OfferSubmissionId(*submission),
+                instrument: InstrumentId(*instrument),
+                custody: CustodyId(*custody),
+                quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
+                gross: gross.to_money("gross")?,
+                fee: match fee {
+                    Some(amount) => Some(amount.to_money("fee")?),
+                    None => None,
+                },
+                accrued_interest: match accrued_interest {
+                    Some(amount) => Some(amount.to_money("accrued_interest")?),
+                    None => None,
+                },
+            },
+        })
+    }
+}
+
+/// Журнальный факт: корпоративное действие или оферта.
+///
+/// Две семьи под одной крышей — это общий канал приёмки, а не общая
+/// природа: корпоративное действие решает эмитент, оферту предъявляет
+/// владелец (`iaam-core/src/event/offer.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JournalFactDto {
+    /// Даты внутри самого факта: дата вступления в силу — часть его
+    /// идентичности, а не свойство подачи.
+    CorporateAction { action: CorporateActionDto },
+    /// У оферты собственной даты нет, поэтому день присылает клиент:
+    /// выдумать его приёмке нечем.
+    OfferExercise {
+        action: OfferExerciseDto,
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date, example = "2026-04-20")]
+        day: Date,
+    },
+}
+
+/// Один журнальный факт в пачке.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JournalEventDto {
+    pub account: Uuid,
+    /// Плоско, как у операции: клиент одного API не должен помнить,
+    /// что у одного входа вид факта лежит в корне, а у соседнего —
+    /// во вложенном объекте.
+    #[serde(flatten)]
+    pub fact: JournalFactDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_operation_id: Option<String>,
+}
+
+impl JournalEventDto {
+    /// Единственное место, где транспорт журнального факта встречается
+    /// с доменом. Отказ возвращается с полем, ожидаемым и полученным —
+    /// это тело ответа `422` (§13).
+    pub fn to_domain(&self) -> Result<SubmittedJournalEvent, Rejection> {
+        let fact = match &self.fact {
+            JournalFactDto::CorporateAction { action } => {
+                JournalFact::CorporateAction(action.to_domain()?)
+            }
+            JournalFactDto::OfferExercise { action, day } => JournalFact::OfferExercise {
+                action: action.to_domain()?,
+                day: *day,
+            },
+        };
+        Ok(SubmittedJournalEvent {
+            account: AccountId(self.account),
+            fact,
+            idempotency_key: self.idempotency_key.clone(),
+            source_operation_id: self.source_operation_id.clone(),
+        })
+    }
+}
+
+/// Запрос приёмки журнальных фактов.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubmitJournalEventsRequest {
+    /// Метка источника: ручной ввод, конкретный агент, конкретный файл.
+    pub source_label: String,
+    pub events: Vec<JournalEventDto>,
 }

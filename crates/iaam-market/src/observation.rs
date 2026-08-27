@@ -7,7 +7,7 @@
 //! подделываемой ответом, а вместе с ней и воспроизводимость отчёта.
 
 use iaam_core::ids::InstrumentId;
-use iaam_core::money::CurrencyCode;
+use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::QuotationBasis;
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,23 @@ pub struct PriceObservation {
     pub executability: Executability,
 }
 
+/// Наблюдение накопленного купонного дохода.
+///
+/// Отдельный тип, а не поле в [`PriceObservation`], по трём причинам.
+/// Во-первых, котировка облигации — процент номинала, а НКД — деньги:
+/// одна структура на две размерности возвращает ошибку смешения единиц.
+/// Во-вторых, исполнимости у НКД нет: это не цена, по которой кто-то
+/// торгует. В-третьих, у акции такое поле было бы вечно пустым.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccruedInterestObservation {
+    pub instrument: InstrumentId,
+    pub venue: Venue,
+    pub trade_date: TradeDate,
+    pub observed_at: ObservedAt,
+    /// На ОДНУ бумагу, вместе с валютой из `FACEUNIT`.
+    pub per_unit: PerUnitAmount,
+}
+
 /// Наблюдение курса.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FxObservation {
@@ -127,6 +144,8 @@ pub struct KeyRateObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iaam_core::ids::InstrumentId;
+    use iaam_core::money::PerUnitAmount;
     use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 
@@ -169,5 +188,27 @@ mod tests {
         let observation: PriceObservation = serde_json::from_value(value).unwrap();
         assert_eq!(observation.basis, QuotationBasis::Unknown);
         assert_eq!(observation.basis_evidence, "");
+    }
+
+    #[test]
+    fn accrued_interest_is_measured_per_bond_not_per_trade() {
+        // Trade.accrued_interest — сумма ВСЕЙ сделки (event/mod.rs,
+        // trade_settlement складывает её с gross целиком). Наблюдение —
+        // величина на одну бумагу. Тип обязан делать подмену
+        // непредставимой: голый Dec её не остановит.
+        let observation = AccruedInterestObservation {
+            instrument: InstrumentId::new_random(),
+            venue: Venue {
+                board: "TQOB".to_owned(),
+                session: 3,
+            },
+            trade_date: TradeDate(date!(2026 - 08 - 20)),
+            observed_at: ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
+            per_unit: PerUnitAmount::new(
+                Dec::new(Decimal::from_str_exact("15.17").unwrap()),
+                CurrencyCode::Rub,
+            ),
+        };
+        assert_eq!(observation.per_unit.currency(), CurrencyCode::Rub);
     }
 }

@@ -16,8 +16,8 @@ pub mod schedule;
 
 pub use error::MarketError;
 pub use observation::{
-    Executability, FxObservation, KeyRateObservation, ObservedAt, PriceKind, PriceObservation,
-    TradeDate, Venue,
+    AccruedInterestObservation, Executability, FxObservation, KeyRateObservation, ObservedAt,
+    PriceKind, PriceObservation, TradeDate, Venue,
 };
 pub use schedule::completeness::{Completeness, validate_moex_profile};
 pub use schedule::terms::{DefaultFlags, IssueTerms};

@@ -8,6 +8,7 @@ use crate::error::AppError;
 use iaam_core::ids::InstrumentId;
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::valuation::QuotationBasis;
 use iaam_market::cbr::key_rate::{Boundary, derive_intervals};
 use iaam_market::{KeyRateObservation, ObservedAt, TradeDate};
 use iaam_store::market::{FxRow, KeyRateRow, MarketWindow, PriceRow, PriceVenue, SeriesKey};
@@ -49,6 +50,8 @@ pub struct MarketPriceView {
     pub session: i64,
     pub kind: String,
     pub value: String,
+    pub quotation_basis: QuotationBasis,
+    pub basis_evidence: String,
     pub currency: String,
     pub date: Date,
     pub source: String,
@@ -199,12 +202,16 @@ fn price_view(row: PriceRow, complete_through: Option<Date>) -> Result<MarketPri
         .parse::<Uuid>()
         .map(InstrumentId)
         .map_err(|error| invalid_value("instrument_id", error.to_string()))?;
+    let quotation_basis = QuotationBasis::from_code(&row.quotation_basis)
+        .ok_or_else(|| invalid_value("quotation_basis", row.quotation_basis.clone()))?;
     Ok(MarketPriceView {
         instrument,
         board: row.board,
         session: row.session,
         kind: row.kind,
         value: row.price,
+        quotation_basis,
+        basis_evidence: row.basis_evidence,
         currency: row.currency,
         date: parse_date(&row.trade_date)?,
         source: "moex-iss".to_owned(),

@@ -412,7 +412,11 @@ struct SelectedPosition {
 
 #[derive(Serialize)]
 enum PositionValuation {
-    Selected(SelectedObservation),
+    /// Наблюдение в боксе: с основанием котировки вариант перевесил
+    /// остальные вчетверо, и перечисление стало занимать размер самого
+    /// большого на каждой позиции (clippy::large_enum_variant). Тот же
+    /// приём уже применён к `PositionAssessmentKind::Selected`.
+    Selected(Box<SelectedObservation>),
     LegacyDerived {
         quality: PriceQuality,
         price: Option<crate::valuation::InstrumentPrice>,
@@ -427,6 +431,10 @@ struct SelectedObservation {
     instrument: InstrumentId,
     price: Dec,
     currency: CurrencyCode,
+    #[serde(default)]
+    quotation_basis: &'static str,
+    #[serde(default)]
+    basis_evidence: String,
     trade_date: Date,
     observed_at: OffsetDateTime,
     executability: &'static str,
@@ -503,6 +511,8 @@ fn selected_observation(price: &SelectedPrice) -> SelectedObservation {
         crate::valuation::PriceOrigin::OwnerAsserted => SelectedOrigin::OwnerAsserted,
     };
     SelectedObservation {
+        quotation_basis: price.candidate.basis.code(),
+        basis_evidence: price.candidate.basis_evidence.clone(),
         instrument: price.candidate.instrument,
         price: price.candidate.price,
         currency: price.candidate.currency,
@@ -605,7 +615,7 @@ fn inputs_hash_with_assessments(
             } = assessment;
             let valuation = match kind {
                 PositionAssessmentKind::Selected(selected) => {
-                    PositionValuation::Selected(selected_observation(&selected))
+                    PositionValuation::Selected(Box::new(selected_observation(&selected)))
                 }
                 PositionAssessmentKind::LegacyDerived(quality) => {
                     PositionValuation::LegacyDerived {
@@ -1541,6 +1551,85 @@ mod tests {
             hash_for_venue("moex"),
             hash_for_venue("corrected-source"),
             "исправление provenance выбранного наблюдения внутри окна обязано менять хеш"
+        );
+    }
+    #[test]
+    fn a_quotation_basis_change_inside_the_window_changes_inputs_hash() {
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let coordinate = KnowledgeCoordinate {
+            knowledge_as_of: datetime!(2026-08-26 09:00:00 UTC),
+            source_priority_version: 1,
+            valuation_policy_version: 1,
+        };
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate,
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+        };
+
+        let hash_for_basis = |basis: QuotationBasis| {
+            let origin = crate::valuation::PriceOrigin::Market {
+                venue: "moex".to_owned(),
+                kind: crate::valuation::PriceKind::LegalClose,
+            };
+            let selected = SelectedPrice {
+                candidate: PriceCandidate {
+                    instrument,
+                    price: Dec::new(rust_decimal::Decimal::from(98)),
+                    currency: CurrencyCode::Rub,
+                    basis,
+                    basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
+                    trade_date: date!(2026 - 08 - 26),
+                    observed_at: datetime!(2026-08-26 08:00:00 UTC),
+                    origin: origin.clone(),
+                    executability: SourceExecutability::Executable,
+                },
+                selection: crate::valuation::PriceSelection::AsObserved,
+                freshness: crate::valuation::PriceFreshness::Fresh,
+                provenance: crate::valuation::PriceProvenance {
+                    price_kind: Some("legal_close".to_owned()),
+                    origin,
+                    venue: Some("moex".to_owned()),
+                    quotation_basis: basis,
+                    basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
+                    observed_at: datetime!(2026-08-26 08:00:00 UTC),
+                    valuation_policy_version: coordinate.valuation_policy_version,
+                    source_priority_version: coordinate.source_priority_version,
+                    carry_forward_limit: 10,
+                    price_max_age: 30,
+                },
+            };
+            inputs_hash_with_assessments(
+                &state,
+                &request,
+                vec![PositionAssessment {
+                    account,
+                    custody: None,
+                    instrument,
+                    quantity: crate::money::Quantity(Dec::one()),
+                    raw_price: None,
+                    remaining_face: Ok(None),
+                    kind: PositionAssessmentKind::Selected(Box::new(selected)),
+                }],
+            )
+        };
+
+        assert_ne!(
+            hash_for_basis(QuotationBasis::MoneyPerUnit),
+            hash_for_basis(QuotationBasis::PercentOfRemainingFace),
+            "смена доказанного основания обязана менять хеш входов"
         );
     }
 

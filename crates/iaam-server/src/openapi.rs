@@ -19,9 +19,9 @@ use crate::dto::{
     LegacyDerivedPositionDto, LiquidationEstimateDto, MarketFxDto, MarketKeyRateDto,
     MarketPriceDto, MarketSourceDto, MarketSyncRequest, OperationDatesDto, OperationDto,
     OperationKindDto, OwnerBalanceRequest, PositionCoverageDto, PriceFreshnessDto, PriceOriginDto,
-    PriceProvenanceDto, PriceQualityDto, PriceSelectionDto, RateDto, ReconciliationStatusDto,
-    ReturnsReportDto, SelectedPriceDto, SubmitOperationsRequest, SyncOutcomeDto, TokenDto,
-    UncoveredPositionDto, VerdictDto,
+    PriceProvenanceDto, PriceQualityDto, PriceSelectionDto, QuotationBasisDto, RateDto,
+    ReconciliationStatusDto, ReturnsReportDto, SelectedPriceDto, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, UncoveredPositionDto, VerdictDto,
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
@@ -104,6 +104,7 @@ impl Modify for BearerSecurity {
         PriceProvenanceDto,
         PriceQualityDto,
         PriceSelectionDto,
+        QuotationBasisDto,
         PositionCoverageDto,
         RateDto,
         ReconciliationStatusDto,

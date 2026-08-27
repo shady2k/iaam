@@ -52,9 +52,9 @@ use crate::dto::{
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
     InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
-    MarketSyncRequest, OwnerBalanceRequest, ReconciliationParams, ReconciliationStatusDto,
-    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitOperationsRequest,
-    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    MarketSyncRequest, OwnerBalanceRequest, QuotationBasisDto, ReconciliationParams,
+    ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -1457,6 +1457,8 @@ fn market_price_dto(
         kind: view.kind,
         value: view.value,
         currency: view.currency,
+        quotation_basis: QuotationBasisDto::from_domain(view.quotation_basis),
+        basis_evidence: (!view.basis_evidence.is_empty()).then_some(view.basis_evidence),
         date: view.date,
         source: view.source,
         observed_at: view.observed_at,

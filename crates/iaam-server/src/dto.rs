@@ -25,8 +25,8 @@ use iaam_core::returns::{
     UncoveredPosition,
 };
 use iaam_core::valuation::{
-    PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, SelectedPrice,
-    SourceExecutability,
+    PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, QuotationBasis,
+    SelectedPrice, SourceExecutability,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -678,12 +678,39 @@ pub enum PriceOriginDto {
     OwnerAsserted,
 }
 
+/// Единица, в которой источник назвал цену.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotationBasisDto {
+    MoneyPerUnit,
+    PercentOfRemainingFace,
+    /// Источник основания не доказал: цена этой строки в деньги
+    /// не пересчитывается.
+    #[default]
+    Unknown,
+}
+
+impl QuotationBasisDto {
+    #[must_use]
+    pub const fn from_domain(basis: QuotationBasis) -> Self {
+        match basis {
+            QuotationBasis::MoneyPerUnit => Self::MoneyPerUnit,
+            QuotationBasis::PercentOfRemainingFace => Self::PercentOfRemainingFace,
+            QuotationBasis::Unknown => Self::Unknown,
+        }
+    }
+}
+
 /// Основание выбора: вид источника, площадка, версии и оба порога.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PriceProvenanceDto {
     pub price_kind: Option<String>,
     pub origin: PriceOriginDto,
     pub venue: Option<String>,
+    #[serde(default)]
+    pub quotation_basis: QuotationBasisDto,
+    #[serde(default)]
+    pub basis_evidence: Option<String>,
     pub observed_at: String,
     pub valuation_policy_version: u32,
     pub source_priority_version: u32,
@@ -897,6 +924,9 @@ impl PriceProvenanceDto {
             price_kind: provenance.price_kind.clone(),
             origin: PriceOriginDto::from_domain(&provenance.origin),
             venue: provenance.venue.clone(),
+            quotation_basis: QuotationBasisDto::from_domain(provenance.quotation_basis),
+            basis_evidence: (!provenance.basis_evidence.is_empty())
+                .then(|| provenance.basis_evidence.clone()),
             observed_at: format_timestamp(provenance.observed_at),
             valuation_policy_version: provenance.valuation_policy_version,
             source_priority_version: provenance.source_priority_version,
@@ -1397,6 +1427,10 @@ pub struct MarketPriceDto {
     pub kind: String,
     pub value: String,
     pub currency: String,
+    #[serde(default)]
+    pub quotation_basis: QuotationBasisDto,
+    #[serde(default)]
+    pub basis_evidence: Option<String>,
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub date: Date,
@@ -1683,6 +1717,32 @@ mod tests {
         assert_ne!(
             detail, "нет потоков, пересекающих границу контура",
             "разные причины обязаны объясняться по-разному"
+        );
+    }
+
+    #[test]
+    fn the_wire_explains_where_the_money_came_from() {
+        let provenance = PriceProvenance {
+            price_kind: Some("legal_close".to_owned()),
+            origin: PriceOrigin::OwnerAsserted,
+            venue: Some("moex".to_owned()),
+            quotation_basis: iaam_core::valuation::QuotationBasis::PercentOfRemainingFace,
+            basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
+            observed_at: time::macros::datetime!(2026-08-26 08:00:00 UTC),
+            valuation_policy_version: 1,
+            source_priority_version: 1,
+            carry_forward_limit: 10,
+            price_max_age: 30,
+        };
+
+        let dto = PriceProvenanceDto::from_domain(&provenance);
+        assert_eq!(
+            dto.quotation_basis,
+            QuotationBasisDto::PercentOfRemainingFace
+        );
+        assert_eq!(
+            dto.basis_evidence.as_deref(),
+            Some("iss:engines/stock/markets/bonds")
         );
     }
 }

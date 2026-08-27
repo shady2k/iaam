@@ -209,8 +209,10 @@ pub enum MaterialIssue {
     AccruedInterestMismatch {
         instrument: InstrumentId,
         computed: Dec,
+        computed_currency: CurrencyCode,
         observed: Dec,
-        currency: CurrencyCode,
+        observed_currency: CurrencyCode,
+        quantity: crate::money::Quantity,
         date: Date,
     },
 }
@@ -929,25 +931,40 @@ fn accrued_mismatch_is_material(computed: Dec, observed: Dec, currency: Currency
 
 fn accrued_mismatch_issues(
     assessments: &[PositionAssessment],
-    request: &ReturnsRequest<'_>,
+    request: &ReturnsRequest,
     rule: &dyn AccruedInterestRule,
 ) -> Vec<MaterialIssue> {
-    assessments
-        .iter()
-        .filter_map(|assessment| {
-            let computed = accrued_per_unit(request, rule, assessment.instrument).ok()?;
-            let observed = request.accrued_observations.get(&assessment.instrument)?;
+    let mut quantities = BTreeMap::new();
+    for assessment in assessments {
+        let total = quantities
+            .entry(assessment.instrument)
+            .or_insert_with(Dec::zero);
+        if let Ok(sum) = total.checked_add(assessment.quantity.0) {
+            *total = sum;
+        }
+    }
+    quantities
+        .into_iter()
+        .filter_map(|(instrument, quantity)| {
+            let computed = accrued_per_unit(request, rule, instrument).ok()?;
+            let observed = request.accrued_observations.get(&instrument)?;
             let material = computed.currency() != observed.currency()
                 || accrued_mismatch_is_material(
                     computed.value(),
                     observed.value(),
                     observed.currency(),
                 );
-            material.then_some(MaterialIssue::AccruedInterestMismatch {
-                instrument: assessment.instrument,
-                computed: computed.value(),
-                observed: observed.value(),
-                currency: observed.currency(),
+            if !material {
+                return None;
+            }
+            let quantity = crate::money::Quantity(quantity);
+            Some(MaterialIssue::AccruedInterestMismatch {
+                instrument,
+                computed: computed.checked_mul_quantity(quantity).ok()?,
+                computed_currency: computed.currency(),
+                observed: observed.checked_mul_quantity(quantity).ok()?,
+                observed_currency: observed.currency(),
+                quantity,
                 date: request.as_of,
             })
         })
@@ -2367,14 +2384,142 @@ mod tests {
             CurrencyCode::Rub
         ));
     }
+    #[test]
+    fn accrued_mismatch_amounts_are_position_totals_and_duplicate_accounts_are_merged() {
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), []);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let mut schedules = BTreeMap::new();
+        schedules.insert(
+            instrument,
+            BondSchedule {
+                periods: vec![crate::bond::AccrualPeriod {
+                    period_start: date!(2026 - 08 - 01),
+                    accrual_end: date!(2026 - 09 - 01),
+                    payment_date: date!(2026 - 09 - 01),
+                    coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
+                }],
+                principal_returns: vec![],
+            },
+        );
+        let mut observed = BTreeMap::new();
+        observed.insert(
+            instrument,
+            PerUnitAmount::new(dec("22.40"), CurrencyCode::Rub),
+        );
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+            bond_schedules: &schedules,
+            accrued_observations: &observed,
+        };
+        let assessments = vec![
+            position_assessment(
+                AccountId::new_random(),
+                instrument,
+                Quantity(dec("60")),
+            ),
+            position_assessment(
+                AccountId::new_random(),
+                instrument,
+                Quantity(dec("40")),
+            ),
+        ];
+
+        let issues = accrued_mismatch_issues(&assessments, &request, &AccruedInterestV1);
+        assert_eq!(issues.len(), 1);
+        let MaterialIssue::AccruedInterestMismatch {
+            computed,
+            computed_currency,
+            observed,
+            observed_currency,
+            quantity,
+            ..
+        } = &issues[0]
+        else {
+            panic!("ожидалось расхождение НКД");
+        };
+        assert_eq!(*computed, dec("2500.00"));
+        assert_eq!(*computed_currency, CurrencyCode::Rub);
+        assert_eq!(*observed, dec("2240.00"));
+        assert_eq!(*observed_currency, CurrencyCode::Rub);
+        assert_eq!(*quantity, Quantity(dec("100")));
+    }
+    #[test]
+    fn accrued_mismatch_keeps_computed_and_observed_currencies_separate() {
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), []);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let schedules = BTreeMap::from([(
+            instrument,
+            BondSchedule {
+                periods: vec![crate::bond::AccrualPeriod {
+                    period_start: date!(2026 - 08 - 01),
+                    accrual_end: date!(2026 - 09 - 01),
+                    payment_date: date!(2026 - 09 - 01),
+                    coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
+                }],
+                principal_returns: vec![],
+            },
+        )]);
+        let observed = BTreeMap::from([(
+            instrument,
+            PerUnitAmount::new(dec("22.40"), CurrencyCode::Usd),
+        )]);
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+            bond_schedules: &schedules,
+            accrued_observations: &observed,
+        };
+        let issues = accrued_mismatch_issues(
+            &[position_assessment(
+                AccountId::new_random(),
+                instrument,
+                Quantity(dec("1")),
+            )],
+            &request,
+            &AccruedInterestV1,
+        );
+        let MaterialIssue::AccruedInterestMismatch {
+            computed_currency,
+            observed_currency,
+            ..
+        } = &issues[0]
+        else {
+            panic!("ожидалось расхождение НКД");
+        };
+        assert_eq!(*computed_currency, CurrencyCode::Rub);
+        assert_eq!(*observed_currency, CurrencyCode::Usd);
+    }
 
     #[test]
     fn an_accrued_interest_mismatch_is_a_defect() {
         let issue = MaterialIssue::AccruedInterestMismatch {
             instrument: InstrumentId::new_random(),
             computed: dec("15.17"),
+            computed_currency: CurrencyCode::Rub,
             observed: dec("22.40"),
-            currency: CurrencyCode::Rub,
+            observed_currency: CurrencyCode::Rub,
+            quantity: Quantity(dec("1")),
             date: date!(2026 - 08 - 26),
         };
         assert!(issue.is_defect());

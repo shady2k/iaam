@@ -1,0 +1,23 @@
+{
+"amortizations": {
+	"columns": ["isin", "name", "issuevalue", "amortdate", "facevalue", "initialfacevalue", "faceunit", "valueprc", "value", "value_rub", "data_source", "secid", "primary_boardid"], 
+	"data": [
+		["BYM000001818", "РесБел 331 29.06.2027", 240419000, "2027-06-29", 1000, 1000, "USD", 100, 1000, 84282, "maturity", "BYM000001818", "TQCB"]
+	]
+},
+"coupons": {
+	"columns": ["isin", "name", "issuevalue", "coupondate", "recorddate", "startdate", "initialfacevalue", "facevalue", "faceunit", "value", "valueprc", "value_rub", "secid", "primary_boardid"], 
+	"data": [
+		["BYM000001818", "РесБел 331 29.06.2027", 240419000, "2025-06-29", "2025-06-27", "2024-12-27", 1000, 1000, "USD", 38.5798355754, 7.6250000000, 3027.3, "BYM000001818", "TQCB"],
+		["BYM000001818", "РесБел 331 29.06.2027", 240419000, "2025-12-29", "2025-12-26", "2025-06-29", 1000, 1000, "USD", 38.23, 7.6250000000, 2970.18, "BYM000001818", "TQCB"],
+		["BYM000001818", "РесБел 331 29.06.2027", 240419000, "2026-06-29", "2026-06-26", "2025-12-29", 1000, 1000, "USD", 38.02, 7.6250000000, 2929.86, "BYM000001818", "TQCB"],
+		["BYM000001818", "РесБел 331 29.06.2027", 240419000, "2026-12-29", "2026-12-28", "2026-06-29", 1000, 1000, "USD", 38.23, 7.6250000000, 3222.1, "BYM000001818", "TQCB"],
+		["BYM000001818", "РесБел 331 29.06.2027", 240419000, "2027-06-29", "2027-06-28", "2026-12-29", 1000, 1000, "USD", 38.02, 7.6250000000, 3204.4, "BYM000001818", "TQCB"]
+	]
+},
+"offers": {
+	"columns": ["isin", "name", "issuevalue", "offerdate", "offerdatestart", "offerdateend", "facevalue", "faceunit", "price", "value", "agent", "offertype", "secid", "primary_boardid"], 
+	"data": [
+
+	]
+}}

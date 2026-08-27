@@ -188,6 +188,17 @@ MODULES=(
   "crates/iaam-core/src/event/offer.rs"
   "crates/iaam-core/src/event/legs.rs"
   "crates/iaam-core/src/rules/amortisation.rs"
+  # Правило НКД и выводы по графику. Добавлено при исполнении E3.4.4
+  # (iaam-pa0m). accrued_interest.rs держит полуоткрытость границы
+  # периода и стратегию округления: обе меняют сумму при одинаковом
+  # inputs_hash, и мутант, сдвинувший `<` в `<=`, выдал бы на конце
+  # периода целый купон вместо нуля. finality.rs решает, возвращён ли
+  # номинал целиком; posting.rs решает, по какому полю берётся дата
+  # выплаты — payment_date против accrual_end. Ни один из этих мутантов
+  # не меняет числа напрямую, они меняют то, чему число соответствует.
+  "crates/iaam-core/src/rules/accrued_interest.rs"
+  "crates/iaam-core/src/bond/finality.rs"
+  "crates/iaam-core/src/bond/posting.rs"
   "crates/iaam-core/src/projection/offers.rs"
   # График выплат (E3.4 часть 2). Ошибка в инвариантах полноты не меняет
   # ни одной суммы — она меняет то, что система считает полным графиком,

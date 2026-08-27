@@ -281,6 +281,12 @@ fn settlement(
 
 /// Количество выбывающей бумаги. Клиент присылает положительное —
 /// знак ставит приёмка.
+///
+/// Отказ пробрасывается, хотя ни одно `Decimal` его сегодня не вызывает
+/// (`checked_neg` — это `0 - self`, и у `Decimal` результат представим
+/// всегда): `unwrap` здесь утверждал бы, что так будет и впредь, о чём
+/// эта функция знать не может. Тот же приём, что в `operation.rs`
+/// у продажи.
 fn retired(quantity: Quantity) -> Result<Quantity, Rejection> {
     quantity
         .0
@@ -528,6 +534,71 @@ mod tests {
         assert!(
             event.validate_structure().is_err(),
             "нулевая выплата обязана быть отклонена"
+        );
+    }
+
+    /// Комиссия в чужой валюте — не «почти правильный» выкуп: сложив
+    /// её с суммой, приёмка записала бы поступление, которого не было.
+    #[test]
+    fn a_fee_in_another_currency_is_refused_instead_of_being_added() {
+        let rejection = normalize_journal_event(
+            &submitted(JournalFact::OfferExercise {
+                action: OfferExerciseAction::Settled {
+                    submission: OfferSubmissionId::new_random(),
+                    instrument: InstrumentId::new_random(),
+                    custody: CustodyId::new_random(),
+                    quantity: qty("5"),
+                    gross: rub(500_000),
+                    fee: Some(Money::new(PostedMinor::new(1_000), CurrencyCode::Usd)),
+                    accrued_interest: None,
+                },
+                day: date!(2026 - 04 - 20),
+            }),
+            context(),
+        )
+        .expect_err("выкуп с комиссией в чужой валюте обязан быть отклонён");
+        assert_eq!(rejection.field, "fee");
+    }
+
+    #[test]
+    fn accrued_interest_in_another_currency_is_refused_too() {
+        let rejection = normalize_journal_event(
+            &submitted(JournalFact::OfferExercise {
+                action: OfferExerciseAction::Settled {
+                    submission: OfferSubmissionId::new_random(),
+                    instrument: InstrumentId::new_random(),
+                    custody: CustodyId::new_random(),
+                    quantity: qty("5"),
+                    gross: rub(500_000),
+                    fee: None,
+                    accrued_interest: Some(Money::new(PostedMinor::new(2_000), CurrencyCode::Usd)),
+                },
+                day: date!(2026 - 04 - 20),
+            }),
+            context(),
+        )
+        .expect_err("накопленный купон в чужой валюте обязан быть отклонён");
+        assert_eq!(rejection.field, "accrued_interest");
+    }
+
+    /// Идентификатор факта в источнике доезжает до происхождения: без
+    /// него сверку с выгрузкой брокера не на чем строить (§4.1).
+    #[test]
+    fn the_source_identifier_reaches_the_provenance() {
+        let event = normalize_journal_event(
+            &SubmittedJournalEvent {
+                account: AccountId::new_random(),
+                fact: JournalFact::CorporateAction(partial_redemption()),
+                idempotency_key: None,
+                source_operation_id: Some("амортизация-7".into()),
+            },
+            context(),
+        )
+        .expect("нормализация обязана пройти")
+        .event;
+        assert_eq!(
+            event.provenance.source_operation_id(),
+            Some("амортизация-7")
         );
     }
 

@@ -74,6 +74,24 @@ pub struct StoredSnapshot {
     pub offer_windows: Vec<OfferWindowRow>,
 }
 
+/// Строка условий выпуска. Все значения строками, как и везде в
+/// хранилище: форматов источников оно не знает.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueTermsRow {
+    pub instrument_id: String,
+    pub source_id: String,
+    pub observed_at: String,
+    pub effective_from: Option<String>,
+    pub maturity_date: Option<String>,
+    pub initial_face_value: Option<String>,
+    pub face_currency_code: Option<String>,
+    pub coupon_periods_per_year: Option<i64>,
+    pub day_count: Option<String>,
+    pub calendar: Option<String>,
+    pub default_declared: bool,
+    pub default_technical: bool,
+}
+
 impl SqliteStore {
     /// Записать снимок графика целиком.
     ///
@@ -314,5 +332,75 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Записать наблюдение условий выпуска.
+    ///
+    /// `INSERT OR IGNORE`, а не `UPSERT`: наблюдение append-only, и
+    /// повторная запись на тот же `observed_at` — это то же наблюдение,
+    /// а не исправление. Исправление приходит новым `observed_at`.
+    pub fn record_issue_terms(&mut self, row: &IssueTermsRow) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO issue_terms
+                 (instrument_id, source_id, observed_at, effective_from, maturity_date,
+                  initial_face_value, face_currency_code, coupon_periods_per_year,
+                  day_count, calendar, default_declared, default_technical, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                &row.instrument_id,
+                &row.source_id,
+                &row.observed_at,
+                &row.effective_from,
+                &row.maturity_date,
+                &row.initial_face_value,
+                &row.face_currency_code,
+                &row.coupon_periods_per_year,
+                &row.day_count,
+                &row.calendar,
+                i64::from(row.default_declared),
+                i64::from(row.default_technical),
+                now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Последнее наблюдение условий не позже координаты знания.
+    pub fn issue_terms_at_or_before(
+        &self,
+        instrument_id: &str,
+        source_id: &str,
+        knowledge_as_of: &str,
+    ) -> Result<Option<IssueTermsRow>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT instrument_id, source_id, observed_at, effective_from, maturity_date,
+                        initial_face_value, face_currency_code, coupon_periods_per_year,
+                        day_count, calendar, default_declared, default_technical
+                 FROM issue_terms
+                 WHERE instrument_id = ?1 AND source_id = ?2 AND observed_at <= ?3
+                 ORDER BY observed_at DESC
+                 LIMIT 1",
+                params![instrument_id, source_id, knowledge_as_of],
+                |row| {
+                    Ok(IssueTermsRow {
+                        instrument_id: row.get(0)?,
+                        source_id: row.get(1)?,
+                        observed_at: row.get(2)?,
+                        effective_from: row.get(3)?,
+                        maturity_date: row.get(4)?,
+                        initial_face_value: row.get(5)?,
+                        face_currency_code: row.get(6)?,
+                        coupon_periods_per_year: row.get(7)?,
+                        day_count: row.get(8)?,
+                        calendar: row.get(9)?,
+                        default_declared: row.get::<_, i64>(10)? != 0,
+                        default_technical: row.get::<_, i64>(11)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 }

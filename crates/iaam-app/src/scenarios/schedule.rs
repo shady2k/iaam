@@ -20,13 +20,16 @@
 
 use iaam_core::ids::InstrumentId;
 use iaam_market::moex::bondization::parse_bondization_page;
+use iaam_market::moex::description::{parse_description, terms_request};
 use iaam_market::moex::{PAGE_LIMIT, ScheduleQuery, schedule_request};
 use iaam_market::observation::ObservedAt;
 use iaam_market::schedule::completeness::{Completeness, validate_moex_profile};
-use iaam_market::schedule::{CouponAmount, CouponPeriod, OfferWindow, PrincipalRepayment};
+use iaam_market::schedule::{
+    CouponAmount, CouponPeriod, Knowledge, OfferWindow, PrincipalRepayment,
+};
 use iaam_store::market::MarketStore;
 use iaam_store::schedule::{
-    CouponPeriodRow, OfferWindowRow, PrincipalRepaymentRow, ScheduleSnapshotRow,
+    CouponPeriodRow, IssueTermsRow, OfferWindowRow, PrincipalRepaymentRow, ScheduleSnapshotRow,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -209,6 +212,76 @@ pub async fn sync_schedule(
         pages_seen,
         completeness,
     })
+}
+
+/// Синхронизировать условия выпуска.
+///
+/// Отдельный сценарий, а не шаг синхронизации графика: у условий свой
+/// эндпойнт, своя ось действия (`effective_from`) и своя append-only
+/// таблица. Слить их значило бы записывать новое наблюдение условий
+/// каждый раз, когда поменялся график, и наоборот.
+pub async fn sync_issue_terms(
+    store: &mut MarketStore,
+    transport: &dyn OutboundHttp,
+    instrument: InstrumentId,
+    secid: &str,
+) -> Result<(), AppError> {
+    let observed_at = ObservedAt(OffsetDateTime::now_utc());
+    let response = transport.send(terms_request(secid)).await?;
+    if !(200..300).contains(&response.status) {
+        return Err(invalid(
+            "status",
+            "успешный ответ источника",
+            &response.status.to_string(),
+        ));
+    }
+    let terms = parse_description(&response.body, instrument, observed_at)
+        .map_err(|error| invalid("body", "разбираемое описание", &error.to_string()))?;
+
+    // Код валюты хранится как его дал источник, но словарь обязан его
+    // знать: неизвестный код, дошедший до базы, станет второй валютой
+    // рядом с рублём, и позиции разъедутся молча.
+    if let Knowledge::Known(code) = &terms.face_currency_code {
+        let currencies = store
+            .market_source_codes(SOURCE_ID, "currency")
+            .map_err(|error| invalid("dictionary", "словарь валют", &error.to_string()))?;
+        if !currencies.contains_key(code) {
+            return Err(invalid(
+                "currency",
+                "код валюты, известный словарю источника",
+                code,
+            ));
+        }
+    }
+
+    store
+        .record_issue_terms(&IssueTermsRow {
+            instrument_id: instrument.inner().to_string(),
+            source_id: SOURCE_ID.to_owned(),
+            observed_at: observed_at
+                .0
+                .format(&Rfc3339)
+                .map_err(|error| invalid("observed_at", "RFC 3339", &error.to_string()))?,
+            // Неизвестное доходит до базы NULL. Значение по умолчанию
+            // здесь — правдоподобно неверный НКД.
+            effective_from: terms.effective_from.known().map(ToString::to_string),
+            maturity_date: terms.maturity_date.known().map(ToString::to_string),
+            initial_face_value: terms
+                .initial_face_value
+                .known()
+                .map(|value| value.inner().to_string()),
+            face_currency_code: terms.face_currency_code.known().cloned(),
+            coupon_periods_per_year: terms
+                .coupon_periods_per_year
+                .known()
+                .map(|value| i64::from(*value)),
+            day_count: terms.day_count.known().cloned(),
+            calendar: terms.calendar.known().cloned(),
+            default_declared: terms.default_flags.declared,
+            default_technical: terms.default_flags.technical,
+        })
+        .map_err(|error| invalid("issue_terms", "записываемые условия", &error.to_string()))?;
+    Ok(())
 }
 
 fn coupon_row(period: &CouponPeriod) -> CouponPeriodRow {

@@ -5,14 +5,19 @@
 //! не переживающий сериализацию, бесполезен — хранилище кладёт событие
 //! в текстовое поле и читает обратно.
 
+use std::collections::BTreeSet;
+
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates, TradeDate};
+use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
 use iaam_core::event::leg::Leg;
+use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RowLocator};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId, TransferId};
-use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
+use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::reconciliation::claim::{AssertionPeriod, ControlClaim};
 use iaam_core::valuation::PriceQuality;
 use rust_decimal::Decimal;
 use time::macros::date;
@@ -23,6 +28,13 @@ fn rub(minor: i64) -> Money {
 
 fn qty(units: i64) -> Quantity {
     Quantity(Dec::new(Decimal::from(units)))
+}
+
+fn per_unit(text: &str) -> PerUnitAmount {
+    PerUnitAmount::new(
+        Dec::new(Decimal::from_str_exact(text).expect("десятичное число")),
+        CurrencyCode::Rub,
+    )
 }
 
 fn envelope(kind: EventKind, legs: Vec<Leg>) -> Event {
@@ -137,7 +149,162 @@ fn every_kind() -> Vec<Event> {
             },
             vec![],
         ),
+        envelope(
+            EventKind::ControlAssertion {
+                period: AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+                    .expect("интервал"),
+                claim: ControlClaim::CashTurnover {
+                    currency: CurrencyCode::Rub,
+                    debit: PostedMinor::new(150_000),
+                    credit: PostedMinor::new(20_000),
+                },
+            },
+            vec![],
+        ),
+        envelope(
+            EventKind::CorporateAction {
+                action: CorporateAction::PartialRedemption {
+                    instrument,
+                    custody,
+                    quantity: qty(10),
+                    principal_returned_per_unit: per_unit("200.0000"),
+                    compensation: rub(200_000),
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: Some(date!(2026 - 06 - 13)),
+                    grounds: Some("решение эмитента №4".to_owned()),
+                },
+            },
+            vec![Leg::principal(account, instrument, rub(200_000))],
+        ),
+        envelope(
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption {
+                    instrument,
+                    custody,
+                    quantity: qty(10),
+                    principal_returned_per_unit: per_unit("800.0000"),
+                    compensation: rub(800_000),
+                    effective_date: date!(2026 - 12 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![
+                Leg::principal(account, instrument, rub(800_000)),
+                Leg::security(account, custody, instrument, qty(-10)),
+            ],
+        ),
+        envelope(
+            EventKind::CorporateAction {
+                action: CorporateAction::Conversion {
+                    predecessor: instrument,
+                    successor: InstrumentId::new_random(),
+                    custody,
+                    ratio: Dec::new(Decimal::new(15, 1)),
+                    quantity_in: qty(10),
+                    quantity_out: qty(15),
+                    fractional: FractionalTreatment::NotApplicable,
+                    compensation: None,
+                    effective_date: date!(2026 - 09 - 01),
+                    record_date: Some(date!(2026 - 08 - 30)),
+                    grounds: None,
+                    basis_transfer: BasisTransferRule::CarryOver,
+                },
+            },
+            vec![],
+        ),
+        envelope(
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Submitted {
+                    submission: OfferSubmissionId::new_random(),
+                    window: OfferWindowId::new_random(),
+                    instrument,
+                    quantity: qty(10),
+                },
+            },
+            vec![],
+        ),
+        envelope(
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Cancelled {
+                    submission: OfferSubmissionId::new_random(),
+                    quantity: qty(4),
+                },
+            },
+            vec![],
+        ),
+        envelope(
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Settled {
+                    submission: OfferSubmissionId::new_random(),
+                    instrument,
+                    custody,
+                    quantity: qty(6),
+                    gross: rub(600_000),
+                    fee: Some(rub(1_000)),
+                    accrued_interest: Some(rub(12_345)),
+                },
+            },
+            vec![
+                Leg::cash(account, rub(611_345)),
+                Leg::security(account, custody, instrument, qty(-6)),
+            ],
+        ),
     ]
+}
+
+/// Все виды события, которые обязан покрывать круг через JSON.
+///
+/// Список закреплён вручную и сверяется с образцами: без сверки тест
+/// продолжал бы называться «каждый вид», покрывая не каждый. Так уже
+/// было — `control_assertion` в образцах отсутствовал.
+const EVERY_DISCRIMINANT: [&str; 12] = [
+    "trade",
+    "cash_in",
+    "cash_out",
+    "cash_transfer",
+    "income",
+    "fee",
+    "opening_position",
+    "opening_cash",
+    "valuation",
+    "control_assertion",
+    "corporate_action",
+    "offer_exercise",
+];
+
+/// Заслон полноты списка выше: новый вариант обязан сломать сборку
+/// здесь. Ветки `_` нет намеренно — она и есть та дыра, ради которой
+/// заслон существует (§15.1).
+fn is_known(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Trade { .. }
+        | EventKind::CashIn { .. }
+        | EventKind::CashOut { .. }
+        | EventKind::CashTransfer { .. }
+        | EventKind::Income { .. }
+        | EventKind::Fee { .. }
+        | EventKind::OpeningPosition { .. }
+        | EventKind::OpeningCash { .. }
+        | EventKind::Valuation { .. }
+        | EventKind::ControlAssertion { .. }
+        | EventKind::CorporateAction { .. }
+        | EventKind::OfferExercise { .. } => true,
+    }
+}
+
+#[test]
+fn the_round_trip_covers_every_event_kind() {
+    let covered: BTreeSet<&str> = every_kind()
+        .iter()
+        .inspect(|event| assert!(is_known(&event.kind)))
+        .map(|event| event.kind.discriminant())
+        .collect();
+    let expected: BTreeSet<&str> = EVERY_DISCRIMINANT.into_iter().collect();
+    assert_eq!(
+        covered, expected,
+        "у вида события нет образца: круг через JSON его не проверяет"
+    );
 }
 
 #[test]

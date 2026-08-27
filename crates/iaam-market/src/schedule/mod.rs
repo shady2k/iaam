@@ -11,6 +11,7 @@
 //! вид права по оферте хранятся так, как их назвал источник, и переводятся
 //! словарём на границе приложения (§2.5).
 
+pub mod completeness;
 pub mod terms;
 
 use iaam_core::ids::InstrumentId;

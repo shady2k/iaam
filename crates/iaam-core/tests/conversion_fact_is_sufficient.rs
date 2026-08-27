@@ -193,11 +193,29 @@ fn successor_lots_are_derived_from_predecessor_lots_and_the_event_alone() {
         "срок владения обнулился"
     );
 
+    // Стоимость обязана прийти к преемнику как приобретённая, иначе
+    // тождество «приобретено = осталось + списано» перестанет держаться
+    // и инвариант проекции остановит отчёт (projection/invariants.rs).
+    assert_eq!(successor.acquired_basis(), Some(rub(1_000_000)));
+    assert_eq!(successor.released_basis(), None);
+
     let predecessor = book
         .entry(&swap.predecessor_key())
         .expect("запись предшественника");
     assert_eq!(predecessor.quantity().unwrap(), qty(0));
     assert_eq!(predecessor.released_basis(), Some(rub(1_000_000)));
+
+    // Тождество сохранения стоимости по обеим записям.
+    for entry in [predecessor, successor] {
+        let acquired = entry.acquired_basis().expect("стоимость приобретения");
+        let remaining = entry.remaining_basis().unwrap().unwrap_or_else(|| rub(0));
+        let released = entry.released_basis().unwrap_or_else(|| rub(0));
+        assert_eq!(
+            acquired,
+            remaining.try_add(released).unwrap(),
+            "замещение потеряло стоимость"
+        );
+    }
 }
 
 #[test]

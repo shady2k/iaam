@@ -569,6 +569,24 @@ fn describe(reason: &NotComputable) -> String {
         NotComputable::MissingFxRate { from, to, date } => {
             format!("нет курса {}→{} на {date}", from.code(), to.code())
         }
+        NotComputable::QuotationBasisUnknown { instrument } => {
+            format!(
+                "неизвестно основание котировки инструмента {}",
+                instrument.inner()
+            )
+        }
+        NotComputable::RemainingFaceUnknown { instrument } => {
+            format!(
+                "неизвестен остаточный номинал инструмента {}",
+                instrument.inner()
+            )
+        }
+        NotComputable::RemainingFaceAmbiguous { instrument } => {
+            format!(
+                "неоднозначен остаточный номинал инструмента {}",
+                instrument.inner()
+            )
+        }
         NotComputable::SolverRefused { refusal } => refusal.to_string(),
         NotComputable::NoExternalFlows => "нет потоков, пересекающих границу контура".into(),
         NotComputable::StateNewerThanReport { last_event, as_of } => {

@@ -20,14 +20,18 @@ use time::{Date, OffsetDateTime, UtcOffset};
 use crate::contour::{ContourDefinition, ContourId, ContourVersion};
 use crate::ids::{AccountId, InstrumentId, SourceId};
 use crate::money::CurrencyCode;
+use crate::money::PerUnitAmount;
 use crate::numeric::approx::SolverPolicy;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverRefusal};
 use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
+use crate::projection::lots::{LotBook, LotKey};
 use crate::projection::state::LedgerState;
 use crate::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use crate::rules::lot_disposal::RuleId;
+use crate::rules::quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 use crate::rules::{SourcePriorityVersion, ValuationPolicyV1, ValuationRule};
+use crate::valuation::QuotationBasis;
 use crate::valuation::{
     FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
     SelectedPrice, SourceExecutability, UncoveredReason, ValuationError,
@@ -74,6 +78,12 @@ pub enum NotComputable {
         to: CurrencyCode,
         date: Date,
     },
+    /// Основание котировки не доказано источником.
+    QuotationBasisUnknown { instrument: InstrumentId },
+    /// Номинал бумаги неизвестен.
+    RemainingFaceUnknown { instrument: InstrumentId },
+    /// Лоты одной пары «счёт и бумага» несут разные номиналы.
+    RemainingFaceAmbiguous { instrument: InstrumentId },
     /// Решатель отказался: корня нет, корней несколько, не сошлось.
     SolverRefused { refusal: SolverRefusal },
     /// Ни одного потока, пересекающего границу контура.
@@ -95,6 +105,9 @@ impl NotComputable {
         match self {
             Self::MissingPrice { .. } => "missing_price",
             Self::MissingFxRate { .. } => "missing_fx_rate",
+            Self::QuotationBasisUnknown { .. } => "quotation_basis_unknown",
+            Self::RemainingFaceUnknown { .. } => "remaining_face_unknown",
+            Self::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
             Self::SolverRefused { .. } => "solver_refused",
             Self::NoExternalFlows => "no_external_flows",
             Self::StateNewerThanReport { .. } => "state_newer_than_report",
@@ -306,6 +319,8 @@ pub struct AppliedRules {
     /// Порог, по которому классифицирован отрицательный остаток (§11).
     /// Цифра, зависящая от порога, обязана нести порог рядом с собой.
     pub perimeter_policy: PerimeterPolicy,
+    /// Версия единого правила пересчёта котировки в деньги.
+    pub quotation_rule: QuotationRuleVersion,
 }
 
 /// Координата знания, зафиксированная отчётом (§4).
@@ -586,6 +601,7 @@ fn inputs_hash_with_assessments(
                 quantity,
                 raw_price,
                 kind,
+                remaining_face: _,
             } = assessment;
             let valuation = match kind {
                 PositionAssessmentKind::Selected(selected) => {
@@ -672,6 +688,13 @@ fn inputs_hash_with_assessments(
     }
     result
 }
+/// Правило пересчёта котировки, применяемое отчётом.
+///
+/// Один помощник нужен, чтобы оценка позиции и XIRR не получили
+/// расходящиеся реализации пересчёта.
+pub(crate) const fn quotation_rule() -> (QuotationRuleVersion, QuotationV1) {
+    (QuotationRuleVersion(1), QuotationV1)
+}
 
 /// Расчёт отчёта.
 ///
@@ -680,6 +703,7 @@ fn inputs_hash_with_assessments(
 /// с указанием причины, а не в подставленное значение.
 #[must_use]
 pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsReport {
+    let (quotation_rule_version, _) = quotation_rule();
     let series = xirr::flow_series(state, request);
     let terminal = xirr::terminal_value(state, request);
     let (contributed, withdrawn) = match &series {
@@ -730,6 +754,7 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
             day_count: DayCount::Act365,
             solver_policy: request.solver_policy,
             perimeter_policy: request.perimeter.policy(),
+            quotation_rule: quotation_rule_version,
         },
         data_quality,
     }
@@ -752,6 +777,7 @@ struct PositionAssessment {
     quantity: crate::money::Quantity,
     raw_price: Option<crate::valuation::InstrumentPrice>,
     kind: PositionAssessmentKind,
+    remaining_face: Result<Option<PerUnitAmount>, NotComputable>,
 }
 
 fn position_assessments(
@@ -839,22 +865,79 @@ fn position_assessments(
                 instrument: key.instrument,
                 quantity,
                 raw_price,
+                remaining_face: remaining_face(
+                    state.book(),
+                    LotKey {
+                        account: key.account,
+                        instrument: key.instrument,
+                    },
+                ),
                 kind,
             }
         })
         .collect()
 }
 
+struct PositionQuotation<'a> {
+    price: Dec,
+    basis: QuotationBasis,
+    venue_currency: CurrencyCode,
+    remaining_face: Result<Option<PerUnitAmount>, NotComputable>,
+    rule: &'a dyn QuotationRule,
+}
+
+/// Возвращает единый остаточный номинал лотов пары «счёт и бумага».
+fn remaining_face(book: &LotBook, key: LotKey) -> Result<Option<PerUnitAmount>, NotComputable> {
+    let Some(entry) = book.entry(&key) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for lot in entry.lots() {
+        let Some(remaining) = lot.principal.remaining_per_unit() else {
+            continue;
+        };
+        match found {
+            None => found = Some(remaining),
+            Some(previous) if previous == remaining => {}
+            Some(_) => {
+                return Err(NotComputable::RemainingFaceAmbiguous {
+                    instrument: key.instrument,
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn quotation_error(error: QuotationError, instrument: InstrumentId) -> NotComputable {
+    match error {
+        QuotationError::BasisUnknown => NotComputable::QuotationBasisUnknown { instrument },
+        QuotationError::PrincipalUnknown => NotComputable::RemainingFaceUnknown { instrument },
+        QuotationError::Numeric(_) => NotComputable::Numeric { code: "numeric" },
+    }
+}
 fn position_value(
     assessment: &PositionAssessment,
-    price: Dec,
-    currency: CurrencyCode,
+    quotation: PositionQuotation<'_>,
     request: &ReturnsRequest<'_>,
 ) -> Result<Dec, NotComputable> {
+    let remaining_face = match quotation.basis {
+        QuotationBasis::PercentOfRemainingFace => quotation.remaining_face?,
+        QuotationBasis::MoneyPerUnit | QuotationBasis::Unknown => None,
+    };
+    let (money_per_unit, currency) = quotation
+        .rule
+        .money_per_unit(
+            quotation.basis,
+            quotation.price,
+            quotation.venue_currency,
+            remaining_face,
+        )
+        .map_err(|error| quotation_error(error, assessment.instrument))?;
     let local = assessment
         .quantity
         .0
-        .checked_mul(price)
+        .checked_mul(money_per_unit)
         .map_err(|_| NotComputable::Numeric { code: "numeric" })?;
     let rate = request
         .fx
@@ -895,6 +978,7 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
         legacy_derived: Vec::new(),
     };
     let mut executability = ExecutabilityAccumulator::default();
+    let (_, rule) = quotation_rule();
     for assessment in &assessments {
         match &assessment.kind {
             PositionAssessmentKind::Selected(selected) => {
@@ -908,8 +992,13 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
                 });
                 if let Ok(value) = position_value(
                     assessment,
-                    selected.candidate.price,
-                    selected.candidate.currency,
+                    PositionQuotation {
+                        price: selected.candidate.price,
+                        basis: selected.candidate.basis,
+                        venue_currency: selected.candidate.currency,
+                        remaining_face: assessment.remaining_face.clone(),
+                        rule: &rule,
+                    },
                     request,
                 ) {
                     executability.add(selected.candidate.executability, value);
@@ -926,9 +1015,17 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
                         quality: *quality,
                     });
                 if let Some(price) = assessment.raw_price {
-                    if let Ok(value) =
-                        position_value(assessment, price.price, price.currency, request)
-                    {
+                    if let Ok(value) = position_value(
+                        assessment,
+                        PositionQuotation {
+                            price: price.price,
+                            basis: QuotationBasis::MoneyPerUnit,
+                            venue_currency: price.currency,
+                            remaining_face: Ok(None),
+                            rule: &rule,
+                        },
+                        request,
+                    ) {
                         executability.add(SourceExecutability::Unknown, value);
                     }
                 }
@@ -1105,11 +1202,12 @@ mod tests {
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
     use crate::ids::{AccountId, CustodyId, InstrumentId};
-    use crate::money::{Money, PostedMinor, Quantity};
+    use crate::money::{Money, PerUnitAmount, PostedMinor, Quantity};
     use crate::projection::lots::LotBook;
     use crate::projection::{ProjectionContext, project};
     use crate::rules::{LotRuleVersion, RuleRegistry};
     use crate::valuation::PriceQuality;
+    use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 
     fn report_for(state: &LedgerState, coordinate: KnowledgeCoordinate) -> ReturnsReport {
@@ -1133,6 +1231,190 @@ mod tests {
             market_prices: &[],
         };
         returns_report(state, &request)
+    }
+
+    fn dec(text: &str) -> Dec {
+        Dec::new(Decimal::from_str_exact(text).unwrap())
+    }
+
+    fn position_assessment(
+        account: AccountId,
+        instrument: InstrumentId,
+        quantity: Quantity,
+    ) -> PositionAssessment {
+        PositionAssessment {
+            account,
+            custody: None,
+            instrument,
+            quantity,
+            raw_price: None,
+            remaining_face: Ok(None),
+            kind: PositionAssessmentKind::Uncovered(UncoveredReason::NoObservation),
+        }
+    }
+
+    fn position_request<'a>(
+        contour: &'a ContourDefinition,
+        fx: &'a FxTable,
+        ledger: &'a ReconciliationLedger,
+        perimeter: &'a PerimeterAssessment,
+    ) -> ReturnsRequest<'a> {
+        ReturnsRequest {
+            contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger,
+            perimeter,
+            market_prices: &[],
+        }
+    }
+
+    #[test]
+    fn a_bond_quoted_in_percent_is_valued_through_its_remaining_face() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let assessment = position_assessment(account, instrument, Quantity(dec("10")));
+        let (_, rule) = quotation_rule();
+
+        let value = position_value(
+            &assessment,
+            PositionQuotation {
+                price: dec("98.5"),
+                basis: QuotationBasis::PercentOfRemainingFace,
+                venue_currency: CurrencyCode::Rub,
+                remaining_face: Ok(Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub))),
+                rule: &rule,
+            },
+            &request,
+        );
+
+        assert_eq!(value, Ok(dec("9850.0")));
+    }
+
+    #[test]
+    fn a_bond_without_a_known_face_is_not_computable_with_its_own_reason() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let assessment = position_assessment(account, instrument, Quantity(dec("10")));
+        let (_, rule) = quotation_rule();
+
+        assert_eq!(
+            position_value(
+                &assessment,
+                PositionQuotation {
+                    price: dec("98.5"),
+                    basis: QuotationBasis::PercentOfRemainingFace,
+                    venue_currency: CurrencyCode::Rub,
+                    remaining_face: Ok(None),
+                    rule: &rule,
+                },
+                &request,
+            ),
+            Err(NotComputable::RemainingFaceUnknown { instrument }),
+        );
+    }
+
+    #[test]
+    fn an_undecided_basis_is_not_computable_rather_than_valued_as_money() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let assessment = position_assessment(account, instrument, Quantity(dec("10")));
+        let (_, rule) = quotation_rule();
+
+        assert_eq!(
+            position_value(
+                &assessment,
+                PositionQuotation {
+                    price: dec("98.5"),
+                    basis: QuotationBasis::Unknown,
+                    venue_currency: CurrencyCode::Rub,
+                    remaining_face: Ok(None),
+                    rule: &rule,
+                },
+                &request,
+            ),
+            Err(NotComputable::QuotationBasisUnknown { instrument }),
+        );
+    }
+
+    #[test]
+    fn lots_that_disagree_about_the_remaining_face_refuse_instead_of_averaging() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let assessment = position_assessment(account, instrument, Quantity(dec("10")));
+        let (_, rule) = quotation_rule();
+
+        assert_eq!(
+            position_value(
+                &assessment,
+                PositionQuotation {
+                    price: dec("98.5"),
+                    basis: QuotationBasis::PercentOfRemainingFace,
+                    venue_currency: CurrencyCode::Rub,
+                    remaining_face: Err(NotComputable::RemainingFaceAmbiguous { instrument }),
+                    rule: &rule,
+                },
+                &request,
+            ),
+            Err(NotComputable::RemainingFaceAmbiguous { instrument }),
+        );
+    }
+
+    #[test]
+    fn a_share_quoted_in_money_is_valued_exactly_as_before() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let assessment = position_assessment(account, instrument, Quantity(dec("10")));
+        let (_, rule) = quotation_rule();
+
+        let value = position_value(
+            &assessment,
+            PositionQuotation {
+                price: dec("270.13"),
+                basis: QuotationBasis::MoneyPerUnit,
+                venue_currency: CurrencyCode::Rub,
+                remaining_face: Ok(None),
+                rule: &rule,
+            },
+            &request,
+        );
+
+        assert_eq!(value, Ok(dec("2701.30")));
+    }
+
+    #[test]
+    fn the_report_names_the_quotation_rule_it_applied() {
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let report = report_for(&state, KnowledgeCoordinate::default());
+        assert_eq!(report.applied_rules.quotation_rule, QuotationRuleVersion(1));
     }
 
     #[test]
@@ -1249,6 +1531,7 @@ mod tests {
                     instrument,
                     quantity: crate::money::Quantity(Dec::one()),
                     raw_price: None,
+                    remaining_face: Ok(None),
                     kind: PositionAssessmentKind::Selected(Box::new(selected)),
                 }],
             )

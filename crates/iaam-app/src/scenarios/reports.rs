@@ -330,6 +330,9 @@ fn report_from_projection(
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: inputs.market_prices,
+            // Подача входов — Задача 12 (iaam-18f5). Здесь только заглушка сборки.
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
         },
     ))
 }

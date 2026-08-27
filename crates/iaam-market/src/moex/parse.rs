@@ -178,14 +178,15 @@ pub fn parse_accrued_interest(
         .get("history")
         .ok_or_else(|| MarketError::Malformed("нет блока history".to_owned()))?;
     let names = column_names(block)?;
-    // Колонки нет вовсе — это не облигационный сегмент, а не поломка.
-    if index_of(&names, "ACCINT").is_none() {
-        return Ok(Vec::new());
-    }
     let rows = block
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| MarketError::Malformed("нет history.data".to_owned()))?;
+    ensure_page_is_whole(&root, rows.len())?;
+    // Колонки нет вовсе — это не облигационный сегмент, а не поломка.
+    if index_of(&names, "ACCINT").is_none() {
+        return Ok(Vec::new());
+    }
 
     let mut observations = Vec::new();
     for row in rows {
@@ -439,6 +440,23 @@ mod tests {
             observations[0].per_unit.value(),
             Dec::new(Decimal::from_str_exact("15.17").unwrap())
         );
+    }
+    #[test]
+    fn accrued_interest_rejects_a_truncated_page() {
+        let body = r#"{"history":{
+            "columns":["BOARDID","TRADEDATE","ACCINT","FACEUNIT","TRADINGSESSION"],
+            "data":[["TQOB","2026-08-20",15.17,"RUB",3]]},
+            "history.cursor":{
+                "columns":["INDEX","TOTAL","PAGESIZE"],
+                "data":[[0,2,100]]}}"#;
+        assert!(matches!(
+            parse_accrued_interest(
+                body,
+                InstrumentId::new_random(),
+                ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
+            ),
+            Err(MarketError::Truncated { got: 1, total: 2 })
+        ));
     }
 
     #[test]

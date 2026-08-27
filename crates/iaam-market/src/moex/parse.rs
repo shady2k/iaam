@@ -6,7 +6,7 @@
 //! однажды прочитает объём как цену.
 
 use iaam_core::ids::InstrumentId;
-use iaam_core::money::CurrencyCode;
+use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::QuotationBasis;
 use rust_decimal::Decimal;
@@ -16,7 +16,8 @@ use time::format_description::well_known::Iso8601;
 
 use crate::error::MarketError;
 use crate::observation::{
-    Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue,
+    AccruedInterestObservation, Executability, ObservedAt, PriceKind, PriceObservation, TradeDate,
+    Venue,
 };
 
 /// Ценовые колонки ISS и их смысл.
@@ -161,6 +162,75 @@ pub fn parse_history(
     Ok(observations)
 }
 
+/// Разбор наблюдений НКД из той же страницы истории.
+///
+/// Отдельная функция, а не ветка внутри `parse_history`: величины разной
+/// размерности (процент номинала против денег) и разной судьбы —
+/// смешивать их в одном цикле значит однажды записать одну вместо другой.
+pub fn parse_accrued_interest(
+    body: &str,
+    instrument: InstrumentId,
+    observed_at: ObservedAt,
+) -> Result<Vec<AccruedInterestObservation>, MarketError> {
+    let root: Value =
+        serde_json::from_str(body).map_err(|error| MarketError::Malformed(error.to_string()))?;
+    let block = root
+        .get("history")
+        .ok_or_else(|| MarketError::Malformed("нет блока history".to_owned()))?;
+    let names = column_names(block)?;
+    // Колонки нет вовсе — это не облигационный сегмент, а не поломка.
+    if index_of(&names, "ACCINT").is_none() {
+        return Ok(Vec::new());
+    }
+    let rows = block
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| MarketError::Malformed("нет history.data".to_owned()))?;
+
+    let mut observations = Vec::new();
+    for row in rows {
+        let row = row
+            .as_array()
+            .ok_or_else(|| MarketError::Malformed("строка history.data не массив".to_owned()))?;
+        let get = |name: &str| index_of(&names, name).and_then(|i| row.get(i));
+        // Пустое значение наблюдения не порождает: ноль НКД означал бы
+        // начало купонного периода, а не отсутствие торгов.
+        let Some(value) = get("ACCINT").and_then(Value::as_number) else {
+            continue;
+        };
+        let amount = value
+            .to_string()
+            .parse::<Decimal>()
+            .map_err(|error| MarketError::Malformed(error.to_string()))?;
+        // Валюта НКД — валюта номинала (FACEUNIT), а не валюта расчётов
+        // площадки (CURRENCYID). В одной строке они различаются.
+        let currency = currency_of(
+            get("FACEUNIT")
+                .and_then(Value::as_str)
+                .ok_or_else(|| MarketError::Malformed("строка с ACCINT без FACEUNIT".to_owned()))?,
+        )?;
+        let trade_date = TradeDate(parse_date(
+            get("TRADEDATE")
+                .and_then(Value::as_str)
+                .ok_or_else(|| MarketError::Malformed("строка без TRADEDATE".to_owned()))?,
+        )?);
+        observations.push(AccruedInterestObservation {
+            instrument,
+            venue: Venue {
+                board: get("BOARDID")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| MarketError::Malformed("строка без BOARDID".to_owned()))?
+                    .to_owned(),
+                session: get("TRADINGSESSION").and_then(Value::as_i64).unwrap_or(0),
+            },
+            trade_date,
+            observed_at,
+            per_unit: PerUnitAmount::new(Dec::new(amount), currency),
+        });
+    }
+    Ok(observations)
+}
+
 /// Страница пришла целиком.
 ///
 /// Курсор ISS даёт `INDEX`, `TOTAL` и `PAGESIZE`. Неполная страница,
@@ -237,6 +307,13 @@ mod tests {
 
     const FIXTURE: &str =
         include_str!("../../../../tests/fixtures/market/moex-iss-history-sber.json");
+
+    const BOND_HISTORY: &str = r#"{"history":{
+        "columns":["BOARDID","TRADEDATE","SECID","CLOSE","ACCINT","CURRENCYID","FACEUNIT","TRADINGSESSION"],
+        "data":[
+            ["TQOB","2026-08-20","SU26238RMFS4",53.198,15.17,"SUR","RUB",3],
+            ["TQOB","2026-08-21","SU26238RMFS4",53.355,null,"SUR","RUB",3]
+        ]}}"#;
 
     fn observed() -> ObservedAt {
         ObservedAt(datetime!(2026-08-26 09:00:00 UTC))
@@ -345,5 +422,38 @@ mod tests {
         assert_eq!(as_shares[0].basis, QuotationBasis::MoneyPerUnit);
         assert_eq!(as_bonds[0].basis, QuotationBasis::PercentOfRemainingFace);
         assert_eq!(as_shares[0].price, as_bonds[0].price, "цена не меняется");
+    }
+
+    #[test]
+    fn accrued_interest_takes_its_currency_from_face_unit_not_from_currency_id() {
+        // В одной строке источник называет валюту дважды и по-разному:
+        // CURRENCYID=SUR и FACEUNIT=RUB. НКД выражен в валюте номинала.
+        let observations = parse_accrued_interest(
+            BOND_HISTORY,
+            InstrumentId::new_random(),
+            ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
+        )
+        .unwrap();
+        assert_eq!(observations.len(), 1, "строка с null наблюдения не даёт");
+        assert_eq!(observations[0].per_unit.currency(), CurrencyCode::Rub);
+        assert_eq!(
+            observations[0].per_unit.value(),
+            Dec::new(Decimal::from_str_exact("15.17").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_response_without_the_column_yields_nothing_rather_than_failing() {
+        // Ответ по акции колонки ACCINT не содержит вовсе. Отказ здесь
+        // сломал бы синхронизацию всех необлигаций.
+        let body = r#"{"history":{"columns":["BOARDID","TRADEDATE","CLOSE","CURRENCYID","TRADINGSESSION"],
+            "data":[["TQBR","2026-08-20",300.5,"SUR",3]]}}"#;
+        let observations = parse_accrued_interest(
+            body,
+            InstrumentId::new_random(),
+            ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
+        )
+        .unwrap();
+        assert!(observations.is_empty());
     }
 }

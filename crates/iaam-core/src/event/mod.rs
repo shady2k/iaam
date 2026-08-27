@@ -1,5 +1,6 @@
 //! Envelope события журнала (§4.1).
 
+pub mod corporate_action;
 pub mod correction;
 pub mod kind;
 pub mod leg;

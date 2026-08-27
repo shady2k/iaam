@@ -8,6 +8,7 @@
 pub mod broker_access;
 pub mod broker_operation_kinds;
 pub mod market;
+pub mod market_source_codes;
 
 pub mod bundle;
 pub mod documents;

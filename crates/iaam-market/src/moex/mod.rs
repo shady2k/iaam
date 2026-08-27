@@ -5,6 +5,7 @@
 //! это другой источник, и смешивать их в одной серии нельзя.
 
 pub mod bondization;
+pub mod dictionary_seed;
 pub mod parse;
 
 use iaam_http::{Destination, HttpRequest};

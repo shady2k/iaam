@@ -4,6 +4,7 @@
 //! Ни ввода-вывода, ни `async`, ни `Mutex`, ни зависимостей на другие
 //! крейты воркспейса. См. §3.1 спецификации.
 
+pub mod bond;
 pub mod contour;
 pub mod dates;
 pub mod event;

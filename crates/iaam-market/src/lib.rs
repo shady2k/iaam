@@ -12,9 +12,13 @@ pub mod cbr;
 pub mod error;
 pub mod moex;
 pub mod observation;
+pub mod schedule;
 
 pub use error::MarketError;
 pub use observation::{
     Executability, FxObservation, KeyRateObservation, ObservedAt, PriceKind, PriceObservation,
     TradeDate, Venue,
+};
+pub use schedule::{
+    CouponAmount, CouponPeriod, Knowledge, OfferWindow, PrincipalRepayment, ScheduleSnapshot,
 };

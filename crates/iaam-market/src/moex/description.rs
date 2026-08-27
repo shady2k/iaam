@@ -139,24 +139,15 @@ mod tests {
     use iaam_core::ids::InstrumentId;
     use time::macros::{date, datetime};
 
-    const BODY: &str = r#"{
-      "description": {
-        "columns": ["name", "title", "value"],
-        "data": [
-          ["MATDATE", "Дата погашения", "2036-02-06"],
-          ["INITIALFACEVALUE", "Первоначальная номинальная стоимость", "1000"],
-          ["FACEVALUE", "Номинальная стоимость", "375"],
-          ["FACEUNIT", "Валюта номинала", "SUR"],
-          ["COUPONFREQUENCY", "Периодичность выплаты купона в год", "2"],
-          ["HASDEFAULT", "Допущен дефолт", "0"],
-          ["HASTECHNICALDEFAULT", "Допущен технический дефолт", "0"]
-        ]
-      }
-    }"#;
+    // Живой ответ ISS 2026-08-27, замороженный эталон. Ни базы начисления
+    // дней, ни календаря в нём нет — это свойство источника, а не нашего
+    // литерала, и проверять его надо на источнике.
+    const DESCRIPTION: &[u8] =
+        include_bytes!("../../../../tests/fixtures/market/moex-iss-description-amortised.json");
 
     fn parsed() -> IssueTerms {
         parse_description(
-            BODY.as_bytes(),
+            DESCRIPTION,
             InstrumentId::new_random(),
             ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
         )
@@ -188,5 +179,15 @@ mod tests {
     fn the_maturity_date_is_read() {
         let terms = parsed();
         assert_eq!(terms.maturity_date, Knowledge::Known(date!(2036 - 02 - 06)));
+    }
+
+    #[test]
+    fn both_default_flags_are_parsed() {
+        // Оба признака, а не один: технический дефолт и объявленный —
+        // разные состояния, и потерять второй значит посчитать метрику
+        // по бумаге в дефолте так, будто выплаты состоятся.
+        let terms = parsed();
+        assert!(!terms.default_flags.declared);
+        assert!(!terms.default_flags.technical);
     }
 }

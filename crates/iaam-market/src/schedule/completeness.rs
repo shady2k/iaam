@@ -191,4 +191,25 @@ mod tests {
         // корректный график — такая же ошибка, как принять усечённый.
         assert_eq!(validate_moex_profile(&[], &[]), Completeness::Unknown);
     }
+
+    #[test]
+    fn coupons_without_any_repayment_are_unknown_not_incomplete() {
+        // Область применимости — купонный выпуск С погашением. Ряд
+        // купонов без единого возврата номинала за её пределами, и
+        // объявить его неполным значит отвергнуть корректный график
+        // бессрочного выпуска. Незнание — не нарушение.
+        let coupons = vec![coupon(date!(2026 - 02 - 15), date!(2026 - 08 - 15))];
+        assert_eq!(validate_moex_profile(&coupons, &[]), Completeness::Unknown);
+    }
+
+    #[test]
+    fn repayments_without_any_coupon_are_unknown_too() {
+        // Бескупонный выпуск: возврат есть, купонов нет. Та же
+        // граница профиля с другой стороны.
+        let repayments = vec![repayment(date!(2026 - 08 - 15), 100)];
+        assert_eq!(
+            validate_moex_profile(&[], &repayments),
+            Completeness::Unknown
+        );
+    }
 }

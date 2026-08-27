@@ -59,6 +59,23 @@ impl OutboundHttp for Pages {
     }
 }
 
+/// Транспорт, у которого страницы никогда не кончаются.
+///
+/// Нужен ради предохранителя `MAX_PAGES`: источник, отдающий строки
+/// бесконечно, обязан давать отказ, а не тихо оборванный график.
+struct Endless;
+
+#[async_trait]
+impl OutboundHttp for Endless {
+    async fn send(&self, _request: HttpRequest) -> Result<OutboundResponse, AppError> {
+        Ok(OutboundResponse {
+            status: 200,
+            body: PAGE_ONE.as_bytes().to_vec(),
+            raw_hash: "hash-endless".to_owned(),
+        })
+    }
+}
+
 const EMPTY_PAGE: &str = r#"{
   "amortizations": {"columns": ["amortdate", "valueprc", "data_source"], "data": []},
   "coupons": {"columns": ["coupondate", "startdate", "value", "valueprc", "faceunit"],
@@ -101,6 +118,50 @@ const PAGE_WITH_UNKNOWN_KIND: &str = r#"{
   "offers": {"columns": ["offerdate", "offertype"], "data": []}
 }"#;
 
+const PAGE_WITH_OFFER: &str = r#"{
+  "amortizations": {
+    "columns": ["amortdate", "valueprc", "data_source"],
+    "data": [["2027-02-15", 100, "maturity"]]
+  },
+  "coupons": {
+    "columns": ["coupondate", "startdate", "value", "valueprc", "faceunit"],
+    "data": [["2027-02-15", "2026-08-15", 34.41, 6.9, "RUB"]]
+  },
+  "offers": {
+    "columns": ["offerdate", "offertype"],
+    "data": [["2026-11-20", "Оферта"]]
+  }
+}"#;
+
+const PAGE_WITH_UNKNOWN_OFFER_KIND: &str = r#"{
+  "amortizations": {
+    "columns": ["amortdate", "valueprc", "data_source"],
+    "data": [["2027-02-15", 100, "maturity"]]
+  },
+  "coupons": {
+    "columns": ["coupondate", "startdate", "value", "valueprc", "faceunit"],
+    "data": [["2027-02-15", "2026-08-15", 34.41, 6.9, "RUB"]]
+  },
+  "offers": {
+    "columns": ["offerdate", "offertype"],
+    "data": [["2026-11-20", "Досрочное погашение"]]
+  }
+}"#;
+
+/// График, отличающийся от `PAGE_ONE`/`PAGE_TWO`: эмитент отменил один
+/// купон. Нужен ради проверки, что изменившийся график **пишется**.
+const PAGE_CHANGED: &str = r#"{
+  "amortizations": {
+    "columns": ["amortdate", "valueprc", "data_source"],
+    "data": [["2027-02-15", 100, "maturity"]]
+  },
+  "coupons": {
+    "columns": ["coupondate", "startdate", "value", "valueprc", "faceunit"],
+    "data": [["2027-02-15", "2026-02-15", 68.82, 6.9, "RUB"]]
+  },
+  "offers": {"columns": ["offerdate", "offertype"], "data": []}
+}"#;
+
 fn store() -> (SqliteStore, InstrumentId) {
     let mut store = SqliteStore::open_in_memory().expect("база в памяти");
     let instrument = InstrumentId::new_random();
@@ -128,6 +189,11 @@ fn store() -> (SqliteStore, InstrumentId) {
                     domain: "principal_repayment_kind".to_owned(),
                     source_code: "maturity".to_owned(),
                     meaning: "principal_return".to_owned(),
+                },
+                SourceCodeEntry {
+                    domain: "offer_kind".to_owned(),
+                    source_code: "Оферта".to_owned(),
+                    meaning: "put_option".to_owned(),
                 },
             ],
         )
@@ -223,4 +289,72 @@ async fn a_broken_invariant_does_not_cancel_the_snapshot() {
         .expect("синхронизация");
     assert!(matches!(result.completeness, Completeness::Unknown));
     assert!(result.written, "снимок обязан быть записан");
+}
+
+#[tokio::test]
+async fn an_offer_kind_known_to_the_dictionary_passes_and_an_unknown_one_does_not() {
+    // Проверка вида оферты обязана отвергать НЕизвестное, а не известное.
+    // Перевёрнутое условие пропускало бы незнакомый код и спотыкалось на
+    // знакомом — и то и другое молча меняет состав графика.
+    let (mut accepting, known) = store();
+    let accepted = sync_schedule(
+        &mut accepting,
+        &Pages::new(&[PAGE_WITH_OFFER]),
+        request(known),
+    )
+    .await
+    .expect("известный словарю вид оферты обязан проходить");
+    assert!(accepted.written);
+
+    let (mut fresh, other) = store();
+    let error = sync_schedule(
+        &mut fresh,
+        &Pages::new(&[PAGE_WITH_UNKNOWN_OFFER_KIND]),
+        request(other),
+    )
+    .await
+    .expect_err("неизвестный вид оферты обязан быть отказом");
+    assert!(
+        error.to_string().contains("Досрочное погашение"),
+        "отказ обязан назвать код: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_source_that_never_runs_out_of_pages_is_refused_not_truncated() {
+    // Предохранитель по числу страниц существует ради источника, который
+    // отдаёт строки бесконечно. Тихий возврат на потолке был бы тем же
+    // усечением, только нашими руками, — поэтому здесь отказ.
+    let (mut store, instrument) = store();
+    let error = sync_schedule(&mut store, &Endless, request(instrument))
+        .await
+        .expect_err("бесконечный источник обязан давать отказ");
+    assert!(
+        error.to_string().contains("100"),
+        "отказ обязан назвать потолок: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_schedule_is_written_as_a_new_snapshot() {
+    // Обратная сторона дедупа: если содержимое изменилось, новый снимок
+    // обязан появиться. Постоянный хэш прошёл бы проверку на повторе и
+    // молча похоронил бы каждую правку эмитента.
+    let (mut store, instrument) = store();
+    let first = sync_schedule(
+        &mut store,
+        &Pages::new(&[PAGE_ONE, PAGE_TWO]),
+        request(instrument),
+    )
+    .await
+    .expect("первый прогон");
+    let second = sync_schedule(
+        &mut store,
+        &Pages::new(&[PAGE_CHANGED]),
+        request(instrument),
+    )
+    .await
+    .expect("прогон по изменившемуся графику");
+    assert!(second.written, "изменившийся график обязан записаться");
+    assert_ne!(first.snapshot_id, second.snapshot_id);
 }

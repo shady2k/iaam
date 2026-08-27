@@ -189,33 +189,28 @@ mod tests {
     use super::*;
     use time::macros::datetime;
 
-    const PAGE: &str = r#"{
-      "amortizations": {
-        "columns": ["amortdate", "facevalue", "initialfacevalue", "valueprc",
-                    "value", "value_rub", "data_source"],
-        "data": [["2034-08-09", 375, 1000, 25, 250, 250, "amortization"]]
-      },
-      "coupons": {
-        "columns": ["coupondate", "recorddate", "startdate", "initialfacevalue",
-                    "facevalue", "faceunit", "value", "valueprc", "value_rub"],
-        "data": [
-          ["2026-08-15", null, "2026-02-15", 1000, 375, "RUB", null, null, null],
-          ["2027-02-15", "2027-02-14", "2026-08-15", 1000, 375, "RUB", 34.41, 6.9, 34.41]
-        ]
-      },
-      "offers": {
-        "columns": ["offerdate", "offerdatestart", "offerdateend", "price",
-                    "value", "agent", "offertype"],
-        "data": [["2027-08-26", null, null, null, null, null, "Оферта"]]
-      }
-    }"#;
+    // Эталоны сняты живыми вызовами ISS 2026-08-27 и заморожены
+    // (`tests/fixtures/MANIFEST.sha256`). Литерал, сконструированный
+    // по памяти, проверяет наше представление об источнике, а не сам
+    // источник, — и расходится с ним молча.
+    const FLOATER: &[u8] =
+        include_bytes!("../../../../tests/fixtures/market/moex-iss-bondization-floater.json");
+    const AMORTISED: &[u8] =
+        include_bytes!("../../../../tests/fixtures/market/moex-iss-bondization-amortised.json");
+    const OFFERS: &[u8] =
+        include_bytes!("../../../../tests/fixtures/market/moex-iss-bondization-offers.json");
+    const FIXED_COUPON: &[u8] =
+        include_bytes!("../../../../tests/fixtures/market/moex-iss-bondization-fixed-coupon.json");
+    const FOREIGN_FACE: &[u8] =
+        include_bytes!("../../../../tests/fixtures/market/moex-iss-bondization-foreign-face.json");
+    const PAGE_ONE: &[u8] =
+        include_bytes!("../../../../tests/fixtures/market/moex-iss-bondization-page-1.json");
+    const PAGE_TWO: &[u8] =
+        include_bytes!("../../../../tests/fixtures/market/moex-iss-bondization-page-2.json");
 
-    fn parsed() -> BondizationPage {
-        parse_bondization_page(
-            PAGE.as_bytes(),
-            ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
-        )
-        .expect("страница разобрана")
+    fn parsed(body: &[u8]) -> BondizationPage {
+        parse_bondization_page(body, ObservedAt(datetime!(2026-08-27 12:00:00 UTC)))
+            .expect("страница разобрана")
     }
 
     #[test]
@@ -223,13 +218,13 @@ mod tests {
         // У проверенного флоатера прошедший купон приходит без суммы и без
         // ставки. Ноль здесь занизил бы и поток, и YTM, и сделал бы это
         // правдоподобно.
-        let page = parsed();
+        let page = parsed(FLOATER);
         assert_eq!(page.coupon_periods[0].amount, CouponAmount::Undetermined);
     }
 
     #[test]
     fn a_known_amount_carries_its_currency() {
-        let page = parsed();
+        let page = parsed(FLOATER);
         assert!(matches!(
             page.coupon_periods[1].amount,
             CouponAmount::AmountFixed { .. }
@@ -237,13 +232,30 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_face_value_keeps_its_own_currency() {
+        // Валюта номинала — не рубль по умолчанию. Подставить рубль значит
+        // сложить доллары с рублями и получить правдоподобное число.
+        let page = parsed(FOREIGN_FACE);
+        let CouponAmount::AmountFixed { currency, .. } = page.coupon_periods[0].amount else {
+            panic!("сумма купона известна: {:?}", page.coupon_periods[0].amount);
+        };
+        assert_eq!(currency.code(), "USD");
+    }
+
+    #[test]
     fn the_source_kind_arrives_uninterpreted() {
         // Разборщик кодов не толкует: вид права по оферте у MOEX это
         // свободный русский текст, и match по нему сломается от правки
         // формулировки на стороне биржи.
-        let page = parsed();
-        assert_eq!(page.principal_repayments[0].source_kind, "amortization");
-        assert_eq!(page.offer_windows[0].source_kind, "Оферта");
+        assert_eq!(
+            parsed(AMORTISED).principal_repayments[0].source_kind,
+            "amortization"
+        );
+        assert_eq!(parsed(OFFERS).offer_windows[0].source_kind, "Оферта");
+        assert_eq!(
+            parsed(FIXED_COUPON).principal_repayments[0].source_kind,
+            "maturity"
+        );
     }
 
     #[test]
@@ -252,9 +264,9 @@ mod tests {
         // у бумаги, прошедшей часть амортизаций, все строки за все годы
         // показывают текущий остаток. Принять его за номинал периода
         // значит задним числом пересчитать всю историю.
-        let page = parsed();
+        let page = parsed(AMORTISED);
         // Возврат несёт долю первоначального номинала, а не сумму,
-        // выведенную из показанных 375.
+        // выведенную из показанного номинала строки.
         assert_eq!(
             page.principal_repayments[0]
                 .share_percent
@@ -266,10 +278,104 @@ mod tests {
 
     #[test]
     fn an_offer_without_conditions_is_unknown() {
-        let page = parsed();
+        // У одного и того же выпуска окна приходят и с ценой, и без неё.
+        // Пустая цена — незнание условий, а не выкуп даром.
+        let page = parsed(OFFERS);
         assert!(matches!(
             page.offer_windows[0].price_percent,
+            Knowledge::Known(_)
+        ));
+        assert!(matches!(
+            page.offer_windows[1].price_percent,
             Knowledge::Unknown
         ));
+    }
+
+    #[test]
+    fn the_first_page_of_a_long_issue_looks_whole_and_is_not() {
+        // Эталон конкретной ловушки: первая страница замкнута по цепи и
+        // короче настоящего графика на десять лет. Ловит её только
+        // несовпадение хвоста с последним возвратом номинала.
+        let page = parsed(PAGE_ONE);
+        assert_eq!(page.coupon_periods.len(), 100);
+        let outcome = crate::schedule::completeness::validate_moex_profile(
+            &page.coupon_periods,
+            &page.principal_repayments,
+        );
+        assert!(
+            matches!(
+                outcome,
+                crate::schedule::completeness::Completeness::Incomplete { .. }
+            ),
+            "усечённая страница обязана давать Incomplete: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn the_second_page_closes_the_chain_the_first_left_open() {
+        // Вторая страница продолжает тот же ряд: её первый период
+        // начинается там, где кончился последний период первой, и вместе
+        // они дают полный график. Это и есть доказательство, что
+        // остановка на первой странице была усечением.
+        let first = parsed(PAGE_ONE);
+        let second = parsed(PAGE_TWO);
+        assert_eq!(
+            first
+                .coupon_periods
+                .last()
+                .expect("хвост первой")
+                .accrual_end,
+            second.coupon_periods[0].period_start
+        );
+        let mut coupons = first.coupon_periods;
+        coupons.extend(second.coupon_periods);
+        let mut repayments = first.principal_repayments;
+        repayments.extend(second.principal_repayments);
+        assert_eq!(
+            crate::schedule::completeness::validate_moex_profile(&coupons, &repayments),
+            crate::schedule::completeness::Completeness::Validated
+        );
+    }
+
+    #[test]
+    fn a_rate_without_an_amount_is_not_a_zero_amount() {
+        // Литерал, а не эталон, намеренно: MOEX такую строку не отдаёт
+        // ни в одном из проверенных выпусков — он заполняет `value`
+        // и `valueprc` вместе либо не заполняет ни одного. Состояние
+        // «ставка известна, сумма ещё нет» объявлено спекой (§2.3) и
+        // хранится схемой, поэтому разбор обязан его строить, а не
+        // схлопывать в `Undetermined`: схлопывание потеряло бы
+        // известную ставку флоатера.
+        const RATE_ONLY: &str = r#"{
+          "amortizations": {"columns": ["amortdate", "valueprc", "data_source"], "data": []},
+          "coupons": {
+            "columns": ["coupondate", "startdate", "value", "valueprc", "faceunit"],
+            "data": [["2027-02-15", "2026-08-15", null, 6.9, "RUB"]]
+          },
+          "offers": {"columns": ["offerdate", "offertype"], "data": []}
+        }"#;
+        let page = parsed(RATE_ONLY.as_bytes());
+        let CouponAmount::RateFixedAmountUndetermined { rate_percent } =
+            &page.coupon_periods[0].amount
+        else {
+            panic!(
+                "ставка известна, сумма нет: {:?}",
+                page.coupon_periods[0].amount
+            );
+        };
+        assert_eq!(rate_percent.inner().to_string(), "6.9");
+    }
+
+    #[test]
+    fn the_row_count_covers_all_three_blocks_together() {
+        // Счётчик строк — единственное, по чему вызывающий отличает
+        // «страница пуста» от «пуст один блок». Счёт по одному блоку
+        // остановил бы пагинацию там, где кончились амортизации,
+        // и обрезал бы купоны.
+        let page = parsed(OFFERS);
+        assert_eq!(page.coupon_periods.len(), 40);
+        assert_eq!(page.principal_repayments.len(), 1);
+        assert_eq!(page.offer_windows.len(), 8);
+        assert_eq!(page.total_rows, 49);
     }
 }

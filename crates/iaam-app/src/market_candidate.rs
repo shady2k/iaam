@@ -179,8 +179,10 @@ mod tests {
     }
     #[test]
     fn market_candidate_preserves_the_full_venue_identity() {
-        let candidate =
-            candidate_from_market_observation(observation(PriceKind::Close, Executability::Executable));
+        let candidate = candidate_from_market_observation(observation(
+            PriceKind::Close,
+            Executability::Executable,
+        ));
         let PriceOrigin::Market { venue, .. } = candidate.origin else {
             panic!("рыночное наблюдение должно стать Market-кандидатом");
         };

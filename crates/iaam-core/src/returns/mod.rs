@@ -44,9 +44,9 @@ use crate::rules::{
 };
 use crate::valuation::QuotationBasis;
 use crate::valuation::{
-    candidate_from_legacy_valuation, FxSource, FxTable, LegacyValuationOutcome, PriceCandidate,
-    PriceQuality, PriceQuery, SelectedPrice, SourceExecutability, UncoveredReason, ValuationError,
-    Venue,
+    FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
+    SelectedPrice, SourceExecutability, UncoveredReason, ValuationError, Venue,
+    candidate_from_legacy_valuation,
 };
 
 /// Величина, которую система может отказаться вычислить.
@@ -2718,8 +2718,7 @@ mod tests {
                 },
             ),
         ];
-        let contour =
-            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
         let rules = RuleRegistry::with_defaults();
         let context = ProjectionContext {
             contour: &contour,
@@ -2756,16 +2755,20 @@ mod tests {
             (instrument, venue.clone(), date!(2026 - 08 - 26)),
             PerUnitAmount::new(dec("22.40"), CurrencyCode::Rub),
         );
-        let market_prices = [match selected_market_position_assessment(
-            account,
-            instrument,
-            Quantity(dec("100")),
-            venue,
-            date!(2026 - 08 - 26),
-        ).kind {
-            PositionAssessmentKind::Selected(selected) => selected.candidate,
-            _ => unreachable!(),
-        }];
+        let market_prices = [
+            match selected_market_position_assessment(
+                account,
+                instrument,
+                Quantity(dec("100")),
+                venue,
+                date!(2026 - 08 - 26),
+            )
+            .kind
+            {
+                PositionAssessmentKind::Selected(selected) => selected.candidate,
+                _ => unreachable!(),
+            },
+        ];
         let report = returns_report(
             &state,
             &ReturnsRequest {
@@ -2786,11 +2789,13 @@ mod tests {
             },
         );
         assert_ne!(report.data_quality.status, DataQualityStatus::Clean);
-        assert!(report
-            .data_quality
-            .material_issues
-            .iter()
-            .any(|issue| matches!(issue, MaterialIssue::AccruedInterestMismatch { .. })));
+        assert!(
+            report
+                .data_quality
+                .material_issues
+                .iter()
+                .any(|issue| matches!(issue, MaterialIssue::AccruedInterestMismatch { .. }))
+        );
     }
     #[test]
     fn termination_value_without_an_executable_exit_is_unknown_not_the_accrual() {

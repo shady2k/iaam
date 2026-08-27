@@ -13,9 +13,7 @@ use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, adva
 use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
-use iaam_core::valuation::{
-    FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue,
-};
+use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue};
 use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
 use iaam_store::market::SeriesKey;
 use iaam_store::market::{MarketWindow, PriceRow, PriceVenue};

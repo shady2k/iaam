@@ -987,7 +987,7 @@ impl PriceOriginDto {
     fn from_domain(origin: &PriceOrigin) -> Self {
         match origin {
             PriceOrigin::Market { venue, kind } => Self::Market {
-                venue: venue.clone(),
+                venue: venue.board.clone(),
                 price_kind: match kind {
                     iaam_core::valuation::PriceKind::Close => "close",
                     iaam_core::valuation::PriceKind::LegalClose => "legal_close",

@@ -13,6 +13,15 @@ use crate::money::CurrencyCode;
 use crate::numeric::decimal::Dec;
 
 use super::PriceQuality;
+/// Режим торгов, входящий в идентичность рыночного наблюдения.
+///
+/// Номер сессии отделяет основную торговлю от вечерней: одного кода
+/// инструмента и доски недостаточно, чтобы связать цену с наблюдением НКД.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Venue {
+    pub board: String,
+    pub session: i64,
+}
 
 /// Колонки рыночной цены MOEX, различаемые политикой оценки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,7 +53,7 @@ impl PriceKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PriceOrigin {
     /// Наблюдение из рыночного источника.
-    Market { venue: String, kind: PriceKind },
+    Market { venue: Venue, kind: PriceKind },
     /// Цена, разобранная из отчёта или другого документа.
     ReportParsed { source: SourceId },
     /// Цена, утверждённая владельцем.

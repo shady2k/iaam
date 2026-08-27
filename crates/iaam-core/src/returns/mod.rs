@@ -44,9 +44,9 @@ use crate::rules::{
 };
 use crate::valuation::QuotationBasis;
 use crate::valuation::{
-    FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
-    SelectedPrice, SourceExecutability, UncoveredReason, ValuationError,
-    candidate_from_legacy_valuation,
+    candidate_from_legacy_valuation, FxSource, FxTable, LegacyValuationOutcome, PriceCandidate,
+    PriceQuality, PriceQuery, SelectedPrice, SourceExecutability, UncoveredReason, ValuationError,
+    Venue,
 };
 
 /// Величина, которую система может отказаться вычислить.
@@ -430,8 +430,8 @@ pub struct ReturnsRequest<'a> {
     pub market_prices: &'a [PriceCandidate],
     /// График выплат на координату знания, по инструменту.
     pub bond_schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
-    /// Наблюдённый НКД на одну бумагу, по инструменту.
-    pub accrued_observations: &'a BTreeMap<InstrumentId, PerUnitAmount>,
+    /// Наблюдённый НКД на одну бумагу, с привязкой к площадке и дате сделки.
+    pub accrued_observations: &'a BTreeMap<(InstrumentId, Venue, Date), PerUnitAmount>,
 }
 
 /// Ответ на три вопроса этапа 1.
@@ -561,7 +561,7 @@ fn selected_observation(price: &SelectedPrice) -> SelectedObservation {
     };
     let origin = match &price.provenance.origin {
         crate::valuation::PriceOrigin::Market { venue, kind } => SelectedOrigin::Market {
-            venue: venue.clone(),
+            venue: venue.board.clone(),
             price_kind: match kind {
                 crate::valuation::PriceKind::Close => "close",
                 crate::valuation::PriceKind::LegalClose => "legal_close",
@@ -638,7 +638,7 @@ struct SelectedInputs<'a> {
     positions: Vec<SelectedPosition>,
     fx: SelectedFx<'a>,
     bond_schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
-    accrued_observations: &'a BTreeMap<InstrumentId, PerUnitAmount>,
+    accrued_observations: &'a BTreeMap<(InstrumentId, Venue, Date), PerUnitAmount>,
     accrued_interest_rule: AccruedInterestRuleVersion,
 }
 
@@ -851,6 +851,23 @@ fn selected_executability(assessment: &PositionAssessment) -> Option<SourceExecu
         PositionAssessmentKind::LegacyDerived(_) | PositionAssessmentKind::Uncovered(_) => None,
     }
 }
+fn selected_accrued_observation<'a>(
+    assessment: &PositionAssessment,
+    request: &'a ReturnsRequest<'_>,
+) -> Option<&'a PerUnitAmount> {
+    let PositionAssessmentKind::Selected(selected) = &assessment.kind else {
+        return None;
+    };
+    if selected.candidate.trade_date != request.as_of {
+        return None;
+    }
+    let crate::valuation::PriceOrigin::Market { venue, .. } = &selected.candidate.origin else {
+        return None;
+    };
+    request
+        .accrued_observations
+        .get(&(assessment.instrument, venue.clone(), request.as_of))
+}
 
 fn bond_position_attributes(
     state: &LedgerState,
@@ -871,9 +888,7 @@ fn bond_position_attributes(
                 Ok(per_unit) => position_amount(per_unit, assessment.quantity, request),
                 Err(reason) => Computed::NotComputable { reason },
             };
-            let payable_observation = request
-                .accrued_observations
-                .get(&assessment.instrument)
+            let payable_observation = selected_accrued_observation(&assessment, request)
                 .map(|per_unit| position_amount(*per_unit, assessment.quantity, request))
                 .unwrap_or_else(|| Computed::NotComputable {
                     reason: NotComputable::AccruedObservationMissing {
@@ -947,7 +962,10 @@ fn accrued_mismatch_issues(
         .into_iter()
         .filter_map(|(instrument, quantity)| {
             let computed = accrued_per_unit(request, rule, instrument).ok()?;
-            let observed = request.accrued_observations.get(&instrument)?;
+            let observed = assessments
+                .iter()
+                .find(|assessment| assessment.instrument == instrument)
+                .and_then(|assessment| selected_accrued_observation(assessment, request))?;
             let material = computed.currency() != observed.currency()
                 || accrued_mismatch_is_material(
                     computed.value(),
@@ -1534,7 +1552,8 @@ mod tests {
     use time::macros::{date, datetime};
 
     static EMPTY_BOND_SCHEDULES: BTreeMap<InstrumentId, BondSchedule> = BTreeMap::new();
-    static EMPTY_ACCRUED_OBSERVATIONS: BTreeMap<InstrumentId, PerUnitAmount> = BTreeMap::new();
+    static EMPTY_ACCRUED_OBSERVATIONS: BTreeMap<(InstrumentId, Venue, Date), PerUnitAmount> =
+        BTreeMap::new();
 
     fn report_for(state: &LedgerState, coordinate: KnowledgeCoordinate) -> ReturnsReport {
         let contour = ContourDefinition::new(
@@ -1578,6 +1597,54 @@ mod tests {
             raw_price: None,
             remaining_face: Ok(None),
             kind: PositionAssessmentKind::Uncovered(UncoveredReason::NoObservation),
+        }
+    }
+    fn selected_market_position_assessment(
+        account: AccountId,
+        instrument: InstrumentId,
+        quantity: Quantity,
+        venue: Venue,
+        trade_date: Date,
+    ) -> PositionAssessment {
+        let candidate = PriceCandidate {
+            instrument,
+            price: dec("100"),
+            currency: CurrencyCode::Rub,
+            basis: QuotationBasis::Unknown,
+            basis_evidence: String::new(),
+            trade_date,
+            observed_at: datetime!(2026 - 08 - 26 09:00:00 UTC),
+            origin: PriceOrigin::Market {
+                venue: venue.clone(),
+                kind: CorePriceKind::LegalClose,
+            },
+            executability: SourceExecutability::Executable,
+        };
+        let selected = SelectedPrice {
+            candidate: candidate.clone(),
+            selection: crate::valuation::PriceSelection::AsObserved,
+            freshness: crate::valuation::PriceFreshness::Fresh,
+            provenance: crate::valuation::PriceProvenance {
+                price_kind: Some("legal_close".to_owned()),
+                origin: candidate.origin,
+                venue: Some(venue.board.clone()),
+                quotation_basis: QuotationBasis::Unknown,
+                basis_evidence: String::new(),
+                observed_at: candidate.observed_at,
+                valuation_policy_version: 1,
+                source_priority_version: 1,
+                carry_forward_limit: 10,
+                price_max_age: 30,
+            },
+        };
+        PositionAssessment {
+            account,
+            custody: None,
+            instrument,
+            quantity,
+            raw_price: None,
+            remaining_face: Ok(None),
+            kind: PositionAssessmentKind::Selected(Box::new(selected)),
         }
     }
 
@@ -1642,7 +1709,10 @@ mod tests {
             trade_date: date!(2026 - 08 - 03),
             observed_at: datetime!(2026 - 08 - 26 09:00:00 UTC),
             origin: PriceOrigin::Market {
-                venue: "TQOB".to_owned(),
+                venue: crate::valuation::Venue {
+                    board: "TQOB".to_owned(),
+                    session: 0,
+                },
                 kind: CorePriceKind::LegalClose,
             },
             executability: SourceExecutability::Executable,
@@ -1912,7 +1982,10 @@ mod tests {
 
         let hash_for_venue = |venue: &str| {
             let origin = crate::valuation::PriceOrigin::Market {
-                venue: venue.to_owned(),
+                venue: crate::valuation::Venue {
+                    board: venue.to_owned(),
+                    session: 0,
+                },
                 kind: crate::valuation::PriceKind::LegalClose,
             };
             let selected = SelectedPrice {
@@ -1993,7 +2066,10 @@ mod tests {
 
         let hash_for_basis = |basis: QuotationBasis| {
             let origin = crate::valuation::PriceOrigin::Market {
-                venue: "moex".to_owned(),
+                venue: crate::valuation::Venue {
+                    board: "moex".to_owned(),
+                    session: 0,
+                },
                 kind: crate::valuation::PriceKind::LegalClose,
             };
             let selected = SelectedPrice {
@@ -2404,9 +2480,13 @@ mod tests {
                 principal_returns: vec![],
             },
         );
+        let venue = Venue {
+            board: "TQBR".to_owned(),
+            session: 3,
+        };
         let mut observed = BTreeMap::new();
         observed.insert(
-            instrument,
+            (instrument, venue.clone(), date!(2026 - 08 - 26)),
             PerUnitAmount::new(dec("22.40"), CurrencyCode::Rub),
         );
         let request = ReturnsRequest {
@@ -2423,15 +2503,19 @@ mod tests {
             accrued_observations: &observed,
         };
         let assessments = vec![
-            position_assessment(
+            selected_market_position_assessment(
                 AccountId::new_random(),
                 instrument,
                 Quantity(dec("60")),
+                venue.clone(),
+                date!(2026 - 08 - 26),
             ),
-            position_assessment(
+            selected_market_position_assessment(
                 AccountId::new_random(),
                 instrument,
                 Quantity(dec("40")),
+                venue,
+                date!(2026 - 08 - 26),
             ),
         ];
 
@@ -2473,8 +2557,12 @@ mod tests {
                 principal_returns: vec![],
             },
         )]);
+        let venue = Venue {
+            board: "TQBR".to_owned(),
+            session: 3,
+        };
         let observed = BTreeMap::from([(
-            instrument,
+            (instrument, venue.clone(), date!(2026 - 08 - 26)),
             PerUnitAmount::new(dec("22.40"), CurrencyCode::Usd),
         )]);
         let request = ReturnsRequest {
@@ -2491,10 +2579,12 @@ mod tests {
             accrued_observations: &observed,
         };
         let issues = accrued_mismatch_issues(
-            &[position_assessment(
+            &[selected_market_position_assessment(
                 AccountId::new_random(),
                 instrument,
                 Quantity(dec("1")),
+                venue,
+                date!(2026 - 08 - 26),
             )],
             &request,
             &AccruedInterestV1,
@@ -2509,6 +2599,45 @@ mod tests {
         };
         assert_eq!(*computed_currency, CurrencyCode::Rub);
         assert_eq!(*observed_currency, CurrencyCode::Usd);
+    }
+    #[test]
+    fn an_older_trade_date_does_not_supply_the_current_day_observation() {
+        let instrument = InstrumentId::new_random();
+        let account = AccountId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), []);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let venue = Venue {
+            board: "TQBR".to_owned(),
+            session: 3,
+        };
+        let observed = BTreeMap::from([(
+            (instrument, venue.clone(), date!(2026 - 08 - 25)),
+            PerUnitAmount::new(dec("22.40"), CurrencyCode::Rub),
+        )]);
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &observed,
+        };
+        let assessment = selected_market_position_assessment(
+            account,
+            instrument,
+            Quantity(dec("1")),
+            venue,
+            date!(2026 - 08 - 25),
+        );
+
+        assert!(accrued_mismatch_issues(&[assessment], &request, &AccruedInterestV1).is_empty());
     }
 
     #[test]
@@ -2618,11 +2747,25 @@ mod tests {
                 principal_returns: vec![],
             },
         );
+        let venue = Venue {
+            board: "TQBR".to_owned(),
+            session: 3,
+        };
         let mut accrued = BTreeMap::new();
         accrued.insert(
-            instrument,
+            (instrument, venue.clone(), date!(2026 - 08 - 26)),
             PerUnitAmount::new(dec("22.40"), CurrencyCode::Rub),
         );
+        let market_prices = [match selected_market_position_assessment(
+            account,
+            instrument,
+            Quantity(dec("100")),
+            venue,
+            date!(2026 - 08 - 26),
+        ).kind {
+            PositionAssessmentKind::Selected(selected) => selected.candidate,
+            _ => unreachable!(),
+        }];
         let report = returns_report(
             &state,
             &ReturnsRequest {
@@ -2631,10 +2774,13 @@ mod tests {
                 report_currency: CurrencyCode::Rub,
                 fx: &fx,
                 solver_policy: SolverPolicy::returns_default(),
-                coordinate: KnowledgeCoordinate::default(),
+                coordinate: KnowledgeCoordinate {
+                    knowledge_as_of: datetime!(2026 - 08 - 26 12:00:00 UTC),
+                    ..KnowledgeCoordinate::default()
+                },
                 ledger: &ledger,
                 perimeter: &perimeter,
-                market_prices: &[],
+                market_prices: &market_prices,
                 bond_schedules: &schedules,
                 accrued_observations: &accrued,
             },

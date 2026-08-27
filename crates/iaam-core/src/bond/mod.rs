@@ -13,6 +13,7 @@ use crate::money::PerUnitAmount;
 use crate::numeric::decimal::Dec;
 
 pub mod finality;
+pub mod posting;
 
 /// Купонный период: начисление и платёж — разные даты.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

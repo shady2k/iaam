@@ -8,8 +8,8 @@ pub mod candidate;
 
 pub use candidate::{
     LegacyValuationOutcome, PriceCandidate, PriceFreshness, PriceKind, PriceOrigin,
-    PriceProvenance, PriceQuery, PriceSelection, SelectedPrice, SourceExecutability, Uncovered,
-    UncoveredReason, candidate_from_legacy_valuation,
+    PriceProvenance, PriceQuery, PriceSelection, QuotationBasis, SelectedPrice,
+    SourceExecutability, Uncovered, UncoveredReason, candidate_from_legacy_valuation,
 };
 use std::collections::BTreeMap;
 

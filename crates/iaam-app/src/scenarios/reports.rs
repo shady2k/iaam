@@ -218,6 +218,8 @@ fn market_candidate_from_row(row: PriceRow) -> Result<PriceCandidate, AppError> 
             kind,
             price: iaam_core::numeric::decimal::Dec::new(price),
             currency,
+            basis: iaam_core::valuation::QuotationBasis::Unknown,
+            basis_evidence: String::new(),
             executability,
         },
     ))

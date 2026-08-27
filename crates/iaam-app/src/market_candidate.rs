@@ -24,6 +24,8 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
         instrument: observation.instrument,
         price: observation.price,
         currency: observation.currency,
+        basis: observation.basis,
+        basis_evidence: observation.basis_evidence,
         trade_date: observation.trade_date.0,
         observed_at: observation.observed_at.0,
         origin: PriceOrigin::Market {
@@ -63,6 +65,8 @@ mod tests {
             kind,
             price: Dec::new(Decimal::new(1, 0)),
             currency: CurrencyCode::Rub,
+            basis: iaam_core::valuation::QuotationBasis::Unknown,
+            basis_evidence: String::new(),
             executability,
         }
     }

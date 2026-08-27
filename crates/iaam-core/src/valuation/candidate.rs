@@ -5,6 +5,7 @@
 //! принадлежит источнику; всё, что вывела политика оценки, живёт в
 //! [`SelectedPrice`] и в кандидат не попадает по построению.
 
+use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
 use crate::ids::{InstrumentId, SourceId};
@@ -65,6 +66,50 @@ pub enum SourceExecutability {
     Unknown,
 }
 
+/// Единица, в которой источник назвал цену (§10.2).
+///
+/// Третья ось наряду с полнотой и исполнимостью (ADR-0002), и, как они,
+/// **атрибут наблюдения от источника**, а не вывод политики: основание
+/// задаётся рынком и режимом торгов, из которого адаптер брал строку.
+/// Вывести его правилом задним числом — то же смешение осей, которое
+/// решение 0002 запрещает.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QuotationBasis {
+    /// Деньги за одну бумагу. Валюта числа — валюта наблюдения.
+    MoneyPerUnit,
+    /// Проценты непогашенного номинала. Само число **безразмерно**:
+    /// денежная валюта приходит из валюты номинала, а не отсюда.
+    PercentOfRemainingFace,
+    /// Источник основания не доказал. Отказ при оценке, а не догадка.
+    #[default]
+    Unknown,
+}
+
+impl QuotationBasis {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MoneyPerUnit => "money_per_unit",
+            Self::PercentOfRemainingFace => "percent_of_remaining_face",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Разбор кода из хранилища. `None`, а не `Unknown`: неизвестный код —
+    /// порча строки, и выдать её за недоказанное наблюдение значит
+    /// спрятать порчу.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::MoneyPerUnit,
+            Self::PercentOfRemainingFace,
+            Self::Unknown,
+        ]
+        .into_iter()
+        .find(|basis| basis.code() == code)
+    }
+}
+
 /// Способ выбора — почему дата наблюдения не совпала с датой оценки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceSelection {
@@ -111,6 +156,13 @@ pub struct PriceCandidate {
     pub instrument: InstrumentId,
     pub price: Dec,
     pub currency: CurrencyCode,
+    /// Единица цены. `#[serde(default)]` не нужен: `PriceCandidate`
+    /// не сериализуется, он строится на каждом расчёте.
+    pub basis: QuotationBasis,
+    /// Признак, по которому основание выведено. Хранится рядом, а не
+    /// восстанавливается по основанию: без него запись недоказуема
+    /// при разборе аудита (§10.2).
+    pub basis_evidence: String,
     pub trade_date: Date,
     pub observed_at: OffsetDateTime,
     pub origin: PriceOrigin,
@@ -224,11 +276,48 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn an_undecided_quotation_basis_is_unknown_not_money_per_unit() {
+        // Строка, записанная до появления основания, недоказуема.
+        // `MoneyPerUnit` по умолчанию объявил бы её доказанной (§4.9).
+        assert_eq!(QuotationBasis::default(), QuotationBasis::Unknown);
+    }
+
+    #[test]
+    fn every_quotation_basis_names_itself() {
+        assert_eq!(QuotationBasis::MoneyPerUnit.code(), "money_per_unit");
+        assert_eq!(
+            QuotationBasis::PercentOfRemainingFace.code(),
+            "percent_of_remaining_face"
+        );
+        assert_eq!(QuotationBasis::Unknown.code(), "unknown");
+    }
+
+    #[test]
+    fn a_quotation_basis_survives_a_round_trip_through_its_code() {
+        for basis in [
+            QuotationBasis::MoneyPerUnit,
+            QuotationBasis::PercentOfRemainingFace,
+            QuotationBasis::Unknown,
+        ] {
+            assert_eq!(QuotationBasis::from_code(basis.code()), Some(basis));
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_code_does_not_fall_back_to_a_basis() {
+        // Неизвестный код из базы — это порча, а не `Unknown`: `Unknown`
+        // означает «источник не доказал», а не «строку не прочитали».
+        assert_eq!(QuotationBasis::from_code("percent"), None);
+    }
+
     fn price() -> PriceCandidate {
         PriceCandidate {
             instrument: InstrumentId::new_random(),
             price: Dec::new(Decimal::from(281)),
             currency: CurrencyCode::Rub,
+            basis: QuotationBasis::Unknown,
+            basis_evidence: String::new(),
             trade_date: date!(2026 - 08 - 03),
             observed_at: datetime!(2026 - 08 - 03 18:00 UTC),
             origin: PriceOrigin::ReportParsed {

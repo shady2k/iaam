@@ -115,6 +115,8 @@ pub fn parse_history(
                 kind,
                 price: Dec::new(price),
                 currency,
+                basis: iaam_core::valuation::QuotationBasis::Unknown,
+                basis_evidence: String::new(),
                 // Дневная история даёт цену закрытия, а не исполнимый bid.
                 // Помечать её исполнимой значило бы выдать ориентир
                 // за цену выхода (§5.1, §5.3).

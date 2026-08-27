@@ -9,6 +9,7 @@
 use iaam_core::ids::InstrumentId;
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::valuation::QuotationBasis;
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
@@ -81,6 +82,16 @@ pub struct PriceObservation {
     /// Валюта площадки, **не «валюта инструмента»**: ISS отдаёт
     /// `CURRENCYID` построчно, и она принадлежит наблюдению.
     pub currency: CurrencyCode,
+    /// Единица цены, доказанная при разборе (§10.2).
+    ///
+    /// `#[serde(default)]` обязателен: наблюдения записаны до появления
+    /// поля, и подставить им `MoneyPerUnit` значит объявить доказанным
+    /// то, чего никто не доказывал.
+    #[serde(default)]
+    pub basis: QuotationBasis,
+    /// Признак, из которого основание выведено.
+    #[serde(default)]
+    pub basis_evidence: String,
     pub executability: Executability,
 }
 
@@ -116,6 +127,7 @@ pub struct KeyRateObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 
     #[test]
@@ -140,5 +152,22 @@ mod tests {
             Executability::IndicativePreviousClose,
         ];
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn an_observation_written_before_the_basis_existed_reads_as_unknown() {
+        let value = serde_json::json!({
+            "instrument": InstrumentId::new_random(),
+            "venue": {"board": "TQBR", "session": 3},
+            "trade_date": TradeDate(date!(2026 - 08 - 03)),
+            "observed_at": ObservedAt(datetime!(2026-08-03 19:00:00 UTC)),
+            "kind": PriceKind::Close,
+            "price": Dec::new(Decimal::from(100)),
+            "currency": CurrencyCode::Rub,
+            "executability": Executability::IndicativePreviousClose,
+        });
+        let observation: PriceObservation = serde_json::from_value(value).unwrap();
+        assert_eq!(observation.basis, QuotationBasis::Unknown);
+        assert_eq!(observation.basis_evidence, "");
     }
 }

@@ -284,6 +284,8 @@ mod tests {
             instrument,
             price: Dec::new(Decimal::from(281)),
             currency: CurrencyCode::Rub,
+            basis: crate::valuation::QuotationBasis::Unknown,
+            basis_evidence: String::new(),
             trade_date,
             observed_at: datetime!(2026 - 08 - 10 12:00 UTC),
             origin: PriceOrigin::ReportParsed {

@@ -14,6 +14,7 @@ pub mod documents;
 pub mod events;
 pub mod reference;
 pub mod rules;
+pub mod schedule;
 pub mod schema;
 pub mod snapshots;
 pub mod tokens;

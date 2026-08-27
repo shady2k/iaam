@@ -20,9 +20,11 @@ use iaam_ingest::{Verdict, normalize};
 use iaam_market::cbr::key_rate::key_rate_request;
 use iaam_market::cbr::{daily_request, dynamic_request};
 use iaam_market::moex::{HistoryQuery, history_request};
-use iaam_market::{FxObservation, KeyRateObservation, PriceKind, PriceObservation};
+use iaam_market::{
+    AccruedInterestObservation, FxObservation, KeyRateObservation, PriceKind, PriceObservation,
+};
 use iaam_store::market::{
-    Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
+    AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
 };
 use sha2::{Digest, Sha256};
 use time::Date;
@@ -385,10 +387,15 @@ pub async fn sync_market(
         to: request.to,
     };
     let result = match parsed {
-        ParsedObservations::Prices(observations) => {
-            let rows = observations.iter().map(price_row).collect::<Vec<_>>();
-            match store.record_prices(&handle, &response.raw_hash, &rows) {
+        ParsedObservations::Prices { prices, accrued } => {
+            let rows = prices.iter().map(price_row).collect::<Vec<_>>();
+            let written = match store.record_prices(&handle, &response.raw_hash, &rows) {
                 Ok(count) => count,
+                Err(error) => return Err(fail_run(store, &handle, error)),
+            };
+            let accrued_rows = accrued.iter().map(accrued_interest_row).collect::<Vec<_>>();
+            match store.record_accrued_interest(&handle, &response.raw_hash, &accrued_rows) {
+                Ok(count) => written + count,
                 Err(error) => return Err(fail_run(store, &handle, error)),
             }
         }
@@ -455,7 +462,10 @@ fn request_for(source: &MarketSource, from: Date, to: Date) -> HttpRequest {
 }
 
 enum ParsedObservations {
-    Prices(Vec<PriceObservation>),
+    Prices {
+        prices: Vec<PriceObservation>,
+        accrued: Vec<AccruedInterestObservation>,
+    },
     Fx(Vec<FxObservation>),
     KeyRates(Vec<KeyRateObservation>),
 }
@@ -474,14 +484,19 @@ fn parse_response(
         } => {
             let body = core::str::from_utf8(body)
                 .map_err(|error| AppError::Store(format!("ответ MOEX не UTF-8: {error}")))?;
-            iaam_market::moex::parse::parse_history(
+            let prices = iaam_market::moex::parse::parse_history(
                 body,
                 *instrument,
                 observed_at,
                 iaam_market::moex::parse::MarketSegment { engine, market },
             )
-            .map(ParsedObservations::Prices)
-            .map_err(|error| AppError::Store(error.to_string()))
+            .map_err(|error| AppError::Store(error.to_string()))?;
+            // Тот же ответ, та же координата знания: НКД лежит в той же
+            // строке, что и цена, и второго обращения не требует.
+            let accrued =
+                iaam_market::moex::parse::parse_accrued_interest(body, *instrument, observed_at)
+                    .map_err(|error| AppError::Store(error.to_string()))?;
+            Ok(ParsedObservations::Prices { prices, accrued })
         }
         MarketSource::CbrDaily => {
             let body = iaam_market::cbr::fx::decode_cp1251(body);
@@ -553,6 +568,22 @@ fn price_row(observation: &PriceObservation) -> PriceRow {
         quotation_basis: observation.basis.code().to_owned(),
         basis_evidence: observation.basis_evidence.clone(),
         executability: executability(observation.executability).to_owned(),
+    }
+}
+
+fn accrued_interest_row(observation: &AccruedInterestObservation) -> AccruedInterestRow {
+    AccruedInterestRow {
+        instrument_id: observation.instrument.inner().to_string(),
+        board: observation.venue.board.clone(),
+        session: observation.venue.session,
+        trade_date: observation.trade_date.0.to_string(),
+        observed_at: observation
+            .observed_at
+            .0
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| observation.observed_at.0.to_string()),
+        per_unit: observation.per_unit.value().inner().to_string(),
+        currency: observation.per_unit.currency().code().to_owned(),
     }
 }
 
@@ -646,7 +677,34 @@ mod market_tests {
     use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
     use iaam_core::money::CurrencyCode;
     use iaam_store::reference::InstrumentRecord;
-    use time::macros::date;
+    use time::macros::{date, datetime};
+
+    #[test]
+    #[ignore = "фикстура появляется в задаче 14"]
+    fn one_bond_response_yields_both_prices_and_accrued_interest() {
+        // ACCINT приходит в той же строке, что и CLOSE. Второй запрос
+        // за ним был бы лишним обращением к источнику и второй
+        // координатой знания на одну и ту же строку.
+        let body =
+            std::fs::read("../../tests/fixtures/market/moex-iss-history-ofz.json").unwrap();
+        let parsed = parse_response(
+            &MarketSource::Moex {
+                instrument: iaam_core::ids::InstrumentId::new_random(),
+                engine: "stock".to_owned(),
+                market: "bonds".to_owned(),
+                board: "TQOB".to_owned(),
+                secid: "SU26238RMFS4".to_owned(),
+            },
+            &body,
+            iaam_market::ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
+        )
+        .unwrap();
+        let ParsedObservations::Prices { prices, accrued } = parsed else {
+            panic!("облигационный ответ обязан дать оба вида наблюдений");
+        };
+        assert!(!prices.is_empty());
+        assert!(!accrued.is_empty());
+    }
 
     struct FixtureTransport {
         body: Vec<u8>,

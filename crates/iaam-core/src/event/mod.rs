@@ -3,6 +3,7 @@
 pub mod correction;
 pub mod kind;
 pub mod leg;
+pub mod legs;
 pub mod provenance;
 
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,25 @@ pub enum EventValidationError {
         kind: &'static str,
         field: &'static str,
         value: String,
+    },
+    #[error("для {event} лишняя нога: ожидалось ног {expected}, найдено {found}")]
+    UnexpectedLeg {
+        event: &'static str,
+        expected: usize,
+        found: usize,
+    },
+    #[error("для {event} не хватает ноги {kind:?}: ожидалось ног {expected}, найдено {found}")]
+    MissingLeg {
+        event: &'static str,
+        kind: LegKind,
+        expected: usize,
+        found: usize,
+    },
+    #[error("для {event} нога {kind:?} не совпала с ожиданием по полю {field}")]
+    LegMismatch {
+        event: &'static str,
+        kind: LegKind,
+        field: &'static str,
     },
     #[error(transparent)]
     Numeric(#[from] crate::numeric::NumericError),

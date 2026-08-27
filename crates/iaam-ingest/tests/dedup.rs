@@ -309,6 +309,7 @@ fn different_operations_have_different_fingerprints() {
         instrument: Some(InstrumentId::new_random()),
         gross_minor: 100_000,
         currency: CurrencyCode::Rub,
+        kind: None,
     };
     assert_ne!(
         fingerprint(&other_kind),

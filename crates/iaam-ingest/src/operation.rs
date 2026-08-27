@@ -3,7 +3,7 @@
 use iaam_core::dates::{
     CashPostedDate, EffectiveOrder, EventDates, PaidDate, SettledDate, TradeDate,
 };
-use iaam_core::event::kind::{EventKind, FeeOrigin, OpeningAssertions, TradeSide};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TradeSide};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
@@ -81,6 +81,10 @@ pub enum OperationKind {
         instrument: Option<InstrumentId>,
         gross_minor: i64,
         currency: CurrencyCode,
+        /// Вид дохода, если источник его назвал. `None` — «не
+        /// утверждалось»: подставить дивиденд там, где источник промолчал,
+        /// значит записать в журнал выдумку (§4.9).
+        kind: Option<IncomeKind>,
     },
     Fee {
         amount_minor: i64,
@@ -388,15 +392,14 @@ fn build(
             instrument,
             gross_minor,
             currency,
+            kind,
         } => {
             let gross = money(positive(*gross_minor, "amount", *currency)?, *currency);
             Ok((
                 EventKind::Income {
                     instrument: *instrument,
                     gross,
-                    // Вид дохода приходит из канала в E3.4.1.T11;
-                    // до тех пор источник его не называл.
-                    kind: None,
+                    kind: *kind,
                 },
                 vec![Leg::cash(account, gross)],
             ))

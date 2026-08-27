@@ -333,6 +333,11 @@ fn parse_income_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Locat
                     instrument,
                     gross_minor,
                     currency,
+                    // Лист «Купоны и дивиденды» смешивает оба вида
+                    // и не называет вид построчно. `None` — «не
+                    // утверждалось»: угадать по типу бумаги значило бы
+                    // выдать догадку за слова источника (§4.9).
+                    kind: None,
                 },
                 date,
                 None,

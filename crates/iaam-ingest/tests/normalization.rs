@@ -2,7 +2,7 @@
 //! структурную проверку ядра. Это шов, на котором ломается всё:
 //! приёмка строит ноги, а форму этих ног задаёт ядро.
 
-use iaam_core::event::kind::{EventKind, FeeOrigin, TradeSide};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
 use iaam_core::ids::EventId;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor};
@@ -76,6 +76,7 @@ fn all_kinds() -> Vec<OperationKind> {
             instrument: Some(instrument),
             gross_minor: 12_000,
             currency: CurrencyCode::Rub,
+            kind: Some(IncomeKind::Coupon),
         },
         OperationKind::Fee {
             amount_minor: 900,

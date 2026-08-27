@@ -316,6 +316,9 @@ fn build_kind(
             },
             gross_minor: minor(row.amount.as_deref(), "amount", currency)?,
             currency,
+            // У строки CSV колонки вида дохода нет: источник его
+            // не называл, и подставить вид было бы выдумкой (§4.9).
+            kind: None,
         }),
         "fee" => Ok(OperationKind::Fee {
             amount_minor: minor(row.amount.as_deref(), "amount", currency)?,

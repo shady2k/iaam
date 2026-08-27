@@ -15,7 +15,7 @@ use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, ClassificationRuleView, IssuedToken, Scope, TokenView,
 };
-use iaam_core::event::kind::FeeOrigin;
+use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
@@ -99,6 +99,30 @@ impl PriceQualityDto {
             Self::Executable => PriceQuality::Executable,
             Self::PreviousClose => PriceQuality::PreviousClose,
             Self::OwnerEstimate => PriceQuality::OwnerEstimate,
+        }
+    }
+}
+
+/// Вид дохода в транспорте.
+///
+/// Варианта «прочее» нет — как и в ядре: мешок, по которому нельзя
+/// принять решение, не отличается от незнания, а незнание выражается
+/// отсутствием поля.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IncomeKindDto {
+    Coupon,
+    Dividend,
+    DepositInterest,
+}
+
+impl IncomeKindDto {
+    #[must_use]
+    pub const fn to_domain(self) -> IncomeKind {
+        match self {
+            Self::Coupon => IncomeKind::Coupon,
+            Self::Dividend => IncomeKind::Dividend,
+            Self::DepositInterest => IncomeKind::DepositInterest,
         }
     }
 }
@@ -204,6 +228,11 @@ pub enum OperationKindDto {
         instrument: Option<Uuid>,
         amount: String,
         currency: CurrencyDto,
+        /// Вид дохода. Отсутствие поля означает «не утверждалось»:
+        /// без него API продолжил бы терять вид у журнала, который
+        /// его уже умеет хранить.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<IncomeKindDto>,
     },
     Fee {
         amount: String,
@@ -354,10 +383,12 @@ impl OperationDto {
                 instrument,
                 amount,
                 currency,
+                kind,
             } => OperationKind::Income {
                 instrument: instrument.map(InstrumentId),
                 gross_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
+                kind: kind.map(IncomeKindDto::to_domain),
             },
             OperationKindDto::Fee {
                 amount,
@@ -1410,6 +1441,71 @@ mod tests {
     use super::*;
     use iaam_core::ids::{EventId, InstrumentId};
     use iaam_core::numeric::xirr::SolverRefusal;
+
+    fn income_operation(kind: Option<IncomeKindDto>) -> OperationDto {
+        OperationDto {
+            account: Uuid::from_u128(3),
+            kind: OperationKindDto::Income {
+                instrument: Some(Uuid::from_u128(7)),
+                amount: "1200.00".to_owned(),
+                currency: CurrencyDto::Rub,
+                kind,
+            },
+            dates: OperationDatesDto::default(),
+            idempotency_key: None,
+            source_operation_id: None,
+        }
+    }
+
+    #[test]
+    fn the_api_does_not_drop_the_income_kind() {
+        // Журнал вид уже хранит: потерять его в транспорте значит
+        // оставить внешнего агента без того, что система знает.
+        assert!(matches!(
+            income_operation(Some(IncomeKindDto::Coupon))
+                .to_domain()
+                .unwrap()
+                .kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::Coupon),
+                ..
+            }
+        ));
+        assert!(matches!(
+            income_operation(Some(IncomeKindDto::DepositInterest))
+                .to_domain()
+                .unwrap()
+                .kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::DepositInterest),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_income_without_a_kind_stays_without_one() {
+        // Отсутствие поля означает «не утверждалось», а не «дивиденд».
+        assert!(matches!(
+            income_operation(None).to_domain().unwrap().kind,
+            OperationKind::Income { kind: None, .. }
+        ));
+    }
+
+    #[test]
+    fn an_income_kind_survives_a_json_round_trip() {
+        let dto = income_operation(Some(IncomeKindDto::Dividend));
+        let text = serde_json::to_string(&dto).unwrap();
+        assert!(text.contains(r#""kind":"dividend""#), "{text}");
+        let restored: OperationDto = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            restored.to_domain().unwrap().kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::Dividend),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn every_verdict_reaches_the_wire_with_the_field_that_explains_it() {

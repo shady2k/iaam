@@ -324,8 +324,13 @@ fn tinkoff_report_preserves_rows_operations_period_controls_and_repo_quarantine(
                 instrument: actual_instrument,
                 gross_minor,
                 currency,
+                kind,
             } => {
                 assert_eq!(*currency, CurrencyCode::Rub);
+                // Лист «Купоны и дивиденды» смешивает оба вида и вида
+                // построчно не называет: «не утверждалось» здесь честно,
+                // а угадывание по типу бумаги — нет.
+                assert_eq!(*kind, None);
                 incomes.push((*actual_instrument, *gross_minor));
             }
             other => panic!("неожиданный вид операции: {other:?}"),

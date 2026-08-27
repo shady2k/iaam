@@ -2,12 +2,15 @@
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
-use iaam_core::event::kind::EventKind;
+use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
+use iaam_core::event::kind::{EventKind, IncomeKind};
 use iaam_core::event::leg::Leg;
+use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
-use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
+use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+use iaam_core::numeric::decimal::Dec;
 use iaam_store::SqliteStore;
 use iaam_store::bundle::ImportOutcome;
 use iaam_store::reference::AccountRecord;
@@ -280,4 +283,202 @@ fn versions_of_a_contour_are_exported_as_separate_sections_with_all_their_accoun
         !version_one.contains(second_account),
         "счёт версии 2 не должен протечь в версию 1"
     );
+}
+
+// --- новые факты E3.4 ---
+
+fn bond_event(
+    owner: OwnerId,
+    account: AccountId,
+    sequence: u32,
+    kind: EventKind,
+    legs: Vec<Leg>,
+) -> Event {
+    let day = date!(2026 - 06 - 15);
+    Event {
+        id: EventId::new_random(),
+        schema_version: SCHEMA_VERSION,
+        owner,
+        account,
+        kind,
+        dates: EventDates::for_cash(CashPostedDate(day)),
+        order: EffectiveOrder::new(day, sequence),
+        legs,
+        provenance: Provenance::new(
+            SourceId::new_random(),
+            RawHash::parse(&"9".repeat(64)).unwrap(),
+            ParserVersion("manual/1".into()),
+        ),
+        relation: Relation::None,
+        confidence: Confidence::Known,
+        idempotency_key: None,
+    }
+}
+
+/// По одному событию каждого нового вида. Тест обязан ломаться, когда
+/// в семейство добавят члена: архив, потерявший факт, выглядит целым.
+fn every_new_fact(owner: OwnerId, account: AccountId) -> Vec<Event> {
+    let instrument = InstrumentId::new_random();
+    let successor = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let submission = OfferSubmissionId::new_random();
+    let money = |minor| Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
+    // `rust_decimal` в зависимостях этого крейта нет, а добавлять его
+    // ради теста — правка Cargo.toml, то есть файла политики. Число
+    // приходит через тот же serde, которым его читает и хранилище.
+    let dec = |text: &str| serde_json::from_str::<Dec>(text).unwrap();
+    let qty = |text: &str| Quantity(dec(text));
+    let per_unit = |text: &str| PerUnitAmount::new(dec(text), CurrencyCode::Rub);
+
+    vec![
+        bond_event(
+            owner,
+            account,
+            10,
+            EventKind::CorporateAction {
+                action: CorporateAction::PartialRedemption {
+                    instrument,
+                    custody,
+                    quantity: qty("10"),
+                    principal_returned_per_unit: per_unit("200"),
+                    compensation: money(200_000),
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: Some(date!(2026 - 06 - 13)),
+                    grounds: Some("решение эмитента №4".to_owned()),
+                },
+            },
+            vec![Leg::principal(account, instrument, money(200_000))],
+        ),
+        bond_event(
+            owner,
+            account,
+            11,
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption {
+                    instrument,
+                    custody,
+                    quantity: qty("10"),
+                    principal_returned_per_unit: per_unit("800"),
+                    compensation: money(800_000),
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![
+                Leg::principal(account, instrument, money(800_000)),
+                Leg::security(account, custody, instrument, qty("-10")),
+            ],
+        ),
+        bond_event(
+            owner,
+            account,
+            12,
+            EventKind::CorporateAction {
+                action: CorporateAction::Conversion {
+                    predecessor: instrument,
+                    successor,
+                    custody,
+                    ratio: Dec::one(),
+                    quantity_in: qty("10"),
+                    quantity_out: qty("10"),
+                    fractional: FractionalTreatment::NotApplicable,
+                    compensation: None,
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                    basis_transfer: BasisTransferRule::CarryOver,
+                },
+            },
+            vec![
+                Leg::security(account, custody, instrument, qty("-10")),
+                Leg::security(account, custody, successor, qty("10")),
+            ],
+        ),
+        bond_event(
+            owner,
+            account,
+            13,
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Submitted {
+                    submission,
+                    window: OfferWindowId::new_random(),
+                    instrument,
+                    quantity: qty("10"),
+                },
+            },
+            Vec::new(),
+        ),
+        bond_event(
+            owner,
+            account,
+            14,
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Cancelled {
+                    submission,
+                    quantity: qty("4"),
+                },
+            },
+            Vec::new(),
+        ),
+        bond_event(
+            owner,
+            account,
+            15,
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Settled {
+                    submission,
+                    instrument,
+                    custody,
+                    quantity: qty("6"),
+                    gross: money(600_000),
+                    fee: Some(money(1_000)),
+                    accrued_interest: Some(money(12_345)),
+                },
+            },
+            vec![
+                Leg::cash(account, money(611_345)),
+                Leg::security(account, custody, instrument, qty("-6")),
+            ],
+        ),
+        bond_event(
+            owner,
+            account,
+            16,
+            EventKind::Income {
+                instrument: Some(instrument),
+                gross: money(70_000),
+                kind: Some(IncomeKind::Coupon),
+            },
+            vec![Leg::cash(account, money(70_000))],
+        ),
+    ]
+}
+
+#[test]
+fn a_bundle_round_trip_keeps_the_new_facts() {
+    // Архив, потерявший поле нового факта, выглядит целым — и обнаружится
+    // только при восстановлении, когда исходной базы уже нет.
+    let (source, owner, account, _) = populated();
+    let facts = every_new_fact(owner, account);
+    for event in &facts {
+        source.append_event(event).unwrap();
+    }
+
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+
+    assert_eq!(
+        restored.load_events(owner).unwrap(),
+        source.load_events(owner).unwrap()
+    );
+    let stored = restored.load_events(owner).unwrap();
+    for event in &facts {
+        assert!(
+            stored.iter().any(|kept| kept == event),
+            "факт {} не пережил круг через архив",
+            event.kind.discriminant()
+        );
+    }
 }

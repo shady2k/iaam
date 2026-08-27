@@ -680,7 +680,6 @@ mod market_tests {
     use time::macros::{date, datetime};
 
     #[test]
-    #[ignore = "фикстура появляется в задаче 14"]
     fn one_bond_response_yields_both_prices_and_accrued_interest() {
         // ACCINT приходит в той же строке, что и CLOSE. Второй запрос
         // за ним был бы лишним обращением к источнику и второй

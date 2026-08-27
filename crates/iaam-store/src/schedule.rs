@@ -274,4 +274,45 @@ impl SqliteStore {
             offer_windows,
         }))
     }
+
+    /// Записать три утверждения о полноте снимка.
+    ///
+    /// Три, а не одно: «источник вычитан до конца» и «график доменно
+    /// достаточен» — разные утверждения, и полностью вычитанный источник
+    /// с дырой внутри проходил бы как полный.
+    pub fn record_schedule_completeness(
+        &mut self,
+        snapshot_id: &str,
+        fetch_exhausted: bool,
+        structurally_validated: bool,
+        incomplete_reason: Option<&str>,
+        pages_seen: &[u32],
+    ) -> Result<(), StoreError> {
+        let pages = pages_seen
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn.execute(
+            "INSERT INTO schedule_completeness
+                 (snapshot_id, fetch_exhausted, structurally_validated,
+                  incomplete_reason, pages_seen, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (snapshot_id) DO UPDATE SET
+                 fetch_exhausted = excluded.fetch_exhausted,
+                 structurally_validated = excluded.structurally_validated,
+                 incomplete_reason = excluded.incomplete_reason,
+                 pages_seen = excluded.pages_seen,
+                 updated_at = excluded.updated_at",
+            params![
+                snapshot_id,
+                i64::from(fetch_exhausted),
+                i64::from(structurally_validated),
+                incomplete_reason,
+                format!("[{pages}]"),
+                now(),
+            ],
+        )?;
+        Ok(())
+    }
 }

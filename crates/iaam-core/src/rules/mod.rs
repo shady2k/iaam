@@ -4,6 +4,7 @@
 //! неизменяемый вход, поэтому чистота функционального ядра сохраняется.
 //! Реестр закрытый: плагины в рантайме не нужны.
 
+mod accrued_interest;
 pub mod amortisation;
 pub mod lot_disposal;
 pub mod quotation;
@@ -15,6 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
 use lot_disposal::{FifoV1, LotDisposalRule};
+pub use accrued_interest::{
+    AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
+};
+
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,
@@ -35,6 +40,8 @@ pub struct RuleRegistry {
     /// связала бы два независимых решения.
     amortisation_rules: BTreeMap<AmortisationRuleVersion, Box<dyn AmortisationRule>>,
     quotation_rules: BTreeMap<QuotationRuleVersion, Box<dyn QuotationRule>>,
+    accrued_interest_rules: BTreeMap<AccruedInterestRuleVersion, Box<dyn AccruedInterestRule>>,
+
 }
 
 impl RuleRegistry {
@@ -55,11 +62,19 @@ impl RuleRegistry {
         let mut quotation_rules: BTreeMap<QuotationRuleVersion, Box<dyn QuotationRule>> =
             BTreeMap::new();
         quotation_rules.insert(QuotationRuleVersion(1), Box::new(QuotationV1));
+        let mut accrued_interest_rules: BTreeMap<
+            AccruedInterestRuleVersion,
+            Box<dyn AccruedInterestRule>,
+        > = BTreeMap::new();
+        accrued_interest_rules.insert(AccruedInterestRuleVersion(1), Box::new(AccruedInterestV1));
+
         Self {
             lot_rules,
             valuation_rules,
             amortisation_rules,
             quotation_rules,
+            accrued_interest_rules,
+
         }
     }
 
@@ -69,6 +84,16 @@ impl RuleRegistry {
         version: AmortisationRuleVersion,
     ) -> Option<&dyn AmortisationRule> {
         self.amortisation_rules
+            .get(&version)
+            .map(|rule| rule.as_ref())
+    }
+
+    #[must_use]
+    pub fn accrued_interest_rule(
+        &self,
+        version: AccruedInterestRuleVersion,
+    ) -> Option<&dyn AccruedInterestRule> {
+        self.accrued_interest_rules
             .get(&version)
             .map(|rule| rule.as_ref())
     }

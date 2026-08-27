@@ -1497,6 +1497,125 @@ mod tests {
     use iaam_core::ids::{EventId, InstrumentId};
     use iaam_core::numeric::xirr::SolverRefusal;
 
+    fn amount(value: &str) -> AmountDto {
+        AmountDto {
+            amount: value.to_owned(),
+            currency: CurrencyDto::Rub,
+        }
+    }
+
+    /// Имя члена в JSON — часть контракта: по нему внешний агент
+    /// выбирает разбор. `match` исчерпывающий, поэтому новый член
+    /// обязан сломать сборку, а не тихо появиться безымянным (§15.1).
+    fn corporate_action_tag(action: &CorporateActionDto) -> &'static str {
+        match action {
+            CorporateActionDto::PartialRedemption { .. } => "partial_redemption",
+            CorporateActionDto::Redemption { .. } => "redemption",
+            CorporateActionDto::Conversion { .. } => "conversion",
+        }
+    }
+
+    fn offer_tag(action: &OfferExerciseDto) -> &'static str {
+        match action {
+            OfferExerciseDto::Submitted { .. } => "submitted",
+            OfferExerciseDto::Cancelled { .. } => "cancelled",
+            OfferExerciseDto::Settled { .. } => "settled",
+        }
+    }
+
+    #[test]
+    fn every_corporate_action_member_names_itself_in_json() {
+        let redemption_fields = || CorporateActionDto::Redemption {
+            instrument: Uuid::new_v4(),
+            custody: Uuid::new_v4(),
+            quantity: "10".into(),
+            principal_returned_per_unit: amount("1000"),
+            compensation: amount("10000.00"),
+            effective_date: time::macros::date!(2026 - 06 - 01),
+            record_date: None,
+            grounds: None,
+        };
+        let members = [
+            CorporateActionDto::PartialRedemption {
+                instrument: Uuid::new_v4(),
+                custody: Uuid::new_v4(),
+                quantity: "10".into(),
+                principal_returned_per_unit: amount("100"),
+                compensation: amount("1000.00"),
+                effective_date: time::macros::date!(2026 - 05 - 20),
+                record_date: Some(time::macros::date!(2026 - 05 - 18)),
+                grounds: None,
+            },
+            redemption_fields(),
+            CorporateActionDto::Conversion {
+                predecessor: Uuid::new_v4(),
+                successor: Uuid::new_v4(),
+                custody: Uuid::new_v4(),
+                ratio: "1".into(),
+                quantity_in: "10".into(),
+                quantity_out: "10".into(),
+                fractional: FractionalTreatmentDto::NotApplicable,
+                compensation: None,
+                effective_date: time::macros::date!(2026 - 07 - 01),
+                record_date: None,
+                grounds: None,
+                basis_transfer: BasisTransferRuleDto::CarryOver,
+            },
+        ];
+        for member in &members {
+            let json = serde_json::to_value(member).expect("член представим в JSON");
+            assert_eq!(json["type"], corporate_action_tag(member));
+            // Разбор обратно обязан пройти: имя, которое сериализуется,
+            // но не разбирается, — это контракт только на бумаге.
+            let parsed: CorporateActionDto =
+                serde_json::from_value(json).expect("член разбирается обратно");
+            assert_eq!(corporate_action_tag(&parsed), corporate_action_tag(member));
+            member.to_domain().expect("член доезжает до домена");
+        }
+    }
+
+    #[test]
+    fn every_offer_member_names_itself_in_json() {
+        let members = [
+            OfferExerciseDto::Submitted {
+                submission: Uuid::new_v4(),
+                window: Uuid::new_v4(),
+                instrument: Uuid::new_v4(),
+                quantity: "5".into(),
+            },
+            OfferExerciseDto::Cancelled {
+                submission: Uuid::new_v4(),
+                quantity: "5".into(),
+            },
+            OfferExerciseDto::Settled {
+                submission: Uuid::new_v4(),
+                instrument: Uuid::new_v4(),
+                custody: Uuid::new_v4(),
+                quantity: "5".into(),
+                gross: amount("5000.00"),
+                fee: Some(amount("10.00")),
+                accrued_interest: Some(amount("20.00")),
+            },
+        ];
+        for member in &members {
+            let json = serde_json::to_value(member).expect("член представим в JSON");
+            assert_eq!(json["type"], offer_tag(member));
+            let parsed: OfferExerciseDto =
+                serde_json::from_value(json).expect("член разбирается обратно");
+            assert_eq!(offer_tag(&parsed), offer_tag(member));
+            member.to_domain().expect("член доезжает до домена");
+        }
+    }
+
+    /// Сумма без валюты не бывает: если бы валюта была необязательной,
+    /// пропущенное поле пришлось бы чем-то заменять — и заменялось бы
+    /// оно рублём, потому что так удобнее.
+    #[test]
+    fn an_amount_without_a_currency_is_not_representable() {
+        let raw = serde_json::json!({ "amount": "100.00" });
+        assert!(serde_json::from_value::<AmountDto>(raw).is_err());
+    }
+
     fn income_operation(kind: Option<IncomeKindDto>) -> OperationDto {
         OperationDto {
             account: Uuid::from_u128(3),

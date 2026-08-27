@@ -3123,3 +3123,143 @@ async fn a_read_only_token_may_not_submit_journal_events() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(response["code"], "forbidden");
 }
+
+/// Круг через JSON по каждому оставшемуся члену: разбор, что не прошёл
+/// ни одного факта, отличается от разобранного только тем, что ошибку
+/// в нём никто не увидит.
+#[tokio::test]
+async fn a_redemption_is_recorded_through_the_journal_route() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "1000", "currency": "RUB" },
+                "compensation": { "amount": "10000.00", "currency": "RUB" },
+                "effective_date": "2026-06-01",
+                "grounds": "решение эмитента"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+#[tokio::test]
+async fn a_conversion_is_recorded_through_the_journal_route() {
+    let harness = harness();
+    let successor = Uuid::new_v4();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "conversion",
+                "predecessor": harness.instrument.inner(),
+                "successor": successor,
+                "custody": harness.custody.inner(),
+                "ratio": "1",
+                "quantity_in": "10",
+                "quantity_out": "10",
+                "fractional": "not_applicable",
+                "effective_date": "2026-07-01",
+                "basis_transfer": "carry_over"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+/// Выкупленная деньгами дробь добавляет денежную ногу — и валюта
+/// компенсации приезжает вместе с суммой, а не отдельным полем.
+#[tokio::test]
+async fn a_cash_compensated_fraction_travels_with_its_currency() {
+    let harness = harness();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "conversion",
+                "predecessor": harness.instrument.inner(),
+                "successor": Uuid::new_v4(),
+                "custody": harness.custody.inner(),
+                "ratio": "1.5",
+                "quantity_in": "11",
+                "quantity_out": "16",
+                "fractional": "cash_compensated",
+                "compensation": { "amount": "50.00", "currency": "RUB" },
+                "effective_date": "2026-07-01",
+                "record_date": "2026-06-28",
+                "basis_transfer": "restart"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+}
+
+#[tokio::test]
+async fn an_offer_application_and_its_withdrawal_are_recorded() {
+    let harness = harness();
+    let submission = Uuid::new_v4();
+    let body = json!({
+        "source_label": "тест",
+        "events": [
+            {
+                "account": harness.account.inner(),
+                "type": "offer_exercise",
+                "day": "2026-04-10",
+                "action": {
+                    "type": "submitted",
+                    "submission": submission,
+                    "window": Uuid::new_v4(),
+                    "instrument": harness.instrument.inner(),
+                    "quantity": "5"
+                }
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "offer_exercise",
+                "day": "2026-04-12",
+                "action": {
+                    "type": "cancelled",
+                    "submission": submission,
+                    "quantity": "5"
+                }
+            }
+        ]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+    assert_eq!(response[1]["verdict"], "provisional", "{response}");
+}

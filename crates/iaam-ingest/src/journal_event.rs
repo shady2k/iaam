@@ -508,6 +508,61 @@ mod tests {
             .find_map(iaam_core::event::leg::Leg::cash_effect)
             .expect("расчёт обязан двигать деньги");
         assert_eq!(cash.amount().raw(), 501_000, "500000 - 1000 + 2000");
+        // Без даты расчёт не попадёт ни в один период: деньги пришли
+        // и бумага выбыла в никуда.
+        assert_eq!(event.dates.effective_date(), Some(date!(2026 - 04 - 20)));
+    }
+
+    /// Отпечаток обязан РАЗЛИЧАТЬ факты, а не только совпадать сам
+    /// с собой: постоянная каноническая форма даёт один отпечаток всему
+    /// на свете, и дедупликация объявит дубликатом что угодно (§10.6).
+    #[test]
+    fn two_different_facts_get_two_different_fingerprints() {
+        let account = AccountId::new_random();
+        let one = SubmittedJournalEvent {
+            account,
+            fact: JournalFact::CorporateAction(partial_redemption()),
+            idempotency_key: None,
+            source_operation_id: None,
+        };
+        let mut other = partial_redemption();
+        if let CorporateAction::PartialRedemption { compensation, .. } = &mut other {
+            *compensation = rub(200_000);
+        }
+        let two = SubmittedJournalEvent {
+            account,
+            fact: JournalFact::CorporateAction(other),
+            idempotency_key: None,
+            source_operation_id: None,
+        };
+        assert_ne!(
+            crate::dedup::fingerprint_journal_event(&one),
+            crate::dedup::fingerprint_journal_event(&two),
+            "две разные выплаты обязаны дать разные отпечатки"
+        );
+    }
+
+    /// Счёт входит в отпечаток: тот же факт на другом счёте — другой
+    /// факт, и слипаться они не должны.
+    #[test]
+    fn the_same_fact_on_another_account_is_another_fingerprint() {
+        let fact = partial_redemption();
+        let one = SubmittedJournalEvent {
+            account: AccountId::new_random(),
+            fact: JournalFact::CorporateAction(fact.clone()),
+            idempotency_key: None,
+            source_operation_id: None,
+        };
+        let two = SubmittedJournalEvent {
+            account: AccountId::new_random(),
+            fact: JournalFact::CorporateAction(fact),
+            idempotency_key: None,
+            source_operation_id: None,
+        };
+        assert_ne!(
+            crate::dedup::fingerprint_journal_event(&one),
+            crate::dedup::fingerprint_journal_event(&two)
+        );
     }
 
     /// Нулевая компенсация — не «амортизация на ноль», а брак источника.

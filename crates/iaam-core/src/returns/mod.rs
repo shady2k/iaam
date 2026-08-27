@@ -108,6 +108,8 @@ pub enum NotComputable {
     UnsupportedFinancing { account: AccountId },
     /// Снимка графика выпуска на координату знания отсутствует.
     ScheduleMissing { instrument: InstrumentId },
+    /// Наблюдение НКД на дату выхода отсутствует.
+    AccruedObservationMissing { instrument: InstrumentId },
     /// Сумма купона текущего периода не определена.
     CouponUndetermined { instrument: InstrumentId },
     /// Дата отчёта вне покрытия графика.
@@ -133,6 +135,7 @@ impl NotComputable {
             Self::Numeric { .. } => "numeric",
             Self::UnsupportedFinancing { .. } => "unsupported_financing",
             Self::ScheduleMissing { .. } => "schedule_missing",
+            Self::AccruedObservationMissing { .. } => "accrued_observation_missing",
             Self::CouponUndetermined { .. } => "coupon_undetermined",
             Self::OutsideScheduleCoverage { .. } => "outside_schedule_coverage",
             Self::ExitNotExecutable => "exit_not_executable",
@@ -851,6 +854,13 @@ fn bond_position_attributes(
 ) -> Vec<BondPositionAttributes> {
     position_assessments(state, request)
         .into_iter()
+        .filter(|assessment| {
+            matches!(
+                &assessment.kind,
+                PositionAssessmentKind::Selected(selected)
+                    if selected.candidate.basis == QuotationBasis::PercentOfRemainingFace
+            )
+        })
         .map(|assessment| {
             let accrued = match accrued_per_unit(request, rule, assessment.instrument) {
                 Ok(per_unit) => position_amount(per_unit, assessment.quantity, request),
@@ -861,7 +871,7 @@ fn bond_position_attributes(
                 .get(&assessment.instrument)
                 .map(|per_unit| position_amount(*per_unit, assessment.quantity, request))
                 .unwrap_or_else(|| Computed::NotComputable {
-                    reason: NotComputable::ScheduleMissing {
+                    reason: NotComputable::AccruedObservationMissing {
                         instrument: assessment.instrument,
                     },
                 });
@@ -1507,7 +1517,7 @@ mod tests {
     use crate::projection::lots::LotBook;
     use crate::projection::{ProjectionContext, project};
     use crate::rules::{LotRuleVersion, RuleRegistry};
-    use crate::valuation::PriceQuality;
+    use crate::valuation::{PriceKind as CorePriceKind, PriceOrigin, PriceQuality};
     use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 
@@ -1579,6 +1589,99 @@ mod tests {
             accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
         }
     }
+    fn report_with_market_basis(
+        basis: QuotationBasis,
+    ) -> (ReturnsReport, InstrumentId) {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let quantity = Quantity(dec("10"));
+        let opening = event_with(
+            account,
+            date!(2026 - 08 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity,
+                cost_basis: None,
+                assertions: Default::default(),
+            },
+            vec![Leg::security(account, custody, instrument, quantity)],
+        );
+        let state = project(&[opening], &context)
+            .expect("проекция позиции")
+            .snapshot()
+            .state()
+            .clone();
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let candidate = PriceCandidate {
+            instrument,
+            price: dec("98.5"),
+            currency: CurrencyCode::Rub,
+            basis,
+            basis_evidence: "test:market".to_owned(),
+            trade_date: date!(2026 - 08 - 03),
+            observed_at: datetime!(2026 - 08 - 26 09:00:00 UTC),
+            origin: PriceOrigin::Market {
+                venue: "TQOB".to_owned(),
+                kind: CorePriceKind::LegalClose,
+            },
+            executability: SourceExecutability::Executable,
+        };
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate {
+                knowledge_as_of: datetime!(2026 - 08 - 26 12:00:00 UTC),
+                source_priority_version: 1,
+                valuation_policy_version: 1,
+            },
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: std::slice::from_ref(&candidate),
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+        };
+        (returns_report(&state, &request), instrument)
+    }
+
+    #[test]
+    fn a_share_does_not_get_bond_position_attributes() {
+        let (report, _) = report_with_market_basis(QuotationBasis::MoneyPerUnit);
+
+        assert!(report.bond_attributes.is_empty());
+    }
+
+    #[test]
+    fn a_bond_without_a_schedule_keeps_a_schedule_missing_attribute() {
+        let (report, instrument) =
+            report_with_market_basis(QuotationBasis::PercentOfRemainingFace);
+
+        let attributes = report
+            .bond_attributes
+            .first()
+            .expect("облигация должна иметь атрибуты");
+        assert!(matches!(
+            attributes.accrued_interest,
+            Computed::NotComputable {
+                reason: NotComputable::ScheduleMissing { instrument: actual }
+            } if actual == instrument
+        ));
+    }
+
+
 
     #[test]
     fn a_bond_quoted_in_percent_is_valued_through_its_remaining_face() {
@@ -2332,4 +2435,21 @@ mod tests {
             Some("no_external_flows")
         );
     }
+    #[test]
+    fn a_missing_accrued_observation_has_its_own_reason() {
+        let (report, instrument) =
+            report_with_market_basis(QuotationBasis::PercentOfRemainingFace);
+
+        let attributes = report
+            .bond_attributes
+            .first()
+            .expect("облигация должна иметь атрибуты");
+        assert!(matches!(
+            attributes.accrued_interest_payable_on_termination,
+            Computed::NotComputable {
+                reason: NotComputable::AccruedObservationMissing { instrument: actual }
+            } if actual == instrument
+        ));
+    }
+
 }

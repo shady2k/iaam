@@ -1,17 +1,22 @@
 //! Отчёты.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::money::CurrencyCode;
+use iaam_core::ids::InstrumentId;
+use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::approx::SolverPolicy;
+use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
-use iaam_core::valuation::{FxSource, FxTable, PriceCandidate};
+use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis};
 use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
 use iaam_store::market::SeriesKey;
-use iaam_store::market::{MarketWindow, PriceRow};
+use iaam_store::market::{MarketWindow, PriceRow, PriceVenue};
 use rust_decimal::Decimal;
 use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::{Date, OffsetDateTime};
@@ -34,6 +39,10 @@ pub struct ReturnsQuery {
 struct ReportInputs<'a> {
     fx: &'a FxTable,
     market_prices: &'a [PriceCandidate],
+    /// График на координату знания, по инструменту.
+    schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
+    /// Наблюдённый НКД на одну бумагу, по инструменту.
+    accrued_observations: &'a BTreeMap<InstrumentId, PerUnitAmount>,
     knowledge_as_of: OffsetDateTime,
 }
 
@@ -95,7 +104,7 @@ pub async fn returns(
         &context,
     )
     .await?;
-    let market_prices =
+    let market_inputs =
         market_price_candidates(services, &projection, &definition, as_of, knowledge_as_of).await?;
 
     if snapshot_may_be_saved(as_of, today) {
@@ -117,7 +126,9 @@ pub async fn returns(
         query,
         ReportInputs {
             fx: &fx,
-            market_prices: &market_prices,
+            market_prices: &market_inputs.candidates,
+            schedules: &market_inputs.schedules,
+            accrued_observations: &market_inputs.accrued_observations,
             knowledge_as_of,
         },
         &definition,
@@ -125,14 +136,22 @@ pub async fn returns(
         &reconciliation_events,
     )
 }
+const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
+
+struct ReportMarketInputs {
+    candidates: Vec<PriceCandidate>,
+    schedules: BTreeMap<InstrumentId, BondSchedule>,
+    accrued_observations: BTreeMap<InstrumentId, PerUnitAmount>,
+}
+
 async fn market_price_candidates(
     services: &AppServices,
     projection: &Projection,
     definition: &ContourDefinition,
     as_of: Date,
     knowledge_as_of: OffsetDateTime,
-) -> Result<Vec<PriceCandidate>, AppError> {
-    let instruments: std::collections::BTreeSet<_> = projection
+) -> Result<ReportMarketInputs, AppError> {
+    let instruments: BTreeSet<_> = projection
         .state()
         .balances()
         .iter_positions()
@@ -146,10 +165,12 @@ async fn market_price_candidates(
         .map_err(|error| AppError::Store(error.to_string()))?;
     let store = services.market_store.lock().await;
     let mut candidates = Vec::new();
+    let mut schedules = BTreeMap::new();
+    let mut accrued_observations = BTreeMap::new();
     for instrument in instruments {
         let rows = store
             .prices_for_instrument_between(
-                "moex-iss",
+                MOEX_ISS_SOURCE_ID,
                 "prices",
                 &instrument.inner().to_string(),
                 MarketWindow {
@@ -159,13 +180,64 @@ async fn market_price_candidates(
                 },
             )
             .map_err(|error| AppError::Store(error.to_string()))?;
-        candidates.extend(
-            rows.into_iter()
-                .map(market_candidate_from_row)
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        let mut venues = Vec::new();
+        for row in rows {
+            let venue = PriceVenue {
+                board: row.board.clone(),
+                session: row.session,
+            };
+            if !venues.contains(&venue) {
+                venues.push(venue);
+            }
+            candidates.push(market_candidate_from_row(row)?);
+        }
+
+        if let Some(snapshot) = store
+            .schedule_at_or_before(
+                &instrument.inner().to_string(),
+                MOEX_ISS_SOURCE_ID,
+                &knowledge_as_of,
+            )
+            .map_err(|error| AppError::Store(error.to_string()))?
+        {
+            schedules.insert(
+                instrument,
+                BondSchedule {
+                    periods: crate::market_candidate::accrual_periods_from_snapshot(&snapshot)?,
+                    principal_returns: crate::market_candidate::principal_returns_from_snapshot(
+                        &snapshot,
+                    )?,
+                },
+            );
+        }
+
+        for venue in venues {
+            let Some(row) = store
+                .accrued_interest_at_or_before(
+                    &instrument.inner().to_string(),
+                    &venue,
+                    &to_date,
+                    &knowledge_as_of,
+                )
+                .map_err(|error| AppError::Store(error.to_string()))?
+            else {
+                continue;
+            };
+            let value = row
+                .per_unit
+                .parse::<Decimal>()
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let currency = CurrencyCode::from_code(&row.currency)
+                .ok_or_else(|| AppError::Store(format!("неизвестная валюта НКД: {}", row.currency)))?;
+            accrued_observations.insert(instrument, PerUnitAmount::new(Dec::new(value), currency));
+            break;
+        }
     }
-    Ok(candidates)
+    Ok(ReportMarketInputs {
+        candidates,
+        schedules,
+        accrued_observations,
+    })
 }
 
 fn market_candidate_from_row(row: PriceRow) -> Result<PriceCandidate, AppError> {
@@ -197,6 +269,8 @@ fn market_candidate_from_row(row: PriceRow) -> Result<PriceCandidate, AppError> 
         .map_err(|error| AppError::Store(error.to_string()))?;
     let currency = CurrencyCode::from_code(&row.currency)
         .ok_or_else(|| AppError::Store(format!("неизвестная валюта цены: {}", row.currency)))?;
+    let basis = QuotationBasis::from_code(&row.quotation_basis)
+        .ok_or_else(|| AppError::Store(format!("неизвестное основание цены: {}", row.quotation_basis)))?;
     let executability = match row.executability.as_str() {
         "executable" => Executability::Executable,
         "indicative_previous_close" => Executability::IndicativePreviousClose,
@@ -218,8 +292,8 @@ fn market_candidate_from_row(row: PriceRow) -> Result<PriceCandidate, AppError> 
             kind,
             price: iaam_core::numeric::decimal::Dec::new(price),
             currency,
-            basis: iaam_core::valuation::QuotationBasis::Unknown,
-            basis_evidence: String::new(),
+            basis,
+            basis_evidence: row.basis_evidence,
             executability,
         },
     ))
@@ -330,9 +404,8 @@ fn report_from_projection(
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: inputs.market_prices,
-            // Подача входов — Задача 12 (iaam-18f5). Здесь только заглушка сборки.
-            bond_schedules: &std::collections::BTreeMap::new(),
-            accrued_observations: &std::collections::BTreeMap::new(),
+            bond_schedules: inputs.schedules,
+            accrued_observations: inputs.accrued_observations,
         },
     ))
 }
@@ -519,6 +592,8 @@ mod tests {
             ReportInputs {
                 fx: &query.fx,
                 market_prices: &[],
+                schedules: &BTreeMap::new(),
+                accrued_observations: &BTreeMap::new(),
                 knowledge_as_of: OffsetDateTime::UNIX_EPOCH,
             },
             &contour,

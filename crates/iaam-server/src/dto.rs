@@ -603,6 +603,9 @@ fn describe(reason: &NotComputable) -> String {
         NotComputable::ScheduleMissing { instrument } => {
             format!("нет графика выпуска инструмента {}", instrument.inner())
         }
+        NotComputable::AccruedObservationMissing { instrument } => {
+            format!("нет наблюдения НКД инструмента {}", instrument.inner())
+        }
         NotComputable::CouponUndetermined { instrument } => {
             format!("не определена сумма купона инструмента {}", instrument.inner())
         }
@@ -1925,6 +1928,24 @@ mod tests {
         assert!(
             printed.contains("домашний агент"),
             "метка секретом не является и обязана оставаться видимой: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_missing_accrued_observation_serialises_with_a_distinct_reason() {
+        let instrument = InstrumentId::new_random();
+        let dto = ComputedDto::from_dec(&Computed::NotComputable {
+            reason: NotComputable::AccruedObservationMissing { instrument },
+        });
+
+        assert_eq!(
+            dto.not_computable.as_deref(),
+            Some("accrued_observation_missing")
+        );
+        assert!(
+            dto.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("наблюдения НКД"))
         );
     }
 

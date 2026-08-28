@@ -25,15 +25,28 @@ use iaam_app::storage::{
     AccountRecord, AliasRecord, BrokerCode, Coverage, FxRow, InstrumentRecord, KeyRateRow,
     PriceRow, RunOutcome, SeriesKey, TokenRecord, TokenScope,
 };
+use iaam_store::market_source_codes::SourceCodeEntry;
+use iaam_store::schedule::{
+    CouponPeriodRow, IssueTermsRow, OfferWindowRow, PrincipalRepaymentRow,
+    ScheduleSnapshotRow,
+};
+use iaam_store::market::AccruedInterestRow;
 use iaam_broker::credentials::Key;
+use ciborium::value::Value as CborValue;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::projection::{ProjectionContext, Snapshot, project};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
+use iaam_core::money::{CurrencyCode, PerUnitAmount};
+use iaam_core::numeric::decimal::Dec;
+use iaam_core::rules::lot_disposal::PrincipalState;
+use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
-use iaam_core::money::CurrencyCode;
 use iaam_core::reconciliation::Dimension;
 use iaam_server::auth::hash_token;
 use iaam_server::dto::VerdictDto;
+use std::io::Cursor;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use serde_json::{Value, json};
@@ -470,10 +483,259 @@ async fn seed_market(harness: &Harness) {
             RunOutcome::Succeeded,
             Some(Coverage {
                 from: date!(2026 - 08 - 03),
+
                 to: date!(2026 - 08 - 10),
             }),
         )
         .expect("публикация ставки");
+}
+
+async fn seed_bond_market(harness: &Harness) {
+    let mut store = harness.market_store.lock().await;
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: harness.instrument,
+            kind: Some(InstrumentKind::Bond),
+            symbol: "BOND".into(),
+            title: "Тестовая облигация".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("инструмент рынка облигации");
+    store.extend_market_source_codes(
+            "moex-iss",
+            "offer_kind",
+            &[SourceCodeEntry {
+                domain: "offer_kind".into(),
+                source_code: "Оферта".into(),
+                meaning: "put_option".into(),
+            }],
+        )
+        .expect("словарь оферт");
+
+    let price_run = store
+        .begin_run(
+            SeriesKey {
+                source_id: "moex-iss".into(),
+                dataset: "prices".into(),
+                series_key: format!("{}:TQOB:0", harness.instrument.inner()),
+            },
+            date!(2026 - 08 - 01),
+            date!(2026 - 08 - 03),
+            OffsetDateTime::now_utc() + TimeDuration::days(1),
+        )
+        .expect("запуск цен облигации");
+    store
+        .record_prices(
+            &price_run,
+            &"d".repeat(64),
+            &[PriceRow {
+                instrument_id: harness.instrument.inner().to_string(),
+                board: "TQOB".into(),
+                session: 0,
+                trade_date: "2026-08-03".into(),
+                kind: "close".into(),
+                observed_at: "2026-08-20T00:00:00Z".into(),
+                price: "98.5".into(),
+                currency: "RUB".into(),
+                quotation_basis: "percent_of_remaining_face".into(),
+                basis_evidence: "iss:engines/stock/markets/bonds".into(),
+                executability: "executable".into(),
+            }],
+        )
+        .expect("цена облигации");
+    store
+        .finish_run(
+            &price_run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 01),
+                to: date!(2026 - 08 - 03),
+            }),
+        )
+        .expect("публикация цены облигации");
+    let accrued_run = store
+        .begin_run(
+            SeriesKey {
+                source_id: "moex-iss".into(),
+                dataset: "accrued_interest".into(),
+                series_key: format!("{}:TQOB:0", harness.instrument.inner()),
+            },
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            OffsetDateTime::now_utc() + TimeDuration::days(1),
+        )
+        .expect("запуск НКД");
+    store
+        .record_accrued_interest(
+            &accrued_run,
+            &"e".repeat(64),
+            &[AccruedInterestRow {
+                instrument_id: harness.instrument.inner().to_string(),
+                board: "TQOB".into(),
+                session: 0,
+                trade_date: "2026-08-03".into(),
+                observed_at: "2026-08-20T00:00:00Z".into(),
+                per_unit: "1".into(),
+                currency: "RUB".into(),
+            }],
+        )
+        .expect("НКД облигации");
+    store
+        .finish_run(
+            &accrued_run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 03),
+                to: date!(2026 - 08 - 03),
+            }),
+        )
+        .expect("публикация НКД облигации");
+
+    let snapshot = store
+        .record_schedule_snapshot(
+            &ScheduleSnapshotRow {
+                instrument_id: harness.instrument.inner().to_string(),
+                source_id: "moex-iss".into(),
+                observed_at: "2026-08-20T00:00:00Z".into(),
+                content_hash: "bond-contract-schedule".into(),
+            },
+            &[CouponPeriodRow {
+                period_start: "2026-08-01".into(),
+                accrual_end: "2026-12-01".into(),
+                payment_date: "2026-12-02".into(),
+                record_date: None,
+                amount_status: "amount_fixed".into(),
+                amount_per_unit: Some("5".into()),
+                amount_currency: Some("RUB".into()),
+                rate_percent: None,
+                source_entry_id: Some("coupon-1".into()),
+            }],
+            &[PrincipalRepaymentRow {
+                repayment_date: "2026-12-02".into(),
+                share_percent: "100".into(),
+                source_kind: "maturity".into(),
+                source_entry_id: Some("principal-1".into()),
+            }],
+            &[
+                OfferWindowRow {
+                    execution_date: "2026-08-26".into(),
+                    submission_start: None,
+                    submission_end: None,
+                    price_percent: Some("100".into()),
+                    agent: None,
+                    source_kind: "Оферта".into(),
+                    source_entry_id: Some("offer-now".into()),
+                },
+                OfferWindowRow {
+                    execution_date: "2026-09-15".into(),
+                    submission_start: None,
+                    submission_end: None,
+                    price_percent: Some("100".into()),
+                    agent: None,
+                    source_kind: "Оферта".into(),
+                    source_entry_id: Some("offer-future".into()),
+                },
+            ],
+        )
+        .expect("снимок графика");
+    store
+        .record_schedule_completeness(&snapshot.snapshot_id, true, true, None, &[0])
+        .expect("полнота графика");
+    store
+        .record_issue_terms(&IssueTermsRow {
+            instrument_id: harness.instrument.inner().to_string(),
+            source_id: "moex-iss".into(),
+            observed_at: "2026-08-20T00:00:00Z".into(),
+            effective_from: Some("2026-08-01".into()),
+            maturity_date: Some("2026-12-02".into()),
+            initial_face_value: Some("1000".into()),
+            face_currency_code: Some("RUB".into()),
+            coupon_periods_per_year: Some(1),
+            day_count: Some("act/365".into()),
+            calendar: Some("MOEX".into()),
+            default_declared: false,
+            default_technical: false,
+        })
+        .expect("условия выпуска");
+}
+
+fn replace_unknown_principal(value: &mut CborValue, known: &CborValue) -> usize {
+    match value {
+        CborValue::Map(entries) => {
+            let mut replaced = 0;
+            for (key, value) in entries {
+                let is_principal = matches!(key, CborValue::Text(name) if name == "principal");
+                if is_principal && matches!(value, CborValue::Text(name) if name == "Unknown") {
+                    *value = known.clone();
+                    replaced += 1;
+                } else {
+                    replaced += replace_unknown_principal(value, known);
+                }
+            }
+            replaced
+        }
+        CborValue::Array(values) => values
+            .iter_mut()
+            .map(|value| replace_unknown_principal(value, known))
+            .sum(),
+        CborValue::Tag(_, value) => replace_unknown_principal(value, known),
+        _ => 0,
+    }
+}
+
+fn install_known_principal_snapshot(
+    path: &std::path::Path,
+    owner: OwnerId,
+    account: AccountId,
+    contour_id: Uuid,
+) {
+    let store = SqliteStore::open(path).expect("второе соединение для снимка");
+    let events = store
+        .load_events_through(owner, Date::MAX)
+        .expect("события позиции");
+    let contour = ContourDefinition::new(ContourId(contour_id), ContourVersion(1), [account]);
+    let rules = RuleRegistry::with_defaults();
+    let context = ProjectionContext {
+        contour: &contour,
+        rules: &rules,
+        lot_rule: LotRuleVersion(1),
+    };
+    let projection = project(&events, &context).expect("проекция позиции");
+
+    let principal = PrincipalState::known(
+        PerUnitAmount::new(
+            Dec::new("1000".parse().expect("номинал")),
+            CurrencyCode::Rub,
+        ),
+        PerUnitAmount::new(
+            Dec::new("1000".parse().expect("остаток номинала")),
+            CurrencyCode::Rub,
+        ),
+    )
+    .expect("известный номинал");
+    let mut encoded_principal = Vec::new();
+    ciborium::ser::into_writer(&principal, &mut encoded_principal).expect("кодирование номинала");
+    let known: CborValue =
+        ciborium::de::from_reader(Cursor::new(encoded_principal)).expect("разбор номинала");
+
+    let mut encoded_state = Vec::new();
+    ciborium::ser::into_writer(projection.snapshot().state(), &mut encoded_state)
+        .expect("кодирование состояния");
+    let mut state_value: CborValue =
+        ciborium::de::from_reader(Cursor::new(encoded_state)).expect("разбор состояния");
+    let replaced = replace_unknown_principal(&mut state_value, &known);
+    assert_eq!(replaced, 1, "только лот тестовой облигации требует номинал");
+    let mut patched_state_bytes = Vec::new();
+    ciborium::ser::into_writer(&state_value, &mut patched_state_bytes)
+        .expect("кодирование исправленного состояния");
+    let mut parts = projection.snapshot().clone().into_parts();
+    parts.state =
+        ciborium::de::from_reader(Cursor::new(patched_state_bytes)).expect("исправленное состояние");
+    parts.fingerprint = parts.state.fingerprint();
+    store
+        .save_snapshot(owner, &Snapshot::restore(parts))
+        .expect("снимок с известным номиналом");
 }
 
 async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
@@ -949,6 +1211,200 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         "unknown"
     );
     assert!(report["liquidation_value_before_exit_costs_and_tax"]["exit_costs"]["value"].is_null());
+}
+
+#[tokio::test]
+async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
+    let (harness, path) = harness_on_disk();
+    let (status, instrument_response) = call(
+        &harness.router,
+        post(
+            "/v1/instruments",
+            &harness.owner_token,
+            &json!({
+                "id": harness.instrument.inner(),
+                "kind": "bond",
+                "symbol": "BOND",
+                "title": "Тестовая облигация",
+                "denomination_currency": "RUB",
+                "settlement_currency": "RUB",
+                "quote_currency": "RUB"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{instrument_response}");
+    seed_bond_market(&harness).await;
+
+    let contour = json!({
+        "title": "Облигационный портфель",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("контур")
+        .to_owned();
+
+    let operations = json!({
+        "source_label": "ручной ввод",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "deposit",
+                "amount": "10000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-01" }
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "buy",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "amount": "985.00",
+                "accrued_interest": "1.00",
+                "currency": "RUB",
+                "dates": { "trade": "2026-08-10", "cash_posted": "2026-08-10" }
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "income",
+                "instrument": harness.instrument.inner(),
+                "amount": "5.00",
+                "currency": "RUB",
+                "kind": "coupon",
+                "dates": { "cash_posted": "2026-08-20" }
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert!(
+        verdicts
+            .as_array()
+            .expect("массив вердиктов")
+            .iter()
+            .all(|verdict| verdict["verdict"] == "provisional"),
+        "{verdicts}"
+    );
+    install_known_principal_snapshot(
+        &path,
+        harness.owner,
+        harness.account,
+        contour_id.parse().expect("идентификатор контура"),
+    );
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-08-26"
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+
+    let bond_metrics = report["bond_metrics"].as_array().expect("bond_metrics");
+    assert_eq!(bond_metrics.len(), 1);
+    let bond = &bond_metrics[0];
+    assert_eq!(bond["account"], json!(harness.account.inner()));
+    assert_eq!(bond["custody"], json!(harness.custody.inner()));
+    assert_eq!(bond["instrument"], json!(harness.instrument.inner()));
+    let attributes = report["bond_attributes"].as_array().expect("bond_attributes");
+    assert_eq!(attributes.len(), 1);
+    assert_eq!(attributes[0]["accrued_interest"]["value"], "10.20");
+    assert_eq!(
+        attributes[0]["accrued_interest_payable_on_termination"]["not_computable"],
+        "accrued_observation_missing"
+    );
+    assert_eq!(attributes[0]["next_posting_date"], "2026-12-02");
+    assert_eq!(attributes[0]["next_principal_return_finality"], "final");
+
+    let scenarios = bond["scenarios"].as_array().expect("сценарии");
+    assert_eq!(scenarios.len(), 3);
+    assert!(
+        scenarios
+            .iter()
+            .any(|scenario| scenario["prospective"]["irr_label"] == "yield_to_maturity")
+    );
+    assert!(
+        scenarios
+            .iter()
+            .any(|scenario| scenario["prospective"]["irr_label"] == "yield_to_offer")
+    );
+
+    let ytm = scenarios
+        .iter()
+        .find(|scenario| scenario["prospective"]["irr_label"] == "yield_to_maturity")
+        .expect("YTM");
+    assert_eq!(
+        ytm["prospective"]["c0"]["value"]["currency"],
+        "RUB",
+        "{report:#}"
+    );
+    assert_eq!(
+        ytm["prospective"]["c0"]["value"]["value"],
+        "9860.200",
+        "{report:#}"
+    );
+    assert_eq!(
+        ytm["prospective"]["metrics"]["value"]["terminal_wealth"]["value"],
+        "10050",
+    );
+    assert_eq!(
+        ytm["prospective"]["metrics"]["value"]["postings"][0]["amount"]["value"],
+        "50",
+    );
+    assert_eq!(
+        ytm["prospective"]["metrics"]["value"]["terminal_wealth"]["currency"],
+        "RUB"
+    );
+    assert!(!ytm["prospective"]["metrics"]["value"]["zero_reinvestment_note"]
+        .as_str()
+        .expect("пояснение")
+        .is_empty());
+    let lifetime = ytm["lifetime"]["value"].as_array().expect("когорты");
+    assert_eq!(lifetime.len(), 1);
+    assert_eq!(lifetime[0]["quantity"], "10");
+    assert_eq!(
+        lifetime[0]["c0"]["value"]["currency"],
+        "RUB"
+    );
+    assert_eq!(lifetime[0]["c0"]["value"]["value"], "986.00");
+    assert_eq!(
+        lifetime[0]["metrics"]["value"]["terminal_wealth"]["value"],
+        "10055.00"
+    );
+    assert!(!lifetime[0]["irr_absent_because"]
+        .as_str()
+        .expect("причина отсутствия IRR")
+        .is_empty());
+
+    let refusal = scenarios
+        .iter()
+        .find(|scenario| scenario["prospective"]["terminal_date"] == "2026-08-26")
+        .expect("отказная offer-ставка");
+    assert_eq!(refusal["prospective"]["irr"]["value"], "");
+    assert_eq!(refusal["prospective"]["irr"]["error_bound"], "");
+    assert_eq!(refusal["prospective"]["irr"]["not_computable"], "solver_refused");
+    assert!(!refusal["prospective"]["irr"]["detail"]
+        .as_str()
+        .expect("деталь отказа")
+        .is_empty());
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

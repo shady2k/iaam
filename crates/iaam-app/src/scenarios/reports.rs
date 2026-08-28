@@ -4,15 +4,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::kind::EventKind;
 use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::CurrencyRoles;
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
+use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::ReconciliationLedger;
-use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report};
+use iaam_core::returns::{
+    ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs,
+};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue};
 use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
@@ -461,6 +465,27 @@ const fn snapshot_may_be_saved(as_of: Date, today: Date) -> bool {
     // для ссылок, но для значения — реализует.
     as_of.ordinal() == today.ordinal() && as_of.year() == today.year()
 }
+fn offer_book_through(
+    events: &[iaam_core::event::Event],
+    as_of: Date,
+) -> Result<OfferBook, AppError> {
+    let mut book = OfferBook::default();
+    for event in events {
+        if !event
+            .dates
+            .effective_date()
+            .is_some_and(|date| date <= as_of)
+        {
+            continue;
+        }
+        if let EventKind::OfferExercise { action } = &event.kind {
+            book.apply(action)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+        }
+    }
+    Ok(book)
+}
+
 fn report_from_projection(
     projection: &Projection,
     query: &ReturnsQuery,
@@ -471,8 +496,9 @@ fn report_from_projection(
 ) -> Result<ReturnsReport, AppError> {
     let perimeter = assess(reconciliation_events, PerimeterPolicy::default())?;
     let ledger = ReconciliationLedger::build_with(reconciliation_events, &perimeter.exceptions())?;
+    let offer_book = offer_book_through(reconciliation_events, as_of)?;
 
-    Ok(returns_report(
+    Ok(returns_report_with_bond_inputs(
         projection.state(),
         &ReturnsRequest {
             contour: definition,
@@ -491,9 +517,10 @@ fn report_from_projection(
             bond_schedules: inputs.schedules,
             accrued_observations: inputs.accrued_observations,
         },
+        &offer_book,
     ))
-}
 
+}
 /// Стоит ли пересчитывать журнал целиком после отказа `advance`.
 ///
 /// Снимок — кэш, и его непригодность не является ошибкой работы: почти

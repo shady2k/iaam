@@ -1180,6 +1180,15 @@ fn issue(value: &MaterialIssue) -> String {
             "на счёте {} присутствует финансирование вне периметра",
             account.inner()
         ),
+        MaterialIssue::OfferWindowUnresolved { submission } => format!(
+            "заявка оферты {} ссылается на неизвестное окно",
+            submission.inner()
+        ),
+        MaterialIssue::ScheduledPostingNotReceived { instrument, date } => format!(
+            "ожидаемая выплата инструмента {} на {} не подтверждена",
+            instrument.inner(),
+            date
+        ),
         MaterialIssue::AccruedInterestMismatch {
             instrument,
             computed,

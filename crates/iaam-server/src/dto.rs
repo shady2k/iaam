@@ -2255,6 +2255,30 @@ mod tests {
             Some("iss:engines/stock/markets/bonds")
         );
     }
+    /// Отображение доменного статуса в DTO — место, где `Proven`
+    /// и `Contradicts` можно переставить местами, не сломав ни сборку,
+    /// ни один существующий тест: наружу оба уходят строкой, и до сих
+    /// пор через `from_domain` проходил только `NotProven`. Перепутанная
+    /// пара назвала бы противоречивую запись доказанной — то есть ровно
+    /// то, что витрина обязана различать.
+    #[test]
+    fn отображение_доменного_статуса_в_dto_не_путает_ветви() {
+        use iaam_app::scenarios::market_reference::QuotationBasisStatus;
+
+        assert_eq!(
+            QuotationBasisStatusDto::from_domain(QuotationBasisStatus::Proven),
+            QuotationBasisStatusDto::Proven
+        );
+        assert_eq!(
+            QuotationBasisStatusDto::from_domain(QuotationBasisStatus::Contradicts),
+            QuotationBasisStatusDto::Contradicts
+        );
+        assert_eq!(
+            QuotationBasisStatusDto::from_domain(QuotationBasisStatus::NotProven),
+            QuotationBasisStatusDto::NotProven
+        );
+    }
+
     #[test]
     fn каждый_статус_основания_называет_себя_в_api() {
         use std::collections::HashSet;

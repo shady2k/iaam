@@ -526,7 +526,7 @@ struct SelectedObservation {
     #[serde(default)]
     basis_evidence: String,
     trade_date: Date,
-    observed_at: OffsetDateTime,
+    observed_at: Option<OffsetDateTime>,
     executability: &'static str,
     selection: SelectedSelection,
     freshness: SelectedFreshness,
@@ -553,7 +553,7 @@ struct SelectedProvenance {
     price_kind: Option<String>,
     origin: SelectedOrigin,
     venue: Option<String>,
-    observed_at: OffsetDateTime,
+    observed_at: Option<OffsetDateTime>,
     valuation_policy_version: u32,
     source_priority_version: u32,
     carry_forward_limit: u16,
@@ -1187,7 +1187,7 @@ fn position_assessments(
                     basis_evidence: "journal:valuation".to_owned(),
                     basis_evidence_contradicts: false,
                     trade_date: price.as_of,
-                    observed_at: request.coordinate.knowledge_as_of,
+                    observed_at: None,
                     origin: crate::valuation::PriceOrigin::ReportParsed { source },
                     executability: SourceExecutability::Unknown,
                 };
@@ -1753,7 +1753,7 @@ mod tests {
             basis_evidence: String::new(),
             basis_evidence_contradicts: false,
             trade_date,
-            observed_at: datetime!(2026 - 08 - 26 09:00:00 UTC),
+            observed_at: Some(datetime!(2026 - 08 - 26 09:00:00 UTC)),
             origin: PriceOrigin::Market {
                 venue: venue.clone(),
                 kind: CorePriceKind::LegalClose,
@@ -1855,7 +1855,7 @@ mod tests {
             basis_evidence: "test:market".to_owned(),
             basis_evidence_contradicts: false,
             trade_date: date!(2026 - 08 - 03),
-            observed_at: datetime!(2026 - 08 - 26 09:00:00 UTC),
+            observed_at: Some(datetime!(2026 - 08 - 26 09:00:00 UTC)),
             origin: PriceOrigin::Market {
                 venue: crate::valuation::Venue {
                     board: "TQOB".to_owned(),
@@ -2484,7 +2484,7 @@ mod tests {
                     basis_evidence: String::new(),
                     basis_evidence_contradicts: false,
                     trade_date: date!(2026 - 08 - 26),
-                    observed_at: datetime!(2026-08-26 08:00:00 UTC),
+                    observed_at: Some(datetime!(2026-08-26 08:00:00 UTC)),
                     origin: origin.clone(),
                     executability: SourceExecutability::Executable,
                 },
@@ -2496,7 +2496,7 @@ mod tests {
                     venue: Some(venue.to_owned()),
                     quotation_basis: crate::valuation::QuotationBasis::Unknown,
                     basis_evidence: String::new(),
-                    observed_at: datetime!(2026-08-26 08:00:00 UTC),
+                    observed_at: Some(datetime!(2026-08-26 08:00:00 UTC)),
                     valuation_policy_version: coordinate.valuation_policy_version,
                     source_priority_version: coordinate.source_priority_version,
                     carry_forward_limit: 10,
@@ -2569,7 +2569,7 @@ mod tests {
                     basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
                     basis_evidence_contradicts: false,
                     trade_date: date!(2026 - 08 - 26),
-                    observed_at: datetime!(2026-08-26 08:00:00 UTC),
+                    observed_at: Some(datetime!(2026-08-26 08:00:00 UTC)),
                     origin: origin.clone(),
                     executability: SourceExecutability::Executable,
                 },
@@ -2581,7 +2581,7 @@ mod tests {
                     venue: Some("moex".to_owned()),
                     quotation_basis: basis,
                     basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
-                    observed_at: datetime!(2026-08-26 08:00:00 UTC),
+                    observed_at: Some(datetime!(2026-08-26 08:00:00 UTC)),
                     valuation_policy_version: coordinate.valuation_policy_version,
                     source_priority_version: coordinate.source_priority_version,
                     carry_forward_limit: 10,
@@ -2679,6 +2679,8 @@ mod tests {
             crate::valuation::QuotationBasis::MoneyPerUnit
         );
         assert_eq!(selected.candidate.basis_evidence, "journal:valuation");
+        assert_eq!(selected.candidate.observed_at, None);
+        assert_eq!(selected.provenance.observed_at, None);
     }
 
     #[test]

@@ -177,7 +177,9 @@ pub struct PriceCandidate {
     /// до оценки позиции отдельно от недоказанности.
     pub basis_evidence_contradicts: bool,
     pub trade_date: Date,
-    pub observed_at: OffsetDateTime,
+    /// Момент, когда источник узнал о наблюдении. Для журнальной
+    /// оценки этот момент не записан и остаётся `None`.
+    pub observed_at: Option<OffsetDateTime>,
     pub origin: PriceOrigin,
     pub executability: SourceExecutability,
 }
@@ -194,7 +196,8 @@ pub struct PriceProvenance {
     pub quotation_basis: QuotationBasis,
     /// Признак, по которому основание выведено.
     pub basis_evidence: String,
-    pub observed_at: OffsetDateTime,
+    /// Момент, когда источник узнал о наблюдении, если журнал его хранит.
+    pub observed_at: Option<OffsetDateTime>,
     pub valuation_policy_version: u32,
     pub source_priority_version: u32,
     pub carry_forward_limit: u16,
@@ -338,7 +341,7 @@ mod tests {
             basis_evidence: String::new(),
             basis_evidence_contradicts: false,
             trade_date: date!(2026 - 08 - 03),
-            observed_at: datetime!(2026 - 08 - 03 18:00 UTC),
+            observed_at: Some(datetime!(2026 - 08 - 03 18:00 UTC)),
             origin: PriceOrigin::ReportParsed {
                 source: SourceId::new_random(),
             },
@@ -389,7 +392,7 @@ mod tests {
                 venue: None,
                 quotation_basis: QuotationBasis::Unknown,
                 basis_evidence: String::new(),
-                observed_at: datetime!(2026 - 07 - 01 18:00 UTC),
+                observed_at: Some(datetime!(2026 - 07 - 01 18:00 UTC)),
                 valuation_policy_version: 1,
                 source_priority_version: 1,
                 carry_forward_limit: 10,

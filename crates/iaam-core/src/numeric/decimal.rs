@@ -336,4 +336,14 @@ mod tests {
         let value = Dec::new(Decimal::from_str_exact("1.5").unwrap());
         assert!(value.checked_round_to_scale(Dec::max_scale() + 1).is_err());
     }
+
+    #[test]
+    fn the_limit_itself_is_allowed_not_refused() {
+        // Граница включительная: max_scale — предельный, а не первый
+        // запрещённый знак. Без этого утверждения мутант `>` -> `>=`
+        // выживает, а с ним валюта с максимальной точностью перестала бы
+        // округляться вовсе — и правило НКД отказывало бы на ровном месте.
+        let value = Dec::new(Decimal::from_str_exact("1.5").unwrap());
+        assert!(value.checked_round_to_scale(Dec::max_scale()).is_ok());
+    }
 }

@@ -746,13 +746,17 @@ pub enum QuotationBasisStatusDto {
 
 impl QuotationBasisStatusDto {
     #[must_use]
-    pub const fn from_domain(status: iaam_app::scenarios::market_reference::QuotationBasisStatus) -> Self {
+    pub const fn from_domain(
+        status: iaam_app::scenarios::market_reference::QuotationBasisStatus,
+    ) -> Self {
         match status {
             iaam_app::scenarios::market_reference::QuotationBasisStatus::Proven => Self::Proven,
             iaam_app::scenarios::market_reference::QuotationBasisStatus::Contradicts => {
                 Self::Contradicts
             }
-            iaam_app::scenarios::market_reference::QuotationBasisStatus::NotProven => Self::NotProven,
+            iaam_app::scenarios::market_reference::QuotationBasisStatus::NotProven => {
+                Self::NotProven
+            }
         }
     }
 }
@@ -2284,10 +2288,11 @@ mod tests {
             unique_codes.len(),
             codes.len(),
             "код статуса повторяется: {}",
-            duplicate.map(|code| code.as_str()).unwrap_or("<неизвестен>")
+            duplicate
+                .map(|code| code.as_str())
+                .unwrap_or("<неизвестен>")
         );
     }
-
 }
 /// Параметры загрузки отчёта. Тело маршрута — двоичные байты книги.
 #[derive(Debug, Clone, Deserialize, IntoParams)]

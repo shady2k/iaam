@@ -51,7 +51,6 @@ pub enum QuotationBasisStatus {
     NotProven,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketPriceView {
     pub instrument: InstrumentId,
@@ -406,9 +405,14 @@ mod tests {
     }
     #[test]
     fn совпадающее_основание_имеет_статус_доказано() {
-        let view =
-            price_view(price_row("percent_of_remaining_face", "iss:engines/stock/markets/bonds"), None)
-                .expect("строка цены");
+        let view = price_view(
+            price_row(
+                "percent_of_remaining_face",
+                "iss:engines/stock/markets/bonds",
+            ),
+            None,
+        )
+        .expect("строка цены");
 
         assert_eq!(view.quotation_basis, QuotationBasis::PercentOfRemainingFace);
         assert_eq!(view.quotation_basis_status, QuotationBasisStatus::Proven);
@@ -417,12 +421,17 @@ mod tests {
 
     #[test]
     fn противоречащее_основание_имеет_статус_противоречит() {
-        let view =
-            price_view(price_row("money_per_unit", "iss:engines/stock/markets/bonds"), None)
-                .expect("строка цены");
+        let view = price_view(
+            price_row("money_per_unit", "iss:engines/stock/markets/bonds"),
+            None,
+        )
+        .expect("строка цены");
 
         assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
-        assert_eq!(view.quotation_basis_status, QuotationBasisStatus::Contradicts);
+        assert_eq!(
+            view.quotation_basis_status,
+            QuotationBasisStatus::Contradicts
+        );
         assert_eq!(view.recorded_quotation_basis, "money_per_unit");
     }
 

@@ -407,14 +407,12 @@ fn подсказка_владельцу_содержит_пятый_урове�
     let incoming = deposit(account, 100_000);
     let key = choose_key(&incoming, &incoming_context);
 
-    let DedupDecision::PossibleDuplicate { level, .. } =
-        assess(
-            key.as_ref(),
-            &fingerprint(&incoming),
-            &incoming_context,
-            &known,
-        )
-    else {
+    let DedupDecision::PossibleDuplicate { level, .. } = assess(
+        key.as_ref(),
+        &fingerprint(&incoming),
+        &incoming_context,
+        &known,
+    ) else {
         panic!("совпадение отпечатка разных документов обязано стать подсказкой");
     };
     assert_eq!(

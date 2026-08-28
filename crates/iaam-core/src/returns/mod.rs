@@ -1718,10 +1718,7 @@ mod tests {
         }
     }
 
-    fn legacy_price(
-        instrument: InstrumentId,
-        price: &str,
-    ) -> crate::valuation::InstrumentPrice {
+    fn legacy_price(instrument: InstrumentId, price: &str) -> crate::valuation::InstrumentPrice {
         crate::valuation::InstrumentPrice {
             instrument,
             price: dec(price),
@@ -1911,12 +1908,9 @@ mod tests {
             &request,
         );
 
-        let without_legacy_value = xirr::terminal_value_from_position_values(
-            &state,
-            &request,
-            &without_legacy_positions,
-        )
-        .unwrap();
+        let without_legacy_value =
+            xirr::terminal_value_from_position_values(&state, &request, &without_legacy_positions)
+                .unwrap();
         let legacy_value =
             xirr::terminal_value_from_position_values(&state, &request, &legacy_positions).unwrap();
         let quality = data_quality(&state, &request, &legacy_positions);
@@ -1988,8 +1982,7 @@ mod tests {
         let assessments = cases
             .iter()
             .map(|(instrument, reason)| {
-                let mut assessment =
-                    position_assessment(account, *instrument, Quantity(dec("1")));
+                let mut assessment = position_assessment(account, *instrument, Quantity(dec("1")));
                 assessment.kind = PositionAssessmentKind::Uncovered(reason.clone());
                 assessment
             })
@@ -2003,11 +1996,9 @@ mod tests {
                 UncoveredReason::NoObservation
                 | UncoveredReason::TooOld
                 | UncoveredReason::AmbiguousVenue
-                | UncoveredReason::AmbiguousCandidate => {
-                    NotComputable::MissingPrice {
-                        instrument: *instrument,
-                    }
-                }
+                | UncoveredReason::AmbiguousCandidate => NotComputable::MissingPrice {
+                    instrument: *instrument,
+                },
             };
             assert_eq!(position.value, Err(expected));
         }

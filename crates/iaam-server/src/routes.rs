@@ -56,10 +56,9 @@ use crate::dto::{
     DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
     InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
     MarketSyncRequest, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
-    ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest,
-    SyncOutcomeDto, TokenDto, TokenScopeDto,
-    VerdictDto,
+    ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
+    ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
+    TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;

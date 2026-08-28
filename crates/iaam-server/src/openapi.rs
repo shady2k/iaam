@@ -22,9 +22,8 @@ use crate::dto::{
     OperationDatesDto, OperationDto, OperationKindDto, OwnerBalanceRequest, PositionCoverageDto,
     PriceFreshnessDto, PriceOriginDto, PriceProvenanceDto, PriceQualityDto, PriceSelectionDto,
     QuotationBasisDto, QuotationBasisStatusDto, RateDto, ReconciliationStatusDto, ReturnsReportDto,
-    SelectedPriceDto,
-    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto,
-    UncoveredPositionDto, VerdictDto,
+    SelectedPriceDto, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
+    TokenDto, UncoveredPositionDto, VerdictDto,
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;

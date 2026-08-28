@@ -5,6 +5,7 @@
 //! Реестр закрытый: плагины в рантайме не нужны.
 
 mod accrued_interest;
+pub mod cashflow;
 pub mod amortisation;
 pub mod lot_disposal;
 pub mod quotation;
@@ -21,6 +22,10 @@ use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
 use lot_disposal::{FifoV1, LotDisposalRule};
 
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
+pub use cashflow::{
+    CashflowError, CashflowInput, CashflowPlan, CashflowProjection, CashflowProjectionV1,
+    CashflowProjectionVersion, ExpectedPosting, PostingKind,
+};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,
     ValuationRule,
@@ -40,6 +45,7 @@ pub struct RuleRegistry {
     /// связала бы два независимых решения.
     amortisation_rules: BTreeMap<AmortisationRuleVersion, Box<dyn AmortisationRule>>,
     quotation_rules: BTreeMap<QuotationRuleVersion, Box<dyn QuotationRule>>,
+    cashflow_rules: BTreeMap<CashflowProjectionVersion, Box<dyn CashflowProjection>>,
     accrued_interest_rules: BTreeMap<AccruedInterestRuleVersion, Box<dyn AccruedInterestRule>>,
 }
 
@@ -65,6 +71,11 @@ impl RuleRegistry {
             AccruedInterestRuleVersion,
             Box<dyn AccruedInterestRule>,
         > = BTreeMap::new();
+        let mut cashflow_rules: BTreeMap<
+            CashflowProjectionVersion,
+            Box<dyn CashflowProjection>,
+        > = BTreeMap::new();
+        cashflow_rules.insert(CashflowProjectionVersion(1), Box::new(CashflowProjectionV1));
         accrued_interest_rules.insert(AccruedInterestRuleVersion(1), Box::new(AccruedInterestV1));
 
         Self {
@@ -73,6 +84,7 @@ impl RuleRegistry {
             amortisation_rules,
             quotation_rules,
             accrued_interest_rules,
+            cashflow_rules,
         }
     }
 
@@ -94,6 +106,20 @@ impl RuleRegistry {
         self.accrued_interest_rules
             .get(&version)
             .map(|rule| rule.as_ref())
+    }
+
+    #[must_use]
+    pub fn cashflow_rule(
+        &self,
+        version: CashflowProjectionVersion,
+    ) -> Option<&dyn CashflowProjection> {
+        self.cashflow_rules.get(&version).map(|rule| rule.as_ref())
+    }
+
+    /// Наибольшая доступная версия правила построения потока.
+    #[must_use]
+    pub fn latest_cashflow_version(&self) -> Option<CashflowProjectionVersion> {
+        self.cashflow_rules.keys().next_back().copied()
     }
 
     /// Наибольшая доступная версия правила амортизации.
@@ -227,5 +253,19 @@ mod tests {
     fn unknown_valuation_policy_version_is_none_not_a_silent_default() {
         let reg = RuleRegistry::with_defaults();
         assert!(reg.valuation_rule(ValuationPolicyVersion(2)).is_none());
+    }
+    #[test]
+    fn registry_resolves_cashflow_v1() {
+        let reg = RuleRegistry::with_defaults();
+        assert!(reg.cashflow_rule(CashflowProjectionVersion(1)).is_some());
+    }
+
+    #[test]
+    fn latest_cashflow_version_is_reported() {
+        let reg = RuleRegistry::with_defaults();
+        assert_eq!(
+            reg.latest_cashflow_version(),
+            Some(CashflowProjectionVersion(1))
+        );
     }
 }

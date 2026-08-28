@@ -8,7 +8,7 @@ use time::Date;
 use crate::bond::offer::{OfferChoice, ScheduleCompleteness};
 use crate::bond::BondSchedule;
 use crate::instrument::CurrencyRoles;
-use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
+use crate::money::{CalcMoney, CurrencyCode, Quantity};
 use crate::numeric::decimal::Dec;
 use crate::numeric::NumericError;
 
@@ -37,11 +37,6 @@ pub enum CashflowError {
     IssueTermsUnknown,
     #[error(transparent)]
     Numeric(#[from] NumericError),
-    #[error("сумма {value:?} не помещается в минорные единицы {currency:?}")]
-    MoneyOverflow {
-        value: Dec,
-        currency: CurrencyCode,
-    },
     #[error("валютные роли не позволяют применить формулу: {roles:?}")]
     CurrencyFormulaUnknown { roles: Option<CurrencyRoles> },
     #[error("окно оферты {window:?} нельзя исполнить")]
@@ -64,7 +59,7 @@ pub struct CashflowInput<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpectedPosting {
     pub date: Date,
-    pub amount: Money,
+    pub amount: CalcMoney,
     pub kind: PostingKind,
 }
 
@@ -100,31 +95,16 @@ fn dec_hundred() -> Dec {
     Dec::new(Decimal::ONE_HUNDRED)
 }
 
-fn money_from_dec(value: Dec, currency: CurrencyCode) -> Result<Money, CashflowError> {
-    let factor = Decimal::from_i128_with_scale(10_i128.pow(currency.minor_units()), 0);
-    let minor = value
-        .inner()
-        .checked_mul(factor)
-        .ok_or(NumericError::Overflow)?
-        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointNearestEven)
-        .mantissa();
-    let minor = i64::try_from(minor).map_err(|_| CashflowError::MoneyOverflow {
-        value,
-        currency,
-    })?;
-    Ok(Money::new(PostedMinor::new(minor), currency))
-}
-
 fn amount_for_per_unit(
     value: crate::money::PerUnitAmount,
     quantity: Quantity,
     factor: Dec,
-) -> Result<Money, CashflowError> {
+) -> Result<CalcMoney, CashflowError> {
     let total = value
         .value()
         .checked_mul(quantity.0)?
         .checked_mul(factor)?;
-    money_from_dec(total, value.currency())
+    Ok(CalcMoney::new(total, value.currency()))
 }
 
 impl CashflowProjection for CashflowProjectionV1 {
@@ -386,6 +366,30 @@ mod tests {
     }
 
     #[test]
+    fn coupon_fractional_minor_units_stays_exact() {
+        let schedule = valid_schedule(
+            vec![period(date!(2026 - 08 - 01), date!(2026 - 09 - 01), Some("3.333"))],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 10 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+        let plan = CashflowProjectionV1
+            .future_postings(&CashflowInput {
+                schedule: &schedule,
+                principal: known_principal("100", "100"),
+                quantity: quantity("3"),
+                choice: &choice,
+                as_of: date!(2026 - 08 - 01),
+                report_currency: CurrencyCode::Rub,
+            })
+            .expect("fractional coupon is computable");
+
+        assert_eq!(plan.postings[0].amount.value(), dec("9.999"));
+    }
+
+    #[test]
     fn uniform_ruble_schedule_produces_complete_flow_and_whole_shares() {
         let schedule = valid_schedule(
             vec![period(date!(2026 - 08 - 01), date!(2026 - 09 - 01), Some("10"))],
@@ -414,13 +418,44 @@ mod tests {
 
         assert_eq!(plan.postings.len(), 3);
         assert_eq!(plan.postings[0].kind, PostingKind::Coupon);
-        assert_eq!(plan.postings[0].amount.amount().raw(), 2_000);
+        assert_eq!(plan.postings[0].amount.value(), dec("20"));
         assert_eq!(plan.postings[1].kind, PostingKind::PrincipalReturn);
-        assert_eq!(plan.postings[1].amount.amount().raw(), 12_000);
-        assert_eq!(plan.postings[2].amount.amount().raw(), 8_000);
+        assert_eq!(plan.postings[1].amount.value(), dec("120"));
+        assert_eq!(plan.postings[2].amount.value(), dec("80"));
         assert_eq!(plan.terminal_date, date!(2026 - 11 - 01));
         assert!(plan.past.is_empty());
         assert_eq!(Dec::sum(&schedule.principal_returns.iter().map(|r| r.share_percent).collect::<Vec<_>>()).unwrap(), dec("100"));
+    }
+
+    #[test]
+    fn principal_return_fractional_minor_units_stays_exact() {
+        let schedule = valid_schedule(
+            vec![],
+            vec![
+                PrincipalReturn {
+                    repayment_date: date!(2026 - 09 - 01),
+                    share_percent: dec("33.333"),
+                },
+                PrincipalReturn {
+                    repayment_date: date!(2026 - 10 - 01),
+                    share_percent: dec("66.667"),
+                },
+            ],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+        let plan = CashflowProjectionV1
+            .future_postings(&CashflowInput {
+                schedule: &schedule,
+                principal: known_principal("100", "100"),
+                quantity: quantity("3"),
+                choice: &choice,
+                as_of: date!(2026 - 08 - 01),
+                report_currency: CurrencyCode::Rub,
+            })
+            .expect("fractional principal return is computable");
+
+        assert_eq!(plan.postings[0].amount.value(), dec("99.999"));
+        assert_eq!(plan.postings[1].amount.value(), dec("200.001"));
     }
 
     #[test]
@@ -450,7 +485,7 @@ mod tests {
             })
             .expect("known principal is computable");
 
-        assert_eq!(plan.postings[0].amount.amount().raw(), 5_000);
+        assert_eq!(plan.postings[0].amount.value(), dec("50"));
     }
 
     #[test]
@@ -516,7 +551,7 @@ mod tests {
         assert_eq!(plan.postings.len(), 2);
         assert_eq!(plan.postings[0].kind, PostingKind::Coupon);
         assert_eq!(plan.postings[1].kind, PostingKind::OfferSettlement);
-        assert_eq!(plan.postings[1].amount.amount().raw(), 22_000);
+        assert_eq!(plan.postings[1].amount.value(), dec("220"));
     }
 
     #[test]
@@ -891,36 +926,9 @@ mod tests {
 
         assert_eq!(plan.postings.len(), 2);
         assert_eq!(plan.postings[0].kind, PostingKind::Coupon);
-        assert_eq!(plan.postings[0].amount.amount().raw(), 1_000);
+        assert_eq!(plan.postings[0].amount.value(), dec("10"));
         assert_eq!(plan.postings[1].kind, PostingKind::OfferSettlement);
-        assert_eq!(plan.postings[1].amount.amount().raw(), 10_000);
+        assert_eq!(plan.postings[1].amount.value(), dec("100"));
     }
 
-    #[test]
-    fn money_overflow_is_returned_as_an_error() {
-        let schedule = valid_schedule(
-            vec![],
-            vec![PrincipalReturn {
-                repayment_date: date!(2026 - 09 - 01),
-                share_percent: dec("100"),
-            }],
-        );
-        let choice = OfferChoice::HoldToMaturity;
-        let result = CashflowProjectionV1.future_postings(&CashflowInput {
-            schedule: &schedule,
-            principal: known_principal("1000000000000000000", "1000000000000000000"),
-            quantity: quantity("1"),
-            choice: &choice,
-            as_of: date!(2026 - 08 - 01),
-            report_currency: CurrencyCode::Rub,
-        });
-
-        assert!(matches!(
-            result,
-            Err(CashflowError::MoneyOverflow {
-                currency: CurrencyCode::Rub,
-                ..
-            })
-        ));
-    }
 }

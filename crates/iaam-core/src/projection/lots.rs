@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::dates::TradeDate;
 use crate::event::Event;
 use crate::event::corporate_action::{BasisTransferRule, CorporateAction};
-use crate::event::kind::{EventKind, TradeSide};
+use crate::event::kind::{EventKind, IncomeKind, TradeSide};
 use crate::event::offer::OfferExerciseAction;
 use crate::ids::{AccountId, EventId, InstrumentId};
 use crate::money::{Money, MoneyError, PerUnitAmount, Quantity};
@@ -27,7 +27,7 @@ use crate::numeric::decimal::Dec;
 use crate::rules::amortisation::{AmortisationError, AmortisationRuleVersion};
 use crate::rules::lot_disposal::{
     DisposalError, DisposalInput, DisposalResult, Lot, LotId, PrincipalError, PrincipalState,
-    RuleId,
+    RuleId, split_basis,
 };
 use crate::rules::{LotRuleVersion, RuleRegistry};
 
@@ -88,6 +88,37 @@ impl BasisGap {
     }
 }
 
+/// Группа лотов, приобретённых в одну дату.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cohort {
+    pub acquired: TradeDate,
+    pub quantity: Quantity,
+    pub cost_basis: Money,
+    pub accrued_interest_paid: Option<Money>,
+    pub received_to_date: Option<Money>,
+}
+
+/// Почему пожизненная метрика по когортам не вычисляется.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
+pub enum CohortGap {
+    #[error("дата приобретения неизвестна")]
+    AcquisitionDateUnknown,
+    #[error("вид дохода неизвестен")]
+    IncomeKindUnknown,
+    #[error("позиция восстановлена без документированной стоимости")]
+    RestoredWithoutBasis,
+    #[error("количество лотов переполняется при сложении")]
+    InconsistentQuantity,
+    #[error("валюты стоимостей лотов различаются")]
+    InconsistentCostBasisCurrency,
+    #[error("стоимость лотов переполняется при сложении")]
+    InconsistentCostBasisOverflow,
+    #[error("валюты дополнительных денежных величин лотов различаются")]
+    InconsistentOptionalMoneyCurrency,
+    #[error("дополнительные денежные величины лотов переполняются при сложении")]
+    InconsistentOptionalMoneyOverflow,
+}
+
 /// Лоты одного инструмента на одном счёте.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstrumentLots {
@@ -104,6 +135,16 @@ pub struct InstrumentLots {
     /// Суммарная стоимость, списанная при выбытиях.
     released_basis: Option<Money>,
     gap: Option<BasisGap>,
+    /// Факт выплаты неизвестного вида, который нельзя приписать лотам.
+    #[serde(default)]
+    income_kind_unknown: bool,
+    /// Известная выплата, часть которой пришлась на восстановленное
+    /// количество либо на позицию без лотов.
+    #[serde(default)]
+    unallocated_income: Option<Money>,
+    /// Доля известной выплаты, пришедшаяся на восстановленное количество.
+    #[serde(default)]
+    unpriced_income: Option<Money>,
 }
 
 /// Пустая книга по инструменту. Пишется вручную, потому что `Quantity`
@@ -118,6 +159,9 @@ impl Default for InstrumentLots {
             acquired_basis: None,
             released_basis: None,
             gap: None,
+            income_kind_unknown: false,
+            unallocated_income: None,
+            unpriced_income: None,
         }
     }
 }
@@ -141,6 +185,23 @@ impl InstrumentLots {
     #[must_use]
     pub const fn gap(&self) -> Option<BasisGap> {
         self.gap
+    }
+
+    #[must_use]
+    pub const fn income_kind_unknown(&self) -> bool {
+        self.income_kind_unknown
+    }
+
+    /// Известная выплата, которую нельзя приписать документированному лоту.
+    #[must_use]
+    pub const fn unallocated_income(&self) -> Option<Money> {
+        self.unallocated_income
+    }
+
+    /// Доля известных выплат, пришедшаяся на восстановленное количество.
+    #[must_use]
+    pub const fn unpriced_income(&self) -> Option<Money> {
+        self.unpriced_income
     }
 
     /// Стоимость приобретений. Вместе с [`Self::released_basis`] образует
@@ -216,6 +277,126 @@ impl InstrumentLots {
             .iter()
             .try_fold(self.unpriced.0, |acc, lot| acc.checked_add(lot.quantity.0))
             .map(Quantity)
+    }
+    /// Добавляет фактическую выплату лотам пропорционально количеству.
+    ///
+    /// В знаменатель входит и восстановленное количество. Его доля
+    /// сохраняется как нераспределённая: у него нет лота, которому можно
+    /// приписать выплату.
+    fn add_received(&mut self, amount: Money) -> Result<(), LotError> {
+        let total_quantity = self.quantity()?.0.inner();
+        if total_quantity.is_zero() {
+            self.unallocated_income = Some(match self.unallocated_income {
+                Some(previous) => previous.try_add(amount)?,
+                None => amount,
+            });
+            return Ok(());
+        }
+
+        let mut remaining_amount = amount;
+        let mut remaining_quantity = total_quantity;
+        if !self.unpriced.0.is_zero() {
+            let unpriced_amount = split_basis(amount, self.unpriced.0.inner(), total_quantity)?;
+            self.unpriced_income = Some(match self.unpriced_income {
+                Some(previous) => previous.try_add(unpriced_amount)?,
+                None => unpriced_amount,
+            });
+            remaining_amount = remaining_amount.try_sub(unpriced_amount)?;
+            remaining_quantity = remaining_quantity
+                .checked_sub(self.unpriced.0.inner())
+                .ok_or(NumericError::Overflow)?;
+        }
+
+        for lot in self.lots_mut() {
+            let lot_quantity = lot.quantity.0.inner();
+            if lot_quantity.is_zero() {
+                continue;
+            }
+            let received = split_basis(remaining_amount, lot_quantity, remaining_quantity)?;
+            lot.received_to_date = Some(match lot.received_to_date {
+                Some(previous) => previous.try_add(received)?,
+                None => received,
+            });
+            remaining_amount = remaining_amount.try_sub(received)?;
+            remaining_quantity = remaining_quantity
+                .checked_sub(lot_quantity)
+                .ok_or(NumericError::Overflow)?;
+        }
+        Ok(())
+    }
+
+    /// Группирует оставшиеся партии по дате приобретения.
+    pub fn cohorts(&self) -> Result<Vec<Cohort>, CohortGap> {
+        if !self.unpriced.0.is_zero() {
+            return Err(CohortGap::AcquisitionDateUnknown);
+        }
+        if self.income_kind_unknown {
+            return Err(CohortGap::IncomeKindUnknown);
+        }
+        if self.gap == Some(BasisGap::RestoredWithoutBasis) {
+            return Err(CohortGap::RestoredWithoutBasis);
+        }
+
+        let mut grouped: BTreeMap<TradeDate, Vec<&Lot>> = BTreeMap::new();
+        for lot in &self.lots {
+            let acquired = lot.acquired.ok_or(CohortGap::AcquisitionDateUnknown)?;
+            grouped.entry(acquired).or_default().push(lot);
+        }
+
+        let mut cohorts = Vec::with_capacity(grouped.len());
+        for (acquired, lots) in grouped {
+            let mut quantity = Dec::zero();
+            let mut cost_basis = Money::zero(lots[0].cost_basis.currency());
+            for lot in &lots {
+                quantity = quantity
+                    .checked_add(lot.quantity.0)
+                    .map_err(|_| CohortGap::InconsistentQuantity)?;
+                cost_basis = cost_basis
+                    .try_add(lot.cost_basis)
+                    .map_err(|error| match error {
+                        MoneyError::CurrencyMismatch { .. } => {
+                            CohortGap::InconsistentCostBasisCurrency
+                        }
+                        MoneyError::Overflow | MoneyError::Numeric(_) => {
+                            CohortGap::InconsistentCostBasisOverflow
+                        }
+                    })?;
+            }
+            cohorts.push(Cohort {
+                acquired,
+                quantity: Quantity(quantity),
+                cost_basis,
+                accrued_interest_paid: Self::sum_optional_money(&lots, |lot| {
+                    lot.accrued_interest_paid
+                })?,
+                received_to_date: Self::sum_optional_money(&lots, |lot| lot.received_to_date)?,
+            });
+        }
+        Ok(cohorts)
+    }
+
+    fn sum_optional_money<F>(lots: &[&Lot], select: F) -> Result<Option<Money>, CohortGap>
+    where
+        F: Fn(&Lot) -> Option<Money>,
+    {
+        let mut total: Option<Money> = None;
+        for lot in lots {
+            let Some(value) = select(lot) else {
+                return Ok(None);
+            };
+            total = Some(match total {
+                Some(previous) => previous.try_add(value).map_err(|error| match error {
+                    MoneyError::CurrencyMismatch { .. } => {
+                        CohortGap::InconsistentOptionalMoneyCurrency
+                    }
+                    MoneyError::Overflow | MoneyError::Numeric(_) => {
+                        CohortGap::InconsistentOptionalMoneyOverflow
+                    }
+                })?,
+                None => value,
+            });
+        }
+        Ok(total)
     }
 }
 
@@ -359,15 +540,44 @@ impl LotBook {
             EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
-            | EventKind::Income { .. }
             | EventKind::Fee { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. } => Ok(()),
+            EventKind::Income {
+                instrument: Some(instrument),
+                gross,
+                kind,
+            } => self.apply_income(event, *instrument, *gross, *kind),
+            EventKind::Income {
+                instrument: None, ..
+            } => Ok(()),
             EventKind::CorporateAction { action } => {
                 self.apply_corporate_action(event, action, rules)
             }
             EventKind::OfferExercise { action } => self.apply_offer_exercise(event, action, rules),
+        }
+    }
+
+    fn apply_income(
+        &mut self,
+        event: &Event,
+        instrument: InstrumentId,
+        amount: Money,
+        kind: Option<IncomeKind>,
+    ) -> Result<(), LotError> {
+        let key = LotKey {
+            account: event.account,
+            instrument,
+        };
+        let entry = self.entries.entry(key).or_default();
+        match kind {
+            Some(IncomeKind::Coupon) => entry.add_received(amount),
+            Some(IncomeKind::Dividend | IncomeKind::DepositInterest) => Ok(()),
+            None => {
+                entry.income_kind_unknown = true;
+                Ok(())
+            }
         }
     }
 
@@ -589,6 +799,7 @@ impl LotBook {
                 Err(other) => return Err(other.into()),
             }
         }
+        next.add_received(facts.compensation)?;
         if principal_unknown {
             next.mark_basis_gap(BasisGap::PrincipalUnknown);
         }
@@ -1224,6 +1435,12 @@ mod tests {
         )
     }
 
+    fn dated_buy(trade: &Trade, sequence: u32) -> Event {
+        let mut event = buy(trade, sequence);
+        event.dates.trade = Some(TradeDate(trade.day));
+        event
+    }
+
     fn sell(trade: &Trade, sequence: u32) -> Event {
         let fee = rub(10_000);
         let settlement = rub(trade.gross - 10_000);
@@ -1506,6 +1723,363 @@ mod tests {
         assert_eq!(
             book.entry(&key(&trade)).unwrap().lots()[0].accrued_interest_paid,
             None
+        );
+    }
+    #[test]
+    fn a_coupon_is_distributed_between_lots_by_quantity() {
+        let trade = sample_trade();
+        let first = Trade {
+            day: date!(2025 - 03 - 01),
+            units: 30,
+            gross: 300_000,
+            ..trade
+        };
+        let second = Trade {
+            day: date!(2025 - 04 - 01),
+            units: 70,
+            gross: 700_000,
+            ..trade
+        };
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&buy(&first, 1), &rules).unwrap();
+        book.apply(&buy(&second, 2), &rules).unwrap();
+        let coupon = event_with(
+            trade.account,
+            date!(2025 - 05 - 01),
+            3,
+            EventKind::Income {
+                instrument: Some(trade.instrument),
+                gross: rub(101),
+                kind: Some(crate::event::kind::IncomeKind::Coupon),
+            },
+            vec![Leg::cash(trade.account, rub(101))],
+        );
+
+        book.apply(&coupon, &rules).unwrap();
+
+        let lots = &book.entry(&key(&trade)).unwrap().lots;
+        assert_eq!(lots[0].received_to_date, Some(rub(30)));
+        assert_eq!(lots[1].received_to_date, Some(rub(71)));
+        assert_eq!(
+            lots.iter()
+                .filter_map(|lot| lot.received_to_date)
+                .try_fold(rub(0), |sum, amount| sum.try_add(amount))
+                .unwrap(),
+            rub(101)
+        );
+    }
+
+    #[test]
+    fn a_coupon_before_a_second_purchase_stays_with_the_first_lot() {
+        let trade = sample_trade();
+        let first = Trade { units: 30, ..trade };
+        let second = Trade {
+            day: date!(2025 - 04 - 01),
+            units: 70,
+            gross: 700_000,
+            ..trade
+        };
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&buy(&first, 1), &rules).unwrap();
+        book.apply(
+            &event_with(
+                trade.account,
+                date!(2025 - 03 - 15),
+                2,
+                EventKind::Income {
+                    instrument: Some(trade.instrument),
+                    gross: rub(100),
+                    kind: Some(IncomeKind::Coupon),
+                },
+                vec![Leg::cash(trade.account, rub(100))],
+            ),
+            &rules,
+        )
+        .unwrap();
+        book.apply(&buy(&second, 3), &rules).unwrap();
+
+        let lots = book.entry(&key(&trade)).unwrap().lots();
+        assert_eq!(lots[0].received_to_date, Some(rub(100)));
+        assert_eq!(lots[1].received_to_date, None);
+    }
+
+    #[test]
+    fn amortisation_records_the_returned_cash_on_each_lot() {
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![
+                bond_lot(&bond, 30, known("1000", "1000"), 300_000),
+                bond_lot(&bond, 70, known("1000", "1000"), 700_000),
+            ],
+        );
+
+        book.apply(&bond.amortisation(100, "1", 101), &rules)
+            .unwrap();
+
+        let lots = book.entry(&bond.key()).unwrap().lots();
+        assert_eq!(lots[0].received_to_date, Some(rub(30)));
+        assert_eq!(lots[1].received_to_date, Some(rub(71)));
+    }
+
+    #[test]
+    fn received_cash_is_split_when_a_lot_is_partially_sold() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&buy(&trade, 1), &rules).unwrap();
+        book.apply(
+            &event_with(
+                trade.account,
+                date!(2025 - 04 - 01),
+                2,
+                EventKind::Income {
+                    instrument: Some(trade.instrument),
+                    gross: rub(100),
+                    kind: Some(IncomeKind::Coupon),
+                },
+                vec![Leg::cash(trade.account, rub(100))],
+            ),
+            &rules,
+        )
+        .unwrap();
+        let partial = Trade {
+            units: 40,
+            day: date!(2025 - 06 - 01),
+            gross: 500_000,
+            ..trade
+        };
+        book.apply(&sell(&partial, 3), &rules).unwrap();
+
+        assert_eq!(
+            book.entry(&key(&trade)).unwrap().lots()[0].received_to_date,
+            Some(rub(60))
+        );
+    }
+
+    #[test]
+    fn an_unpriced_quantity_receives_its_share_of_a_coupon_as_unallocated() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        let restored = event_with(
+            trade.account,
+            date!(2024 - 01 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument: trade.instrument,
+                quantity: qty(50),
+                cost_basis: None,
+                assertions: crate::event::kind::OpeningAssertions::default(),
+            },
+            vec![Leg::security(
+                trade.account,
+                CustodyId::new_random(),
+                trade.instrument,
+                qty(50),
+            )],
+        );
+        book.apply(&restored, &rules).unwrap();
+        let priced = Trade {
+            units: 50,
+            gross: 500_000,
+            ..trade
+        };
+        book.apply(&buy(&priced, 2), &rules).unwrap();
+        book.apply(
+            &event_with(
+                trade.account,
+                date!(2025 - 04 - 01),
+                3,
+                EventKind::Income {
+                    instrument: Some(trade.instrument),
+                    gross: rub(100),
+                    kind: Some(IncomeKind::Coupon),
+                },
+                vec![Leg::cash(trade.account, rub(100))],
+            ),
+            &rules,
+        )
+        .unwrap();
+
+        let entry = book.entry(&key(&trade)).unwrap();
+        assert_eq!(entry.lots()[0].received_to_date, Some(rub(50)));
+        assert_eq!(entry.unpriced_income(), Some(rub(50)));
+        assert_eq!(entry.cohorts(), Err(CohortGap::AcquisitionDateUnknown));
+    }
+
+    #[test]
+    fn an_income_without_an_approved_kind_refuses_cohorts() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&buy(&trade, 1), &rules).unwrap();
+        book.apply(
+            &event_with(
+                trade.account,
+                date!(2025 - 04 - 01),
+                2,
+                EventKind::Income {
+                    instrument: Some(trade.instrument),
+                    gross: rub(100),
+                    kind: None,
+                },
+                vec![Leg::cash(trade.account, rub(100))],
+            ),
+            &rules,
+        )
+        .unwrap();
+
+        let entry = book.entry(&key(&trade)).unwrap();
+        assert_eq!(entry.lots()[0].received_to_date, None);
+        assert!(entry.income_kind_unknown());
+        assert_eq!(entry.cohorts(), Err(CohortGap::IncomeKindUnknown));
+    }
+
+    #[test]
+    fn a_coupon_for_an_unknown_position_is_retained_as_a_marker() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(
+            &event_with(
+                trade.account,
+                date!(2025 - 04 - 01),
+                1,
+                EventKind::Income {
+                    instrument: Some(trade.instrument),
+                    gross: rub(100),
+                    kind: Some(IncomeKind::Coupon),
+                },
+                vec![Leg::cash(trade.account, rub(100))],
+            ),
+            &rules,
+        )
+        .unwrap();
+
+        let entry = book.entry(&key(&trade)).unwrap();
+        assert!(entry.lots().is_empty());
+        assert_eq!(entry.unallocated_income(), Some(rub(100)));
+        assert!(entry.cohorts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cohorts_report_restored_without_basis_after_unpriced_quantity_is_sold() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        let restored = event_with(
+            trade.account,
+            date!(2024 - 01 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument: trade.instrument,
+                quantity: qty(50),
+                cost_basis: None,
+                assertions: crate::event::kind::OpeningAssertions::default(),
+            },
+            vec![Leg::security(
+                trade.account,
+                CustodyId::new_random(),
+                trade.instrument,
+                qty(50),
+            )],
+        );
+        book.apply(&restored, &rules).unwrap();
+        let sale = Trade {
+            units: 50,
+            day: date!(2025 - 02 - 01),
+            gross: 500_000,
+            ..trade
+        };
+        book.apply(&sell(&sale, 2), &rules).unwrap();
+
+        let entry = book.entry(&key(&trade)).unwrap();
+        assert_eq!(entry.unpriced(), qty(0));
+        assert_eq!(entry.cohorts(), Err(CohortGap::RestoredWithoutBasis));
+    }
+
+    #[test]
+    fn cohorts_group_same_acquisition_dates_and_keep_different_dates_separate() {
+        let trade = sample_trade();
+        let same_day_a = Trade {
+            units: 30,
+            gross: 300_000,
+            ..trade
+        };
+        let same_day_b = Trade {
+            units: 20,
+            gross: 200_000,
+            ..trade
+        };
+        let later = Trade {
+            day: date!(2025 - 04 - 01),
+            units: 50,
+            gross: 500_000,
+            ..trade
+        };
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&dated_buy(&same_day_a, 1), &rules).unwrap();
+        book.apply(&dated_buy(&same_day_b, 2), &rules).unwrap();
+        book.apply(&dated_buy(&later, 3), &rules).unwrap();
+
+        let cohorts = book.entry(&key(&trade)).unwrap().cohorts().unwrap();
+        assert_eq!(cohorts.len(), 2);
+        assert_eq!(cohorts[0].acquired, TradeDate(date!(2025 - 03 - 01)));
+        assert_eq!(cohorts[0].quantity, qty(50));
+        assert_eq!(cohorts[0].cost_basis, rub(520_000));
+        assert_eq!(cohorts[1].acquired, TradeDate(date!(2025 - 04 - 01)));
+        assert_eq!(cohorts[1].quantity, qty(50));
+        assert_eq!(cohorts[1].cost_basis, rub(510_000));
+    }
+
+    #[test]
+    fn a_dividend_does_not_block_cohort_construction() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&dated_buy(&trade, 1), &rules).unwrap();
+        book.apply(
+            &event_with(
+                trade.account,
+                date!(2025 - 04 - 01),
+                2,
+                EventKind::Income {
+                    instrument: Some(trade.instrument),
+                    gross: rub(100),
+                    kind: Some(IncomeKind::Dividend),
+                },
+                vec![Leg::cash(trade.account, rub(100))],
+            ),
+            &rules,
+        )
+        .unwrap();
+
+        let entry = book.entry(&key(&trade)).unwrap();
+        assert!(!entry.income_kind_unknown());
+        assert_eq!(entry.cohorts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cohorts_report_mixed_cost_basis_currencies() {
+        let bond = Bond::new();
+        let mut foreign = bond_lot(&bond, 10, known("1000", "1000"), 1_000_000);
+        foreign.cost_basis = Money::new(PostedMinor::new(1_000_000), CurrencyCode::Usd);
+        let book = book_with_lots(
+            &bond,
+            vec![
+                bond_lot(&bond, 10, known("1000", "1000"), 1_000_000),
+                foreign,
+            ],
+        );
+
+        assert_eq!(
+            book.entry(&bond.key()).unwrap().cohorts(),
+            Err(CohortGap::InconsistentCostBasisCurrency)
         );
     }
 }

@@ -9,6 +9,9 @@ use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_core::ids::CustodyId;
+use iaam_core::numeric::decimal::Dec;
+use iaam_core::projection::lots::LotKey;
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_store::SqliteStore;
@@ -37,6 +40,46 @@ fn deposit(owner: OwnerId, account: AccountId, sequence: u32, minor: i64) -> Eve
         relation: Relation::None,
         confidence: Confidence::Known,
         idempotency_key: None,
+    }
+}
+
+fn purchase(owner: OwnerId, account: AccountId, instrument: InstrumentId) -> Event {
+    let amount = Money::new(PostedMinor::new(100_000), CurrencyCode::Rub);
+    let mut event = deposit(owner, account, 1, amount.amount().raw());
+    event.kind = EventKind::Trade {
+        side: iaam_core::event::kind::TradeSide::Buy,
+        instrument,
+        quantity: iaam_core::money::Quantity(Dec::new(10_i64.into())),
+        gross: amount,
+        fee: None,
+        accrued_interest: None,
+    };
+    event.legs = vec![
+        Leg::cash(account, Money::new(PostedMinor::new(-100_000), CurrencyCode::Rub)),
+        Leg::security(
+            account,
+            CustodyId::new_random(),
+            instrument,
+            iaam_core::money::Quantity(Dec::new(10_i64.into())),
+        ),
+    ];
+    event
+}
+
+fn strip_acquisition_basis(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.remove("acquisition_basis");
+            for child in fields.values_mut() {
+                strip_acquisition_basis(child);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                strip_acquisition_basis(child);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -72,6 +115,49 @@ fn a_snapshot_survives_a_write_and_a_read() {
         snapshot.state().balances().cash(account, CurrencyCode::Rub)
     );
     assert_eq!(loaded, snapshot);
+}
+
+#[test]
+fn a_projection_snapshot_written_before_acquisition_basis_loads() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+    let rules = RuleRegistry::with_defaults();
+    let ctx = ProjectionContext {
+        contour: &contour,
+        rules: &rules,
+        lot_rule: LotRuleVersion(1),
+    };
+    let snapshot = project(&[purchase(owner, account, instrument)], &ctx)
+        .unwrap()
+        .into_snapshot();
+
+    store.save_snapshot(owner, &snapshot).unwrap();
+    let mut legacy = serde_json::to_value(&snapshot).unwrap();
+    strip_acquisition_basis(&mut legacy);
+    let mut body = Vec::new();
+    ciborium::into_writer(&legacy, &mut body).unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE snapshots SET body = ?1 WHERE owner = ?2",
+            rusqlite::params![body, owner.inner().to_string()],
+        )
+        .unwrap();
+
+    let loaded = store
+        .load_snapshot(owner, contour.id(), contour.version(), LotRuleVersion(1))
+        .unwrap()
+        .expect("старый снимок найден");
+    let entry = loaded
+        .state()
+        .book()
+        .entry(&LotKey { account, instrument })
+        .expect("лот восстановлен");
+    assert_eq!(entry.lots()[0].acquisition_basis, None);
+    assert_eq!(entry.lots()[0].cost_basis, Money::new(PostedMinor::new(100_000), CurrencyCode::Rub));
 }
 
 #[test]

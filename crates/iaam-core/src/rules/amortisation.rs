@@ -117,6 +117,7 @@ mod tests {
             acquired: Some(TradeDate(date!(2026 - 01 - 10))),
             quantity: Quantity(dec("100")),
             cost_basis,
+            acquisition_basis: None,
             accrued_interest_paid: None,
             received_to_date: None,
             principal,

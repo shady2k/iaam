@@ -38,6 +38,9 @@ pub struct Lot {
     pub acquired: Option<TradeDate>,
     pub quantity: Quantity,
     pub cost_basis: Money,
+    /// Историческая стоимость приобретения; амортизация её не уменьшает.
+    #[serde(default)]
+    pub acquisition_basis: Option<Money>,
     /// НКД, уплаченный при приобретении лота; неизвестное не превращается
     /// в ноль (§4.9).
     #[serde(default)]
@@ -284,6 +287,8 @@ impl LotDisposalRule for FifoV1 {
                 let kept_basis = lot.cost_basis.try_sub(taken_basis)?;
                 let (taken_accrued_interest, kept_accrued_interest) =
                     split_optional_basis(lot.accrued_interest_paid, left, lot_qty)?;
+                let (_, kept_acquisition_basis) =
+                    split_optional_basis(lot.acquisition_basis, left, lot_qty)?;
                 let (_, kept_received) = split_optional_basis(lot.received_to_date, left, lot_qty)?;
                 disposed.push(DisposedPart {
                     lot: lot.id,
@@ -295,6 +300,7 @@ impl LotDisposalRule for FifoV1 {
                 remaining.push(Lot {
                     quantity: Quantity(Dec::new(lot_qty - left)),
                     cost_basis: kept_basis,
+                    acquisition_basis: kept_acquisition_basis,
                     accrued_interest_paid: kept_accrued_interest,
                     received_to_date: kept_received,
                     ..lot.clone()
@@ -475,6 +481,53 @@ mod tests {
         assert_eq!(lot.accrued_interest_paid, None);
         assert_eq!(lot.received_to_date, None);
     }
+    #[test]
+    fn splitting_a_lot_splits_its_historical_acquisition_basis() {
+        let lot = Lot {
+            id: LotId::new_random(),
+            instrument: InstrumentId::new_random(),
+            acquired: Some(TradeDate(date!(2026 - 03 - 10))),
+            quantity: qty(100),
+            cost_basis: rub(10_000),
+            acquisition_basis: Some(rub(10_000)),
+            accrued_interest_paid: Some(rub(1_000)),
+            received_to_date: Some(rub(800)),
+            principal: PrincipalState::Unknown,
+        };
+
+        let partial = FifoV1
+            .apply(&DisposalInput {
+                lots: vec![lot.clone()],
+                quantity: qty(50),
+            })
+            .unwrap();
+
+        assert_eq!(
+            partial.remaining[0].acquisition_basis,
+            Some(rub(5_000))
+        );
+
+        let full = FifoV1
+            .apply(&DisposalInput {
+                lots: vec![lot],
+                quantity: qty(100),
+            })
+            .unwrap();
+        assert!(full.remaining.is_empty());
+    }
+
+    #[test]
+    fn a_lot_snapshot_without_historical_acquisition_basis_reads_as_unknown() {
+        let value = serde_json::json!({
+            "id": LotId::new_random(),
+            "instrument": InstrumentId::new_random(),
+            "acquired": null,
+            "quantity": qty(10),
+            "cost_basis": rub(100_000),
+        });
+        let lot: Lot = serde_json::from_value(value).unwrap();
+        assert_eq!(lot.acquisition_basis, None);
+    }
 
     fn qty(n: i64) -> Quantity {
         Quantity(Dec::new(Decimal::from(n)))
@@ -493,6 +546,7 @@ mod tests {
                 received_to_date: None,
                 quantity: qty(10),
                 cost_basis: rub(100_000), // 10 шт по 100 ₽
+                acquisition_basis: None,
                 principal: PrincipalState::Unknown,
             },
             Lot {
@@ -503,6 +557,7 @@ mod tests {
                 received_to_date: None,
                 quantity: qty(10),
                 cost_basis: rub(90_000), // 10 шт по 90 ₽
+                acquisition_basis: None,
                 principal: PrincipalState::Unknown,
             },
         ]
@@ -519,6 +574,7 @@ mod tests {
             acquired: Some(TradeDate(date!(2026 - 03 - 10))),
             quantity: qty(quantity),
             cost_basis: rub(basis_minor),
+            acquisition_basis: None,
             principal: PrincipalState::Unknown,
         }]
     }
@@ -690,6 +746,7 @@ mod tests {
             acquired: Some(TradeDate(date!(2026 - 03 - 10))),
             quantity: qty(100),
             cost_basis: rub(10_000),
+            acquisition_basis: None,
             accrued_interest_paid: Some(rub(1_000)),
             received_to_date: Some(rub(800)),
             principal: PrincipalState::Unknown,

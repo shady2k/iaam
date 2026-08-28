@@ -1578,7 +1578,7 @@ impl ExecutabilityAccumulator {
         }
         let executable = self.executable / total;
         let indicative_previous_close = self.indicative_previous_close / total;
-        let unknown = rust_decimal::Decimal::ONE - executable - indicative_previous_close;
+        let unknown = self.unknown / total;
         ExecutabilityShares {
             evaluated_positions_value: Dec::new(total),
             executable: Dec::new(executable),
@@ -3385,5 +3385,476 @@ mod tests {
                 reason: NotComputable::AccruedObservationMissing { instrument: actual }
             } if actual == instrument
         ));
+    }
+    fn состояние_с_номиналами(state: LedgerState, faces: &[&str]) -> LedgerState {
+        fn known(face: &str) -> ciborium::Value {
+            let principal = crate::rules::lot_disposal::PrincipalState::known(
+                PerUnitAmount::new(dec(face), CurrencyCode::Rub),
+                PerUnitAmount::new(dec(face), CurrencyCode::Rub),
+            )
+            .expect("известный номинал");
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&principal, &mut bytes).expect("сериализация номинала");
+            ciborium::de::from_reader(bytes.as_slice()).expect("разбор номинала")
+        }
+
+        fn replace(
+            value: &mut ciborium::Value,
+            faces: &[&str],
+            next: &mut usize,
+        ) {
+            match value {
+                ciborium::Value::Map(entries) => {
+                    for (key, value) in entries {
+                        if matches!(key, ciborium::Value::Text(text) if text == "principal") {
+                            let face = faces
+                                .get(*next)
+                                .copied()
+                                .expect("для каждой партии задан номинал");
+                            *value = known(face);
+                            *next += 1;
+                        } else {
+                            replace(value, faces, next);
+                        }
+                    }
+                }
+                ciborium::Value::Array(values) => {
+                    for value in values {
+                        replace(value, faces, next);
+                    }
+                }
+                ciborium::Value::Tag(_, value) => replace(value, faces, next),
+                _ => {}
+            }
+        }
+
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&state, &mut bytes).expect("сериализация состояния");
+        let mut value: ciborium::Value =
+            ciborium::de::from_reader(bytes.as_slice()).expect("разбор состояния");
+        let mut next = 0;
+        replace(&mut value, faces, &mut next);
+        assert_eq!(next, faces.len(), "все партии должны получить номинал");
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&value, &mut bytes).expect("сериализация изменённого состояния");
+        ciborium::de::from_reader(bytes.as_slice()).expect("разбор изменённого состояния")
+    }
+
+    fn покупка_для_номинала(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        sequence: u32,
+    ) -> crate::event::Event {
+        let quantity = Quantity(dec("10"));
+        event_with(
+            account,
+            day,
+            sequence,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity,
+                cost_basis: Some(Money::new(PostedMinor::new(100_000), CurrencyCode::Rub)),
+                assertions: Default::default(),
+            },
+            vec![Leg::security(
+                account,
+                CustodyId::new_random(),
+                instrument,
+                quantity,
+            )],
+        )
+    }
+
+    fn отчёт_процентной_цены_по_покупкам(faces: &[&str]) -> ReturnsReport {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let events: Vec<_> = faces
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                покупка_для_номинала(
+                    account,
+                    instrument,
+                    date!(2026 - 08 - 01),
+                    u32::try_from(index + 1).expect("номер покупки"),
+                )
+            })
+            .collect();
+        let state = состояние_из_события(&contour, &events[0]);
+        let state = if events.len() == 1 {
+            состояние_с_номиналами(state, faces)
+        } else {
+            let rules = RuleRegistry::with_defaults();
+            let context = ProjectionContext {
+                contour: &contour,
+                rules: &rules,
+                lot_rule: LotRuleVersion(1),
+            };
+            let state = project(&events, &context)
+                .expect("проекция покупок")
+                .snapshot()
+                .state()
+                .clone();
+            состояние_с_номиналами(state, faces)
+        };
+        let mut candidate = рыночная_цена(instrument, date!(2026 - 08 - 25));
+        candidate.price = dec("98.5");
+        candidate.basis = QuotationBasis::PercentOfRemainingFace;
+        отчёт_с_рыночной_ценой(&state, &contour, candidate)
+    }
+
+    #[test]
+    fn процентная_цена_в_отчёте_использует_найденный_номинал_лота() {
+        let report = отчёт_процентной_цены_по_покупкам(&["1000"]);
+
+        assert_eq!(report.terminal_value, Computed::Value(dec("9850")));
+    }
+
+    #[test]
+    fn одинаковый_номинал_лотов_остаётся_вычислимым_в_отчёте() {
+        let report = отчёт_процентной_цены_по_покупкам(&["1000", "1000"]);
+
+        assert_eq!(report.terminal_value, Computed::Value(dec("19700")));
+    }
+
+    #[test]
+    fn разные_номиналы_лотов_дают_явную_ошибку_в_отчёте() {
+        let report = отчёт_процентной_цены_по_покупкам(&["1000", "2000"]);
+
+        assert!(matches!(
+            report.terminal_value,
+            Computed::NotComputable {
+                reason: NotComputable::RemainingFaceAmbiguous { .. }
+            }
+        ));
+    }
+    fn состояние_из_события(contour: &ContourDefinition, event: &crate::event::Event) -> LedgerState {
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        project(std::slice::from_ref(event), &context)
+            .expect("проекция тестового события")
+            .snapshot()
+            .state()
+            .clone()
+    }
+
+    fn хеш_отчёта(state: &LedgerState, contour: &ContourDefinition) -> String {
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(contour, &fx, &ledger, &perimeter);
+        returns_report(state, &request).inputs_hash
+    }
+
+    fn рыночная_цена(instrument: InstrumentId, trade_date: Date) -> PriceCandidate {
+        PriceCandidate {
+            instrument,
+            price: dec("100"),
+            currency: CurrencyCode::Rub,
+            basis: QuotationBasis::MoneyPerUnit,
+            basis_evidence: "test:market".to_owned(),
+            basis_evidence_contradicts: false,
+            trade_date,
+            observed_at: None,
+            origin: PriceOrigin::Market {
+                venue: Venue {
+                    board: "TQBR".to_owned(),
+                    session: 0,
+                },
+                kind: CorePriceKind::LegalClose,
+            },
+            executability: SourceExecutability::Executable,
+        }
+    }
+
+    fn отчёт_с_рыночной_ценой(
+        state: &LedgerState,
+        contour: &ContourDefinition,
+        candidate: PriceCandidate,
+    ) -> ReturnsReport {
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = ReturnsRequest {
+            contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: std::slice::from_ref(&candidate),
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+        };
+        returns_report(state, &request)
+    }
+
+    #[test]
+    fn поток_после_даты_отчёта_не_попадает_в_публичный_отпечаток() {
+        let account = AccountId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let amount = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
+        let event = event_with(
+            account,
+            date!(2026 - 08 - 26),
+            1,
+            EventKind::CashIn { amount },
+            vec![Leg::cash(account, amount)],
+        );
+        let mut future_event = event.clone();
+        future_event.dates =
+            crate::dates::EventDates::for_cash(crate::dates::CashPostedDate(date!(
+                2026 - 08 - 27
+            )));
+        future_event.order = crate::dates::EffectiveOrder::new(date!(2026 - 08 - 27), 1);
+        let included = состояние_из_события(&contour, &event);
+        let excluded = состояние_из_события(&contour, &future_event);
+        let baseline_event = event_with(
+            account,
+            date!(2026 - 08 - 26),
+            2,
+            EventKind::OpeningCash { amount },
+            vec![Leg::cash(account, amount)],
+        );
+        let baseline = состояние_из_события(&contour, &baseline_event);
+
+        assert_ne!(хеш_отчёта(&included, &contour), хеш_отчёта(&baseline, &contour));
+        assert_eq!(хеш_отчёта(&excluded, &contour), хеш_отчёта(&baseline, &contour));
+    }
+
+    #[test]
+    fn поток_чужого_контура_исключается_из_публичного_отпечатка() {
+        let account = AccountId::new_random();
+        let id = ContourId::new_random();
+        let contour = ContourDefinition::new(id, ContourVersion(1), [account]);
+        let foreign = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let amount = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
+        let event = event_with(
+            account,
+            date!(2026 - 08 - 26),
+            1,
+            EventKind::CashIn { amount },
+            vec![Leg::cash(account, amount)],
+        );
+        let included = состояние_из_события(&contour, &event);
+        let excluded = состояние_из_события(&foreign, &event);
+        let baseline_event = event_with(
+            account,
+            date!(2026 - 08 - 26),
+            2,
+            EventKind::OpeningCash { amount },
+            vec![Leg::cash(account, amount)],
+        );
+        let baseline = состояние_из_события(&contour, &baseline_event);
+
+        assert_ne!(хеш_отчёта(&included, &contour), хеш_отчёта(&baseline, &contour));
+        assert_eq!(хеш_отчёта(&excluded, &contour), хеш_отчёта(&baseline, &contour));
+    }
+
+    #[test]
+    fn поток_старой_версии_контура_исключается_из_публичного_отпечатка() {
+        let account = AccountId::new_random();
+        let id = ContourId::new_random();
+        let contour = ContourDefinition::new(id, ContourVersion(2), [account]);
+        let foreign = ContourDefinition::new(id, ContourVersion(1), [account]);
+        let amount = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
+        let event = event_with(
+            account,
+            date!(2026 - 08 - 26),
+            1,
+            EventKind::CashIn { amount },
+            vec![Leg::cash(account, amount)],
+        );
+        let included = состояние_из_события(&contour, &event);
+        let excluded = состояние_из_события(&foreign, &event);
+        let baseline_event = event_with(
+            account,
+            date!(2026 - 08 - 26),
+            2,
+            EventKind::OpeningCash { amount },
+            vec![Leg::cash(account, amount)],
+        );
+        let baseline = состояние_из_события(&contour, &baseline_event);
+
+        assert_ne!(хеш_отчёта(&included, &contour), хеш_отчёта(&baseline, &contour));
+        assert_eq!(хеш_отчёта(&excluded, &contour), хеш_отчёта(&baseline, &contour));
+    }
+
+    fn состояние_позиции_с_унаследованной_оценкой(
+        contour: &ContourDefinition,
+        instrument: InstrumentId,
+        account: AccountId,
+    ) -> LedgerState {
+        let opening = event_with(
+            account,
+            date!(2026 - 08 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity: Quantity(dec("10")),
+                cost_basis: None,
+                assertions: Default::default(),
+            },
+            vec![Leg::security(
+                account,
+                CustodyId::new_random(),
+                instrument,
+                Quantity(dec("10")),
+            )],
+        );
+        let valuation = event_with(
+            account,
+            date!(2026 - 08 - 25),
+            2,
+            EventKind::Valuation {
+                instrument,
+                price: dec("12"),
+                currency: CurrencyCode::Rub,
+                quality: PriceQuality::CarriedForward,
+            },
+            vec![],
+        );
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        project(&[opening, valuation], &context)
+            .expect("проекция позиции с унаследованной оценкой")
+            .snapshot()
+            .state()
+            .clone()
+    }
+
+    #[test]
+    fn будущий_рыночный_кандидат_не_отменяет_унаследованную_оценку() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let state = состояние_позиции_с_унаследованной_оценкой(&contour, instrument, account);
+        let report = отчёт_с_рыночной_ценой(
+            &state,
+            &contour,
+            рыночная_цена(instrument, date!(2026 - 08 - 27)),
+        );
+
+        assert_eq!(report.data_quality.position_coverage.legacy_derived.len(), 1);
+        assert!(report.data_quality.position_coverage.uncovered.is_empty());
+    }
+
+    #[test]
+    fn кандидат_чужого_инструмента_не_отменяет_унаследованную_оценку() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let state = состояние_позиции_с_унаследованной_оценкой(&contour, instrument, account);
+        let report = отчёт_с_рыночной_ценой(
+            &state,
+            &contour,
+            рыночная_цена(InstrumentId::new_random(), date!(2026 - 08 - 25)),
+        );
+
+        assert_eq!(report.data_quality.position_coverage.legacy_derived.len(), 1);
+        assert!(report.data_quality.position_coverage.uncovered.is_empty());
+    }
+
+    #[test]
+    fn рыночная_цена_чужого_инструмента_не_покрывает_позицию() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let opening = event_with(
+            account,
+            date!(2026 - 08 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity: Quantity(dec("10")),
+                cost_basis: None,
+                assertions: Default::default(),
+            },
+            vec![Leg::security(
+                account,
+                CustodyId::new_random(),
+                instrument,
+                Quantity(dec("10")),
+            )],
+        );
+        let state = состояние_из_события(&contour, &opening);
+        let report = отчёт_с_рыночной_ценой(
+            &state,
+            &contour,
+            рыночная_цена(InstrumentId::new_random(), date!(2026 - 08 - 25)),
+        );
+
+        assert!(matches!(
+            report.data_quality.position_coverage.uncovered.first(),
+            Some(UncoveredPosition {
+                reason: UncoveredReason::NoObservation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn будущая_рыночная_цена_не_покрывает_позицию() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let opening = event_with(
+            account,
+            date!(2026 - 08 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity: Quantity(dec("10")),
+                cost_basis: None,
+                assertions: Default::default(),
+            },
+            vec![Leg::security(
+                account,
+                CustodyId::new_random(),
+                instrument,
+                Quantity(dec("10")),
+            )],
+        );
+        let state = состояние_из_события(&contour, &opening);
+        let report = отчёт_с_рыночной_ценой(
+            &state,
+            &contour,
+            рыночная_цена(instrument, date!(2026 - 08 - 27)),
+        );
+
+        assert!(matches!(
+            report.data_quality.position_coverage.uncovered.first(),
+            Some(UncoveredPosition {
+                reason: UncoveredReason::NoObservation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn отчёт_показывает_накопленную_долю_unknown_по_двум_позициям() {
+        let mut shares = ExecutabilityAccumulator::default();
+        shares.add(SourceExecutability::Executable, dec("2"));
+        shares.add(SourceExecutability::IndicativePreviousClose, dec("1"));
+        shares.add(SourceExecutability::Unknown, dec("1"));
+
+        let shares = shares.finish();
+
+        assert_eq!(shares.evaluated_positions_value, dec("4"));
+        assert_eq!(shares.executable, dec("0.5"));
+        assert_eq!(shares.indicative_previous_close, dec("0.25"));
+        assert_eq!(shares.unknown, dec("0.25"));
     }
 }

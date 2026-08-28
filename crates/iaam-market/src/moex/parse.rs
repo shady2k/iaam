@@ -88,18 +88,10 @@ impl MarketSegment<'_> {
 pub fn quotation_basis_from_evidence(evidence: &str) -> Option<QuotationBasis> {
     let path = evidence.strip_prefix("iss:engines/")?;
     let (engine, market) = path.split_once("/markets/")?;
-    if engine.is_empty()
-        || market.is_empty()
-        || engine.contains('/')
-        || market.contains('/')
-    {
+    if engine.is_empty() || market.is_empty() || engine.contains('/') || market.contains('/') {
         return None;
     }
-    Some(
-        MarketSegment { engine, market }
-            .quotation_basis()
-            .0,
-    )
+    Some(MarketSegment { engine, market }.quotation_basis().0)
 }
 
 /// Сверяет записанное основание с доказательством из строки.
@@ -481,8 +473,10 @@ mod tests {
 
     #[test]
     fn известное_противоречащее_основание_становится_unknown() {
-        let (basis, contradicts) =
-            reconcile_quotation_basis(QuotationBasis::MoneyPerUnit, "iss:engines/stock/markets/bonds");
+        let (basis, contradicts) = reconcile_quotation_basis(
+            QuotationBasis::MoneyPerUnit,
+            "iss:engines/stock/markets/bonds",
+        );
         assert_eq!(basis, QuotationBasis::Unknown);
         assert!(contradicts);
 
@@ -495,8 +489,7 @@ mod tests {
     #[test]
     fn недоказанное_unknown_основание_проходит() {
         for evidence in ["", "test:market", "iss:engines/stock/markets/futures"] {
-            let (basis, contradicts) =
-                reconcile_quotation_basis(QuotationBasis::Unknown, evidence);
+            let (basis, contradicts) = reconcile_quotation_basis(QuotationBasis::Unknown, evidence);
             assert_eq!(basis, QuotationBasis::Unknown, "признак: {evidence}");
             assert!(!contradicts, "признак: {evidence}");
         }
@@ -520,7 +513,6 @@ mod tests {
             assert_eq!(quotation_basis_from_evidence(&evidence), Some(basis));
         }
     }
-
 
     #[test]
     fn accrued_interest_takes_its_currency_from_face_unit_not_from_currency_id() {

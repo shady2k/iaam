@@ -205,8 +205,7 @@ fn price_view(row: PriceRow, complete_through: Option<Date>) -> Result<MarketPri
         .map_err(|error| invalid_value("instrument_id", error.to_string()))?;
     let recorded_basis = QuotationBasis::from_code(&row.quotation_basis)
         .ok_or_else(|| invalid_value("quotation_basis", row.quotation_basis.clone()))?;
-    let (quotation_basis, _) =
-        reconcile_quotation_basis(recorded_basis, &row.basis_evidence);
+    let (quotation_basis, _) = reconcile_quotation_basis(recorded_basis, &row.basis_evidence);
     Ok(MarketPriceView {
         instrument,
         board: row.board,

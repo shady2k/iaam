@@ -2607,7 +2607,7 @@ mod tests {
         assert_eq!(*quantity, Quantity(dec("100")));
     }
     #[test]
-    fn accrued_mismatch_keeps_computed_and_observed_currencies_separate() {
+    fn accrued_mismatch_marks_close_values_in_different_currencies_as_material() {
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), []);
         let fx = FxTable::new(FxSource::OwnerSupplied);
@@ -2631,7 +2631,7 @@ mod tests {
         };
         let observed = BTreeMap::from([(
             (instrument, venue.clone(), date!(2026 - 08 - 26)),
-            PerUnitAmount::new(dec("22.40"), CurrencyCode::Usd),
+            PerUnitAmount::new(dec("25.01"), CurrencyCode::Usd),
         )]);
         let request = ReturnsRequest {
             contour: &contour,
@@ -2658,7 +2658,9 @@ mod tests {
             &AccruedInterestV1,
         );
         let MaterialIssue::AccruedInterestMismatch {
+            computed,
             computed_currency,
+            observed,
             observed_currency,
             ..
         } = &issues[0]
@@ -2666,6 +2668,8 @@ mod tests {
             panic!("ожидалось расхождение НКД");
         };
         assert_eq!(*computed_currency, CurrencyCode::Rub);
+        assert_eq!(*computed, dec("25.00"));
+        assert_eq!(*observed, dec("25.01"));
         assert_eq!(*observed_currency, CurrencyCode::Usd);
     }
     #[test]

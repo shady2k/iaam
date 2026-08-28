@@ -51,6 +51,7 @@ fn to_core_lots(items: &[RefLotJson]) -> Vec<Lot> {
             acquired: Some(TradeDate(date!(2026 - 01 - 01))),
             quantity: qty(l.quantity),
             cost_basis: Money::new(PostedMinor::new(l.basis_minor), CurrencyCode::Rub),
+            acquisition_basis: None,
             accrued_interest_paid: None,
             received_to_date: None,
             principal: PrincipalState::Unknown,

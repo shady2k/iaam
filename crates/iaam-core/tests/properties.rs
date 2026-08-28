@@ -41,6 +41,7 @@ fn tie_rounding_preserves_total_basis() {
         acquired: None,
         quantity: Quantity(Dec::new(Decimal::from(2))),
         cost_basis: Money::new(PostedMinor::new(5), CurrencyCode::Rub),
+        acquisition_basis: None,
         accrued_interest_paid: None,
         received_to_date: None,
         principal: PrincipalState::Unknown,
@@ -93,6 +94,7 @@ proptest! {
                 accrued_interest_paid: None,
                 received_to_date: None,
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                acquisition_basis: None,
                 principal: PrincipalState::Unknown,
             })
             .collect();
@@ -136,6 +138,7 @@ proptest! {
                 acquired: None,
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                acquisition_basis: None,
                 accrued_interest_paid: None,
                 received_to_date: None,
                 principal: PrincipalState::Unknown,
@@ -175,6 +178,7 @@ proptest! {
                 received_to_date: None,
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
+                acquisition_basis: None,
                 principal: PrincipalState::Unknown,
             })
             .collect();

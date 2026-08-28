@@ -197,6 +197,11 @@ fn successor_lots_are_derived_from_predecessor_lots_and_the_event_alone() {
     // тождество «приобретено = осталось + списано» перестанет держаться
     // и инвариант проекции остановит отчёт (projection/invariants.rs).
     assert_eq!(successor.acquired_basis(), Some(rub(1_000_000)));
+    assert_eq!(
+        successor.lots()[0].acquisition_basis,
+        Some(rub(1_000_000)),
+        "историческая стоимость должна перейти к преемнику"
+    );
     assert_eq!(successor.released_basis(), None);
 
     let predecessor = book

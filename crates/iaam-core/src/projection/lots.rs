@@ -94,6 +94,8 @@ pub struct Cohort {
     pub acquired: TradeDate,
     pub quantity: Quantity,
     pub cost_basis: Money,
+    #[serde(default)]
+    pub acquisition_basis: Option<Money>,
     pub accrued_interest_paid: Option<Money>,
     pub received_to_date: Option<Money>,
 }
@@ -346,6 +348,8 @@ impl InstrumentLots {
         let mut cohorts = Vec::with_capacity(grouped.len());
         for (acquired, lots) in grouped {
             let mut quantity = Dec::zero();
+            let acquisition_basis =
+                Self::sum_optional_money(&lots, |lot| lot.acquisition_basis)?;
             let mut cost_basis = Money::zero(lots[0].cost_basis.currency());
             for lot in &lots {
                 quantity = quantity
@@ -366,6 +370,7 @@ impl InstrumentLots {
                 acquired,
                 quantity: Quantity(quantity),
                 cost_basis,
+                acquisition_basis,
                 accrued_interest_paid: Self::sum_optional_money(&lots, |lot| {
                     lot.accrued_interest_paid
                 })?,
@@ -628,6 +633,7 @@ impl LotBook {
                     accrued_interest_paid: accrued_interest,
                     received_to_date: None,
                     cost_basis: basis,
+                    acquisition_basis: Some(basis),
                     // Номинал сюда придёт из справочника в E3.4;
                     // подставлять ноль запрещено (§4.9).
                     principal: PrincipalState::Unknown,
@@ -860,6 +866,7 @@ impl LotBook {
                 // из неё **не** вычитается: как она влияет на базу —
                 // правило E5, и решать за него часть 1 не вправе.
                 cost_basis: lot.cost_basis,
+                acquisition_basis: lot.acquisition_basis,
                 accrued_interest_paid: lot.accrued_interest_paid,
                 received_to_date: lot.received_to_date,
                 // Номинал преемника — свойство другого выпуска, и
@@ -947,6 +954,7 @@ impl LotBook {
                         accrued_interest_paid: None,
                         received_to_date: None,
                         cost_basis: basis,
+                        acquisition_basis: Some(basis),
                         principal: PrincipalState::Unknown,
                     },
                 );
@@ -1112,6 +1120,7 @@ mod tests {
             acquired: Some(crate::dates::TradeDate(date!(2024 - 03 - 01))),
             quantity: qty(units),
             cost_basis: rub(basis),
+            acquisition_basis: Some(rub(basis)),
             accrued_interest_paid: None,
             received_to_date: None,
             principal,
@@ -1186,6 +1195,31 @@ mod tests {
         assert_eq!(entry.realized(), Some(rub(0)));
         assert_eq!(entry.released_basis(), Some(rub(200_000)));
         assert_eq!(entry.remaining_basis().unwrap(), Some(rub(800_000)));
+        assert_eq!(
+            entry.lots()[0].acquisition_basis,
+            Some(rub(1_000_000)),
+            "амортизация не уменьшает историческую стоимость"
+        );
+    }
+
+    #[test]
+    fn amortisation_reduces_current_basis_but_preserves_historical_purchase_cost() {
+        // Пожизненный поток включает уже полученные 200 и будущие 800.
+        // Если знаменатель взять из уменьшенного cost_basis (800 вместо
+        // исторических 1000), HPR ошибочно выйдет 25 % вместо 0 %.
+        let bond = Bond::new();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = book_with_lots(
+            &bond,
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
+        );
+
+        book.apply(&bond.amortisation(10, "200", 200_000), &rules)
+            .unwrap();
+
+        let lot = &book.entry(&bond.key()).unwrap().lots()[0];
+        assert_eq!(lot.cost_basis, rub(800_000));
+        assert_eq!(lot.acquisition_basis, Some(rub(1_000_000)));
     }
 
     #[test]
@@ -1495,6 +1529,7 @@ mod tests {
         let entry = book.entry(&key(&trade)).unwrap();
         assert_eq!(entry.lots().len(), 1);
         assert_eq!(entry.lots()[0].cost_basis, rub(1_010_000));
+        assert_eq!(entry.lots()[0].acquisition_basis, Some(rub(1_010_000)));
         assert_eq!(entry.quantity().unwrap(), qty(100));
     }
 
@@ -2032,9 +2067,11 @@ mod tests {
         assert_eq!(cohorts[0].acquired, TradeDate(date!(2025 - 03 - 01)));
         assert_eq!(cohorts[0].quantity, qty(50));
         assert_eq!(cohorts[0].cost_basis, rub(520_000));
+        assert_eq!(cohorts[0].acquisition_basis, Some(rub(520_000)));
         assert_eq!(cohorts[1].acquired, TradeDate(date!(2025 - 04 - 01)));
         assert_eq!(cohorts[1].quantity, qty(50));
         assert_eq!(cohorts[1].cost_basis, rub(510_000));
+        assert_eq!(cohorts[1].acquisition_basis, Some(rub(510_000)));
     }
 
     #[test]

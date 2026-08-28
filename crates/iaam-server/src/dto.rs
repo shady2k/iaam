@@ -735,6 +735,28 @@ impl QuotationBasisDto {
     }
 }
 
+/// Статус доказанности записанного основания цены.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotationBasisStatusDto {
+    Proven,
+    Contradicts,
+    NotProven,
+}
+
+impl QuotationBasisStatusDto {
+    #[must_use]
+    pub const fn from_domain(status: iaam_app::scenarios::market_reference::QuotationBasisStatus) -> Self {
+        match status {
+            iaam_app::scenarios::market_reference::QuotationBasisStatus::Proven => Self::Proven,
+            iaam_app::scenarios::market_reference::QuotationBasisStatus::Contradicts => {
+                Self::Contradicts
+            }
+            iaam_app::scenarios::market_reference::QuotationBasisStatus::NotProven => Self::NotProven,
+        }
+    }
+}
+
 /// Основание выбора: вид источника, площадка, версии и оба порога.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PriceProvenanceDto {
@@ -1538,6 +1560,9 @@ pub struct MarketPriceDto {
     pub currency: String,
     #[serde(default)]
     pub quotation_basis: QuotationBasisDto,
+    /// Основание ровно в том виде, в каком его записал источник.
+    pub recorded_quotation_basis: String,
+    pub quotation_basis_status: QuotationBasisStatusDto,
     #[serde(default)]
     pub basis_evidence: Option<String>,
     #[serde(with = "iso_date")]
@@ -2226,6 +2251,43 @@ mod tests {
             Some("iss:engines/stock/markets/bonds")
         );
     }
+    #[test]
+    fn каждый_статус_основания_называет_себя_в_api() {
+        use std::collections::HashSet;
+
+        let values = [
+            QuotationBasisStatusDto::Proven,
+            QuotationBasisStatusDto::Contradicts,
+            QuotationBasisStatusDto::NotProven,
+        ];
+        let expected = ["proven", "contradicts", "not_proven"];
+        let codes: Vec<_> = values
+            .iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .expect("статус представим в JSON")
+                    .as_str()
+                    .expect("код статуса — строка")
+                    .to_owned()
+            })
+            .collect();
+
+        for (value, expected) in codes.iter().zip(expected) {
+            assert_eq!(value, expected);
+        }
+        let duplicate = codes
+            .iter()
+            .enumerate()
+            .find_map(|(index, code)| codes[..index].contains(code).then_some(code));
+        let unique_codes = codes.iter().collect::<HashSet<_>>();
+        assert_eq!(
+            unique_codes.len(),
+            codes.len(),
+            "код статуса повторяется: {}",
+            duplicate.map(|code| code.as_str()).unwrap_or("<неизвестен>")
+        );
+    }
+
 }
 /// Параметры загрузки отчёта. Тело маршрута — двоичные байты книги.
 #[derive(Debug, Clone, Deserialize, IntoParams)]

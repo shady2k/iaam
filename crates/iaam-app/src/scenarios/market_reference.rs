@@ -44,6 +44,14 @@ pub struct MarketKeyRateQuery {
     pub knowledge_as_of: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotationBasisStatus {
+    Proven,
+    Contradicts,
+    NotProven,
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketPriceView {
     pub instrument: InstrumentId,
@@ -52,6 +60,8 @@ pub struct MarketPriceView {
     pub kind: String,
     pub value: String,
     pub quotation_basis: QuotationBasis,
+    pub recorded_quotation_basis: String,
+    pub quotation_basis_status: QuotationBasisStatus,
     pub basis_evidence: String,
     pub currency: String,
     pub date: Date,
@@ -203,9 +213,18 @@ fn price_view(row: PriceRow, complete_through: Option<Date>) -> Result<MarketPri
         .parse::<Uuid>()
         .map(InstrumentId)
         .map_err(|error| invalid_value("instrument_id", error.to_string()))?;
-    let recorded_basis = QuotationBasis::from_code(&row.quotation_basis)
-        .ok_or_else(|| invalid_value("quotation_basis", row.quotation_basis.clone()))?;
-    let (quotation_basis, _) = reconcile_quotation_basis(recorded_basis, &row.basis_evidence);
+    let recorded_quotation_basis = row.quotation_basis.clone();
+    let recorded_basis = QuotationBasis::from_code(&recorded_quotation_basis)
+        .ok_or_else(|| invalid_value("quotation_basis", recorded_quotation_basis.clone()))?;
+    let (quotation_basis, contradicts) =
+        reconcile_quotation_basis(recorded_basis, &row.basis_evidence);
+    let quotation_basis_status = if contradicts {
+        QuotationBasisStatus::Contradicts
+    } else if quotation_basis == QuotationBasis::Unknown {
+        QuotationBasisStatus::NotProven
+    } else {
+        QuotationBasisStatus::Proven
+    };
     Ok(MarketPriceView {
         instrument,
         board: row.board,
@@ -213,6 +232,8 @@ fn price_view(row: PriceRow, complete_through: Option<Date>) -> Result<MarketPri
         kind: row.kind,
         value: row.price,
         quotation_basis,
+        recorded_quotation_basis,
+        quotation_basis_status,
         basis_evidence: row.basis_evidence,
         currency: row.currency,
         date: parse_date(&row.trade_date)?,
@@ -379,6 +400,55 @@ mod tests {
         .expect("строка миграции допустима для витрины");
 
         assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
+        assert_eq!(view.quotation_basis_status, QuotationBasisStatus::NotProven);
+        assert_eq!(view.recorded_quotation_basis, "unknown");
         assert!(view.basis_evidence.is_empty());
+    }
+    #[test]
+    fn совпадающее_основание_имеет_статус_доказано() {
+        let view =
+            price_view(price_row("percent_of_remaining_face", "iss:engines/stock/markets/bonds"), None)
+                .expect("строка цены");
+
+        assert_eq!(view.quotation_basis, QuotationBasis::PercentOfRemainingFace);
+        assert_eq!(view.quotation_basis_status, QuotationBasisStatus::Proven);
+        assert_eq!(view.recorded_quotation_basis, "percent_of_remaining_face");
+    }
+
+    #[test]
+    fn противоречащее_основание_имеет_статус_противоречит() {
+        let view =
+            price_view(price_row("money_per_unit", "iss:engines/stock/markets/bonds"), None)
+                .expect("строка цены");
+
+        assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
+        assert_eq!(view.quotation_basis_status, QuotationBasisStatus::Contradicts);
+        assert_eq!(view.recorded_quotation_basis, "money_per_unit");
+    }
+
+    #[test]
+    fn отсутствие_доказательства_имеет_статус_не_доказано() {
+        let view =
+            price_view(price_row("money_per_unit", "test:market"), None).expect("строка цены");
+
+        assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
+        assert_eq!(view.quotation_basis_status, QuotationBasisStatus::NotProven);
+        assert_eq!(view.recorded_quotation_basis, "money_per_unit");
+    }
+
+    fn price_row(quotation_basis: &str, basis_evidence: &str) -> PriceRow {
+        PriceRow {
+            instrument_id: Uuid::nil().to_string(),
+            board: "TQBR".to_owned(),
+            session: 3,
+            trade_date: "2026-08-03".to_owned(),
+            kind: "close".to_owned(),
+            observed_at: "2026-08-26T09:00:00Z".to_owned(),
+            price: "281.39".to_owned(),
+            currency: "RUB".to_owned(),
+            quotation_basis: quotation_basis.to_owned(),
+            basis_evidence: basis_evidence.to_owned(),
+            executability: "indicative_previous_close".to_owned(),
+        }
     }
 }

@@ -21,7 +21,8 @@ use crate::dto::{
     MarketKeyRateDto, MarketPriceDto, MarketSourceDto, MarketSyncRequest, OfferExerciseDto,
     OperationDatesDto, OperationDto, OperationKindDto, OwnerBalanceRequest, PositionCoverageDto,
     PriceFreshnessDto, PriceOriginDto, PriceProvenanceDto, PriceQualityDto, PriceSelectionDto,
-    QuotationBasisDto, RateDto, ReconciliationStatusDto, ReturnsReportDto, SelectedPriceDto,
+    QuotationBasisDto, QuotationBasisStatusDto, RateDto, ReconciliationStatusDto, ReturnsReportDto,
+    SelectedPriceDto,
     SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto,
     UncoveredPositionDto, VerdictDto,
 };
@@ -113,6 +114,7 @@ impl Modify for BearerSecurity {
         PriceProvenanceDto,
         PriceQualityDto,
         PriceSelectionDto,
+        QuotationBasisStatusDto,
         QuotationBasisDto,
         PositionCoverageDto,
         RateDto,

@@ -55,9 +55,10 @@ use crate::dto::{
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
     InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
-    MarketSyncRequest, OwnerBalanceRequest, QuotationBasisDto, ReconciliationParams,
-    ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
-    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    MarketSyncRequest, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
+    ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest,
+    ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TokenScopeDto,
     VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
@@ -1516,6 +1517,8 @@ fn market_price_dto(
         kind: view.kind,
         value: view.value,
         currency: view.currency,
+        recorded_quotation_basis: view.recorded_quotation_basis,
+        quotation_basis_status: QuotationBasisStatusDto::from_domain(view.quotation_basis_status),
         quotation_basis: QuotationBasisDto::from_domain(view.quotation_basis),
         basis_evidence: (!view.basis_evidence.is_empty()).then_some(view.basis_evidence),
         date: view.date,

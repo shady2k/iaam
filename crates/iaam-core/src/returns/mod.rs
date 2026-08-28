@@ -44,9 +44,8 @@ use crate::rules::{
 };
 use crate::valuation::{
     FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
-    QuotationBasis, SelectedPrice, SourceExecutability,
-    UncoveredReason as PolicyUncoveredReason, ValuationError, Venue,
-    candidate_from_legacy_valuation,
+    QuotationBasis, SelectedPrice, SourceExecutability, UncoveredReason as PolicyUncoveredReason,
+    ValuationError, Venue, candidate_from_legacy_valuation,
 };
 
 /// Величина, которую система может отказаться вычислить.
@@ -918,7 +917,7 @@ fn bond_position_attributes(
                 Ok(per_unit) => position_amount(per_unit, assessment.quantity, request),
                 Err(reason) => Computed::NotComputable { reason },
             };
-            let payable_observation = selected_accrued_observation(&assessment, request)
+            let payable_observation = selected_accrued_observation(assessment, request)
                 .map(|per_unit| position_amount(*per_unit, assessment.quantity, request))
                 .unwrap_or_else(|| Computed::NotComputable {
                     reason: NotComputable::AccruedObservationMissing {
@@ -927,7 +926,7 @@ fn bond_position_attributes(
                 });
             let payable = payable_on_termination(
                 &payable_observation,
-                selected_executability(&assessment).unwrap_or(SourceExecutability::Unknown),
+                selected_executability(assessment).unwrap_or(SourceExecutability::Unknown),
             );
             let (next_posting_date, next_principal_return_finality) = request
                 .bond_schedules
@@ -996,9 +995,7 @@ fn accrued_mismatch_issues(
             let observed = positions
                 .iter()
                 .find(|position| position.assessment.instrument == instrument)
-                .and_then(|position| {
-                    selected_accrued_observation(&position.assessment, request)
-                })?;
+                .and_then(|position| selected_accrued_observation(&position.assessment, request))?;
             let material = computed.currency() != observed.currency()
                 || accrued_mismatch_is_material(
                     computed.value(),
@@ -1261,7 +1258,8 @@ fn position_values_from_assessments(
     request: &ReturnsRequest<'_>,
 ) -> Vec<PositionValue> {
     let (_, rule) = quotation_rule();
-    assessments.into_iter()
+    assessments
+        .into_iter()
         .map(|assessment| {
             let value = match &assessment.kind {
                 PositionAssessmentKind::Selected(selected) => position_value(
@@ -1308,7 +1306,6 @@ fn position_values_from_assessments(
         })
         .collect()
 }
-
 
 struct PositionQuotation<'a> {
     price: Dec,
@@ -1690,9 +1687,7 @@ mod tests {
             kind: PositionAssessmentKind::Uncovered(UncoveredReason::NoObservation),
         }
     }
-    fn position_values_for_tests(
-        assessments: Vec<PositionAssessment>,
-    ) -> Vec<PositionValue> {
+    fn position_values_for_tests(assessments: Vec<PositionAssessment>) -> Vec<PositionValue> {
         assessments
             .into_iter()
             .map(|assessment| PositionValue {
@@ -1856,12 +1851,14 @@ mod tests {
 
         assert_eq!(report.terminal_value, Computed::Value(dec("985")));
         assert_eq!(report.data_quality.position_coverage.evaluated_positions, 1);
-        assert!(report
-            .data_quality
-            .position_coverage
-            .uncovered
-            .iter()
-            .all(|position| position.instrument != instrument));
+        assert!(
+            report
+                .data_quality
+                .position_coverage
+                .uncovered
+                .iter()
+                .all(|position| position.instrument != instrument)
+        );
     }
     #[test]
     fn неизвестное_основание_делает_позицию_непокрытой_с_причиной_пересчёта() {
@@ -1898,7 +1895,6 @@ mod tests {
         );
         assert!(report.terminal_value.value().is_some());
     }
-
 
     #[test]
     fn a_share_does_not_get_bond_position_attributes() {
@@ -2033,8 +2029,7 @@ mod tests {
             selected.candidate.basis = QuotationBasis::PercentOfRemainingFace;
             selected.provenance.quotation_basis = QuotationBasis::PercentOfRemainingFace;
         }
-        assessment.remaining_face =
-            Ok(Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub)));
+        assessment.remaining_face = Ok(Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub)));
         let positions = position_values_from_assessments(vec![assessment], &request);
         let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
 

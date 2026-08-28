@@ -1745,8 +1745,8 @@ mod tests {
     /// одинаковый код скрывает конкретную причину непокрытия.
     #[test]
     fn every_uncovered_reason_names_itself_in_the_api() {
-        use std::collections::HashSet;
         use iaam_core::returns::{NotComputable, UncoveredReason};
+        use std::collections::HashSet;
 
         fn expected(value: &UncoveredReason) -> &'static str {
             match value {
@@ -1855,9 +1855,10 @@ mod tests {
             codes.iter().all(|code| !code.is_empty()),
             "код причины не должен быть пустым"
         );
-        let duplicate = codes.iter().enumerate().find_map(|(index, code)| {
-            codes[..index].contains(code).then_some(*code)
-        });
+        let duplicate = codes
+            .iter()
+            .enumerate()
+            .find_map(|(index, code)| codes[..index].contains(code).then_some(*code));
         let unique_codes = codes.iter().copied().collect::<HashSet<_>>();
         assert_eq!(
             unique_codes.len(),

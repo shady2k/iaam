@@ -1115,3 +1115,158 @@ fn the_quotation_basis_survives_a_round_trip_through_every_read_path() {
     assert_eq!(by_series.len(), 1);
     assert_basis(&by_series[0]);
 }
+
+#[test]
+fn граница_полноты_доступна_на_момент_знания_и_не_раньше() {
+    let (mut store, _) = store_with_instrument();
+    let series = series("SBER:TQBR:1");
+    let run = store
+        .begin_run(
+            series.clone(),
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease(),
+        )
+        .expect("запуск");
+    store
+        .finish_run(
+            &run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 01),
+                to: date!(2026 - 08 - 03),
+            }),
+        )
+        .expect("граница опубликована");
+    store
+        .connection()
+        .execute(
+            "UPDATE series_completeness
+             SET updated_at = '2026-08-04T12:00:00Z'
+             WHERE source_id = 'moex-iss'
+               AND dataset = 'prices'
+               AND series_key = 'SBER:TQBR:1'",
+            [],
+        )
+        .expect("момент знания зафиксирован");
+
+    assert_eq!(
+        store
+            .complete_through_at_or_before(&series, "2026-08-04T12:00:00Z")
+            .expect("чтение на границе"),
+        Some(date!(2026 - 08 - 03))
+    );
+    assert_eq!(
+        store
+            .complete_through_at_or_before(&series, "2026-08-04T11:59:59Z")
+            .expect("чтение до границы"),
+        None
+    );
+}
+
+#[test]
+fn курсы_возвращаются_ровно_в_заданном_окне_и_на_момент_знания() {
+    let (mut store, _) = store_with_instrument();
+    let series = series_with_dataset("fx", "USD/RUB");
+    let run = store
+        .begin_run(
+            series.clone(),
+            date!(2026 - 08 - 01),
+            date!(2026 - 08 - 04),
+            lease(),
+        )
+        .expect("запуск курсов");
+    let rows = [
+        FxRow {
+            from_code: "USD".to_owned(),
+            to_code: "RUB".to_owned(),
+            trade_date: "2026-08-01".to_owned(),
+            observed_at: "2026-08-02T09:00:00Z".to_owned(),
+            nominal: 1,
+            value: "80".to_owned(),
+            unit_rate: "80".to_owned(),
+        },
+        FxRow {
+            from_code: "USD".to_owned(),
+            to_code: "RUB".to_owned(),
+            trade_date: "2026-08-03".to_owned(),
+            observed_at: "2026-08-04T12:00:00Z".to_owned(),
+            nominal: 1,
+            value: "81".to_owned(),
+            unit_rate: "81".to_owned(),
+        },
+        FxRow {
+            from_code: "USD".to_owned(),
+            to_code: "RUB".to_owned(),
+            trade_date: "2026-08-04".to_owned(),
+            observed_at: "2026-08-04T13:00:00Z".to_owned(),
+            nominal: 1,
+            value: "82".to_owned(),
+            unit_rate: "82".to_owned(),
+        },
+    ];
+    store
+        .record_fx(&run, "raw-fx", &rows)
+        .expect("курсы записаны");
+    store
+        .finish_run(&run, RunOutcome::Succeeded, None)
+        .expect("курсы опубликованы");
+
+    let found = store
+        .fx_between(
+            &series,
+            "USD",
+            "RUB",
+            iaam_store::market::MarketWindow {
+                from: "2026-08-01",
+                to: "2026-08-03",
+                knowledge_as_of: "2026-08-04T12:00:00Z",
+            },
+        )
+        .expect("чтение курсов");
+
+    assert_eq!(found, rows[..2].to_vec());
+}
+
+#[test]
+fn ключевые_ставки_возвращаются_ровно_до_границы_торговой_даты_и_знания() {
+    let (mut store, _) = store_with_instrument();
+    let series = series_with_dataset("key-rate", "CBR");
+    let run = store
+        .begin_run(
+            series.clone(),
+            date!(2026 - 08 - 01),
+            date!(2026 - 08 - 04),
+            lease(),
+        )
+        .expect("запуск ключевой ставки");
+    let rows = [
+        KeyRateRow {
+            trade_date: "2026-08-01".to_owned(),
+            observed_at: "2026-08-02T09:00:00Z".to_owned(),
+            rate: "18".to_owned(),
+        },
+        KeyRateRow {
+            trade_date: "2026-08-03".to_owned(),
+            observed_at: "2026-08-04T12:00:00Z".to_owned(),
+            rate: "17.5".to_owned(),
+        },
+        KeyRateRow {
+            trade_date: "2026-08-04".to_owned(),
+            observed_at: "2026-08-04T13:00:00Z".to_owned(),
+            rate: "17".to_owned(),
+        },
+    ];
+    store
+        .record_key_rate(&run, "raw-key-rate", &rows)
+        .expect("ставки записаны");
+    store
+        .finish_run(&run, RunOutcome::Succeeded, None)
+        .expect("ставки опубликованы");
+
+    let found = store
+        .key_rates_through(&series, "2026-08-03", "2026-08-04T12:00:00Z")
+        .expect("чтение ключевых ставок");
+
+    assert_eq!(found, rows[..2].to_vec());
+}

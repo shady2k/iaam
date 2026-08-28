@@ -16,7 +16,7 @@ use time::macros::format_description;
 
 use crate::csv_source::{
     Directory, ParsedRow, resolve_instrument_in_namespace,
-    resolve_instrument_in_namespace_without_date, resolve_named_custody,
+    resolve_instrument_in_namespace_without_date, resolve_named_account, resolve_named_custody,
 };
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::report::sections::{
@@ -623,11 +623,7 @@ fn lookup_account(
     name: &str,
     field: &'static str,
 ) -> Result<iaam_core::ids::AccountId, Rejection> {
-    directory
-        .accounts
-        .get(name)
-        .copied()
-        .ok_or_else(|| rejection(field, "имя из справочника", name))
+    resolve_named_account(name, directory, field)
 }
 
 fn lookup_instrument(

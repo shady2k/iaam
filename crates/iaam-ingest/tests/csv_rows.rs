@@ -13,7 +13,10 @@ fn directory() -> (Directory, AccountId, InstrumentId) {
         default_custody: Some(CustodyId::new_random()),
         ..Directory::default()
     };
-    dir.accounts.insert("Брокерский".into(), account);
+    dir.accounts
+        .entry("Брокерский".into())
+        .or_default()
+        .push(account);
     dir.instruments.insert(
         "SBER".into(),
         vec![(
@@ -73,6 +76,42 @@ fn a_good_document_parses_into_operations() {
         },
         other => panic!("ожидалась операция, получено {other:?}"),
     }
+}
+
+#[test]
+fn неоднозначное_название_счёта_отвергается_только_в_ссылающейся_строке() {
+    let (mut dir, _, _) = directory();
+    let duplicate = AccountId::new_random();
+    let unique = AccountId::new_random();
+    dir.accounts
+        .entry("Брокерский".into())
+        .or_default()
+        .push(duplicate);
+    dir.accounts
+        .entry("Однозначный".into())
+        .or_default()
+        .push(unique);
+
+    let document = format!(
+        "{HEADER}\n\
+         2026-01-10,deposit,Брокерский,,,,,100000.00,,,RUB,duplicate\n\
+         2026-01-11,deposit,Однозначный,,,,,1000.00,,,RUB,unique\n"
+    );
+    let rows = parse(&document, &dir);
+
+    let ParsedRow::Rejected(rejection) = &rows[0] else {
+        panic!("неоднозначное название должно быть отвергнуто: {:?}", rows[0]);
+    };
+    assert_eq!(rejection.field, "account");
+    assert_eq!(
+        rejection.actual,
+        "Брокерский: название счёта неоднозначно: 2 счёта"
+    );
+
+    let ParsedRow::Operation(operation) = &rows[1] else {
+        panic!("однозначное название должно разрешаться: {:?}", rows[1]);
+    };
+    assert_eq!(operation.account, unique);
 }
 
 #[test]

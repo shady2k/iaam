@@ -46,7 +46,9 @@ const EXPECTED_TAX_TOTAL_MINOR: i64 = 10_000;
 
 fn directory(account: AccountId, custody: CustodyId, instrument: InstrumentId) -> Directory {
     Directory {
-        accounts: [("INVEST-001".to_owned(), account)].into_iter().collect(),
+        accounts: [("INVEST-001".to_owned(), vec![account])]
+            .into_iter()
+            .collect(),
         custodies: [("НРД".to_owned(), vec![custody])].into_iter().collect(),
         instruments: [(
             "FIN-BOND".to_owned(),
@@ -72,7 +74,9 @@ fn directory_with_historical_instrument(
     second: InstrumentId,
 ) -> Directory {
     Directory {
-        accounts: [("INVEST-001".to_owned(), account)].into_iter().collect(),
+        accounts: [("INVEST-001".to_owned(), vec![account])]
+            .into_iter()
+            .collect(),
         custodies: [("НРД".to_owned(), vec![custody])].into_iter().collect(),
         instruments: [(
             "FIN-BOND".to_owned(),

@@ -1644,7 +1644,11 @@ async fn build_directory(
 
     let mut directory = Directory::default();
     for account in accounts {
-        directory.accounts.insert(account.title, account.id);
+        directory
+            .accounts
+            .entry(account.title)
+            .or_default()
+            .push(account.id);
     }
     for place in places {
         directory

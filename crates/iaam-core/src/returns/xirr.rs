@@ -8,15 +8,12 @@ use std::collections::BTreeMap;
 
 use time::Date;
 
-use super::{Computed, NotComputable, ReturnsRequest, quotation_error, quotation_rule};
+use super::{Computed, NotComputable, ReturnsRequest};
 use crate::ids::AccountId;
-use crate::money::CurrencyCode;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverFlow, solve};
 use crate::projection::flows::FlowDirection;
 use crate::projection::state::LedgerState;
-use crate::rules::quotation::QuotationRule;
-use crate::valuation::QuotationBasis;
 use crate::valuation::convert;
 
 /// Ряд потоков в валюте отчёта.
@@ -96,7 +93,7 @@ impl AccountValue {
 }
 
 /// Стоимость контура **по счетам** на дату отчёта: деньги плюс позиции
-/// по последней цене, наблюдавшейся не позже даты отчёта.
+/// по кандидату, выбранному политикой оценки.
 ///
 /// Это **ликвидационная** оценка в упрощённом виде (§5.1): комиссий
 /// закрытия и налога к уплате в ней нет, потому что ни того, ни другого
@@ -111,9 +108,17 @@ pub fn account_values(
     state: &LedgerState,
     request: &ReturnsRequest,
 ) -> Result<BTreeMap<AccountId, AccountValue>, NotComputable> {
+    let positions = super::position_values(state, request);
+    account_values_from_position_values(state, request, &positions)
+}
+
+pub(super) fn account_values_from_position_values(
+    state: &LedgerState,
+    request: &ReturnsRequest,
+    positions: &[super::PositionValue],
+) -> Result<BTreeMap<AccountId, AccountValue>, NotComputable> {
     guard_state_not_newer(state, request.as_of)?;
     let mut values: BTreeMap<AccountId, AccountValue> = BTreeMap::new();
-    let (_, rule) = quotation_rule();
 
     for (account, money) in state.balances().iter_cash() {
         if !request.contour.contains(account) {
@@ -124,39 +129,33 @@ pub fn account_values(
         slot.cash = add(slot.cash, converted)?;
     }
 
-    for (key, quantity) in state.balances().iter_positions() {
-        if !request.contour.contains(key.account) || quantity.0.is_zero() {
-            continue;
-        }
-        let price = state
-            .prices()
-            .price_at_or_before(key.instrument, request.as_of)
-            .ok_or(NotComputable::MissingPrice {
-                instrument: key.instrument,
-            })?;
-        let (money_per_unit, currency) = rule
-            .money_per_unit(
-                QuotationBasis::MoneyPerUnit,
-                price.price,
-                price.currency,
-                None,
-            )
-            .map_err(|error| quotation_error(error, key.instrument))?;
-        let local = mul(quantity.0, money_per_unit)?;
-        let converted = in_report_currency(local, currency, request)?;
-        let slot = values.entry(key.account).or_default();
-        slot.positions = add(slot.positions, converted)?;
+    for position in positions {
+        let value = match &position.value {
+            Ok(value) => *value,
+            Err(reason) => return Err(reason.clone()),
+        };
+        let slot = values.entry(position.assessment.account).or_default();
+        slot.positions = add(slot.positions, value)?;
     }
     Ok(values)
 }
 
-/// Стоимость контура на дату отчёта — сумма по счетам.
-pub fn terminal_value(state: &LedgerState, request: &ReturnsRequest) -> Result<Dec, NotComputable> {
+pub(super) fn terminal_value_from_position_values(
+    state: &LedgerState,
+    request: &ReturnsRequest,
+    positions: &[super::PositionValue],
+) -> Result<Dec, NotComputable> {
     let mut total = Dec::zero();
-    for value in account_values(state, request)?.values() {
+    for value in account_values_from_position_values(state, request, positions)?.values() {
         total = add(total, value.total()?)?;
     }
     Ok(total)
+}
+
+/// Стоимость контура на дату отчёта — сумма по счетам.
+pub fn terminal_value(state: &LedgerState, request: &ReturnsRequest) -> Result<Dec, NotComputable> {
+    let positions = super::position_values(state, request);
+    terminal_value_from_position_values(state, request, &positions)
 }
 
 /// Ставка по ряду потоков и терминальной стоимости.
@@ -222,32 +221,12 @@ fn guard_state_not_newer(state: &LedgerState, as_of: Date) -> Result<(), NotComp
     }
 }
 
-fn in_report_currency(
-    amount: Dec,
-    currency: CurrencyCode,
-    request: &ReturnsRequest,
-) -> Result<Dec, NotComputable> {
-    let rate = request
-        .fx
-        .rate(currency, request.report_currency, request.as_of)
-        .ok_or(NotComputable::MissingFxRate {
-            from: currency,
-            to: request.report_currency,
-            date: request.as_of,
-        })?;
-    mul(amount, rate)
-}
-
 fn add(left: Dec, right: Dec) -> Result<Dec, NotComputable> {
     left.checked_add(right).map_err(numeric)
 }
 
 fn sub(left: Dec, right: Dec) -> Result<Dec, NotComputable> {
     left.checked_sub(right).map_err(numeric)
-}
-
-fn mul(left: Dec, right: Dec) -> Result<Dec, NotComputable> {
-    left.checked_mul(right).map_err(numeric)
 }
 
 fn neg(value: Dec) -> Result<Dec, NotComputable> {

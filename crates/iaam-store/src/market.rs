@@ -502,7 +502,7 @@ impl SqliteStore {
         value.map_or(Ok(None), |date| parse_date(&date).map(Some))
     }
 
-    /// Вернуть последнее по знанию опубликованное наблюдение цены.
+    /// Вернуть последнее опубликованное наблюдение по торговой дате и знанию.
     pub fn prices_at_or_before(
         &self,
         instrument_id: &str,
@@ -523,7 +523,7 @@ impl SqliteStore {
                    AND p.trade_date <= ?4
                    AND p.observed_at <= ?5
                    AND r.status = 'succeeded'
-                 ORDER BY p.observed_at DESC
+                 ORDER BY p.trade_date DESC, p.observed_at DESC
                  LIMIT 1",
                 params![
                     instrument_id,
@@ -552,7 +552,7 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
-    /// Вернуть последнее по знанию опубликованное наблюдение НКД.
+    /// Вернуть последнее опубликованное наблюдение НКД по торговой дате и знанию.
     pub fn accrued_interest_at_or_before(
         &self,
         instrument_id: &str,
@@ -572,7 +572,7 @@ impl SqliteStore {
                    AND a.trade_date <= ?4
                    AND a.observed_at <= ?5
                    AND r.status = 'succeeded'
-                 ORDER BY a.observed_at DESC, a.trade_date DESC
+                 ORDER BY a.trade_date DESC, a.observed_at DESC
                  LIMIT 1",
                 params![
                     instrument_id,

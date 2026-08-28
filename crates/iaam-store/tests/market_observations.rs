@@ -707,6 +707,358 @@ fn an_expired_lease_is_replaced_and_old_token_cannot_finish() {
 }
 
 #[test]
+fn цена_выбирает_последнюю_торговую_дату_а_затем_знание() {
+    let (mut store, instrument) = store_with_instrument();
+    let old_day = store
+        .begin_run(
+            series("SBER:TQBR:1"),
+            date!(2026 - 08 - 20),
+            date!(2026 - 08 - 20),
+            lease(),
+        )
+        .expect("запуск старого торгового дня");
+    store
+        .record_prices(
+            &old_day,
+            "raw-old-day",
+            &[PriceRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQBR".to_owned(),
+                session: 1,
+                trade_date: "2026-08-20".to_owned(),
+                kind: "close".to_owned(),
+                observed_at: "2026-08-28T09:00:00Z".to_owned(),
+                price: "100".to_owned(),
+                currency: "RUB".to_owned(),
+                quotation_basis: "unknown".to_owned(),
+                basis_evidence: String::new(),
+                executability: "executable".to_owned(),
+            }],
+        )
+        .expect("старая цена");
+    store
+        .finish_run(&old_day, RunOutcome::Succeeded, None)
+        .expect("старый день опубликован");
+
+    let recent_day = store
+        .begin_run(
+            series("SBER:TQBR:1"),
+            date!(2026 - 08 - 26),
+            date!(2026 - 08 - 26),
+            lease(),
+        )
+        .expect("запуск свежего торгового дня");
+    store
+        .record_prices(
+            &recent_day,
+            "raw-recent-day",
+            &[PriceRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQBR".to_owned(),
+                session: 1,
+                trade_date: "2026-08-26".to_owned(),
+                kind: "close".to_owned(),
+                observed_at: "2026-08-27T09:00:00Z".to_owned(),
+                price: "101".to_owned(),
+                currency: "RUB".to_owned(),
+                quotation_basis: "unknown".to_owned(),
+                basis_evidence: String::new(),
+                executability: "executable".to_owned(),
+            }],
+        )
+        .expect("свежая цена");
+    store
+        .finish_run(&recent_day, RunOutcome::Succeeded, None)
+        .expect("свежий день опубликован");
+
+    let value = store
+        .prices_at_or_before(
+            &instrument.inner().to_string(),
+            &PriceVenue {
+                board: "TQBR".to_owned(),
+                session: 1,
+            },
+            "2026-08-26",
+            "2026-08-29T00:00:00Z",
+        )
+        .expect("чтение цены")
+        .expect("цена найдена");
+    assert_eq!(value.trade_date, "2026-08-26");
+    assert_eq!(value.price, "101");
+}
+
+#[test]
+fn нкд_выбирает_последнюю_торговую_дату_а_затем_знание() {
+    let (mut store, instrument) = store_with_instrument();
+    let old_day = store
+        .begin_run(
+            series("SBER:TQOB:3"),
+            date!(2026 - 08 - 20),
+            date!(2026 - 08 - 20),
+            lease(),
+        )
+        .expect("запуск старого торгового дня");
+    store
+        .record_accrued_interest(
+            &old_day,
+            "raw-old-day",
+            &[AccruedInterestRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQOB".to_owned(),
+                session: 3,
+                trade_date: "2026-08-20".to_owned(),
+                observed_at: "2026-08-28T09:00:00Z".to_owned(),
+                per_unit: "15.00".to_owned(),
+                currency: "RUB".to_owned(),
+            }],
+        )
+        .expect("старый НКД");
+    store
+        .finish_run(&old_day, RunOutcome::Succeeded, None)
+        .expect("старый НКД опубликован");
+
+    let recent_day = store
+        .begin_run(
+            series("SBER:TQOB:3"),
+            date!(2026 - 08 - 26),
+            date!(2026 - 08 - 26),
+            lease(),
+        )
+        .expect("запуск свежего торгового дня");
+    store
+        .record_accrued_interest(
+            &recent_day,
+            "raw-recent-day",
+            &[AccruedInterestRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQOB".to_owned(),
+                session: 3,
+                trade_date: "2026-08-26".to_owned(),
+                observed_at: "2026-08-27T09:00:00Z".to_owned(),
+                per_unit: "16.00".to_owned(),
+                currency: "RUB".to_owned(),
+            }],
+        )
+        .expect("свежий НКД");
+    store
+        .finish_run(&recent_day, RunOutcome::Succeeded, None)
+        .expect("свежий НКД опубликован");
+
+    let value = store
+        .accrued_interest_at_or_before(
+            &instrument.inner().to_string(),
+            &PriceVenue {
+                board: "TQOB".to_owned(),
+                session: 3,
+            },
+            "2026-08-26",
+            "2026-08-29T00:00:00Z",
+        )
+        .expect("чтение НКД")
+        .expect("НКД найден");
+    assert_eq!(value.trade_date, "2026-08-26");
+    assert_eq!(value.per_unit, "16.00");
+}
+
+#[test]
+fn уточнение_внутри_торговой_даты_побеждает_для_цены_и_нкд() {
+    let (mut store, instrument) = store_with_instrument();
+    let first_price = store
+        .begin_run(
+            series("SBER:TQBR:1"),
+            date!(2026 - 08 - 26),
+            date!(2026 - 08 - 26),
+            lease(),
+        )
+        .expect("первый запуск цены");
+    store
+        .record_prices(
+            &first_price,
+            "raw-price-1",
+            &[PriceRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQBR".to_owned(),
+                session: 1,
+                trade_date: "2026-08-26".to_owned(),
+                kind: "close".to_owned(),
+                observed_at: "2026-08-27T09:00:00Z".to_owned(),
+                price: "101".to_owned(),
+                currency: "RUB".to_owned(),
+                quotation_basis: "unknown".to_owned(),
+                basis_evidence: String::new(),
+                executability: "executable".to_owned(),
+            }],
+        )
+        .expect("первая цена");
+    store
+        .finish_run(&first_price, RunOutcome::Succeeded, None)
+        .unwrap();
+
+    let second_price = store
+        .begin_run(
+            series("SBER:TQBR:1"),
+            date!(2026 - 08 - 26),
+            date!(2026 - 08 - 26),
+            lease(),
+        )
+        .expect("второй запуск цены");
+    store
+        .record_prices(
+            &second_price,
+            "raw-price-2",
+            &[PriceRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQBR".to_owned(),
+                session: 1,
+                trade_date: "2026-08-26".to_owned(),
+                kind: "close".to_owned(),
+                observed_at: "2026-08-28T09:00:00Z".to_owned(),
+                price: "102".to_owned(),
+                currency: "RUB".to_owned(),
+                quotation_basis: "unknown".to_owned(),
+                basis_evidence: String::new(),
+                executability: "executable".to_owned(),
+            }],
+        )
+        .expect("уточнение цены");
+    store
+        .finish_run(&second_price, RunOutcome::Succeeded, None)
+        .unwrap();
+
+    let first_interest = store
+        .begin_run(
+            series("SBER:TQOB:3"),
+            date!(2026 - 08 - 26),
+            date!(2026 - 08 - 26),
+            lease(),
+        )
+        .expect("первый запуск НКД");
+    store
+        .record_accrued_interest(
+            &first_interest,
+            "raw-interest-1",
+            &[AccruedInterestRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQOB".to_owned(),
+                session: 3,
+                trade_date: "2026-08-26".to_owned(),
+                observed_at: "2026-08-27T09:00:00Z".to_owned(),
+                per_unit: "16.00".to_owned(),
+                currency: "RUB".to_owned(),
+            }],
+        )
+        .expect("первый НКД");
+    store
+        .finish_run(&first_interest, RunOutcome::Succeeded, None)
+        .unwrap();
+
+    let second_interest = store
+        .begin_run(
+            series("SBER:TQOB:3"),
+            date!(2026 - 08 - 26),
+            date!(2026 - 08 - 26),
+            lease(),
+        )
+        .expect("второй запуск НКД");
+    store
+        .record_accrued_interest(
+            &second_interest,
+            "raw-interest-2",
+            &[AccruedInterestRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQOB".to_owned(),
+                session: 3,
+                trade_date: "2026-08-26".to_owned(),
+                observed_at: "2026-08-28T09:00:00Z".to_owned(),
+                per_unit: "17.00".to_owned(),
+                currency: "RUB".to_owned(),
+            }],
+        )
+        .expect("уточнение НКД");
+    store
+        .finish_run(&second_interest, RunOutcome::Succeeded, None)
+        .unwrap();
+
+    let venue = PriceVenue {
+        board: "TQBR".to_owned(),
+        session: 1,
+    };
+    let price = store
+        .prices_at_or_before(
+            &instrument.inner().to_string(),
+            &venue,
+            "2026-08-26",
+            "2026-08-29T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(price.price, "102");
+
+    let interest = store
+        .accrued_interest_at_or_before(
+            &instrument.inner().to_string(),
+            &PriceVenue {
+                board: "TQOB".to_owned(),
+                session: 3,
+            },
+            "2026-08-26",
+            "2026-08-29T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(interest.per_unit, "17.00");
+}
+
+#[test]
+fn наблюдение_после_координаты_знания_не_видно() {
+    let (mut store, instrument) = store_with_instrument();
+    let run = store
+        .begin_run(
+            series("SBER:TQBR:1"),
+            date!(2026 - 08 - 26),
+            date!(2026 - 08 - 26),
+            lease(),
+        )
+        .expect("запуск");
+    store
+        .record_prices(
+            &run,
+            "raw-future",
+            &[PriceRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQBR".to_owned(),
+                session: 1,
+                trade_date: "2026-08-26".to_owned(),
+                kind: "close".to_owned(),
+                observed_at: "2026-08-29T09:00:00Z".to_owned(),
+                price: "103".to_owned(),
+                currency: "RUB".to_owned(),
+                quotation_basis: "unknown".to_owned(),
+                basis_evidence: String::new(),
+                executability: "executable".to_owned(),
+            }],
+        )
+        .expect("будущая цена");
+    store.finish_run(&run, RunOutcome::Succeeded, None).unwrap();
+
+    assert!(
+        store
+            .prices_at_or_before(
+                &instrument.inner().to_string(),
+                &PriceVenue {
+                    board: "TQBR".to_owned(),
+                    session: 1,
+                },
+                "2026-08-26",
+                "2026-08-28T00:00:00Z",
+            )
+            .unwrap()
+            .is_none(),
+        "знание из будущего не публикуется"
+    );
+}
+
+#[test]
 fn the_quotation_basis_survives_a_round_trip_through_every_read_path() {
     // Основание, потерянное на одном из путей чтения, обнаружится
     // не отказом, а заниженной в номинал/100 раз стоимостью позиции.

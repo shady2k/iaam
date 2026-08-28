@@ -9,11 +9,23 @@
 use serde::{Deserialize, Serialize};
 use time::Date;
 
+use crate::instrument::CurrencyRoles;
 use crate::money::PerUnitAmount;
 use crate::numeric::decimal::Dec;
 
 pub mod finality;
+pub mod offer;
 pub mod posting;
+pub use offer::{
+    OfferRight, OfferWindowError, OfferWindowId, OfferWindowTerms, ScheduleCompleteness,
+};
+
+/// Объявленный дефолт по выпуску.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultFlags {
+    pub declared: bool,
+    pub technical: bool,
+}
 
 /// Купонный период: начисление и платёж — разные даты.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,14 +52,27 @@ pub struct PrincipalReturn {
     /// Доля ПЕРВОНАЧАЛЬНОГО номинала, в процентах.
     pub share_percent: Dec,
 }
+
 /// График выплат облигации на координату знания.
 ///
 /// Это компактный доменный вход ядра, а не зеркало структуры источника:
 /// перевод снимка в него выполняет слой приложения.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` нужен для тестовых литералов через `..Default::default()`.
+/// В рабочем коде `BondSchedule::default()` вызывать нельзя: пустой график
+/// с полнотой `Unknown` означает неизвестный источник, а не отсутствие графика.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BondSchedule {
     pub periods: Vec<AccrualPeriod>,
     pub principal_returns: Vec<PrincipalReturn>,
+    #[serde(default)]
+    pub offer_windows: Vec<offer::OfferWindowTerms>,
+    #[serde(default)]
+    pub completeness: offer::ScheduleCompleteness,
+    #[serde(default)]
+    pub default_flags: Option<DefaultFlags>,
+    #[serde(default)]
+    pub currency_roles: Option<CurrencyRoles>,
 }
 
 #[cfg(test)]
@@ -79,5 +104,34 @@ mod tests {
             coupon_per_unit: None,
         };
         assert!(period.coupon_per_unit.is_none());
+    }
+
+    #[test]
+    fn bond_schedule_carries_typed_offer_and_quality_inputs() {
+        let instrument = crate::ids::InstrumentId::new_random();
+        let window = offer::OfferWindowId::derive(instrument, date!(2026 - 12 - 01));
+        let schedule = BondSchedule {
+            periods: Vec::new(),
+            principal_returns: Vec::new(),
+            offer_windows: vec![offer::OfferWindowTerms {
+                window,
+                right: offer::OfferRight::HolderPut,
+                execution_date: date!(2026 - 12 - 01),
+                submission_start: None,
+                submission_end: None,
+                price_percent: None,
+            }],
+            completeness: offer::ScheduleCompleteness::Validated,
+            default_flags: Some(DefaultFlags {
+                declared: false,
+                technical: false,
+            }),
+            currency_roles: Some(CurrencyRoles::uniform(crate::money::CurrencyCode::Rub)),
+        };
+
+        assert_eq!(schedule.offer_windows[0].window, window);
+        assert_eq!(schedule.completeness, offer::ScheduleCompleteness::Validated);
+        assert!(schedule.currency_roles.is_some());
+        assert!(BondSchedule::default().default_flags.is_none());
     }
 }

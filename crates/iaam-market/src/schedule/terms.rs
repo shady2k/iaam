@@ -5,6 +5,7 @@
 //! вопроса заставляет отчёт воспроизвести условия, которых на выбранную
 //! дату не существовало.
 
+pub use iaam_core::bond::DefaultFlags;
 use iaam_core::ids::InstrumentId;
 use iaam_core::numeric::decimal::Dec;
 use serde::{Deserialize, Serialize};
@@ -12,16 +13,6 @@ use time::Date;
 
 use crate::observation::ObservedAt;
 use crate::schedule::Knowledge;
-
-/// Объявленный дефолт по выпуску.
-///
-/// Метрика по бумаге в дефолте, посчитанная так, будто выплаты
-/// состоятся, — правдоподобная ложь. Признак обязан доходить до отказа.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DefaultFlags {
-    pub declared: bool,
-    pub technical: bool,
-}
 
 /// Снимок условий выпуска — набор утверждений **одного** источника
 /// на **один** `observed_at`.

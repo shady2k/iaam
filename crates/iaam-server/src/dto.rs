@@ -672,7 +672,8 @@ pub struct SelectedPriceDto {
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub trade_date: Date,
-    pub observed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
     pub executability: String,
     pub selection: PriceSelectionDto,
     pub freshness: PriceFreshnessDto,
@@ -771,7 +772,8 @@ pub struct PriceProvenanceDto {
     pub quotation_basis: QuotationBasisDto,
     #[serde(default)]
     pub basis_evidence: Option<String>,
-    pub observed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
     pub valuation_policy_version: u32,
     pub source_priority_version: u32,
     pub carry_forward_limit: u16,
@@ -1107,10 +1109,12 @@ fn principal_return_finality(value: iaam_core::bond::finality::PrincipalReturnFi
     .to_owned()
 }
 
-fn format_timestamp(value: OffsetDateTime) -> String {
-    value
-        .format(&time::format_description::well_known::Rfc3339)
-        .expect("временная метка provenance должна форматироваться")
+fn format_timestamp(value: Option<OffsetDateTime>) -> Option<String> {
+    value.map(|value| {
+        value
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("временная метка provenance должна форматироваться")
+    })
 }
 
 fn executability(value: SourceExecutability) -> &'static str {
@@ -1909,14 +1913,17 @@ mod tests {
         );
     }
 
-    /// Время наблюдения уходит в отчёт строкой. Пустая строка на месте
-    /// метки времени не отличима от «наблюдение без времени», а такого
-    /// наблюдения не бывает: по этой метке решают, свежая ли цена.
+    /// Время наблюдения уходит в отчёт строкой, а неизвестное время
+    /// отсутствует в ответе вместо подстановки пустой строки.
     #[test]
     fn a_timestamp_travels_as_rfc_3339_in_utc() {
         let value =
             OffsetDateTime::from_unix_timestamp(1_787_000_000).expect("метка времени представима");
-        assert_eq!(format_timestamp(value), "2026-08-17T20:53:20Z");
+        assert_eq!(
+            format_timestamp(Some(value)),
+            Some("2026-08-17T20:53:20Z".to_owned())
+        );
+        assert_eq!(format_timestamp(None), None);
     }
 
     /// Сумма без валюты не бывает: если бы валюта была необязательной,
@@ -2238,7 +2245,7 @@ mod tests {
             venue: Some("moex".to_owned()),
             quotation_basis: iaam_core::valuation::QuotationBasis::PercentOfRemainingFace,
             basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
-            observed_at: time::macros::datetime!(2026-08-26 08:00:00 UTC),
+            observed_at: Some(time::macros::datetime!(2026-08-26 08:00:00 UTC)),
             valuation_policy_version: 1,
             source_priority_version: 1,
             carry_forward_limit: 10,

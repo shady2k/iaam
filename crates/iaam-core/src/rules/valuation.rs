@@ -147,8 +147,13 @@ impl ValuationRule for ValuationPolicyV1 {
             if candidate.instrument != query.instrument {
                 continue;
             }
-            if candidate.trade_date > query.as_of || candidate.observed_at > query.knowledge_as_of {
+            if candidate.trade_date > query.as_of {
                 continue;
+            }
+            if let Some(observed_at) = candidate.observed_at {
+                if observed_at > query.knowledge_as_of {
+                    continue;
+                }
             }
             let age = (query.as_of - candidate.trade_date).whole_days();
             if age < 0 {
@@ -227,12 +232,18 @@ impl ValuationRule for ValuationPolicyV1 {
             });
         }
 
-        let latest_observed_at = matching
+        // Безвременные кандидаты не могут конкурировать по свежести с
+        // известными: сравнивать их момент знания не с чем. Если известный
+        // момент есть, он оставляет только самый свежий; если нет, все
+        // безвременные остаются и несколько таких кандидатов дают явный
+        // отказ как неоднозначные.
+        if let Some(latest_observed_at) = matching
             .iter()
-            .map(|(_, candidate)| candidate.observed_at)
+            .filter_map(|(_, candidate)| candidate.observed_at)
             .max()
-            .expect("not empty");
-        matching.retain(|(_, candidate)| candidate.observed_at == latest_observed_at);
+        {
+            matching.retain(|(_, candidate)| candidate.observed_at == Some(latest_observed_at));
+        }
 
         if matching.len() != 1 {
             return PriceSelectionResult {
@@ -290,7 +301,7 @@ mod tests {
             basis_evidence: String::new(),
             basis_evidence_contradicts: false,
             trade_date,
-            observed_at: datetime!(2026 - 08 - 10 12:00 UTC),
+            observed_at: Some(datetime!(2026 - 08 - 10 12:00 UTC)),
             origin: PriceOrigin::ReportParsed {
                 source: crate::ids::SourceId::new_random(),
             },
@@ -305,7 +316,7 @@ mod tests {
         origin: PriceOrigin,
     ) -> PriceCandidate {
         let mut candidate = candidate(instrument, trade_date);
-        candidate.observed_at = observed_at;
+        candidate.observed_at = Some(observed_at);
         candidate.origin = origin;
         candidate
     }
@@ -680,7 +691,7 @@ mod tests {
                 .expect("версия до knowledge_as_of")
                 .provenance
                 .observed_at,
-            datetime!(2026 - 08 - 10 11:00 UTC)
+            Some(datetime!(2026 - 08 - 10 11:00 UTC))
         );
     }
 
@@ -800,10 +811,93 @@ mod tests {
         );
         assert_eq!(provenance.basis_evidence, "iss:engines/stock/markets/bonds");
         assert!(matches!(provenance.origin, PriceOrigin::Market { .. }));
-        assert_eq!(provenance.observed_at, observed_at);
+        assert_eq!(provenance.observed_at, Some(observed_at));
         assert_eq!(provenance.valuation_policy_version, 1);
         assert_eq!(provenance.source_priority_version, 1);
         assert_eq!(provenance.carry_forward_limit, 10);
         assert_eq!(provenance.price_max_age, 30);
+    }
+    #[test]
+    fn известное_время_отчёта_побеждает_неизвестное_в_любом_порядке() {
+        let query = query(date!(2026 - 08 - 10));
+        let known_at = datetime!(2026 - 08 - 10 11:00 UTC);
+        let known = candidate_from_origin(
+            query.instrument,
+            query.as_of,
+            known_at,
+            PriceOrigin::ReportParsed {
+                source: crate::ids::SourceId::new_random(),
+            },
+        );
+        let mut unknown = known.clone();
+        unknown.observed_at = None;
+
+        for candidates in [[known.clone(), unknown.clone()], [unknown, known]] {
+            let result = policy().select(&query, &candidates);
+            let selected = result
+                .selected()
+                .expect("известное время должно победить");
+            assert_eq!(selected.provenance.observed_at, Some(known_at));
+        }
+    }
+    #[test]
+    fn рыночное_время_побеждает_журнальное_безвременное_в_любом_порядке() {
+        let query = query(date!(2026 - 08 - 10));
+        let mut journal = candidate_from_origin(
+            query.instrument,
+            query.as_of,
+            datetime!(2026 - 08 - 10 10:00 UTC),
+            PriceOrigin::ReportParsed {
+                source: crate::ids::SourceId::new_random(),
+            },
+        );
+        journal.observed_at = None;
+        let market = market_candidate(
+            query.instrument,
+            "TQBR",
+            "legal_close",
+            query.as_of,
+            datetime!(2026 - 08 - 10 11:00 UTC),
+        );
+
+        for candidates in [[market.clone(), journal.clone()], [journal, market]] {
+            let result = policy().select(&query, &candidates);
+            let selected = result
+                .selected()
+                .expect("известное рыночное время должно победить");
+            assert!(matches!(selected.candidate.origin, PriceOrigin::Market { .. }));
+        }
+    }
+
+    #[test]
+    fn журнальные_кандидаты_без_времени_детерминированы_и_не_зависят_от_координаты() {
+        let instrument = instrument();
+        let mut first = candidate(instrument, date!(2026 - 08 - 10));
+        first.observed_at = None;
+        let mut second = candidate(instrument, date!(2026 - 08 - 10));
+        second.observed_at = None;
+        let queries = [
+            PriceQuery {
+                instrument,
+                as_of: date!(2026 - 08 - 10),
+                knowledge_as_of: datetime!(2026 - 08 - 10 00:00 UTC),
+            },
+            PriceQuery {
+                instrument,
+                as_of: date!(2026 - 08 - 10),
+                knowledge_as_of: datetime!(2026 - 08 - 10 23:59 UTC),
+            },
+        ];
+
+        for query in queries {
+            for candidates in [[first.clone(), second.clone()], [second.clone(), first.clone()]] {
+                let result = policy().select(&query, &candidates);
+                assert!(result.selected().is_none());
+                assert_eq!(
+                    result.uncovered_reason(),
+                    Some(UncoveredReason::AmbiguousCandidate)
+                );
+            }
+        }
     }
 }

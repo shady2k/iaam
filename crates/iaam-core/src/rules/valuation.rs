@@ -834,9 +834,7 @@ mod tests {
 
         for candidates in [[known.clone(), unknown.clone()], [unknown, known]] {
             let result = policy().select(&query, &candidates);
-            let selected = result
-                .selected()
-                .expect("известное время должно победить");
+            let selected = result.selected().expect("известное время должно победить");
             assert_eq!(selected.provenance.observed_at, Some(known_at));
         }
     }
@@ -865,7 +863,10 @@ mod tests {
             let selected = result
                 .selected()
                 .expect("известное рыночное время должно победить");
-            assert!(matches!(selected.candidate.origin, PriceOrigin::Market { .. }));
+            assert!(matches!(
+                selected.candidate.origin,
+                PriceOrigin::Market { .. }
+            ));
         }
     }
 
@@ -890,7 +891,10 @@ mod tests {
         ];
 
         for query in queries {
-            for candidates in [[first.clone(), second.clone()], [second.clone(), first.clone()]] {
+            for candidates in [
+                [first.clone(), second.clone()],
+                [second.clone(), first.clone()],
+            ] {
                 let result = policy().select(&query, &candidates);
                 assert!(result.selected().is_none());
                 assert_eq!(

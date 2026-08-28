@@ -1389,10 +1389,7 @@ async fn неоднозначное_название_счёта_отвергае
     assert_eq!(body[0]["verdict"], "rejected");
     assert_eq!(body[0]["field"], "account");
     let actual = body[0]["actual"].as_str().expect("причина отказа");
-    assert_eq!(
-        actual,
-        "Брокерский: название счёта неоднозначно: 2 счёта"
-    );
+    assert_eq!(actual, "Брокерский: название счёта неоднозначно: 2 счёта");
     assert_eq!(body[1]["verdict"], "provisional");
 
     drop(harness);

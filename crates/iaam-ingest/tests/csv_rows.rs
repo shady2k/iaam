@@ -100,7 +100,10 @@ fn неоднозначное_название_счёта_отвергается
     let rows = parse(&document, &dir);
 
     let ParsedRow::Rejected(rejection) = &rows[0] else {
-        panic!("неоднозначное название должно быть отвергнуто: {:?}", rows[0]);
+        panic!(
+            "неоднозначное название должно быть отвергнуто: {:?}",
+            rows[0]
+        );
     };
     assert_eq!(rejection.field, "account");
     assert_eq!(

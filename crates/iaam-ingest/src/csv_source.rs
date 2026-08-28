@@ -452,7 +452,10 @@ fn lookup<T: Copy>(
         _ => Err(Rejection {
             field: field.to_owned(),
             expected: "однозначное имя из справочника".into(),
-            actual: format!("{name}: название {entity} неоднозначно: {} {entity}", candidates.len()),
+            actual: format!(
+                "{name}: название {entity} неоднозначно: {} {entity}",
+                candidates.len()
+            ),
         }),
     }
 }

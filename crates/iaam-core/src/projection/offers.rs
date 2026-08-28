@@ -150,6 +150,27 @@ impl OfferBook {
     }
 }
 
+/// Перечислить заявки, чьи записанные окна отсутствуют в реестре графика.
+///
+/// Старые факты журнала не переписываются и не сопоставляются с окнами по
+/// похожей дате: у заявки есть только сохранённый идентификатор окна.
+#[must_use]
+pub fn unresolved_submissions(
+    book: &OfferBook,
+    schedule: &crate::bond::BondSchedule,
+) -> Vec<OfferSubmissionId> {
+    book.submissions
+        .iter()
+        .filter_map(|(submission, state)| {
+            let known = schedule
+                .offer_windows
+                .iter()
+                .any(|window| window.window == state.window);
+            if known { None } else { Some(*submission) }
+        })
+        .collect()
+}
+
 /// Отозванное плюс исполненное не превосходит поданного.
 ///
 /// Инвариант цепочки: отдельный факт расчёта сам по себе безупречен,
@@ -370,5 +391,72 @@ mod tests {
         book.apply(&settled(submission, qty("6"))).unwrap();
         let text = serde_json::to_string(&book).unwrap();
         assert_eq!(serde_json::from_str::<OfferBook>(&text).unwrap(), book);
+    }
+    #[test]
+    fn unresolved_submissions_names_only_windows_missing_from_schedule() {
+        let known_window = OfferWindowId::new_random();
+        let unknown_window = OfferWindowId::new_random();
+        let known_submission = OfferSubmissionId::new_random();
+        let unknown_submission = OfferSubmissionId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut book = OfferBook::default();
+        book.apply(&OfferExerciseAction::Submitted {
+            submission: known_submission,
+            window: known_window,
+            instrument,
+            quantity: qty("1"),
+        })
+        .unwrap();
+        book.apply(&OfferExerciseAction::Submitted {
+            submission: unknown_submission,
+            window: unknown_window,
+            instrument,
+            quantity: qty("1"),
+        })
+        .unwrap();
+        let schedule = crate::bond::BondSchedule {
+            offer_windows: vec![crate::bond::OfferWindowTerms {
+                window: known_window,
+                right: crate::bond::OfferRight::HolderPut,
+                execution_date: time::macros::date!(2026 - 12 - 01),
+                submission_start: None,
+                submission_end: None,
+                price_percent: Some(Dec::one()),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unresolved_submissions(&book, &schedule),
+            vec![unknown_submission]
+        );
+    }
+
+    #[test]
+    fn unresolved_submissions_does_not_guess_a_similar_window() {
+        let recorded_window = OfferWindowId::new_random();
+        let submitted_window = OfferWindowId::new_random();
+        let submission = OfferSubmissionId::new_random();
+        let mut book = OfferBook::default();
+        book.apply(&OfferExerciseAction::Submitted {
+            submission,
+            window: submitted_window,
+            instrument: InstrumentId::new_random(),
+            quantity: qty("1"),
+        })
+        .unwrap();
+        let schedule = crate::bond::BondSchedule {
+            offer_windows: vec![crate::bond::OfferWindowTerms {
+                window: recorded_window,
+                right: crate::bond::OfferRight::HolderPut,
+                execution_date: time::macros::date!(2026 - 12 - 01),
+                submission_start: None,
+                submission_end: None,
+                price_percent: Some(Dec::one()),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(unresolved_submissions(&book, &schedule), vec![submission]);
     }
 }

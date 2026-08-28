@@ -1032,10 +1032,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "ciborium",
  "http-body-util",
  "iaam-app",
  "iaam-broker",
  "iaam-core",
+ "iaam-store",
  "insta",
  "rust_decimal",
  "serde",

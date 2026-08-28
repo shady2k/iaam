@@ -38,6 +38,8 @@ insta = { version = "1", features = ["filters", "json", "redactions"] }
 # Только тестам: стенду нужен ключ шифрования, чтобы брокерские
 # маршруты отвечали делом, а не 503.
 iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
+iaam-store = { path = "../iaam-store", version = "0.1.0" }
+ciborium = "0.2"
 tower = "0.5"
 
 [lints]

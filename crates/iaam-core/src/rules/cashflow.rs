@@ -950,4 +950,138 @@ mod tests {
         assert_eq!(plan.postings[1].kind, PostingKind::OfferSettlement);
         assert_eq!(plan.postings[1].amount.value(), dec("100"));
     }
+    #[test]
+    fn rejects_overflow_in_share_sum_and_posting_amounts() {
+        let mut schedule = valid_schedule(
+            vec![],
+            vec![
+                PrincipalReturn {
+                    repayment_date: date!(2026 - 09 - 01),
+                    share_percent: Dec::new(Decimal::MAX),
+                },
+                PrincipalReturn {
+                    repayment_date: date!(2026 - 10 - 01),
+                    share_percent: Dec::new(Decimal::MAX),
+                },
+            ],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+        assert!(matches!(
+            CashflowProjectionV1.future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 08 - 01),
+            )),
+            Err(CashflowError::Numeric(_))
+        ));
+
+        schedule.principal_returns = vec![PrincipalReturn {
+            repayment_date: date!(2026 - 09 - 01),
+            share_percent: dec("100"),
+        }];
+        let original = PerUnitAmount::new(Dec::new(Decimal::MAX), CurrencyCode::Rub);
+        assert!(matches!(
+            CashflowProjectionV1.future_postings(&CashflowInput {
+                schedule: &schedule,
+                principal: PrincipalState::known(original, original).unwrap(),
+                quantity: quantity("2"),
+                choice: &choice,
+                as_of: date!(2026 - 08 - 01),
+                report_currency: CurrencyCode::Rub,
+            }),
+            Err(CashflowError::Numeric(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_currency_mismatch_in_roles_principal_and_coupon() {
+        let mut schedule = valid_schedule(vec![], vec![]);
+        schedule.currency_roles = Some(CurrencyRoles {
+            denomination: CurrencyCode::Rub,
+            settlement: CurrencyCode::Usd,
+            quote: CurrencyCode::Usd,
+        });
+        let choice = OfferChoice::HoldToMaturity;
+        assert!(matches!(
+            CashflowProjectionV1.future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 08 - 01),
+            )),
+            Err(CashflowError::CurrencyFormulaUnknown { .. })
+        ));
+
+        let original = PerUnitAmount::new(dec("100"), CurrencyCode::Usd);
+        schedule.currency_roles = Some(CurrencyRoles::uniform(CurrencyCode::Rub));
+        assert!(matches!(
+            CashflowProjectionV1.future_postings(&CashflowInput {
+                schedule: &schedule,
+                principal: PrincipalState::known(original, original).unwrap(),
+                quantity: quantity("1"),
+                choice: &choice,
+                as_of: date!(2026 - 08 - 01),
+                report_currency: CurrencyCode::Rub,
+            }),
+            Err(CashflowError::CurrencyFormulaUnknown { .. })
+        ));
+
+        schedule.periods = vec![AccrualPeriod {
+            period_start: date!(2026 - 08 - 01),
+            accrual_end: date!(2026 - 09 - 01),
+            payment_date: date!(2026 - 09 - 01),
+            coupon_per_unit: Some(PerUnitAmount::new(dec("1"), CurrencyCode::Usd)),
+        }];
+        assert!(matches!(
+            CashflowProjectionV1.future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 08 - 01),
+            )),
+            Err(CashflowError::CurrencyFormulaUnknown { .. })
+        ));
+    }
+
+
+    #[test]
+    fn rejects_each_non_holder_offer_right() {
+        for right in [
+            crate::bond::OfferRight::HolderPutSettled,
+            crate::bond::OfferRight::IssuerCall,
+            crate::bond::OfferRight::Other,
+        ] {
+            let window = crate::bond::OfferWindowId::derive(
+                crate::ids::InstrumentId::new_random(),
+                date!(2026 - 10 - 01),
+            );
+            let mut schedule = valid_schedule(
+                vec![],
+                vec![PrincipalReturn {
+                    repayment_date: date!(2026 - 12 - 01),
+                    share_percent: dec("100"),
+                }],
+            );
+            schedule.offer_windows.push(crate::bond::OfferWindowTerms {
+                window,
+                right,
+                execution_date: date!(2026 - 10 - 01),
+                submission_start: None,
+                submission_end: None,
+                price_percent: Some(dec("100")),
+            });
+            let choice = OfferChoice::ExerciseAtOffer { window };
+            assert!(matches!(
+                CashflowProjectionV1.future_postings(&input(
+                    &schedule,
+                    known_principal("100", "100"),
+                    &choice,
+                    date!(2026 - 08 - 01),
+                )),
+                Err(CashflowError::OfferWindowNotExercisable { window: actual })
+                    if actual == window
+            ));
+        }
+    }
 }

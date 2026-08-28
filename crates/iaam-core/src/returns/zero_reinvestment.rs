@@ -989,4 +989,480 @@ mod tests {
             Some("expense_unknown")
         );
     }
+    #[test]
+    fn expense_policies_keep_known_and_absent_irr_computable_but_unknown_refused() {
+        let postings = vec![posting(date!(2027 - 01 - 01), "100")];
+        let known = irr_for_expense_policy(
+            postings.clone(),
+            calc("50"),
+            date!(2026 - 01 - 01),
+            ExpenseTreatment::Known {
+                amount: money(1000),
+                on: date!(2026 - 06 - 01),
+            },
+        );
+        assert!(matches!(known, Computed::Value(_)));
+
+        let absent = irr_for_expense_policy(
+            postings.clone(),
+            calc("50"),
+            date!(2026 - 01 - 01),
+            ExpenseTreatment::AbsentByPolicy,
+        );
+        assert!(matches!(absent, Computed::Value(_)));
+
+        let bounded = irr_for_expense_policy(
+            postings,
+            calc("50"),
+            date!(2026 - 01 - 01),
+            ExpenseTreatment::UnknownBoundedBy { upper: money(1000) },
+        );
+        assert_eq!(bounded.reason().map(NotComputable::code), Some("expense_unknown"));
+
+        let unknown = expense_adjusted_metrics(
+            Vec::new(),
+            calc("50"),
+            date!(2026 - 01 - 01),
+            date!(2027 - 01 - 01),
+            ExpenseTreatment::Unknown,
+        );
+        assert!(matches!(
+            unknown,
+            ExpenseMetrics::NotComputable {
+                reason: NotComputable::ExpenseUnknown
+            }
+        ));
+    }
+
+    #[test]
+    fn expense_bound_currency_mismatch_is_not_a_bounded_result() {
+        let result = expense_adjusted_metrics(
+            vec![posting(date!(2027 - 01 - 01), "100")],
+            calc("50"),
+            date!(2026 - 01 - 01),
+            date!(2027 - 01 - 01),
+            ExpenseTreatment::UnknownBoundedBy {
+                upper: Money::new(PostedMinor::new(1000), CurrencyCode::Usd),
+            },
+        );
+        assert!(matches!(
+            result,
+            ExpenseMetrics::NotComputable {
+                reason: NotComputable::CurrencyMismatch {
+                    expected: CurrencyCode::Rub,
+                    actual: CurrencyCode::Usd
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn currency_mismatches_refuse_c0_terminal_wealth_and_payouts() {
+        let foreign_posting = ExpectedPosting {
+            date: date!(2027 - 01 - 01),
+            amount: CalcMoney::new(dec("100"), CurrencyCode::Usd),
+            kind: PostingKind::Coupon,
+        };
+        let metrics = zero_reinvestment_metrics(
+            vec![foreign_posting],
+            calc("50"),
+            date!(2026 - 01 - 01),
+            date!(2027 - 01 - 01),
+        );
+        assert!(matches!(
+            metrics,
+            Computed::NotComputable {
+                reason: NotComputable::CurrencyMismatch {
+                    expected: CurrencyCode::Rub,
+                    actual: CurrencyCode::Usd
+                }
+            }
+        ));
+
+        let c0 = prospective_c0(
+            Quantity(dec("1")),
+            QuotationBasis::MoneyPerUnit,
+            dec("50"),
+            CurrencyCode::Rub,
+            None,
+            CalcMoney::new(dec("0"), CurrencyCode::Usd),
+        );
+        assert!(matches!(
+            c0,
+            Computed::NotComputable {
+                reason: NotComputable::CurrencyMismatch {
+                    expected: CurrencyCode::Rub,
+                    actual: CurrencyCode::Usd
+                }
+            }
+        ));
+
+        let cohort = Cohort {
+            acquired: TradeDate(date!(2026 - 01 - 01)),
+            quantity: Quantity(dec("1")),
+            cost_basis: money(100),
+            acquisition_basis: Some(money(100)),
+            accrued_interest_paid: Some(money(0)),
+            received_to_date: Some(Money::new(PostedMinor::new(100), CurrencyCode::Usd)),
+        };
+        let lifetime = lifetime_cohort_metric(cohort, Vec::new(), date!(2027 - 01 - 01));
+        assert_eq!(
+            lifetime.metrics.reason().map(NotComputable::code),
+            Some("currency_mismatch")
+        );
+
+        let cohort = Cohort {
+            received_to_date: Some(money(0)),
+            ..cohort
+        };
+        let lifetime = lifetime_cohort_metric(cohort, vec![foreign_posting], date!(2027 - 01 - 01));
+        assert_eq!(
+            lifetime.metrics.reason().map(NotComputable::code),
+            Some("currency_mismatch")
+        );
+    }
+
+    #[test]
+    fn arithmetic_refusals_preserve_their_diagnostic_codes() {
+        let extreme_posting = ExpectedPosting {
+            date: date!(2027 - 01 - 01),
+            amount: CalcMoney::new(Dec::new(Decimal::MAX), CurrencyCode::Rub),
+            kind: PostingKind::Coupon,
+        };
+        let surplus = zero_reinvestment_metrics(
+            vec![extreme_posting],
+            CalcMoney::new(Dec::new(Decimal::MIN), CurrencyCode::Rub),
+            date!(2026 - 01 - 01),
+            date!(2027 - 01 - 01),
+        );
+        assert_eq!(surplus.reason().map(NotComputable::code), Some("numeric"));
+        assert!(matches!(
+            surplus,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric { code: "surplus_sub" }
+            }
+        ));
+
+        let tiny = CalcMoney::new(Dec::new(Decimal::new(1, 18)), CurrencyCode::Rub);
+        let hpr = zero_reinvestment_metrics(
+            vec![extreme_posting],
+            tiny,
+            date!(2026 - 01 - 01),
+            date!(2027 - 01 - 01),
+        );
+        let Computed::Value(hpr_metrics) = hpr else {
+            panic!("hpr overflow belongs to the hpr field");
+        };
+        assert!(matches!(
+            hpr_metrics.hpr,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric { code: "hpr_div" }
+            }
+        ));
+
+        let cohort_quantity_div = split_postings(
+            &[],
+            Dec::one(),
+            Dec::zero(),
+        );
+        assert!(matches!(
+            cohort_quantity_div,
+            Err(NotComputable::Numeric {
+                code: "cohort_quantity_div"
+            })
+        ));
+
+        let cohort_posting_mul = split_postings(
+            &[extreme_posting],
+            Dec::new(Decimal::from(2)),
+            Dec::one(),
+        );
+        assert!(matches!(
+            cohort_posting_mul,
+            Err(NotComputable::Numeric {
+                code: "cohort_posting_mul"
+            })
+        ));
+
+        let cohort_posting_remainder_sub = split_postings(
+            &[ExpectedPosting {
+                amount: CalcMoney::new(Dec::new(Decimal::MAX), CurrencyCode::Rub),
+                ..extreme_posting
+            }],
+            Dec::new(Decimal::from(-1)),
+            Dec::one(),
+        );
+        assert!(matches!(
+            cohort_posting_remainder_sub,
+            Err(NotComputable::Numeric {
+                code: "cohort_posting_remainder_sub"
+            })
+        ));
+
+    }
+
+    #[test]
+    fn lifetime_wealth_and_acquisition_additions_refuse_overflow() {
+        let acquisition_overflow = Cohort {
+            acquired: TradeDate(date!(2026 - 01 - 01)),
+            quantity: Quantity(dec("1")),
+            cost_basis: money(0),
+            acquisition_basis: Some(Money::new(PostedMinor::new(i64::MAX), CurrencyCode::Rub)),
+            accrued_interest_paid: Some(money(1)),
+            received_to_date: Some(money(0)),
+        };
+        let metric =
+            lifetime_cohort_metric(acquisition_overflow, Vec::new(), date!(2027 - 01 - 01));
+        assert_eq!(
+            metric.c0.reason().map(NotComputable::code),
+            Some("numeric")
+        );
+        assert!(matches!(
+            metric.c0,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "acquisition_c0_add"
+                }
+            }
+        ));
+
+        let wealth_overflow = Cohort {
+            acquired: TradeDate(date!(2026 - 01 - 01)),
+            quantity: Quantity(dec("1")),
+            cost_basis: money(0),
+            acquisition_basis: Some(money(100)),
+            accrued_interest_paid: Some(money(0)),
+            received_to_date: Some(Money::new(
+                PostedMinor::new(i64::MAX),
+                CurrencyCode::Rub,
+            )),
+        };
+        let posting = ExpectedPosting {
+            date: date!(2027 - 01 - 01),
+            amount: CalcMoney::new(Dec::new(Decimal::MAX), CurrencyCode::Rub),
+            kind: PostingKind::Coupon,
+        };
+        let metric = lifetime_cohort_metric(wealth_overflow, vec![posting], date!(2027 - 01 - 01));
+        assert!(matches!(
+            metric.metrics,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "lifetime_wealth_add"
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn cohort_quantity_sum_overflow_and_empty_quantity_are_explicit() {
+        let cohort = |quantity| Cohort {
+            acquired: TradeDate(date!(2026 - 01 - 01)),
+            quantity: Quantity(quantity),
+            cost_basis: money(0),
+            acquisition_basis: Some(money(0)),
+            accrued_interest_paid: Some(money(0)),
+            received_to_date: Some(money(0)),
+        };
+        let plan = CashflowPlan {
+            postings: Vec::new(),
+            terminal_date: date!(2027 - 01 - 01),
+            past: Vec::new(),
+        };
+        let result = lifetime_cohort_metrics(
+            &[
+                cohort(Dec::new(Decimal::MAX)),
+                cohort(Dec::new(Decimal::MAX)),
+            ],
+            &plan,
+        );
+        assert!(matches!(
+            result,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "cohort_quantity_sum"
+                }
+            }
+        ));
+
+        assert_eq!(
+            lifetime_cohort_metrics(&[cohort(Dec::zero())], &plan),
+            Computed::Value(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unknown_acquisition_interest_and_receipts_remain_distinct() {
+        let base = Cohort {
+            acquired: TradeDate(date!(2026 - 01 - 01)),
+            quantity: Quantity(dec("1")),
+            cost_basis: money(100),
+            acquisition_basis: Some(money(100)),
+            accrued_interest_paid: Some(money(0)),
+            received_to_date: Some(money(0)),
+        };
+        let missing_accrued = lifetime_cohort_metric(
+            Cohort {
+                accrued_interest_paid: None,
+                ..base
+            },
+            Vec::new(),
+            date!(2027 - 01 - 01),
+        );
+        assert_eq!(
+            missing_accrued.c0.reason().map(NotComputable::code),
+            Some("accrued_interest_at_acquisition_unknown")
+        );
+
+        let missing_receipts = lifetime_cohort_metric(
+            Cohort {
+                received_to_date: None,
+                ..base
+            },
+            Vec::new(),
+            date!(2027 - 01 - 01),
+        );
+        assert_eq!(
+            missing_receipts.metrics.reason().map(NotComputable::code),
+            Some("historical_receipts_unknown")
+        );
+    }
+    #[test]
+    fn prospective_c0_refuses_unknown_basis_missing_face_and_numeric_arithmetic() {
+        let unknown = prospective_c0(
+            Quantity(dec("1")),
+            QuotationBasis::Unknown,
+            dec("50"),
+            CurrencyCode::Rub,
+            None,
+            calc("0"),
+        );
+        assert!(matches!(
+            unknown,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "quotation_basis_unknown"
+                }
+            }
+        ));
+
+        let missing_face = prospective_c0(
+            Quantity(dec("1")),
+            QuotationBasis::PercentOfRemainingFace,
+            dec("50"),
+            CurrencyCode::Rub,
+            None,
+            calc("0"),
+        );
+        assert!(matches!(
+            missing_face,
+            Computed::NotComputable {
+                reason: NotComputable::PrincipalUnknown
+            }
+        ));
+
+        let numeric_quote = prospective_c0(
+            Quantity(dec("1")),
+            QuotationBasis::PercentOfRemainingFace,
+            Dec::new(Decimal::MAX),
+            CurrencyCode::Rub,
+            Some(PerUnitAmount::new(Dec::new(Decimal::MAX), CurrencyCode::Rub)),
+            calc("0"),
+        );
+        assert!(matches!(
+            numeric_quote,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "quotation_numeric"
+                }
+            }
+        ));
+
+        let position_overflow = prospective_c0(
+            Quantity(Dec::new(Decimal::MAX)),
+            QuotationBasis::MoneyPerUnit,
+            dec("2"),
+            CurrencyCode::Rub,
+            None,
+            calc("0"),
+        );
+        assert!(matches!(
+            position_overflow,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "prospective_position_mul"
+                }
+            }
+        ));
+
+        let addition_overflow = prospective_c0(
+            Quantity(dec("1")),
+            QuotationBasis::MoneyPerUnit,
+            Dec::new(Decimal::MAX),
+            CurrencyCode::Rub,
+            None,
+            CalcMoney::new(dec("1"), CurrencyCode::Rub),
+        );
+        assert!(matches!(
+            addition_overflow,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "prospective_c0_add"
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn irr_refuses_currency_mismatched_postings_and_keeps_noop_expense() {
+
+        let mismatched = irr_for_expense_policy(
+            vec![ExpectedPosting {
+                date: date!(2027 - 01 - 01),
+                amount: CalcMoney::new(dec("1"), CurrencyCode::Usd),
+                kind: PostingKind::Coupon,
+            }],
+            calc("1"),
+            date!(2026 - 01 - 01),
+            ExpenseTreatment::AbsentByPolicy,
+        );
+        assert!(matches!(
+            mismatched,
+            Computed::NotComputable {
+                reason: NotComputable::CurrencyMismatch {
+                    expected: CurrencyCode::Rub,
+                    actual: CurrencyCode::Usd
+                }
+            }
+        ));
+
+        let unchanged = apply_expense(
+            vec![posting(date!(2027 - 01 - 01), "1")],
+            ExpenseTreatment::AbsentByPolicy,
+        )
+        .unwrap();
+        assert_eq!(unchanged.len(), 1);
+    }
+
+    #[test]
+    fn terminal_wealth_sum_overflow_is_not_silently_wrapped() {
+        let posting = ExpectedPosting {
+            date: date!(2027 - 01 - 01),
+            amount: CalcMoney::new(Dec::new(Decimal::MAX), CurrencyCode::Rub),
+            kind: PostingKind::Coupon,
+        };
+        let result = zero_reinvestment_metrics(
+            vec![posting, posting],
+            calc("1"),
+            date!(2026 - 01 - 01),
+            date!(2027 - 01 - 01),
+        );
+        assert!(matches!(
+            result,
+            Computed::NotComputable {
+                reason: NotComputable::Numeric {
+                    code: "terminal_wealth_sum"
+                }
+            }
+        ));
+    }
 }

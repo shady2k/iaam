@@ -2118,4 +2118,70 @@ mod tests {
             Err(CohortGap::InconsistentCostBasisCurrency)
         );
     }
+    #[test]
+    fn cohorts_refuse_missing_acquisition_date_and_cost_basis_overflow() {
+        let bond = Bond::new();
+        let mut missing_date = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        missing_date.acquired = None;
+        assert_eq!(
+            book_with_lots(&bond, vec![missing_date])
+                .entry(&bond.key())
+                .unwrap()
+                .cohorts(),
+            Err(CohortGap::AcquisitionDateUnknown)
+        );
+
+        let mut first = bond_lot(&bond, 1, known("1000", "1000"), i64::MAX);
+        let mut second = bond_lot(&bond, 1, known("1000", "1000"), i64::MAX);
+        first.acquisition_basis = None;
+        second.acquisition_basis = None;
+        assert_eq!(
+            book_with_lots(&bond, vec![first, second])
+                .entry(&bond.key())
+                .unwrap()
+                .cohorts(),
+            Err(CohortGap::InconsistentCostBasisOverflow)
+        );
+    }
+
+    #[test]
+    fn cohorts_refuse_quantity_and_optional_money_overflow_or_currency_mismatch() {
+        let bond = Bond::new();
+        let mut first = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        let mut second = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        first.quantity = Quantity(Dec::new(Decimal::MAX));
+        second.quantity = Quantity(Dec::new(Decimal::MAX));
+        assert_eq!(
+            book_with_lots(&bond, vec![first, second])
+                .entry(&bond.key())
+                .unwrap()
+                .cohorts(),
+            Err(CohortGap::InconsistentQuantity)
+        );
+
+        let mut first = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        let mut second = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        first.accrued_interest_paid = Some(rub(1));
+        second.accrued_interest_paid =
+            Some(Money::new(PostedMinor::new(1), CurrencyCode::Usd));
+        assert_eq!(
+            book_with_lots(&bond, vec![first, second])
+                .entry(&bond.key())
+                .unwrap()
+                .cohorts(),
+            Err(CohortGap::InconsistentOptionalMoneyCurrency)
+        );
+
+        let mut first = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        let mut second = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        first.accrued_interest_paid = Some(rub(i64::MAX));
+        second.accrued_interest_paid = Some(rub(i64::MAX));
+        assert_eq!(
+            book_with_lots(&bond, vec![first, second])
+                .entry(&bond.key())
+                .unwrap()
+                .cohorts(),
+            Err(CohortGap::InconsistentOptionalMoneyOverflow)
+        );
+    }
 }

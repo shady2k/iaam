@@ -42,10 +42,10 @@ use crate::rules::{
     AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
     SourcePriorityVersion, ValuationPolicyV1, ValuationRule,
 };
-use crate::valuation::QuotationBasis;
 use crate::valuation::{
     FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
-    SelectedPrice, SourceExecutability, UncoveredReason, ValuationError, Venue,
+    QuotationBasis, SelectedPrice, SourceExecutability,
+    UncoveredReason as PolicyUncoveredReason, ValuationError, Venue,
     candidate_from_legacy_valuation,
 };
 
@@ -244,6 +244,25 @@ impl MaterialIssue {
             | Self::UnsupportedFinancing { .. } => true,
         }
     }
+}
+
+/// Причина, по которой позиция не вошла в денежную стоимость.
+///
+/// Первые варианты описывают решение политики выбора цены. Вариант
+/// `NotComputable` сохраняет конкретную причину отказа пересчёта, чтобы
+/// покрытие не объявляло позицию оценённой без денежного вклада.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UncoveredReason {
+    /// Для инструмента нет ни одного наблюдения.
+    NoObservation,
+    /// Все наблюдения старше предельного возраста.
+    TooOld,
+    /// Нельзя однозначно определить площадку.
+    AmbiguousVenue,
+    /// После отбора осталось несколько кандидатов.
+    AmbiguousCandidate,
+    /// Выбранное наблюдение нельзя перевести в деньги.
+    NotComputable { reason: NotComputable },
 }
 
 /// Позиция без выбранного кандидата и причина отсутствия покрытия.
@@ -605,12 +624,22 @@ fn selected_observation(price: &SelectedPrice) -> SelectedObservation {
     }
 }
 
-fn uncovered_reason_code(reason: UncoveredReason) -> &'static str {
+fn uncovered_reason_code(reason: &UncoveredReason) -> &'static str {
     match reason {
         UncoveredReason::NoObservation => "no_observation",
         UncoveredReason::TooOld => "too_old",
         UncoveredReason::AmbiguousVenue => "ambiguous_venue",
         UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
+        UncoveredReason::NotComputable { reason } => reason.code(),
+    }
+}
+
+fn policy_uncovered_reason(reason: PolicyUncoveredReason) -> UncoveredReason {
+    match reason {
+        PolicyUncoveredReason::NoObservation => UncoveredReason::NoObservation,
+        PolicyUncoveredReason::TooOld => UncoveredReason::TooOld,
+        PolicyUncoveredReason::AmbiguousVenue => UncoveredReason::AmbiguousVenue,
+        PolicyUncoveredReason::AmbiguousCandidate => UncoveredReason::AmbiguousCandidate,
     }
 }
 
@@ -694,7 +723,7 @@ fn inputs_hash_with_assessments(
                     }
                 }
                 PositionAssessmentKind::Uncovered(reason) => PositionValuation::Uncovered {
-                    reason: uncovered_reason_code(reason),
+                    reason: uncovered_reason_code(&reason),
                 },
             };
             SelectedPosition {
@@ -870,20 +899,21 @@ fn selected_accrued_observation<'a>(
 }
 
 fn bond_position_attributes(
-    state: &LedgerState,
+    positions: &[PositionValue],
     request: &ReturnsRequest<'_>,
     rule: &dyn AccruedInterestRule,
 ) -> Vec<BondPositionAttributes> {
-    position_assessments(state, request)
-        .into_iter()
-        .filter(|assessment| {
+    positions
+        .iter()
+        .filter(|position| {
             matches!(
-                &assessment.kind,
+                &position.assessment.kind,
                 PositionAssessmentKind::Selected(selected)
                     if selected.candidate.basis == QuotationBasis::PercentOfRemainingFace
             )
         })
-        .map(|assessment| {
+        .map(|position| {
+            let assessment = &position.assessment;
             let accrued = match accrued_per_unit(request, rule, assessment.instrument) {
                 Ok(per_unit) => position_amount(per_unit, assessment.quantity, request),
                 Err(reason) => Computed::NotComputable { reason },
@@ -945,12 +975,13 @@ fn accrued_mismatch_is_material(computed: Dec, observed: Dec, currency: Currency
 }
 
 fn accrued_mismatch_issues(
-    assessments: &[PositionAssessment],
+    positions: &[PositionValue],
     request: &ReturnsRequest,
     rule: &dyn AccruedInterestRule,
 ) -> Vec<MaterialIssue> {
     let mut quantities = BTreeMap::new();
-    for assessment in assessments {
+    for position in positions {
+        let assessment = &position.assessment;
         let total = quantities
             .entry(assessment.instrument)
             .or_insert_with(Dec::zero);
@@ -962,10 +993,12 @@ fn accrued_mismatch_issues(
         .into_iter()
         .filter_map(|(instrument, quantity)| {
             let computed = accrued_per_unit(request, rule, instrument).ok()?;
-            let observed = assessments
+            let observed = positions
                 .iter()
-                .find(|assessment| assessment.instrument == instrument)
-                .and_then(|assessment| selected_accrued_observation(assessment, request))?;
+                .find(|position| position.assessment.instrument == instrument)
+                .and_then(|position| {
+                    selected_accrued_observation(&position.assessment, request)
+                })?;
             let material = computed.currency() != observed.currency()
                 || accrued_mismatch_is_material(
                     computed.value(),
@@ -1035,8 +1068,9 @@ fn aggregate_payable_on_termination(attributes: &[BondPositionAttributes]) -> Co
 pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsReport {
     let (quotation_rule_version, _) = quotation_rule();
     let (accrued_interest_rule_version, accrued_interest_rule) = accrued_interest_rule();
+    let positions = position_values(state, request);
     let series = xirr::flow_series(state, request);
-    let terminal = xirr::terminal_value(state, request);
+    let terminal = xirr::terminal_value_from_position_values(state, request, &positions);
     let (contributed, withdrawn) = match &series {
         Ok(series) => (
             Computed::Value(series.contributed),
@@ -1058,8 +1092,8 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
         },
     };
     let rate = xirr::rate(&series, &terminal, request);
-    let bond_attributes = bond_position_attributes(state, request, &accrued_interest_rule);
-    let data_quality = data_quality(state, request);
+    let bond_attributes = bond_position_attributes(&positions, request, &accrued_interest_rule);
+    let data_quality = data_quality(state, request, &positions);
     let liquidation_value_before_exit_costs_and_tax = LiquidationEstimate {
         value_before_exit_costs_and_tax: terminal_value.clone(),
         executability: data_quality.executability,
@@ -1187,11 +1221,11 @@ fn position_assessments(
                 );
                 match result.selected() {
                     Some(selected) => PositionAssessmentKind::Selected(Box::new(selected.clone())),
-                    None => PositionAssessmentKind::Uncovered(
+                    None => PositionAssessmentKind::Uncovered(policy_uncovered_reason(
                         result
                             .uncovered_reason()
-                            .unwrap_or(UncoveredReason::NoObservation),
-                    ),
+                            .unwrap_or(PolicyUncoveredReason::NoObservation),
+                    )),
                 }
             };
             PositionAssessment {
@@ -1212,6 +1246,69 @@ fn position_assessments(
         })
         .collect()
 }
+
+fn position_values(state: &LedgerState, request: &ReturnsRequest<'_>) -> Vec<PositionValue> {
+    position_values_from_assessments(position_assessments(state, request), request)
+}
+
+struct PositionValue {
+    assessment: PositionAssessment,
+    value: Result<Dec, NotComputable>,
+}
+
+fn position_values_from_assessments(
+    assessments: Vec<PositionAssessment>,
+    request: &ReturnsRequest<'_>,
+) -> Vec<PositionValue> {
+    let (_, rule) = quotation_rule();
+    assessments.into_iter()
+        .map(|assessment| {
+            let value = match &assessment.kind {
+                PositionAssessmentKind::Selected(selected) => position_value(
+                    &assessment,
+                    PositionQuotation {
+                        price: selected.candidate.price,
+                        basis: selected.candidate.basis,
+                        venue_currency: selected.candidate.currency,
+                        remaining_face: assessment.remaining_face.clone(),
+                        rule: &rule,
+                    },
+                    request,
+                ),
+                PositionAssessmentKind::LegacyDerived(_) => {
+                    if let Some(price) = assessment.raw_price {
+                        position_value(
+                            &assessment,
+                            PositionQuotation {
+                                price: price.price,
+                                basis: QuotationBasis::MoneyPerUnit,
+                                venue_currency: price.currency,
+                                remaining_face: Ok(None),
+                                rule: &rule,
+                            },
+                            request,
+                        )
+                    } else {
+                        Err(NotComputable::MissingPrice {
+                            instrument: assessment.instrument,
+                        })
+                    }
+                }
+                PositionAssessmentKind::Uncovered(reason) => Err(match reason {
+                    UncoveredReason::NotComputable { reason } => reason.clone(),
+                    UncoveredReason::NoObservation
+                    | UncoveredReason::TooOld
+                    | UncoveredReason::AmbiguousVenue
+                    | UncoveredReason::AmbiguousCandidate => NotComputable::MissingPrice {
+                        instrument: assessment.instrument,
+                    },
+                }),
+            };
+            PositionValue { assessment, value }
+        })
+        .collect()
+}
+
 
 struct PositionQuotation<'a> {
     price: Dec,
@@ -1289,7 +1386,11 @@ fn position_value(
 
 /// Блок качества данных строится из состояния, реестра сверки и оценки
 /// периметра, а не из желания показать зелёный статус.
-fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
+fn data_quality(
+    state: &LedgerState,
+    request: &ReturnsRequest,
+    positions: &[PositionValue],
+) -> DataQuality {
     let mut issues = Vec::new();
     for account in state.coverage().restored_accounts() {
         issues.push(MaterialIssue::RestoredWithoutBasis { account: *account });
@@ -1304,25 +1405,20 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
         issues.push(MaterialIssue::HistoryStartsAt { date });
     }
 
-    let assessments = position_assessments(state, request);
     let (_, accrued_rule) = accrued_interest_rule();
-    issues.extend(accrued_mismatch_issues(
-        &assessments,
-        request,
-        &accrued_rule,
-    ));
+    issues.extend(accrued_mismatch_issues(positions, request, &accrued_rule));
     let mut position_coverage = PositionCoverage {
         evaluated_positions: 0,
-        total_positions: assessments.len() as u32,
+        total_positions: positions.len() as u32,
         selected: Vec::new(),
         uncovered: Vec::new(),
         legacy_derived: Vec::new(),
     };
     let mut executability = ExecutabilityAccumulator::default();
-    let (_, rule) = quotation_rule();
-    for assessment in &assessments {
-        match &assessment.kind {
-            PositionAssessmentKind::Selected(selected) => {
+    for position in positions {
+        let assessment = &position.assessment;
+        match (&assessment.kind, &position.value) {
+            (PositionAssessmentKind::Selected(selected), Ok(value)) => {
                 position_coverage.evaluated_positions += 1;
                 position_coverage.selected.push(EvaluatedPosition {
                     account: assessment.account,
@@ -1331,21 +1427,19 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
                     quantity: assessment.quantity,
                     price: (**selected).clone(),
                 });
-                if let Ok(value) = position_value(
-                    assessment,
-                    PositionQuotation {
-                        price: selected.candidate.price,
-                        basis: selected.candidate.basis,
-                        venue_currency: selected.candidate.currency,
-                        remaining_face: assessment.remaining_face.clone(),
-                        rule: &rule,
-                    },
-                    request,
-                ) {
-                    executability.add(selected.candidate.executability, value);
-                }
+                executability.add(selected.candidate.executability, *value);
             }
-            PositionAssessmentKind::LegacyDerived(quality) => {
+            (PositionAssessmentKind::Selected(_), Err(reason)) => {
+                position_coverage.uncovered.push(UncoveredPosition {
+                    account: assessment.account,
+                    custody: assessment.custody,
+                    instrument: assessment.instrument,
+                    reason: UncoveredReason::NotComputable {
+                        reason: reason.clone(),
+                    },
+                });
+            }
+            (PositionAssessmentKind::LegacyDerived(quality), Ok(value)) => {
                 position_coverage.evaluated_positions += 1;
                 position_coverage
                     .legacy_derived
@@ -1355,28 +1449,24 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
                         instrument: assessment.instrument,
                         quality: *quality,
                     });
-                if let Some(price) = assessment.raw_price {
-                    if let Ok(value) = position_value(
-                        assessment,
-                        PositionQuotation {
-                            price: price.price,
-                            basis: QuotationBasis::MoneyPerUnit,
-                            venue_currency: price.currency,
-                            remaining_face: Ok(None),
-                            rule: &rule,
-                        },
-                        request,
-                    ) {
-                        executability.add(SourceExecutability::Unknown, value);
-                    }
-                }
+                executability.add(SourceExecutability::Unknown, *value);
             }
-            PositionAssessmentKind::Uncovered(reason) => {
+            (PositionAssessmentKind::LegacyDerived(_), Err(reason)) => {
                 position_coverage.uncovered.push(UncoveredPosition {
                     account: assessment.account,
                     custody: assessment.custody,
                     instrument: assessment.instrument,
-                    reason: *reason,
+                    reason: UncoveredReason::NotComputable {
+                        reason: reason.clone(),
+                    },
+                });
+            }
+            (PositionAssessmentKind::Uncovered(reason), _) => {
+                position_coverage.uncovered.push(UncoveredPosition {
+                    account: assessment.account,
+                    custody: assessment.custody,
+                    instrument: assessment.instrument,
+                    reason: reason.clone(),
                 });
             }
         }
@@ -1385,7 +1475,8 @@ fn data_quality(state: &LedgerState, request: &ReturnsRequest) -> DataQuality {
     // Стоимость по счетам может не посчитаться — например, без цены.
     // Тогда взвешивать покрытие нечем, и оно честно остаётся
     // неизвестным, а не выдаётся за полное.
-    let values = xirr::account_values(state, request).unwrap_or_default();
+    let values =
+        xirr::account_values_from_position_values(state, request, positions).unwrap_or_default();
     let mut shares = Shares::default();
     for (account, value) in &values {
         if request.perimeter.financing_present(*account) {
@@ -1599,6 +1690,18 @@ mod tests {
             kind: PositionAssessmentKind::Uncovered(UncoveredReason::NoObservation),
         }
     }
+    fn position_values_for_tests(
+        assessments: Vec<PositionAssessment>,
+    ) -> Vec<PositionValue> {
+        assessments
+            .into_iter()
+            .map(|assessment| PositionValue {
+                assessment,
+                value: Ok(Dec::zero()),
+            })
+            .collect()
+    }
+
     fn selected_market_position_assessment(
         account: AccountId,
         instrument: InstrumentId,
@@ -1748,6 +1851,56 @@ mod tests {
     }
 
     #[test]
+    fn биржевая_оценка_без_журнальной_оценки_входит_в_стоимость_контура() {
+        let (report, instrument) = report_with_market_basis(QuotationBasis::MoneyPerUnit);
+
+        assert_eq!(report.terminal_value, Computed::Value(dec("985")));
+        assert_eq!(report.data_quality.position_coverage.evaluated_positions, 1);
+        assert!(report
+            .data_quality
+            .position_coverage
+            .uncovered
+            .iter()
+            .all(|position| position.instrument != instrument));
+    }
+    #[test]
+    fn неизвестное_основание_делает_позицию_непокрытой_с_причиной_пересчёта() {
+        let (report, instrument) = report_with_market_basis(QuotationBasis::Unknown);
+        let coverage = &report.data_quality.position_coverage;
+
+        assert_eq!(coverage.evaluated_positions, 0);
+        assert_eq!(coverage.uncovered.len(), 1);
+        assert_eq!(
+            coverage.uncovered[0].reason,
+            UncoveredReason::NotComputable {
+                reason: NotComputable::QuotationBasisUnknown { instrument },
+            }
+        );
+        assert_eq!(
+            report.terminal_value.reason(),
+            Some(&NotComputable::QuotationBasisUnknown { instrument })
+        );
+        assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
+    }
+
+    #[test]
+    fn покрытие_считает_каждую_позицию_ровно_один_раз() {
+        let (report, _) = report_with_market_basis(QuotationBasis::MoneyPerUnit);
+        let coverage = &report.data_quality.position_coverage;
+
+        assert_eq!(
+            coverage.evaluated_positions as usize + coverage.uncovered.len(),
+            coverage.total_positions as usize
+        );
+        assert_eq!(
+            coverage.evaluated_positions as usize,
+            coverage.selected.len() + coverage.legacy_derived.len()
+        );
+        assert!(report.terminal_value.value().is_some());
+    }
+
+
+    #[test]
     fn a_share_does_not_get_bond_position_attributes() {
         let (report, _) = report_with_market_basis(QuotationBasis::MoneyPerUnit);
 
@@ -1853,6 +2006,42 @@ mod tests {
         );
 
         assert_eq!(value, Ok(dec("9850.0")));
+    }
+
+    #[test]
+    fn процентная_котировка_входит_в_nav_через_остаточный_номинал() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let venue = Venue {
+            board: "TQOB".to_owned(),
+            session: 0,
+        };
+        let mut assessment = selected_market_position_assessment(
+            account,
+            instrument,
+            Quantity(dec("10")),
+            venue,
+            date!(2026 - 08 - 26),
+        );
+        if let PositionAssessmentKind::Selected(selected) = &mut assessment.kind {
+            selected.candidate.price = dec("98.5");
+            selected.candidate.basis = QuotationBasis::PercentOfRemainingFace;
+            selected.provenance.quotation_basis = QuotationBasis::PercentOfRemainingFace;
+        }
+        assessment.remaining_face =
+            Ok(Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub)));
+        let positions = position_values_from_assessments(vec![assessment], &request);
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+
+        assert_eq!(
+            xirr::terminal_value_from_position_values(&state, &request, &positions),
+            Ok(dec("9850.0"))
+        );
     }
 
     #[test]
@@ -2390,7 +2579,8 @@ mod tests {
             perimeter: &perimeter,
             market_prices: &[],
         };
-        data_quality(projection.snapshot().state(), &request)
+        let positions = position_values(projection.snapshot().state(), &request);
+        data_quality(projection.snapshot().state(), &request, &positions)
     }
 
     #[test]
@@ -2587,7 +2777,11 @@ mod tests {
             ),
         ];
 
-        let issues = accrued_mismatch_issues(&assessments, &request, &AccruedInterestV1);
+        let issues = accrued_mismatch_issues(
+            &position_values_for_tests(assessments),
+            &request,
+            &AccruedInterestV1,
+        );
         assert_eq!(issues.len(), 1);
         let MaterialIssue::AccruedInterestMismatch {
             computed,
@@ -2647,13 +2841,13 @@ mod tests {
             accrued_observations: &observed,
         };
         let issues = accrued_mismatch_issues(
-            &[selected_market_position_assessment(
+            &position_values_for_tests(vec![selected_market_position_assessment(
                 AccountId::new_random(),
                 instrument,
                 Quantity(dec("1")),
                 venue,
                 date!(2026 - 08 - 26),
-            )],
+            )]),
             &request,
             &AccruedInterestV1,
         );
@@ -2709,7 +2903,14 @@ mod tests {
             date!(2026 - 08 - 25),
         );
 
-        assert!(accrued_mismatch_issues(&[assessment], &request, &AccruedInterestV1).is_empty());
+        assert!(
+            accrued_mismatch_issues(
+                &position_values_for_tests(vec![assessment]),
+                &request,
+                &AccruedInterestV1,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

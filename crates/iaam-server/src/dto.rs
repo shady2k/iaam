@@ -910,7 +910,7 @@ impl UncoveredPositionDto {
             account: position.account.inner(),
             custody: position.custody.map(|custody| custody.inner()),
             instrument: position.instrument.inner(),
-            reason: uncovered_reason(position.reason).to_owned(),
+            reason: uncovered_reason(&position.reason).to_owned(),
         }
     }
 }
@@ -1089,12 +1089,13 @@ fn executability(value: SourceExecutability) -> &'static str {
     }
 }
 
-fn uncovered_reason(value: iaam_core::valuation::UncoveredReason) -> &'static str {
+fn uncovered_reason(value: &iaam_core::returns::UncoveredReason) -> &'static str {
     match value {
-        iaam_core::valuation::UncoveredReason::NoObservation => "no_observation",
-        iaam_core::valuation::UncoveredReason::TooOld => "too_old",
-        iaam_core::valuation::UncoveredReason::AmbiguousVenue => "ambiguous_venue",
-        iaam_core::valuation::UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
+        iaam_core::returns::UncoveredReason::NoObservation => "no_observation",
+        iaam_core::returns::UncoveredReason::TooOld => "too_old",
+        iaam_core::returns::UncoveredReason::AmbiguousVenue => "ambiguous_venue",
+        iaam_core::returns::UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
+        iaam_core::returns::UncoveredReason::NotComputable { reason } => reason.code(),
     }
 }
 
@@ -1735,25 +1736,135 @@ mod tests {
     /// Причина, по которой позиция осталась без цены, — это то, что
     /// владелец увидит вместо суммы. Подменить её пустой строкой
     /// значит показать «цены нет» без объяснения, почему.
+    ///
+    /// Ожидаемое имя задаётся отдельным исчерпывающим `match`
+    /// со строковыми литералами, а не через проверяемую функцию
+    /// или метод домена. Поэтому тест ловит неверный код и обязан
+    /// сломать сборку при добавлении нового варианта причины.
+    /// Дополнительные проверки требуют непустых и различных кодов:
+    /// одинаковый код скрывает конкретную причину непокрытия.
     #[test]
     fn every_uncovered_reason_names_itself_in_the_api() {
-        use iaam_core::valuation::UncoveredReason;
-        fn expected(value: UncoveredReason) -> &'static str {
+        use std::collections::HashSet;
+        use iaam_core::returns::{NotComputable, UncoveredReason};
+
+        fn expected(value: &UncoveredReason) -> &'static str {
             match value {
                 UncoveredReason::NoObservation => "no_observation",
                 UncoveredReason::TooOld => "too_old",
                 UncoveredReason::AmbiguousVenue => "ambiguous_venue",
                 UncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
+                UncoveredReason::NotComputable { reason } => match reason {
+                    NotComputable::MissingPrice { .. } => "missing_price",
+                    NotComputable::MissingFxRate { .. } => "missing_fx_rate",
+                    NotComputable::QuotationBasisUnknown { .. } => "quotation_basis_unknown",
+                    NotComputable::RemainingFaceUnknown { .. } => "remaining_face_unknown",
+                    NotComputable::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
+                    NotComputable::SolverRefused { .. } => "solver_refused",
+                    NotComputable::NoExternalFlows => "no_external_flows",
+                    NotComputable::StateNewerThanReport { .. } => "state_newer_than_report",
+                    NotComputable::Numeric { .. } => "numeric",
+                    NotComputable::UnsupportedFinancing { .. } => "unsupported_financing",
+                    NotComputable::ScheduleMissing { .. } => "schedule_missing",
+                    NotComputable::AccruedObservationMissing { .. } => {
+                        "accrued_observation_missing"
+                    }
+                    NotComputable::CouponUndetermined { .. } => "coupon_undetermined",
+                    NotComputable::OutsideScheduleCoverage { .. } => "outside_schedule_coverage",
+                    NotComputable::OverlappingScheduleCoverage { .. } => {
+                        "overlapping_schedule_coverage"
+                    }
+                    NotComputable::ExitNotExecutable => "exit_not_executable",
+                },
             }
         }
-        for value in [
+
+        let instrument = InstrumentId::new_random();
+        let account = AccountId::new_random();
+        let date = time::macros::date!(2026 - 08 - 28);
+        let values = [
             UncoveredReason::NoObservation,
             UncoveredReason::TooOld,
             UncoveredReason::AmbiguousVenue,
             UncoveredReason::AmbiguousCandidate,
-        ] {
-            assert_eq!(uncovered_reason(value), expected(value));
+            UncoveredReason::NotComputable {
+                reason: NotComputable::MissingPrice { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::MissingFxRate {
+                    from: CurrencyCode::Rub,
+                    to: CurrencyCode::Usd,
+                    date,
+                },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::QuotationBasisUnknown { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::RemainingFaceUnknown { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::RemainingFaceAmbiguous { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::SolverRefused {
+                    refusal: SolverRefusal::TooFewFlows,
+                },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::NoExternalFlows,
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::StateNewerThanReport {
+                    last_event: date,
+                    as_of: date,
+                },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::Numeric { code: "overflow" },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::UnsupportedFinancing { account },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::ScheduleMissing { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::AccruedObservationMissing { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::CouponUndetermined { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::OutsideScheduleCoverage { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::OverlappingScheduleCoverage { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::ExitNotExecutable,
+            },
+        ];
+        for value in &values {
+            let expected = expected(value);
+            assert_eq!(uncovered_reason(value), expected);
         }
+
+        let codes: Vec<_> = values.iter().map(uncovered_reason).collect();
+        assert!(
+            codes.iter().all(|code| !code.is_empty()),
+            "код причины не должен быть пустым"
+        );
+        let duplicate = codes.iter().enumerate().find_map(|(index, code)| {
+            codes[..index].contains(code).then_some(*code)
+        });
+        let unique_codes = codes.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(
+            unique_codes.len(),
+            codes.len(),
+            "код причины повторяется: {}",
+            duplicate.unwrap_or("<неизвестен>")
+        );
     }
 
     /// Время наблюдения уходит в отчёт строкой. Пустая строка на месте

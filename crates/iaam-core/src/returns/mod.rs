@@ -1701,6 +1701,36 @@ mod tests {
             kind: PositionAssessmentKind::Uncovered(UncoveredReason::NoObservation),
         }
     }
+    fn legacy_position_assessment(
+        account: AccountId,
+        instrument: InstrumentId,
+        quantity: Quantity,
+        raw_price: Option<crate::valuation::InstrumentPrice>,
+    ) -> PositionAssessment {
+        PositionAssessment {
+            account,
+            custody: None,
+            instrument,
+            quantity,
+            raw_price,
+            remaining_face: Ok(None),
+            kind: PositionAssessmentKind::LegacyDerived(PriceQuality::CarriedForward),
+        }
+    }
+
+    fn legacy_price(
+        instrument: InstrumentId,
+        price: &str,
+    ) -> crate::valuation::InstrumentPrice {
+        crate::valuation::InstrumentPrice {
+            instrument,
+            price: dec(price),
+            currency: CurrencyCode::Rub,
+            quality: PriceQuality::CarriedForward,
+            as_of: date!(2026 - 08 - 25),
+        }
+    }
+
     fn position_values_for_tests(assessments: Vec<PositionAssessment>) -> Vec<PositionValue> {
         assessments
             .into_iter()
@@ -1859,6 +1889,172 @@ mod tests {
             accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
         };
         (returns_report(&state, &request), instrument)
+    }
+    #[test]
+    fn legacy_оценка_входит_в_terminal_value_как_деньги_за_единицу() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let without_legacy_positions = position_values_from_assessments(Vec::new(), &request);
+        let legacy_positions = position_values_from_assessments(
+            vec![legacy_position_assessment(
+                account,
+                instrument,
+                Quantity(dec("10")),
+                Some(legacy_price(instrument, "12")),
+            )],
+            &request,
+        );
+
+        let without_legacy_value = xirr::terminal_value_from_position_values(
+            &state,
+            &request,
+            &without_legacy_positions,
+        )
+        .unwrap();
+        let legacy_value =
+            xirr::terminal_value_from_position_values(&state, &request, &legacy_positions).unwrap();
+        let quality = data_quality(&state, &request, &legacy_positions);
+        assert_eq!(quality.position_coverage.evaluated_positions, 1);
+        assert_eq!(quality.position_coverage.legacy_derived.len(), 1);
+
+        assert_eq!(without_legacy_value, Dec::zero());
+        assert_eq!(
+            legacy_value.checked_sub(without_legacy_value).unwrap(),
+            dec("120")
+        );
+    }
+
+    #[test]
+    fn legacy_оценка_без_raw_price_становится_непокрытой_с_missing_price() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let assessment = legacy_position_assessment(account, instrument, Quantity(dec("10")), None);
+
+        let positions = position_values_from_assessments(vec![assessment], &request);
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let quality = data_quality(&state, &request, &positions);
+
+        assert_eq!(
+            positions[0].value,
+            Err(NotComputable::MissingPrice { instrument })
+        );
+        assert_eq!(quality.position_coverage.evaluated_positions, 0);
+        assert_eq!(quality.position_coverage.uncovered.len(), 1);
+        assert_eq!(
+            quality.position_coverage.uncovered[0].reason,
+            UncoveredReason::NotComputable {
+                reason: NotComputable::MissingPrice { instrument }
+            }
+        );
+    }
+
+    #[test]
+    fn непокрытая_позиция_отображает_все_причины_в_not_computable() {
+        let account = AccountId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let not_computable_instrument = InstrumentId::new_random();
+        let cases = [
+            (InstrumentId::new_random(), UncoveredReason::NoObservation),
+            (InstrumentId::new_random(), UncoveredReason::TooOld),
+            (InstrumentId::new_random(), UncoveredReason::AmbiguousVenue),
+            (
+                InstrumentId::new_random(),
+                UncoveredReason::AmbiguousCandidate,
+            ),
+            (
+                not_computable_instrument,
+                UncoveredReason::NotComputable {
+                    reason: NotComputable::QuotationBasisUnknown {
+                        instrument: not_computable_instrument,
+                    },
+                },
+            ),
+        ];
+        let assessments = cases
+            .iter()
+            .map(|(instrument, reason)| {
+                let mut assessment =
+                    position_assessment(account, *instrument, Quantity(dec("1")));
+                assessment.kind = PositionAssessmentKind::Uncovered(reason.clone());
+                assessment
+            })
+            .collect();
+
+        let positions = position_values_from_assessments(assessments, &request);
+
+        for ((instrument, reason), position) in cases.iter().zip(&positions) {
+            let expected = match reason {
+                UncoveredReason::NotComputable { reason } => reason.clone(),
+                UncoveredReason::NoObservation
+                | UncoveredReason::TooOld
+                | UncoveredReason::AmbiguousVenue
+                | UncoveredReason::AmbiguousCandidate => {
+                    NotComputable::MissingPrice {
+                        instrument: *instrument,
+                    }
+                }
+            };
+            assert_eq!(position.value, Err(expected));
+        }
+    }
+
+    #[test]
+    fn uncovered_reason_code_имеет_коды_для_всех_ветвей() {
+        let instrument = InstrumentId::new_random();
+        assert_eq!(
+            uncovered_reason_code(&UncoveredReason::NoObservation),
+            "no_observation"
+        );
+        assert_eq!(uncovered_reason_code(&UncoveredReason::TooOld), "too_old");
+        assert_eq!(
+            uncovered_reason_code(&UncoveredReason::AmbiguousVenue),
+            "ambiguous_venue"
+        );
+        assert_eq!(
+            uncovered_reason_code(&UncoveredReason::AmbiguousCandidate),
+            "ambiguous_candidate"
+        );
+        assert_eq!(
+            uncovered_reason_code(&UncoveredReason::NotComputable {
+                reason: NotComputable::MissingPrice { instrument }
+            }),
+            "missing_price"
+        );
+    }
+
+    #[test]
+    fn policy_uncovered_reason_отображает_все_четыре_варианта() {
+        assert_eq!(
+            policy_uncovered_reason(PolicyUncoveredReason::NoObservation),
+            UncoveredReason::NoObservation
+        );
+        assert_eq!(
+            policy_uncovered_reason(PolicyUncoveredReason::TooOld),
+            UncoveredReason::TooOld
+        );
+        assert_eq!(
+            policy_uncovered_reason(PolicyUncoveredReason::AmbiguousVenue),
+            UncoveredReason::AmbiguousVenue
+        );
+        assert_eq!(
+            policy_uncovered_reason(PolicyUncoveredReason::AmbiguousCandidate),
+            UncoveredReason::AmbiguousCandidate
+        );
     }
 
     #[test]

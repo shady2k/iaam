@@ -12,6 +12,7 @@
 //! ни одна сделка.
 
 pub mod xirr;
+pub mod zero_reinvestment;
 
 use std::collections::BTreeMap;
 
@@ -96,6 +97,8 @@ pub enum NotComputable {
     RemainingFaceUnknown { instrument: InstrumentId },
     /// Лоты одной пары «счёт и бумага» несут разные номиналы.
     RemainingFaceAmbiguous { instrument: InstrumentId },
+    /// Для пересчёта котировки не передан номинал.
+    PrincipalUnknown,
     /// Решатель отказался: корня нет, корней несколько, не сошлось.
     SolverRefused { refusal: SolverRefusal },
     /// Ни одного потока, пересекающего границу контура.
@@ -104,8 +107,7 @@ pub enum NotComputable {
     StateNewerThanReport { last_event: Date, as_of: Date },
     /// Арифметическая невозможность: переполнение, деление на ноль.
     Numeric { code: &'static str },
-    /// На счёте финансирование вне периметра: экономику система
-    /// не достраивает (§11).
+    /// На счёте финансирование вне периметра: экономику система не достраивает.
     UnsupportedFinancing { account: AccountId },
     /// Снимка графика выпуска на координату знания отсутствует.
     ScheduleMissing { instrument: InstrumentId },
@@ -119,11 +121,36 @@ pub enum NotComputable {
     OverlappingScheduleCoverage { instrument: InstrumentId },
     /// Исполнимого выхода нет: реализовать НКД сегодня нельзя.
     ExitNotExecutable,
+    /// Дата окончания горизонта не позже координаты метрики.
+    NonPositiveDuration { coordinate: Date, terminal_date: Date },
+    /// Начальная стоимость не положительна.
+    NonPositiveInitialCapital,
+    /// Терминальное благосостояние отрицательно.
+    NegativeTerminalWealth,
+    /// Лоты несут разные состояния номинала.
+    PrincipalStateAmbiguous { instrument: InstrumentId },
+    /// Историческая стоимость приобретения когорты неизвестна.
+    AcquisitionBasisUnknown,
+    /// Уплаченный при приобретении НКД неизвестен.
+    AccruedInterestAtAcquisitionUnknown,
+    /// История полученных выплат агрегирована неизвестно.
+    HistoricalReceiptsUnknown,
+    /// Когорта не может быть построена.
+    CohortGap {
+        gap: crate::projection::lots::CohortGap,
+    },
+    /// Денежные величины имеют разные валюты.
+    CurrencyMismatch {
+        expected: CurrencyCode,
+        actual: CurrencyCode,
+    },
+    /// Расход неизвестен и не ограничен сверху.
+    ExpenseUnknown,
 }
 
 impl NotComputable {
     /// Машиночитаемый код для API (§13). Внешний агент разбирает код,
-    /// а не текст: текст предназначен человеку.
+    /// а текст предназначен человеку.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -134,6 +161,7 @@ impl NotComputable {
             }
             Self::QuotationBasisUnknown { .. } => "quotation_basis_unknown",
             Self::RemainingFaceUnknown { .. } => "remaining_face_unknown",
+            Self::PrincipalUnknown => "principal_unknown",
             Self::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
             Self::SolverRefused { .. } => "solver_refused",
             Self::NoExternalFlows => "no_external_flows",
@@ -146,6 +174,18 @@ impl NotComputable {
             Self::OutsideScheduleCoverage { .. } => "outside_schedule_coverage",
             Self::OverlappingScheduleCoverage { .. } => "overlapping_schedule_coverage",
             Self::ExitNotExecutable => "exit_not_executable",
+            Self::NonPositiveDuration { .. } => "non_positive_duration",
+            Self::NonPositiveInitialCapital => "non_positive_initial_capital",
+            Self::NegativeTerminalWealth => "negative_terminal_wealth",
+            Self::PrincipalStateAmbiguous { .. } => "principal_state_ambiguous",
+            Self::AcquisitionBasisUnknown => "acquisition_basis_unknown",
+            Self::AccruedInterestAtAcquisitionUnknown => {
+                "accrued_interest_at_acquisition_unknown"
+            }
+            Self::HistoricalReceiptsUnknown => "historical_receipts_unknown",
+            Self::CohortGap { .. } => "cohort_gap",
+            Self::CurrencyMismatch { .. } => "currency_mismatch",
+            Self::ExpenseUnknown => "expense_unknown",
         }
     }
 }

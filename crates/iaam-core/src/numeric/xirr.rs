@@ -108,6 +108,16 @@ pub struct RateOutcome {
 }
 
 impl RateOutcome {
+    /// Создать точную граничную ставку, для которой численный решатель
+    /// неприменим (например, полная потеря капитала даёт ровно −100 %).
+    #[must_use]
+    pub const fn exact(value: f64, policy: SolverPolicy, day_count: DayCount) -> Self {
+        Self {
+            rate: ApproxValue::new(value, 0.0, 0),
+            policy,
+            day_count,
+        }
+    }
     #[must_use]
     pub const fn rate(&self) -> ApproxValue {
         self.rate

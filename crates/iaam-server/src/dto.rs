@@ -631,6 +631,25 @@ fn describe(reason: &NotComputable) -> String {
             )
         }
         NotComputable::ExitNotExecutable => "нет исполнимого выхода для реализации НКД".to_owned(),
+        NotComputable::PrincipalUnknown => "неизвестен номинал для пересчёта котировки".into(),
+        NotComputable::NonPositiveDuration { coordinate, terminal_date } => {
+            format!("дата окончания {terminal_date} не позже координаты {coordinate}")
+        }
+        NotComputable::NonPositiveInitialCapital => "начальная стоимость не положительна".into(),
+        NotComputable::NegativeTerminalWealth => "терминальное благосостояние отрицательно".into(),
+        NotComputable::PrincipalStateAmbiguous { instrument } => {
+            format!("неоднозначное состояние номинала инструмента {}", instrument.inner())
+        }
+        NotComputable::AcquisitionBasisUnknown => "историческая стоимость приобретения неизвестна".into(),
+        NotComputable::AccruedInterestAtAcquisitionUnknown => {
+            "НКД, уплаченный при приобретении, неизвестен".into()
+        }
+        NotComputable::HistoricalReceiptsUnknown => "история полученных выплат неизвестна".into(),
+        NotComputable::CohortGap { gap } => gap.to_string(),
+        NotComputable::CurrencyMismatch { expected, actual } => {
+            format!("валюты не совпадают: {} и {}", expected.code(), actual.code())
+        }
+        NotComputable::ExpenseUnknown => "расход неизвестен".into(),
     }
 }
 
@@ -1816,7 +1835,20 @@ mod tests {
                     NotComputable::OverlappingScheduleCoverage { .. } => {
                         "overlapping_schedule_coverage"
                     }
+                    NotComputable::PrincipalUnknown => "principal_unknown",
                     NotComputable::ExitNotExecutable => "exit_not_executable",
+                    NotComputable::NonPositiveDuration { .. } => "non_positive_duration",
+                    NotComputable::NonPositiveInitialCapital => "non_positive_initial_capital",
+                    NotComputable::NegativeTerminalWealth => "negative_terminal_wealth",
+                    NotComputable::PrincipalStateAmbiguous { .. } => "principal_state_ambiguous",
+                    NotComputable::AcquisitionBasisUnknown => "acquisition_basis_unknown",
+                    NotComputable::AccruedInterestAtAcquisitionUnknown => {
+                        "accrued_interest_at_acquisition_unknown"
+                    }
+                    NotComputable::HistoricalReceiptsUnknown => "historical_receipts_unknown",
+                    NotComputable::CohortGap { .. } => "cohort_gap",
+                    NotComputable::CurrencyMismatch { .. } => "currency_mismatch",
+                    NotComputable::ExpenseUnknown => "expense_unknown",
                 },
             }
         }

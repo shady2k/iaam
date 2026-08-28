@@ -281,6 +281,151 @@ fn the_client_key_catches_a_resubmission_without_a_document() {
 }
 
 #[test]
+fn повторный_источник_побеждает_локатор_и_становится_дубликатом() {
+    let account = AccountId::new_random();
+    let document = hash("1");
+    let mut first = deposit(account, 100_000);
+    first.source_operation_id = Some("OP-4417".to_owned());
+    let known = vec![recorded(&first, &from_row(&document, 7))];
+
+    let mut repeat = deposit(account, 999_000);
+    repeat.source_operation_id = Some("OP-4417".to_owned());
+    let context = from_row(&document, 8);
+    let key = choose_key(&repeat, &context);
+
+    assert_eq!(
+        assess(key.as_ref(), &fingerprint(&repeat), &context, &known),
+        DedupDecision::Duplicate {
+            key: DedupKey::SourceOperationId("OP-4417".to_owned()),
+            existing: known[0].event,
+        }
+    );
+}
+
+#[test]
+fn разные_идентификаторы_источника_не_сливаются() {
+    let account = AccountId::new_random();
+    let mut first = deposit(account, 100_000);
+    first.source_operation_id = Some("OP-1".to_owned());
+    let known = vec![recorded(&first, &from_stream())];
+
+    let mut incoming = deposit(account, 100_001);
+    incoming.source_operation_id = Some("OP-2".to_owned());
+    let context = from_stream();
+    let key = choose_key(&incoming, &context);
+
+    assert_eq!(
+        assess(key.as_ref(), &fingerprint(&incoming), &context, &known),
+        DedupDecision::Fresh
+    );
+}
+
+#[test]
+fn тот_же_документ_и_отпечаток_становятся_дубликатом() {
+    let account = AccountId::new_random();
+    let document = hash("2");
+    let context = DocumentContext {
+        document: Some(document.clone()),
+        sheet: None,
+        row: None,
+    };
+    let first = deposit(account, 100_000);
+    let known = vec![recorded(&first, &context)];
+    let repeat = deposit(account, 100_000);
+    let key = choose_key(&repeat, &context);
+
+    assert_eq!(
+        assess(key.as_ref(), &fingerprint(&repeat), &context, &known),
+        DedupDecision::Duplicate {
+            key: DedupKey::NormalizedFingerprint {
+                document,
+                fingerprint: fingerprint(&repeat),
+            },
+            existing: known[0].event,
+        }
+    );
+}
+
+#[test]
+fn тот_же_документ_с_другим_отпечатком_проходит_в_журнал() {
+    let account = AccountId::new_random();
+    let document = hash("3");
+    let context = DocumentContext {
+        document: Some(document),
+        sheet: None,
+        row: None,
+    };
+    let known = vec![recorded(&deposit(account, 100_000), &context)];
+    let incoming = deposit(account, 100_001);
+    let key = choose_key(&incoming, &context);
+
+    assert_eq!(
+        assess(key.as_ref(), &fingerprint(&incoming), &context, &known),
+        DedupDecision::Fresh
+    );
+}
+
+#[test]
+fn другой_документ_с_тем_же_отпечатком_остаётся_подсказкой() {
+    let account = AccountId::new_random();
+    let known_context = DocumentContext {
+        document: Some(hash("4")),
+        sheet: None,
+        row: None,
+    };
+    let incoming_context = DocumentContext {
+        document: Some(hash("5")),
+        sheet: None,
+        row: None,
+    };
+    let first = deposit(account, 100_000);
+    let known = vec![recorded(&first, &known_context)];
+    let incoming = deposit(account, 100_000);
+    let key = choose_key(&incoming, &incoming_context);
+
+    assert_eq!(
+        assess(
+            key.as_ref(),
+            &fingerprint(&incoming),
+            &incoming_context,
+            &known
+        ),
+        DedupDecision::PossibleDuplicate {
+            of: known[0].event,
+            level: DedupLevel::Probabilistic,
+        }
+    );
+}
+
+#[test]
+fn подсказка_владельцу_содержит_пятый_уровень() {
+    let account = AccountId::new_random();
+    let known_context = from_row(&hash("6"), 7);
+    let incoming_context = from_row(&hash("7"), 8);
+    let first = deposit(account, 100_000);
+    let known = vec![recorded(&first, &known_context)];
+    let incoming = deposit(account, 100_000);
+    let key = choose_key(&incoming, &incoming_context);
+
+    let DedupDecision::PossibleDuplicate { level, .. } =
+        assess(
+            key.as_ref(),
+            &fingerprint(&incoming),
+            &incoming_context,
+            &known,
+        )
+    else {
+        panic!("совпадение отпечатка разных документов обязано стать подсказкой");
+    };
+    assert_eq!(
+        level,
+        DedupLevel::Probabilistic,
+        "владелец должен видеть вероятностный уровень"
+    );
+    assert_eq!(level.number(), 5, "номер уровня — часть объяснения решения");
+}
+
+#[test]
 fn the_fingerprint_ignores_the_keys_that_name_the_submission() {
     // Ключ идемпотентности называет подачу, а не операцию: одна и та же
     // операция, посланная с разными ключами, обязана давать один

@@ -224,6 +224,9 @@ MODULES=(
   # бы заслон либо красным (ноль мутантов — отказ), либо ложно-зелёным.
   # Ветки закреплены шестью модульными тестами в самом файле и свойством
   # линейности стоимости по остаточному номиналу (tests/properties.rs).
+  "crates/iaam-core/src/rules/cashflow.rs"
+  "crates/iaam-core/src/returns/zero_reinvestment.rs"
+  "crates/iaam-core/src/bond/offer.rs"
 )
 
 # Пустой список — это заслон, который проходит всегда. Опустошение массива

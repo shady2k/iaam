@@ -29,12 +29,18 @@ use crate::verdict::Rejection;
 /// Справочник имён. Заполняется оболочкой из таблиц счетов и инструментов.
 #[derive(Debug, Clone, Default)]
 pub struct Directory {
-    pub accounts: BTreeMap<String, AccountId>,
+    pub accounts: AccountNames,
     pub custodies: CustodyNames,
     pub instruments: InstrumentAliases,
     /// Место хранения по умолчанию для счёта без указанного депозитария.
     pub default_custody: Option<CustodyId>,
 }
+
+/// Названия счетов с сохранением всех совпадений.
+pub type AccountNames = BTreeMap<String, Vec<AccountId>>;
+
+/// Названия мест хранения с сохранением всех совпадений.
+pub type CustodyNames = BTreeMap<String, Vec<CustodyId>>;
 
 /// Псевдонимы инструмента со своими интервалами действия.
 ///
@@ -43,9 +49,6 @@ pub struct Directory {
 /// жизнь меняет ISIN корпоративным действием (§4.7). Разрешение идёт
 /// на дату строки, а не на «сегодня».
 pub type InstrumentAliases = BTreeMap<String, Vec<(String, AliasInterval, InstrumentId)>>;
-
-/// Названия мест хранения с сохранением всех совпадений.
-pub type CustodyNames = BTreeMap<String, Vec<CustodyId>>;
 
 /// Инструмент по коду на дату строки.
 pub fn resolve_instrument(
@@ -268,7 +271,7 @@ pub fn parse(content: &str, directory: &Directory) -> Vec<ParsedRow> {
 fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperation, Rejection> {
     let date = parse_date(&row.date)?;
     let currency = parse_currency(&row.currency)?;
-    let account = lookup(&directory.accounts, &row.account, "account")?;
+    let account = lookup(&directory.accounts, &row.account, "account", "счёта")?;
     let kind = build_kind(row, directory, currency, date)?;
 
     Ok(SubmittedOperation {
@@ -304,6 +307,7 @@ fn build_kind(
                 &directory.accounts,
                 row.counterparty_account.as_deref().unwrap_or_default(),
                 "counterparty_account",
+                "счёта",
             )?,
             amount_minor: minor(row.amount.as_deref(), "amount", currency)?,
             currency,
@@ -365,31 +369,20 @@ fn resolve_custody(name: Option<&str>, directory: &Directory) -> Result<CustodyI
     }
 }
 
+pub(crate) fn resolve_named_account(
+    name: &str,
+    directory: &Directory,
+    field: &'static str,
+) -> Result<AccountId, Rejection> {
+    lookup(&directory.accounts, name, field, "счёта")
+}
+
 pub(crate) fn resolve_named_custody(
     name: &str,
     directory: &Directory,
     field: &'static str,
 ) -> Result<CustodyId, Rejection> {
-    let Some(candidates) = directory.custodies.get(name) else {
-        return Err(Rejection {
-            field: field.to_owned(),
-            expected: "имя из справочника".into(),
-            actual: name.to_owned(),
-        });
-    };
-    match candidates.as_slice() {
-        [single] => Ok(*single),
-        [] => Err(Rejection {
-            field: field.to_owned(),
-            expected: "имя из справочника".into(),
-            actual: name.to_owned(),
-        }),
-        _ => Err(Rejection {
-            field: field.to_owned(),
-            expected: "однозначное имя из справочника".into(),
-            actual: format!("{name}: название места хранения неоднозначно"),
-        }),
-    }
+    lookup(&directory.custodies, name, field, "места хранения")
 }
 
 fn build_trade(
@@ -437,15 +430,31 @@ fn build_trade(
 }
 
 fn lookup<T: Copy>(
-    table: &BTreeMap<String, T>,
+    table: &BTreeMap<String, Vec<T>>,
     name: &str,
     field: &'static str,
+    entity: &'static str,
 ) -> Result<T, Rejection> {
-    table.get(name).copied().ok_or_else(|| Rejection {
-        field: field.to_owned(),
-        expected: "имя из справочника".into(),
-        actual: name.to_owned(),
-    })
+    let Some(candidates) = table.get(name) else {
+        return Err(Rejection {
+            field: field.to_owned(),
+            expected: "имя из справочника".into(),
+            actual: name.to_owned(),
+        });
+    };
+    match candidates.as_slice() {
+        [single] => Ok(*single),
+        [] => Err(Rejection {
+            field: field.to_owned(),
+            expected: "имя из справочника".into(),
+            actual: name.to_owned(),
+        }),
+        _ => Err(Rejection {
+            field: field.to_owned(),
+            expected: "однозначное имя из справочника".into(),
+            actual: format!("{name}: название {entity} неоднозначно: {} {entity}", candidates.len()),
+        }),
+    }
 }
 
 fn parse_date(value: &str) -> Result<Date, Rejection> {

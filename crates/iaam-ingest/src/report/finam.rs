@@ -15,7 +15,7 @@ use time::macros::format_description;
 
 use crate::csv_source::{
     Directory, ParsedRow, resolve_instrument, resolve_instrument_without_date,
-    resolve_named_custody,
+    resolve_named_account, resolve_named_custody,
 };
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::report::sections::{
@@ -624,11 +624,7 @@ fn account_value(
     field: &'static str,
 ) -> Result<iaam_core::ids::AccountId, Rejection> {
     let name = text_value(cell)?;
-    directory
-        .accounts
-        .get(name)
-        .copied()
-        .ok_or_else(|| rejection(field, "имя из справочника", name))
+    resolve_named_account(name, directory, field)
 }
 
 fn instrument_value(

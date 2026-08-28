@@ -1351,6 +1351,55 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
 }
 
 #[tokio::test]
+async fn неоднозначное_название_счёта_отвергается_при_разрешении_строки() {
+    let (harness, path) = harness_on_disk();
+    {
+        let store = SqliteStore::open(&path).expect("второе соединение");
+        store
+            .upsert_account(&AccountRecord {
+                id: AccountId::new_random(),
+                owner: harness.owner,
+                title: "Брокерский".into(),
+                institution: None,
+            })
+            .expect("дубликат счёта");
+        store
+            .upsert_account(&AccountRecord {
+                id: AccountId::new_random(),
+                owner: harness.owner,
+                title: "Однозначный".into(),
+                institution: None,
+            })
+            .expect("однозначный счёт");
+    }
+
+    let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
+        2025-01-01,deposit,Брокерский,,,,,1000.00,,,RUB,duplicate\n\
+        2025-01-02,deposit,Однозначный,,,,,1000.00,,,RUB,unique\n";
+    let request = Request::builder()
+        .uri("/v1/ingest/csv")
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from(document))
+        .expect("запрос");
+    let (status, body) = call(&harness.router, request).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "rejected");
+    assert_eq!(body[0]["field"], "account");
+    let actual = body[0]["actual"].as_str().expect("причина отказа");
+    assert_eq!(
+        actual,
+        "Брокерский: название счёта неоднозначно: 2 счёта"
+    );
+    assert_eq!(body[1]["verdict"], "provisional");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
     // Молчаливое умолчание «сегодня» вместо непонятой даты выдало бы
     // отчёт не на ту дату — с виду нормальный, но про другой период.

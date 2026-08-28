@@ -284,8 +284,7 @@ impl LotDisposalRule for FifoV1 {
                 let kept_basis = lot.cost_basis.try_sub(taken_basis)?;
                 let (taken_accrued_interest, kept_accrued_interest) =
                     split_optional_basis(lot.accrued_interest_paid, left, lot_qty)?;
-                let (_, kept_received) =
-                    split_optional_basis(lot.received_to_date, left, lot_qty)?;
+                let (_, kept_received) = split_optional_basis(lot.received_to_date, left, lot_qty)?;
                 disposed.push(DisposedPart {
                     lot: lot.id,
                     quantity: Quantity(Dec::new(left)),
@@ -704,7 +703,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(partial.disposed[0].basis_released, rub(5_000));
-        assert_eq!(partial.disposed[0].accrued_interest_released, Some(rub(500)));
+        assert_eq!(
+            partial.disposed[0].accrued_interest_released,
+            Some(rub(500))
+        );
         assert_eq!(partial.remaining[0].cost_basis, rub(5_000));
         assert_eq!(partial.remaining[0].accrued_interest_paid, Some(rub(500)));
         assert_eq!(partial.remaining[0].received_to_date, Some(rub(400)));

@@ -852,6 +852,13 @@ async fn the_stage_one_question_is_answered_end_to_end() {
     // 2 900,00 рубля денег плюс 100 бумаг по 1 000 = 102 900,00.
     assert_eq!(report["terminal_value"]["value"], "102900.00");
     assert_eq!(report["history_starts"], "2025-01-01");
+    assert_eq!(report["bond_metrics"], json!([]));
+    assert!(
+        report["data_quality"]["nav_coverage"]
+            .get("bond_metrics")
+            .is_none(),
+        "метрики облигаций не должны попадать в data_quality"
+    );
     assert_eq!(report["applied_rules"]["fx_source"], "cbr_official");
     assert_eq!(report["applied_rules"]["day_count"], "act/365");
     let (status, missing_rate_report) = call(

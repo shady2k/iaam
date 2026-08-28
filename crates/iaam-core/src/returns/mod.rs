@@ -3386,7 +3386,10 @@ mod tests {
             } if actual == instrument
         ));
     }
-    fn состояние_с_номиналами(state: LedgerState, faces: &[&str]) -> LedgerState {
+    fn состояние_с_номиналами(
+        state: LedgerState,
+        faces: &[&str],
+    ) -> LedgerState {
         fn known(face: &str) -> ciborium::Value {
             let principal = crate::rules::lot_disposal::PrincipalState::known(
                 PerUnitAmount::new(dec(face), CurrencyCode::Rub),
@@ -3398,11 +3401,7 @@ mod tests {
             ciborium::de::from_reader(bytes.as_slice()).expect("разбор номинала")
         }
 
-        fn replace(
-            value: &mut ciborium::Value,
-            faces: &[&str],
-            next: &mut usize,
-        ) {
+        fn replace(value: &mut ciborium::Value, faces: &[&str], next: &mut usize) {
             match value {
                 ciborium::Value::Map(entries) => {
                     for (key, value) in entries {
@@ -3466,7 +3465,9 @@ mod tests {
         )
     }
 
-    fn отчёт_процентной_цены_по_покупкам(faces: &[&str]) -> ReturnsReport {
+    fn отчёт_процентной_цены_по_покупкам(
+        faces: &[&str],
+    ) -> ReturnsReport {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -3514,14 +3515,16 @@ mod tests {
 
     #[test]
     fn одинаковый_номинал_лотов_остаётся_вычислимым_в_отчёте() {
-        let report = отчёт_процентной_цены_по_покупкам(&["1000", "1000"]);
+        let report =
+            отчёт_процентной_цены_по_покупкам(&["1000", "1000"]);
 
         assert_eq!(report.terminal_value, Computed::Value(dec("19700")));
     }
 
     #[test]
     fn разные_номиналы_лотов_дают_явную_ошибку_в_отчёте() {
-        let report = отчёт_процентной_цены_по_покупкам(&["1000", "2000"]);
+        let report =
+            отчёт_процентной_цены_по_покупкам(&["1000", "2000"]);
 
         assert!(matches!(
             report.terminal_value,
@@ -3530,7 +3533,10 @@ mod tests {
             }
         ));
     }
-    fn состояние_из_события(contour: &ContourDefinition, event: &crate::event::Event) -> LedgerState {
+    fn состояние_из_события(
+        contour: &ContourDefinition,
+        event: &crate::event::Event,
+    ) -> LedgerState {
         let rules = RuleRegistry::with_defaults();
         let context = ProjectionContext {
             contour,
@@ -3611,9 +3617,7 @@ mod tests {
         );
         let mut future_event = event.clone();
         future_event.dates =
-            crate::dates::EventDates::for_cash(crate::dates::CashPostedDate(date!(
-                2026 - 08 - 27
-            )));
+            crate::dates::EventDates::for_cash(crate::dates::CashPostedDate(date!(2026 - 08 - 27)));
         future_event.order = crate::dates::EffectiveOrder::new(date!(2026 - 08 - 27), 1);
         let included = состояние_из_события(&contour, &event);
         let excluded = состояние_из_события(&contour, &future_event);
@@ -3626,8 +3630,14 @@ mod tests {
         );
         let baseline = состояние_из_события(&contour, &baseline_event);
 
-        assert_ne!(хеш_отчёта(&included, &contour), хеш_отчёта(&baseline, &contour));
-        assert_eq!(хеш_отчёта(&excluded, &contour), хеш_отчёта(&baseline, &contour));
+        assert_ne!(
+            хеш_отчёта(&included, &contour),
+            хеш_отчёта(&baseline, &contour)
+        );
+        assert_eq!(
+            хеш_отчёта(&excluded, &contour),
+            хеш_отчёта(&baseline, &contour)
+        );
     }
 
     #[test]
@@ -3655,8 +3665,14 @@ mod tests {
         );
         let baseline = состояние_из_события(&contour, &baseline_event);
 
-        assert_ne!(хеш_отчёта(&included, &contour), хеш_отчёта(&baseline, &contour));
-        assert_eq!(хеш_отчёта(&excluded, &contour), хеш_отчёта(&baseline, &contour));
+        assert_ne!(
+            хеш_отчёта(&included, &contour),
+            хеш_отчёта(&baseline, &contour)
+        );
+        assert_eq!(
+            хеш_отчёта(&excluded, &contour),
+            хеш_отчёта(&baseline, &contour)
+        );
     }
 
     #[test]
@@ -3684,8 +3700,14 @@ mod tests {
         );
         let baseline = состояние_из_события(&contour, &baseline_event);
 
-        assert_ne!(хеш_отчёта(&included, &contour), хеш_отчёта(&baseline, &contour));
-        assert_eq!(хеш_отчёта(&excluded, &contour), хеш_отчёта(&baseline, &contour));
+        assert_ne!(
+            хеш_отчёта(&included, &contour),
+            хеш_отчёта(&baseline, &contour)
+        );
+        assert_eq!(
+            хеш_отчёта(&excluded, &contour),
+            хеш_отчёта(&baseline, &contour)
+        );
     }
 
     fn состояние_позиции_с_унаследованной_оценкой(
@@ -3740,14 +3762,20 @@ mod tests {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
-        let state = состояние_позиции_с_унаследованной_оценкой(&contour, instrument, account);
+        let state =
+            состояние_позиции_с_унаследованной_оценкой(
+                &contour, instrument, account,
+            );
         let report = отчёт_с_рыночной_ценой(
             &state,
             &contour,
             рыночная_цена(instrument, date!(2026 - 08 - 27)),
         );
 
-        assert_eq!(report.data_quality.position_coverage.legacy_derived.len(), 1);
+        assert_eq!(
+            report.data_quality.position_coverage.legacy_derived.len(),
+            1
+        );
         assert!(report.data_quality.position_coverage.uncovered.is_empty());
     }
 
@@ -3756,14 +3784,20 @@ mod tests {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
-        let state = состояние_позиции_с_унаследованной_оценкой(&contour, instrument, account);
+        let state =
+            состояние_позиции_с_унаследованной_оценкой(
+                &contour, instrument, account,
+            );
         let report = отчёт_с_рыночной_ценой(
             &state,
             &contour,
             рыночная_цена(InstrumentId::new_random(), date!(2026 - 08 - 25)),
         );
 
-        assert_eq!(report.data_quality.position_coverage.legacy_derived.len(), 1);
+        assert_eq!(
+            report.data_quality.position_coverage.legacy_derived.len(),
+            1
+        );
         assert!(report.data_quality.position_coverage.uncovered.is_empty());
     }
 

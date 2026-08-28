@@ -188,6 +188,8 @@ step-up. Неопределённость хотя бы одного будущ�
   валютные роли; `DefaultFlags` и `Completeness` в сигнатуру не приходили.
 - `T` и терминальная дата не зависели от сценария, см. решение 9.
 - Граница `as_of` допускала двойной счёт, см. решение 10.
+- Поле прошлых выплат называлось `missed`, хотя правило неполучения не знает
+  (исправлено в Задаче 5 при приёмке 2026-08-28).
 - `Income.kind == None` принимался за купон, см. решение 7.
 - Голый `Dec` в `terminal_wealth`, `surplus`, `c0` терял валюту.
 - Волны 1–2 сталкивались: поля `Lot` и `BondSchedule` ломают литералы в чужих
@@ -389,7 +391,7 @@ step-up. Неопределённость хотя бы одного будущ�
   реализация `CashflowProjectionV1`, регистрация в `RuleRegistry`
 - Отдаёт: `pub struct CashflowInput<'a> { schedule: &'a BondSchedule, principal: PrincipalState, quantity: Quantity, choice: &'a OfferChoice, as_of: Date, report_currency: CurrencyCode }`
 - Отдаёт: `fn future_postings(&self, input: &CashflowInput) -> Result<CashflowPlan, CashflowError>`
-- Отдаёт: `pub struct CashflowPlan { postings: Vec<ExpectedPosting>, terminal_date: Date, missed: Vec<Date> }`
+- Отдаёт: `pub struct CashflowPlan { postings: Vec<ExpectedPosting>, terminal_date: Date, past: Vec<Date> }`
 - Отдаёт: `pub struct ExpectedPosting { date: Date, amount: Money, kind: PostingKind }`,
   `pub enum PostingKind { Coupon, PrincipalReturn, OfferSettlement }`
 
@@ -421,8 +423,21 @@ step-up. Неопределённость хотя бы одного будущ�
 - При `HoldToMaturity` `terminal_date` — дата последнего возврата номинала.
 - В поток входят выплаты **строго позже** `as_of`; выплата на саму `as_of` в
   будущий поток не попадает (её место — в проекции журнала, решение 10).
-- Запланированная выплата с датой не позже `as_of` попадает в `missed` — ни в
-  один из двух потоков, но и не молча.
+- Запланированная выплата с датой не позже `as_of` попадает в `past` — ни в
+  один из двух потоков, но и не молча. Поле называется `past`, а **не** `missed`:
+  правило журнала не видит и знать о полученном не может, поэтому утверждать
+  неполучение оно не вправе. Сверку с журналом делает Задача 7, сравнивая с
+  `received_to_date` лотов; иначе каждая здоровая облигация с историей выплат
+  подняла бы ложную тревогу по каждому давно полученному купону.
+- Отказ `CouponUndetermined` смотрит только **внутри горизонта сценария**
+  (позже `as_of`, не позже `terminal_date`). Проверка по всему графику лишала бы
+  флоатер с близкой офертой вычислимого сценария из-за купона, которого владелец
+  при выходе никогда не получит.
+- Купон с датой платежа ровно в дату исполнения оферты **входит** в поток:
+  `price_percent` — процент номинала и купона не содержит, поэтому двойного
+  счёта нет, а отбрасывание было бы молчаливым занижением.
+- Арифметический отказ — член `CashflowError`, а не `panic!`/`expect`.
+  Переполнение на крупной позиции обязано давать причину, а не падение.
 - Рублёвая бумага с `CurrencyRoles::uniform(Rub)` и рублёвым отчётом считается;
   бумага с `denomination != settlement` отказывает `CurrencyFormulaUnknown`.
   Оба случая — отдельные тесты.

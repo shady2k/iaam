@@ -169,12 +169,8 @@ impl DedupDecision {
 #[must_use]
 pub fn choose_key(operation: &SubmittedOperation, context: &DocumentContext) -> Option<DedupKey> {
     let mut available: Vec<DedupKey> = Vec::new();
-    if let Some(id) = operation.source_operation_id.as_deref() {
-        available.push(DedupKey::SourceOperationId(id.to_owned()));
-    }
-    if let Some(key) = operation.idempotency_key.as_deref() {
-        available.push(DedupKey::IdempotencyKey(key.to_owned()));
-    }
+    // Порядок добавления намеренно не совпадает с иерархией: её задаёт
+    // `precedence`, а не случайный порядок появления кандидатов.
     if let Some(document) = context.document.clone() {
         match context.row {
             Some(row) => available.push(DedupKey::DocumentRow {
@@ -187,6 +183,12 @@ pub fn choose_key(operation: &SubmittedOperation, context: &DocumentContext) -> 
                 document,
             }),
         }
+    }
+    if let Some(id) = operation.source_operation_id.as_deref() {
+        available.push(DedupKey::SourceOperationId(id.to_owned()));
+    }
+    if let Some(key) = operation.idempotency_key.as_deref() {
+        available.push(DedupKey::IdempotencyKey(key.to_owned()));
     }
     available.sort_by_key(DedupKey::precedence);
     available.into_iter().next()

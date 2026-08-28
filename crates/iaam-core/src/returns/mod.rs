@@ -1669,6 +1669,13 @@ mod tests {
         }
     }
     fn report_with_market_basis(basis: QuotationBasis) -> (ReturnsReport, InstrumentId) {
+        report_with_market_basis_and_schedule(basis, None)
+    }
+
+    fn report_with_market_basis_and_schedule(
+        basis: QuotationBasis,
+        schedule: Option<BondSchedule>,
+    ) -> (ReturnsReport, InstrumentId) {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
@@ -1717,6 +1724,9 @@ mod tests {
             },
             executability: SourceExecutability::Executable,
         };
+        let bond_schedules = schedule
+            .map(|schedule| BTreeMap::from([(instrument, schedule)]))
+            .unwrap_or_default();
         let request = ReturnsRequest {
             contour: &contour,
             as_of: date!(2026 - 08 - 26),
@@ -1731,7 +1741,7 @@ mod tests {
             ledger: &ledger,
             perimeter: &perimeter,
             market_prices: std::slice::from_ref(&candidate),
-            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            bond_schedules: &bond_schedules,
             accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
         };
         (returns_report(&state, &request), instrument)
@@ -1758,6 +1768,64 @@ mod tests {
                 reason: NotComputable::ScheduleMissing { instrument: actual }
             } if actual == instrument
         ));
+    }
+
+    #[test]
+    fn a_coupon_as_the_next_posting_has_no_principal_return_finality() {
+        let (report, instrument) = report_with_market_basis_and_schedule(
+            QuotationBasis::PercentOfRemainingFace,
+            Some(BondSchedule {
+                periods: vec![crate::bond::AccrualPeriod {
+                    period_start: date!(2026 - 08 - 01),
+                    accrual_end: date!(2026 - 09 - 01),
+                    payment_date: date!(2026 - 09 - 01),
+                    coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
+                }],
+                principal_returns: vec![crate::bond::PrincipalReturn {
+                    repayment_date: date!(2026 - 10 - 01),
+                    share_percent: dec("100"),
+                }],
+            }),
+        );
+        let attributes = report
+            .bond_attributes
+            .iter()
+            .find(|attributes| attributes.instrument == instrument)
+            .expect("процентная облигация должна иметь атрибуты");
+
+        assert_eq!(attributes.next_posting_date, Some(date!(2026 - 09 - 01)));
+        assert_eq!(attributes.next_principal_return_finality, None);
+    }
+
+    #[test]
+    fn principal_return_finality_comes_from_the_return_on_the_next_date() {
+        let (report, instrument) = report_with_market_basis_and_schedule(
+            QuotationBasis::PercentOfRemainingFace,
+            Some(BondSchedule {
+                periods: vec![],
+                principal_returns: vec![
+                    crate::bond::PrincipalReturn {
+                        repayment_date: date!(2026 - 09 - 15),
+                        share_percent: dec("40"),
+                    },
+                    crate::bond::PrincipalReturn {
+                        repayment_date: date!(2026 - 10 - 15),
+                        share_percent: dec("60"),
+                    },
+                ],
+            }),
+        );
+        let attributes = report
+            .bond_attributes
+            .iter()
+            .find(|attributes| attributes.instrument == instrument)
+            .expect("процентная облигация должна иметь атрибуты");
+
+        assert_eq!(attributes.next_posting_date, Some(date!(2026 - 09 - 15)));
+        assert_eq!(
+            attributes.next_principal_return_finality,
+            Some(PrincipalReturnFinality::Partial)
+        );
     }
 
     #[test]

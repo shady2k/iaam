@@ -91,6 +91,8 @@ pub enum NotComputable {
     },
     /// Основание котировки не доказано источником.
     QuotationBasisUnknown { instrument: InstrumentId },
+    /// Записанное основание противоречит доказательству источника.
+    QuotationBasisContradictsEvidence { instrument: InstrumentId },
     /// Номинал бумаги неизвестен.
     RemainingFaceUnknown { instrument: InstrumentId },
     /// Лоты одной пары «счёт и бумага» несут разные номиналы.
@@ -128,6 +130,9 @@ impl NotComputable {
         match self {
             Self::MissingPrice { .. } => "missing_price",
             Self::MissingFxRate { .. } => "missing_fx_rate",
+            Self::QuotationBasisContradictsEvidence { .. } => {
+                "quotation_basis_contradicts_evidence"
+            }
             Self::QuotationBasisUnknown { .. } => "quotation_basis_unknown",
             Self::RemainingFaceUnknown { .. } => "remaining_face_unknown",
             Self::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
@@ -1183,6 +1188,7 @@ fn position_assessments(
                     // номинала через `EventKind::Valuation` запрещён.
                     basis: crate::valuation::QuotationBasis::MoneyPerUnit,
                     basis_evidence: "journal:valuation".to_owned(),
+                    basis_evidence_contradicts: false,
                     trade_date: price.as_of,
                     observed_at: request.coordinate.knowledge_as_of,
                     origin: crate::valuation::PriceOrigin::ReportParsed { source },
@@ -1348,11 +1354,19 @@ fn quotation_error(error: QuotationError, instrument: InstrumentId) -> NotComput
         QuotationError::Numeric(_) => NotComputable::Numeric { code: "numeric" },
     }
 }
+
 fn position_value(
     assessment: &PositionAssessment,
     quotation: PositionQuotation<'_>,
     request: &ReturnsRequest<'_>,
 ) -> Result<Dec, NotComputable> {
+    if let PositionAssessmentKind::Selected(selected) = &assessment.kind {
+        if selected.candidate.basis_evidence_contradicts {
+            return Err(NotComputable::QuotationBasisContradictsEvidence {
+                instrument: assessment.instrument,
+            });
+        }
+    }
     let remaining_face = match quotation.basis {
         QuotationBasis::PercentOfRemainingFace => quotation.remaining_face?,
         QuotationBasis::MoneyPerUnit | QuotationBasis::Unknown => None,
@@ -1715,6 +1729,7 @@ mod tests {
             currency: CurrencyCode::Rub,
             basis: QuotationBasis::Unknown,
             basis_evidence: String::new(),
+            basis_evidence_contradicts: false,
             trade_date,
             observed_at: datetime!(2026 - 08 - 26 09:00:00 UTC),
             origin: PriceOrigin::Market {
@@ -1816,6 +1831,7 @@ mod tests {
             currency: CurrencyCode::Rub,
             basis,
             basis_evidence: "test:market".to_owned(),
+            basis_evidence_contradicts: false,
             trade_date: date!(2026 - 08 - 03),
             observed_at: datetime!(2026 - 08 - 26 09:00:00 UTC),
             origin: PriceOrigin::Market {
@@ -1881,6 +1897,38 @@ mod tests {
             Some(&NotComputable::QuotationBasisUnknown { instrument })
         );
         assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
+    }
+
+    #[test]
+    fn противоречие_основания_имеет_отдельную_причину_позиции() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let mut assessment = selected_market_position_assessment(
+            account,
+            instrument,
+            Quantity(dec("10")),
+            Venue {
+                board: "TQBR".to_owned(),
+                session: 3,
+            },
+            date!(2026 - 08 - 26),
+        );
+        if let PositionAssessmentKind::Selected(selected) = &mut assessment.kind {
+            selected.candidate.basis = QuotationBasis::Unknown;
+            selected.candidate.basis_evidence_contradicts = true;
+        }
+
+        let positions = position_values_from_assessments(vec![assessment], &request);
+
+        assert_eq!(
+            positions[0].value,
+            Err(NotComputable::QuotationBasisContradictsEvidence { instrument })
+        );
     }
 
     #[test]
@@ -2252,6 +2300,7 @@ mod tests {
                     currency: CurrencyCode::Rub,
                     basis: crate::valuation::QuotationBasis::Unknown,
                     basis_evidence: String::new(),
+                    basis_evidence_contradicts: false,
                     trade_date: date!(2026 - 08 - 26),
                     observed_at: datetime!(2026-08-26 08:00:00 UTC),
                     origin: origin.clone(),
@@ -2336,6 +2385,7 @@ mod tests {
                     currency: CurrencyCode::Rub,
                     basis,
                     basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
+                    basis_evidence_contradicts: false,
                     trade_date: date!(2026 - 08 - 26),
                     observed_at: datetime!(2026-08-26 08:00:00 UTC),
                     origin: origin.clone(),

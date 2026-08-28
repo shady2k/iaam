@@ -7,6 +7,7 @@ use iaam_core::valuation::{
     PriceCandidate, PriceKind as CorePriceKind, PriceOrigin, SourceExecutability,
 };
 use iaam_market::{Executability, PriceKind, PriceObservation};
+use iaam_market::moex::parse::reconcile_quotation_basis;
 use iaam_store::schedule::StoredSnapshot;
 use rust_decimal::Decimal;
 use time::Date;
@@ -27,13 +28,15 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
         Executability::Executable => SourceExecutability::Executable,
         Executability::IndicativePreviousClose => SourceExecutability::IndicativePreviousClose,
     };
-
+    let (basis, basis_evidence_contradicts) =
+        reconcile_quotation_basis(observation.basis, &observation.basis_evidence);
     PriceCandidate {
         instrument: observation.instrument,
         price: observation.price,
         currency: observation.currency,
-        basis: observation.basis,
+        basis,
         basis_evidence: observation.basis_evidence,
+        basis_evidence_contradicts,
         trade_date: observation.trade_date.0,
         observed_at: observation.observed_at.0,
         origin: PriceOrigin::Market {

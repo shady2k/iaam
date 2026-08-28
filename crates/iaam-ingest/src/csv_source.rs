@@ -667,6 +667,115 @@ mod tests {
     }
 
     #[test]
+    fn пространство_без_даты_принимает_единственный_псевдоним() {
+        let instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![(
+                "ticker".to_owned(),
+                AliasInterval {
+                    valid_from: date!(2020 - 01 - 01),
+                    valid_to: None,
+                },
+                instrument,
+            )],
+        );
+
+        assert_eq!(
+            resolve_instrument_in_namespace_without_date(&aliases, "ticker", "SBER")
+                .expect("единственный псевдоним разрешён"),
+            instrument
+        );
+    }
+
+    #[test]
+    fn пространство_без_даты_отвергает_код_из_другого_пространства() {
+        let instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![(
+                "broker_code".to_owned(),
+                AliasInterval {
+                    valid_from: date!(2020 - 01 - 01),
+                    valid_to: None,
+                },
+                instrument,
+            )],
+        );
+
+        let refused = resolve_instrument_in_namespace_without_date(&aliases, "ticker", "SBER")
+            .expect_err("чужое пространство не должно разрешаться");
+
+        assert_eq!(refused.field, "instrument");
+        assert_eq!(refused.expected, "код инструмента из справочника");
+        assert_eq!(refused.actual, "SBER");
+    }
+
+    #[test]
+    fn пространство_без_даты_отвергает_несколько_псевдонимов_с_причиной() {
+        let first = InstrumentId::new_random();
+        let second = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![
+                (
+                    "ticker".to_owned(),
+                    AliasInterval {
+                        valid_from: date!(2020 - 01 - 01),
+                        valid_to: None,
+                    },
+                    first,
+                ),
+                (
+                    "ticker".to_owned(),
+                    AliasInterval {
+                        valid_from: date!(2024 - 01 - 01),
+                        valid_to: None,
+                    },
+                    second,
+                ),
+            ],
+        );
+
+        let refused = resolve_instrument_in_namespace_without_date(&aliases, "ticker", "SBER")
+            .expect_err("несколько псевдонимов требуют дату снимка");
+
+        assert_eq!(
+            refused.expected,
+            "дата снимка отчёта для выбора кода инструмента"
+        );
+        assert_eq!(refused.actual, "SBER");
+    }
+
+    #[test]
+    fn пространство_с_датой_отличает_неработающий_код_от_неоднозначного() {
+        let instrument = InstrumentId::new_random();
+        let mut aliases = BTreeMap::new();
+        aliases.insert(
+            "SBER".to_owned(),
+            vec![(
+                "ticker".to_owned(),
+                AliasInterval {
+                    valid_from: date!(2025 - 01 - 01),
+                    valid_to: None,
+                },
+                instrument,
+            )],
+        );
+
+        let refused =
+            resolve_instrument_in_namespace(&aliases, "ticker", "SBER", date!(2024 - 03 - 01))
+                .expect_err("код вне интервала должен быть отвергнут");
+
+        assert_eq!(refused.field, "instrument");
+        assert_eq!(refused.expected, "код, действующий на дату операции");
+        assert_eq!(refused.actual, "SBER");
+    }
+
+    #[test]
     fn a_duplicate_custody_title_is_rejected_as_ambiguous() {
         let first = CustodyId::new_random();
         let second = CustodyId::new_random();

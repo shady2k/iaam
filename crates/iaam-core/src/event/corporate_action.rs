@@ -245,6 +245,19 @@ mod tests {
     }
 
     #[test]
+    fn дата_фиксации_реестра_остаётся_доступной_для_проверки_права() {
+        let action = sample_conversion();
+        let record_date = action
+            .record_date()
+            .expect("известная дата фиксации должна быть доступна");
+
+        assert!(
+            record_date < action.effective_date(),
+            "отсечка должна предшествовать дате вступления в силу"
+        );
+    }
+
+    #[test]
     fn a_fractional_treatment_survives_a_json_round_trip() {
         for treatment in [
             FractionalTreatment::CashCompensated,

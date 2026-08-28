@@ -69,15 +69,21 @@ fn purchase(owner: OwnerId, account: AccountId, instrument: InstrumentId) -> Eve
     event
 }
 
-fn strip_acquisition_basis(value: &mut serde_json::Value) {
+/// Убрать поле из снимка, представленного значением CBOR.
+///
+/// Именно CBOR, а не JSON: карты состояния имеют составные ключи, и
+/// `serde_json` их не берёт — попытка пройти снимок через JSON падает
+/// с «key must be a string». Ради этого проект и хранит снимки в CBOR
+/// (см. комментарий к зависимости `ciborium` в `iaam-core/Cargo.toml`).
+fn strip_acquisition_basis(value: &mut ciborium::value::Value) {
     match value {
-        serde_json::Value::Object(fields) => {
-            fields.remove("acquisition_basis");
-            for child in fields.values_mut() {
+        ciborium::value::Value::Map(entries) => {
+            entries.retain(|(key, _)| key.as_text() != Some("acquisition_basis"));
+            for (_, child) in entries.iter_mut() {
                 strip_acquisition_basis(child);
             }
         }
-        serde_json::Value::Array(values) => {
+        ciborium::value::Value::Array(values) => {
             for child in values {
                 strip_acquisition_basis(child);
             }
@@ -138,7 +144,7 @@ fn a_projection_snapshot_written_before_acquisition_basis_loads() {
         .into_snapshot();
 
     store.save_snapshot(owner, &snapshot).unwrap();
-    let mut legacy = serde_json::to_value(&snapshot).unwrap();
+    let mut legacy = ciborium::value::Value::serialized(&snapshot).unwrap();
     strip_acquisition_basis(&mut legacy);
     let mut body = Vec::new();
     ciborium::into_writer(&legacy, &mut body).unwrap();

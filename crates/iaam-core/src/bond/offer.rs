@@ -86,17 +86,16 @@ pub fn validate_unique_windows(windows: &[OfferWindowTerms]) -> Result<(), Offer
 }
 
 /// Вердикт уже выполненной проверки полноты источника.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScheduleCompleteness {
     Validated,
-    Incomplete { reason: String },
+    Incomplete {
+        reason: String,
+    },
+    /// Умолчание намеренно `Unknown`, а не `Validated`: снимок без
+    /// записанного вердикта полноты не является проверенным.
+    #[default]
     Unknown,
-}
-
-impl Default for ScheduleCompleteness {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Сценарий, который владелец сравнивает в отчёте.

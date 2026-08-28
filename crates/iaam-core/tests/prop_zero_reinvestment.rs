@@ -303,15 +303,24 @@ proptest! {
     }
 }
 
-fn event(
+/// Кто и куда записывает — тройка, неизменная для всех событий сценария.
+///
+/// Структура, а не три аргумента подряд: `OwnerId`, `SourceId` и
+/// `AccountId` — разные типы, но в списке из семи позиций перепутать их
+/// местами легко, а тест от этого молча поменяет смысл.
+#[derive(Debug, Clone, Copy)]
+struct Party {
     owner: OwnerId,
     source: SourceId,
     account: AccountId,
-    day: Date,
-    sequence: u32,
-    kind: EventKind,
-    legs: Vec<Leg>,
-) -> Event {
+}
+
+fn event(party: Party, day: Date, sequence: u32, kind: EventKind, legs: Vec<Leg>) -> Event {
+    let Party {
+        owner,
+        source,
+        account,
+    } = party;
     Event {
         id: EventId::new_random(),
         schema_version: SCHEMA_VERSION,
@@ -333,9 +342,7 @@ fn event(
 }
 
 fn buy_event(
-    owner: OwnerId,
-    source: SourceId,
-    account: AccountId,
+    party: Party,
     instrument: InstrumentId,
     custody: CustodyId,
     day: Date,
@@ -343,9 +350,7 @@ fn buy_event(
     units: i64,
 ) -> Event {
     let mut event = event(
-        owner,
-        source,
-        account,
+        party,
         day,
         sequence,
         EventKind::Trade {
@@ -357,8 +362,8 @@ fn buy_event(
             accrued_interest: None,
         },
         vec![
-            Leg::cash(account, rub(-(units * 1_000))),
-            Leg::security(account, custody, instrument, qty(units)),
+            Leg::cash(party.account, rub(-(units * 1_000))),
+            Leg::security(party.account, custody, instrument, qty(units)),
         ],
     );
     event.dates = EventDates::for_trade(TradeDate(day), None);
@@ -366,18 +371,14 @@ fn buy_event(
 }
 
 fn income_event(
-    owner: OwnerId,
-    source: SourceId,
-    account: AccountId,
+    party: Party,
     instrument: InstrumentId,
     day: Date,
     sequence: u32,
     amount: i64,
 ) -> Event {
     event(
-        owner,
-        source,
-        account,
+        party,
         day,
         sequence,
         EventKind::Income {
@@ -385,7 +386,7 @@ fn income_event(
             gross: rub(amount),
             kind: Some(iaam_core::event::kind::IncomeKind::Coupon),
         },
-        vec![Leg::cash(account, rub(amount))],
+        vec![Leg::cash(party.account, rub(amount))],
     )
 }
 
@@ -404,19 +405,20 @@ proptest! {
         let source = SourceId::new_random();
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
+        let party = Party { owner, source, account };
         let first_buy = buy_event(
-            owner, source, account, instrument, CustodyId::new_random(),
+            party, instrument, CustodyId::new_random(),
             date!(2024 - 01 - 01), 1, first_quantity,
         );
         let second_buy = buy_event(
-            owner, source, account, instrument, CustodyId::new_random(),
+            party, instrument, CustodyId::new_random(),
             date!(2024 - 02 - 01), 2, second_quantity,
         );
         let income_events: Vec<Event> = payments
             .iter()
             .enumerate()
             .map(|(index, amount)| income_event(
-                owner, source, account, instrument,
+                party, instrument,
                 date!(2024 - 03 - 01) + Duration::days(index as i64),
                 (index + 3) as u32,
                 *amount,
@@ -454,9 +456,11 @@ fn resyncing_the_same_issue_keeps_every_report_number() {
     let owner = OwnerId::new_random();
     let source = SourceId::new_random();
     let events = vec![event(
-        owner,
-        source,
-        account,
+        Party {
+            owner,
+            source,
+            account,
+        },
         date!(2025 - 01 - 01),
         1,
         EventKind::CashIn {

@@ -1360,15 +1360,32 @@ fn unavailable_prospective(
     }
 }
 
+/// Входы одной облигационной позиции, общие для всех её сценариев.
+///
+/// Структура, а не семь аргументов: набор един на позицию, а меняется
+/// между вызовами только сценарий, и перепутать местами две ссылки
+/// одного типа в списке из семи слишком легко.
+struct BondScenarioInputs<'a> {
+    assessment: &'a PositionAssessment,
+    request: &'a ReturnsRequest<'a>,
+    schedule: &'a BondSchedule,
+    lots: Option<&'a crate::projection::lots::InstrumentLots>,
+    cashflow: &'a dyn crate::rules::CashflowProjection,
+    accrued_rule: &'a dyn AccruedInterestRule,
+}
+
 fn bond_scenario(
-    assessment: &PositionAssessment,
-    request: &ReturnsRequest<'_>,
-    schedule: &BondSchedule,
-    lots: Option<&crate::projection::lots::InstrumentLots>,
+    inputs: &BondScenarioInputs<'_>,
     choice: OfferChoice,
-    cashflow: &dyn crate::rules::CashflowProjection,
-    accrued_rule: &dyn AccruedInterestRule,
 ) -> zero_reinvestment::BondScenarioResult {
+    let BondScenarioInputs {
+        assessment,
+        request,
+        schedule,
+        lots,
+        cashflow,
+        accrued_rule,
+    } = *inputs;
     let c0 = bond_c0(assessment, request, accrued_rule);
     let principal = lots
         .map(|lots| zero_reinvestment::common_principal_state(lots, assessment.instrument))
@@ -1469,13 +1486,15 @@ fn bond_position_metrics(
                 })
                 .map(|choice| {
                     bond_scenario(
-                        assessment,
-                        request,
-                        schedule,
-                        lots,
+                        &BondScenarioInputs {
+                            assessment,
+                            request,
+                            schedule,
+                            lots,
+                            cashflow: &cashflow,
+                            accrued_rule: &accrued_rule,
+                        },
                         choice,
-                        &cashflow,
-                        &accrued_rule,
                     )
                 })
                 .collect();
@@ -4327,7 +4346,6 @@ mod tests {
                 technical: false,
             }),
             currency_roles: Some(crate::instrument::CurrencyRoles::uniform(CurrencyCode::Rub)),
-            ..Default::default()
         };
         let (report, _) =
             report_with_market_basis_and_schedule(QuotationBasis::MoneyPerUnit, Some(schedule));

@@ -197,6 +197,8 @@ mod tests {
             acquired: Some(TradeDate(date!(2026 - 01 - 10))),
             quantity: Quantity(Dec::new(Decimal::from(10))),
             cost_basis: Money::new(PostedMinor::new(100_000), CurrencyCode::Rub),
+            accrued_interest_paid: None,
+            received_to_date: None,
             principal: PrincipalState::Unknown,
         }];
         let out = rule

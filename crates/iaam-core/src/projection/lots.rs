@@ -229,6 +229,7 @@ struct TradeFacts {
     quantity: Quantity,
     gross: Money,
     fee: Option<Money>,
+    accrued_interest: Option<Money>,
 }
 
 /// Факты амортизации, нужные книге лотов.
@@ -332,8 +333,7 @@ impl LotBook {
                 quantity,
                 gross,
                 fee,
-                // НКД не участвует в стоимости приобретения — см. `apply_trade`.
-                accrued_interest: _,
+                accrued_interest,
             } => self.apply_trade(
                 event,
                 TradeFacts {
@@ -342,6 +342,7 @@ impl LotBook {
                     quantity: *quantity,
                     gross: *gross,
                     fee: *fee,
+                    accrued_interest: *accrued_interest,
                 },
                 rules,
             ),
@@ -387,6 +388,7 @@ impl LotBook {
             quantity,
             gross,
             fee,
+            accrued_interest,
         } = trade;
         let key = LotKey {
             account: event.account,
@@ -412,6 +414,9 @@ impl LotBook {
                     instrument,
                     acquired: event.dates.trade,
                     quantity,
+                    // Отсутствующий НКД оставляем неизвестным, а не нулём.
+                    accrued_interest_paid: accrued_interest,
+                    received_to_date: None,
                     cost_basis: basis,
                     // Номинал сюда придёт из справочника в E3.4;
                     // подставлять ноль запрещено (§4.9).
@@ -644,6 +649,8 @@ impl LotBook {
                 // из неё **не** вычитается: как она влияет на базу —
                 // правило E5, и решать за него часть 1 не вправе.
                 cost_basis: lot.cost_basis,
+                accrued_interest_paid: lot.accrued_interest_paid,
+                received_to_date: lot.received_to_date,
                 // Номинал преемника — свойство другого выпуска, и
                 // вывести его из номинала предшественника нечем.
                 // Подставить прежний значило бы выдумать (§4.9).
@@ -726,6 +733,8 @@ impl LotBook {
                         instrument,
                         acquired: event.dates.trade,
                         quantity,
+                        accrued_interest_paid: None,
+                        received_to_date: None,
                         cost_basis: basis,
                         principal: PrincipalState::Unknown,
                     },
@@ -892,6 +901,8 @@ mod tests {
             acquired: Some(crate::dates::TradeDate(date!(2024 - 03 - 01))),
             quantity: qty(units),
             cost_basis: rub(basis),
+            accrued_interest_paid: None,
+            received_to_date: None,
             principal,
         }
     }
@@ -1436,6 +1447,65 @@ mod tests {
         assert_eq!(
             BasisGap::RestoredWithoutBasis.code(),
             "restored_without_basis"
+        );
+    }
+    fn set_accrued_interest(event: &mut Event, value: Option<Money>) {
+        match &mut event.kind {
+            EventKind::Trade {
+                accrued_interest, ..
+            } => *accrued_interest = value,
+            _ => panic!("expected trade event"),
+        }
+    }
+
+    #[test]
+    fn a_bond_purchase_records_paid_accrued_interest_and_preserves_unknown() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut with_interest = buy(&trade, 1);
+        set_accrued_interest(&mut with_interest, Some(rub(12_345)));
+        let mut with = LotBook::new(LotRuleVersion(1));
+        with.apply(&with_interest, &rules).unwrap();
+        assert_eq!(
+            with.entry(&key(&trade)).unwrap().lots()[0].accrued_interest_paid,
+            Some(rub(12_345))
+        );
+
+        let mut without = LotBook::new(LotRuleVersion(1));
+        without.apply(&buy(&trade, 1), &rules).unwrap();
+        assert_eq!(
+            without.entry(&key(&trade)).unwrap().lots()[0].accrued_interest_paid,
+            None
+        );
+    }
+
+    #[test]
+    fn an_opening_position_never_invents_paid_accrued_interest() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let restored = event_with(
+            trade.account,
+            date!(2024 - 01 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument: trade.instrument,
+                quantity: qty(50),
+                cost_basis: Some(rub(500_000)),
+                assertions: crate::event::kind::OpeningAssertions::default(),
+            },
+            vec![Leg::security(
+                trade.account,
+                CustodyId::new_random(),
+                trade.instrument,
+                qty(50),
+            )],
+        );
+
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&restored, &rules).unwrap();
+        assert_eq!(
+            book.entry(&key(&trade)).unwrap().lots()[0].accrued_interest_paid,
+            None
         );
     }
 }

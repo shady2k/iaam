@@ -24,24 +24,27 @@ use time::{Date, OffsetDateTime, UtcOffset};
 use crate::bond::{
     BondSchedule,
     finality::{PrincipalReturnFinality, finality_of},
+    offer::{OfferChoice, available_choices},
     posting::next_posting_date,
 };
 use crate::contour::{ContourDefinition, ContourId, ContourVersion};
 use crate::ids::{AccountId, InstrumentId, SourceId};
-use crate::money::CurrencyCode;
+use crate::money::{CalcMoney, CurrencyCode};
 use crate::money::PerUnitAmount;
 use crate::numeric::approx::SolverPolicy;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverRefusal};
 use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
 use crate::projection::lots::{LotBook, LotKey};
+use crate::projection::offers::{OfferBook, unresolved_submissions};
 use crate::projection::state::LedgerState;
 use crate::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use crate::rules::lot_disposal::RuleId;
 use crate::rules::quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 use crate::rules::{
     AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
-    SourcePriorityVersion, ValuationPolicyV1, ValuationRule,
+    CashflowInput, CashflowProjectionVersion, SourcePriorityVersion, ValuationPolicyV1,
+    ValuationRule,
 };
 use crate::valuation::{
     FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
@@ -249,6 +252,15 @@ pub enum MaterialIssue {
     },
     /// На счёте присутствует финансирование вне периметра (§11).
     UnsupportedFinancing { account: AccountId },
+    /// Поданная заявка ссылается на окно, которого нет в графике.
+    OfferWindowUnresolved {
+        submission: crate::event::offer::OfferSubmissionId,
+    },
+    /// Запланированная выплата не подтверждена датированным фактом дохода.
+    ScheduledPostingNotReceived {
+        instrument: InstrumentId,
+        date: Date,
+    },
     /// Расчётный и наблюдённый НКД разошлись больше допуска.
     AccruedInterestMismatch {
         instrument: InstrumentId,
@@ -269,8 +281,8 @@ impl MaterialIssue {
     ///
     /// - начало истории — это факт о периоде, а не дефект (§10.7);
     /// - отсутствие независимого источника — нормальное состояние
-    ///   данных: §10.5 прямо требует считать такие записи в отчётах
-    ///   по умолчанию, иначе система бесполезна именно для банков без
+    ///   данных: §10.5 прямо требует считать такие записи в отчётах по
+    ///   умолчанию, иначе система бесполезна именно для банков без
     ///   экспорта и ручного ввода. Показывать это надо, объявлять ответ
     ///   неполным — нельзя, иначе `Incomplete` перестанет что-либо
     ///   означать, потому что будет стоять почти всегда.
@@ -285,7 +297,9 @@ impl MaterialIssue {
             | Self::RestoredWithoutBasis { .. }
             | Self::NegativeCash { .. }
             | Self::Discrepancy { .. }
-            | Self::UnsupportedFinancing { .. } => true,
+            | Self::UnsupportedFinancing { .. }
+            | Self::OfferWindowUnresolved { .. }
+            | Self::ScheduledPostingNotReceived { .. } => true,
         }
     }
 }
@@ -350,6 +364,14 @@ pub struct BondPositionAttributes {
     pub next_posting_date: Option<Date>,
     /// Окончателен ли ближайший возврат номинала, если он и есть.
     pub next_principal_return_finality: Option<PrincipalReturnFinality>,
+}
+/// Метрики всех сценариев одной облигационной позиции.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BondPositionMetrics {
+    pub account: AccountId,
+    pub custody: Option<crate::ids::CustodyId>,
+    pub instrument: InstrumentId,
+    pub scenarios: Vec<crate::returns::zero_reinvestment::BondScenarioResult>,
 }
 
 /// Покрытие ценой: только количество позиций, без выдуманного денежного
@@ -437,6 +459,10 @@ pub struct AppliedRules {
     pub lot_rule: Option<RuleId>,
     pub fx_source: FxSource,
     pub day_count: DayCount,
+    /// Версия правила построения будущего потока облигации.
+    pub cashflow_projection: CashflowProjectionVersion,
+    /// Версия политики учёта расходов.
+    pub expense_policy: zero_reinvestment::ExpensePolicyVersion,
     pub solver_policy: SolverPolicy,
     /// Порог, по которому классифицирован отрицательный остаток (§11).
     /// Цифра, зависящая от порога, обязана нести порог рядом с собой.
@@ -513,6 +539,8 @@ pub struct ReturnsReport {
     pub withdrawn: Computed<Dec>,
     /// Стоимость контура на дату отчёта: деньги плюс позиции по цене.
     pub terminal_value: Computed<Dec>,
+    /// Метрики облигационных позиций по каждому доступному сценарию.
+    pub bond_metrics: Vec<BondPositionMetrics>,
     /// Стоимость до издержек выхода и до налога.
     pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimate,
     /// Внутренняя норма доходности **до налога**.
@@ -713,16 +741,26 @@ struct SelectedInputs<'a> {
     bond_schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
     accrued_observations: &'a BTreeMap<(InstrumentId, Venue, Date), PerUnitAmount>,
     accrued_interest_rule: AccruedInterestRuleVersion,
+    offer_book: &'a OfferBook,
+    cashflow_projection: CashflowProjectionVersion,
+    expense_policy: u32,
 }
 
-fn inputs_hash(state: &LedgerState, request: &ReturnsRequest<'_>) -> String {
-    inputs_hash_with_assessments(state, request, position_assessments(state, request))
-}
-
+#[cfg(test)]
 fn inputs_hash_with_assessments(
     state: &LedgerState,
     request: &ReturnsRequest<'_>,
     assessments: Vec<PositionAssessment>,
+) -> String {
+    let offer_book = OfferBook::default();
+    inputs_hash_with_bond_inputs(state, request, assessments, &offer_book)
+}
+
+fn inputs_hash_with_bond_inputs(
+    state: &LedgerState,
+    request: &ReturnsRequest<'_>,
+    assessments: Vec<PositionAssessment>,
+    offer_book: &OfferBook,
 ) -> String {
     let mut flows: Vec<_> = state
         .flows()
@@ -828,10 +866,14 @@ fn inputs_hash_with_assessments(
         bond_schedules: request.bond_schedules,
         accrued_observations: request.accrued_observations,
         accrued_interest_rule: accrued_interest_rule().0,
+        offer_book,
+        cashflow_projection: cashflow_projection_rule().0,
+        expense_policy: expense_policy_rule().0,
     };
     let mut encoded = Vec::new();
-    ciborium::into_writer(&selected, &mut encoded)
-        .unwrap_or_else(|error| panic!("входы отчёта не сериализуются: {error}"));
+    if ciborium::into_writer(&selected, &mut encoded).is_err() {
+        encoded.extend_from_slice(b"serialization_error");
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(b"iaam/returns-inputs/v1");
@@ -850,6 +892,16 @@ fn inputs_hash_with_assessments(
 /// расходящиеся реализации пересчёта.
 pub(crate) const fn quotation_rule() -> (QuotationRuleVersion, QuotationV1) {
     (QuotationRuleVersion(1), QuotationV1)
+}
+
+/// Версия правила построения сценарных потоков.
+pub(crate) const fn cashflow_projection_rule() -> (CashflowProjectionVersion, crate::rules::CashflowProjectionV1) {
+    (CashflowProjectionVersion(1), crate::rules::CashflowProjectionV1)
+}
+
+/// Версия политики расходов, применяемой до появления налогового контура.
+pub(crate) const fn expense_policy_rule() -> zero_reinvestment::ExpensePolicyVersion {
+    zero_reinvestment::ExpensePolicyVersion(1)
 }
 
 /// Правило расчёта НКД, применяемое отчётом.
@@ -1101,15 +1153,29 @@ fn aggregate_payable_on_termination(attributes: &[BondPositionAttributes]) -> Co
     Computed::Value(total)
 }
 
-/// Расчёт отчёта.
+/// Расчёт отчёта без отдельной книги заявок.
+#[must_use]
+pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsReport {
+    let offer_book = OfferBook::default();
+    returns_report_with_bond_inputs(state, request, &offer_book)
+}
+
+/// Расчёт отчёта с входами, которые относятся только к облигационным
+/// сценариям. Книга заявок строится оболочкой приложения из журнала.
 ///
 /// Ядро не ходит за данными: цены и курсы приходят готовыми, границы
 /// контура заданы явно. Всё, чего не хватает, превращается в отказ
 /// с указанием причины, а не в подставленное значение.
 #[must_use]
-pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsReport {
+pub fn returns_report_with_bond_inputs(
+    state: &LedgerState,
+    request: &ReturnsRequest,
+    offer_book: &OfferBook,
+) -> ReturnsReport {
     let (quotation_rule_version, _) = quotation_rule();
     let (accrued_interest_rule_version, accrued_interest_rule) = accrued_interest_rule();
+    let (cashflow_projection_version, _) = cashflow_projection_rule();
+    let expense_policy_version = expense_policy_rule();
     let positions = position_values(state, request);
     let series = xirr::flow_series(state, request);
     let terminal = xirr::terminal_value_from_position_values(state, request, &positions);
@@ -1135,7 +1201,18 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
     };
     let rate = xirr::rate(&series, &terminal, request);
     let bond_attributes = bond_position_attributes(&positions, request, &accrued_interest_rule);
-    let data_quality = data_quality(state, request, &positions);
+    let mut data_quality = data_quality(state, request, &positions);
+    let bond_metrics = bond_position_metrics(state, request, &positions, offer_book);
+    for issue in unresolved_offer_issues(request, offer_book) {
+        data_quality.material_issues.push(issue);
+    }
+    if data_quality
+        .material_issues
+        .iter()
+        .any(MaterialIssue::is_defect)
+    {
+        data_quality.status = DataQualityStatus::Incomplete;
+    }
     let liquidation_value_before_exit_costs_and_tax = LiquidationEstimate {
         value_before_exit_costs_and_tax: terminal_value.clone(),
         executability: data_quality.executability,
@@ -1149,10 +1226,16 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
         history_starts: state.coverage().first_event(),
         report_currency: request.report_currency,
         coordinate: request.coordinate,
-        inputs_hash: inputs_hash(state, request),
+        inputs_hash: inputs_hash_with_bond_inputs(
+            state,
+            request,
+            position_assessments(state, request),
+            offer_book,
+        ),
         contributed,
         withdrawn,
         terminal_value,
+        bond_metrics,
         liquidation_value_before_exit_costs_and_tax,
         xirr: rate,
         applied_rules: AppliedRules {
@@ -1165,10 +1248,259 @@ pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsR
             perimeter_policy: request.perimeter.policy(),
             quotation_rule: quotation_rule_version,
             accrued_interest_rule: accrued_interest_rule_version,
+            cashflow_projection: cashflow_projection_version,
+            expense_policy: expense_policy_version,
         },
         bond_attributes,
         data_quality,
     }
+}
+
+fn cashflow_reason(error: crate::rules::CashflowError, instrument: InstrumentId) -> NotComputable {
+    match error {
+        crate::rules::CashflowError::CouponUndetermined { .. } => {
+            NotComputable::CouponUndetermined { instrument }
+        }
+        crate::rules::CashflowError::PrincipalUnknown => NotComputable::PrincipalUnknown,
+        crate::rules::CashflowError::ScheduleIncomplete { .. }
+        | crate::rules::CashflowError::ScheduleCompletenessUnknown
+        | crate::rules::CashflowError::IssueTermsUnknown => {
+            NotComputable::ScheduleMissing { instrument }
+        }
+        crate::rules::CashflowError::IssuerDefaultDeclared
+        | crate::rules::CashflowError::IssuerTechnicalDefault
+        | crate::rules::CashflowError::SharesDoNotSumToWhole { .. }
+        | crate::rules::CashflowError::CurrencyFormulaUnknown { .. }
+        | crate::rules::CashflowError::OfferWindowNotExercisable { .. }
+        | crate::rules::CashflowError::Numeric(_) => NotComputable::Numeric { code: "cashflow" },
+    }
+}
+
+fn bond_c0(
+    assessment: &PositionAssessment,
+    request: &ReturnsRequest<'_>,
+    accrued_rule: &dyn AccruedInterestRule,
+) -> Computed<CalcMoney> {
+    let accrued = match accrued_per_unit(request, accrued_rule, assessment.instrument)
+        .and_then(|value| {
+            value
+                .checked_mul_quantity(assessment.quantity)
+                .map(|total| CalcMoney::new(total, value.currency()))
+                .map_err(|_| NotComputable::Numeric { code: "accrued_total" })
+        }) {
+        Ok(value) => value,
+        Err(reason) => return Computed::NotComputable { reason },
+    };
+    let selected = match &assessment.kind {
+        PositionAssessmentKind::Selected(selected) => selected,
+        PositionAssessmentKind::LegacyDerived(_)
+        | PositionAssessmentKind::Uncovered(UncoveredReason::NoObservation)
+        | PositionAssessmentKind::Uncovered(UncoveredReason::TooOld)
+        | PositionAssessmentKind::Uncovered(UncoveredReason::AmbiguousVenue)
+        | PositionAssessmentKind::Uncovered(UncoveredReason::AmbiguousCandidate) => {
+            return Computed::NotComputable {
+                reason: NotComputable::MissingPrice {
+                    instrument: assessment.instrument,
+                },
+            };
+        }
+        PositionAssessmentKind::Uncovered(UncoveredReason::NotComputable { reason }) => {
+            return Computed::NotComputable {
+                reason: reason.clone(),
+            };
+        }
+    };
+    let remaining_face = match &assessment.remaining_face {
+        Ok(value) => *value,
+        Err(reason) => {
+            return Computed::NotComputable {
+                reason: reason.clone(),
+            };
+        }
+    };
+    zero_reinvestment::prospective_c0(
+        assessment.quantity,
+        selected.candidate.basis,
+        selected.candidate.price,
+        selected.candidate.currency,
+        remaining_face,
+        accrued,
+    )
+}
+
+fn unavailable_prospective(
+    as_of: Date,
+    terminal_date: Date,
+    c0: Computed<CalcMoney>,
+    choice: OfferChoice,
+    reason: NotComputable,
+) -> zero_reinvestment::ProspectiveMetric {
+    let irr_label = match choice {
+        OfferChoice::HoldToMaturity => zero_reinvestment::IrrLabel::YieldToMaturity,
+        OfferChoice::ExerciseAtOffer { .. } => zero_reinvestment::IrrLabel::YieldToOffer,
+    };
+    zero_reinvestment::ProspectiveMetric {
+        as_of,
+        terminal_date,
+        c0,
+        metrics: Computed::NotComputable {
+            reason: reason.clone(),
+        },
+        irr: Computed::NotComputable { reason },
+        irr_label,
+    }
+}
+
+fn bond_scenario(
+    assessment: &PositionAssessment,
+    request: &ReturnsRequest<'_>,
+    schedule: &BondSchedule,
+    lots: Option<&crate::projection::lots::InstrumentLots>,
+    choice: OfferChoice,
+    cashflow: &dyn crate::rules::CashflowProjection,
+    accrued_rule: &dyn AccruedInterestRule,
+) -> zero_reinvestment::BondScenarioResult {
+    let c0 = bond_c0(assessment, request, accrued_rule);
+    let principal = lots
+        .map(|lots| zero_reinvestment::common_principal_state(lots, assessment.instrument))
+        .unwrap_or(Ok(crate::rules::lot_disposal::PrincipalState::Unknown));
+    let plan = principal.and_then(|principal| {
+        cashflow
+            .future_postings(&CashflowInput {
+                schedule,
+                principal,
+                quantity: assessment.quantity,
+                choice: &choice,
+                as_of: request.as_of,
+                report_currency: request.report_currency,
+            })
+            .map_err(|error| cashflow_reason(error, assessment.instrument))
+    });
+    match plan {
+        Ok(plan) => {
+            let prospective = zero_reinvestment::prospective_metric(
+                request.as_of,
+                &plan,
+                c0,
+                &choice,
+            );
+            let lifetime = lots.map_or_else(
+                || {
+                    Computed::NotComputable {
+                        reason: NotComputable::CohortGap {
+                            gap: crate::projection::lots::CohortGap::AcquisitionDateUnknown,
+                        },
+                    }
+                },
+                |lots| zero_reinvestment::lifetime_metrics_from_lots(lots, &plan),
+            );
+            zero_reinvestment::BondScenarioResult {
+                choice,
+                prospective,
+                lifetime,
+            }
+        }
+        Err(reason) => {
+            let terminal_date = match choice {
+                OfferChoice::HoldToMaturity => schedule
+                    .principal_returns
+                    .iter()
+                    .map(|item| item.repayment_date)
+                    .max()
+                    .unwrap_or(request.as_of),
+                OfferChoice::ExerciseAtOffer { window } => schedule
+                    .offer_windows
+                    .iter()
+                    .find(|terms| terms.window == window)
+                    .map_or(request.as_of, |terms| terms.execution_date),
+            };
+            zero_reinvestment::BondScenarioResult {
+                choice: choice.clone(),
+                prospective: unavailable_prospective(
+                    request.as_of,
+                    terminal_date,
+                    c0,
+                    choice,
+                    reason.clone(),
+                ),
+                lifetime: Computed::NotComputable { reason },
+            }
+        }
+    }
+}
+
+fn bond_position_metrics(
+    state: &LedgerState,
+    request: &ReturnsRequest<'_>,
+    positions: &[PositionValue],
+    offer_book: &OfferBook,
+) -> Vec<BondPositionMetrics> {
+    let (_, cashflow) = cashflow_projection_rule();
+    let (_, accrued_rule) = accrued_interest_rule();
+    positions
+        .iter()
+        .filter_map(|position| {
+            let assessment = &position.assessment;
+            let schedule = request.bond_schedules.get(&assessment.instrument)?;
+            if !request.contour.contains(assessment.account) || assessment.quantity.0.is_zero() {
+                return None;
+            }
+            let lots = state.book().entry(&LotKey {
+                account: assessment.account,
+                instrument: assessment.instrument,
+            });
+            let unresolved: std::collections::BTreeSet<_> = unresolved_submissions(
+                offer_book,
+                schedule,
+            )
+            .into_iter()
+            .filter(|submission| {
+                offer_book
+                    .submission(*submission)
+                    .is_some_and(|state| state.instrument == assessment.instrument)
+            })
+            .collect();
+            let scenarios = available_choices(schedule, request.as_of)
+                .into_iter()
+                .filter(|choice| match choice {
+                    OfferChoice::HoldToMaturity => true,
+                    OfferChoice::ExerciseAtOffer { .. } => unresolved.is_empty(),
+                })
+                .map(|choice| {
+                    bond_scenario(
+                        assessment,
+                        request,
+                        schedule,
+                        lots,
+                        choice,
+                        &cashflow,
+                        &accrued_rule,
+                    )
+                })
+                .collect();
+            Some(BondPositionMetrics {
+                account: assessment.account,
+                custody: assessment.custody,
+                instrument: assessment.instrument,
+                scenarios,
+            })
+        })
+        .collect()
+}
+
+fn unresolved_offer_issues(
+    request: &ReturnsRequest<'_>,
+    offer_book: &OfferBook,
+) -> Vec<MaterialIssue> {
+    let submissions: std::collections::BTreeSet<_> = request
+        .bond_schedules
+        .values()
+        .flat_map(|schedule| unresolved_submissions(offer_book, schedule))
+        .collect();
+    submissions
+        .into_iter()
+        .map(|submission| MaterialIssue::OfferWindowUnresolved { submission })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1720,6 +2052,36 @@ mod tests {
             accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
         };
         returns_report(state, &request)
+    }
+
+    fn report_for_schedules(
+        state: &LedgerState,
+        schedules: &BTreeMap<InstrumentId, BondSchedule>,
+    ) -> ReturnsReport {
+        let contour = ContourDefinition::new(
+            ContourId(uuid::Uuid::nil()),
+            ContourVersion(1),
+            Vec::<AccountId>::new(),
+        );
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        returns_report(
+            state,
+            &ReturnsRequest {
+                contour: &contour,
+                as_of: date!(2026 - 08 - 26),
+                report_currency: CurrencyCode::Rub,
+                fx: &fx,
+                solver_policy: SolverPolicy::returns_default(),
+                coordinate: KnowledgeCoordinate::default(),
+                ledger: &ledger,
+                perimeter: &perimeter,
+                market_prices: &[],
+                bond_schedules: schedules,
+                accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+            },
+        )
     }
 
     fn dec(text: &str) -> Dec {
@@ -3906,6 +4268,7 @@ mod tests {
                 Quantity(dec("10")),
             )],
         );
+
         let state = состояние_из_события(&contour, &opening);
         let report = отчёт_с_рыночной_ценой(
             &state,
@@ -3935,5 +4298,230 @@ mod tests {
         assert_eq!(shares.executable, dec("0.5"));
         assert_eq!(shares.indicative_previous_close, dec("0.25"));
         assert_eq!(shares.unknown, dec("0.25"));
+    }
+    #[test]
+    fn bond_positions_receive_scenario_metrics_and_rule_versions() {
+        let schedule = BondSchedule {
+            periods: vec![crate::bond::AccrualPeriod {
+                period_start: date!(2026 - 08 - 01),
+                accrual_end: date!(2026 - 12 - 01),
+                payment_date: date!(2026 - 12 - 02),
+                coupon_per_unit: Some(PerUnitAmount::new(dec("5"), CurrencyCode::Rub)),
+            }],
+            principal_returns: vec![crate::bond::PrincipalReturn {
+                repayment_date: date!(2026 - 12 - 02),
+                share_percent: dec("100"),
+            }],
+            offer_windows: vec![crate::bond::OfferWindowTerms {
+                window: crate::bond::OfferWindowId::new_random(),
+                right: crate::bond::OfferRight::HolderPut,
+                execution_date: date!(2026 - 09 - 15),
+                submission_start: None,
+                submission_end: None,
+                price_percent: Some(dec("100")),
+            }],
+            completeness: crate::bond::ScheduleCompleteness::Validated,
+            default_flags: Some(crate::bond::DefaultFlags {
+                declared: false,
+                technical: false,
+            }),
+            currency_roles: Some(crate::instrument::CurrencyRoles::uniform(CurrencyCode::Rub)),
+            ..Default::default()
+        };
+        let (report, _) = report_with_market_basis_and_schedule(
+            QuotationBasis::MoneyPerUnit,
+            Some(schedule),
+        );
+
+        assert_eq!(report.bond_metrics.len(), 1);
+        assert_eq!(report.bond_metrics[0].scenarios.len(), 2);
+        assert_ne!(
+            report.bond_metrics[0].scenarios[0].prospective.terminal_date,
+            report.bond_metrics[0].scenarios[1].prospective.terminal_date
+        );
+        let (share_report, _) = report_with_market_basis(QuotationBasis::MoneyPerUnit);
+        assert!(share_report.bond_metrics.is_empty());
+        assert_eq!(
+            report.applied_rules.cashflow_projection,
+            crate::rules::CashflowProjectionVersion(1)
+        );
+        assert_eq!(
+            report.applied_rules.expense_policy,
+            crate::returns::zero_reinvestment::ExpensePolicyVersion(1)
+        );
+    }
+
+    #[test]
+    fn unresolved_offer_submission_only_removes_its_instrument_offer_scenarios() {
+        let account = AccountId::new_random();
+        let first_instrument = InstrumentId::new_random();
+        let second_instrument = InstrumentId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let quantity = Quantity(dec("10"));
+        let first_opening = event_with(
+            account,
+            date!(2026 - 08 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument: first_instrument,
+                quantity,
+                cost_basis: None,
+                assertions: Default::default(),
+            },
+            vec![Leg::security(
+                account,
+                CustodyId::new_random(),
+                first_instrument,
+                quantity,
+            )],
+        );
+        let second_opening = event_with(
+            account,
+            date!(2026 - 08 - 02),
+            1,
+            EventKind::OpeningPosition {
+                instrument: second_instrument,
+                quantity,
+                cost_basis: None,
+                assertions: Default::default(),
+            },
+            vec![Leg::security(
+                account,
+                CustodyId::new_random(),
+                second_instrument,
+                quantity,
+            )],
+        );
+        let state = project(&[first_opening, second_opening], &context)
+            .expect("проекция двух позиций")
+            .snapshot()
+            .state()
+            .clone();
+        let first_window = crate::bond::OfferWindowId::new_random();
+        let second_window = crate::bond::OfferWindowId::new_random();
+        let unknown_window = crate::bond::OfferWindowId::new_random();
+        let schedule = |window| BondSchedule {
+            principal_returns: vec![crate::bond::PrincipalReturn {
+                repayment_date: date!(2026 - 12 - 02),
+                share_percent: dec("100"),
+            }],
+            offer_windows: vec![crate::bond::OfferWindowTerms {
+                window,
+                right: crate::bond::OfferRight::HolderPut,
+                execution_date: date!(2026 - 09 - 15),
+                submission_start: None,
+                submission_end: None,
+                price_percent: Some(dec("100")),
+            }],
+            completeness: crate::bond::ScheduleCompleteness::Validated,
+            currency_roles: Some(crate::instrument::CurrencyRoles::uniform(CurrencyCode::Rub)),
+            ..Default::default()
+        };
+        let schedules = BTreeMap::from([
+            (first_instrument, schedule(first_window)),
+            (second_instrument, schedule(second_window)),
+        ]);
+        let submission = crate::event::offer::OfferSubmissionId::new_random();
+        let mut offer_book = OfferBook::default();
+        offer_book
+            .apply(&crate::event::offer::OfferExerciseAction::Submitted {
+                submission,
+                window: unknown_window,
+                instrument: first_instrument,
+                quantity,
+            })
+            .expect("подача заявки");
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+            bond_schedules: &schedules,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+        };
+        let report = returns_report_with_bond_inputs(&state, &request, &offer_book);
+
+        assert!(report.data_quality.material_issues.iter().any(|issue| {
+            matches!(
+                issue,
+                MaterialIssue::OfferWindowUnresolved { submission: id } if *id == submission
+            )
+        }));
+        let first_metrics = report
+            .bond_metrics
+            .iter()
+            .find(|metrics| metrics.instrument == first_instrument)
+            .expect("метрики первой бумаги");
+        assert_eq!(first_metrics.scenarios.len(), 1);
+        assert!(matches!(
+            first_metrics.scenarios[0].choice,
+            OfferChoice::HoldToMaturity
+        ));
+        let second_metrics = report
+            .bond_metrics
+            .iter()
+            .find(|metrics| metrics.instrument == second_instrument)
+            .expect("метрики второй бумаги");
+        assert_eq!(second_metrics.scenarios.len(), 2);
+    }
+    #[test]
+    fn a_schedule_change_changes_inputs_hash() {
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let instrument = InstrumentId::new_random();
+        let first = BondSchedule {
+            periods: vec![crate::bond::AccrualPeriod {
+                period_start: date!(2026 - 01 - 01),
+                accrual_end: date!(2026 - 06 - 30),
+                payment_date: date!(2026 - 07 - 01),
+                coupon_per_unit: Some(PerUnitAmount::new(dec("5"), CurrencyCode::Rub)),
+            }],
+            ..Default::default()
+        };
+        let second = BondSchedule {
+            periods: vec![crate::bond::AccrualPeriod {
+                coupon_per_unit: Some(PerUnitAmount::new(dec("6"), CurrencyCode::Rub)),
+                ..first.periods[0]
+            }],
+            ..first.clone()
+        };
+        let first_hash =
+            report_for_schedules(&state, &BTreeMap::from([(instrument, first)])).inputs_hash;
+        let second_hash =
+            report_for_schedules(&state, &BTreeMap::from([(instrument, second)])).inputs_hash;
+        assert_ne!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn resyncing_unchanged_schedule_keeps_inputs_hash() {
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let instrument = InstrumentId::new_random();
+        let schedule = BondSchedule {
+            periods: vec![crate::bond::AccrualPeriod {
+                period_start: date!(2026 - 01 - 01),
+                accrual_end: date!(2026 - 06 - 30),
+                payment_date: date!(2026 - 07 - 01),
+                coupon_per_unit: Some(PerUnitAmount::new(dec("5"), CurrencyCode::Rub)),
+            }],
+            ..Default::default()
+        };
+        let inputs = BTreeMap::from([(instrument, schedule)]);
+        let first_hash = report_for_schedules(&state, &inputs).inputs_hash;
+        let second_hash = report_for_schedules(&state, &inputs).inputs_hash;
+        assert_eq!(first_hash, second_hash);
     }
 }

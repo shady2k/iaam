@@ -6,10 +6,10 @@ use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::ids::CustodyId;
 use iaam_core::ids::{AccountId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
-use iaam_core::ids::CustodyId;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::lots::LotKey;
 use iaam_core::projection::{ProjectionContext, project};
@@ -55,7 +55,10 @@ fn purchase(owner: OwnerId, account: AccountId, instrument: InstrumentId) -> Eve
         accrued_interest: None,
     };
     event.legs = vec![
-        Leg::cash(account, Money::new(PostedMinor::new(-100_000), CurrencyCode::Rub)),
+        Leg::cash(
+            account,
+            Money::new(PostedMinor::new(-100_000), CurrencyCode::Rub),
+        ),
         Leg::security(
             account,
             CustodyId::new_random(),
@@ -154,10 +157,16 @@ fn a_projection_snapshot_written_before_acquisition_basis_loads() {
     let entry = loaded
         .state()
         .book()
-        .entry(&LotKey { account, instrument })
+        .entry(&LotKey {
+            account,
+            instrument,
+        })
         .expect("лот восстановлен");
     assert_eq!(entry.lots()[0].acquisition_basis, None);
-    assert_eq!(entry.lots()[0].cost_basis, Money::new(PostedMinor::new(100_000), CurrencyCode::Rub));
+    assert_eq!(
+        entry.lots()[0].cost_basis,
+        Money::new(PostedMinor::new(100_000), CurrencyCode::Rub)
+    );
 }
 
 #[test]

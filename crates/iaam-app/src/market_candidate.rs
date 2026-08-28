@@ -133,11 +133,13 @@ pub fn offer_windows_from_snapshot(
         .offer_windows
         .iter()
         .map(|row| {
-            let meaning = offer_kinds.get(&row.source_kind).ok_or_else(|| AppError::Invalid {
-                field: "offer_kind".to_owned(),
-                expected: "код, известный словарю источника".to_owned(),
-                actual: row.source_kind.clone(),
-            })?;
+            let meaning = offer_kinds
+                .get(&row.source_kind)
+                .ok_or_else(|| AppError::Invalid {
+                    field: "offer_kind".to_owned(),
+                    expected: "код, известный словарю источника".to_owned(),
+                    actual: row.source_kind.clone(),
+                })?;
             let right = OfferRight::from_dictionary_meaning(meaning).map_err(|error| {
                 AppError::Invalid {
                     field: "offer_kind".to_owned(),
@@ -217,7 +219,6 @@ pub fn default_flags_from_terms(row: Option<&IssueTermsRow>) -> Option<DefaultFl
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use iaam_core::money::CurrencyCode;
     use iaam_core::numeric::decimal::Dec;
     use iaam_core::rules::{ValuationPolicyV1, ValuationRule};
@@ -228,11 +229,12 @@ mod tests {
     use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
     use iaam_store::schedule::{CouponPeriodRow, OfferWindowRow, StoredSnapshot};
     use rust_decimal::Decimal;
+    use std::collections::BTreeMap;
     use time::macros::{date, datetime};
 
     use super::{
-        accrual_periods_from_snapshot, candidate_from_market_observation,
-        default_flags_from_terms, offer_windows_from_snapshot, schedule_completeness_from_row,
+        accrual_periods_from_snapshot, candidate_from_market_observation, default_flags_from_terms,
+        offer_windows_from_snapshot, schedule_completeness_from_row,
     };
 
     #[test]
@@ -280,7 +282,10 @@ mod tests {
         let windows = offer_windows_from_snapshot(&snapshot, instrument, &dictionary).unwrap();
 
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].right, iaam_core::bond::offer::OfferRight::HolderPut);
+        assert_eq!(
+            windows[0].right,
+            iaam_core::bond::offer::OfferRight::HolderPut
+        );
         assert!(windows[0].submission_start.is_none());
         assert!(windows[0].submission_end.is_none());
         assert!(windows[0].price_percent.is_none());

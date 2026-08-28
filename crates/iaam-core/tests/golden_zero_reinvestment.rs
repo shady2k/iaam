@@ -4,16 +4,14 @@
 //! типы прямо в тесте. Ожидаемые суммы ниже вычислены вручную из строк
 //! fixtures, а не вызовом проверяемых функций.
 
-use iaam_core::bond::{AccrualPeriod, BondSchedule, DefaultFlags, PrincipalReturn};
 use iaam_core::bond::offer::{OfferChoice, OfferRight, ScheduleCompleteness};
+use iaam_core::bond::{AccrualPeriod, BondSchedule, DefaultFlags, PrincipalReturn};
 use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::CurrencyRoles;
 use iaam_core::money::{CalcMoney, CurrencyCode, PerUnitAmount, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::numeric::xirr::RateOutcome;
-use iaam_core::returns::zero_reinvestment::{
-    IrrLabel, prospective_metric,
-};
+use iaam_core::returns::zero_reinvestment::{IrrLabel, prospective_metric};
 use iaam_core::returns::{Computed, NotComputable};
 use iaam_core::rules::{
     CashflowError, CashflowInput, CashflowProjection, CashflowProjectionV1, ExpectedPosting,
@@ -21,8 +19,8 @@ use iaam_core::rules::{
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
-use time::{Date, Duration};
 use time::macros::{date, format_description};
+use time::{Date, Duration};
 
 const FIXED_COUPON: &str =
     include_str!("../../../tests/fixtures/market/moex-iss-bondization-fixed-coupon.json");
@@ -78,7 +76,10 @@ fn optional_dec(columns: &[&str], row: &Value, name: &str) -> Option<Dec> {
     if value.is_null() {
         None
     } else {
-        let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+        let text = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string());
         Some(dec(&text))
     }
 }
@@ -152,7 +153,12 @@ fn principal() -> iaam_core::rules::lot_disposal::PrincipalState {
     .expect("известный номинал")
 }
 
-fn project(raw: &str, instrument: InstrumentId, as_of: Date, choice: &OfferChoice) -> iaam_core::rules::CashflowPlan {
+fn project(
+    raw: &str,
+    instrument: InstrumentId,
+    as_of: Date,
+    choice: &OfferChoice,
+) -> iaam_core::rules::CashflowPlan {
     let schedule = schedule_from_fixture(raw, instrument);
     CashflowProjectionV1
         .future_postings(&CashflowInput {
@@ -206,7 +212,10 @@ fn fixed_coupon_fixture_matches_independent_schedule_ytm_and_cagr() {
     assert_eq!(plan.terminal_date, terminal);
 
     let metric = prospective_metric(as_of, &plan, Computed::Value(calc("1000")), &choice);
-    let metrics = metric.metrics.value().expect("метрики фиксированного купона");
+    let metrics = metric
+        .metrics
+        .value()
+        .expect("метрики фиксированного купона");
     assert_eq!(metrics.terminal_wealth, calc("1035.4"));
     assert_eq!(metrics.surplus, calc("35.4"));
     assert_eq!(metrics.hpr, Computed::Value(dec("0.0354")));
@@ -215,9 +224,16 @@ fn fixed_coupon_fixture_matches_independent_schedule_ytm_and_cagr() {
     // Независимо: (1,035.40 / 1,000)^(365 / 182) - 1.
     // При одном терминальном дне эта же арифметика задаёт YTM через NPV.
     let expected_rate = 0.072_258_093_861_151_67_f64;
-    assert_rate(metric.irr.value().expect("YTM фиксированного купона"), expected_rate, "YTM fixed");
     assert_rate(
-        metrics.cagr_0r.value().expect("CAGR_0R фиксированного купона"),
+        metric.irr.value().expect("YTM фиксированного купона"),
+        expected_rate,
+        "YTM fixed",
+    );
+    assert_rate(
+        metrics
+            .cagr_0r
+            .value()
+            .expect("CAGR_0R фиксированного купона"),
         expected_rate,
         "CAGR fixed",
     );
@@ -240,20 +256,55 @@ fn amortised_fixture_matches_independent_schedule_ytm_and_cagr() {
     assert_eq!(
         plan.postings,
         vec![
-            ExpectedPosting { date: date!(2034 - 08 - 09), amount: calc("34.41"), kind: PostingKind::Coupon },
-            ExpectedPosting { date: date!(2034 - 08 - 09), amount: calc("250"), kind: PostingKind::PrincipalReturn },
-            ExpectedPosting { date: date!(2035 - 02 - 07), amount: calc("25.8"), kind: PostingKind::Coupon },
-            ExpectedPosting { date: date!(2035 - 02 - 07), amount: calc("250"), kind: PostingKind::PrincipalReturn },
-            ExpectedPosting { date: date!(2035 - 08 - 08), amount: calc("17.2"), kind: PostingKind::Coupon },
-            ExpectedPosting { date: date!(2035 - 08 - 08), amount: calc("250"), kind: PostingKind::PrincipalReturn },
-            ExpectedPosting { date: terminal, amount: calc("8.6"), kind: PostingKind::Coupon },
-            ExpectedPosting { date: terminal, amount: calc("250"), kind: PostingKind::PrincipalReturn },
+            ExpectedPosting {
+                date: date!(2034 - 08 - 09),
+                amount: calc("34.41"),
+                kind: PostingKind::Coupon
+            },
+            ExpectedPosting {
+                date: date!(2034 - 08 - 09),
+                amount: calc("250"),
+                kind: PostingKind::PrincipalReturn
+            },
+            ExpectedPosting {
+                date: date!(2035 - 02 - 07),
+                amount: calc("25.8"),
+                kind: PostingKind::Coupon
+            },
+            ExpectedPosting {
+                date: date!(2035 - 02 - 07),
+                amount: calc("250"),
+                kind: PostingKind::PrincipalReturn
+            },
+            ExpectedPosting {
+                date: date!(2035 - 08 - 08),
+                amount: calc("17.2"),
+                kind: PostingKind::Coupon
+            },
+            ExpectedPosting {
+                date: date!(2035 - 08 - 08),
+                amount: calc("250"),
+                kind: PostingKind::PrincipalReturn
+            },
+            ExpectedPosting {
+                date: terminal,
+                amount: calc("8.6"),
+                kind: PostingKind::Coupon
+            },
+            ExpectedPosting {
+                date: terminal,
+                amount: calc("250"),
+                kind: PostingKind::PrincipalReturn
+            },
         ]
     );
     assert_eq!(plan.terminal_date, terminal);
 
     let metric = prospective_metric(as_of, &plan, Computed::Value(calc("1000")), &choice);
-    let metrics = metric.metrics.value().expect("метрики амортизируемого выпуска");
+    let metrics = metric
+        .metrics
+        .value()
+        .expect("метрики амортизируемого выпуска");
     assert_eq!(metrics.terminal_wealth, calc("1086.01"));
     assert_eq!(metrics.surplus, calc("86.01"));
     assert_eq!(metrics.hpr, Computed::Value(dec("0.08601")));
@@ -265,9 +316,16 @@ fn amortised_fixture_matches_independent_schedule_ytm_and_cagr() {
     // 267.20 в день 366; 258.60 в день 548.
     let expected_cagr = 0.056_494_935_308_105_676_f64;
     let expected_ytm = 0.122_174_516_159_886_06_f64;
-    assert_rate(metric.irr.value().expect("YTM амортизируемого выпуска"), expected_ytm, "YTM amortised");
     assert_rate(
-        metrics.cagr_0r.value().expect("CAGR_0R амортизируемого выпуска"),
+        metric.irr.value().expect("YTM амортизируемого выпуска"),
+        expected_ytm,
+        "YTM amortised",
+    );
+    assert_rate(
+        metrics
+            .cagr_0r
+            .value()
+            .expect("CAGR_0R амортизируемого выпуска"),
         expected_cagr,
         "CAGR amortised",
     );
@@ -321,7 +379,6 @@ fn floater_fixture_has_reproducible_coupon_undetermined_refusal() {
         metric.irr.reason().expect("причина отказа").code(),
         "coupon_undetermined"
     );
-
 }
 
 #[test]
@@ -345,13 +402,15 @@ fn offers_fixture_lists_only_future_priced_holder_windows() {
             // Все купоны до погашения уже прошли, поэтому неизвестные
             // купоны после горизонта не участвуют в сценарии удержания.
             OfferChoice::HoldToMaturity => date!(2032 - 02 - 17),
-            OfferChoice::ExerciseAtOffer { window } => schedule
-                .offer_windows
-                .iter()
-                .find(|terms| terms.window == *window)
-                .expect("окно оферты")
-                .execution_date
-                - Duration::days(1),
+            OfferChoice::ExerciseAtOffer { window } => {
+                schedule
+                    .offer_windows
+                    .iter()
+                    .find(|terms| terms.window == *window)
+                    .expect("окно оферты")
+                    .execution_date
+                    - Duration::days(1)
+            }
         };
         let plan = project(OFFERS, instrument, scenario_as_of, &choice);
         match choice {

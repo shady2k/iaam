@@ -130,7 +130,10 @@ mod tests {
         };
 
         assert_eq!(schedule.offer_windows[0].window, window);
-        assert_eq!(schedule.completeness, offer::ScheduleCompleteness::Validated);
+        assert_eq!(
+            schedule.completeness,
+            offer::ScheduleCompleteness::Validated
+        );
         assert!(schedule.currency_roles.is_some());
         assert!(BondSchedule::default().default_flags.is_none());
     }

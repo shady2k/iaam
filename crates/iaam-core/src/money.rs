@@ -416,10 +416,7 @@ mod tests {
 
     #[test]
     fn calc_money_multiplication_reports_numeric_overflow() {
-        let amount = CalcMoney::new(
-            dec("79228162514264337593543950335"),
-            CurrencyCode::Rub,
-        );
+        let amount = CalcMoney::new(dec("79228162514264337593543950335"), CurrencyCode::Rub);
 
         assert!(matches!(
             amount.checked_mul(dec("2")),

@@ -502,10 +502,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(
-            partial.remaining[0].acquisition_basis,
-            Some(rub(5_000))
-        );
+        assert_eq!(partial.remaining[0].acquisition_basis, Some(rub(5_000)));
 
         let full = FifoV1
             .apply(&DisposalInput {

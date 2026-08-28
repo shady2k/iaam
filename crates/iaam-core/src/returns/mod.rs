@@ -29,8 +29,8 @@ use crate::bond::{
 };
 use crate::contour::{ContourDefinition, ContourId, ContourVersion};
 use crate::ids::{AccountId, InstrumentId, SourceId};
-use crate::money::{CalcMoney, CurrencyCode};
 use crate::money::PerUnitAmount;
+use crate::money::{CalcMoney, CurrencyCode};
 use crate::numeric::approx::SolverPolicy;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverRefusal};
@@ -125,7 +125,10 @@ pub enum NotComputable {
     /// Исполнимого выхода нет: реализовать НКД сегодня нельзя.
     ExitNotExecutable,
     /// Дата окончания горизонта не позже координаты метрики.
-    NonPositiveDuration { coordinate: Date, terminal_date: Date },
+    NonPositiveDuration {
+        coordinate: Date,
+        terminal_date: Date,
+    },
     /// Начальная стоимость не положительна.
     NonPositiveInitialCapital,
     /// Терминальное благосостояние отрицательно.
@@ -182,9 +185,7 @@ impl NotComputable {
             Self::NegativeTerminalWealth => "negative_terminal_wealth",
             Self::PrincipalStateAmbiguous { .. } => "principal_state_ambiguous",
             Self::AcquisitionBasisUnknown => "acquisition_basis_unknown",
-            Self::AccruedInterestAtAcquisitionUnknown => {
-                "accrued_interest_at_acquisition_unknown"
-            }
+            Self::AccruedInterestAtAcquisitionUnknown => "accrued_interest_at_acquisition_unknown",
             Self::HistoricalReceiptsUnknown => "historical_receipts_unknown",
             Self::CohortGap { .. } => "cohort_gap",
             Self::CurrencyMismatch { .. } => "currency_mismatch",
@@ -895,8 +896,14 @@ pub(crate) const fn quotation_rule() -> (QuotationRuleVersion, QuotationV1) {
 }
 
 /// Версия правила построения сценарных потоков.
-pub(crate) const fn cashflow_projection_rule() -> (CashflowProjectionVersion, crate::rules::CashflowProjectionV1) {
-    (CashflowProjectionVersion(1), crate::rules::CashflowProjectionV1)
+pub(crate) const fn cashflow_projection_rule() -> (
+    CashflowProjectionVersion,
+    crate::rules::CashflowProjectionV1,
+) {
+    (
+        CashflowProjectionVersion(1),
+        crate::rules::CashflowProjectionV1,
+    )
 }
 
 /// Версия политики расходов, применяемой до появления налогового контура.
@@ -1281,16 +1288,18 @@ fn bond_c0(
     request: &ReturnsRequest<'_>,
     accrued_rule: &dyn AccruedInterestRule,
 ) -> Computed<CalcMoney> {
-    let accrued = match accrued_per_unit(request, accrued_rule, assessment.instrument)
-        .and_then(|value| {
+    let accrued =
+        match accrued_per_unit(request, accrued_rule, assessment.instrument).and_then(|value| {
             value
                 .checked_mul_quantity(assessment.quantity)
                 .map(|total| CalcMoney::new(total, value.currency()))
-                .map_err(|_| NotComputable::Numeric { code: "accrued_total" })
+                .map_err(|_| NotComputable::Numeric {
+                    code: "accrued_total",
+                })
         }) {
-        Ok(value) => value,
-        Err(reason) => return Computed::NotComputable { reason },
-    };
+            Ok(value) => value,
+            Err(reason) => return Computed::NotComputable { reason },
+        };
     let selected = match &assessment.kind {
         PositionAssessmentKind::Selected(selected) => selected,
         PositionAssessmentKind::LegacyDerived(_)
@@ -1378,19 +1387,13 @@ fn bond_scenario(
     });
     match plan {
         Ok(plan) => {
-            let prospective = zero_reinvestment::prospective_metric(
-                request.as_of,
-                &plan,
-                c0,
-                &choice,
-            );
+            let prospective =
+                zero_reinvestment::prospective_metric(request.as_of, &plan, c0, &choice);
             let lifetime = lots.map_or_else(
-                || {
-                    Computed::NotComputable {
-                        reason: NotComputable::CohortGap {
-                            gap: crate::projection::lots::CohortGap::AcquisitionDateUnknown,
-                        },
-                    }
+                || Computed::NotComputable {
+                    reason: NotComputable::CohortGap {
+                        gap: crate::projection::lots::CohortGap::AcquisitionDateUnknown,
+                    },
                 },
                 |lots| zero_reinvestment::lifetime_metrics_from_lots(lots, &plan),
             );
@@ -1449,17 +1452,15 @@ fn bond_position_metrics(
                 account: assessment.account,
                 instrument: assessment.instrument,
             });
-            let unresolved: std::collections::BTreeSet<_> = unresolved_submissions(
-                offer_book,
-                schedule,
-            )
-            .into_iter()
-            .filter(|submission| {
-                offer_book
-                    .submission(*submission)
-                    .is_some_and(|state| state.instrument == assessment.instrument)
-            })
-            .collect();
+            let unresolved: std::collections::BTreeSet<_> =
+                unresolved_submissions(offer_book, schedule)
+                    .into_iter()
+                    .filter(|submission| {
+                        offer_book
+                            .submission(*submission)
+                            .is_some_and(|state| state.instrument == assessment.instrument)
+                    })
+                    .collect();
             let scenarios = available_choices(schedule, request.as_of)
                 .into_iter()
                 .filter(|choice| match choice {
@@ -4328,16 +4329,18 @@ mod tests {
             currency_roles: Some(crate::instrument::CurrencyRoles::uniform(CurrencyCode::Rub)),
             ..Default::default()
         };
-        let (report, _) = report_with_market_basis_and_schedule(
-            QuotationBasis::MoneyPerUnit,
-            Some(schedule),
-        );
+        let (report, _) =
+            report_with_market_basis_and_schedule(QuotationBasis::MoneyPerUnit, Some(schedule));
 
         assert_eq!(report.bond_metrics.len(), 1);
         assert_eq!(report.bond_metrics[0].scenarios.len(), 2);
         assert_ne!(
-            report.bond_metrics[0].scenarios[0].prospective.terminal_date,
-            report.bond_metrics[0].scenarios[1].prospective.terminal_date
+            report.bond_metrics[0].scenarios[0]
+                .prospective
+                .terminal_date,
+            report.bond_metrics[0].scenarios[1]
+                .prospective
+                .terminal_date
         );
         let (share_report, _) = report_with_market_basis(QuotationBasis::MoneyPerUnit);
         assert!(share_report.bond_metrics.is_empty());
@@ -4356,8 +4359,7 @@ mod tests {
         let account = AccountId::new_random();
         let first_instrument = InstrumentId::new_random();
         let second_instrument = InstrumentId::new_random();
-        let contour =
-            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
         let rules = RuleRegistry::with_defaults();
         let context = ProjectionContext {
             contour: &contour,

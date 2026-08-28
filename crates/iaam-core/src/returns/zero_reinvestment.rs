@@ -90,7 +90,9 @@ pub enum ExpenseMetrics {
         without_expense: ZeroReinvestmentMetrics,
         with_upper_bound: ZeroReinvestmentMetrics,
     },
-    NotComputable { reason: NotComputable },
+    NotComputable {
+        reason: NotComputable,
+    },
 }
 
 /// Рассчитать пять величин для будущего потока.
@@ -190,8 +192,14 @@ fn metrics_from_terminal_wealth(
             };
             match solve(
                 &[
-                    SolverFlow { day_offset: 0, amount: negative_c0 },
-                    SolverFlow { day_offset: days, amount: terminal_wealth.value() },
+                    SolverFlow {
+                        day_offset: 0,
+                        amount: negative_c0,
+                    },
+                    SolverFlow {
+                        day_offset: days,
+                        amount: terminal_wealth.value(),
+                    },
                 ],
                 solver_policy,
                 DayCount::Act365,
@@ -243,15 +251,15 @@ pub fn prospective_c0(
     remaining_face: Option<crate::money::PerUnitAmount>,
     accrued_interest: CalcMoney,
 ) -> Computed<CalcMoney> {
-    let (money_per_unit, currency) = match QuotationV1.money_per_unit(
-        basis,
-        price,
-        venue_currency,
-        remaining_face,
-    ) {
-        Ok(value) => value,
-        Err(error) => return Computed::NotComputable { reason: quote_error(error) },
-    };
+    let (money_per_unit, currency) =
+        match QuotationV1.money_per_unit(basis, price, venue_currency, remaining_face) {
+            Ok(value) => value,
+            Err(error) => {
+                return Computed::NotComputable {
+                    reason: quote_error(error),
+                };
+            }
+        };
     if currency != accrued_interest.currency() {
         return Computed::NotComputable {
             reason: NotComputable::CurrencyMismatch {
@@ -272,9 +280,13 @@ pub fn prospective_c0(
 
 fn quote_error(error: QuotationError) -> NotComputable {
     match error {
-        QuotationError::BasisUnknown => NotComputable::Numeric { code: "quotation_basis_unknown" },
+        QuotationError::BasisUnknown => NotComputable::Numeric {
+            code: "quotation_basis_unknown",
+        },
         QuotationError::PrincipalUnknown => NotComputable::PrincipalUnknown,
-        QuotationError::Numeric(_) => NotComputable::Numeric { code: "quotation_numeric" },
+        QuotationError::Numeric(_) => NotComputable::Numeric {
+            code: "quotation_numeric",
+        },
     }
 }
 
@@ -291,17 +303,18 @@ pub fn prospective_metric(
         OfferChoice::ExerciseAtOffer { .. } => IrrLabel::YieldToOffer,
     };
     let metrics = match &c0 {
-        Computed::Value(value) => zero_reinvestment_metrics(
-            plan.postings.clone(),
-            *value,
-            as_of,
-            plan.terminal_date,
-        ),
-        Computed::NotComputable { reason } => Computed::NotComputable { reason: reason.clone() },
+        Computed::Value(value) => {
+            zero_reinvestment_metrics(plan.postings.clone(), *value, as_of, plan.terminal_date)
+        }
+        Computed::NotComputable { reason } => Computed::NotComputable {
+            reason: reason.clone(),
+        },
     };
     let irr = match &c0 {
         Computed::Value(value) => irr_for_postings(&plan.postings, *value, as_of),
-        Computed::NotComputable { reason } => Computed::NotComputable { reason: reason.clone() },
+        Computed::NotComputable { reason } => Computed::NotComputable {
+            reason: reason.clone(),
+        },
     };
     ProspectiveMetric {
         as_of,
@@ -320,10 +333,17 @@ fn irr_for_postings(
 ) -> Computed<RateOutcome> {
     let negative_c0 = match c0.value().checked_neg() {
         Ok(value) => value,
-        Err(_) => return rate_refusal(NotComputable::Numeric { code: "irr_c0_negate" }),
+        Err(_) => {
+            return rate_refusal(NotComputable::Numeric {
+                code: "irr_c0_negate",
+            });
+        }
     };
     let mut flows = Vec::with_capacity(postings.len() + 1);
-    flows.push(SolverFlow { day_offset: 0, amount: negative_c0 });
+    flows.push(SolverFlow {
+        day_offset: 0,
+        amount: negative_c0,
+    });
     for posting in postings {
         if posting.amount.currency() != c0.currency() {
             return rate_refusal(NotComputable::CurrencyMismatch {
@@ -351,7 +371,9 @@ pub fn lifetime_cohort_metric(
     terminal_date: Date,
 ) -> LifetimeCohortMetric {
     let c0 = match (cohort.acquisition_basis, cohort.accrued_interest_paid) {
-        (None, _) => Computed::NotComputable { reason: NotComputable::AcquisitionBasisUnknown },
+        (None, _) => Computed::NotComputable {
+            reason: NotComputable::AcquisitionBasisUnknown,
+        },
         (_, None) => Computed::NotComputable {
             reason: NotComputable::AccruedInterestAtAcquisitionUnknown,
         },
@@ -361,7 +383,9 @@ pub fn lifetime_cohort_metric(
         },
     };
     let metrics = match (&c0, cohort.received_to_date) {
-        (Computed::NotComputable { reason }, _) => Computed::NotComputable { reason: reason.clone() },
+        (Computed::NotComputable { reason }, _) => Computed::NotComputable {
+            reason: reason.clone(),
+        },
         (Computed::Value(_), None) => Computed::NotComputable {
             reason: NotComputable::HistoricalReceiptsUnknown,
         },
@@ -387,8 +411,9 @@ pub fn lifetime_cohort_metric(
                     wealth = match wealth.checked_add(posting.amount) {
                         Ok(value) => value,
                         Err(_) => {
-                            failure =
-                                Some(NotComputable::Numeric { code: "lifetime_wealth_add" });
+                            failure = Some(NotComputable::Numeric {
+                                code: "lifetime_wealth_add",
+                            });
                             break;
                         }
                     };
@@ -437,14 +462,11 @@ pub fn lifetime_cohort_metrics(
     let mut remaining_quantity = total;
     let mut remaining_postings = plan.postings.clone();
     for cohort in cohorts.iter().copied() {
-        let (postings, remainder) = match split_postings(
-            &remaining_postings,
-            cohort.quantity.0,
-            remaining_quantity,
-        ) {
-            Ok(value) => value,
-            Err(reason) => return Computed::NotComputable { reason },
-        };
+        let (postings, remainder) =
+            match split_postings(&remaining_postings, cohort.quantity.0, remaining_quantity) {
+                Ok(value) => value,
+                Err(reason) => return Computed::NotComputable { reason },
+            };
         remaining_postings = remainder;
         remaining_quantity = match remaining_quantity.checked_sub(cohort.quantity.0) {
             Ok(value) => value,
@@ -477,18 +499,24 @@ fn split_postings(
 ) -> Result<(Vec<ExpectedPosting>, Vec<ExpectedPosting>), NotComputable> {
     let ratio = quantity
         .checked_div(remaining_quantity)
-        .map_err(|_| NotComputable::Numeric { code: "cohort_quantity_div" })?;
+        .map_err(|_| NotComputable::Numeric {
+            code: "cohort_quantity_div",
+        })?;
     let mut result = Vec::with_capacity(postings.len());
     let mut remainder = Vec::with_capacity(postings.len());
     for posting in postings {
         let amount = posting
             .amount
             .checked_mul(ratio)
-            .map_err(|_| NotComputable::Numeric { code: "cohort_posting_mul" })?;
+            .map_err(|_| NotComputable::Numeric {
+                code: "cohort_posting_mul",
+            })?;
         let remaining = posting
             .amount
             .checked_sub(amount)
-            .map_err(|_| NotComputable::Numeric { code: "cohort_posting_remainder_sub" })?;
+            .map_err(|_| NotComputable::Numeric {
+                code: "cohort_posting_remainder_sub",
+            })?;
         result.push(ExpectedPosting { amount, ..*posting });
         remainder.push(ExpectedPosting {
             amount: remaining,
@@ -529,7 +557,9 @@ pub fn apply_expense(
         let value = amount
             .to_calc_dec()
             .checked_neg()
-            .map_err(|_| NotComputable::Numeric { code: "expense_apply" })?;
+            .map_err(|_| NotComputable::Numeric {
+                code: "expense_apply",
+            })?;
         postings.push(ExpectedPosting {
             date: on,
             amount: CalcMoney::new(value, amount.currency()),
@@ -569,7 +599,6 @@ pub fn irr_for_expense_policy(
     }
 }
 
-
 /// Применить политику расходов, сохранив верхнюю и нижнюю границы.
 pub fn expense_adjusted_metrics(
     postings: Vec<ExpectedPosting>,
@@ -579,39 +608,31 @@ pub fn expense_adjusted_metrics(
     treatment: ExpenseTreatment,
 ) -> ExpenseMetrics {
     match treatment {
-        ExpenseTreatment::AbsentByPolicy => exact_expense_metrics(
-            postings,
-            c0,
-            coordinate,
-            terminal_date,
-        ),
+        ExpenseTreatment::AbsentByPolicy => {
+            exact_expense_metrics(postings, c0, coordinate, terminal_date)
+        }
         ExpenseTreatment::Known { amount, on } => {
-            let adjusted = match apply_expense(
-                postings,
-                ExpenseTreatment::Known { amount, on },
-            ) {
+            let adjusted = match apply_expense(postings, ExpenseTreatment::Known { amount, on }) {
                 Ok(value) => value,
                 Err(reason) => return ExpenseMetrics::NotComputable { reason },
             };
             exact_expense_metrics(adjusted, c0, coordinate, terminal_date)
         }
         ExpenseTreatment::UnknownBoundedBy { upper } => {
-            let without_expense = match exact_expense_metrics(
-                postings.clone(),
-                c0,
-                coordinate,
-                terminal_date,
-            ) {
-                ExpenseMetrics::Exact(value) => value,
-                ExpenseMetrics::NotComputable { reason } => {
-                    return ExpenseMetrics::NotComputable { reason };
-                }
-                ExpenseMetrics::Bounded { .. } => {
-                    return ExpenseMetrics::NotComputable {
-                        reason: NotComputable::Numeric { code: "expense_bound_negate" },
-                    };
-                }
-            };
+            let without_expense =
+                match exact_expense_metrics(postings.clone(), c0, coordinate, terminal_date) {
+                    ExpenseMetrics::Exact(value) => value,
+                    ExpenseMetrics::NotComputable { reason } => {
+                        return ExpenseMetrics::NotComputable { reason };
+                    }
+                    ExpenseMetrics::Bounded { .. } => {
+                        return ExpenseMetrics::NotComputable {
+                            reason: NotComputable::Numeric {
+                                code: "expense_bound_negate",
+                            },
+                        };
+                    }
+                };
             if upper.currency() != c0.currency() {
                 return ExpenseMetrics::NotComputable {
                     reason: NotComputable::CurrencyMismatch {
@@ -624,7 +645,9 @@ pub fn expense_adjusted_metrics(
                 Ok(value) => value,
                 Err(_) => {
                     return ExpenseMetrics::NotComputable {
-                        reason: NotComputable::Numeric { code: "expense_bound_negate" },
+                        reason: NotComputable::Numeric {
+                            code: "expense_bound_negate",
+                        },
                     };
                 }
             };
@@ -634,22 +657,20 @@ pub fn expense_adjusted_metrics(
                 amount: CalcMoney::new(negative_upper, upper.currency()),
                 kind: PostingKind::OfferSettlement,
             });
-            let with_upper_bound = match exact_expense_metrics(
-                adjusted,
-                c0,
-                coordinate,
-                terminal_date,
-            ) {
-                ExpenseMetrics::Exact(value) => value,
-                ExpenseMetrics::NotComputable { reason } => {
-                    return ExpenseMetrics::NotComputable { reason };
-                }
-                ExpenseMetrics::Bounded { .. } => {
-                    return ExpenseMetrics::NotComputable {
-                        reason: NotComputable::Numeric { code: "expense_bound_calculation" },
-                    };
-                }
-            };
+            let with_upper_bound =
+                match exact_expense_metrics(adjusted, c0, coordinate, terminal_date) {
+                    ExpenseMetrics::Exact(value) => value,
+                    ExpenseMetrics::NotComputable { reason } => {
+                        return ExpenseMetrics::NotComputable { reason };
+                    }
+                    ExpenseMetrics::Bounded { .. } => {
+                        return ExpenseMetrics::NotComputable {
+                            reason: NotComputable::Numeric {
+                                code: "expense_bound_calculation",
+                            },
+                        };
+                    }
+                };
             ExpenseMetrics::Bounded {
                 without_expense,
                 with_upper_bound,
@@ -717,7 +738,9 @@ mod tests {
             date!(2026 - 08 - 28),
             date!(2027 - 09 - 01),
         );
-        let Computed::Value(metrics) = result else { panic!("expected metrics") };
+        let Computed::Value(metrics) = result else {
+            panic!("expected metrics")
+        };
         assert_eq!(metrics.terminal_wealth.value(), dec("9.999"));
         assert_eq!(metrics.surplus.value(), dec("4.999"));
         assert_eq!(metrics.hpr, Computed::Value(dec("0.9998")));
@@ -740,8 +763,12 @@ mod tests {
             date!(2026 - 01 - 01),
             date!(2027 - 01 - 01),
         );
-        let Computed::Value(hold) = hold else { panic!("hold") };
-        let Computed::Value(offer) = offer else { panic!("offer") };
+        let Computed::Value(hold) = hold else {
+            panic!("hold")
+        };
+        let Computed::Value(offer) = offer else {
+            panic!("offer")
+        };
         assert_ne!(hold.cagr_0r, offer.cagr_0r);
     }
 
@@ -778,7 +805,9 @@ mod tests {
             calc("100"),
             date!(2026 - 08 - 28),
             date!(2026 - 08 - 28),
-        ) else { panic!("expected metrics") };
+        ) else {
+            panic!("expected metrics")
+        };
         assert_eq!(metrics.hpr, Computed::Value(dec("0.1")));
         assert!(matches!(metrics.cagr_0r, Computed::NotComputable { .. }));
     }
@@ -790,7 +819,9 @@ mod tests {
             calc("100"),
             date!(2026 - 01 - 01),
             date!(2027 - 01 - 01),
-        ) else { panic!("expected metrics") };
+        ) else {
+            panic!("expected metrics")
+        };
         assert_eq!(metrics.hpr, Computed::Value(dec("-1")));
         assert_eq!(metrics.cagr_0r, Computed::Value(exact_minus_one_rate()));
     }
@@ -802,7 +833,9 @@ mod tests {
             calc("100"),
             date!(2026 - 01 - 01),
             date!(2027 - 01 - 01),
-        ) else { panic!("expected metrics") };
+        ) else {
+            panic!("expected metrics")
+        };
         assert_eq!(metrics.hpr, Computed::Value(dec("-1.01")));
         assert!(matches!(metrics.cagr_0r, Computed::NotComputable { .. }));
     }
@@ -814,7 +847,9 @@ mod tests {
             calc("0"),
             date!(2026 - 01 - 01),
             date!(2027 - 01 - 01),
-        ) else { panic!("expected metrics") };
+        ) else {
+            panic!("expected metrics")
+        };
         assert!(matches!(metrics.hpr, Computed::NotComputable { .. }));
         assert!(matches!(metrics.cagr_0r, Computed::NotComputable { .. }));
     }
@@ -835,7 +870,9 @@ mod tests {
             date!(2027 - 01 - 01),
         );
         assert_eq!(metric.c0, Computed::Value(calc("1000")));
-        let Computed::Value(metrics) = metric.metrics else { panic!("metrics") };
+        let Computed::Value(metrics) = metric.metrics else {
+            panic!("metrics")
+        };
         assert_eq!(metrics.hpr, Computed::Value(dec("0")));
         assert_eq!(
             metric.irr_absent_because,
@@ -862,8 +899,12 @@ mod tests {
     fn known_expense_is_a_dated_negative_cashflow() {
         let result = apply_expense(
             vec![posting(date!(2027 - 01 - 01), "100")],
-            ExpenseTreatment::Known { amount: money(1000), on: date!(2026 - 09 - 01) },
-        ).unwrap();
+            ExpenseTreatment::Known {
+                amount: money(1000),
+                on: date!(2026 - 09 - 01),
+            },
+        )
+        .unwrap();
         assert_eq!(result[0].amount.value(), dec("-10"));
         assert_eq!(result[0].date, date!(2026 - 09 - 01));
     }
@@ -899,8 +940,18 @@ mod tests {
         else {
             panic!("cohorts")
         };
-        assert_eq!(metrics[0].metrics.value().unwrap().postings[0].amount.value(), dec("30"));
-        assert_eq!(metrics[1].metrics.value().unwrap().postings[0].amount.value(), dec("70"));
+        assert_eq!(
+            metrics[0].metrics.value().unwrap().postings[0]
+                .amount
+                .value(),
+            dec("30")
+        );
+        assert_eq!(
+            metrics[1].metrics.value().unwrap().postings[0]
+                .amount
+                .value(),
+            dec("70")
+        );
     }
 
     #[test]

@@ -19,12 +19,12 @@ use iaam_core::money::{CalcMoney, CurrencyCode, Money, PerUnitAmount, PostedMino
 use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::lots::{Cohort, LotKey};
-use iaam_core::rules::lot_disposal::Lot;
-use iaam_core::projection::{advance, project, ProjectionContext};
-use iaam_core::returns::{returns_report, Computed, ReturnsRequest};
+use iaam_core::projection::{ProjectionContext, advance, project};
 use iaam_core::returns::zero_reinvestment::{
-    lifetime_cohort_metrics, zero_reinvestment_metrics, ZeroReinvestmentMetrics,
+    ZeroReinvestmentMetrics, lifetime_cohort_metrics, zero_reinvestment_metrics,
 };
+use iaam_core::returns::{Computed, ReturnsRequest, returns_report};
+use iaam_core::rules::lot_disposal::Lot;
 use iaam_core::rules::lot_disposal::{FifoV1, LotDisposalRule, PrincipalState};
 use iaam_core::rules::{
     CashflowPlan, CashflowProjection, CashflowProjectionV1, ExpectedPosting, LotRuleVersion,
@@ -459,14 +459,12 @@ fn resyncing_the_same_issue_keeps_every_report_number() {
         account,
         date!(2025 - 01 - 01),
         1,
-        EventKind::CashIn { amount: rub(100_000) },
+        EventKind::CashIn {
+            amount: rub(100_000),
+        },
         vec![Leg::cash(account, rub(100_000))],
     )];
-    let contour = ContourDefinition::new(
-        ContourId::new_random(),
-        ContourVersion(1),
-        [account],
-    );
+    let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
     let rules = RuleRegistry::with_defaults();
     let context = ProjectionContext {
         contour: &contour,
@@ -502,4 +500,3 @@ fn resyncing_the_same_issue_keeps_every_report_number() {
         "неизменный выпуск не должен менять ни одной цифры отчёта",
     );
 }
-

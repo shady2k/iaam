@@ -16,23 +16,22 @@ use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, ClassificationRuleView, IssuedToken, Scope, TokenView,
 };
+use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
-use iaam_core::bond::offer::OfferChoice;
-use iaam_core::rules::{ExpectedPosting, PostingKind};
-use iaam_core::returns::zero_reinvestment::{
-    BondScenarioResult, IrrLabel, LifetimeCohortMetric, ProspectiveMetric,
-    ZeroReinvestmentMetrics,
-};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::returns::zero_reinvestment::{
+    BondScenarioResult, IrrLabel, LifetimeCohortMetric, ProspectiveMetric, ZeroReinvestmentMetrics,
+};
 use iaam_core::returns::{
     AmountQualification, BondPositionAttributes, Computed, DataQuality, EvaluatedPosition,
     ExecutabilityShares, LiquidationEstimate, MaterialIssue, NotComputable, PositionCoverage,
     ReturnsReport, UncoveredPosition,
 };
+use iaam_core::rules::{ExpectedPosting, PostingKind};
 use iaam_core::valuation::{
     PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, QuotationBasis,
     SelectedPrice, SourceExecutability,
@@ -638,22 +637,34 @@ fn describe(reason: &NotComputable) -> String {
         }
         NotComputable::ExitNotExecutable => "нет исполнимого выхода для реализации НКД".to_owned(),
         NotComputable::PrincipalUnknown => "неизвестен номинал для пересчёта котировки".into(),
-        NotComputable::NonPositiveDuration { coordinate, terminal_date } => {
+        NotComputable::NonPositiveDuration {
+            coordinate,
+            terminal_date,
+        } => {
             format!("дата окончания {terminal_date} не позже координаты {coordinate}")
         }
         NotComputable::NonPositiveInitialCapital => "начальная стоимость не положительна".into(),
         NotComputable::NegativeTerminalWealth => "терминальное благосостояние отрицательно".into(),
         NotComputable::PrincipalStateAmbiguous { instrument } => {
-            format!("неоднозначное состояние номинала инструмента {}", instrument.inner())
+            format!(
+                "неоднозначное состояние номинала инструмента {}",
+                instrument.inner()
+            )
         }
-        NotComputable::AcquisitionBasisUnknown => "историческая стоимость приобретения неизвестна".into(),
+        NotComputable::AcquisitionBasisUnknown => {
+            "историческая стоимость приобретения неизвестна".into()
+        }
         NotComputable::AccruedInterestAtAcquisitionUnknown => {
             "НКД, уплаченный при приобретении, неизвестен".into()
         }
         NotComputable::HistoricalReceiptsUnknown => "история полученных выплат неизвестна".into(),
         NotComputable::CohortGap { gap } => gap.to_string(),
         NotComputable::CurrencyMismatch { expected, actual } => {
-            format!("валюты не совпадают: {} и {}", expected.code(), actual.code())
+            format!(
+                "валюты не совпадают: {} и {}",
+                expected.code(),
+                actual.code()
+            )
         }
         NotComputable::ExpenseUnknown => "расход неизвестен".into(),
     }
@@ -851,9 +862,7 @@ impl OfferChoiceDto {
     fn from_domain(value: &OfferChoice) -> Self {
         match value {
             OfferChoice::HoldToMaturity => Self::HoldToMaturity,
-            OfferChoice::ExerciseAtOffer { window } => Self::ExerciseAtOffer {
-                window: window.0,
-            },
+            OfferChoice::ExerciseAtOffer { window } => Self::ExerciseAtOffer { window: window.0 },
         }
     }
 }
@@ -1008,7 +1017,10 @@ impl BondPositionMetricsDto {
     }
 }
 
-fn rate_dto(value: &Computed<iaam_core::numeric::xirr::RateOutcome>, fallback_day_count: &str) -> RateDto {
+fn rate_dto(
+    value: &Computed<iaam_core::numeric::xirr::RateOutcome>,
+    fallback_day_count: &str,
+) -> RateDto {
     match value {
         Computed::Value(outcome) => RateDto {
             value: format_rate(outcome.rate().value()),
@@ -1028,7 +1040,6 @@ fn rate_dto(value: &Computed<iaam_core::numeric::xirr::RateOutcome>, fallback_da
         },
     }
 }
-
 
 /// Выбранная цена позиции с выводами политики и provenance.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2552,16 +2563,12 @@ mod tests {
 
     #[test]
     fn zero_reinvestment_note_is_present_in_serialized_metrics_body() {
-        let computed =
-            iaam_core::returns::zero_reinvestment::zero_reinvestment_metrics(
-                Vec::new(),
-                iaam_core::money::CalcMoney::new(
-                    Dec::new(Decimal::new(100, 0)),
-                    CurrencyCode::Rub,
-                ),
-                time::macros::date!(2026 - 01 - 01),
-                time::macros::date!(2027 - 01 - 01),
-            );
+        let computed = iaam_core::returns::zero_reinvestment::zero_reinvestment_metrics(
+            Vec::new(),
+            iaam_core::money::CalcMoney::new(Dec::new(Decimal::new(100, 0)), CurrencyCode::Rub),
+            time::macros::date!(2026 - 01 - 01),
+            time::macros::date!(2027 - 01 - 01),
+        );
         let Computed::Value(metrics) = computed else {
             panic!("простые метрики должны вычисляться");
         };

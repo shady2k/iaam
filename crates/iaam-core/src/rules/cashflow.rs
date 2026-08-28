@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::Date;
 
-use crate::bond::offer::{OfferChoice, ScheduleCompleteness};
 use crate::bond::BondSchedule;
+use crate::bond::offer::{OfferChoice, ScheduleCompleteness};
 use crate::instrument::CurrencyRoles;
 use crate::money::{CalcMoney, CurrencyCode, Quantity};
-use crate::numeric::decimal::Dec;
 use crate::numeric::NumericError;
+use crate::numeric::decimal::Dec;
 
 /// Версия правила построения будущего потока.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -40,9 +40,7 @@ pub enum CashflowError {
     #[error("валютные роли не позволяют применить формулу: {roles:?}")]
     CurrencyFormulaUnknown { roles: Option<CurrencyRoles> },
     #[error("окно оферты {window:?} нельзя исполнить")]
-    OfferWindowNotExercisable {
-        window: crate::bond::OfferWindowId,
-    },
+    OfferWindowNotExercisable { window: crate::bond::OfferWindowId },
 }
 
 /// Входы правила построения потока.
@@ -100,10 +98,7 @@ fn amount_for_per_unit(
     quantity: Quantity,
     factor: Dec,
 ) -> Result<CalcMoney, CashflowError> {
-    let total = value
-        .value()
-        .checked_mul(quantity.0)?
-        .checked_mul(factor)?;
+    let total = value.value().checked_mul(quantity.0)?.checked_mul(factor)?;
     Ok(CalcMoney::new(total, value.currency()))
 }
 
@@ -144,8 +139,7 @@ impl CashflowProjection for CashflowProjectionV1 {
                 return Err(CashflowError::PrincipalUnknown);
             }
             crate::rules::lot_disposal::PrincipalState::Known {
-                original_per_unit,
-                ..
+                original_per_unit, ..
             } => original_per_unit,
         };
 
@@ -187,7 +181,9 @@ impl CashflowProjection for CashflowProjectionV1 {
                 match terms.right {
                     crate::bond::OfferRight::HolderPut => {
                         if terms.price_percent.is_none() {
-                            return Err(CashflowError::OfferWindowNotExercisable { window: *window });
+                            return Err(CashflowError::OfferWindowNotExercisable {
+                                window: *window,
+                            });
                         }
                     }
                     crate::bond::OfferRight::HolderPutSettled
@@ -295,7 +291,6 @@ impl CashflowProjection for CashflowProjectionV1 {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,7 +363,11 @@ mod tests {
     #[test]
     fn coupon_fractional_minor_units_stays_exact() {
         let schedule = valid_schedule(
-            vec![period(date!(2026 - 08 - 01), date!(2026 - 09 - 01), Some("3.333"))],
+            vec![period(
+                date!(2026 - 08 - 01),
+                date!(2026 - 09 - 01),
+                Some("3.333"),
+            )],
             vec![PrincipalReturn {
                 repayment_date: date!(2026 - 10 - 01),
                 share_percent: dec("100"),
@@ -392,7 +391,11 @@ mod tests {
     #[test]
     fn uniform_ruble_schedule_produces_complete_flow_and_whole_shares() {
         let schedule = valid_schedule(
-            vec![period(date!(2026 - 08 - 01), date!(2026 - 09 - 01), Some("10"))],
+            vec![period(
+                date!(2026 - 08 - 01),
+                date!(2026 - 09 - 01),
+                Some("10"),
+            )],
             vec![
                 PrincipalReturn {
                     repayment_date: date!(2026 - 10 - 01),
@@ -424,7 +427,17 @@ mod tests {
         assert_eq!(plan.postings[2].amount.value(), dec("80"));
         assert_eq!(plan.terminal_date, date!(2026 - 11 - 01));
         assert!(plan.past.is_empty());
-        assert_eq!(Dec::sum(&schedule.principal_returns.iter().map(|r| r.share_percent).collect::<Vec<_>>()).unwrap(), dec("100"));
+        assert_eq!(
+            Dec::sum(
+                &schedule
+                    .principal_returns
+                    .iter()
+                    .map(|r| r.share_percent)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+            dec("100")
+        );
     }
 
     #[test]
@@ -491,7 +504,11 @@ mod tests {
     #[test]
     fn past_scheduled_dates_are_listed_separately_from_future_postings() {
         let schedule = valid_schedule(
-            vec![period(date!(2026 - 07 - 01), date!(2026 - 08 - 01), Some("10"))],
+            vec![period(
+                date!(2026 - 07 - 01),
+                date!(2026 - 08 - 01),
+                Some("10"),
+            )],
             vec![PrincipalReturn {
                 repayment_date: date!(2026 - 08 - 01),
                 share_percent: dec("100"),
@@ -508,7 +525,10 @@ mod tests {
             .expect("past payments are listed separately from future postings");
 
         assert!(plan.postings.is_empty());
-        assert_eq!(plan.past, vec![date!(2026 - 08 - 01), date!(2026 - 08 - 01)]);
+        assert_eq!(
+            plan.past,
+            vec![date!(2026 - 08 - 01), date!(2026 - 08 - 01)]
+        );
     }
 
     #[test]
@@ -930,5 +950,4 @@ mod tests {
         assert_eq!(plan.postings[1].kind, PostingKind::OfferSettlement);
         assert_eq!(plan.postings[1].amount.value(), dec("100"));
     }
-
 }

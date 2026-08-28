@@ -5,8 +5,8 @@
 //! Реестр закрытый: плагины в рантайме не нужны.
 
 mod accrued_interest;
-pub mod cashflow;
 pub mod amortisation;
+pub mod cashflow;
 pub mod lot_disposal;
 pub mod quotation;
 pub mod valuation;
@@ -21,11 +21,11 @@ pub use accrued_interest::{
 use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
 use lot_disposal::{FifoV1, LotDisposalRule};
 
-pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 pub use cashflow::{
     CashflowError, CashflowInput, CashflowPlan, CashflowProjection, CashflowProjectionV1,
     CashflowProjectionVersion, ExpectedPosting, PostingKind,
 };
+pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,
     ValuationRule,
@@ -71,10 +71,8 @@ impl RuleRegistry {
             AccruedInterestRuleVersion,
             Box<dyn AccruedInterestRule>,
         > = BTreeMap::new();
-        let mut cashflow_rules: BTreeMap<
-            CashflowProjectionVersion,
-            Box<dyn CashflowProjection>,
-        > = BTreeMap::new();
+        let mut cashflow_rules: BTreeMap<CashflowProjectionVersion, Box<dyn CashflowProjection>> =
+            BTreeMap::new();
         cashflow_rules.insert(CashflowProjectionVersion(1), Box::new(CashflowProjectionV1));
         accrued_interest_rules.insert(AccruedInterestRuleVersion(1), Box::new(AccruedInterestV1));
 

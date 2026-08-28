@@ -14,9 +14,7 @@ use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::ReconciliationLedger;
-use iaam_core::returns::{
-    ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs,
-};
+use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue};
 use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
@@ -183,8 +181,8 @@ async fn market_price_candidates(
                             view.denomination_currency
                         ))
                     })?;
-                let settlement = CurrencyCode::from_code(&view.settlement_currency)
-                    .ok_or_else(|| {
+                let settlement =
+                    CurrencyCode::from_code(&view.settlement_currency).ok_or_else(|| {
                         AppError::Store(format!(
                             "неизвестная валюта расчётов: {}",
                             view.settlement_currency
@@ -260,8 +258,7 @@ async fn market_price_candidates(
                     &knowledge_as_of,
                 )
                 .map_err(|error| AppError::Store(error.to_string()))?;
-            let default_flags =
-                crate::market_candidate::default_flags_from_terms(terms.as_ref());
+            let default_flags = crate::market_candidate::default_flags_from_terms(terms.as_ref());
             schedules.insert(
                 instrument,
                 BondSchedule {
@@ -519,7 +516,6 @@ fn report_from_projection(
         },
         &offer_book,
     ))
-
 }
 /// Стоит ли пересчитывать журнал целиком после отказа `advance`.
 ///

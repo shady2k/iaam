@@ -348,8 +348,7 @@ impl InstrumentLots {
         let mut cohorts = Vec::with_capacity(grouped.len());
         for (acquired, lots) in grouped {
             let mut quantity = Dec::zero();
-            let acquisition_basis =
-                Self::sum_optional_money(&lots, |lot| lot.acquisition_basis)?;
+            let acquisition_basis = Self::sum_optional_money(&lots, |lot| lot.acquisition_basis)?;
             let mut cost_basis = Money::zero(lots[0].cost_basis.currency());
             for lot in &lots {
                 quantity = quantity

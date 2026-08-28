@@ -597,7 +597,7 @@ async fn health_is_public_and_reports_versions() {
     // агент читает эту цифру, чтобы понять, разберёт ли он ответ, —
     // поэтому она закреплена здесь, а не выводится из кода.
     assert_eq!(body["schema_version"], 4);
-    assert_eq!(body["projection_version"], 1);
+    assert_eq!(body["projection_version"], 2);
 }
 
 #[tokio::test]

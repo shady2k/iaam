@@ -38,6 +38,13 @@ pub struct Lot {
     pub acquired: Option<TradeDate>,
     pub quantity: Quantity,
     pub cost_basis: Money,
+    /// НКД, уплаченный при приобретении лота; неизвестное не превращается
+    /// в ноль (§4.9).
+    #[serde(default)]
+    pub accrued_interest_paid: Option<Money>,
+    /// Денежные выплаты, уже полученные этим лотом.
+    #[serde(default)]
+    pub received_to_date: Option<Money>,
     /// Непогашенный номинал — только у долговой бумаги; у акции его нет
     /// и не бывает, поэтому умолчание `Unknown` здесь честно.
     ///
@@ -178,6 +185,7 @@ pub struct DisposedPart {
     pub quantity: Quantity,
     pub basis_released: Money,
     pub acquired: Option<TradeDate>,
+    pub accrued_interest_released: Option<Money>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -266,21 +274,30 @@ impl LotDisposalRule for FifoV1 {
                     quantity: lot.quantity,
                     basis_released: lot.cost_basis,
                     acquired: lot.acquired,
+                    accrued_interest_released: lot.accrued_interest_paid,
                 });
                 left -= lot_qty;
             } else {
-                // Лот делится. Стоимость разносится пропорционально количеству.
+                // Лот делится. Денежные величины разносится пропорционально
+                // количеству; остаток округления остаётся у невыбывшей части.
                 let taken_basis = split_basis(lot.cost_basis, left, lot_qty)?;
                 let kept_basis = lot.cost_basis.try_sub(taken_basis)?;
+                let (taken_accrued_interest, kept_accrued_interest) =
+                    split_optional_basis(lot.accrued_interest_paid, left, lot_qty)?;
+                let (_, kept_received) =
+                    split_optional_basis(lot.received_to_date, left, lot_qty)?;
                 disposed.push(DisposedPart {
                     lot: lot.id,
                     quantity: Quantity(Dec::new(left)),
                     basis_released: taken_basis,
                     acquired: lot.acquired,
+                    accrued_interest_released: taken_accrued_interest,
                 });
                 remaining.push(Lot {
                     quantity: Quantity(Dec::new(lot_qty - left)),
                     cost_basis: kept_basis,
+                    accrued_interest_paid: kept_accrued_interest,
+                    received_to_date: kept_received,
                     ..lot.clone()
                 });
                 left = Decimal::ZERO;
@@ -317,6 +334,19 @@ pub(crate) fn split_basis(
     let value = i64::try_from(rounded.trunc().mantissa())
         .map_err(|_| DisposalError::Money(MoneyError::Overflow))?;
     Ok(Money::new(PostedMinor::new(value), total.currency()))
+}
+
+fn split_optional_basis(
+    total: Option<Money>,
+    taken_qty: Decimal,
+    lot_qty: Decimal,
+) -> Result<(Option<Money>, Option<Money>), DisposalError> {
+    let Some(total) = total else {
+        return Ok((None, None));
+    };
+    let taken = split_basis(total, taken_qty, lot_qty)?;
+    let kept = total.try_sub(taken)?;
+    Ok((Some(taken), Some(kept)))
 }
 
 #[cfg(test)]
@@ -441,10 +471,10 @@ mod tests {
             "quantity": qty(10),
             "cost_basis": rub(100_000),
         });
-        assert_eq!(
-            serde_json::from_value::<Lot>(value).unwrap().principal,
-            PrincipalState::Unknown
-        );
+        let lot: Lot = serde_json::from_value(value).unwrap();
+        assert_eq!(lot.principal, PrincipalState::Unknown);
+        assert_eq!(lot.accrued_interest_paid, None);
+        assert_eq!(lot.received_to_date, None);
     }
 
     fn qty(n: i64) -> Quantity {
@@ -460,6 +490,8 @@ mod tests {
                 id: LotId::new_random(),
                 instrument: InstrumentId::new_random(),
                 acquired: Some(TradeDate(date!(2026 - 01 - 10))),
+                accrued_interest_paid: None,
+                received_to_date: None,
                 quantity: qty(10),
                 cost_basis: rub(100_000), // 10 шт по 100 ₽
                 principal: PrincipalState::Unknown,
@@ -468,6 +500,8 @@ mod tests {
                 id: LotId::new_random(),
                 instrument: InstrumentId::new_random(),
                 acquired: Some(TradeDate(date!(2026 - 02 - 10))),
+                accrued_interest_paid: None,
+                received_to_date: None,
                 quantity: qty(10),
                 cost_basis: rub(90_000), // 10 шт по 90 ₽
                 principal: PrincipalState::Unknown,
@@ -481,6 +515,8 @@ mod tests {
         vec![Lot {
             id: LotId::new_random(),
             instrument: InstrumentId::new_random(),
+            accrued_interest_paid: None,
+            received_to_date: None,
             acquired: Some(TradeDate(date!(2026 - 03 - 10))),
             quantity: qty(quantity),
             cost_basis: rub(basis_minor),
@@ -646,5 +682,45 @@ mod tests {
     #[test]
     fn the_rule_reports_its_own_identifier() {
         assert_eq!(FifoV1.id(), RuleId::new("fifo/214.1/v1"));
+    }
+    #[test]
+    fn splitting_a_lot_splits_accrued_and_received_values_and_full_disposal_keeps_them() {
+        let lot = Lot {
+            id: LotId::new_random(),
+            instrument: InstrumentId::new_random(),
+            acquired: Some(TradeDate(date!(2026 - 03 - 10))),
+            quantity: qty(100),
+            cost_basis: rub(10_000),
+            accrued_interest_paid: Some(rub(1_000)),
+            received_to_date: Some(rub(800)),
+            principal: PrincipalState::Unknown,
+        };
+
+        let partial = FifoV1
+            .apply(&DisposalInput {
+                lots: vec![lot.clone()],
+                quantity: qty(50),
+            })
+            .unwrap();
+
+        assert_eq!(partial.disposed[0].basis_released, rub(5_000));
+        assert_eq!(partial.disposed[0].accrued_interest_released, Some(rub(500)));
+        assert_eq!(partial.remaining[0].cost_basis, rub(5_000));
+        assert_eq!(partial.remaining[0].accrued_interest_paid, Some(rub(500)));
+        assert_eq!(partial.remaining[0].received_to_date, Some(rub(400)));
+
+        let full = FifoV1
+            .apply(&DisposalInput {
+                lots: vec![lot.clone()],
+                quantity: qty(100),
+            })
+            .unwrap();
+
+        assert_eq!(full.disposed[0].basis_released, lot.cost_basis);
+        assert_eq!(
+            full.disposed[0].accrued_interest_released,
+            lot.accrued_interest_paid
+        );
+        assert!(full.remaining.is_empty());
     }
 }

@@ -513,6 +513,49 @@ mod tests {
             assert_eq!(quotation_basis_from_evidence(&evidence), Some(basis));
         }
     }
+    #[test]
+    fn обратный_разбор_отвергает_пустой_engine() {
+        assert_eq!(
+            quotation_basis_from_evidence("iss:engines//markets/shares"),
+            None
+        );
+    }
+
+    #[test]
+    fn обратный_разбор_отвергает_пустой_market() {
+        assert_eq!(
+            quotation_basis_from_evidence("iss:engines/stock/markets/"),
+            None
+        );
+    }
+
+    #[test]
+    fn обратный_разбор_отвергает_slash_в_engine() {
+        assert_eq!(
+            quotation_basis_from_evidence("iss:engines/stock/extra/markets/shares"),
+            None
+        );
+    }
+
+    #[test]
+    fn обратный_разбор_отвергает_slash_в_market() {
+        assert_eq!(
+            quotation_basis_from_evidence("iss:engines/stock/markets/shares/extra"),
+            None
+        );
+    }
+
+    #[test]
+    fn неизвестный_сегмент_отличается_от_неполного_признака() {
+        assert_eq!(
+            quotation_basis_from_evidence("iss:engines/other/markets/futures"),
+            Some(QuotationBasis::Unknown)
+        );
+        assert_eq!(
+            quotation_basis_from_evidence("iss:engines/other/futures"),
+            None
+        );
+    }
 
     #[test]
     fn accrued_interest_takes_its_currency_from_face_unit_not_from_currency_id() {

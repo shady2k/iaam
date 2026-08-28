@@ -249,6 +249,72 @@ impl Money {
     }
 }
 
+/// Расчётная денежная величина с валютой.
+///
+/// В отличие от [`Money`], который хранит проведённую сумму в целых
+/// минимальных единицах, `CalcMoney` хранит точное значение [`Dec`],
+/// вычисленное по условиям выпуска или графику. Поэтому дробные доли
+/// минимальной единицы не округляются во время расчёта.
+///
+/// Обратного перехода в [`Money`] нет намеренно: расчётная величина становится
+/// проведённой суммой только через подтверждённый факт источника, а не через
+/// округление результата.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalcMoney {
+    value: Dec,
+    currency: CurrencyCode,
+}
+
+impl CalcMoney {
+    /// Тривиальная упаковка двух независимых полей — проверять при
+    /// сборке нечего, как и у [`Money::new`].
+    #[must_use]
+    pub const fn new(value: Dec, currency: CurrencyCode) -> Self {
+        Self { value, currency }
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> Dec {
+        self.value
+    }
+
+    #[must_use]
+    pub const fn currency(&self) -> CurrencyCode {
+        self.currency
+    }
+
+    fn require_same_currency(self, other: Self) -> Result<(), MoneyError> {
+        if self.currency == other.currency {
+            Ok(())
+        } else {
+            Err(MoneyError::CurrencyMismatch {
+                left: self.currency,
+                right: other.currency,
+            })
+        }
+    }
+
+    pub fn checked_add(self, other: Self) -> Result<Self, MoneyError> {
+        self.require_same_currency(other)?;
+        Ok(Self::new(
+            self.value.checked_add(other.value)?,
+            self.currency,
+        ))
+    }
+
+    pub fn checked_sub(self, other: Self) -> Result<Self, MoneyError> {
+        self.require_same_currency(other)?;
+        Ok(Self::new(
+            self.value.checked_sub(other.value)?,
+            self.currency,
+        ))
+    }
+
+    pub fn checked_mul(self, factor: Dec) -> Result<Self, MoneyError> {
+        Ok(Self::new(self.value.checked_mul(factor)?, self.currency))
+    }
+}
+
 /// Денежная величина **на одну единицу** — расчётная, а не проведённая.
 ///
 /// Номинал выпуска и купон на бумагу договорные, а не списанные со счёта:
@@ -296,6 +362,69 @@ mod tests {
 
     fn dec(text: &str) -> Dec {
         Dec::new(Decimal::from_str_exact(text).unwrap())
+    }
+
+    // --- Расчётная денежная величина ---
+
+    #[test]
+    fn calc_money_keeps_value_and_currency() {
+        let amount = CalcMoney::new(dec("333.333"), CurrencyCode::Rub);
+
+        assert_eq!(amount.value(), dec("333.333"));
+        assert_eq!(amount.currency(), CurrencyCode::Rub);
+    }
+
+    #[test]
+    fn calc_money_arithmetic_is_checked() {
+        let amount = CalcMoney::new(dec("10.25"), CurrencyCode::Rub);
+        let other = CalcMoney::new(dec("2.75"), CurrencyCode::Rub);
+
+        assert_eq!(
+            amount.checked_add(other).unwrap(),
+            CalcMoney::new(dec("13.00"), CurrencyCode::Rub)
+        );
+        assert_eq!(
+            amount.checked_sub(other).unwrap(),
+            CalcMoney::new(dec("7.50"), CurrencyCode::Rub)
+        );
+        assert_eq!(
+            amount.checked_mul(dec("3")).unwrap(),
+            CalcMoney::new(dec("30.75"), CurrencyCode::Rub)
+        );
+    }
+
+    #[test]
+    fn calc_money_rejects_different_currencies() {
+        let rubles = CalcMoney::new(dec("10"), CurrencyCode::Rub);
+        let dollars = CalcMoney::new(dec("10"), CurrencyCode::Usd);
+
+        assert!(matches!(
+            rubles.checked_add(dollars),
+            Err(MoneyError::CurrencyMismatch {
+                left: CurrencyCode::Rub,
+                right: CurrencyCode::Usd
+            })
+        ));
+        assert!(matches!(
+            rubles.checked_sub(dollars),
+            Err(MoneyError::CurrencyMismatch {
+                left: CurrencyCode::Rub,
+                right: CurrencyCode::Usd
+            })
+        ));
+    }
+
+    #[test]
+    fn calc_money_multiplication_reports_numeric_overflow() {
+        let amount = CalcMoney::new(
+            dec("79228162514264337593543950335"),
+            CurrencyCode::Rub,
+        );
+
+        assert!(matches!(
+            amount.checked_mul(dec("2")),
+            Err(MoneyError::Numeric(NumericError::Overflow))
+        ));
     }
 
     // --- Величина на единицу ---

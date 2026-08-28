@@ -1044,7 +1044,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn rejects_each_non_holder_offer_right() {
         for right in [

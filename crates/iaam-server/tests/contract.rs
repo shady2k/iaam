@@ -12,6 +12,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use ciborium::value::Value as CborValue;
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
@@ -25,31 +26,29 @@ use iaam_app::storage::{
     AccountRecord, AliasRecord, BrokerCode, Coverage, FxRow, InstrumentRecord, KeyRateRow,
     PriceRow, RunOutcome, SeriesKey, TokenRecord, TokenScope,
 };
-use iaam_store::market_source_codes::SourceCodeEntry;
-use iaam_store::schedule::{
-    CouponPeriodRow, IssueTermsRow, OfferWindowRow, PrincipalRepaymentRow,
-    ScheduleSnapshotRow,
-};
-use iaam_store::market::AccruedInterestRow;
 use iaam_broker::credentials::Key;
-use ciborium::value::Value as CborValue;
-use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::projection::{ProjectionContext, Snapshot, project};
+use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
+use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::projection::{ProjectionContext, Snapshot, project};
+use iaam_core::reconciliation::Dimension;
 use iaam_core::rules::lot_disposal::PrincipalState;
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
-use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
-use iaam_core::reconciliation::Dimension;
 use iaam_server::auth::hash_token;
 use iaam_server::dto::VerdictDto;
-use std::io::Cursor;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
+use iaam_store::market::AccruedInterestRow;
+use iaam_store::market_source_codes::SourceCodeEntry;
+use iaam_store::schedule::{
+    CouponPeriodRow, IssueTermsRow, OfferWindowRow, PrincipalRepaymentRow, ScheduleSnapshotRow,
+};
 use serde_json::{Value, json};
+use std::io::Cursor;
 use std::time::Duration;
 use time::macros::date;
 use time::{Date, Duration as TimeDuration, OffsetDateTime};
@@ -502,7 +501,8 @@ async fn seed_bond_market(harness: &Harness) {
             lineage: None,
         })
         .expect("инструмент рынка облигации");
-    store.extend_market_source_codes(
+    store
+        .extend_market_source_codes(
             "moex-iss",
             "offer_kind",
             &[SourceCodeEntry {
@@ -730,8 +730,8 @@ fn install_known_principal_snapshot(
     ciborium::ser::into_writer(&state_value, &mut patched_state_bytes)
         .expect("кодирование исправленного состояния");
     let mut parts = projection.snapshot().clone().into_parts();
-    parts.state =
-        ciborium::de::from_reader(Cursor::new(patched_state_bytes)).expect("исправленное состояние");
+    parts.state = ciborium::de::from_reader(Cursor::new(patched_state_bytes))
+        .expect("исправленное состояние");
     parts.fingerprint = parts.state.fingerprint();
     store
         .save_snapshot(owner, &Snapshot::restore(parts))
@@ -1307,9 +1307,7 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     let (status, report) = call(
         &harness.router,
         get(
-            &format!(
-                "/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-08-26"
-            ),
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-08-26"),
             Some(&harness.owner_token),
         ),
     )
@@ -1322,7 +1320,9 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     assert_eq!(bond["account"], json!(harness.account.inner()));
     assert_eq!(bond["custody"], json!(harness.custody.inner()));
     assert_eq!(bond["instrument"], json!(harness.instrument.inner()));
-    let attributes = report["bond_attributes"].as_array().expect("bond_attributes");
+    let attributes = report["bond_attributes"]
+        .as_array()
+        .expect("bond_attributes");
     assert_eq!(attributes.len(), 1);
     assert_eq!(attributes[0]["accrued_interest"]["value"], "10.20");
     assert_eq!(
@@ -1350,13 +1350,11 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
         .find(|scenario| scenario["prospective"]["irr_label"] == "yield_to_maturity")
         .expect("YTM");
     assert_eq!(
-        ytm["prospective"]["c0"]["value"]["currency"],
-        "RUB",
+        ytm["prospective"]["c0"]["value"]["currency"], "RUB",
         "{report:#}"
     );
     assert_eq!(
-        ytm["prospective"]["c0"]["value"]["value"],
-        "9860.200",
+        ytm["prospective"]["c0"]["value"]["value"], "9860.200",
         "{report:#}"
     );
     assert_eq!(
@@ -1371,26 +1369,27 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
         ytm["prospective"]["metrics"]["value"]["terminal_wealth"]["currency"],
         "RUB"
     );
-    assert!(!ytm["prospective"]["metrics"]["value"]["zero_reinvestment_note"]
-        .as_str()
-        .expect("пояснение")
-        .is_empty());
+    assert!(
+        !ytm["prospective"]["metrics"]["value"]["zero_reinvestment_note"]
+            .as_str()
+            .expect("пояснение")
+            .is_empty()
+    );
     let lifetime = ytm["lifetime"]["value"].as_array().expect("когорты");
     assert_eq!(lifetime.len(), 1);
     assert_eq!(lifetime[0]["quantity"], "10");
-    assert_eq!(
-        lifetime[0]["c0"]["value"]["currency"],
-        "RUB"
-    );
+    assert_eq!(lifetime[0]["c0"]["value"]["currency"], "RUB");
     assert_eq!(lifetime[0]["c0"]["value"]["value"], "986.00");
     assert_eq!(
         lifetime[0]["metrics"]["value"]["terminal_wealth"]["value"],
         "10055.00"
     );
-    assert!(!lifetime[0]["irr_absent_because"]
-        .as_str()
-        .expect("причина отсутствия IRR")
-        .is_empty());
+    assert!(
+        !lifetime[0]["irr_absent_because"]
+            .as_str()
+            .expect("причина отсутствия IRR")
+            .is_empty()
+    );
 
     let refusal = scenarios
         .iter()
@@ -1398,11 +1397,16 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
         .expect("отказная offer-ставка");
     assert_eq!(refusal["prospective"]["irr"]["value"], "");
     assert_eq!(refusal["prospective"]["irr"]["error_bound"], "");
-    assert_eq!(refusal["prospective"]["irr"]["not_computable"], "solver_refused");
-    assert!(!refusal["prospective"]["irr"]["detail"]
-        .as_str()
-        .expect("деталь отказа")
-        .is_empty());
+    assert_eq!(
+        refusal["prospective"]["irr"]["not_computable"],
+        "solver_refused"
+    );
+    assert!(
+        !refusal["prospective"]["irr"]["detail"]
+            .as_str()
+            .expect("деталь отказа")
+            .is_empty()
+    );
     drop(harness);
     let _ = std::fs::remove_file(path);
 }

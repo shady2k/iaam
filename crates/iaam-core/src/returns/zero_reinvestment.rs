@@ -1017,7 +1017,10 @@ mod tests {
             date!(2026 - 01 - 01),
             ExpenseTreatment::UnknownBoundedBy { upper: money(1000) },
         );
-        assert_eq!(bounded.reason().map(NotComputable::code), Some("expense_unknown"));
+        assert_eq!(
+            bounded.reason().map(NotComputable::code),
+            Some("expense_unknown")
+        );
 
         let unknown = expense_adjusted_metrics(
             Vec::new(),
@@ -1139,7 +1142,9 @@ mod tests {
         assert!(matches!(
             surplus,
             Computed::NotComputable {
-                reason: NotComputable::Numeric { code: "surplus_sub" }
+                reason: NotComputable::Numeric {
+                    code: "surplus_sub"
+                }
             }
         ));
 
@@ -1160,11 +1165,7 @@ mod tests {
             }
         ));
 
-        let cohort_quantity_div = split_postings(
-            &[],
-            Dec::one(),
-            Dec::zero(),
-        );
+        let cohort_quantity_div = split_postings(&[], Dec::one(), Dec::zero());
         assert!(matches!(
             cohort_quantity_div,
             Err(NotComputable::Numeric {
@@ -1172,11 +1173,8 @@ mod tests {
             })
         ));
 
-        let cohort_posting_mul = split_postings(
-            &[extreme_posting],
-            Dec::new(Decimal::from(2)),
-            Dec::one(),
-        );
+        let cohort_posting_mul =
+            split_postings(&[extreme_posting], Dec::new(Decimal::from(2)), Dec::one());
         assert!(matches!(
             cohort_posting_mul,
             Err(NotComputable::Numeric {
@@ -1198,7 +1196,6 @@ mod tests {
                 code: "cohort_posting_remainder_sub"
             })
         ));
-
     }
 
     #[test]
@@ -1213,10 +1210,7 @@ mod tests {
         };
         let metric =
             lifetime_cohort_metric(acquisition_overflow, Vec::new(), date!(2027 - 01 - 01));
-        assert_eq!(
-            metric.c0.reason().map(NotComputable::code),
-            Some("numeric")
-        );
+        assert_eq!(metric.c0.reason().map(NotComputable::code), Some("numeric"));
         assert!(matches!(
             metric.c0,
             Computed::NotComputable {
@@ -1232,10 +1226,7 @@ mod tests {
             cost_basis: money(0),
             acquisition_basis: Some(money(100)),
             accrued_interest_paid: Some(money(0)),
-            received_to_date: Some(Money::new(
-                PostedMinor::new(i64::MAX),
-                CurrencyCode::Rub,
-            )),
+            received_to_date: Some(Money::new(PostedMinor::new(i64::MAX), CurrencyCode::Rub)),
         };
         let posting = ExpectedPosting {
             date: date!(2027 - 01 - 01),
@@ -1365,7 +1356,10 @@ mod tests {
             QuotationBasis::PercentOfRemainingFace,
             Dec::new(Decimal::MAX),
             CurrencyCode::Rub,
-            Some(PerUnitAmount::new(Dec::new(Decimal::MAX), CurrencyCode::Rub)),
+            Some(PerUnitAmount::new(
+                Dec::new(Decimal::MAX),
+                CurrencyCode::Rub,
+            )),
             calc("0"),
         );
         assert!(matches!(
@@ -1414,7 +1408,6 @@ mod tests {
 
     #[test]
     fn irr_refuses_currency_mismatched_postings_and_keeps_noop_expense() {
-
         let mismatched = irr_for_expense_policy(
             vec![ExpectedPosting {
                 date: date!(2027 - 01 - 01),

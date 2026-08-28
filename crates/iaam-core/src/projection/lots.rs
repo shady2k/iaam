@@ -2162,8 +2162,7 @@ mod tests {
         let mut first = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
         let mut second = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
         first.accrued_interest_paid = Some(rub(1));
-        second.accrued_interest_paid =
-            Some(Money::new(PostedMinor::new(1), CurrencyCode::Usd));
+        second.accrued_interest_paid = Some(Money::new(PostedMinor::new(1), CurrencyCode::Usd));
         assert_eq!(
             book_with_lots(&bond, vec![first, second])
                 .entry(&bond.key())

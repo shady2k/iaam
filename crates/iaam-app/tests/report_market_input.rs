@@ -10,6 +10,7 @@ use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::{FxSource, FxTable};
+use iaam_core::returns::{NotComputable, UncoveredReason};
 use iaam_ingest::operation::{OperationDates, OperationKind};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
@@ -91,6 +92,23 @@ async fn seed_position(
 }
 
 async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
+    seed_market_price_with(
+        services,
+        instrument,
+        "281.39",
+        "money_per_unit",
+        "iss:engines/stock/markets/shares",
+    )
+    .await;
+}
+
+async fn seed_market_price_with(
+    services: &AppServices,
+    instrument: InstrumentId,
+    price: &str,
+    quotation_basis: &str,
+    basis_evidence: &str,
+) {
     let from = date!(2026 - 08 - 01);
     let to = date!(2026 - 08 - 26);
     let series = SeriesKey {
@@ -128,10 +146,10 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
                 trade_date: "2026-08-03".to_owned(),
                 kind: "legal_close".to_owned(),
                 observed_at: "2026-08-26T09:00:00Z".to_owned(),
-                price: "281.39".to_owned(),
+                price: price.to_owned(),
                 currency: "RUB".to_owned(),
-                quotation_basis: "money_per_unit".to_owned(),
-                basis_evidence: "test:market".to_owned(),
+                quotation_basis: quotation_basis.to_owned(),
+                basis_evidence: basis_evidence.to_owned(),
                 executability: "indicative_previous_close".to_owned(),
             }],
         )
@@ -213,4 +231,92 @@ async fn report_values_position_from_market_observation() {
     ));
     assert_eq!(report.data_quality.position_coverage.evaluated_positions, 1);
     assert_eq!(report.data_quality.position_coverage.total_positions, 1);
+}
+
+#[tokio::test]
+async fn противоречивая_цена_делает_непокрытой_только_свою_позицию() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let healthy = InstrumentId::new_random();
+    let contradictory = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+    services
+        .store
+        .upsert_account(
+            owner,
+            AccountView {
+                id: account,
+                title: "market".to_owned(),
+                institution: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("insert account: {error}"));
+    services
+        .store
+        .insert_contour_version(owner, contour.clone(), "market".to_owned(), vec![account])
+        .await
+        .unwrap_or_else(|error| panic!("insert contour: {error}"));
+    for instrument in [healthy, contradictory] {
+        services
+            .directory
+            .record_instrument(InstrumentUpsert {
+                id: instrument,
+                kind: Some(InstrumentKind::Share),
+                symbol: "SBER".to_owned(),
+                title: "Sberbank".to_owned(),
+                currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+                lineage: None,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("insert instrument: {error}"));
+        seed_position(&services, owner, account, instrument, custody).await;
+    }
+    seed_market_price_with(
+        &services,
+        healthy,
+        "281.39",
+        "money_per_unit",
+        "iss:engines/stock/markets/shares",
+    )
+    .await;
+    seed_market_price_with(
+        &services,
+        contradictory,
+        "281.39",
+        "money_per_unit",
+        "iss:engines/stock/markets/bonds",
+    )
+    .await;
+
+    let report = returns(
+        &services,
+        &principal(owner),
+        &ReturnsQuery {
+            contour: contour.id(),
+            contour_version: Some(contour.version()),
+            as_of: Some(date!(2026 - 08 - 26)),
+            report_currency: CurrencyCode::Rub,
+            fx: FxTable::new(FxSource::OwnerSupplied),
+            lot_rule: iaam_core::rules::LotRuleVersion(1),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("report: {error}"));
+
+    let coverage = &report.data_quality.position_coverage;
+    assert_eq!(coverage.total_positions, 2);
+    assert_eq!(coverage.evaluated_positions, 1);
+    assert_eq!(coverage.selected[0].instrument, healthy);
+    assert!(coverage.uncovered.iter().any(|position| {
+        position.instrument == contradictory
+            && position.reason
+                == (UncoveredReason::NotComputable {
+                    reason: NotComputable::QuotationBasisContradictsEvidence {
+                        instrument: contradictory,
+                    },
+                })
+    }));
 }

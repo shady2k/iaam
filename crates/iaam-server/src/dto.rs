@@ -578,6 +578,12 @@ fn describe(reason: &NotComputable) -> String {
                 instrument.inner()
             )
         }
+        NotComputable::QuotationBasisContradictsEvidence { instrument } => {
+            format!(
+                "основание котировки противоречит доказательству инструмента {}",
+                instrument.inner()
+            )
+        }
         NotComputable::RemainingFaceUnknown { instrument } => {
             format!(
                 "неизвестен остаточный номинал инструмента {}",
@@ -1758,6 +1764,9 @@ mod tests {
                     NotComputable::MissingPrice { .. } => "missing_price",
                     NotComputable::MissingFxRate { .. } => "missing_fx_rate",
                     NotComputable::QuotationBasisUnknown { .. } => "quotation_basis_unknown",
+                    NotComputable::QuotationBasisContradictsEvidence { .. } => {
+                        "quotation_basis_contradicts_evidence"
+                    }
                     NotComputable::RemainingFaceUnknown { .. } => "remaining_face_unknown",
                     NotComputable::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
                     NotComputable::SolverRefused { .. } => "solver_refused",
@@ -1799,6 +1808,9 @@ mod tests {
             },
             UncoveredReason::NotComputable {
                 reason: NotComputable::QuotationBasisUnknown { instrument },
+            },
+            UncoveredReason::NotComputable {
+                reason: NotComputable::QuotationBasisContradictsEvidence { instrument },
             },
             UncoveredReason::NotComputable {
                 reason: NotComputable::RemainingFaceUnknown { instrument },

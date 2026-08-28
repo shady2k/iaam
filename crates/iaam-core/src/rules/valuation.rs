@@ -288,6 +288,7 @@ mod tests {
             currency: CurrencyCode::Rub,
             basis: crate::valuation::QuotationBasis::Unknown,
             basis_evidence: String::new(),
+            basis_evidence_contradicts: false,
             trade_date,
             observed_at: datetime!(2026 - 08 - 10 12:00 UTC),
             origin: PriceOrigin::ReportParsed {

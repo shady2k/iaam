@@ -78,6 +78,52 @@ impl MarketSegment<'_> {
     }
 }
 
+/// Основание, выведенное из полного признака ISS.
+///
+/// `None` означает отсутствие доказательства или признак другого источника.
+/// Неизвестный, но правильно оформленный ISS-сегмент возвращает
+/// `Some(Unknown)`: формат признака доказан, а таблица сегментов его пока
+/// не знает.
+#[must_use]
+pub fn quotation_basis_from_evidence(evidence: &str) -> Option<QuotationBasis> {
+    let path = evidence.strip_prefix("iss:engines/")?;
+    let (engine, market) = path.split_once("/markets/")?;
+    if engine.is_empty()
+        || market.is_empty()
+        || engine.contains('/')
+        || market.contains('/')
+    {
+        return None;
+    }
+    Some(
+        MarketSegment { engine, market }
+            .quotation_basis()
+            .0,
+    )
+}
+
+/// Сверяет записанное основание с доказательством из строки.
+///
+/// Возвращает эффективное основание и признак противоречия. Отсутствие
+/// доказательства не является противоречием: в таком случае известное
+/// записанное основание просто гасится до `Unknown`.
+#[must_use]
+pub fn reconcile_quotation_basis(
+    recorded: QuotationBasis,
+    evidence: &str,
+) -> (QuotationBasis, bool) {
+    match quotation_basis_from_evidence(evidence) {
+        Some(inferred) if inferred != QuotationBasis::Unknown => {
+            if inferred == recorded {
+                (recorded, false)
+            } else {
+                (QuotationBasis::Unknown, true)
+            }
+        }
+        _ => (QuotationBasis::Unknown, false),
+    }
+}
+
 /// Разбор страницы истории в наблюдения.
 ///
 /// `observed_at` приходит **снаружи**: в ответе ISS момента наблюдения
@@ -423,6 +469,58 @@ mod tests {
         assert_eq!(as_bonds[0].basis, QuotationBasis::PercentOfRemainingFace);
         assert_eq!(as_shares[0].price, as_bonds[0].price, "цена не меняется");
     }
+    #[test]
+    fn совпадающее_известное_основание_доказано() {
+        let (basis, contradicts) = reconcile_quotation_basis(
+            QuotationBasis::PercentOfRemainingFace,
+            "iss:engines/stock/markets/bonds",
+        );
+        assert_eq!(basis, QuotationBasis::PercentOfRemainingFace);
+        assert!(!contradicts);
+    }
+
+    #[test]
+    fn известное_противоречащее_основание_становится_unknown() {
+        let (basis, contradicts) =
+            reconcile_quotation_basis(QuotationBasis::MoneyPerUnit, "iss:engines/stock/markets/bonds");
+        assert_eq!(basis, QuotationBasis::Unknown);
+        assert!(contradicts);
+
+        let (basis, contradicts) =
+            reconcile_quotation_basis(QuotationBasis::Unknown, "iss:engines/stock/markets/bonds");
+        assert_eq!(basis, QuotationBasis::Unknown);
+        assert!(contradicts);
+    }
+
+    #[test]
+    fn недоказанное_unknown_основание_проходит() {
+        for evidence in ["", "test:market", "iss:engines/stock/markets/futures"] {
+            let (basis, contradicts) =
+                reconcile_quotation_basis(QuotationBasis::Unknown, evidence);
+            assert_eq!(basis, QuotationBasis::Unknown, "признак: {evidence}");
+            assert!(!contradicts, "признак: {evidence}");
+        }
+    }
+
+    #[test]
+    fn известное_основание_без_доказательства_гасится() {
+        for evidence in ["", "test:market", "iss:engines/stock/markets/futures"] {
+            let (basis, contradicts) =
+                reconcile_quotation_basis(QuotationBasis::MoneyPerUnit, evidence);
+            assert_eq!(basis, QuotationBasis::Unknown, "признак: {evidence}");
+            assert!(!contradicts, "признак: {evidence}");
+        }
+    }
+
+    #[test]
+    fn обратный_разбор_возвращает_основание_для_известной_пары() {
+        for (engine, market) in [("stock", "bonds"), ("stock", "shares")] {
+            let segment = MarketSegment { engine, market };
+            let (basis, evidence) = segment.quotation_basis();
+            assert_eq!(quotation_basis_from_evidence(&evidence), Some(basis));
+        }
+    }
+
 
     #[test]
     fn accrued_interest_takes_its_currency_from_face_unit_not_from_currency_id() {

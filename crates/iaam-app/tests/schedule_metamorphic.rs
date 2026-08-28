@@ -250,7 +250,7 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
                 price: "98.5".to_owned(),
                 currency: "RUB".to_owned(),
                 quotation_basis: "percent_of_remaining_face".to_owned(),
-                basis_evidence: "test:market".to_owned(),
+                basis_evidence: "iss:engines/stock/markets/bonds".to_owned(),
                 executability: "executable".to_owned(),
             }],
         )

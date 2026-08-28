@@ -10,6 +10,7 @@ use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::QuotationBasis;
 use iaam_market::cbr::key_rate::{Boundary, derive_intervals};
+use iaam_market::moex::parse::reconcile_quotation_basis;
 use iaam_market::{KeyRateObservation, ObservedAt, TradeDate};
 use iaam_store::market::{FxRow, KeyRateRow, MarketWindow, PriceRow, PriceVenue, SeriesKey};
 use rust_decimal::Decimal;
@@ -202,8 +203,10 @@ fn price_view(row: PriceRow, complete_through: Option<Date>) -> Result<MarketPri
         .parse::<Uuid>()
         .map(InstrumentId)
         .map_err(|error| invalid_value("instrument_id", error.to_string()))?;
-    let quotation_basis = QuotationBasis::from_code(&row.quotation_basis)
+    let recorded_basis = QuotationBasis::from_code(&row.quotation_basis)
         .ok_or_else(|| invalid_value("quotation_basis", row.quotation_basis.clone()))?;
+    let (quotation_basis, _) =
+        reconcile_quotation_basis(recorded_basis, &row.basis_evidence);
     Ok(MarketPriceView {
         instrument,
         board: row.board,
@@ -354,5 +357,29 @@ mod tests {
         assert_eq!(view.source, "cbr");
         assert_eq!(view.quality, "official");
         assert!(!view.observed_at.is_empty());
+    }
+
+    #[test]
+    fn мигрированная_строка_unknown_без_признака_остаётся_витриной() {
+        let view = price_view(
+            PriceRow {
+                instrument_id: Uuid::nil().to_string(),
+                board: "TQBR".to_owned(),
+                session: 3,
+                trade_date: "2026-08-03".to_owned(),
+                kind: "close".to_owned(),
+                observed_at: "2026-08-26T09:00:00Z".to_owned(),
+                price: "281.39".to_owned(),
+                currency: "RUB".to_owned(),
+                quotation_basis: "unknown".to_owned(),
+                basis_evidence: String::new(),
+                executability: "indicative_previous_close".to_owned(),
+            },
+            None,
+        )
+        .expect("строка миграции допустима для витрины");
+
+        assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
+        assert!(view.basis_evidence.is_empty());
     }
 }

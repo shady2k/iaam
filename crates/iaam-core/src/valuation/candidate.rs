@@ -172,6 +172,10 @@ pub struct PriceCandidate {
     /// восстанавливается по основанию: без него запись недоказуема
     /// при разборе аудита (§10.2).
     pub basis_evidence: String,
+    /// Признак противоречит записанному основанию. Эффективное основание
+    /// в таком кандидате уже `Unknown`, но причина отказа должна дойти
+    /// до оценки позиции отдельно от недоказанности.
+    pub basis_evidence_contradicts: bool,
     pub trade_date: Date,
     pub observed_at: OffsetDateTime,
     pub origin: PriceOrigin,
@@ -332,6 +336,7 @@ mod tests {
             currency: CurrencyCode::Rub,
             basis: QuotationBasis::Unknown,
             basis_evidence: String::new(),
+            basis_evidence_contradicts: false,
             trade_date: date!(2026 - 08 - 03),
             observed_at: datetime!(2026 - 08 - 03 18:00 UTC),
             origin: PriceOrigin::ReportParsed {

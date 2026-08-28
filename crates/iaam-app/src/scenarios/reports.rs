@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::InstrumentId;
+use iaam_core::instrument::CurrencyRoles;
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
@@ -163,6 +164,51 @@ async fn market_price_candidates(
     let knowledge_as_of = knowledge_as_of
         .format(&Rfc3339)
         .map_err(|error| AppError::Store(error.to_string()))?;
+
+    let mut currency_roles = BTreeMap::new();
+    for instrument in &instruments {
+        let roles = services
+            .directory
+            .instrument(*instrument)
+            .await?
+            .map(|view| {
+                let denomination = CurrencyCode::from_code(&view.denomination_currency)
+                    .ok_or_else(|| {
+                        AppError::Store(format!(
+                            "неизвестная валюта обязательства: {}",
+                            view.denomination_currency
+                        ))
+                    })?;
+                let settlement = CurrencyCode::from_code(&view.settlement_currency)
+                    .ok_or_else(|| {
+                        AppError::Store(format!(
+                            "неизвестная валюта расчётов: {}",
+                            view.settlement_currency
+                        ))
+                    })?;
+                let quote = CurrencyCode::from_code(&view.quote_currency).ok_or_else(|| {
+                    AppError::Store(format!(
+                        "неизвестная валюта котировки: {}",
+                        view.quote_currency
+                    ))
+                })?;
+                Ok::<CurrencyRoles, AppError>(CurrencyRoles {
+                    denomination,
+                    settlement,
+                    quote,
+                })
+            })
+            .transpose()?;
+        currency_roles.insert(*instrument, roles);
+    }
+
+    let offer_kinds = {
+        let store = services.market_store.lock().await;
+        store
+            .market_source_codes(MOEX_ISS_SOURCE_ID, "offer_kind")
+            .map_err(|error| AppError::Store(error.to_string()))?
+    };
+
     let store = services.market_store.lock().await;
     let mut candidates = Vec::new();
     let mut schedules = BTreeMap::new();
@@ -200,6 +246,18 @@ async fn market_price_candidates(
             )
             .map_err(|error| AppError::Store(error.to_string()))?
         {
+            let completeness_row = store
+                .schedule_completeness(&snapshot.snapshot_id)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let terms = store
+                .issue_terms_at_or_before(
+                    &instrument.inner().to_string(),
+                    MOEX_ISS_SOURCE_ID,
+                    &knowledge_as_of,
+                )
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let default_flags =
+                crate::market_candidate::default_flags_from_terms(terms.as_ref());
             schedules.insert(
                 instrument,
                 BondSchedule {
@@ -207,6 +265,16 @@ async fn market_price_candidates(
                     principal_returns: crate::market_candidate::principal_returns_from_snapshot(
                         &snapshot,
                     )?,
+                    offer_windows: crate::market_candidate::offer_windows_from_snapshot(
+                        &snapshot,
+                        instrument,
+                        &offer_kinds,
+                    )?,
+                    completeness: crate::market_candidate::schedule_completeness_from_row(
+                        completeness_row.as_ref(),
+                    ),
+                    default_flags,
+                    currency_roles: currency_roles.get(&instrument).copied().flatten(),
                 },
             );
         }

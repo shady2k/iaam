@@ -1,6 +1,14 @@
 //! Преобразование рыночных наблюдений в доменные кандидаты.
+use std::collections::BTreeMap;
+
 use crate::error::AppError;
-use iaam_core::bond::{AccrualPeriod, PrincipalReturn};
+use iaam_core::bond::{
+    AccrualPeriod, DefaultFlags, PrincipalReturn,
+    offer::{
+        OfferRight, OfferWindowId, OfferWindowTerms, ScheduleCompleteness, validate_unique_windows,
+    },
+};
+use iaam_core::ids::InstrumentId;
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::{
@@ -8,7 +16,7 @@ use iaam_core::valuation::{
 };
 use iaam_market::moex::parse::reconcile_quotation_basis;
 use iaam_market::{Executability, PriceKind, PriceObservation};
-use iaam_store::schedule::StoredSnapshot;
+use iaam_store::schedule::{IssueTermsRow, StoredSnapshot};
 use rust_decimal::Decimal;
 use time::Date;
 use time::format_description::well_known::Iso8601;
@@ -115,8 +123,101 @@ pub fn principal_returns_from_snapshot(
         .collect()
 }
 
+/// Преобразует строки окон снимка в типизированные права и условия.
+pub fn offer_windows_from_snapshot(
+    snapshot: &StoredSnapshot,
+    instrument: InstrumentId,
+    offer_kinds: &BTreeMap<String, String>,
+) -> Result<Vec<OfferWindowTerms>, AppError> {
+    let windows = snapshot
+        .offer_windows
+        .iter()
+        .map(|row| {
+            let meaning = offer_kinds.get(&row.source_kind).ok_or_else(|| AppError::Invalid {
+                field: "offer_kind".to_owned(),
+                expected: "код, известный словарю источника".to_owned(),
+                actual: row.source_kind.clone(),
+            })?;
+            let right = OfferRight::from_dictionary_meaning(meaning).map_err(|error| {
+                AppError::Invalid {
+                    field: "offer_kind".to_owned(),
+                    expected: "известное доменное значение права".to_owned(),
+                    actual: error.to_string(),
+                }
+            })?;
+            let execution_date = Date::parse(&row.execution_date, &Iso8601::DEFAULT)
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let submission_start = row
+                .submission_start
+                .as_deref()
+                .map(|value| Date::parse(value, &Iso8601::DEFAULT))
+                .transpose()
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let submission_end = row
+                .submission_end
+                .as_deref()
+                .map(|value| Date::parse(value, &Iso8601::DEFAULT))
+                .transpose()
+                .map_err(|error| AppError::Store(error.to_string()))?;
+            let price_percent = row
+                .price_percent
+                .as_deref()
+                .map(Decimal::from_str_exact)
+                .transpose()
+                .map_err(|error| AppError::Store(error.to_string()))?
+                .map(Dec::new);
+
+            Ok(OfferWindowTerms {
+                window: OfferWindowId::derive(instrument, execution_date),
+                right,
+                execution_date,
+                submission_start,
+                submission_end,
+                price_percent,
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    validate_unique_windows(&windows).map_err(|error| AppError::Invalid {
+        field: "offer_windows".to_owned(),
+        expected: "одна строка на дату исполнения".to_owned(),
+        actual: error.to_string(),
+    })?;
+    Ok(windows)
+}
+
+/// Перевести сохранённый вердикт полноты без повторной проверки графика.
+pub fn schedule_completeness_from_row(
+    row: Option<&iaam_store::schedule::ScheduleCompletenessRow>,
+) -> ScheduleCompleteness {
+    let Some(row) = row else {
+        return ScheduleCompleteness::Unknown;
+    };
+    if row.structurally_validated && row.fetch_exhausted {
+        ScheduleCompleteness::Validated
+    } else if let Some(reason) = &row.incomplete_reason {
+        ScheduleCompleteness::Incomplete {
+            reason: reason.clone(),
+        }
+    } else if !row.fetch_exhausted {
+        ScheduleCompleteness::Incomplete {
+            reason: "источник не вычитан до конца".to_owned(),
+        }
+    } else {
+        ScheduleCompleteness::Unknown
+    }
+}
+
+/// Перевести известные условия выпуска в типизированные флаги дефолта.
+pub fn default_flags_from_terms(row: Option<&IssueTermsRow>) -> Option<DefaultFlags> {
+    row.map(|terms| DefaultFlags {
+        declared: terms.default_declared,
+        technical: terms.default_technical,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use iaam_core::money::CurrencyCode;
     use iaam_core::numeric::decimal::Dec;
     use iaam_core::rules::{ValuationPolicyV1, ValuationRule};
@@ -125,11 +226,14 @@ mod tests {
     };
     use iaam_market::moex::parse::{MarketSegment, parse_history};
     use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
-    use iaam_store::schedule::{CouponPeriodRow, StoredSnapshot};
+    use iaam_store::schedule::{CouponPeriodRow, OfferWindowRow, StoredSnapshot};
     use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 
-    use super::{accrual_periods_from_snapshot, candidate_from_market_observation};
+    use super::{
+        accrual_periods_from_snapshot, candidate_from_market_observation,
+        default_flags_from_terms, offer_windows_from_snapshot, schedule_completeness_from_row,
+    };
 
     #[test]
     fn a_row_without_a_fixed_amount_translates_to_none_not_zero() {
@@ -152,6 +256,104 @@ mod tests {
         };
         let periods = accrual_periods_from_snapshot(&snapshot).unwrap();
         assert!(periods[0].coupon_per_unit.is_none());
+    }
+
+    #[test]
+    fn offer_translation_derives_stable_ids_and_keeps_unknown_terms_absent() {
+        let instrument = iaam_core::ids::InstrumentId::new_random();
+        let snapshot = StoredSnapshot {
+            snapshot_id: "s1".to_owned(),
+            observed_at: "2026-08-27T12:00:00Z".to_owned(),
+            coupon_periods: Vec::new(),
+            principal_repayments: Vec::new(),
+            offer_windows: vec![OfferWindowRow {
+                execution_date: "2026-12-01".to_owned(),
+                submission_start: None,
+                submission_end: None,
+                price_percent: None,
+                agent: None,
+                source_kind: "source wording".to_owned(),
+                source_entry_id: None,
+            }],
+        };
+        let dictionary = BTreeMap::from([("source wording".to_owned(), "put_option".to_owned())]);
+        let windows = offer_windows_from_snapshot(&snapshot, instrument, &dictionary).unwrap();
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].right, iaam_core::bond::offer::OfferRight::HolderPut);
+        assert!(windows[0].submission_start.is_none());
+        assert!(windows[0].submission_end.is_none());
+        assert!(windows[0].price_percent.is_none());
+        assert_eq!(
+            windows[0].window,
+            iaam_core::bond::offer::OfferWindowId::derive(instrument, date!(2026 - 12 - 01))
+        );
+    }
+
+    #[test]
+    fn duplicate_offer_dates_are_rejected_as_ambiguous() {
+        let snapshot = StoredSnapshot {
+            snapshot_id: "s1".to_owned(),
+            observed_at: "2026-08-27T12:00:00Z".to_owned(),
+            coupon_periods: Vec::new(),
+            principal_repayments: Vec::new(),
+            offer_windows: vec![
+                OfferWindowRow {
+                    execution_date: "2026-12-01".to_owned(),
+                    submission_start: None,
+                    submission_end: None,
+                    price_percent: Some("100".to_owned()),
+                    agent: None,
+                    source_kind: "offer-a".to_owned(),
+                    source_entry_id: None,
+                },
+                OfferWindowRow {
+                    execution_date: "2026-12-01".to_owned(),
+                    submission_start: None,
+                    submission_end: None,
+                    price_percent: Some("101".to_owned()),
+                    agent: None,
+                    source_kind: "offer-b".to_owned(),
+                    source_entry_id: None,
+                },
+            ],
+        };
+        let dictionary = BTreeMap::from([
+            ("offer-a".to_owned(), "put_option".to_owned()),
+            ("offer-b".to_owned(), "put_option".to_owned()),
+        ]);
+
+        let error = offer_windows_from_snapshot(
+            &snapshot,
+            iaam_core::ids::InstrumentId::new_random(),
+            &dictionary,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("несколько окон оферты"));
+    }
+
+    #[test]
+    fn completeness_translation_preserves_the_persisted_verdict() {
+        let row = iaam_store::schedule::ScheduleCompletenessRow {
+            fetch_exhausted: true,
+            structurally_validated: false,
+            incomplete_reason: Some("график оборван".to_owned()),
+        };
+        assert_eq!(
+            schedule_completeness_from_row(Some(&row)),
+            iaam_core::bond::offer::ScheduleCompleteness::Incomplete {
+                reason: "график оборван".to_owned()
+            }
+        );
+        assert_eq!(
+            schedule_completeness_from_row(None),
+            iaam_core::bond::offer::ScheduleCompleteness::Unknown
+        );
+    }
+
+    #[test]
+    fn missing_issue_terms_keep_default_flags_unknown() {
+        assert_eq!(default_flags_from_terms(None), None);
     }
 
     const FIXTURE: &str = include_str!("../../../tests/fixtures/market/moex-iss-history-sber.json");

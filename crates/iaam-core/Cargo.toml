@@ -15,7 +15,7 @@ ethnum = "1"
 # на локальную таймзону по умолчанию. Даты в системе — календарные (`Date`),
 # а не моменты времени: операция происходит в дату, а не в момент.
 time = { version = "0.3", default-features = false, features = ["std", "macros", "serde", "parsing", "formatting"] }
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
 # Каноническая сериализация состояния для отпечатка. CBOR, потому что
 # карты состояния имеют составные ключи: JSON их не берёт.
 ciborium = "0.2"

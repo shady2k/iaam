@@ -2169,6 +2169,7 @@ mod tests {
                     repayment_date: date!(2026 - 10 - 01),
                     share_percent: dec("100"),
                 }],
+                ..Default::default()
             }),
         );
         let attributes = report
@@ -2197,6 +2198,7 @@ mod tests {
                         share_percent: dec("60"),
                     },
                 ],
+                ..Default::default()
             }),
         );
         let attributes = report
@@ -2970,6 +2972,7 @@ mod tests {
                     coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
                 }],
                 principal_returns: vec![],
+                ..Default::default()
             },
         );
         let venue = Venue {
@@ -3051,6 +3054,7 @@ mod tests {
                     coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
                 }],
                 principal_returns: vec![],
+                ..Default::default()
             },
         )]);
         let venue = Venue {
@@ -3251,6 +3255,7 @@ mod tests {
                     coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
                 }],
                 principal_returns: vec![],
+                ..Default::default()
             },
         );
         let venue = Venue {

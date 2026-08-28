@@ -74,6 +74,14 @@ pub struct StoredSnapshot {
     pub offer_windows: Vec<OfferWindowRow>,
 }
 
+/// Сохранённый вердикт полноты снимка.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleCompletenessRow {
+    pub fetch_exhausted: bool,
+    pub structurally_validated: bool,
+    pub incomplete_reason: Option<String>,
+}
+
 /// Строка условий выпуска. Все значения строками, как и везде в
 /// хранилище: форматов источников оно не знает.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +299,30 @@ impl SqliteStore {
             principal_repayments,
             offer_windows,
         }))
+    }
+
+    /// Прочитать сохранённый вердикт полноты целого снимка.
+    pub fn schedule_completeness(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<ScheduleCompletenessRow>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT fetch_exhausted, structurally_validated, incomplete_reason
+                 FROM schedule_completeness
+                 WHERE snapshot_id = ?1",
+                [snapshot_id],
+                |row| {
+                    Ok(ScheduleCompletenessRow {
+                        fetch_exhausted: row.get::<_, i64>(0)? != 0,
+                        structurally_validated: row.get::<_, i64>(1)? != 0,
+                        incomplete_reason: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Записать три утверждения о полноте снимка.

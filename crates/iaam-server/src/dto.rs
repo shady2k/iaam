@@ -19,6 +19,12 @@ use iaam_app::ports::{
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
+use iaam_core::bond::offer::OfferChoice;
+use iaam_core::rules::{ExpectedPosting, PostingKind};
+use iaam_core::returns::zero_reinvestment::{
+    BondScenarioResult, IrrLabel, LifetimeCohortMetric, ProspectiveMetric,
+    ZeroReinvestmentMetrics,
+};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -682,6 +688,348 @@ pub struct RateDto {
     pub detail: Option<String>,
 }
 
+/// Расчётная денежная величина вместе с валютой.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CalcMoneyDto {
+    /// Десятичное расчётное значение строкой.
+    pub value: String,
+    pub currency: CurrencyDto,
+}
+
+impl CalcMoneyDto {
+    fn from_domain(value: &iaam_core::money::CalcMoney) -> Self {
+        Self {
+            value: value.value().inner().to_string(),
+            currency: CurrencyDto::from_domain(value.currency()),
+        }
+    }
+}
+
+/// Расчётная денежная величина, которая может быть невычислимой.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComputedCalcMoneyDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<CalcMoneyDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_computable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ComputedCalcMoneyDto {
+    fn from_domain(value: &Computed<iaam_core::money::CalcMoney>) -> Self {
+        match value {
+            Computed::Value(amount) => Self {
+                value: Some(CalcMoneyDto::from_domain(amount)),
+                not_computable: None,
+                detail: None,
+            },
+            Computed::NotComputable { reason } => Self {
+                value: None,
+                not_computable: Some(reason.code().to_owned()),
+                detail: Some(describe(reason)),
+            },
+        }
+    }
+}
+
+/// Один ожидаемый платёж в нулевом реинвестиционном сценарии.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ExpectedPostingDto {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub date: Date,
+    pub amount: CalcMoneyDto,
+    pub kind: PostingKindDto,
+}
+
+impl ExpectedPostingDto {
+    fn from_domain(value: &ExpectedPosting) -> Self {
+        Self {
+            date: value.date,
+            amount: CalcMoneyDto::from_domain(&value.amount),
+            kind: PostingKindDto::from_domain(value.kind),
+        }
+    }
+}
+
+/// Вид ожидаемого платежа.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PostingKindDto {
+    Coupon,
+    PrincipalReturn,
+    OfferSettlement,
+}
+
+impl PostingKindDto {
+    fn from_domain(value: PostingKind) -> Self {
+        match value {
+            PostingKind::Coupon => Self::Coupon,
+            PostingKind::PrincipalReturn => Self::PrincipalReturn,
+            PostingKind::OfferSettlement => Self::OfferSettlement,
+        }
+    }
+}
+
+const ZERO_REINVESTMENT_NOTE: &str = "Полученные купоны и возвраты номинала считаются сохранёнными до конца срока и не приносящими дохода; если их тратить или реинвестировать, единой цифры терминального капитала не существует — остаются график выплат и IRR.";
+/// Пять величин §7.1 для одного сценария.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ZeroReinvestmentMetricsDto {
+    pub postings: Vec<ExpectedPostingDto>,
+    pub terminal_wealth: CalcMoneyDto,
+    pub surplus: CalcMoneyDto,
+    pub hpr: ComputedDto,
+    pub cagr_0r: RateDto,
+    /// Полученные купоны и возвраты номинала считаются сохранёнными до конца
+    /// срока и не приносящими дохода; если их тратить или реинвестировать,
+    /// единой цифры терминального капитала не существует — остаются график
+    /// выплат и IRR.
+    pub zero_reinvestment_assumed: bool,
+    /// Пояснение допущения, показываемое рядом с рассчитанными величинами.
+    pub zero_reinvestment_note: String,
+    /// Ряд до налога; налоговая политика появится в E5.
+    pub pre_tax: bool,
+}
+
+impl ZeroReinvestmentMetricsDto {
+    fn from_domain(value: &ZeroReinvestmentMetrics) -> Self {
+        Self {
+            postings: value
+                .postings
+                .iter()
+                .map(ExpectedPostingDto::from_domain)
+                .collect(),
+            terminal_wealth: CalcMoneyDto::from_domain(&value.terminal_wealth),
+            surplus: CalcMoneyDto::from_domain(&value.surplus),
+            hpr: ComputedDto::from_dec(&value.hpr),
+            cagr_0r: rate_dto(&value.cagr_0r, "act/365"),
+            zero_reinvestment_assumed: value.zero_reinvestment_assumed,
+            zero_reinvestment_note: ZERO_REINVESTMENT_NOTE.to_owned(),
+            pre_tax: value.pre_tax,
+        }
+    }
+}
+
+/// Метрики сценария, которые могут быть невычислимы целиком.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComputedZeroReinvestmentMetricsDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<ZeroReinvestmentMetricsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_computable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ComputedZeroReinvestmentMetricsDto {
+    fn from_domain(value: &Computed<ZeroReinvestmentMetrics>) -> Self {
+        match value {
+            Computed::Value(metrics) => Self {
+                value: Some(ZeroReinvestmentMetricsDto::from_domain(metrics)),
+                not_computable: None,
+                detail: None,
+            },
+            Computed::NotComputable { reason } => Self {
+                value: None,
+                not_computable: Some(reason.code().to_owned()),
+                detail: Some(describe(reason)),
+            },
+        }
+    }
+}
+
+/// Сценарий удержания до погашения или предъявления к оферте.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OfferChoiceDto {
+    HoldToMaturity,
+    ExerciseAtOffer { window: Uuid },
+}
+
+impl OfferChoiceDto {
+    fn from_domain(value: &OfferChoice) -> Self {
+        match value {
+            OfferChoice::HoldToMaturity => Self::HoldToMaturity,
+            OfferChoice::ExerciseAtOffer { window } => Self::ExerciseAtOffer {
+                window: window.0,
+            },
+        }
+    }
+}
+
+/// Ярлык ставки на проспективной координате.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IrrLabelDto {
+    YieldToMaturity,
+    YieldToOffer,
+}
+
+impl IrrLabelDto {
+    fn from_domain(value: IrrLabel) -> Self {
+        match value {
+            IrrLabel::YieldToMaturity => Self::YieldToMaturity,
+            IrrLabel::YieldToOffer => Self::YieldToOffer,
+        }
+    }
+}
+
+/// Проспективная метрика от даты отчёта.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProspectiveMetricDto {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub as_of: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub terminal_date: Date,
+    pub c0: ComputedCalcMoneyDto,
+    pub metrics: ComputedZeroReinvestmentMetricsDto,
+    pub irr: RateDto,
+    pub irr_label: IrrLabelDto,
+}
+
+impl ProspectiveMetricDto {
+    fn from_domain(value: &ProspectiveMetric) -> Self {
+        Self {
+            as_of: value.as_of,
+            terminal_date: value.terminal_date,
+            c0: ComputedCalcMoneyDto::from_domain(&value.c0),
+            metrics: ComputedZeroReinvestmentMetricsDto::from_domain(&value.metrics),
+            irr: rate_dto(&value.irr, "act/365"),
+            irr_label: IrrLabelDto::from_domain(value.irr_label),
+        }
+    }
+}
+
+/// Пожизненная метрика одной когорты.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LifetimeCohortMetricDto {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub acquired: Date,
+    pub quantity: String,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub terminal_date: Date,
+    pub c0: ComputedCalcMoneyDto,
+    pub metrics: ComputedZeroReinvestmentMetricsDto,
+    /// Исторический IRR отсутствует, потому что прошлые выплаты агрегированы
+    /// без дат.
+    pub irr_absent_because: String,
+}
+
+impl LifetimeCohortMetricDto {
+    fn from_domain(value: &LifetimeCohortMetric) -> Self {
+        Self {
+            acquired: value.acquired.inner(),
+            quantity: value.quantity.0.inner().to_string(),
+            terminal_date: value.terminal_date,
+            c0: ComputedCalcMoneyDto::from_domain(&value.c0),
+            metrics: ComputedZeroReinvestmentMetricsDto::from_domain(&value.metrics),
+            irr_absent_because: value.irr_absent_because.to_owned(),
+        }
+    }
+}
+
+/// Метрики одной облигационной позиции по одному сценарию.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BondScenarioResultDto {
+    pub choice: OfferChoiceDto,
+    pub prospective: ProspectiveMetricDto,
+    pub lifetime: ComputedLifetimeCohortMetricsDto,
+}
+
+impl BondScenarioResultDto {
+    fn from_domain(value: &BondScenarioResult) -> Self {
+        Self {
+            choice: OfferChoiceDto::from_domain(&value.choice),
+            prospective: ProspectiveMetricDto::from_domain(&value.prospective),
+            lifetime: ComputedLifetimeCohortMetricsDto::from_domain(&value.lifetime),
+        }
+    }
+}
+
+/// Пожизненные метрики могут целиком отказаться из-за пробела в истории.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComputedLifetimeCohortMetricsDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Vec<LifetimeCohortMetricDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_computable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ComputedLifetimeCohortMetricsDto {
+    fn from_domain(value: &Computed<Vec<LifetimeCohortMetric>>) -> Self {
+        match value {
+            Computed::Value(cohorts) => Self {
+                value: Some(
+                    cohorts
+                        .iter()
+                        .map(LifetimeCohortMetricDto::from_domain)
+                        .collect(),
+                ),
+                not_computable: None,
+                detail: None,
+            },
+            Computed::NotComputable { reason } => Self {
+                value: None,
+                not_computable: Some(reason.code().to_owned()),
+                detail: Some(describe(reason)),
+            },
+        }
+    }
+}
+
+/// Метрики всех сценариев одной облигационной позиции.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BondPositionMetricsDto {
+    pub account: Uuid,
+    pub custody: Option<Uuid>,
+    pub instrument: Uuid,
+    pub scenarios: Vec<BondScenarioResultDto>,
+}
+
+impl BondPositionMetricsDto {
+    fn from_domain(value: &iaam_core::returns::BondPositionMetrics) -> Self {
+        Self {
+            account: value.account.inner(),
+            custody: value.custody.map(|id| id.inner()),
+            instrument: value.instrument.inner(),
+            scenarios: value
+                .scenarios
+                .iter()
+                .map(BondScenarioResultDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+fn rate_dto(value: &Computed<iaam_core::numeric::xirr::RateOutcome>, fallback_day_count: &str) -> RateDto {
+    match value {
+        Computed::Value(outcome) => RateDto {
+            value: format_rate(outcome.rate().value()),
+            error_bound: format_rate(outcome.rate().error_bound()),
+            iterations: outcome.rate().iterations(),
+            day_count: outcome.day_count().code().to_owned(),
+            not_computable: None,
+            detail: None,
+        },
+        Computed::NotComputable { reason } => RateDto {
+            value: String::new(),
+            error_bound: String::new(),
+            iterations: 0,
+            day_count: fallback_day_count.to_owned(),
+            not_computable: Some(reason.code().to_owned()),
+            detail: Some(describe(reason)),
+        },
+    }
+}
+
+
 /// Выбранная цена позиции с выводами политики и provenance.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SelectedPriceDto {
@@ -1231,6 +1579,8 @@ pub struct ReturnsReportDto {
     pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto,
     /// Атрибуты облигационных позиций (§5.1).
     pub bond_attributes: Vec<BondPositionAttributesDto>,
+    /// Метрики облигационных позиций по каждому доступному сценарию (§7.1).
+    pub bond_metrics: Vec<BondPositionMetricsDto>,
     /// **Доходность до налога.** Имя поля содержит оговорку намеренно:
     /// налоги появляются в E5, и до тех пор называть эту величину
     /// «доходностью» без уточнения нельзя (§16.3).
@@ -1293,6 +1643,11 @@ impl ReturnsReportDto {
                 .bond_attributes
                 .iter()
                 .map(BondPositionAttributesDto::from_domain)
+                .collect(),
+            bond_metrics: report
+                .bond_metrics
+                .iter()
+                .map(BondPositionMetricsDto::from_domain)
                 .collect(),
             xirr_pre_tax: rate,
             applied_rules: AppliedRulesDto {
@@ -2196,6 +2551,31 @@ mod tests {
     }
 
     #[test]
+    fn zero_reinvestment_note_is_present_in_serialized_metrics_body() {
+        let computed =
+            iaam_core::returns::zero_reinvestment::zero_reinvestment_metrics(
+                Vec::new(),
+                iaam_core::money::CalcMoney::new(
+                    Dec::new(Decimal::new(100, 0)),
+                    CurrencyCode::Rub,
+                ),
+                time::macros::date!(2026 - 01 - 01),
+                time::macros::date!(2027 - 01 - 01),
+            );
+        let Computed::Value(metrics) = computed else {
+            panic!("простые метрики должны вычисляться");
+        };
+        let json = serde_json::to_value(ZeroReinvestmentMetricsDto::from_domain(&metrics))
+            .expect("метрики представимы в JSON");
+        let note = json["zero_reinvestment_note"]
+            .as_str()
+            .expect("допущение должно быть строкой в теле");
+        assert!(!note.is_empty());
+        assert!(note.contains("купоны"));
+        assert!(note.contains("реинвестировать"));
+    }
+
+    #[test]
     fn an_unknown_termination_value_serialises_with_a_reason_not_a_zero() {
         let dto = BondPositionAttributesDto::from_domain(&BondPositionAttributes {
             account: AccountId::new_random(),
@@ -2871,6 +3251,9 @@ pub enum OfferExerciseDto {
     /// Поданная заявка: ни денег, ни бумаг она не двигает.
     Submitted {
         submission: Uuid,
+        /// Идентификатор окна выводится из `(instrument, execution_date)`.
+        /// Произвольный UUID приведёт к неразрешённой заявке; старые факты
+        /// не валидируются повторно, поскольку журнал append-only.
         window: Uuid,
         instrument: Uuid,
         quantity: String,

@@ -1077,6 +1077,21 @@ async fn the_openapi_document_declares_report_quality_and_liquidation_fields() {
 }
 
 #[tokio::test]
+async fn the_openapi_document_declares_quotation_basis_provenance_fields() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let schema = &spec["components"]["schemas"]["MarketPriceDto"];
+    assert!(schema["properties"]["recorded_quotation_basis"].is_object());
+    assert!(schema["properties"]["quotation_basis_status"].is_object());
+    assert_eq!(
+        spec["components"]["schemas"]["QuotationBasisStatusDto"]["enum"],
+        json!(["proven", "contradicts", "not_proven"])
+    );
+}
+
+#[tokio::test]
 async fn the_report_shape_is_frozen_by_a_snapshot() {
     // Поштучные проверки полей ловят неверное значение, но не ловят
     // исчезнувшее поле и не ловят появление лишнего. Снапшот ловит
@@ -2920,7 +2935,16 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
         let prices = prices.as_array().expect("массив цен");
         assert_eq!(prices.len(), 2);
         for price in prices {
-            for field in ["value", "date", "source", "observed_at", "quality"] {
+            for field in [
+                "value",
+                "date",
+                "source",
+                "observed_at",
+                "quality",
+                "quotation_basis",
+                "recorded_quotation_basis",
+                "quotation_basis_status",
+            ] {
                 assert!(price.get(field).is_some(), "у цены нет {field}: {price}");
             }
             assert_eq!(price["source"], "moex-iss");
@@ -2932,6 +2956,9 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
                 price["basis_evidence"], "test:contract",
                 "основание цены не доехало: {price}"
             );
+            assert_eq!(price["quotation_basis"], "unknown");
+            assert_eq!(price["recorded_quotation_basis"], "money_per_unit");
+            assert_eq!(price["quotation_basis_status"], "not_proven");
         }
 
         let (status, fx) = call(&harness.router, get(fx_path, Some(token))).await;

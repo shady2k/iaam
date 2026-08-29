@@ -2850,6 +2850,7 @@ mod tests {
                     period_start: date!(2026 - 08 - 01),
                     accrual_end: date!(2026 - 09 - 01),
                     payment_date: date!(2026 - 09 - 01),
+                    record_date: None,
                     coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
                 }],
                 principal_returns: vec![crate::bond::PrincipalReturn {
@@ -3656,6 +3657,7 @@ mod tests {
                     period_start: date!(2026 - 08 - 01),
                     accrual_end: date!(2026 - 09 - 01),
                     payment_date: date!(2026 - 09 - 01),
+                    record_date: None,
                     coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
                 }],
                 principal_returns: vec![],
@@ -3738,6 +3740,7 @@ mod tests {
                     period_start: date!(2026 - 08 - 01),
                     accrual_end: date!(2026 - 09 - 01),
                     payment_date: date!(2026 - 09 - 01),
+                    record_date: None,
                     coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
                 }],
                 principal_returns: vec![],
@@ -3939,6 +3942,7 @@ mod tests {
                     period_start: date!(2026 - 08 - 01),
                     accrual_end: date!(2026 - 09 - 01),
                     payment_date: date!(2026 - 09 - 01),
+                    record_date: None,
                     coupon_per_unit: Some(PerUnitAmount::new(dec("31"), CurrencyCode::Rub)),
                 }],
                 principal_returns: vec![],
@@ -4591,6 +4595,7 @@ mod tests {
                 period_start: date!(2026 - 08 - 01),
                 accrual_end: date!(2026 - 12 - 01),
                 payment_date: date!(2026 - 12 - 02),
+                record_date: None,
                 coupon_per_unit: Some(PerUnitAmount::new(dec("5"), CurrencyCode::Rub)),
             }],
             principal_returns: vec![crate::bond::PrincipalReturn {
@@ -4848,6 +4853,7 @@ mod tests {
                 period_start: date!(2026 - 01 - 01),
                 accrual_end: date!(2026 - 06 - 30),
                 payment_date: date!(2026 - 07 - 01),
+                record_date: None,
                 coupon_per_unit: Some(PerUnitAmount::new(dec("5"), CurrencyCode::Rub)),
             }],
             ..Default::default()
@@ -4875,6 +4881,7 @@ mod tests {
                 period_start: date!(2026 - 01 - 01),
                 accrual_end: date!(2026 - 06 - 30),
                 payment_date: date!(2026 - 07 - 01),
+                record_date: None,
                 coupon_per_unit: Some(PerUnitAmount::new(dec("5"), CurrencyCode::Rub)),
             }],
             ..Default::default()
@@ -4916,6 +4923,7 @@ mod tests {
                     },
                     accrual_end: *payment_date,
                     payment_date: *payment_date,
+                    record_date: None,
                     coupon_per_unit: Some(PerUnitAmount::new(dec("50"), CurrencyCode::Rub)),
                 })
                 .collect(),

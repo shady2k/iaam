@@ -233,6 +233,7 @@ fn график(купоны: &[Date], возвраты: &[(Date, &str)]) -> Bon
                 },
                 accrual_end: *дата,
                 payment_date: *дата,
+                record_date: None,
                 coupon_per_unit: Some(за_единицу("50")),
             })
             .collect(),

@@ -83,6 +83,12 @@ pub enum PostingKind {
 pub struct ScheduledPosting {
     pub date: Date,
     pub kind: PostingKind,
+    /// Дата, на которую определяется право на выплату.
+    ///
+    /// `None` — источник не сообщил дату фиксации. Судить по дате
+    /// платежа в этом случае запрещено, и решение принимает правило
+    /// сопоставления, а не построение плана.
+    pub entitlement: Option<Date>,
 }
 
 /// Полный результат построения потока.
@@ -247,6 +253,7 @@ impl CashflowProjection for CashflowProjectionV1 {
                 past.push(ScheduledPosting {
                     date: period.payment_date,
                     kind: PostingKind::Coupon,
+                    entitlement: None,
                 });
             } else if cutoff.is_none_or(|date| period.payment_date <= date) {
                 let Some(coupon) = period.coupon_per_unit else {
@@ -272,6 +279,7 @@ impl CashflowProjection for CashflowProjectionV1 {
                 past.push(ScheduledPosting {
                     date: principal_return.repayment_date,
                     kind: PostingKind::PrincipalReturn,
+                    entitlement: None,
                 });
             } else if cutoff.is_none_or(|date| principal_return.repayment_date < date) {
                 postings.push(ExpectedPosting {
@@ -301,6 +309,7 @@ impl CashflowProjection for CashflowProjectionV1 {
                 past.push(ScheduledPosting {
                     date: terms.execution_date,
                     kind: PostingKind::OfferSettlement,
+                    entitlement: None,
                 });
             } else {
                 postings.push(ExpectedPosting {
@@ -318,6 +327,39 @@ impl CashflowProjection for CashflowProjectionV1 {
             terminal_date,
             past,
         })
+    }
+}
+
+/// Вторая версия правила потока, передающая дату права в `past`.
+#[derive(Debug, Default)]
+pub struct CashflowProjectionV2;
+
+impl CashflowProjection for CashflowProjectionV2 {
+    fn future_postings(&self, input: &CashflowInput) -> Result<CashflowPlan, CashflowError> {
+        let mut plan = CashflowProjectionV1.future_postings(input)?;
+
+        // V1 намеренно оставляет право неизвестным для совместимости старых
+        // отчётов. V2 обогащает только купоны данными их периода; возвраты
+        // номинала и оферты пока не имеют источника даты фиксации.
+        for index in 0..plan.past.len() {
+            let posting = plan.past[index];
+            if posting.kind != PostingKind::Coupon {
+                continue;
+            }
+            let occurrence = plan.past[..index]
+                .iter()
+                .filter(|item| item.kind == PostingKind::Coupon && item.date == posting.date)
+                .count();
+            plan.past[index].entitlement = input
+                .schedule
+                .periods
+                .iter()
+                .filter(|period| period.payment_date == posting.date)
+                .nth(occurrence)
+                .and_then(|period| period.record_date);
+        }
+
+        Ok(plan)
     }
 }
 
@@ -353,6 +395,7 @@ mod tests {
             period_start: start,
             accrual_end: payment,
             payment_date: payment,
+            record_date: None,
             coupon_per_unit: coupon.map(per_unit),
         }
     }
@@ -388,6 +431,66 @@ mod tests {
             as_of,
             report_currency: CurrencyCode::Rub,
         }
+    }
+
+    #[test]
+    fn v2_carries_coupon_record_date_into_entitlement() {
+        let schedule = valid_schedule(
+            vec![AccrualPeriod {
+                record_date: Some(date!(2026 - 08 - 30)),
+                ..period(date!(2026 - 07 - 01), date!(2026 - 09 - 01), Some("10"))
+            }],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 10 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+
+        let plan = CashflowProjectionV2
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 09 - 15),
+            ))
+            .expect("past coupon is computable");
+
+        assert_eq!(
+            plan.past,
+            vec![ScheduledPosting {
+                date: date!(2026 - 09 - 01),
+                kind: PostingKind::Coupon,
+                entitlement: Some(date!(2026 - 08 - 30)),
+            }]
+        );
+    }
+
+    #[test]
+    fn v2_keeps_coupon_entitlement_unknown_when_record_date_is_missing() {
+        let schedule = valid_schedule(
+            vec![period(
+                date!(2026 - 07 - 01),
+                date!(2026 - 09 - 01),
+                Some("10"),
+            )],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 10 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+
+        let plan = CashflowProjectionV2
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 09 - 15),
+            ))
+            .expect("past coupon is computable");
+
+        assert_eq!(plan.past[0].entitlement, None);
     }
 
     #[test]
@@ -561,10 +664,12 @@ mod tests {
                 ScheduledPosting {
                     date: date!(2026 - 08 - 01),
                     kind: PostingKind::Coupon,
+                    entitlement: None,
                 },
                 ScheduledPosting {
                     date: date!(2026 - 08 - 01),
                     kind: PostingKind::PrincipalReturn,
+                    entitlement: None,
                 },
             ]
         );
@@ -607,10 +712,12 @@ mod tests {
                 ScheduledPosting {
                     date: date!(2026 - 03 - 15),
                     kind: PostingKind::Coupon,
+                    entitlement: None,
                 },
                 ScheduledPosting {
                     date: date!(2026 - 06 - 15),
                     kind: PostingKind::PrincipalReturn,
+                    entitlement: None,
                 },
             ]
         );
@@ -1182,6 +1289,7 @@ mod tests {
             period_start: date!(2026 - 08 - 01),
             accrual_end: date!(2026 - 09 - 01),
             payment_date: date!(2026 - 09 - 01),
+            record_date: None,
             coupon_per_unit: Some(PerUnitAmount::new(dec("1"), CurrencyCode::Usd)),
         }];
         assert!(matches!(

@@ -316,8 +316,8 @@ impl MaterialIssue {
             // Горизонт журнала зеркалит `HistoryStartsAt`: это факт о
             // периоде, а не дефект. Владелец, чей журнал начинается
             // позже выпуска бумаги, иначе получил бы вечный `Incomplete`
-            // без способа его убрать. Остальные три причины чинятся
-            // дозагрузкой фактов и потому дефект.
+            // Остальные пять причин чинятся дозагрузкой фактов и потому
+            // являются дефектами.
             Self::ScheduledPostingUnverifiable { reason, .. } => {
                 !matches!(reason, UnverifiableReason::HistoryStartsAfterSchedule)
             }
@@ -338,6 +338,10 @@ pub enum UnverifiableReason {
     /// Границу владения провести нечем: у партии нет даты приобретения
     /// либо есть количество, восстановленное без стоимости.
     AcquisitionDateUnknown,
+    /// Владение на дату фиксации выплаты нельзя доказать.
+    OwnershipUnknown,
+    /// Источник не сообщил дату, на которую определяется право на выплату.
+    EntitlementDateUnknown,
     /// По паре есть выплата, вид которой не установлен: на график её
     /// не положить.
     IncomeKindUnknown,
@@ -353,6 +357,8 @@ impl UnverifiableReason {
     pub const fn code(self) -> &'static str {
         match self {
             Self::AcquisitionDateUnknown => "acquisition_date_unknown",
+            Self::OwnershipUnknown => "ownership_unknown",
+            Self::EntitlementDateUnknown => "entitlement_date_unknown",
             Self::IncomeKindUnknown => "income_kind_unknown",
             Self::PaymentDateUnknown => "payment_date_unknown",
             Self::HistoryStartsAfterSchedule => "history_starts_after_schedule",
@@ -5477,6 +5483,8 @@ mod tests {
     fn the_other_unverifiable_reasons_are_defects_because_loading_facts_fixes_them() {
         for reason in [
             UnverifiableReason::AcquisitionDateUnknown,
+            UnverifiableReason::OwnershipUnknown,
+            UnverifiableReason::EntitlementDateUnknown,
             UnverifiableReason::IncomeKindUnknown,
             UnverifiableReason::PaymentDateUnknown,
         ] {
@@ -5511,6 +5519,8 @@ mod tests {
     fn every_unverifiable_reason_has_a_machine_readable_code() {
         let codes: std::collections::BTreeSet<_> = [
             UnverifiableReason::AcquisitionDateUnknown,
+            UnverifiableReason::OwnershipUnknown,
+            UnverifiableReason::EntitlementDateUnknown,
             UnverifiableReason::IncomeKindUnknown,
             UnverifiableReason::PaymentDateUnknown,
             UnverifiableReason::HistoryStartsAfterSchedule,
@@ -5519,7 +5529,9 @@ mod tests {
         .map(UnverifiableReason::code)
         .collect();
 
-        assert_eq!(codes.len(), 4);
+        // Шесть вариантов должны оставаться разными: два новых дефекта
+        // чинятся разными дозагрузками и не могут сливаться в один код.
+        assert_eq!(codes.len(), 6);
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub use cashflow::{
     CashflowProjectionV2, CashflowProjectionVersion, ExpectedPosting, PostingKind,
     ScheduleTrustError, ScheduledPosting, historical_schedule_postings,
 };
-pub use posting_match::{PostingMatchV1, PostingMatchVersion};
+pub use posting_match::{PostingMatchV1, PostingMatchV2, PostingMatchVersion, Verdict};
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,

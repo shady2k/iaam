@@ -619,6 +619,7 @@ mod tests {
         };
         let postings = ledger.postings(&key);
         assert_eq!(postings.len(), 2);
+        assert!(!ledger.is_empty());
         assert_eq!(postings[0].date, date!(2026 - 03 - 18));
         assert_eq!(postings[1].date, date!(2026 - 09 - 18));
     }

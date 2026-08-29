@@ -5308,6 +5308,56 @@ mod tests {
     }
 
     #[test]
+    fn a_posting_dated_by_the_first_journal_day_is_covered_and_stays_verifiable() {
+        // Граница начала журнала полуоткрыта: день первого события
+        // журналом ПОКРЫТ, и выплата этого дня проверяема — факт под
+        // неё мог быть записан. Сдвиг границы на `<=` тревогу не
+        // выдумывает, а гасит: пропущенный купон первого дня ушёл бы
+        // из отчёта под видом недоказуемого, то есть под отговоркой.
+        // Зеркало теста восстановленной истории: там выплата раньше
+        // журнала, здесь — ровно на его границе.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let первый_день = date!(2026 - 01 - 01);
+        let schedule = график_купонов(
+            &[первый_день, date!(2026 - 06 - 15)],
+            date!(2026 - 12 - 15),
+        );
+        // Дата сделки заявлена раньше журнала: границу владения купон
+        // первого дня проходит, и решает его судьбу именно граница
+        // истории, а не отбор по владению.
+        let events = vec![восстановленная_позиция(
+            account,
+            instrument,
+            первый_день,
+            date!(2025 - 06 - 01),
+        )];
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        assert!(
+            !содержит(&report, |issue| matches!(
+                issue,
+                MaterialIssue::ScheduledPostingUnverifiable {
+                    reason: UnverifiableReason::HistoryStartsAfterSchedule,
+                    ..
+                }
+            )),
+            "день первого события журналом покрыт: недоказуемости здесь нет"
+        );
+        let даты: Vec<_> = непринятые(&report)
+            .into_iter()
+            .filter_map(|issue| match issue {
+                MaterialIssue::ScheduledPostingNotReceived { date, .. } => Some(*date),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            даты.contains(&первый_день),
+            "купон дня первого события обязан числиться непринятым: {даты:?}"
+        );
+    }
+
+    #[test]
     fn a_purchase_without_a_trade_date_leaves_the_ownership_bound_undrawable() {
         // `Lot.acquired` — `Option<TradeDate>`, и схема отсутствие даты
         // допускает (§4.9). Такая покупка счёт восстановленным НЕ метит,

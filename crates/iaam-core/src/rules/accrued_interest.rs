@@ -111,12 +111,14 @@ mod tests {
                 period_start: date!(2026 - 06 - 03),
                 accrual_end: date!(2026 - 12 - 02),
                 payment_date: date!(2026 - 12 - 02),
+                record_date: None,
                 coupon_per_unit: Some(PerUnitAmount::new(dec("35.40"), CurrencyCode::Rub)),
             },
             AccrualPeriod {
                 period_start: date!(2026 - 12 - 02),
                 accrual_end: date!(2027 - 06 - 02),
                 payment_date: date!(2027 - 06 - 02),
+                record_date: None,
                 coupon_per_unit: Some(PerUnitAmount::new(dec("35.40"), CurrencyCode::Rub)),
             },
         ]
@@ -172,12 +174,14 @@ mod tests {
                 period_start: date!(2026 - 01 - 01),
                 accrual_end: date!(2026 - 03 - 01),
                 payment_date: date!(2026 - 03 - 01),
+                record_date: None,
                 coupon_per_unit: Some(PerUnitAmount::new(dec("10"), CurrencyCode::Rub)),
             },
             AccrualPeriod {
                 period_start: date!(2026 - 02 - 01),
                 accrual_end: date!(2026 - 04 - 01),
                 payment_date: date!(2026 - 04 - 01),
+                record_date: None,
                 coupon_per_unit: Some(PerUnitAmount::new(dec("20"), CurrencyCode::Rub)),
             },
         ];
@@ -195,6 +199,7 @@ mod tests {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),
             payment_date: date!(2026 - 12 - 02),
+            record_date: None,
             coupon_per_unit: None,
         }];
         assert!(matches!(

@@ -24,7 +24,8 @@ use lot_disposal::{FifoV1, LotDisposalRule};
 
 pub use cashflow::{
     CashflowError, CashflowInput, CashflowPlan, CashflowProjection, CashflowProjectionV1,
-    CashflowProjectionVersion, ExpectedPosting, PostingKind, ScheduledPosting,
+    CashflowProjectionV2, CashflowProjectionVersion, ExpectedPosting, PostingKind,
+    ScheduledPosting,
 };
 pub use posting_match::{PostingMatchV1, PostingMatchVersion};
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
@@ -76,6 +77,7 @@ impl RuleRegistry {
         let mut cashflow_rules: BTreeMap<CashflowProjectionVersion, Box<dyn CashflowProjection>> =
             BTreeMap::new();
         cashflow_rules.insert(CashflowProjectionVersion(1), Box::new(CashflowProjectionV1));
+        cashflow_rules.insert(CashflowProjectionVersion(2), Box::new(CashflowProjectionV2));
         accrued_interest_rules.insert(AccruedInterestRuleVersion(1), Box::new(AccruedInterestV1));
 
         Self {
@@ -259,6 +261,7 @@ mod tests {
     fn registry_resolves_cashflow_v1() {
         let reg = RuleRegistry::with_defaults();
         assert!(reg.cashflow_rule(CashflowProjectionVersion(1)).is_some());
+        assert!(reg.cashflow_rule(CashflowProjectionVersion(2)).is_some());
     }
 
     #[test]
@@ -266,7 +269,7 @@ mod tests {
         let reg = RuleRegistry::with_defaults();
         assert_eq!(
             reg.latest_cashflow_version(),
-            Some(CashflowProjectionVersion(1))
+            Some(CashflowProjectionVersion(2))
         );
     }
 }

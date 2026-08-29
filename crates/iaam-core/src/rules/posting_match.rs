@@ -158,6 +158,7 @@ mod tests {
         ScheduledPosting {
             date: march(day),
             kind,
+            entitlement: None,
         }
     }
 
@@ -426,6 +427,7 @@ mod tests {
         let scheduled_in_march = ScheduledPosting {
             date: date!(2026 - 03 - 25),
             kind: PostingKind::Coupon,
+            entitlement: None,
         };
         let fact_in_april = ReceivedPosting {
             event: EventId(Uuid::from_u128(100)),

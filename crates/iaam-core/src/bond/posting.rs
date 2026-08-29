@@ -45,6 +45,7 @@ mod tests {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),
             payment_date: date!(2026 - 12 - 03),
+            record_date: None,
             coupon_per_unit: None,
         }];
         assert_eq!(
@@ -61,6 +62,7 @@ mod tests {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),
             payment_date: date!(2026 - 12 - 02),
+            record_date: None,
             coupon_per_unit: None,
         }];
         let returns = vec![PrincipalReturn {

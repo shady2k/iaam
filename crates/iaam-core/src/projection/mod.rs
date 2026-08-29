@@ -9,6 +9,7 @@
 
 pub mod balances;
 pub mod flows;
+pub mod income;
 pub mod invariants;
 pub mod lots;
 pub mod offers;
@@ -26,13 +27,14 @@ use crate::rules::{LotRuleVersion, RuleRegistry};
 use crate::valuation::InstrumentPrice;
 use balances::BalanceError;
 use flows::FlowError;
+use income::IncomeError;
 use invariants::{InvariantReport, InvariantViolation};
 use lots::{LotBook, LotError};
 use state::{LedgerState, StateHash};
 
 /// Версия формата проекции. Снимок, построенный другой версией,
 /// продвигать нельзя: смысл полей мог измениться.
-pub const PROJECTION_VERSION: u32 = 3;
+pub const PROJECTION_VERSION: u32 = 4;
 
 /// Неизменяемый вход проекции: границы контура и версии правил.
 ///
@@ -83,6 +85,8 @@ pub enum ProjectionError {
     #[error(transparent)]
     Flow(#[from] FlowError),
     #[error(transparent)]
+    Income(#[from] IncomeError),
+    #[error(transparent)]
     Invariant(#[from] InvariantViolation),
 }
 
@@ -100,6 +104,7 @@ impl ProjectionError {
             Self::Balance(_) => "balance",
             Self::Lot(_) => "lot",
             Self::Flow(_) => "flow",
+            Self::Income(_) => "income",
             Self::Invariant(_) => "invariant",
         }
     }
@@ -337,6 +342,7 @@ fn fold(
             book.apply(event, ctx.rules)?;
             flows.apply(event, ctx.contour)?;
         }
+        state.income_mut().apply(event)?;
         if let EventKind::Valuation {
             instrument,
             price,

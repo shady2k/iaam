@@ -15,6 +15,7 @@ use time::Date;
 
 use super::balances::Balances;
 use super::flows::FlowLog;
+use super::income::IncomeLedger;
 use super::lots::LotBook;
 use crate::event::{Confidence, Event};
 use crate::ids::AccountId;
@@ -115,6 +116,7 @@ pub struct LedgerState {
     balances: Balances,
     book: LotBook,
     flows: FlowLog,
+    income: IncomeLedger,
     prices: PriceBoard,
     coverage: Coverage,
 }
@@ -126,6 +128,7 @@ impl LedgerState {
             balances: Balances::new(),
             book,
             flows: FlowLog::new(),
+            income: IncomeLedger::default(),
             prices: PriceBoard::new(),
             coverage: Coverage::default(),
         }
@@ -146,6 +149,12 @@ impl LedgerState {
         &self.flows
     }
 
+    /// Датированные факты дохода: с ними сверяется график выплат.
+    #[must_use]
+    pub const fn income(&self) -> &IncomeLedger {
+        &self.income
+    }
+
     #[must_use]
     pub const fn prices(&self) -> &PriceBoard {
         &self.prices
@@ -158,6 +167,10 @@ impl LedgerState {
 
     pub(super) const fn parts_mut(&mut self) -> (&mut Balances, &mut LotBook, &mut FlowLog) {
         (&mut self.balances, &mut self.book, &mut self.flows)
+    }
+
+    pub(super) const fn income_mut(&mut self) -> &mut IncomeLedger {
+        &mut self.income
     }
 
     pub(super) const fn prices_mut(&mut self) -> &mut PriceBoard {

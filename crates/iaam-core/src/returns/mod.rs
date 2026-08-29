@@ -1646,6 +1646,14 @@ fn bond_position_metrics(
     let (_, posting_match) = posting_match_rule();
     let history_starts = state.coverage().first_event();
     let mut issues = Vec::new();
+    // Сверка идёт по `LotKey`, а позиции обходятся по `PositionKey`
+    // с местом хранения: одна бумага в двух депозитариях — две позиции
+    // и один журнал лотов, поэтому без отметки уже сверенных пар одна
+    // и та же проблема вышла бы дважды. Отметка стоит здесь, а не
+    // внутри `reconcile_past_postings`: правило не должно помнить, кого
+    // оно уже видело, а метрики по каждому месту хранения выдаются
+    // по-прежнему свои.
+    let mut reconciled: std::collections::BTreeSet<LotKey> = std::collections::BTreeSet::new();
     let metrics = positions
         .iter()
         .filter_map(|position| {
@@ -1684,7 +1692,9 @@ fn bond_position_metrics(
             // Непостроенный поток сверку молча пропускает: причина
             // отказа уже названа в самом сценарии, а выдумывать под неё
             // пятую причину недоказуемости спека не даёт.
-            if let Ok(plan) = scenario_plan(&inputs, &OfferChoice::HoldToMaturity) {
+            if let Ok(plan) = scenario_plan(&inputs, &OfferChoice::HoldToMaturity)
+                && reconciled.insert(key)
+            {
                 issues.extend(reconcile_past_postings(
                     key,
                     &plan,
@@ -5641,6 +5651,93 @@ mod tests {
             issue,
             MaterialIssue::ScheduledPostingUnverifiable { .. }
         )));
+    }
+
+    #[test]
+    fn a_bond_kept_in_two_custodies_reports_one_miss_once() {
+        // Позиция обходится по `PositionKey` с местом хранения,
+        // а сверяется `LotKey` без него: одна и та же проблема иначе
+        // выдаётся по разу на депозитарий.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let events = журнал_бумаги_в_двух_депозитариях(account, instrument, &[date!(2026 - 03 - 16)]);
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000", "1000"], &schedule);
+
+        assert_eq!(
+            report.bond_metrics.len(),
+            2,
+            "позиций должно быть две, иначе тест ничего не доказывает"
+        );
+        let issues = непринятые(&report);
+        assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+    }
+
+    #[test]
+    fn moving_a_bond_between_custodies_raises_no_false_alarm() {
+        // Отдельного вида события для перевода бумаги между
+        // депозитариями в модели нет: перевод виден только состоянием —
+        // один `LotKey` под двумя `PositionKey`. Оно и проверяется:
+        // полная история купонов не даёт ни одной тревоги.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let events = журнал_бумаги_в_двух_депозитариях(
+            account,
+            instrument,
+            &[date!(2026 - 03 - 16), date!(2026 - 06 - 16)],
+        );
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000", "1000"], &schedule);
+
+        assert_eq!(report.bond_metrics.len(), 2);
+        assert!(непринятые(&report).is_empty());
+        assert!(!содержит(&report, |issue| matches!(
+            issue,
+            MaterialIssue::ScheduledPostingUnverifiable { .. }
+        )));
+    }
+
+    /// Одна бумага на одном счёте в двух местах хранения.
+    fn журнал_бумаги_в_двух_депозитариях(
+        account: AccountId,
+        instrument: InstrumentId,
+        факты: &[Date],
+    ) -> Vec<crate::event::Event> {
+        let mut events = vec![
+            пополнение(account, date!(2026 - 01 - 05)),
+            покупка_облигации_в_депозитарии(
+                account,
+                instrument,
+                date!(2026 - 01 - 10),
+                CustodyId::new_random(),
+                2,
+            ),
+            покупка_облигации_в_депозитарии(
+                account,
+                instrument,
+                date!(2026 - 01 - 11),
+                CustodyId::new_random(),
+                3,
+            ),
+        ];
+        events.extend(факты.iter().enumerate().map(|(index, day)| {
+            купонный_факт(account, instrument, *day, 4 + u32::try_from(index).expect("номер факта"))
+        }));
+        events
     }
 
     #[test]

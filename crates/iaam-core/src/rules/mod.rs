@@ -8,6 +8,7 @@ mod accrued_interest;
 pub mod amortisation;
 pub mod cashflow;
 pub mod lot_disposal;
+pub mod posting_match;
 pub mod quotation;
 pub mod valuation;
 
@@ -25,6 +26,7 @@ pub use cashflow::{
     CashflowError, CashflowInput, CashflowPlan, CashflowProjection, CashflowProjectionV1,
     CashflowProjectionVersion, ExpectedPosting, PostingKind, ScheduledPosting,
 };
+pub use posting_match::{PostingMatchV1, PostingMatchVersion};
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,

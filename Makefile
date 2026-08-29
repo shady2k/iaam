@@ -91,6 +91,10 @@ diff-coverage: coverage ## Порог 90% на добавленных строк
 mutants: ## Мутационное тестирование, порог по каждому модулю (долго)
 	$(RUN) ./scripts/check-mutants.sh
 
+.PHONY: mutants-diff
+mutants-diff: ## Мутанты только в изменённых строках (BASE=...). Быстро, но НЕ заслон
+	$(RUN) env BASE=$(BASE) ./scripts/mutants-in-diff.sh
+
 # Ходит в интернет и требует заведённого доступа: IAAM_DATABASE и
 # IAAM_BROKER_KEY_FILE должны быть выставлены, иначе цель падает —
 # режим запрошен явно, и молчаливый пропуск был бы враньём.

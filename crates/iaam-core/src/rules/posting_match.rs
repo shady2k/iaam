@@ -1,7 +1,7 @@
 //! Правило сопоставления запланированной выплаты с фактом (§7.2).
 
 use serde::{Deserialize, Serialize};
-use time::Duration;
+use time::{Date, Duration};
 
 use crate::projection::income::ReceivedPosting;
 use crate::rules::cashflow::ScheduledPosting;
@@ -55,6 +55,27 @@ impl PostingMatchV1 {
         self.window_days
     }
 
+    /// Истёк ли срок ожидания выплаты к дате отчёта.
+    ///
+    /// Деньги по депозитарной цепочке идут те же самые 21 день, что
+    /// задают окно сопоставления, поэтому отсрочка перед тревогой равна
+    /// окну и живёт здесь, а не в сверке: сузить окно, не сузив
+    /// отсрочку, значило бы обвинять бумагу за дни, которые правило
+    /// само признаёт нормальным сроком доставки. Одно число — одна
+    /// версия правила.
+    ///
+    /// Выплата, срок которой ещё идёт, не проверяется совсем: она
+    /// не «не получена» — про неё пока нечего сказать.
+    #[must_use]
+    pub fn is_due(&self, scheduled: &ScheduledPosting, as_of: Date) -> bool {
+        // `saturating_add`: сложение дат паникует при выходе за границу
+        // календаря, а вердикт обязан быть у любого входа.
+        scheduled
+            .date
+            .saturating_add(Duration::days(i64::from(self.window_days)))
+            <= as_of
+    }
+
     /// Запланированные выплаты, под которые факта не нашлось.
     ///
     /// Факт закрывает выплату, если совпал вид и он пришёл не раньше
@@ -70,11 +91,15 @@ impl PostingMatchV1 {
     /// Оба среза сортируются внутри, причём факты при равной дате — по
     /// `EventId`, чтобы порядок был полным. Поэтому результат не зависит
     /// от порядка событий в журнале (§15.3).
+    ///
+    /// Выплата, у которой срок ожидания к `as_of` ещё не истёк,
+    /// не проверяется вовсе: см. [`Self::is_due`].
     #[must_use]
     pub fn unreceived(
         &self,
         scheduled: &[ScheduledPosting],
         facts: &[ReceivedPosting],
+        as_of: Date,
     ) -> Vec<ScheduledPosting> {
         let mut plan = scheduled.to_vec();
         plan.sort();
@@ -87,6 +112,13 @@ impl PostingMatchV1 {
         let window = Duration::days(i64::from(self.window_days));
 
         for expected in plan {
+            // Срок ещё идёт — про эту выплату сказать нечего, и факт
+            // она не расходует: иначе исключённая выплата съела бы
+            // подтверждение соседней и создала бы пропуск на пустом
+            // месте.
+            if !self.is_due(&expected, as_of) {
+                continue;
+            }
             // `saturating_add` вместо `+`: сложение дат паникует при
             // выходе за границу календаря, а правило обязано вернуть
             // вердикт по любому входу, а не уронить ядро.
@@ -149,6 +181,45 @@ mod tests {
         received(day, PostingKind::Coupon, u128::from(day))
     }
 
+    /// Дата отчёта, к которой сроки ожидания всех выплат этих тестов
+    /// давно истекли. Нужна, чтобы проверка сопоставления не зависела
+    /// от отсрочки: её граница проверяется отдельными тестами ниже.
+    fn late_enough() -> Date {
+        date!(2026 - 05 - 01)
+    }
+
+    #[test]
+    fn a_payment_whose_waiting_window_has_not_expired_is_not_checked_at_all() {
+        // День в день после плановой даты деньги ещё идут по
+        // депозитарной цепочке. Требовать под них факт — обвинять
+        // здоровую бумагу в дефекте.
+        let rule = PostingMatchV1::new();
+        assert!(rule.unreceived(&[coupon(1)], &[], march(1)).is_empty());
+    }
+
+    #[test]
+    fn the_waiting_window_is_exactly_the_matching_window() {
+        // Граница: +20 дней срок ещё идёт, +21 истёк, +22 тем более.
+        // Отсрочка равна окну ровно затем, чтобы сузить окно значило
+        // сузить и отсрочку.
+        let rule = PostingMatchV1::new();
+        assert!(rule.unreceived(&[coupon(1)], &[], march(21)).is_empty());
+        assert_eq!(rule.unreceived(&[coupon(1)], &[], march(22)), vec![coupon(1)]);
+        assert_eq!(rule.unreceived(&[coupon(1)], &[], march(23)), vec![coupon(1)]);
+    }
+
+    #[test]
+    fn a_payment_whose_waiting_window_has_not_expired_never_consumes_a_fact() {
+        // Выплата исключается целиком, а не откладывается «до лучших
+        // фактов»: иначе она съела бы факт соседней выплаты и создала
+        // пропуск там, где его нет.
+        let rule = PostingMatchV1::new();
+        assert!(
+            rule.unreceived(&[coupon(1), coupon(10)], &[fact(2)], march(22))
+                .is_empty()
+        );
+    }
+
     #[test]
     fn the_window_is_twenty_one_days() {
         assert_eq!(PostingMatchV1::new().window_days(), 21);
@@ -157,7 +228,7 @@ mod tests {
     #[test]
     fn a_payment_inside_the_window_is_received() {
         let rule = PostingMatchV1::new();
-        assert!(rule.unreceived(&[coupon(15)], &[fact(18)]).is_empty());
+        assert!(rule.unreceived(&[coupon(15)], &[fact(18)], late_enough()).is_empty());
     }
 
     #[test]
@@ -165,7 +236,7 @@ mod tests {
         // Нижняя граница окна включающая: деньги, пришедшие день в день,
         // — это исполнение плана, а не другая выплата.
         let rule = PostingMatchV1::new();
-        assert!(rule.unreceived(&[coupon(15)], &[fact(15)]).is_empty());
+        assert!(rule.unreceived(&[coupon(15)], &[fact(15)], late_enough()).is_empty());
     }
 
     #[test]
@@ -173,8 +244,8 @@ mod tests {
         // 21 календарный день — это 10 рабочих дней депозитарной цепочки
         // (ст. 8.7 ФЗ 39-ФЗ), растянутые через праздничный период.
         let rule = PostingMatchV1::new();
-        assert!(rule.unreceived(&[coupon(1)], &[fact(22)]).is_empty());
-        assert_eq!(rule.unreceived(&[coupon(1)], &[fact(23)]), vec![coupon(1)]);
+        assert!(rule.unreceived(&[coupon(1)], &[fact(22)], late_enough()).is_empty());
+        assert_eq!(rule.unreceived(&[coupon(1)], &[fact(23)], late_enough()), vec![coupon(1)]);
     }
 
     #[test]
@@ -182,14 +253,14 @@ mod tests {
         // Окно одностороннее. Факт раньше плановой даты — это другая
         // выплата, а не ранний приход этой.
         let rule = PostingMatchV1::new();
-        assert_eq!(rule.unreceived(&[coupon(15)], &[fact(14)]), vec![coupon(15)]);
+        assert_eq!(rule.unreceived(&[coupon(15)], &[fact(14)], late_enough()), vec![coupon(15)]);
     }
 
     #[test]
     fn a_coupon_fact_does_not_confirm_a_principal_return() {
         let rule = PostingMatchV1::new();
         let principal = scheduled(15, PostingKind::PrincipalReturn);
-        assert_eq!(rule.unreceived(&[principal], &[fact(18)]), vec![principal]);
+        assert_eq!(rule.unreceived(&[principal], &[fact(18)], late_enough()), vec![principal]);
     }
 
     #[test]
@@ -197,7 +268,7 @@ mod tests {
         let rule = PostingMatchV1::new();
         let principal_fact = received(18, PostingKind::PrincipalReturn, 18);
         assert_eq!(
-            rule.unreceived(&[coupon(15)], &[principal_fact]),
+            rule.unreceived(&[coupon(15)], &[principal_fact], late_enough()),
             vec![coupon(15)]
         );
     }
@@ -206,9 +277,9 @@ mod tests {
     fn an_offer_settlement_is_confirmed_only_by_its_own_kind() {
         let rule = PostingMatchV1::new();
         let offer = scheduled(15, PostingKind::OfferSettlement);
-        assert_eq!(rule.unreceived(&[offer], &[fact(18)]), vec![offer]);
+        assert_eq!(rule.unreceived(&[offer], &[fact(18)], late_enough()), vec![offer]);
         assert!(
-            rule.unreceived(&[offer], &[received(18, PostingKind::OfferSettlement, 18)])
+            rule.unreceived(&[offer], &[received(18, PostingKind::OfferSettlement, 18)], late_enough())
                 .is_empty()
         );
     }
@@ -219,7 +290,7 @@ mod tests {
         // закрыл бы и себя, и соседа.
         let rule = PostingMatchV1::new();
         assert_eq!(
-            rule.unreceived(&[coupon(1), coupon(10)], &[fact(11)]),
+            rule.unreceived(&[coupon(1), coupon(10)], &[fact(11)], late_enough()),
             vec![coupon(10)]
         );
     }
@@ -230,7 +301,7 @@ mod tests {
         // достаться второй выплате, а не пропасть вместе с первым.
         let rule = PostingMatchV1::new();
         assert!(
-            rule.unreceived(&[coupon(1), coupon(10)], &[fact(11), fact(12)])
+            rule.unreceived(&[coupon(1), coupon(10)], &[fact(11), fact(12)], late_enough())
                 .is_empty()
         );
     }
@@ -241,7 +312,7 @@ mod tests {
         // поэтому поздняя выплата остаётся с поздним фактом, а не пустой.
         let rule = PostingMatchV1::new();
         assert!(
-            rule.unreceived(&[coupon(1), coupon(20)], &[fact(2), fact(21)])
+            rule.unreceived(&[coupon(1), coupon(20)], &[fact(2), fact(21)], late_enough())
                 .is_empty()
         );
     }
@@ -249,8 +320,8 @@ mod tests {
     #[test]
     fn the_verdict_does_not_depend_on_the_order_of_the_inputs() {
         let rule = PostingMatchV1::new();
-        let forward = rule.unreceived(&[coupon(1), coupon(10)], &[fact(2), fact(11)]);
-        let reversed = rule.unreceived(&[coupon(10), coupon(1)], &[fact(11), fact(2)]);
+        let forward = rule.unreceived(&[coupon(1), coupon(10)], &[fact(2), fact(11)], late_enough());
+        let reversed = rule.unreceived(&[coupon(10), coupon(1)], &[fact(11), fact(2)], late_enough());
         assert_eq!(forward, reversed);
         assert!(forward.is_empty());
     }
@@ -263,8 +334,8 @@ mod tests {
         let rule = PostingMatchV1::new();
         let first = received(11, PostingKind::Coupon, 1);
         let second = received(11, PostingKind::Coupon, 2);
-        let forward = rule.unreceived(&[coupon(1), coupon(10)], &[first, second]);
-        let reversed = rule.unreceived(&[coupon(10), coupon(1)], &[second, first]);
+        let forward = rule.unreceived(&[coupon(1), coupon(10)], &[first, second], late_enough());
+        let reversed = rule.unreceived(&[coupon(10), coupon(1)], &[second, first], late_enough());
         assert_eq!(forward, reversed);
         assert!(forward.is_empty());
     }
@@ -273,7 +344,7 @@ mod tests {
     fn without_facts_every_scheduled_payment_is_unreceived() {
         let rule = PostingMatchV1::new();
         assert_eq!(
-            rule.unreceived(&[coupon(10), coupon(1)], &[]),
+            rule.unreceived(&[coupon(10), coupon(1)], &[], late_enough()),
             vec![coupon(1), coupon(10)]
         );
     }
@@ -281,7 +352,7 @@ mod tests {
     #[test]
     fn without_a_schedule_there_is_nothing_to_confirm() {
         let rule = PostingMatchV1::new();
-        assert!(rule.unreceived(&[], &[fact(11)]).is_empty());
+        assert!(rule.unreceived(&[], &[fact(11)], late_enough()).is_empty());
     }
 
     #[test]
@@ -291,8 +362,8 @@ mod tests {
         // закрывает ровно одну из них.
         let rule = PostingMatchV1::new();
         let twice = [coupon(10), coupon(10)];
-        assert_eq!(rule.unreceived(&twice, &[fact(11)]), vec![coupon(10)]);
-        assert!(rule.unreceived(&twice, &[fact(11), fact(12)]).is_empty());
+        assert_eq!(rule.unreceived(&twice, &[fact(11)], late_enough()), vec![coupon(10)]);
+        assert!(rule.unreceived(&twice, &[fact(11), fact(12)], late_enough()).is_empty());
     }
 
     #[test]
@@ -310,7 +381,7 @@ mod tests {
             kind: PostingKind::Coupon,
         };
         assert!(
-            rule.unreceived(&[scheduled_in_march], &[fact_in_april])
+            rule.unreceived(&[scheduled_in_march], &[fact_in_april], late_enough())
                 .is_empty()
         );
     }

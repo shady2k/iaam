@@ -1572,6 +1572,7 @@ fn reconcile_past_postings(
     income: &crate::projection::income::IncomeLedger,
     history_starts: Option<Date>,
     rule: &PostingMatchV1,
+    as_of: Date,
 ) -> Vec<MaterialIssue> {
     let unverifiable = |reason| {
         vec![MaterialIssue::ScheduledPostingUnverifiable {
@@ -1600,11 +1601,16 @@ fn reconcile_past_postings(
 
     // Купон за период, когда бумаги ещё не было, владельцу не
     // причитается: требовать под него факт значит выдумать дефект.
+    //
+    // Выплата, у которой срок ожидания к `as_of` ещё не истёк,
+    // отсеивается здесь же, а не только внутри правила: иначе она
+    // осталась бы поводом для причины недоказуемости ниже, то есть
+    // тревогой под другим именем. Про неё пока просто нечего сказать.
     let owned: Vec<_> = plan
         .past
         .iter()
         .copied()
-        .filter(|posting| posting.date >= acquired.0)
+        .filter(|posting| posting.date >= acquired.0 && rule.is_due(posting, as_of))
         .collect();
 
     // Выплата, прошедшая границу владения, но датированная раньше
@@ -1618,7 +1624,7 @@ fn reconcile_past_postings(
         return unverifiable(UnverifiableReason::HistoryStartsAfterSchedule);
     }
 
-    rule.unreceived(&owned, income.postings(&key))
+    rule.unreceived(&owned, income.postings(&key), as_of)
         .into_iter()
         .map(|posting| MaterialIssue::ScheduledPostingNotReceived {
             account: key.account,
@@ -1686,6 +1692,7 @@ fn bond_position_metrics(
                     state.income(),
                     history_starts,
                     &posting_match,
+                    request.as_of,
                 ));
             }
             let scenarios = available_choices(schedule, request.as_of)
@@ -5013,6 +5020,27 @@ mod tests {
         faces: &[&str],
         schedule: &BondSchedule,
     ) -> ReturnsReport {
+        отчёт_сверки_на(
+            accounts,
+            instrument,
+            events,
+            faces,
+            schedule,
+            date!(2026 - 08 - 26),
+        )
+    }
+
+    /// Тот же отчёт с явной датой отчёта. Отдельным параметром, потому
+    /// что отсрочка перед тревогой считается от неё: без вариации
+    /// `as_of` границу срока ожидания проверить нечем.
+    fn отчёт_сверки_на(
+        accounts: &[AccountId],
+        instrument: InstrumentId,
+        events: &[crate::event::Event],
+        faces: &[&str],
+        schedule: &BondSchedule,
+        as_of: Date,
+    ) -> ReturnsReport {
         let contour = ContourDefinition::new(
             ContourId::new_random(),
             ContourVersion(1),
@@ -5030,14 +5058,16 @@ mod tests {
             .state()
             .clone();
         let state = состояние_с_номиналами(state, faces);
-        let candidate = рыночная_цена(instrument, date!(2026 - 08 - 25));
+        // Цена наблюдена накануне отчёта: политика отбора цену из
+        // будущего не берёт, и позиция осталась бы непокрытой.
+        let candidate = рыночная_цена(instrument, as_of.saturating_sub(time::Duration::days(1)));
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let ledger = ReconciliationLedger::default();
         let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
         let schedules = BTreeMap::from([(instrument, schedule.clone())]);
         let request = ReturnsRequest {
             contour: &contour,
-            as_of: date!(2026 - 08 - 26),
+            as_of,
             report_currency: CurrencyCode::Rub,
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
@@ -5379,6 +5409,81 @@ mod tests {
             "сценариев должно быть больше одного, иначе тест ничего не доказывает"
         );
         assert_eq!(непринятые(&report).len(), 1);
+    }
+
+    #[test]
+    fn a_coupon_whose_waiting_window_is_still_running_is_not_reported_as_missing() {
+        // Деньги идут по депозитарной цепочке до трёх недель, и всё это
+        // время отсутствие факта ничего не доказывает. Граница: +20
+        // дней — молчание, +21 — тревога.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let events = журнал_с_пропущенным_купоном(account, instrument);
+
+        let ещё_идёт = отчёт_сверки_на(
+            &[account],
+            instrument,
+            &events,
+            &["1000"],
+            &schedule,
+            date!(2026 - 07 - 05),
+        );
+        // Поток построен, значит сверка до плана дошла и промолчала
+        // по существу, а не из-за отказа построения.
+        assert!(matches!(
+            ещё_идёт.bond_metrics[0].scenarios[0].prospective.metrics,
+            Computed::Value(_)
+        ));
+        assert!(непринятые(&ещё_идёт).is_empty());
+        assert!(!содержит(&ещё_идёт, |issue| matches!(
+            issue,
+            MaterialIssue::ScheduledPostingUnverifiable { .. }
+        )));
+
+        let истёк = отчёт_сверки_на(
+            &[account],
+            instrument,
+            &events,
+            &["1000"],
+            &schedule,
+            date!(2026 - 07 - 06),
+        );
+        assert_eq!(непринятые(&истёк).len(), 1, "проблемы: {:?}", непринятые(&истёк));
+    }
+
+    #[test]
+    fn a_payment_whose_waiting_window_is_still_running_is_not_a_reason_to_call_the_report_unverifiable() {
+        // Выплата, срок которой ещё идёт, исключается из проверки
+        // целиком: она не повод ни для тревоги, ни для причины
+        // недоказуемости. Здесь её дата раньше первого события журнала
+        // — прежде это давало `HistoryStartsAfterSchedule`.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[date!(2026 - 08 - 20), date!(2026 - 12 - 15)],
+            date!(2026 - 12 - 15),
+        );
+        let events = vec![восстановленная_позиция(
+            account,
+            instrument,
+            date!(2026 - 08 - 22),
+            date!(2021 - 05 - 01),
+        )];
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        assert!(непринятые(&report).is_empty());
+        assert!(!содержит(&report, |issue| matches!(
+            issue,
+            MaterialIssue::ScheduledPostingUnverifiable { .. }
+        )));
     }
 
     #[test]

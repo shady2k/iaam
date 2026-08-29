@@ -194,6 +194,25 @@ impl InstrumentLots {
         self.income_kind_unknown
     }
 
+    /// Самая ранняя дата приобретения среди текущих партий.
+    ///
+    /// `None`, если есть количество, восстановленное без стоимости,
+    /// либо хоть у одной партии даты нет: границу владения тогда
+    /// провести нечем, а провести её приблизительно значило бы либо
+    /// выдумать дефект, либо скрыть настоящий.
+    #[must_use]
+    pub fn earliest_acquired(&self) -> Option<TradeDate> {
+        if !self.unpriced.0.is_zero() {
+            return None;
+        }
+        self.lots
+            .iter()
+            .map(|lot| lot.acquired)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()
+    }
+
     /// Известная выплата, которую нельзя приписать документированному лоту.
     #[must_use]
     pub const fn unallocated_income(&self) -> Option<Money> {
@@ -1137,6 +1156,60 @@ mod tests {
 
     fn remaining_principal(entry: &InstrumentLots) -> Option<PerUnitAmount> {
         entry.lots().first()?.principal.remaining_per_unit()
+    }
+
+    fn лот_с_датой(instrument: InstrumentId, acquired: Option<Date>) -> Lot {
+        Lot {
+            id: LotId::new_random(),
+            instrument,
+            acquired: acquired.map(TradeDate),
+            quantity: qty(10),
+            cost_basis: rub(100_000),
+            acquisition_basis: Some(rub(100_000)),
+            accrued_interest_paid: None,
+            received_to_date: None,
+            principal: PrincipalState::Unknown,
+        }
+    }
+
+    #[test]
+    fn граница_владения_берёт_самую_раннюю_дату_приобретения() {
+        let instrument = InstrumentId::new_random();
+        let mut entry = InstrumentLots::default();
+        entry.lots = vec![
+            лот_с_датой(instrument, Some(date!(2025 - 07 - 01))),
+            лот_с_датой(instrument, Some(date!(2024 - 03 - 01))),
+        ];
+
+        assert_eq!(
+            entry.earliest_acquired(),
+            Some(TradeDate(date!(2024 - 03 - 01)))
+        );
+    }
+
+    #[test]
+    fn партия_без_даты_приобретения_не_даёт_провести_границу_владения() {
+        let instrument = InstrumentId::new_random();
+        let mut entry = InstrumentLots::default();
+        entry.lots = vec![
+            лот_с_датой(instrument, Some(date!(2024 - 03 - 01))),
+            лот_с_датой(instrument, None),
+        ];
+
+        assert_eq!(entry.earliest_acquired(), None);
+    }
+
+    #[test]
+    fn восстановленное_количество_не_даёт_провести_границу_владения() {
+        // Оно приобретено раньше всего, что система видела, и даты у
+        // него нет: любая граница по оставшимся партиям была бы позже
+        // настоящей и скрыла бы пропуск.
+        let instrument = InstrumentId::new_random();
+        let mut entry = InstrumentLots::default();
+        entry.unpriced = qty(5);
+        entry.lots = vec![лот_с_датой(instrument, Some(date!(2024 - 03 - 01)))];
+
+        assert_eq!(entry.earliest_acquired(), None);
     }
 
     fn known(original: &str, remaining: &str) -> PrincipalState {

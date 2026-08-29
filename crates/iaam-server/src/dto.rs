@@ -1513,6 +1513,14 @@ fn uncovered_reason(value: &iaam_core::returns::UncoveredReason) -> &'static str
     }
 }
 
+fn posting_kind(value: iaam_core::rules::PostingKind) -> &'static str {
+    match value {
+        iaam_core::rules::PostingKind::Coupon => "coupon",
+        iaam_core::rules::PostingKind::PrincipalReturn => "principal_return",
+        iaam_core::rules::PostingKind::OfferSettlement => "offer_settlement",
+    }
+}
+
 fn issue(value: &MaterialIssue) -> String {
     match value {
         MaterialIssue::RestoredWithoutBasis { account } => format!(
@@ -1543,10 +1551,27 @@ fn issue(value: &MaterialIssue) -> String {
             "заявка оферты {} ссылается на неизвестное окно",
             submission.inner()
         ),
-        MaterialIssue::ScheduledPostingNotReceived { instrument, date } => format!(
-            "ожидаемая выплата инструмента {} на {} не подтверждена",
+        MaterialIssue::ScheduledPostingNotReceived {
+            account,
+            instrument,
+            date,
+            kind,
+        } => format!(
+            "выплата {} инструмента {} на счёте {} за {} не подтверждена",
+            posting_kind(*kind),
             instrument.inner(),
+            account.inner(),
             date
+        ),
+        MaterialIssue::ScheduledPostingUnverifiable {
+            account,
+            instrument,
+            reason,
+        } => format!(
+            "сверку выплат инструмента {} на счёте {} провести нечем: {}",
+            instrument.inner(),
+            account.inner(),
+            reason.code()
         ),
         MaterialIssue::AccruedInterestMismatch {
             instrument,

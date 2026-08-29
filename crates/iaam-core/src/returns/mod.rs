@@ -43,8 +43,8 @@ use crate::rules::lot_disposal::RuleId;
 use crate::rules::quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 use crate::rules::{
     AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
-    CashflowInput, CashflowProjectionVersion, SourcePriorityVersion, ValuationPolicyV1,
-    ValuationRule,
+    CashflowInput, CashflowPlan, CashflowProjectionVersion, PostingKind, PostingMatchV1,
+    PostingMatchVersion, SourcePriorityVersion, ValuationPolicyV1, ValuationRule,
 };
 use crate::valuation::{
     FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
@@ -257,10 +257,28 @@ pub enum MaterialIssue {
     OfferWindowUnresolved {
         submission: crate::event::offer::OfferSubmissionId,
     },
-    /// Запланированная выплата не подтверждена датированным фактом дохода.
+    /// Запланированная выплата не подтверждена датированным фактом
+    /// дохода.
+    ///
+    /// Счёт обязателен: одна бумага на двух счетах иначе даёт две
+    /// неразличимые проблемы. Вид выплаты обязателен: «не пришёл купон»
+    /// и «не пришёл возврат номинала» требуют от владельца разных
+    /// действий и ищутся в разных событиях журнала.
     ScheduledPostingNotReceived {
+        account: AccountId,
         instrument: InstrumentId,
         date: Date,
+        kind: PostingKind,
+    },
+    /// Сверку запланированных выплат провести нечем.
+    ///
+    /// Отдельный член, а не молчание: молчание выглядело бы как
+    /// «проверили, всё пришло», и воспроизвело бы ровно тот дефект,
+    /// который эта сверка устраняет.
+    ScheduledPostingUnverifiable {
+        account: AccountId,
+        instrument: InstrumentId,
+        reason: UnverifiableReason,
     },
     /// Расчётный и наблюдённый НКД разошлись больше допуска.
     AccruedInterestMismatch {
@@ -294,6 +312,14 @@ impl MaterialIssue {
     pub const fn is_defect(&self) -> bool {
         match self {
             Self::HistoryStartsAt { .. } | Self::NoIndependentSource { .. } => false,
+            // Горизонт журнала зеркалит `HistoryStartsAt`: это факт о
+            // периоде, а не дефект. Владелец, чей журнал начинается
+            // позже выпуска бумаги, иначе получил бы вечный `Incomplete`
+            // без способа его убрать. Остальные три причины чинятся
+            // дозагрузкой фактов и потому дефект.
+            Self::ScheduledPostingUnverifiable { reason, .. } => {
+                !matches!(reason, UnverifiableReason::HistoryStartsAfterSchedule)
+            }
             Self::AccruedInterestMismatch { .. }
             | Self::RestoredWithoutBasis { .. }
             | Self::NegativeCash { .. }
@@ -301,6 +327,34 @@ impl MaterialIssue {
             | Self::UnsupportedFinancing { .. }
             | Self::OfferWindowUnresolved { .. }
             | Self::ScheduledPostingNotReceived { .. } => true,
+        }
+    }
+}
+
+/// Почему сверку запланированных выплат провести нечем (§6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnverifiableReason {
+    /// Границу владения провести нечем: у партии нет даты приобретения
+    /// либо есть количество, восстановленное без стоимости.
+    AcquisitionDateUnknown,
+    /// По паре есть выплата, вид которой не установлен: на график её
+    /// не положить.
+    IncomeKindUnknown,
+    /// По паре есть выплата без даты зачисления и без даты выплаты.
+    PaymentDateUnknown,
+    /// Выплата прошла границу владения, но её дата раньше первого
+    /// события журнала: фактов под неё нет и быть не может.
+    HistoryStartsAfterSchedule,
+}
+
+impl UnverifiableReason {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::AcquisitionDateUnknown => "acquisition_date_unknown",
+            Self::IncomeKindUnknown => "income_kind_unknown",
+            Self::PaymentDateUnknown => "payment_date_unknown",
+            Self::HistoryStartsAfterSchedule => "history_starts_after_schedule",
         }
     }
 }
@@ -472,6 +526,8 @@ pub struct AppliedRules {
     pub quotation_rule: QuotationRuleVersion,
     /// Версия правила расчёта НКД.
     pub accrued_interest_rule: AccruedInterestRuleVersion,
+    /// Версия правила сверки запланированных выплат с журналом.
+    pub posting_match: PostingMatchVersion,
 }
 
 /// Координата знания, зафиксированная отчётом (§4).
@@ -745,6 +801,10 @@ struct SelectedInputs<'a> {
     offer_book: &'a OfferBook,
     cashflow_projection: CashflowProjectionVersion,
     expense_policy: u32,
+    /// Версия правила сверки: изменение входа отчёта обязано менять
+    /// отпечаток, иначе два несравнимых ответа выглядели бы
+    /// воспроизведением одного.
+    posting_match: PostingMatchVersion,
 }
 
 #[cfg(test)]
@@ -870,9 +930,20 @@ fn inputs_hash_with_bond_inputs(
         offer_book,
         cashflow_projection: cashflow_projection_rule().0,
         expense_policy: expense_policy_rule().0,
+        posting_match: posting_match_rule().0,
     };
+    hash_selected(&selected)
+}
+
+/// Отпечаток отобранных входов.
+///
+/// Вынесен из [`inputs_hash_with_bond_inputs`], чтобы тест мог менять
+/// одно поле входа и проверять, что отпечаток на это отзывается:
+/// собрать `SelectedInputs` руками дешевле, чем воспроизводить целое
+/// состояние ради одной версии правила.
+fn hash_selected(selected: &SelectedInputs<'_>) -> String {
     let mut encoded = Vec::new();
-    if ciborium::into_writer(&selected, &mut encoded).is_err() {
+    if ciborium::into_writer(selected, &mut encoded).is_err() {
         encoded.extend_from_slice(b"serialization_error");
     }
 
@@ -904,6 +975,11 @@ pub(crate) const fn cashflow_projection_rule() -> (
         CashflowProjectionVersion(1),
         crate::rules::CashflowProjectionV1,
     )
+}
+
+/// Правило сверки запланированных выплат с датированными фактами.
+pub(crate) const fn posting_match_rule() -> (PostingMatchVersion, PostingMatchV1) {
+    (PostingMatchVersion(1), PostingMatchV1::new())
 }
 
 /// Версия политики расходов, применяемой до появления налогового контура.
@@ -1209,10 +1285,12 @@ pub fn returns_report_with_bond_inputs(
     let rate = xirr::rate(&series, &terminal, request);
     let bond_attributes = bond_position_attributes(&positions, request, &accrued_interest_rule);
     let mut data_quality = data_quality(state, request, &positions);
-    let bond_metrics = bond_position_metrics(state, request, &positions, offer_book);
+    let bonds = bond_position_metrics(state, request, &positions, offer_book);
+    let bond_metrics = bonds.metrics;
     for issue in unresolved_offer_issues(request, offer_book) {
         data_quality.material_issues.push(issue);
     }
+    data_quality.material_issues.extend(bonds.issues);
     if data_quality
         .material_issues
         .iter()
@@ -1257,6 +1335,7 @@ pub fn returns_report_with_bond_inputs(
             accrued_interest_rule: accrued_interest_rule_version,
             cashflow_projection: cashflow_projection_version,
             expense_policy: expense_policy_version,
+            posting_match: posting_match_rule().0,
         },
         bond_attributes,
         data_quality,
@@ -1374,6 +1453,36 @@ struct BondScenarioInputs<'a> {
     accrued_rule: &'a dyn AccruedInterestRule,
 }
 
+/// Поток одного сценария. Вынесен из [`bond_scenario`], потому что
+/// сверка прошлого строит его отдельно и обязана строить тем же
+/// правилом: иначе `past` у сверки и у сценария разошлись бы.
+fn scenario_plan(
+    inputs: &BondScenarioInputs<'_>,
+    choice: &OfferChoice,
+) -> Result<CashflowPlan, NotComputable> {
+    let BondScenarioInputs {
+        assessment,
+        request,
+        schedule,
+        lots,
+        cashflow,
+        accrued_rule: _,
+    } = *inputs;
+    let principal = lots
+        .map(|lots| zero_reinvestment::common_principal_state(lots, assessment.instrument))
+        .unwrap_or(Ok(crate::rules::lot_disposal::PrincipalState::Unknown))?;
+    cashflow
+        .future_postings(&CashflowInput {
+            schedule,
+            principal,
+            quantity: assessment.quantity,
+            choice,
+            as_of: request.as_of,
+            report_currency: request.report_currency,
+        })
+        .map_err(|error| cashflow_reason(error, assessment.instrument))
+}
+
 fn bond_scenario(
     inputs: &BondScenarioInputs<'_>,
     choice: OfferChoice,
@@ -1383,25 +1492,11 @@ fn bond_scenario(
         request,
         schedule,
         lots,
-        cashflow,
+        cashflow: _,
         accrued_rule,
     } = *inputs;
     let c0 = bond_c0(assessment, request, accrued_rule);
-    let principal = lots
-        .map(|lots| zero_reinvestment::common_principal_state(lots, assessment.instrument))
-        .unwrap_or(Ok(crate::rules::lot_disposal::PrincipalState::Unknown));
-    let plan = principal.and_then(|principal| {
-        cashflow
-            .future_postings(&CashflowInput {
-                schedule,
-                principal,
-                quantity: assessment.quantity,
-                choice: &choice,
-                as_of: request.as_of,
-                report_currency: request.report_currency,
-            })
-            .map_err(|error| cashflow_reason(error, assessment.instrument))
-    });
+    let plan = scenario_plan(inputs, &choice);
     match plan {
         Ok(plan) => {
             let prospective =
@@ -1449,15 +1544,103 @@ fn bond_scenario(
     }
 }
 
+/// Результат прохода по облигационным позициям.
+///
+/// Метрики и проблемы сверки рождаются в одной итерации намеренно:
+/// сценариев у позиции несколько, а сверка обязана пройти ровно один
+/// раз на пару (счёт, инструмент). Отдельный проход по тем же позициям
+/// разошёлся бы с этим по условиям отбора.
+struct BondPositionOutcome {
+    metrics: Vec<BondPositionMetrics>,
+    issues: Vec<MaterialIssue>,
+}
+
+/// Сверяет запланированные выплаты пары с датированными фактами.
+///
+/// Границу владения накладывает сверка, а не правило потока: правило
+/// строит поток от графика выпуска и истории владения не знает.
+///
+/// Порядок причин не произволен. Первым проверяется разрыв в фактах:
+/// он ломает ту сторону сравнения, без которой ни одна граница
+/// владения не сделает вывод доказуемым. Отсутствие даты приобретения
+/// ломает только отбор проверяемых выплат, то есть меньшую часть, и
+/// потому уступает.
+fn reconcile_past_postings(
+    key: LotKey,
+    plan: &CashflowPlan,
+    lots: Option<&crate::projection::lots::InstrumentLots>,
+    income: &crate::projection::income::IncomeLedger,
+    history_starts: Option<Date>,
+    rule: &PostingMatchV1,
+) -> Vec<MaterialIssue> {
+    let unverifiable = |reason| {
+        vec![MaterialIssue::ScheduledPostingUnverifiable {
+            account: key.account,
+            instrument: key.instrument,
+            reason,
+        }]
+    };
+
+    if let Some(gap) = income.gap(&key) {
+        return unverifiable(match gap {
+            crate::projection::income::IncomeGap::IncomeKindUnknown => {
+                UnverifiableReason::IncomeKindUnknown
+            }
+            crate::projection::income::IncomeGap::PaymentDateUnknown => {
+                UnverifiableReason::PaymentDateUnknown
+            }
+        });
+    }
+
+    let Some(acquired) =
+        lots.and_then(crate::projection::lots::InstrumentLots::earliest_acquired)
+    else {
+        return unverifiable(UnverifiableReason::AcquisitionDateUnknown);
+    };
+
+    // Купон за период, когда бумаги ещё не было, владельцу не
+    // причитается: требовать под него факт значит выдумать дефект.
+    let owned: Vec<_> = plan
+        .past
+        .iter()
+        .copied()
+        .filter(|posting| posting.date >= acquired.0)
+        .collect();
+
+    // Выплата, прошедшая границу владения, но датированная раньше
+    // первого события журнала: фактов под неё нет и быть не может.
+    // Граница владения этого случая не поглощает, потому что `acquired`
+    // берётся из заявленной даты сделки, а не из положения события в
+    // журнале, — `OpeningPosition` именно так и записывается.
+    if let Some(start) = history_starts
+        && owned.iter().any(|posting| posting.date < start)
+    {
+        return unverifiable(UnverifiableReason::HistoryStartsAfterSchedule);
+    }
+
+    rule.unreceived(&owned, income.postings(&key))
+        .into_iter()
+        .map(|posting| MaterialIssue::ScheduledPostingNotReceived {
+            account: key.account,
+            instrument: key.instrument,
+            date: posting.date,
+            kind: posting.kind,
+        })
+        .collect()
+}
+
 fn bond_position_metrics(
     state: &LedgerState,
     request: &ReturnsRequest<'_>,
     positions: &[PositionValue],
     offer_book: &OfferBook,
-) -> Vec<BondPositionMetrics> {
+) -> BondPositionOutcome {
     let (_, cashflow) = cashflow_projection_rule();
     let (_, accrued_rule) = accrued_interest_rule();
-    positions
+    let (_, posting_match) = posting_match_rule();
+    let history_starts = state.coverage().first_event();
+    let mut issues = Vec::new();
+    let metrics = positions
         .iter()
         .filter_map(|position| {
             let assessment = &position.assessment;
@@ -1465,10 +1648,11 @@ fn bond_position_metrics(
             if !request.contour.contains(assessment.account) || assessment.quantity.0.is_zero() {
                 return None;
             }
-            let lots = state.book().entry(&LotKey {
+            let key = LotKey {
                 account: assessment.account,
                 instrument: assessment.instrument,
-            });
+            };
+            let lots = state.book().entry(&key);
             let unresolved: std::collections::BTreeSet<_> =
                 unresolved_submissions(offer_book, schedule)
                     .into_iter()
@@ -1478,25 +1662,39 @@ fn bond_position_metrics(
                             .is_some_and(|state| state.instrument == assessment.instrument)
                     })
                     .collect();
+            let inputs = BondScenarioInputs {
+                assessment,
+                request,
+                schedule,
+                lots,
+                cashflow: &cashflow,
+                accrued_rule: &accrued_rule,
+            };
+            // Прошлое у сценариев общее, различаются они будущим,
+            // поэтому сверка идёт по потоку удержания до погашения и
+            // ровно один раз. Провести её внутри сценария значило бы
+            // задвоить одну и ту же проблему по числу окон оферты.
+            //
+            // Непостроенный поток сверку молча пропускает: причина
+            // отказа уже названа в самом сценарии, а выдумывать под неё
+            // пятую причину недоказуемости спека не даёт.
+            if let Ok(plan) = scenario_plan(&inputs, &OfferChoice::HoldToMaturity) {
+                issues.extend(reconcile_past_postings(
+                    key,
+                    &plan,
+                    lots,
+                    state.income(),
+                    history_starts,
+                    &posting_match,
+                ));
+            }
             let scenarios = available_choices(schedule, request.as_of)
                 .into_iter()
                 .filter(|choice| match choice {
                     OfferChoice::HoldToMaturity => true,
                     OfferChoice::ExerciseAtOffer { .. } => unresolved.is_empty(),
                 })
-                .map(|choice| {
-                    bond_scenario(
-                        &BondScenarioInputs {
-                            assessment,
-                            request,
-                            schedule,
-                            lots,
-                            cashflow: &cashflow,
-                            accrued_rule: &accrued_rule,
-                        },
-                        choice,
-                    )
-                })
+                .map(|choice| bond_scenario(&inputs, choice))
                 .collect();
             Some(BondPositionMetrics {
                 account: assessment.account,
@@ -1505,7 +1703,8 @@ fn bond_position_metrics(
                 scenarios,
             })
         })
-        .collect()
+        .collect();
+    BondPositionOutcome { metrics, issues }
 }
 
 fn unresolved_offer_issues(
@@ -4461,9 +4660,12 @@ mod tests {
         }];
         let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
 
-        let metrics = bond_position_metrics(&state, &request, &positions, &OfferBook::default());
+        let outcome = bond_position_metrics(&state, &request, &positions, &OfferBook::default());
 
-        assert!(metrics.is_empty());
+        assert!(outcome.metrics.is_empty());
+        // Полностью выбывшая позиция и сверки не получает: спрашивать
+        // с неё выплаты по графику не за что.
+        assert!(outcome.issues.is_empty());
     }
 
     #[test]
@@ -4637,5 +4839,634 @@ mod tests {
         let first_hash = report_for_schedules(&state, &inputs).inputs_hash;
         let second_hash = report_for_schedules(&state, &inputs).inputs_hash;
         assert_eq!(first_hash, second_hash);
+    }
+
+    /// График облигации с перечисленными купонными датами и одним
+    /// погашением.
+    ///
+    /// Полнота, флаги дефолта и валютные роли заданы явно: без них
+    /// правило потока отказывается строить план, `past` не появляется
+    /// вовсе, и тест проверял бы отказ построения, а не сверку.
+    fn график_купонов(coupons: &[Date], repayment: Date) -> BondSchedule {
+        график_с_офертами(coupons, repayment, &[])
+    }
+
+    fn график_с_офертами(
+        coupons: &[Date],
+        repayment: Date,
+        offers: &[Date],
+    ) -> BondSchedule {
+        BondSchedule {
+            // Период начинается предыдущей выплатой: замкнутая цепь
+            // нужна не сверке, а НКД — без покрытия даты отчёта отказ
+            // приходит из расчёта НКД, и тест перестал бы отличать
+            // молчание сверки от несостоявшегося сценария.
+            periods: coupons
+                .iter()
+                .enumerate()
+                .map(|(index, payment_date)| crate::bond::AccrualPeriod {
+                    period_start: if index == 0 {
+                        payment_date.saturating_sub(time::Duration::days(180))
+                    } else {
+                        coupons[index - 1]
+                    },
+                    accrual_end: *payment_date,
+                    payment_date: *payment_date,
+                    coupon_per_unit: Some(PerUnitAmount::new(dec("50"), CurrencyCode::Rub)),
+                })
+                .collect(),
+            principal_returns: vec![crate::bond::PrincipalReturn {
+                repayment_date: repayment,
+                share_percent: dec("100"),
+            }],
+            offer_windows: offers
+                .iter()
+                .map(|execution_date| crate::bond::OfferWindowTerms {
+                    window: crate::bond::OfferWindowId::derive(
+                        InstrumentId::new_random(),
+                        *execution_date,
+                    ),
+                    right: crate::bond::OfferRight::HolderPut,
+                    execution_date: *execution_date,
+                    submission_start: None,
+                    submission_end: None,
+                    price_percent: Some(dec("100")),
+                })
+                .collect(),
+            completeness: crate::bond::ScheduleCompleteness::Validated,
+            default_flags: Some(crate::bond::DefaultFlags {
+                declared: false,
+                technical: false,
+            }),
+            currency_roles: Some(crate::instrument::CurrencyRoles::uniform(CurrencyCode::Rub)),
+        }
+    }
+
+    fn пополнение(account: AccountId, day: Date) -> crate::event::Event {
+        let amount = Money::new(PostedMinor::new(1_000_000), CurrencyCode::Rub);
+        event_with(
+            account,
+            day,
+            1,
+            EventKind::CashIn { amount },
+            vec![Leg::cash(account, amount)],
+        )
+    }
+
+    /// Покупка облигации. Дата сделки задаётся отдельным полем, потому
+    /// что именно её книга лотов кладёт в `Lot.acquired`, а конверт
+    /// `event_with` заполняет только дату зачисления денег. `None`
+    /// воспроизводит обычную покупку без даты сделки: схема её
+    /// допускает (§4.9), и счёт при этом не становится восстановленным.
+    fn покупка_облигации(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        trade: Option<Date>,
+    ) -> crate::event::Event {
+        let quantity = Quantity(dec("10"));
+        let gross = Money::new(PostedMinor::new(100_000), CurrencyCode::Rub);
+        let settlement = Money::new(PostedMinor::new(-100_000), CurrencyCode::Rub);
+        let mut event = event_with(
+            account,
+            day,
+            2,
+            EventKind::Trade {
+                side: crate::event::kind::TradeSide::Buy,
+                instrument,
+                quantity,
+                gross,
+                fee: None,
+                accrued_interest: None,
+            },
+            vec![
+                Leg::cash(account, settlement),
+                Leg::security(account, CustodyId::new_random(), instrument, quantity),
+            ],
+        );
+        event.dates.trade = trade.map(crate::dates::TradeDate);
+        event
+    }
+
+    /// Восстановленная позиция с заявленной датой сделки пятилетней
+    /// давности. Дата зачисления остаётся днём записи, поэтому журнал
+    /// начинается позже, чем куплена бумага, — ровно тот случай,
+    /// который обязан отличаться от пропущенной выплаты.
+    fn восстановленная_позиция(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        trade: Date,
+    ) -> crate::event::Event {
+        let quantity = Quantity(dec("10"));
+        let mut event = event_with(
+            account,
+            day,
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity,
+                cost_basis: Some(Money::new(PostedMinor::new(100_000), CurrencyCode::Rub)),
+                assertions: Default::default(),
+            },
+            vec![Leg::security(
+                account,
+                CustodyId::new_random(),
+                instrument,
+                quantity,
+            )],
+        );
+        event.dates.trade = Some(crate::dates::TradeDate(trade));
+        event
+    }
+
+    fn купонный_факт(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        sequence: u32,
+    ) -> crate::event::Event {
+        let amount = Money::new(PostedMinor::new(50_000), CurrencyCode::Rub);
+        event_with(
+            account,
+            day,
+            sequence,
+            EventKind::Income {
+                instrument: Some(instrument),
+                gross: amount,
+                kind: Some(crate::event::kind::IncomeKind::Coupon),
+            },
+            vec![Leg::cash(account, amount)],
+        )
+    }
+
+    /// Отчёт по журналу облигации.
+    ///
+    /// Номинал проставляется лотам отдельно: событие покупки его не
+    /// знает, а без него правило потока отказывается строить план.
+    /// Позиция получает биржевую цену, потому что непокрытая позиция
+    /// сама делает отчёт неполным и скрыла бы вклад сверки в статус.
+    fn отчёт_сверки(
+        accounts: &[AccountId],
+        instrument: InstrumentId,
+        events: &[crate::event::Event],
+        faces: &[&str],
+        schedule: &BondSchedule,
+    ) -> ReturnsReport {
+        let contour = ContourDefinition::new(
+            ContourId::new_random(),
+            ContourVersion(1),
+            accounts.to_vec(),
+        );
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let state = project(events, &context)
+            .expect("проекция журнала облигации")
+            .snapshot()
+            .state()
+            .clone();
+        let state = состояние_с_номиналами(state, faces);
+        let candidate = рыночная_цена(instrument, date!(2026 - 08 - 25));
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let schedules = BTreeMap::from([(instrument, schedule.clone())]);
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: std::slice::from_ref(&candidate),
+            bond_schedules: &schedules,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+        };
+        returns_report(&state, &request)
+    }
+
+    fn содержит(report: &ReturnsReport, predicate: impl Fn(&MaterialIssue) -> bool) -> bool {
+        report
+            .data_quality
+            .material_issues
+            .iter()
+            .any(|issue| predicate(issue))
+    }
+
+    fn непринятые(report: &ReturnsReport) -> Vec<&MaterialIssue> {
+        report
+            .data_quality
+            .material_issues
+            .iter()
+            .filter(|issue| matches!(issue, MaterialIssue::ScheduledPostingNotReceived { .. }))
+            .collect()
+    }
+
+    /// Журнал с одной пропущенной выплатой: купон 15.03 подтверждён
+    /// фактом 16.03, купон 15.06 не подтверждён ничем.
+    fn журнал_с_пропущенным_купоном(
+        account: AccountId,
+        instrument: InstrumentId,
+    ) -> Vec<crate::event::Event> {
+        vec![
+            пополнение(account, date!(2026 - 01 - 05)),
+            покупка_облигации(
+                account,
+                instrument,
+                date!(2026 - 01 - 10),
+                Some(date!(2026 - 01 - 10)),
+            ),
+            купонный_факт(account, instrument, date!(2026 - 03 - 16), 3),
+        ]
+    }
+
+    #[test]
+    fn a_missing_coupon_is_named_with_its_account_instrument_date_and_kind() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let report = отчёт_сверки(
+            &[account],
+            instrument,
+            &журнал_с_пропущенным_купоном(account, instrument),
+            &["1000"],
+            &schedule,
+        );
+
+        let issues = непринятые(&report);
+        assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+        assert!(matches!(
+            issues[0],
+            MaterialIssue::ScheduledPostingNotReceived {
+                account: issue_account,
+                instrument: issue_instrument,
+                date,
+                kind: PostingKind::Coupon,
+            } if *issue_account == account
+                && *issue_instrument == instrument
+                && *date == date!(2026 - 06 - 15)
+        ));
+    }
+
+    #[test]
+    fn a_coupon_scheduled_before_the_bond_was_bought_is_not_owed_to_anyone() {
+        // `CashflowPlan.past` строится от графика выпуска и истории
+        // владения не знает. Границу накладывает сверка.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let events = vec![
+            пополнение(account, date!(2026 - 07 - 01)),
+            покупка_облигации(
+                account,
+                instrument,
+                date!(2026 - 07 - 05),
+                Some(date!(2026 - 07 - 05)),
+            ),
+        ];
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        // Поток построен, значит сверка до плана дошла и промолчала по
+        // существу, а не из-за отказа построения.
+        assert!(matches!(
+            report.bond_metrics[0].scenarios[0].prospective.metrics,
+            Computed::Value(_)
+        ));
+        assert!(непринятые(&report).is_empty());
+        assert!(!содержит(&report, |issue| matches!(
+            issue,
+            MaterialIssue::ScheduledPostingUnverifiable { .. }
+        )));
+    }
+
+    #[test]
+    fn a_restored_history_reports_that_it_cannot_verify_rather_than_crying_wolf() {
+        // Заявленная дата сделки пятилетней давности проводит границу
+        // владения до начала журнала: купоны 2021–2025 её проходят,
+        // но фактов под них в журнале нет и быть не может.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2021 - 06 - 15),
+                date!(2022 - 06 - 15),
+                date!(2023 - 06 - 15),
+                date!(2024 - 06 - 15),
+                date!(2025 - 06 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let events = vec![восстановленная_позиция(
+            account,
+            instrument,
+            date!(2026 - 01 - 01),
+            date!(2021 - 05 - 01),
+        )];
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        assert!(непринятые(&report).is_empty());
+        assert!(содержит(&report, |issue| matches!(
+            issue,
+            MaterialIssue::ScheduledPostingUnverifiable {
+                reason: UnverifiableReason::HistoryStartsAfterSchedule,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_purchase_without_a_trade_date_leaves_the_ownership_bound_undrawable() {
+        // `Lot.acquired` — `Option<TradeDate>`, и схема отсутствие даты
+        // допускает (§4.9). Такая покупка счёт восстановленным НЕ метит,
+        // поэтому без нового варианта отчёт остался бы `Complete` при
+        // недоказанной сверке.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let events = vec![
+            пополнение(account, date!(2026 - 01 - 05)),
+            покупка_облигации(account, instrument, date!(2026 - 01 - 10), None),
+        ];
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        assert!(содержит(&report, |issue| matches!(
+            issue,
+            MaterialIssue::ScheduledPostingUnverifiable {
+                reason: UnverifiableReason::AcquisitionDateUnknown,
+                ..
+            }
+        )));
+        assert!(!содержит(&report, |issue| matches!(
+            issue,
+            MaterialIssue::RestoredWithoutBasis { .. }
+        )));
+        assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
+        // Статус неполон именно из-за сверки: других дефектов в отчёте
+        // нет, иначе тест проходил бы и без нового варианта.
+        let другие: Vec<_> = report
+            .data_quality
+            .material_issues
+            .iter()
+            .filter(|issue| {
+                issue.is_defect()
+                    && !matches!(issue, MaterialIssue::ScheduledPostingUnverifiable { .. })
+            })
+            .collect();
+        assert!(другие.is_empty(), "посторонние дефекты: {другие:?}");
+    }
+
+    #[test]
+    fn the_history_horizon_is_reported_but_does_not_make_the_answer_incomplete() {
+        // Зеркалит `HistoryStartsAt`: факт о периоде, а не дефект.
+        assert!(!MaterialIssue::ScheduledPostingUnverifiable {
+            account: AccountId::new_random(),
+            instrument: InstrumentId::new_random(),
+            reason: UnverifiableReason::HistoryStartsAfterSchedule,
+        }
+        .is_defect());
+    }
+
+    #[test]
+    fn the_other_unverifiable_reasons_are_defects_because_loading_facts_fixes_them() {
+        for reason in [
+            UnverifiableReason::AcquisitionDateUnknown,
+            UnverifiableReason::IncomeKindUnknown,
+            UnverifiableReason::PaymentDateUnknown,
+        ] {
+            assert!(
+                MaterialIssue::ScheduledPostingUnverifiable {
+                    account: AccountId::new_random(),
+                    instrument: InstrumentId::new_random(),
+                    reason,
+                }
+                .is_defect(),
+                "{reason:?} чинится дозагрузкой фактов и потому дефект"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scheduled_posting_not_received_is_a_defect() {
+        assert!(
+            MaterialIssue::ScheduledPostingNotReceived {
+                account: AccountId::new_random(),
+                instrument: InstrumentId::new_random(),
+                date: date!(2026 - 06 - 15),
+                kind: PostingKind::Coupon,
+            }
+            .is_defect()
+        );
+    }
+
+    #[test]
+    fn every_unverifiable_reason_has_a_machine_readable_code() {
+        let codes: std::collections::BTreeSet<_> = [
+            UnverifiableReason::AcquisitionDateUnknown,
+            UnverifiableReason::IncomeKindUnknown,
+            UnverifiableReason::PaymentDateUnknown,
+            UnverifiableReason::HistoryStartsAfterSchedule,
+        ]
+        .into_iter()
+        .map(UnverifiableReason::code)
+        .collect();
+
+        assert_eq!(codes.len(), 4);
+    }
+
+    #[test]
+    fn an_income_of_unknown_kind_is_reported_before_the_ownership_bound() {
+        // Неизвестный вид ломает сторону фактов: сверять нечем при любой
+        // границе владения, поэтому причина именно эта, а не отсутствие
+        // даты сделки, которого здесь нет.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let amount = Money::new(PostedMinor::new(50_000), CurrencyCode::Rub);
+        let events = vec![
+            пополнение(account, date!(2026 - 01 - 05)),
+            покупка_облигации(
+                account,
+                instrument,
+                date!(2026 - 01 - 10),
+                Some(date!(2026 - 01 - 10)),
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 16),
+                3,
+                EventKind::Income {
+                    instrument: Some(instrument),
+                    gross: amount,
+                    kind: None,
+                },
+                vec![Leg::cash(account, amount)],
+            ),
+        ];
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        assert!(непринятые(&report).is_empty());
+        assert!(содержит(&report, |issue| matches!(
+            issue,
+            MaterialIssue::ScheduledPostingUnverifiable {
+                reason: UnverifiableReason::IncomeKindUnknown,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_bond_with_several_offer_windows_reports_one_miss_once() {
+        // `bond_scenario` вызывается по разу на сценарий, а прошлое у
+        // сценариев общее: сверка внутри сценария задвоила бы проблему.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_с_офертами(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+            &[date!(2026 - 09 - 15), date!(2026 - 10 - 15)],
+        );
+        let report = отчёт_сверки(
+            &[account],
+            instrument,
+            &журнал_с_пропущенным_купоном(account, instrument),
+            &["1000"],
+            &schedule,
+        );
+
+        assert_eq!(
+            report.bond_metrics[0].scenarios.len(),
+            3,
+            "сценариев должно быть больше одного, иначе тест ничего не доказывает"
+        );
+        assert_eq!(непринятые(&report).len(), 1);
+    }
+
+    #[test]
+    fn two_accounts_holding_the_same_bond_give_two_distinguishable_issues() {
+        let first = AccountId::new_random();
+        let second = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let mut events = журнал_с_пропущенным_купоном(first, instrument);
+        events.extend(журнал_с_пропущенным_купоном(second, instrument));
+        let report = отчёт_сверки(
+            &[first, second],
+            instrument,
+            &events,
+            &["1000", "1000"],
+            &schedule,
+        );
+
+        let accounts: std::collections::BTreeSet<_> = report
+            .data_quality
+            .material_issues
+            .iter()
+            .filter_map(|issue| match issue {
+                MaterialIssue::ScheduledPostingNotReceived { account, .. } => Some(*account),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(accounts, std::collections::BTreeSet::from([first, second]));
+    }
+
+    #[test]
+    fn the_report_names_the_posting_match_rule_it_applied() {
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+        let report = report_for(&state, KnowledgeCoordinate::default());
+
+        assert_eq!(
+            report.applied_rules.posting_match,
+            crate::rules::PostingMatchVersion(1)
+        );
+    }
+
+    #[test]
+    fn the_posting_match_version_reaches_the_inputs_hash() {
+        // Версия правила — вход отчёта: её смена обязана менять
+        // отпечаток, иначе два несравнимых ответа выглядели бы
+        // воспроизведением одного.
+        let contour = ContourDefinition::new(
+            ContourId(uuid::Uuid::nil()),
+            ContourVersion(1),
+            Vec::<AccountId>::new(),
+        );
+        let fx_source = FxSource::OwnerSupplied;
+        let offer_book = OfferBook::default();
+        let inputs = |posting_match| SelectedInputs {
+            coordinate: SelectedCoordinate {
+                knowledge_as_of: OffsetDateTime::UNIX_EPOCH,
+                source_priority_version: 1,
+                valuation_policy_version: 1,
+            },
+            as_of: date!(2026 - 08 - 26),
+            contour: &contour,
+            report_currency: CurrencyCode::Rub,
+            flows: Vec::new(),
+            cash: Vec::new(),
+            positions: Vec::new(),
+            fx: SelectedFx {
+                source: &fx_source,
+                rates: Vec::new(),
+            },
+            bond_schedules: &EMPTY_BOND_SCHEDULES,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+            accrued_interest_rule: accrued_interest_rule().0,
+            offer_book: &offer_book,
+            cashflow_projection: cashflow_projection_rule().0,
+            expense_policy: expense_policy_rule().0,
+            posting_match,
+        };
+
+        assert_ne!(
+            hash_selected(&inputs(crate::rules::PostingMatchVersion(1))),
+            hash_selected(&inputs(crate::rules::PostingMatchVersion(2)))
+        );
     }
 }

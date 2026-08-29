@@ -1726,6 +1726,21 @@ fn issue(value: &MaterialIssue) -> String {
             date,
             reason.code()
         ),
+        MaterialIssue::ScheduledPostingsUnverifiable {
+            account,
+            instrument,
+            kind,
+            reason,
+            count,
+            first_date,
+            last_date,
+        } => format!(
+            "сверку {count} выплат вида {} инструмента {} на счёте {} за период с {first_date} по {last_date} провести нечем: {}",
+            posting_kind(*kind),
+            instrument.inner(),
+            account.inner(),
+            reason.code()
+        ),
         MaterialIssue::AccruedInterestMismatch {
             instrument,
             computed,
@@ -2737,6 +2752,32 @@ mod tests {
         assert!(text.contains("15.17 USD"));
         assert!(text.contains("22.40 RUB"));
         assert!(text.contains("100"));
+    }
+
+    #[test]
+    fn grouped_unverifiable_postings_name_count_and_date_range() {
+        // Количество и границы периода заменяют повторяющиеся адресные
+        // строки: владелец понимает масштаб проблемы и знает, что догружать.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let text = issue(&MaterialIssue::ScheduledPostingsUnverifiable {
+            account,
+            instrument,
+            kind: PostingKind::Coupon,
+            reason: iaam_core::returns::UnverifiableReason::PaymentDateUnknown,
+            count: 5,
+            first_date: time::macros::date!(2026 - 01 - 15),
+            last_date: time::macros::date!(2026 - 05 - 15),
+        });
+
+        assert_eq!(
+            text,
+            format!(
+                "сверку 5 выплат вида coupon инструмента {} на счёте {} за период с 2026-01-15 по 2026-05-15 провести нечем: payment_date_unknown",
+                instrument.inner(),
+                account.inner()
+            )
+        );
     }
 
     #[test]

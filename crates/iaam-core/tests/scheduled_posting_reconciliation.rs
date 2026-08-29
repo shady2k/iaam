@@ -406,7 +406,13 @@ fn недоказуемые(report: &ReturnsReport) -> Vec<&MaterialIssue> {
         .data_quality
         .material_issues
         .iter()
-        .filter(|issue| matches!(issue, MaterialIssue::ScheduledPostingUnverifiable { .. }))
+        .filter(|issue| {
+            matches!(
+                issue,
+                MaterialIssue::ScheduledPostingUnverifiable { .. }
+                    | MaterialIssue::ScheduledPostingsUnverifiable { .. }
+            )
+        })
         .collect()
 }
 
@@ -421,6 +427,7 @@ fn вердикт(report: &ReturnsReport) -> Vec<MaterialIssue> {
                 issue,
                 MaterialIssue::ScheduledPostingNotReceived { .. }
                     | MaterialIssue::ScheduledPostingUnverifiable { .. }
+                    | MaterialIssue::ScheduledPostingsUnverifiable { .. }
             )
         })
         .cloned()

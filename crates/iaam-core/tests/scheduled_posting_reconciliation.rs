@@ -12,24 +12,24 @@
 //! исключительно через публичный интерфейс крейта. Регрессия, которая
 //! спрячет сверку за приватным помощником, здесь покраснеет.
 //!
-//! ## Про подмену номинала
+//! ## Про номинал
 //!
-//! Ни `apply_trade`, ни восстановление позиции номинал лоту не ставят —
+//! `apply_trade` и восстановление позиции номинал лоту не ставят —
 //! он остаётся `PrincipalState::Unknown` (известная дыра `iaam-d8b.15`).
-//! Без номинала правило потока отказывается строить план, сверка молча
-//! пропускается, и любой тест этого файла был бы зелёным, ничего не
-//! проверяя. Поэтому номинал подставляется состоянию после проекции —
-//! так же, как это делает `состояние_с_номиналами` в модульных тестах
-//! `returns/mod.rs`. Что подмена действительно решает исход, а не
-//! украшает журнал, доказывает
-//! `without_the_face_value_the_reconciliation_is_silently_skipped`.
+//! Прошлое для сверки теперь строится прямо из графика
+//! (`historical_schedule_postings`), поэтому неизвестный номинал не должен
+//! молча отключать сверку. Остальные тесты получают подменённый номинал
+//! только для того, чтобы сделать вычислимой независимую проверку метрик
+//! позиции; последний тест закрепляет, что сама сверка без него работает.
+//! Что именно пропущенный купон всё равно называется, доказывает
+//! `without_the_face_value_the_reconciliation_still_runs`.
 
 use std::collections::BTreeMap;
 
 use iaam_core::bond::offer::ScheduleCompleteness;
 use iaam_core::bond::{AccrualPeriod, BondSchedule, DefaultFlags, PrincipalReturn};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates, TradeDate};
+use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates, SettledDate, TradeDate};
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::kind::{EventKind, IncomeKind, TradeSide};
 use iaam_core::event::leg::Leg;
@@ -45,8 +45,8 @@ use iaam_core::projection::state::LedgerState;
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{
-    Computed, KnowledgeCoordinate, MaterialIssue, NotComputable, ReturnsReport, ReturnsRequest,
-    returns_report,
+    Computed, KnowledgeCoordinate, MaterialIssue, ReturnsReport, ReturnsRequest,
+    UnverifiableReason, returns_report,
 };
 use iaam_core::rules::lot_disposal::PrincipalState;
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
@@ -147,7 +147,24 @@ fn покупка(депозитарий: CustodyId, день: Date, номер:
             Leg::security(СЧЁТ, депозитарий, БУМАГА, количество),
         ],
     );
+    // Тест моделирует источник Finam, который сообщает дату расчётов;
+    // здесь она совпадает с датой сделки, потому что расчёты отдельно
+    // не проверяются.
+    event.dates.settled = Some(SettledDate(день));
     event.dates.trade = Some(TradeDate(день));
+    event
+}
+/// Покупка от источника, который не сообщает дату расчётов.
+///
+/// Отсутствие `settled` намеренно оставляет владение недоказуемым:
+/// источник не даёт системе права угадывать дату перехода прав.
+fn покупка_без_даты_расчётов(
+    депозитарий: CustodyId,
+    день: Date,
+    номер: u32,
+) -> Event {
+    let mut event = покупка(депозитарий, день, номер);
+    event.dates.settled = None;
     event
 }
 
@@ -170,6 +187,10 @@ fn продажа(депозитарий: CustodyId, день: Date, номер:
             Leg::security(СЧЁТ, депозитарий, БУМАГА, Quantity(dec("-10"))),
         ],
     );
+    // Тест моделирует источник Finam, который сообщает дату расчётов;
+    // здесь она совпадает с датой сделки, потому что расчёты отдельно
+    // не проверяются.
+    event.dates.settled = Some(SettledDate(день));
     event.dates.trade = Some(TradeDate(день));
     event
 }
@@ -222,6 +243,8 @@ fn частичное_погашение(день: Date, номер: u32) -> Eve
 /// приходит оттуда.
 fn график(купоны: &[Date], возвраты: &[(Date, &str)]) -> BondSchedule {
     BondSchedule {
+        // Тестовый график моделирует источник, который сообщает дату
+        // фиксации реестра; дата фиксации совпадает с датой платежа.
         periods: купоны
             .iter()
             .enumerate()
@@ -233,7 +256,7 @@ fn график(купоны: &[Date], возвраты: &[(Date, &str)]) -> Bon
                 },
                 accrual_end: *дата,
                 payment_date: *дата,
-                record_date: None,
+                record_date: Some(*дата),
                 coupon_per_unit: Some(за_единицу("50")),
             })
             .collect(),
@@ -285,8 +308,8 @@ struct Сценарий<'a> {
     события: &'a [Event],
     график: &'a BondSchedule,
     дата_отчёта: Date,
-    /// `None` — номинал лотам не подставляется, то есть воспроизводится
-    /// рабочий путь `iaam-d8b.15`, на котором сверка молчит.
+    /// `None` сохраняет неизвестный номинал лотов; он нужен только
+    /// тесту, который доказывает независимость сверки от номинала.
     номинал: Option<&'a str>,
 }
 
@@ -528,10 +551,10 @@ fn five_years_of_coupons_received_late_but_received_raise_no_alarm() {
 #[test]
 fn an_amortised_bond_closes_its_principal_returns_with_partial_redemptions() {
     // Возврат номинала подтверждается корпоративным действием, а купон —
-    // доходом. Если бы `past` носил одни даты без вида, эти два факта
-    // стали бы взаимозаменяемыми, и пропущенная амортизация закрылась бы
-    // пришедшим купоном. Контрольный прогон ниже показывает, что вид
-    // выплаты действительно проверяется.
+    // доходом. Для купонных периодов график сообщает дату фиксации, но
+    // `PrincipalReturn` пока не несёт такого поля. Поэтому обе ветки
+    // обязаны молчать именно об обвинении: без даты права нельзя объявить
+    // возврат пропущенным, даже если факт возврата пришёл.
     let график = график(
         &[date!(2026 - 03 - 15), date!(2026 - 09 - 15)],
         &[(date!(2026 - 06 - 15), "50"), (date!(2026 - 09 - 15), "50")],
@@ -542,22 +565,40 @@ fn an_amortised_bond_closes_its_principal_returns_with_partial_redemptions() {
         купон(date!(2026 - 03 - 17), 3),
         частичное_погашение(date!(2026 - 06 - 17), 4),
     ];
+    let проверить_недоказуемость = |report: &ReturnsReport| {
+        поток_построен(report);
+        assert!(
+            непринятые(report).is_empty(),
+            "без даты права нельзя объявлять возврат пропущенным: {:?}",
+            вердикт(report)
+        );
+        let issues = недоказуемые(report);
+        assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+        assert!(
+            matches!(
+                issues[0],
+                MaterialIssue::ScheduledPostingUnverifiable {
+                    date,
+                    kind: PostingKind::PrincipalReturn,
+                    reason: UnverifiableReason::EntitlementDateUnknown,
+                    ..
+                } if *date == date!(2026 - 06 - 15)
+            ),
+            "проблема: {:?}",
+            issues[0]
+        );
+    };
     let report = отчёт(&Сценарий {
         события: &здоровый,
         график: &график,
         дата_отчёта: ДАТА_ОТЧЁТА,
         номинал: Some(НОМИНАЛ),
     });
+    проверить_недоказуемость(&report);
 
-    поток_построен(&report);
-    assert!(
-        вердикт(&report).is_empty(),
-        "вердикт: {:?}",
-        вердикт(&report)
-    );
-
-    // Тот же журнал без амортизационной выплаты: пропущен возврат
-    // номинала, и назван он должен быть именно как `PrincipalReturn`.
+    // Тот же журнал без амортизационной выплаты: пока в модели нет даты
+    // права для `PrincipalReturn`, отсутствие факта также нельзя назвать
+    // пропуском — результат остаётся недоказуемым, а не обвинительным.
     let без_амортизации: Vec<Event> = здоровый[..3].to_vec();
     let report = отчёт(&Сценарий {
         события: &без_амортизации,
@@ -565,22 +606,7 @@ fn an_amortised_bond_closes_its_principal_returns_with_partial_redemptions() {
         дата_отчёта: ДАТА_ОТЧЁТА,
         номинал: Some(НОМИНАЛ),
     });
-
-    поток_построен(&report);
-    let issues = непринятые(&report);
-    assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
-    assert!(
-        matches!(
-            issues[0],
-            MaterialIssue::ScheduledPostingNotReceived {
-                date,
-                kind: PostingKind::PrincipalReturn,
-                ..
-            } if *date == date!(2026 - 06 - 15)
-        ),
-        "проблема: {:?}",
-        issues[0]
-    );
+    проверить_недоказуемость(&report);
 }
 
 #[test]
@@ -919,53 +945,78 @@ fn projecting_the_same_journal_twice_gives_the_same_verdict() {
 }
 
 #[test]
-fn without_the_face_value_the_reconciliation_is_silently_skipped() {
-    // Доказательство, что остальные тесты этого файла не проверяют
-    // пустоту. Номинал не выставляет ни одна рабочая запись журнала
-    // (`iaam-d8b.15`), поэтому без подмены правило потока отказывается
-    // строить план и сверка пропускается целиком — тот же журнал
-    // с изъятым купоном не даёт ни одной проблемы. Как только дыра
-    // будет закрыта, подмена станет лишней, а этот тест — красным
-    // напоминанием её убрать.
+fn without_the_face_value_the_reconciliation_still_runs() {
+    // Прежнее поведение было дефектом: номинал не доходил до лотов
+    // (`iaam-d8b.15`), из-за чего сверка молчала на всех реальных данных.
+    // Историческое прошлое теперь строится прямо из графика и обязано
+    // назвать пропущенный купон даже при неизвестном номинале.
     let события = журнал_пятилетней_истории(Some(date!(2023 - 09 - 15)));
-
-    let без_номинала = отчёт(&Сценарий {
+    let report = отчёт(&Сценарий {
         события: &события,
         график: &график_пятилетней_бумаги(),
         дата_отчёта: ДАТА_ОТЧЁТА,
         номинал: None,
     });
+
+    let issues = непринятые(&report);
+    assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
     assert!(
         matches!(
-            без_номинала.bond_metrics[0].scenarios[0]
-                .prospective
-                .metrics,
-            Computed::NotComputable {
-                reason: NotComputable::PrincipalUnknown
-            }
+            issues[0],
+            MaterialIssue::ScheduledPostingNotReceived {
+                date,
+                kind: PostingKind::Coupon,
+                ..
+            } if *date == date!(2023 - 09 - 15)
         ),
-        "без номинала поток обязан отказываться по названной причине: {:?}",
-        без_номинала.bond_metrics[0].scenarios[0]
-            .prospective
-            .metrics
+        "проблема: {:?}",
+        issues[0]
     );
     assert!(
-        вердикт(&без_номинала).is_empty(),
-        "без номинала сверке нечего сказать: {:?}",
-        вердикт(&без_номинала)
+        недоказуемые(&report).is_empty(),
+        "известное владение не должно стать недоказуемостью: {:?}",
+        вердикт(&report)
     );
+}
 
-    let с_номиналом = отчёт(&Сценарий {
+#[test]
+fn a_source_without_settlement_dates_cannot_accuse_anyone() {
+    // Источник, не сообщающий даты перехода прав, делает владение
+    // недоказуемым. Система обязана признаться, а не угадать: обвинение
+    // требует доказательства, признание незнания — нет.
+    let события = vec![
+        пополнение(date!(2026 - 01 - 05), 1),
+        покупка_без_даты_расчётов(ДЕПОЗИТАРИЙ, date!(2026 - 01 - 10), 2),
+    ];
+    let график = график(
+        &[date!(2026 - 03 - 15), date!(2026 - 12 - 15)],
+        &[(date!(2026 - 12 - 15), "100")],
+    );
+    let report = отчёт(&Сценарий {
         события: &события,
-        график: &график_пятилетней_бумаги(),
+        график: &график,
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
+        номинал: None,
     });
-    поток_построен(&с_номиналом);
-    assert_eq!(
-        непринятые(&с_номиналом).len(),
-        1,
-        "подмена номинала обязана менять исход: {:?}",
-        вердикт(&с_номиналом)
+
+    let issues = недоказуемые(&report);
+    assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+    assert!(
+        matches!(
+            issues[0],
+            MaterialIssue::ScheduledPostingUnverifiable {
+                date,
+                kind: PostingKind::Coupon,
+                reason: UnverifiableReason::OwnershipUnknown,
+                ..
+            } if *date == date!(2026 - 03 - 15)
+        ),
+        "проблема: {:?}",
+        issues[0]
+    );
+    assert!(
+        непринятые(&report).is_empty(),
+        "без доказанного владения нельзя обвинять в пропуске: {:?}",
+        вердикт(&report)
     );
 }

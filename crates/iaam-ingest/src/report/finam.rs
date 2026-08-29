@@ -27,7 +27,7 @@ use crate::report::{
 };
 use crate::verdict::Rejection;
 
-const PARSER_VERSION: &str = "finam-xls/1";
+const PARSER_VERSION: &str = "finam-xls/2";
 const DOCUMENT_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
 /// Парсер выгрузки брокерского отчёта Финама.
@@ -153,8 +153,7 @@ fn parse_trades(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
             let trade_date = date_value(cell(row, trade_date_col), "trade_date")?;
             let settlement_date = settlement_date_col
                 .map(|column| date_value(cell(row, column), "settlement_date"))
-                .transpose()?
-                .unwrap_or(trade_date);
+                .transpose()?;
             let currency = currency_value(cell(row, currency_col))?;
             let account = account_value(directory, cell(row, account_col), "account")?;
             let instrument =
@@ -194,6 +193,7 @@ fn parse_trades(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
                 kind,
                 trade_date,
                 settlement_date,
+                None,
                 source_id_col.and_then(|column| optional_text(cell(row, column))),
             ))
         })();
@@ -246,7 +246,7 @@ fn parse_cash_movements(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Loc
                     &kind_text,
                 ));
             };
-            Ok(operation(account, kind, date, date, None))
+            Ok(operation(account, kind, date, None, Some(date), None))
         })();
         rows.push(located("Денежные движения", row_number, result));
     }
@@ -284,7 +284,8 @@ fn parse_fees(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>) 
                     origin: FeeOrigin::Other,
                 },
                 date,
-                date,
+                None,
+                Some(date),
                 None,
             ))
         })();
@@ -343,7 +344,8 @@ fn parse_income(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
                     kind: Some(income_kind),
                 },
                 date,
-                date,
+                None,
+                Some(date),
                 None,
             ))
         })();
@@ -651,7 +653,11 @@ fn operation(
     account: iaam_core::ids::AccountId,
     kind: OperationKind,
     trade_date: Date,
-    cash_date: Date,
+    // Дата расчётов, а не «денежная дата»: именно при расчётах
+    // переходят права (dates.rs:34). None — колонки в отчёте нет,
+    // и подставлять дату сделки нельзя: это утверждение, а не пропуск.
+    settlement_date: Option<Date>,
+    cash_date: Option<Date>,
     source_id: Option<&str>,
 ) -> SubmittedOperation {
     SubmittedOperation {
@@ -659,7 +665,8 @@ fn operation(
         kind,
         dates: OperationDates {
             trade: Some(trade_date),
-            cash_posted: Some(cash_date),
+            settled: settlement_date,
+            cash_posted: cash_date,
             ..OperationDates::default()
         },
         idempotency_key: None,
@@ -705,5 +712,50 @@ fn cell_description(cell: &Cell) -> String {
         Cell::Number(value) => value.inner().to_string(),
         Cell::Date(value) => value.to_string(),
         Cell::Bool(value) => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iaam_core::ids::AccountId;
+    use time::macros::date;
+
+    #[test]
+    fn the_settlement_date_becomes_settled_and_not_cash_posted() {
+        // Дата расчётов и дата движения денег — разные факты: расчёты
+        // определяют переход прав и отчётный период, а не движение по счёту.
+        let operation = operation(
+            AccountId::new_random(),
+            OperationKind::Deposit {
+                amount_minor: 1,
+                currency: CurrencyCode::Rub,
+            },
+            date!(2026 - 03 - 10),
+            Some(date!(2026 - 03 - 12)),
+            None,
+            None,
+        );
+        assert_eq!(operation.dates.trade, Some(date!(2026 - 03 - 10)));
+        assert_eq!(operation.dates.settled, Some(date!(2026 - 03 - 12)));
+        assert_eq!(operation.dates.cash_posted, None);
+    }
+
+    #[test]
+    fn a_missing_settlement_column_stays_unknown() {
+        // Отсутствие колонки означает неизвестную дату расчётов; дата сделки
+        // не доказывает, что расчёты произошли в тот же день.
+        let operation = operation(
+            AccountId::new_random(),
+            OperationKind::Deposit {
+                amount_minor: 1,
+                currency: CurrencyCode::Rub,
+            },
+            date!(2026 - 03 - 10),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(operation.dates.settled, None);
     }
 }

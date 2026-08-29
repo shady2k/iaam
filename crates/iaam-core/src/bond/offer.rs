@@ -226,6 +226,16 @@ mod tests {
     }
 
     #[test]
+    fn distinct_execution_dates_are_valid() {
+        let windows = [
+            terms(date!(2026 - 12 - 01)),
+            terms(date!(2027 - 12 - 01)),
+        ];
+
+        assert_eq!(validate_unique_windows(&windows), Ok(()));
+    }
+
+    #[test]
     fn known_dictionary_meanings_become_their_typed_rights() {
         assert_eq!(
             OfferRight::from_dictionary_meaning("put_option").unwrap(),

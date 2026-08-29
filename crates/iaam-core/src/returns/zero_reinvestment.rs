@@ -704,6 +704,7 @@ pub fn exact_minus_one_rate() -> RateOutcome {
 mod tests {
     use super::*;
     use crate::money::{PerUnitAmount, PostedMinor};
+    use crate::rules::lot_disposal::{Lot, LotId};
     use rust_decimal::Decimal;
     use time::macros::date;
 
@@ -725,6 +726,38 @@ mod tests {
             amount: calc(value),
             kind: PostingKind::Coupon,
         }
+    }
+
+    fn known_principal(original: &str, remaining: &str) -> PrincipalState {
+        PrincipalState::known(
+            PerUnitAmount::new(dec(original), CurrencyCode::Rub),
+            PerUnitAmount::new(dec(remaining), CurrencyCode::Rub),
+        )
+        .unwrap()
+    }
+
+    fn lot_with_principal(
+        instrument: crate::ids::InstrumentId,
+        principal: PrincipalState,
+    ) -> Lot {
+        Lot {
+            id: LotId::new_random(),
+            instrument,
+            acquired: Some(TradeDate(date!(2026 - 01 - 01))),
+            quantity: Quantity(dec("1")),
+            cost_basis: money(1000),
+            acquisition_basis: None,
+            accrued_interest_paid: None,
+            received_to_date: None,
+            principal,
+        }
+    }
+
+    fn instrument_lots(unpriced: &str, lots: Vec<Lot>) -> InstrumentLots {
+        let mut snapshot = serde_json::to_value(InstrumentLots::default()).unwrap();
+        snapshot["unpriced"] = serde_json::to_value(Quantity(dec(unpriced))).unwrap();
+        snapshot["lots"] = serde_json::to_value(lots).unwrap();
+        serde_json::from_value(snapshot).unwrap()
     }
 
     #[test]
@@ -850,8 +883,77 @@ mod tests {
         ) else {
             panic!("expected metrics")
         };
-        assert!(matches!(metrics.hpr, Computed::NotComputable { .. }));
+        assert_eq!(
+            metrics.hpr,
+            Computed::NotComputable {
+                reason: NotComputable::NonPositiveInitialCapital
+            }
+        );
         assert!(matches!(metrics.cagr_0r, Computed::NotComputable { .. }));
+    }
+
+    #[test]
+    fn common_principal_state_returns_the_known_state_for_one_lot() {
+        let instrument = crate::ids::InstrumentId::new_random();
+        let expected = known_principal("1000", "900");
+        let lots = instrument_lots("0", vec![lot_with_principal(instrument, expected)]);
+
+        assert_eq!(common_principal_state(&lots, instrument), Ok(expected));
+    }
+
+    #[test]
+    fn common_principal_state_accepts_identical_states_across_lots() {
+        let instrument = crate::ids::InstrumentId::new_random();
+        let expected = known_principal("1000", "900");
+        let lots = instrument_lots(
+            "0",
+            vec![
+                lot_with_principal(instrument, expected),
+                lot_with_principal(instrument, expected),
+            ],
+        );
+
+        assert_eq!(common_principal_state(&lots, instrument), Ok(expected));
+    }
+
+    #[test]
+    fn common_principal_state_rejects_different_states() {
+        let instrument = crate::ids::InstrumentId::new_random();
+        let lots = instrument_lots(
+            "0",
+            vec![
+                lot_with_principal(instrument, known_principal("1000", "900")),
+                lot_with_principal(instrument, known_principal("1000", "800")),
+            ],
+        );
+
+        assert_eq!(
+            common_principal_state(&lots, instrument),
+            Err(NotComputable::PrincipalStateAmbiguous { instrument })
+        );
+    }
+
+    #[test]
+    fn common_principal_state_keeps_unpriced_only_positions_unknown() {
+        let instrument = crate::ids::InstrumentId::new_random();
+        let lots = instrument_lots("1", Vec::new());
+
+        assert_eq!(
+            common_principal_state(&lots, instrument),
+            Ok(PrincipalState::Unknown)
+        );
+    }
+
+    #[test]
+    fn common_principal_state_rejects_unpriced_quantity_with_known_lots() {
+        let instrument = crate::ids::InstrumentId::new_random();
+        let expected = known_principal("1000", "900");
+        let lots = instrument_lots("1", vec![lot_with_principal(instrument, expected)]);
+
+        assert_eq!(
+            common_principal_state(&lots, instrument),
+            Err(NotComputable::PrincipalStateAmbiguous { instrument })
+        );
     }
 
     #[test]

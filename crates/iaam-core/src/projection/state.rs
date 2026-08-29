@@ -6,6 +6,7 @@
 //! порядок обхода `BTreeMap` детерминирован, поэтому один и тот же
 //! журнал всегда даёт один и тот же отпечаток.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -45,6 +46,13 @@ impl fmt::Display for StateHash {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coverage {
     events_applied: u64,
+    /// Начало покрытия по каждому счёту.
+    ///
+    /// Глобальная граница отвечает на вопрос отчёта «с какого дня
+    /// вообще есть данные» (§10.7), но для сверки выплат она врёт:
+    /// счёт, заведённый восстановленным остатком позже, унаследовал бы
+    /// чужое покрытие и получил бы обвинение вместо недоказуемости.
+    first_event_by_account: BTreeMap<AccountId, Date>,
     first_event: Option<Date>,
     last_event: Option<Date>,
     /// Счета, история которых начата восстановленным остатком,
@@ -69,6 +77,12 @@ impl Coverage {
         self.first_event
     }
 
+    /// Начало покрытия конкретного счёта.
+    #[must_use]
+    pub fn first_event_for(&self, account: AccountId) -> Option<Date> {
+        self.first_event_by_account.get(&account).copied()
+    }
+
     #[must_use]
     pub const fn last_event(&self) -> Option<Date> {
         self.last_event
@@ -91,6 +105,10 @@ impl Coverage {
                 Some(existing) => existing.min(date),
                 None => date,
             });
+            self.first_event_by_account
+                .entry(event.account)
+                .and_modify(|existing| *existing = (*existing).min(date))
+                .or_insert(date);
             self.last_event = Some(match self.last_event {
                 Some(existing) => existing.max(date),
                 None => date,
@@ -301,6 +319,24 @@ mod tests {
         assert_eq!(coverage.events_applied(), 3);
         assert_eq!(coverage.first_event(), Some(date!(2025 - 01 - 15)));
         assert_eq!(coverage.last_event(), Some(date!(2025 - 12 - 31)));
+    }
+
+    #[test]
+    fn each_account_carries_its_own_history_horizon() {
+        // Глобальный горизонт объявлял бы историю счёта B покрытой
+        // с 2020 года только потому, что счёт A существует с 2020-го.
+        // Выплаты счёта B за 2021–2025 получали бы обвинение вместо
+        // честного «журнал начинается позже графика».
+        let a = AccountId::new_random();
+        let b = AccountId::new_random();
+        let mut coverage = Coverage::default();
+        coverage.observe(&cash_in(a, date!(2020 - 01 - 15), 1));
+        coverage.observe(&cash_in(b, date!(2026 - 01 - 01), 2));
+
+        assert_eq!(coverage.first_event_for(a), Some(date!(2020 - 01 - 15)));
+        assert_eq!(coverage.first_event_for(b), Some(date!(2026 - 01 - 01)));
+        // Глобальная граница остаётся: её показывает отчёт о покрытии (§10.7).
+        assert_eq!(coverage.first_event(), Some(date!(2020 - 01 - 15)));
     }
 
     #[test]

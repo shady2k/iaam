@@ -1671,7 +1671,6 @@ fn bond_position_metrics(
     let (_, cashflow) = cashflow_projection_rule();
     let (_, accrued_rule) = accrued_interest_rule();
     let (_, posting_match) = posting_match_rule();
-    let history_starts = state.coverage().first_event();
     let mut issues = Vec::new();
     // Сверка идёт по `LotKey`, а позиции обходятся по `PositionKey`
     // с местом хранения: одна бумага в двух депозитариях — две позиции
@@ -1693,6 +1692,7 @@ fn bond_position_metrics(
                 account: assessment.account,
                 instrument: assessment.instrument,
             };
+            let history_starts = state.coverage().first_event_for(key.account);
             let lots = state.book().entry(&key);
             let unresolved: std::collections::BTreeSet<_> =
                 unresolved_submissions(offer_book, schedule)
@@ -5351,7 +5351,6 @@ mod tests {
         );
         assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
     }
-
 
     #[test]
     fn a_posting_dated_by_the_first_journal_day_is_covered_and_stays_verifiable() {

@@ -66,6 +66,14 @@ MODULES=(
   "crates/iaam-core/src/reconciliation/check.rs"
   "crates/iaam-core/src/reconciliation/evidence.rs"
   "crates/iaam-core/src/reconciliation/mod.rs"
+  # Владение и дата расчёта решают, кому причиталась выплата. Мутант
+  # здесь не меняет ни одной суммы — он меняет то, чему сумма
+  # соответствует, ровно как в instrument.rs и reconciliation.
+  # Первый кандидат — `latest < day` в settlement.rs: сдвиг границы
+  # на `<=` делает недоказуемое доказанным.
+  "crates/iaam-core/src/settlement.rs"
+  "crates/iaam-core/src/projection/ownership.rs"
+  "crates/iaam-core/src/rules/posting_match.rs"
   # Периметр решает, где система отказывается считать (§11). Мутант,
   # снимающий отказ, выдаёт экономику неподдерживаемого финансирования
   # за посчитанную.

@@ -976,7 +976,7 @@ fn hash_selected(selected: &SelectedInputs<'_>) -> String {
     }
 
     let mut hasher = Sha256::new();
-    hasher.update(b"iaam/returns-inputs/v1");
+    hasher.update(b"iaam/returns-inputs/v2");
     hasher.update(encoded);
     let digest = hasher.finalize();
     let mut result = String::with_capacity(digest.len() * 2);
@@ -1286,6 +1286,7 @@ pub fn returns_report_with_bond_inputs(
     let (quotation_rule_version, _) = quotation_rule();
     let (accrued_interest_rule_version, accrued_interest_rule) = accrued_interest_rule();
     let (cashflow_projection_version, _) = cashflow_projection_rule();
+    let (posting_match_version, _) = posting_match_rule();
     let expense_policy_version = expense_policy_rule();
     let positions = position_values(state, request);
     let series = xirr::flow_series(state, request);
@@ -1364,7 +1365,7 @@ pub fn returns_report_with_bond_inputs(
             accrued_interest_rule: accrued_interest_rule_version,
             cashflow_projection: cashflow_projection_version,
             expense_policy: expense_policy_version,
-            posting_match: posting_match_rule().0,
+            posting_match: posting_match_version,
         },
         bond_attributes,
         data_quality,
@@ -4917,7 +4918,7 @@ mod tests {
         assert_eq!(second_metrics.scenarios.len(), 2);
     }
     #[test]
-    fn a_schedule_change_changes_inputs_hash() {
+    fn a_record_date_change_changes_inputs_hash() {
         let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
         let instrument = InstrumentId::new_random();
         let first = BondSchedule {
@@ -4932,7 +4933,7 @@ mod tests {
         };
         let second = BondSchedule {
             periods: vec![crate::bond::AccrualPeriod {
-                coupon_per_unit: Some(PerUnitAmount::new(dec("6"), CurrencyCode::Rub)),
+                record_date: Some(date!(2026 - 06 - 30)),
                 ..first.periods[0]
             }],
             ..first.clone()
@@ -6252,10 +6253,14 @@ mod tests {
     }
 
     #[test]
-    fn the_report_names_the_posting_match_rule_it_applied() {
+    fn the_report_names_the_applied_rule_versions() {
         let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
         let report = report_for(&state, KnowledgeCoordinate::default());
 
+        assert_eq!(
+            report.applied_rules.cashflow_projection,
+            crate::rules::CashflowProjectionVersion(2)
+        );
         assert_eq!(
             report.applied_rules.posting_match,
             crate::rules::PostingMatchVersion(2)

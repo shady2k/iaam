@@ -536,6 +536,27 @@ struct ConversionFacts {
     basis_transfer: BasisTransferRule,
     effective_date: time::Date,
 }
+/// Данные одной восстановленной позиции: инструмент, количество, стоимость и
+/// заявленная дата приобретения. Эти четыре значения описывают саму позицию,
+/// поэтому группируются вместе, а событие и знание о расчёте остаются
+/// обстоятельствами записи.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RestoreFacts {
+    instrument: InstrumentId,
+    quantity: Quantity,
+    cost_basis: Option<Money>,
+    acquired: Option<TradeDate>,
+}
+
+/// Данные одного выбытия: ключ лота, количество и выручка. Эти значения
+/// составляют одну операцию выбытия и передаются вместе, тогда как событие,
+/// правило и знание о расчёте являются её контекстом.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DisposalFacts {
+    key: LotKey,
+    quantity: Quantity,
+    proceeds: Money,
+}
 
 /// Книга лотов и применённое правило.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -671,11 +692,13 @@ impl LotBook {
                 };
                 self.restore(
                     event,
-                    *instrument,
-                    *quantity,
-                    *cost_basis,
+                    RestoreFacts {
+                        instrument: *instrument,
+                        quantity: *quantity,
+                        cost_basis: *cost_basis,
+                        acquired,
+                    },
                     settlement,
-                    acquired,
                 )
             }
             EventKind::CashIn { .. }
@@ -787,7 +810,16 @@ impl LotBook {
                     Some(f) => gross.try_sub(f)?,
                     None => gross,
                 };
-                self.dispose(event, key, quantity, proceeds, rules, settlement)
+                self.dispose(
+                    event,
+                    DisposalFacts {
+                        key,
+                        quantity,
+                        proceeds,
+                    },
+                    rules,
+                    settlement,
+                )
             }
         }
     }
@@ -836,7 +868,16 @@ impl LotBook {
                     instrument: *instrument,
                 };
                 self.require_whole_position(event, key, *quantity)?;
-                self.dispose(event, key, *quantity, *compensation, rules, settlement)
+                self.dispose(
+                    event,
+                    DisposalFacts {
+                        key,
+                        quantity: *quantity,
+                        proceeds: *compensation,
+                    },
+                    rules,
+                    settlement,
+                )
             }
             CorporateAction::Conversion {
                 predecessor,
@@ -896,7 +937,16 @@ impl LotBook {
                 if let Some(fee) = fee {
                     proceeds = proceeds.try_sub(*fee)?;
                 }
-                self.dispose(event, key, *quantity, proceeds, rules, settlement)
+                self.dispose(
+                    event,
+                    DisposalFacts {
+                        key,
+                        quantity: *quantity,
+                        proceeds,
+                    },
+                    rules,
+                    settlement,
+                )
             }
         }
     }
@@ -1085,12 +1135,15 @@ impl LotBook {
     fn restore(
         &mut self,
         event: &Event,
-        instrument: InstrumentId,
-        quantity: Quantity,
-        cost_basis: Option<Money>,
+        facts: RestoreFacts,
         settlement: SettlementKnowledge,
-        acquired: Option<TradeDate>,
     ) -> Result<(), LotError> {
+        let RestoreFacts {
+            instrument,
+            quantity,
+            cost_basis,
+            acquired,
+        } = facts;
         let key = LotKey {
             account: event.account,
             instrument,
@@ -1136,12 +1189,15 @@ impl LotBook {
     fn dispose(
         &mut self,
         event: &Event,
-        key: LotKey,
-        quantity: Quantity,
-        proceeds: Money,
+        facts: DisposalFacts,
         rules: &RuleRegistry,
         settlement: SettlementKnowledge,
     ) -> Result<(), LotError> {
+        let DisposalFacts {
+            key,
+            quantity,
+            proceeds,
+        } = facts;
         let delta = Quantity(quantity.0.checked_neg()?);
         let rule = rules
             .disposal_rule(self.rule_version)

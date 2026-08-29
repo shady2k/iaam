@@ -4007,15 +4007,17 @@ fn an_unverifiable_scheduled_posting_names_kind_instrument_account_date_and_reas
     );
 }
 
-/// Четыре причины чинятся по-разному, а одна из них вообще не дефект.
-/// Совпади хотя бы две строки — владелец не отличил бы «дозагрузи даты»
-/// от «журнал начинается позже, чинить нечего».
+/// Пять причин чинятся по-разному, а одна из них вообще не дефект.
+/// Совпади хотя бы две строки — владелец не отличил бы «уточни даты
+/// расчётов» от «догрузи дату фиксации» или «журнал начинается позже».
 #[test]
-fn the_four_unverifiable_scheduled_posting_reasons_are_distinguishable() {
+fn the_six_unverifiable_scheduled_posting_reasons_are_distinguishable() {
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
     let reasons = [
         UnverifiableReason::AcquisitionDateUnknown,
+        UnverifiableReason::OwnershipUnknown,
+        UnverifiableReason::EntitlementDateUnknown,
         UnverifiableReason::IncomeKindUnknown,
         UnverifiableReason::PaymentDateUnknown,
         UnverifiableReason::HistoryStartsAfterSchedule,
@@ -4034,5 +4036,5 @@ fn the_four_unverifiable_scheduled_posting_reasons_are_distinguishable() {
     );
 
     let distinct: std::collections::BTreeSet<&String> = texts.iter().collect();
-    assert_eq!(distinct.len(), 4, "причины неразличимы в тексте: {texts:?}");
+    assert_eq!(distinct.len(), 6, "причины неразличимы в тексте: {texts:?}");
 }

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use time::{Date, Duration};
 
 use crate::projection::income::ReceivedPosting;
+use crate::projection::ownership::Ownership;
+use crate::returns::UnverifiableReason;
 use crate::rules::cashflow::ScheduledPosting;
 
 /// Версия правила сопоставления. Хранение датированных фактов
@@ -11,6 +13,103 @@ use crate::rules::cashflow::ScheduledPosting;
 /// **сопоставление**: ширина окна, его односторонность и жадность.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PostingMatchVersion(pub u16);
+
+/// Итог проверки одной запланированной выплаты.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Выплата причиталась, но факта нет.
+    NotReceived,
+    /// Нельзя сделать вывод, потому что не хватает доказательства.
+    Unverifiable(UnverifiableReason),
+    /// Выплата не причиталась либо подтверждена фактом.
+    Silent,
+}
+
+/// Вторая версия правила сопоставления: право определяется на дату
+/// фиксации, а не на дату платежа.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostingMatchV2 {
+    window_days: u16,
+}
+
+impl Default for PostingMatchV2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PostingMatchV2 {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { window_days: 21 }
+    }
+
+    /// Версия, под которой правило войдёт в расчётный контур.
+    #[must_use]
+    pub const fn version() -> PostingMatchVersion {
+        PostingMatchVersion(2)
+    }
+
+    /// Судить все выплаты, распределив каждый факт не более одного раза.
+    #[must_use]
+    pub fn judge_all(
+        &self,
+        postings: &[(ScheduledPosting, Ownership)],
+        facts: &[ReceivedPosting],
+    ) -> Vec<Verdict> {
+        let mut ordered: Vec<(usize, &(ScheduledPosting, Ownership))> =
+            postings.iter().enumerate().collect();
+        ordered.sort_by_key(|(_, (posting, _))| *posting);
+
+        let mut available: Vec<&ReceivedPosting> = facts.iter().collect();
+        available.sort_by_key(|fact| (fact.date, fact.event));
+        let mut used = vec![false; available.len()];
+        let mut fact_found = vec![false; postings.len()];
+        let window = Duration::days(i64::from(self.window_days));
+
+        // Факты распределяются по всем выплатам до классификации вердиктов,
+        // включая Unknown и EntitlementDateUnknown: иначе удалённая заранее
+        // недоказуемая выплата отдаст свой факт соседней и скроет пропуск.
+        for (index, (posting, _)) in ordered {
+            let deadline = posting.date.saturating_add(window);
+            let matched = (0..available.len()).find(|&fact_index| {
+                let fact = available[fact_index];
+                !used[fact_index] && fact_matches(posting, fact, deadline)
+            });
+            if let Some(fact_index) = matched {
+                used[fact_index] = true;
+                fact_found[index] = true;
+            }
+        }
+
+        postings
+            .iter()
+            .enumerate()
+            .map(|(index, (posting, ownership))| self.judge(posting, *ownership, fact_found[index]))
+            .collect()
+    }
+
+    /// Классифицировать одну выплату по уже распределённому факту.
+    fn judge(&self, posting: &ScheduledPosting, ownership: Ownership, fact_found: bool) -> Verdict {
+        if posting.entitlement.is_none() {
+            return Verdict::Unverifiable(UnverifiableReason::EntitlementDateUnknown);
+        }
+        if ownership == Ownership::Unknown {
+            return Verdict::Unverifiable(UnverifiableReason::OwnershipUnknown);
+        }
+        if ownership == Ownership::NotOwned || fact_found {
+            return Verdict::Silent;
+        }
+        // Молчание допустимо только при доказанном отсутствии права
+        // или найденном факте: неопределённость должна быть дефектом,
+        // а не оправданием отсутствия проблемы.
+        Verdict::NotReceived
+    }
+}
+
+fn fact_matches(expected: &ScheduledPosting, fact: &ReceivedPosting, deadline: Date) -> bool {
+    fact.kind == expected.kind && fact.date >= expected.date && fact.date <= deadline
+}
 
 /// Первая версия правила.
 ///
@@ -125,10 +224,7 @@ impl PostingMatchV1 {
             let deadline = expected.date.saturating_add(window);
             let matched = (0..available.len()).find(|&index| {
                 let fact = available[index];
-                !used[index]
-                    && fact.kind == expected.kind
-                    && fact.date >= expected.date
-                    && fact.date <= deadline
+                !used[index] && fact_matches(&expected, fact, deadline)
             });
             match matched {
                 Some(index) => used[index] = true,
@@ -166,6 +262,14 @@ mod tests {
         scheduled(day, PostingKind::Coupon)
     }
 
+    fn scheduled_with_entitlement(day: u8, entitlement: u8) -> ScheduledPosting {
+        ScheduledPosting {
+            date: march(day),
+            kind: PostingKind::Coupon,
+            entitlement: Some(march(entitlement)),
+        }
+    }
+
     /// Идентификатор факта выводится из его номера, а не из `new_random`:
     /// ядро детерминировано, и порядок фактов одной даты должен быть
     /// воспроизводим от прогона к прогону.
@@ -187,6 +291,18 @@ mod tests {
     /// от отсрочки: её граница проверяется отдельными тестами ниже.
     fn late_enough() -> Date {
         date!(2026 - 05 - 01)
+    }
+
+    fn judge_single(
+        posting: ScheduledPosting,
+        ownership: Ownership,
+        facts: &[ReceivedPosting],
+    ) -> Verdict {
+        PostingMatchV2::new()
+            .judge_all(&[(posting, ownership)], facts)
+            .into_iter()
+            .next()
+            .expect("одна выплата должна дать один вердикт")
     }
 
     #[test]
@@ -438,6 +554,113 @@ mod tests {
         assert!(
             rule.unreceived(&[scheduled_in_march], &[fact_in_april], late_enough())
                 .is_empty()
+        );
+    }
+    #[test]
+    fn posting_match_v2_has_version_two() {
+        // Версия фиксирует новое правило отдельно: подключение к обходу
+        // лотов позже не должно незаметно изменить уже выпущенный V1.
+        assert_eq!(PostingMatchV2::version(), PostingMatchVersion(2));
+    }
+
+    #[test]
+    fn known_entitlement_owned_with_fact_is_silent() {
+        // Известная дата фиксации и владение на неё, подтверждённые фактом,
+        // означают, что выплата доказанно не является проблемой.
+        let posting = scheduled_with_entitlement(15, 10);
+        assert_eq!(
+            judge_single(posting, Ownership::Owned, &[fact(18)]),
+            Verdict::Silent
+        );
+    }
+
+    #[test]
+    fn known_entitlement_owned_without_fact_is_not_received() {
+        // При доказанном праве отсутствие подходящего факта — это
+        // доказанный пропуск выплаты, а не недоказуемость владения.
+        let posting = scheduled_with_entitlement(15, 10);
+        assert_eq!(
+            judge_single(posting, Ownership::Owned, &[]),
+            Verdict::NotReceived
+        );
+    }
+
+    #[test]
+    fn known_entitlement_not_owned_is_silent() {
+        // Доказанное отсутствие бумаги на дату фиксации означает, что
+        // выплата не причиталась и отсутствие факта не является дефектом.
+        let posting = scheduled_with_entitlement(15, 10);
+        assert_eq!(
+            judge_single(posting, Ownership::NotOwned, &[]),
+            Verdict::Silent
+        );
+    }
+
+    #[test]
+    fn known_entitlement_unknown_ownership_is_unverifiable() {
+        // Неизвестное владение не позволяет решить, было ли право на
+        // выплату, поэтому молчание стало бы оправданием незнания.
+        let posting = scheduled_with_entitlement(15, 10);
+        assert_eq!(
+            judge_single(posting, Ownership::Unknown, &[]),
+            Verdict::Unverifiable(UnverifiableReason::OwnershipUnknown)
+        );
+    }
+
+    #[test]
+    fn unknown_entitlement_date_is_unverifiable_for_any_ownership() {
+        // Без даты фиксации нельзя выбрать день для проверки владения,
+        // поэтому дата права важнее любого другого входного факта.
+        let posting = coupon(15);
+        assert_eq!(
+            judge_single(posting, Ownership::NotOwned, &[fact(18)]),
+            Verdict::Unverifiable(UnverifiableReason::EntitlementDateUnknown)
+        );
+    }
+
+    #[test]
+    fn silence_is_only_for_proven_absence_of_entitlement() {
+        // Молчание означает «выплата не причиталась». Любая неопределённость
+        // обязана выходить дефектной недоказуемостью, иначе незнание
+        // становится оправданием.
+        let posting = scheduled_with_entitlement(15, 10);
+        assert_eq!(
+            judge_single(posting, Ownership::NotOwned, &[]),
+            Verdict::Silent
+        );
+        assert_eq!(
+            judge_single(posting, Ownership::Unknown, &[]),
+            Verdict::Unverifiable(UnverifiableReason::OwnershipUnknown)
+        );
+    }
+    #[test]
+    fn one_fact_closes_only_the_first_of_overlapping_postings() {
+        // При перекрывающихся окнах один факт обязан закрыть только первую
+        // выплату: иначе настоящий пропуск в плотном графике исчезает.
+        let postings = [
+            (scheduled_with_entitlement(1, 1), Ownership::Owned),
+            (scheduled_with_entitlement(10, 10), Ownership::Owned),
+        ];
+        assert_eq!(
+            PostingMatchV2::new().judge_all(&postings, &[fact(11)]),
+            vec![Verdict::Silent, Verdict::NotReceived]
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_posting_still_consumes_its_matching_fact() {
+        // Недоказуемую выплату нельзя убрать до распределения: её факт не
+        // должен достаться соседней выплате и скрыть её настоящий пропуск.
+        let postings = [
+            (scheduled_with_entitlement(1, 1), Ownership::Unknown),
+            (scheduled_with_entitlement(10, 10), Ownership::Owned),
+        ];
+        assert_eq!(
+            PostingMatchV2::new().judge_all(&postings, &[fact(11)]),
+            vec![
+                Verdict::Unverifiable(UnverifiableReason::OwnershipUnknown),
+                Verdict::NotReceived,
+            ]
         );
     }
 }

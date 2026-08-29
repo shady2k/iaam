@@ -1555,6 +1555,22 @@ struct BondPositionOutcome {
     issues: Vec<MaterialIssue>,
 }
 
+/// Входы сверки прошлого по одной позиции.
+///
+/// Структура, а не семь аргументов: набор един на позицию — журналы,
+/// граница истории и правило сопоставления берутся из одного
+/// состояния и на позицию не меняются, — а перепутать местами две
+/// ссылки одного типа в списке из семи слишком легко.
+struct PastReconciliationInputs<'a> {
+    key: LotKey,
+    plan: &'a CashflowPlan,
+    lots: Option<&'a crate::projection::lots::InstrumentLots>,
+    income: &'a crate::projection::income::IncomeLedger,
+    history_starts: Option<Date>,
+    rule: &'a PostingMatchV1,
+    as_of: Date,
+}
+
 /// Сверяет запланированные выплаты пары с датированными фактами.
 ///
 /// Границу владения накладывает сверка, а не правило потока: правило
@@ -1565,15 +1581,17 @@ struct BondPositionOutcome {
 /// владения не сделает вывод доказуемым. Отсутствие даты приобретения
 /// ломает только отбор проверяемых выплат, то есть меньшую часть, и
 /// потому уступает.
-fn reconcile_past_postings(
-    key: LotKey,
-    plan: &CashflowPlan,
-    lots: Option<&crate::projection::lots::InstrumentLots>,
-    income: &crate::projection::income::IncomeLedger,
-    history_starts: Option<Date>,
-    rule: &PostingMatchV1,
-    as_of: Date,
-) -> Vec<MaterialIssue> {
+fn reconcile_past_postings(inputs: &PastReconciliationInputs<'_>) -> Vec<MaterialIssue> {
+    let PastReconciliationInputs {
+        key,
+        plan,
+        lots,
+        income,
+        history_starts,
+        rule,
+        as_of,
+    } = *inputs;
+
     let unverifiable = |reason| {
         vec![MaterialIssue::ScheduledPostingUnverifiable {
             account: key.account,
@@ -1694,15 +1712,15 @@ fn bond_position_metrics(
             if let Ok(plan) = scenario_plan(&inputs, &OfferChoice::HoldToMaturity)
                 && reconciled.insert(key)
             {
-                issues.extend(reconcile_past_postings(
+                issues.extend(reconcile_past_postings(&PastReconciliationInputs {
                     key,
-                    &plan,
+                    plan: &plan,
                     lots,
-                    state.income(),
+                    income: state.income(),
                     history_starts,
-                    &posting_match,
-                    request.as_of,
-                ));
+                    rule: &posting_match,
+                    as_of: request.as_of,
+                }));
             }
             let scenarios = available_choices(schedule, request.as_of)
                 .into_iter()
@@ -5149,11 +5167,7 @@ mod tests {
         report: &ReturnsReport,
         predicate: impl Fn(&MaterialIssue) -> bool,
     ) -> bool {
-        report
-            .data_quality
-            .material_issues
-            .iter()
-            .any(|issue| predicate(issue))
+        report.data_quality.material_issues.iter().any(predicate)
     }
 
     fn непринятые(report: &ReturnsReport) -> Vec<&MaterialIssue> {

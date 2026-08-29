@@ -1279,8 +1279,10 @@ mod tests {
         // него нет: любая граница по оставшимся партиям была бы позже
         // настоящей и скрыла бы пропуск.
         let instrument = InstrumentId::new_random();
-        let mut entry = InstrumentLots::default();
-        entry.unpriced = qty(5);
+        let mut entry = InstrumentLots {
+            unpriced: qty(5),
+            ..Default::default()
+        };
         entry.push_lot(лот_с_датой(
             instrument,
             Some(date!(2024 - 03 - 01)),

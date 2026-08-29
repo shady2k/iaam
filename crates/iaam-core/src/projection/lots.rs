@@ -1245,8 +1245,14 @@ mod tests {
         // его, проверял бы фикстуру, а не книгу лотов.
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
-        entry.push_lot(лот_с_датой(instrument, Some(date!(2025 - 07 - 01))));
-        entry.push_lot(лот_с_датой(instrument, Some(date!(2024 - 03 - 01))));
+        entry.push_lot(лот_с_датой(
+            instrument,
+            Some(date!(2025 - 07 - 01)),
+        ));
+        entry.push_lot(лот_с_датой(
+            instrument,
+            Some(date!(2024 - 03 - 01)),
+        ));
 
         assert_eq!(
             entry.earliest_acquired(),
@@ -1258,7 +1264,10 @@ mod tests {
     fn партия_без_даты_приобретения_не_даёт_провести_границу_владения() {
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
-        entry.push_lot(лот_с_датой(instrument, Some(date!(2024 - 03 - 01))));
+        entry.push_lot(лот_с_датой(
+            instrument,
+            Some(date!(2024 - 03 - 01)),
+        ));
         entry.push_lot(лот_с_датой(instrument, None));
 
         assert_eq!(entry.earliest_acquired(), None);
@@ -1272,7 +1281,10 @@ mod tests {
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
         entry.unpriced = qty(5);
-        entry.push_lot(лот_с_датой(instrument, Some(date!(2024 - 03 - 01))));
+        entry.push_lot(лот_с_датой(
+            instrument,
+            Some(date!(2024 - 03 - 01)),
+        ));
 
         assert_eq!(entry.earliest_acquired(), None);
     }
@@ -1307,7 +1319,11 @@ mod tests {
         book.apply(&sell(&продажа, 3), &rules).unwrap();
 
         let entry = book.entry(&key(&январь)).unwrap();
-        assert_eq!(entry.lots().len(), 1, "январская партия должна быть списана");
+        assert_eq!(
+            entry.lots().len(),
+            1,
+            "январская партия должна быть списана"
+        );
         assert_eq!(
             entry.earliest_acquired(),
             Some(TradeDate(date!(2026 - 01 - 10)))

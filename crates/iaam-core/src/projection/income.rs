@@ -812,7 +812,12 @@ mod tests {
         let mut ledger = IncomeLedger::default();
 
         ledger
-            .apply(&redemption(account, instrument, date!(2026 - 09 - 20), 1000))
+            .apply(&redemption(
+                account,
+                instrument,
+                date!(2026 - 09 - 20),
+                1000,
+            ))
             .expect("погашение принимается");
 
         let key = LotKey {
@@ -1007,7 +1012,14 @@ mod tests {
             error,
             IncomeError::Money(MoneyError::CurrencyMismatch { .. })
         ));
-        assert!(ledger.postings(&LotKey { account, instrument }).is_empty());
+        assert!(
+            ledger
+                .postings(&LotKey {
+                    account,
+                    instrument
+                })
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1028,7 +1040,14 @@ mod tests {
             .expect_err("переполнение обязано дойти до вызывающего");
 
         assert!(matches!(error, IncomeError::Money(MoneyError::Overflow)));
-        assert!(ledger.postings(&LotKey { account, instrument }).is_empty());
+        assert!(
+            ledger
+                .postings(&LotKey {
+                    account,
+                    instrument
+                })
+                .is_empty()
+        );
     }
 
     #[test]

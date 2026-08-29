@@ -204,8 +204,14 @@ mod tests {
         // сузить и отсрочку.
         let rule = PostingMatchV1::new();
         assert!(rule.unreceived(&[coupon(1)], &[], march(21)).is_empty());
-        assert_eq!(rule.unreceived(&[coupon(1)], &[], march(22)), vec![coupon(1)]);
-        assert_eq!(rule.unreceived(&[coupon(1)], &[], march(23)), vec![coupon(1)]);
+        assert_eq!(
+            rule.unreceived(&[coupon(1)], &[], march(22)),
+            vec![coupon(1)]
+        );
+        assert_eq!(
+            rule.unreceived(&[coupon(1)], &[], march(23)),
+            vec![coupon(1)]
+        );
     }
 
     #[test]
@@ -228,7 +234,10 @@ mod tests {
     #[test]
     fn a_payment_inside_the_window_is_received() {
         let rule = PostingMatchV1::new();
-        assert!(rule.unreceived(&[coupon(15)], &[fact(18)], late_enough()).is_empty());
+        assert!(
+            rule.unreceived(&[coupon(15)], &[fact(18)], late_enough())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -236,7 +245,10 @@ mod tests {
         // Нижняя граница окна включающая: деньги, пришедшие день в день,
         // — это исполнение плана, а не другая выплата.
         let rule = PostingMatchV1::new();
-        assert!(rule.unreceived(&[coupon(15)], &[fact(15)], late_enough()).is_empty());
+        assert!(
+            rule.unreceived(&[coupon(15)], &[fact(15)], late_enough())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -244,8 +256,14 @@ mod tests {
         // 21 календарный день — это 10 рабочих дней депозитарной цепочки
         // (ст. 8.7 ФЗ 39-ФЗ), растянутые через праздничный период.
         let rule = PostingMatchV1::new();
-        assert!(rule.unreceived(&[coupon(1)], &[fact(22)], late_enough()).is_empty());
-        assert_eq!(rule.unreceived(&[coupon(1)], &[fact(23)], late_enough()), vec![coupon(1)]);
+        assert!(
+            rule.unreceived(&[coupon(1)], &[fact(22)], late_enough())
+                .is_empty()
+        );
+        assert_eq!(
+            rule.unreceived(&[coupon(1)], &[fact(23)], late_enough()),
+            vec![coupon(1)]
+        );
     }
 
     #[test]
@@ -253,14 +271,20 @@ mod tests {
         // Окно одностороннее. Факт раньше плановой даты — это другая
         // выплата, а не ранний приход этой.
         let rule = PostingMatchV1::new();
-        assert_eq!(rule.unreceived(&[coupon(15)], &[fact(14)], late_enough()), vec![coupon(15)]);
+        assert_eq!(
+            rule.unreceived(&[coupon(15)], &[fact(14)], late_enough()),
+            vec![coupon(15)]
+        );
     }
 
     #[test]
     fn a_coupon_fact_does_not_confirm_a_principal_return() {
         let rule = PostingMatchV1::new();
         let principal = scheduled(15, PostingKind::PrincipalReturn);
-        assert_eq!(rule.unreceived(&[principal], &[fact(18)], late_enough()), vec![principal]);
+        assert_eq!(
+            rule.unreceived(&[principal], &[fact(18)], late_enough()),
+            vec![principal]
+        );
     }
 
     #[test]
@@ -277,10 +301,17 @@ mod tests {
     fn an_offer_settlement_is_confirmed_only_by_its_own_kind() {
         let rule = PostingMatchV1::new();
         let offer = scheduled(15, PostingKind::OfferSettlement);
-        assert_eq!(rule.unreceived(&[offer], &[fact(18)], late_enough()), vec![offer]);
+        assert_eq!(
+            rule.unreceived(&[offer], &[fact(18)], late_enough()),
+            vec![offer]
+        );
         assert!(
-            rule.unreceived(&[offer], &[received(18, PostingKind::OfferSettlement, 18)], late_enough())
-                .is_empty()
+            rule.unreceived(
+                &[offer],
+                &[received(18, PostingKind::OfferSettlement, 18)],
+                late_enough()
+            )
+            .is_empty()
         );
     }
 
@@ -301,8 +332,12 @@ mod tests {
         // достаться второй выплате, а не пропасть вместе с первым.
         let rule = PostingMatchV1::new();
         assert!(
-            rule.unreceived(&[coupon(1), coupon(10)], &[fact(11), fact(12)], late_enough())
-                .is_empty()
+            rule.unreceived(
+                &[coupon(1), coupon(10)],
+                &[fact(11), fact(12)],
+                late_enough()
+            )
+            .is_empty()
         );
     }
 
@@ -312,16 +347,28 @@ mod tests {
         // поэтому поздняя выплата остаётся с поздним фактом, а не пустой.
         let rule = PostingMatchV1::new();
         assert!(
-            rule.unreceived(&[coupon(1), coupon(20)], &[fact(2), fact(21)], late_enough())
-                .is_empty()
+            rule.unreceived(
+                &[coupon(1), coupon(20)],
+                &[fact(2), fact(21)],
+                late_enough()
+            )
+            .is_empty()
         );
     }
 
     #[test]
     fn the_verdict_does_not_depend_on_the_order_of_the_inputs() {
         let rule = PostingMatchV1::new();
-        let forward = rule.unreceived(&[coupon(1), coupon(10)], &[fact(2), fact(11)], late_enough());
-        let reversed = rule.unreceived(&[coupon(10), coupon(1)], &[fact(11), fact(2)], late_enough());
+        let forward = rule.unreceived(
+            &[coupon(1), coupon(10)],
+            &[fact(2), fact(11)],
+            late_enough(),
+        );
+        let reversed = rule.unreceived(
+            &[coupon(10), coupon(1)],
+            &[fact(11), fact(2)],
+            late_enough(),
+        );
         assert_eq!(forward, reversed);
         assert!(forward.is_empty());
     }
@@ -362,8 +409,14 @@ mod tests {
         // закрывает ровно одну из них.
         let rule = PostingMatchV1::new();
         let twice = [coupon(10), coupon(10)];
-        assert_eq!(rule.unreceived(&twice, &[fact(11)], late_enough()), vec![coupon(10)]);
-        assert!(rule.unreceived(&twice, &[fact(11), fact(12)], late_enough()).is_empty());
+        assert_eq!(
+            rule.unreceived(&twice, &[fact(11)], late_enough()),
+            vec![coupon(10)]
+        );
+        assert!(
+            rule.unreceived(&twice, &[fact(11), fact(12)], late_enough())
+                .is_empty()
+        );
     }
 
     #[test]

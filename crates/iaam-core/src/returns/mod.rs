@@ -1593,8 +1593,7 @@ fn reconcile_past_postings(
         });
     }
 
-    let Some(acquired) =
-        lots.and_then(crate::projection::lots::InstrumentLots::earliest_acquired)
+    let Some(acquired) = lots.and_then(crate::projection::lots::InstrumentLots::earliest_acquired)
     else {
         return unverifiable(UnverifiableReason::AcquisitionDateUnknown);
     };
@@ -5124,7 +5123,8 @@ mod tests {
         let state = состояние_с_номиналами(state, faces);
         // Цена наблюдена накануне отчёта: политика отбора цену из
         // будущего не берёт, и позиция осталась бы непокрытой.
-        let candidate = рыночная_цена(instrument, as_of.saturating_sub(time::Duration::days(1)));
+        let candidate =
+            рыночная_цена(instrument, as_of.saturating_sub(time::Duration::days(1)));
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let ledger = ReconciliationLedger::default();
         let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
@@ -5145,7 +5145,10 @@ mod tests {
         returns_report(&state, &request)
     }
 
-    fn содержит(report: &ReturnsReport, predicate: impl Fn(&MaterialIssue) -> bool) -> bool {
+    fn содержит(
+        report: &ReturnsReport,
+        predicate: impl Fn(&MaterialIssue) -> bool,
+    ) -> bool {
         report
             .data_quality
             .material_issues
@@ -5341,12 +5344,14 @@ mod tests {
     #[test]
     fn the_history_horizon_is_reported_but_does_not_make_the_answer_incomplete() {
         // Зеркалит `HistoryStartsAt`: факт о периоде, а не дефект.
-        assert!(!MaterialIssue::ScheduledPostingUnverifiable {
-            account: AccountId::new_random(),
-            instrument: InstrumentId::new_random(),
-            reason: UnverifiableReason::HistoryStartsAfterSchedule,
-        }
-        .is_defect());
+        assert!(
+            !MaterialIssue::ScheduledPostingUnverifiable {
+                account: AccountId::new_random(),
+                instrument: InstrumentId::new_random(),
+                reason: UnverifiableReason::HistoryStartsAfterSchedule,
+            }
+            .is_defect()
+        );
     }
 
     #[test]
@@ -5567,11 +5572,17 @@ mod tests {
             &schedule,
             date!(2026 - 07 - 06),
         );
-        assert_eq!(непринятые(&истёк).len(), 1, "проблемы: {:?}", непринятые(&истёк));
+        assert_eq!(
+            непринятые(&истёк).len(),
+            1,
+            "проблемы: {:?}",
+            непринятые(&истёк)
+        );
     }
 
     #[test]
-    fn a_payment_whose_waiting_window_is_still_running_is_not_a_reason_to_call_the_report_unverifiable() {
+    fn a_payment_whose_waiting_window_is_still_running_is_not_a_reason_to_call_the_report_unverifiable()
+     {
         // Выплата, срок которой ещё идёт, исключается из проверки
         // целиком: она не повод ни для тревоги, ни для причины
         // недоказуемости. Здесь её дата раньше первого события журнала
@@ -5612,8 +5623,11 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events =
-            журнал_с_проданной_ранней_партией(account, instrument, &[date!(2026 - 06 - 16)]);
+        let events = журнал_с_проданной_ранней_партией(
+            account,
+            instrument,
+            &[date!(2026 - 06 - 16)],
+        );
         let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
 
         let issues = непринятые(&report);
@@ -5668,8 +5682,18 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events = журнал_бумаги_в_двух_депозитариях(account, instrument, &[date!(2026 - 03 - 16)]);
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000", "1000"], &schedule);
+        let events = журнал_бумаги_в_двух_депозитариях(
+            account,
+            instrument,
+            &[date!(2026 - 03 - 16)],
+        );
+        let report = отчёт_сверки(
+            &[account],
+            instrument,
+            &events,
+            &["1000", "1000"],
+            &schedule,
+        );
 
         assert_eq!(
             report.bond_metrics.len(),
@@ -5701,7 +5725,13 @@ mod tests {
             instrument,
             &[date!(2026 - 03 - 16), date!(2026 - 06 - 16)],
         );
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000", "1000"], &schedule);
+        let report = отчёт_сверки(
+            &[account],
+            instrument,
+            &events,
+            &["1000", "1000"],
+            &schedule,
+        );
 
         assert_eq!(report.bond_metrics.len(), 2);
         assert!(непринятые(&report).is_empty());
@@ -5735,7 +5765,12 @@ mod tests {
             ),
         ];
         events.extend(факты.iter().enumerate().map(|(index, day)| {
-            купонный_факт(account, instrument, *day, 4 + u32::try_from(index).expect("номер факта"))
+            купонный_факт(
+                account,
+                instrument,
+                *day,
+                4 + u32::try_from(index).expect("номер факта"),
+            )
         }));
         events
     }
@@ -5754,7 +5789,9 @@ mod tests {
             date!(2026 - 12 - 15),
         );
         let mut events = журнал_с_пропущенным_купоном(first, instrument);
-        events.extend(журнал_с_пропущенным_купоном(second, instrument));
+        events.extend(журнал_с_пропущенным_купоном(
+            second, instrument,
+        ));
         let report = отчёт_сверки(
             &[first, second],
             instrument,

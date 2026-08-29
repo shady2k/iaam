@@ -339,7 +339,9 @@ fn отчёт(сценарий: &Сценарий<'_>) -> ReturnsReport {
 ///
 /// Число замен проверяется: если поле переименуют, молчаливая подмена
 /// нуля партий вернула бы весь файл в проверку пустоты.
-fn состояние_с_номиналом(state: &LedgerState, номинал: &str) -> LedgerState {
+fn состояние_с_номиналом(
+    state: &LedgerState, номинал: &str
+) -> LedgerState {
     fn известный(номинал: &str) -> ciborium::Value {
         let principal = PrincipalState::known(за_единицу(номинал), за_единицу(номинал))
             .expect("известный номинал");
@@ -348,7 +350,11 @@ fn состояние_с_номиналом(state: &LedgerState, номинал:
         ciborium::de::from_reader(bytes.as_slice()).expect("разбор номинала")
     }
 
-    fn подменить(value: &mut ciborium::Value, номинал: &ciborium::Value, заменено: &mut usize) {
+    fn подменить(
+        value: &mut ciborium::Value,
+        номинал: &ciborium::Value,
+        заменено: &mut usize,
+    ) {
         match value {
             ciborium::Value::Map(entries) => {
                 for (key, value) in entries {
@@ -431,10 +437,7 @@ fn поток_построен(report: &ReturnsReport) {
     );
     for позиция in &report.bond_metrics {
         assert!(
-            matches!(
-                позиция.scenarios[0].prospective.metrics,
-                Computed::Value(_)
-            ),
+            matches!(позиция.scenarios[0].prospective.metrics, Computed::Value(_)),
             "поток не построен: {:?}",
             позиция.scenarios[0].prospective.metrics
         );
@@ -471,7 +474,9 @@ fn график_пятилетней_бумаги() -> BondSchedule {
 /// Сдвиг факта от плановой даты гуляет по всему разрешённому диапазону
 /// 1–7 дней: реальная выплата приходит не день в день, и тест обязан
 /// быть зелёным именно на таком журнале, а не на выдуманном идеальном.
-fn журнал_пятилетней_истории(пропущенный: Option<Date>) -> Vec<Event> {
+fn журнал_пятилетней_истории(
+    пропущенный: Option<Date>
+) -> Vec<Event> {
     let mut events = vec![
         пополнение(date!(2021 - 07 - 25), 1),
         покупка(ДЕПОЗИТАРИЙ, date!(2021 - 08 - 01), 2),
@@ -482,7 +487,10 @@ fn журнал_пятилетней_истории(пропущенный: Opti
             continue;
         }
         let сдвиг = i64::try_from(индекс % 7).expect("номер купона") + 1;
-        events.push(купон(дата.saturating_add(Duration::days(сдвиг)), номер));
+        events.push(купон(
+            дата.saturating_add(Duration::days(сдвиг)),
+            номер,
+        ));
         номер += 1;
     }
     events
@@ -502,7 +510,11 @@ fn five_years_of_coupons_received_late_but_received_raise_no_alarm() {
     });
 
     поток_построен(&report);
-    assert!(вердикт(&report).is_empty(), "вердикт: {:?}", вердикт(&report));
+    assert!(
+        вердикт(&report).is_empty(),
+        "вердикт: {:?}",
+        вердикт(&report)
+    );
 }
 
 #[test]
@@ -530,7 +542,11 @@ fn an_amortised_bond_closes_its_principal_returns_with_partial_redemptions() {
     });
 
     поток_построен(&report);
-    assert!(вердикт(&report).is_empty(), "вердикт: {:?}", вердикт(&report));
+    assert!(
+        вердикт(&report).is_empty(),
+        "вердикт: {:?}",
+        вердикт(&report)
+    );
 
     // Тот же журнал без амортизационной выплаты: пропущен возврат
     // номинала, и назван он должен быть именно как `PrincipalReturn`.
@@ -623,7 +639,10 @@ fn the_waiting_window_expires_exactly_twenty_one_days_after_the_scheduled_date()
     // что сдвиг на день в любую сторону — это либо ложная тревога на
     // здоровой бумаге, либо молчание на пропущенной выплате.
     let плановая = date!(2026 - 03 - 15);
-    let график = график(&[плановая, date!(2026 - 09 - 15)], &[(date!(2026 - 09 - 15), "100")]);
+    let график = график(
+        &[плановая, date!(2026 - 09 - 15)],
+        &[(date!(2026 - 09 - 15), "100")],
+    );
     let события = vec![
         пополнение(date!(2026 - 01 - 05), 1),
         покупка(ДЕПОЗИТАРИЙ, date!(2026 - 01 - 10), 2),
@@ -647,7 +666,12 @@ fn the_waiting_window_expires_exactly_twenty_one_days_after_the_scheduled_date()
 
     let истёк = на(21);
     поток_построен(&истёк);
-    assert_eq!(непринятые(&истёк).len(), 1, "проблемы: {:?}", непринятые(&истёк));
+    assert_eq!(
+        непринятые(&истёк).len(),
+        1,
+        "проблемы: {:?}",
+        непринятые(&истёк)
+    );
 
     let давно_истёк = на(22);
     поток_построен(&давно_истёк);
@@ -664,7 +688,9 @@ fn the_waiting_window_expires_exactly_twenty_one_days_after_the_scheduled_date()
 /// Один депозитарий на весь журнал: иначе продажа списала бы бумагу
 /// оттуда, куда её не клали, и позиций стало бы три — тест проверял бы
 /// задвоение, а не границу владения.
-fn журнал_с_проданной_ранней_партией(факты: &[Date]) -> Vec<Event> {
+fn журнал_с_проданной_ранней_партией(
+    факты: &[Date]
+) -> Vec<Event> {
     let mut events = vec![
         пополнение(date!(2026 - 01 - 05), 1),
         покупка(ДЕПОЗИТАРИЙ, date!(2026 - 01 - 10), 2),
@@ -672,7 +698,10 @@ fn журнал_с_проданной_ранней_партией(факты: &[
         продажа(ДЕПОЗИТАРИЙ, date!(2026 - 07 - 10), 4),
     ];
     for (индекс, день) in факты.iter().enumerate() {
-        events.push(купон(*день, 10 + u32::try_from(индекс).expect("номер факта")));
+        events.push(купон(
+            *день,
+            10 + u32::try_from(индекс).expect("номер факта"),
+        ));
     }
     events
 }
@@ -697,7 +726,9 @@ fn a_coupon_missed_while_the_early_lot_was_held_is_named_after_it_was_sold() {
     // мартовский пропуск: владелец потерял бы деньги ровно там, где
     // сверка обязана его предупредить.
     let report = отчёт(&Сценарий {
-        события: &журнал_с_проданной_ранней_партией(&[date!(2026 - 06 - 16)]),
+        события: &журнал_с_проданной_ранней_партией(
+            &[date!(2026 - 06 - 16)],
+        ),
         график: &график_двух_купонов(),
         дата_отчёта: ДАТА_ОТЧЁТА,
         номинал: Some(НОМИНАЛ),
@@ -732,7 +763,11 @@ fn two_purchases_with_a_complete_history_raise_no_alarm() {
     });
 
     поток_построен(&report);
-    assert!(вердикт(&report).is_empty(), "вердикт: {:?}", вердикт(&report));
+    assert!(
+        вердикт(&report).is_empty(),
+        "вердикт: {:?}",
+        вердикт(&report)
+    );
 }
 
 #[test]
@@ -787,8 +822,8 @@ fn переставленный(события: &[Event], семя: u64) -> Vec<
         состояние = состояние
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        let выбор = usize::try_from(состояние >> 33).expect("старшие разряды семени")
-            % (индекс + 1);
+        let выбор =
+            usize::try_from(состояние >> 33).expect("старшие разряды семени") % (индекс + 1);
         порядок.swap(индекс, выбор);
     }
     порядок
@@ -894,13 +929,17 @@ fn without_the_face_value_the_reconciliation_is_silently_skipped() {
     });
     assert!(
         matches!(
-            без_номинала.bond_metrics[0].scenarios[0].prospective.metrics,
+            без_номинала.bond_metrics[0].scenarios[0]
+                .prospective
+                .metrics,
             Computed::NotComputable {
                 reason: NotComputable::PrincipalUnknown
             }
         ),
         "без номинала поток обязан отказываться по названной причине: {:?}",
-        без_номинала.bond_metrics[0].scenarios[0].prospective.metrics
+        без_номинала.bond_metrics[0].scenarios[0]
+            .prospective
+            .metrics
     );
     assert!(
         вердикт(&без_номинала).is_empty(),

@@ -742,6 +742,26 @@ mod tests {
     }
 
     #[test]
+    fn a_cash_movement_date_becomes_cash_posted_and_not_settled() {
+        // Денежное движение доказывает дату зачисления, но не дату
+        // расчётов по сделке: это разные факты в журнале.
+        let operation = operation(
+            AccountId::new_random(),
+            OperationKind::Withdrawal {
+                amount_minor: 1,
+                currency: CurrencyCode::Rub,
+            },
+            date!(2026 - 03 - 10),
+            None,
+            Some(date!(2026 - 03 - 12)),
+            None,
+        );
+
+        assert_eq!(operation.dates.cash_posted, Some(date!(2026 - 03 - 12)));
+        assert_eq!(operation.dates.settled, None);
+    }
+
+    #[test]
     fn a_missing_settlement_column_stays_unknown() {
         // Отсутствие колонки означает неизвестную дату расчётов; дата сделки
         // не доказывает, что расчёты произошли в тот же день.

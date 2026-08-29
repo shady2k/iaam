@@ -288,7 +288,6 @@ impl InstrumentLots {
 
     /// Восстановленная партия встаёт в голову очереди FIFO: она старше
     /// всего, что система видела.
-
     fn insert_restored_lot_with_settlement(&mut self, lot: Lot, settlement: SettlementKnowledge) {
         self.acquisitions.observe(lot.acquired);
         self.ownership.observe(lot.quantity, settlement);

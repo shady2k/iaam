@@ -23,7 +23,7 @@ use lot_disposal::{FifoV1, LotDisposalRule};
 
 pub use cashflow::{
     CashflowError, CashflowInput, CashflowPlan, CashflowProjection, CashflowProjectionV1,
-    CashflowProjectionVersion, ExpectedPosting, PostingKind,
+    CashflowProjectionVersion, ExpectedPosting, PostingKind, ScheduledPosting,
 };
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
 pub use valuation::{

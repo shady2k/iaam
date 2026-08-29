@@ -13,6 +13,7 @@ pub mod income;
 pub mod invariants;
 pub mod lots;
 pub mod offers;
+pub mod ownership;
 pub mod state;
 
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,7 @@ use state::{LedgerState, StateHash};
 
 /// Версия формата проекции. Снимок, построенный другой версией,
 /// продвигать нельзя: смысл полей мог измениться.
-pub const PROJECTION_VERSION: u32 = 5;
+pub const PROJECTION_VERSION: u32 = 6;
 
 /// Неизменяемый вход проекции: границы контура и версии правил.
 ///

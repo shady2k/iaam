@@ -50,6 +50,19 @@ impl PostingMatchV2 {
         PostingMatchVersion(2)
     }
 
+    /// Истёк ли срок ожидания выплаты к дате отчёта.
+    ///
+    /// Пока деньги ещё могут идти по депозитарной цепочке, отсутствие
+    /// факта не является пропуском. Срок совпадает с окном сопоставления.
+    #[must_use]
+    pub fn is_due(&self, scheduled: &ScheduledPosting, as_of: Date) -> bool {
+        // `saturating_add`: крайняя дата не должна ронять расчёт отчёта.
+        scheduled
+            .date
+            .saturating_add(Duration::days(i64::from(self.window_days)))
+            <= as_of
+    }
+
     /// Судить все выплаты, распределив каждый факт не более одного раза.
     #[must_use]
     pub fn judge_all(

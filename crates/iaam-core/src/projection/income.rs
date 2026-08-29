@@ -17,6 +17,7 @@ use time::Date;
 use crate::event::Event;
 use crate::event::corporate_action::CorporateAction;
 use crate::event::kind::{EventKind, IncomeKind};
+use crate::event::offer::OfferExerciseAction;
 use crate::ids::EventId;
 use crate::money::Money;
 use crate::projection::lots::LotKey;
@@ -118,9 +119,15 @@ impl IncomeLedger {
         }
     }
 
-    /// Разбор исчерпывающий намеренно: задача о расчёте по оферте
-    /// добавит свой член, и компилятор обязан напомнить о нём,
-    /// а не пропустить событие через `_`.
+    /// Все три источника запланированных выплат теперь здесь: купон
+    /// приходит `Income`, возврат номинала — `CorporateAction`,
+    /// расчёт по оферте — `OfferExercise`.
+    ///
+    /// Разбор исчерпывающий намеренно, и `_ =>` тут запрещён: новый
+    /// член [`EventKind`] обязан сломать сборку и заставить автора
+    /// ответить, выплата это или нет. Молчаливый `_` ответил бы за него
+    /// «нет» — и пропавший факт вышел бы не ошибкой сборки, а ложной
+    /// тревогой сверки у владельца.
     pub fn apply(&mut self, event: &Event) -> Result<(), IncomeError> {
         match &event.kind {
             EventKind::Income {
@@ -150,12 +157,12 @@ impl IncomeLedger {
             | EventKind::OpeningPosition { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
-            | EventKind::ControlAssertion { .. }
-            | EventKind::OfferExercise { .. } => Ok(()),
+            | EventKind::ControlAssertion { .. } => Ok(()),
             EventKind::CorporateAction { action } => {
                 self.apply_corporate_action(event, action);
                 Ok(())
             }
+            EventKind::OfferExercise { action } => self.apply_offer_exercise(event, action),
         }
     }
 
@@ -205,6 +212,69 @@ impl IncomeLedger {
         );
     }
 
+    /// Расчёт по оферте — третий и последний способ, которым
+    /// запланированная выплата приходит деньгами (§3.3). Заявка и её
+    /// отзыв денег не двигают: бумага остаётся у владельца, пока выкуп
+    /// не состоялся, и их состояние ведёт `super::offers::OfferBook`.
+    ///
+    /// Сумма считается тем же порядком, что и выручка в книге лотов
+    /// (`lots.rs:746`) и денежная нога самого события
+    /// (`event/mod.rs:732`): иначе один и тот же выкуп значил бы в трёх
+    /// местах три разные суммы. Ни комиссия, ни НКД не подставляются
+    /// нулём (§4.9) — отсутствующего слагаемого в сумме просто нет,
+    /// а объявленное складывается через `try_add`/`try_sub`, чтобы
+    /// переполнение и чужая валюта доехали до вызывающего ошибкой,
+    /// а не молчанием.
+    ///
+    /// Единственный из трёх разборов, который может не сойтись: у купона
+    /// и возврата номинала сумма берётся из события как есть, считать
+    /// там нечего.
+    fn apply_offer_exercise(
+        &mut self,
+        event: &Event,
+        action: &OfferExerciseAction,
+    ) -> Result<(), IncomeError> {
+        // Разбор членов, а не отсев одним образцом: `let ... else`
+        // принял бы за «денег не было» и будущий член семейства,
+        // о котором компилятор промолчал бы.
+        match action {
+            OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => Ok(()),
+            OfferExerciseAction::Settled {
+                instrument,
+                gross,
+                fee,
+                accrued_interest,
+                ..
+            } => {
+                let key = LotKey {
+                    account: event.account,
+                    instrument: *instrument,
+                };
+                let Some(date) = Self::payment_date(event) else {
+                    self.mark(key, IncomeGap::PaymentDateUnknown);
+                    return Ok(());
+                };
+                let mut amount = *gross;
+                if let Some(interest) = accrued_interest {
+                    amount = amount.try_add(*interest)?;
+                }
+                if let Some(fee) = fee {
+                    amount = amount.try_sub(*fee)?;
+                }
+                self.record(
+                    key,
+                    ReceivedPosting {
+                        event: event.id,
+                        date,
+                        amount,
+                        kind: PostingKind::OfferSettlement,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
     fn apply_income(
         &mut self,
         event: &Event,
@@ -243,9 +313,10 @@ mod tests {
     use crate::event::corporate_action::{BasisTransferRule, FractionalTreatment};
     use crate::event::kind::{EventKind, IncomeKind};
     use crate::event::leg::Leg;
+    use crate::event::offer::{OfferSubmissionId, OfferWindowId};
     use crate::event::test_support::event_with;
     use crate::ids::{AccountId, CustodyId, InstrumentId};
-    use crate::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use crate::money::{CurrencyCode, Money, MoneyError, PerUnitAmount, PostedMinor, Quantity};
     use crate::numeric::decimal::Dec;
     use crate::projection::lots::LotKey;
     use crate::rules::PostingKind;
@@ -780,6 +851,229 @@ mod tests {
                 account, instrument, 300,
             ))
             .expect("принимается");
+
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        assert!(ledger.postings(&key).is_empty());
+        assert_eq!(ledger.gap(&key), Some(IncomeGap::PaymentDateUnknown));
+    }
+
+    /// Выкуп по оферте в конверте `test_support`. Ноги намеренно пусты:
+    /// [`IncomeLedger`] читает у события вид, даты и величины действия,
+    /// а форму ног проверяет `Event::validate_structure`
+    /// (`event/mod.rs:472`) — собрать их здесь значило бы повторить
+    /// в фикстуре ровно ту арифметику, которую тест и проверяет.
+    fn offer_settled(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        gross: Money,
+        fee: Option<Money>,
+        accrued_interest: Option<Money>,
+    ) -> Event {
+        event_with(
+            account,
+            day,
+            1,
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Settled {
+                    submission: OfferSubmissionId::new_random(),
+                    instrument,
+                    custody: CustodyId::new_random(),
+                    quantity: qty(4),
+                    gross,
+                    fee,
+                    accrued_interest,
+                },
+            },
+            Vec::new(),
+        )
+    }
+
+    fn offer_submitted(account: AccountId, instrument: InstrumentId, day: Date) -> Event {
+        event_with(
+            account,
+            day,
+            1,
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Submitted {
+                    submission: OfferSubmissionId::new_random(),
+                    window: OfferWindowId::new_random(),
+                    instrument,
+                    quantity: qty(4),
+                },
+            },
+            Vec::new(),
+        )
+    }
+
+    fn offer_cancelled(account: AccountId, day: Date) -> Event {
+        event_with(
+            account,
+            day,
+            1,
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Cancelled {
+                    submission: OfferSubmissionId::new_random(),
+                    quantity: qty(4),
+                },
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn an_offer_settlement_is_a_dated_fact() {
+        // Выкуп по оферте — третий способ, которым запланированная
+        // выплата приходит деньгами: в графике он значится
+        // `PostingKind::OfferSettlement` (`rules/cashflow.rs:303`).
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&offer_settled(
+                account,
+                instrument,
+                date!(2026 - 07 - 10),
+                rub(1_000),
+                Some(rub(30)),
+                Some(rub(25)),
+            ))
+            .expect("выкуп принимается");
+
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        let postings = ledger.postings(&key);
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].kind, PostingKind::OfferSettlement);
+        assert_eq!(postings[0].date, date!(2026 - 07 - 10));
+        // 1000 + 25 - 30
+        assert_eq!(postings[0].amount, rub(995));
+        assert_eq!(ledger.gap(&key), None);
+    }
+
+    #[test]
+    fn an_unstated_fee_and_interest_are_absent_from_the_sum_rather_than_zero() {
+        // Отсутствующая величина не подставляется нулём (§4.9): в сумме
+        // её просто нет, и расчёт равен объявленному `gross`.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&offer_settled(
+                account,
+                instrument,
+                date!(2026 - 07 - 10),
+                rub(1_000),
+                None,
+                None,
+            ))
+            .expect("выкуп без комиссии и НКД принимается");
+
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        assert_eq!(ledger.postings(&key)[0].amount, rub(1_000));
+    }
+
+    #[test]
+    fn a_zero_fee_in_another_currency_is_an_error_while_an_absent_one_is_not() {
+        // Ноль — такая же величина, как любая другая, и валюту он несёт:
+        // подставить его вместо отсутствующей комиссии значило бы
+        // подменить отказ считать молчаливым согласием.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        let error = ledger
+            .apply(&offer_settled(
+                account,
+                instrument,
+                date!(2026 - 07 - 10),
+                rub(1_000),
+                Some(Money::new(PostedMinor::new(0), CurrencyCode::Usd)),
+                None,
+            ))
+            .expect_err("комиссия в чужой валюте не складывается с рублями");
+
+        assert!(matches!(
+            error,
+            IncomeError::Money(MoneyError::CurrencyMismatch { .. })
+        ));
+        assert!(ledger.postings(&LotKey { account, instrument }).is_empty());
+    }
+
+    #[test]
+    fn an_overflowing_settlement_is_an_error_rather_than_a_panic_or_a_silent_skip() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        let error = ledger
+            .apply(&offer_settled(
+                account,
+                instrument,
+                date!(2026 - 07 - 10),
+                Money::new(PostedMinor::new(i64::MAX), CurrencyCode::Rub),
+                None,
+                Some(rub(1)),
+            ))
+            .expect_err("переполнение обязано дойти до вызывающего");
+
+        assert!(matches!(error, IncomeError::Money(MoneyError::Overflow)));
+        assert!(ledger.postings(&LotKey { account, instrument }).is_empty());
+    }
+
+    #[test]
+    fn a_submitted_offer_moves_no_money_and_creates_no_fact() {
+        // Заявка денег не двигает: бумага остаётся у владельца, пока
+        // выкуп не состоялся. Её состояние ведёт `OfferBook`.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&offer_submitted(account, instrument, date!(2026 - 07 - 01)))
+            .expect("заявка принимается");
+
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_offer_moves_no_money_and_creates_no_fact() {
+        let account = AccountId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&offer_cancelled(account, date!(2026 - 07 - 05)))
+            .expect("отзыв принимается");
+
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn an_offer_settlement_without_a_payment_date_cannot_be_dated() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        let mut event = offer_settled(
+            account,
+            instrument,
+            date!(2026 - 07 - 10),
+            rub(1_000),
+            None,
+            None,
+        );
+        event.dates = EventDates::empty();
+        ledger.apply(&event).expect("принимается");
 
         let key = LotKey {
             account,

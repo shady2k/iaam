@@ -10,6 +10,7 @@
 //! невычислимым. Нулевая заглушка здесь означала бы выдуманную прибыль,
 //! равную всей выручке.
 
+use super::ownership::Ownership;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,7 @@ use crate::rules::lot_disposal::{
     RuleId, split_basis,
 };
 use crate::rules::{LotRuleVersion, RuleRegistry};
+use crate::settlement::{SettlementKnowledge, SettlementLagPolicy};
 
 /// Лоты не различают место хранения: перевод бумаги между депозитариями
 /// не является приобретением и не создаёт новой партии.
@@ -192,6 +194,11 @@ pub struct InstrumentLots {
     unpriced_income: Option<Money>,
     /// Приобретения, когда-либо наблюдённые по паре.
     acquisitions: AcquisitionHistory,
+    /// История изменений количества со знанием о расчёте.
+    ///
+    /// `#[serde(default)]` намеренно нет: снимок без истории нельзя честно
+    /// считать позицией без владения; его должен отвергнуть номер проекции.
+    ownership: super::ownership::OwnershipHistory,
 }
 
 /// Пустая книга по инструменту. Пишется вручную, потому что `Quantity`
@@ -210,6 +217,7 @@ impl Default for InstrumentLots {
             unallocated_income: None,
             unpriced_income: None,
             acquisitions: AcquisitionHistory::default(),
+            ownership: super::ownership::OwnershipHistory::default(),
         }
     }
 }
@@ -258,18 +266,32 @@ impl InstrumentLots {
         self.acquisitions.lower_bound()
     }
 
+    /// Статус владения на дату с учётом всех изменений количества.
+    #[must_use]
+    pub fn ownership_at(&self, day: time::Date) -> Ownership {
+        self.ownership.ownership_at(day)
+    }
+
     /// Единственная дверь для новой партии: история приобретений
     /// обязана пополняться вместе с партиями, иначе граница владения
     /// разойдётся с журналом.
+    #[cfg(test)]
     fn push_lot(&mut self, lot: Lot) {
+        self.push_lot_with_settlement(lot, SettlementKnowledge::Unbounded);
+    }
+
+    fn push_lot_with_settlement(&mut self, lot: Lot, settlement: SettlementKnowledge) {
         self.acquisitions.observe(lot.acquired);
+        self.ownership.observe(lot.quantity, settlement);
         self.lots.push(lot);
     }
 
     /// Восстановленная партия встаёт в голову очереди FIFO: она старше
     /// всего, что система видела.
-    fn insert_restored_lot(&mut self, lot: Lot) {
+
+    fn insert_restored_lot_with_settlement(&mut self, lot: Lot, settlement: SettlementKnowledge) {
         self.acquisitions.observe(lot.acquired);
+        self.ownership.observe(lot.quantity, settlement);
         self.lots.insert(0, lot);
     }
 
@@ -504,7 +526,6 @@ struct AmortisationFacts {
     returned_per_unit: PerUnitAmount,
     compensation: Money,
 }
-
 /// Факты замещения, нужные книге лотов.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ConversionFacts {
@@ -530,6 +551,7 @@ pub struct LotBook {
     /// и этого поля не содержат.
     #[serde(default = "default_amortisation_version")]
     amortisation_version: AmortisationRuleVersion,
+    settlement_policy: SettlementLagPolicy,
 }
 
 /// Версия правила амортизации в снимке, записанном до E3.4.
@@ -549,6 +571,7 @@ impl LotBook {
             rule_version,
             applied_rule: None,
             amortisation_version: default_amortisation_version(),
+            settlement_policy: SettlementLagPolicy::default(),
         }
     }
 
@@ -556,6 +579,12 @@ impl LotBook {
     #[must_use]
     pub fn with_amortisation_version(mut self, version: AmortisationRuleVersion) -> Self {
         self.amortisation_version = version;
+        self
+    }
+    /// Выбрать таблицу полос расчётов для этой книги.
+    #[must_use]
+    pub fn with_settlement_lag_policy(mut self, policy: SettlementLagPolicy) -> Self {
+        self.settlement_policy = policy;
         self
     }
 
@@ -590,6 +619,9 @@ impl LotBook {
     /// Диспетчер исчерпывающий: новый тип события обязан сломать сборку
     /// здесь, а не молча не создать лот.
     pub fn apply(&mut self, event: &Event, rules: &RuleRegistry) -> Result<(), LotError> {
+        let settlement = self
+            .settlement_policy
+            .knowledge(&event.dates, event.provenance.parser_version());
         match &event.kind {
             EventKind::Trade {
                 side,
@@ -608,6 +640,7 @@ impl LotBook {
                     fee: *fee,
                     accrued_interest: *accrued_interest,
                 },
+                settlement,
                 rules,
             ),
             // Утверждения восстановленного начала (§10.7) книгу лотов
@@ -619,7 +652,7 @@ impl LotBook {
                 quantity,
                 cost_basis,
                 assertions: _,
-            } => self.restore(event, *instrument, *quantity, *cost_basis),
+            } => self.restore(event, *instrument, *quantity, *cost_basis, settlement),
             EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
@@ -636,9 +669,11 @@ impl LotBook {
                 instrument: None, ..
             } => Ok(()),
             EventKind::CorporateAction { action } => {
-                self.apply_corporate_action(event, action, rules)
+                self.apply_corporate_action(event, action, settlement, rules)
             }
-            EventKind::OfferExercise { action } => self.apply_offer_exercise(event, action, rules),
+            EventKind::OfferExercise { action } => {
+                self.apply_offer_exercise(event, action, settlement, rules)
+            }
         }
     }
 
@@ -673,6 +708,7 @@ impl LotBook {
         &mut self,
         event: &Event,
         trade: TradeFacts,
+        settlement: SettlementKnowledge,
         rules: &RuleRegistry,
     ) -> Result<(), LotError> {
         let TradeFacts {
@@ -698,24 +734,27 @@ impl LotBook {
                     Some(previous) => previous.try_add(basis)?,
                     None => basis,
                 });
-                entry.push_lot(Lot {
-                    // Идентификатор лота выводится из события приобретения:
-                    // ядро чисто, случайных идентификаторов в нём быть не может,
-                    // иначе повторная проекция того же журнала дала бы другой
-                    // результат (§3.1, §15.3).
-                    id: LotId(event.id.inner()),
-                    instrument,
-                    acquired: event.dates.trade,
-                    quantity,
-                    // Отсутствующий НКД оставляем неизвестным, а не нулём.
-                    accrued_interest_paid: accrued_interest,
-                    received_to_date: None,
-                    cost_basis: basis,
-                    acquisition_basis: Some(basis),
-                    // Номинал сюда придёт из справочника в E3.4;
-                    // подставлять ноль запрещено (§4.9).
-                    principal: PrincipalState::Unknown,
-                });
+                entry.push_lot_with_settlement(
+                    Lot {
+                        // Идентификатор лота выводится из события приобретения:
+                        // ядро чисто, случайных идентификаторов в нём быть не может,
+                        // иначе повторная проекция того же журнала дала бы другой
+                        // результат (§3.1, §15.3).
+                        id: LotId(event.id.inner()),
+                        instrument,
+                        acquired: event.dates.trade,
+                        quantity,
+                        // Отсутствующий НКД оставляем неизвестным, а не нулём.
+                        accrued_interest_paid: accrued_interest,
+                        received_to_date: None,
+                        cost_basis: basis,
+                        acquisition_basis: Some(basis),
+                        // Номинал сюда придёт из справочника в E3.4;
+                        // подставлять ноль запрещено (§4.9).
+                        principal: PrincipalState::Unknown,
+                    },
+                    settlement,
+                );
                 Ok(())
             }
             TradeSide::Sell => {
@@ -723,7 +762,7 @@ impl LotBook {
                     Some(f) => gross.try_sub(f)?,
                     None => gross,
                 };
-                self.dispose(event, key, quantity, proceeds, rules)
+                self.dispose(event, key, quantity, proceeds, rules, settlement)
             }
         }
     }
@@ -736,6 +775,7 @@ impl LotBook {
         &mut self,
         event: &Event,
         action: &CorporateAction,
+        settlement: SettlementKnowledge,
         rules: &RuleRegistry,
     ) -> Result<(), LotError> {
         match action {
@@ -771,7 +811,7 @@ impl LotBook {
                     instrument: *instrument,
                 };
                 self.require_whole_position(event, key, *quantity)?;
-                self.dispose(event, key, *quantity, *compensation, rules)
+                self.dispose(event, key, *quantity, *compensation, rules, settlement)
             }
             CorporateAction::Conversion {
                 predecessor,
@@ -793,6 +833,7 @@ impl LotBook {
                     basis_transfer: *basis_transfer,
                     effective_date: *effective_date,
                 },
+                settlement,
             ),
         }
     }
@@ -802,6 +843,7 @@ impl LotBook {
         &mut self,
         event: &Event,
         action: &OfferExerciseAction,
+        settlement: SettlementKnowledge,
         rules: &RuleRegistry,
     ) -> Result<(), LotError> {
         match action {
@@ -829,7 +871,7 @@ impl LotBook {
                 if let Some(fee) = fee {
                     proceeds = proceeds.try_sub(*fee)?;
                 }
-                self.dispose(event, key, *quantity, proceeds, rules)
+                self.dispose(event, key, *quantity, proceeds, rules, settlement)
             }
         }
     }
@@ -898,12 +940,18 @@ impl LotBook {
     }
 
     /// Замещение: партии предшественника становятся партиями преемника.
-    fn apply_conversion(&mut self, event: &Event, facts: ConversionFacts) -> Result<(), LotError> {
+    fn apply_conversion(
+        &mut self,
+        event: &Event,
+        facts: ConversionFacts,
+        settlement: SettlementKnowledge,
+    ) -> Result<(), LotError> {
         let from = LotKey {
             account: event.account,
             instrument: facts.predecessor,
         };
         self.require_whole_position(event, from, facts.quantity_in)?;
+        let quantity_in_delta = Quantity(facts.quantity_in.0.checked_neg()?);
         let source = self
             .entries
             .get(&from)
@@ -964,6 +1012,7 @@ impl LotBook {
         let mut source = source;
         source.lots.clear();
         source.add_released_basis(carried_total)?;
+        source.ownership.observe(quantity_in_delta, settlement);
         self.entries.insert(from, source);
 
         let to = LotKey {
@@ -972,8 +1021,12 @@ impl LotBook {
         };
         let target = self.entries.entry(to).or_default();
         target.add_acquired_basis(carried_total)?;
+        target.ownership.observe(facts.quantity_out, settlement);
         for lot in moved {
-            target.push_lot(lot);
+            // Перенос лота не является новым приобретением: старую
+            // AcquisitionHistory сохраняем отдельно от дельты владения.
+            target.acquisitions.observe(lot.acquired);
+            target.lots.push(lot);
         }
         Ok(())
     }
@@ -1010,6 +1063,7 @@ impl LotBook {
         instrument: InstrumentId,
         quantity: Quantity,
         cost_basis: Option<Money>,
+        settlement: SettlementKnowledge,
     ) -> Result<(), LotError> {
         let key = LotKey {
             account: event.account,
@@ -1024,17 +1078,20 @@ impl LotBook {
                     Some(previous) => previous.try_add(basis)?,
                     None => basis,
                 });
-                entry.insert_restored_lot(Lot {
-                    id: LotId(event.id.inner()),
-                    instrument,
-                    acquired: event.dates.trade,
-                    quantity,
-                    accrued_interest_paid: None,
-                    received_to_date: None,
-                    cost_basis: basis,
-                    acquisition_basis: Some(basis),
-                    principal: PrincipalState::Unknown,
-                });
+                entry.insert_restored_lot_with_settlement(
+                    Lot {
+                        id: LotId(event.id.inner()),
+                        instrument,
+                        acquired: event.dates.trade,
+                        quantity,
+                        accrued_interest_paid: None,
+                        received_to_date: None,
+                        cost_basis: basis,
+                        acquisition_basis: Some(basis),
+                        principal: PrincipalState::Unknown,
+                    },
+                    settlement,
+                );
             }
             None => {
                 entry.unpriced = Quantity(entry.unpriced.0.checked_add(quantity.0)?);
@@ -1044,6 +1101,7 @@ impl LotBook {
                 // по этой паре недоказуема и после того, как количество
                 // спишется.
                 entry.acquisitions.observe(None);
+                entry.ownership.observe(quantity, settlement);
             }
         }
         Ok(())
@@ -1056,7 +1114,9 @@ impl LotBook {
         quantity: Quantity,
         proceeds: Money,
         rules: &RuleRegistry,
+        settlement: SettlementKnowledge,
     ) -> Result<(), LotError> {
+        let delta = Quantity(quantity.0.checked_neg()?);
         let rule = rules
             .disposal_rule(self.rule_version)
             .ok_or(LotError::UnknownRule {
@@ -1082,6 +1142,7 @@ impl LotBook {
         }
         let left = quantity.0.checked_sub(from_unpriced)?;
         if left.is_zero() {
+            entry.ownership.observe(delta, settlement);
             return Ok(());
         }
 
@@ -1106,6 +1167,7 @@ impl LotBook {
                 None => realized,
             });
         }
+        entry.ownership.observe(delta, settlement);
         Ok(())
     }
 }
@@ -1843,7 +1905,7 @@ mod tests {
         let trade = sample_trade();
         let rules = RuleRegistry::with_defaults();
         let mut book = LotBook::new(LotRuleVersion(1));
-        let restored = event_with(
+        let mut restored = event_with(
             trade.account,
             date!(2024 - 01 - 01),
             1,
@@ -1860,11 +1922,15 @@ mod tests {
                 qty(50),
             )],
         );
+        // Точная дата расчёта позволяет проверить, что восстановленное
+        // количество участвует во владении так же, как документированный лот.
+        restored.dates.settled = Some(crate::dates::SettledDate(date!(2024 - 01 - 02)));
         book.apply(&restored, &rules).unwrap();
         let entry = book.entry(&key(&trade)).unwrap();
         assert!(entry.lots().is_empty());
         assert_eq!(entry.unpriced(), qty(50));
         assert_eq!(entry.gap(), Some(BasisGap::RestoredWithoutBasis));
+        assert_eq!(entry.ownership_at(date!(2024 - 01 - 03)), Ownership::Owned);
 
         // Продажа из восстановленного количества уменьшает позицию,
         // но реализованный результат остаётся невычислимым.

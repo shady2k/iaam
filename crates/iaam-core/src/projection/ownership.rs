@@ -171,9 +171,10 @@ mod tests {
     }
 
     #[test]
-    fn small_unbounded_sale_does_not_hide_a_large_exact_residual() {
-        // Неограниченно датированная продажа 10 оставляет минимум 90
-        // после точного приобретения 100, поэтому результат остаётся Owned.
+    fn an_unbounded_sale_from_a_bad_source_preserves_a_proven_positive_minimum() {
+        // Плохой источник не делает неизвестным весь остаток: продажа 10
+        // без даты после точного приобретения 100 оставляет минимум 90,
+        // поэтому доказанное владение должно остаться Owned.
         let mut history = OwnershipHistory::default();
         history.observe(
             quantity(100),

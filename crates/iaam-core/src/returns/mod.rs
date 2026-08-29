@@ -14,7 +14,7 @@
 pub mod xirr;
 pub mod zero_reinvestment;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -283,6 +283,22 @@ pub enum MaterialIssue {
         kind: PostingKind,
         reason: UnverifiableReason,
     },
+    /// Несколько запланированных выплат недоказуемы по одной причине.
+    ///
+    /// Свёртка, а не список одиночных проблем: причина уровня источника
+    /// чинится одним действием, и десять одинаковых строк не несут
+    /// десяти единиц информации. Число и границы дат оставлены,
+    /// потому что «где-то в истории плохая дата» так же бесполезно,
+    /// как десять повторов.
+    ScheduledPostingsUnverifiable {
+        account: AccountId,
+        instrument: InstrumentId,
+        kind: PostingKind,
+        reason: UnverifiableReason,
+        count: u32,
+        first_date: Date,
+        last_date: Date,
+    },
     /// Расчётный и наблюдённый НКД разошлись больше допуска.
     AccruedInterestMismatch {
         instrument: InstrumentId,
@@ -320,7 +336,8 @@ impl MaterialIssue {
             // позже выпуска бумаги, иначе получил бы вечный `Incomplete`
             // Остальные шесть причин чинятся дозагрузкой фактов и потому
             // являются дефектами.
-            Self::ScheduledPostingUnverifiable { reason, .. } => {
+            Self::ScheduledPostingUnverifiable { reason, .. }
+            | Self::ScheduledPostingsUnverifiable { reason, .. } => {
                 !matches!(reason, UnverifiableReason::HistoryStartsAfterSchedule)
             }
             Self::AccruedInterestMismatch { .. }
@@ -335,7 +352,7 @@ impl MaterialIssue {
 }
 
 /// Почему сверку запланированных выплат провести нечем (§6.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnverifiableReason {
     /// Границу владения провести нечем: у партии нет даты приобретения
     /// либо есть количество, восстановленное без стоимости.
@@ -1556,6 +1573,84 @@ fn bond_scenario(
     }
 }
 
+/// Сворачивает повторяющиеся недоказуемости после завершения всей сверки.
+///
+/// Источник проблемы чинится одним действием, поэтому повтор одной причины
+/// не должен занимать в отчёте место каждой отдельной выплаты. При этом
+/// остальные проблемы проходят без фильтрации: обвинение в пропуске остаётся
+/// адресным, а разные причины не смешиваются.
+fn collapse_scheduled_posting_unverifiable(issues: Vec<MaterialIssue>) -> Vec<MaterialIssue> {
+    type Key = (AccountId, InstrumentId, PostingKind, UnverifiableReason);
+
+    let mut groups: BTreeMap<Key, (u32, Date, Date)> = BTreeMap::new();
+    for issue in &issues {
+        let MaterialIssue::ScheduledPostingUnverifiable {
+            account,
+            instrument,
+            date,
+            kind,
+            reason,
+        } = issue
+        else {
+            continue;
+        };
+        // Профиль источника намеренно не входит в ключ: книга лотов не
+        // отслеживает происхождение событий, а количество и период уже
+        // дают владельцу нужное действие для исправления.
+        let key = (*account, *instrument, *kind, *reason);
+        groups
+            .entry(key)
+            .and_modify(|(count, first_date, last_date)| {
+                *count = count.checked_add(1).expect("слишком много выплат");
+                *first_date = (*first_date).min(*date);
+                *last_date = (*last_date).max(*date);
+            })
+            .or_insert((1, *date, *date));
+    }
+
+    let mut emitted = BTreeSet::new();
+    let mut collapsed = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let MaterialIssue::ScheduledPostingUnverifiable {
+            account,
+            instrument,
+            date,
+            kind,
+            reason,
+        } = issue
+        else {
+            collapsed.push(issue);
+            continue;
+        };
+        let key = (account, instrument, kind, reason);
+        if !emitted.insert(key) {
+            continue;
+        }
+        let (count, first_date, last_date) =
+            groups.remove(&key).expect("группа недоказуемости потеряна");
+        if count == 1 {
+            collapsed.push(MaterialIssue::ScheduledPostingUnverifiable {
+                account,
+                instrument,
+                date,
+                kind,
+                reason,
+            });
+        } else {
+            collapsed.push(MaterialIssue::ScheduledPostingsUnverifiable {
+                account,
+                instrument,
+                kind,
+                reason,
+                count,
+                first_date,
+                last_date,
+            });
+        }
+    }
+    collapsed
+}
+
 /// Сверка прошлого по книге лотов, независимо от текущих позиций.
 ///
 /// Полностью проданная бумага остаётся в книге лотов, но исчезает из
@@ -1666,7 +1761,7 @@ fn historical_reconciliation_issues(
         }
     }
 
-    issues
+    collapse_scheduled_posting_unverifiable(issues)
 }
 
 fn bond_position_metrics(
@@ -5284,11 +5379,21 @@ mod tests {
                     date,
                     reason: UnverifiableReason::HistoryStartsAfterSchedule,
                     ..
-                } => Some(*date),
+                } => Some((1, *date, *date)),
+                MaterialIssue::ScheduledPostingsUnverifiable {
+                    first_date,
+                    last_date,
+                    reason: UnverifiableReason::HistoryStartsAfterSchedule,
+                    count,
+                    ..
+                } => Some((*count, *first_date, *last_date)),
                 _ => None,
             })
             .collect();
-        assert_eq!(reasons, vec![date!(2026 - 03 - 15), date!(2026 - 06 - 15)]);
+        assert_eq!(
+            reasons,
+            vec![(2, date!(2026 - 03 - 15), date!(2026 - 06 - 15))]
+        );
         assert!(непринятые(&report).is_empty());
     }
 
@@ -5327,19 +5432,26 @@ mod tests {
             MaterialIssue::ScheduledPostingUnverifiable {
                 reason: UnverifiableReason::HistoryStartsAfterSchedule,
                 ..
+            } | MaterialIssue::ScheduledPostingsUnverifiable {
+                reason: UnverifiableReason::HistoryStartsAfterSchedule,
+                ..
             }
         )));
     }
     #[test]
     fn a_posting_before_the_journal_does_not_silence_a_provable_miss_after_it() {
         // Восстановленная позиция 2021 года, журнал с 01.01.2026,
-        // купоны 15.12.2025 и 15.03.2026, мартовский не пришёл.
-        // Ранний возврат объявлял недоказуемой ВСЮ пару, и мартовский
-        // пропуск исчезал вместе со статусом качества.
+        // купоны 15.09.2025, 15.12.2025 и 15.03.2026, мартовский не пришёл.
+        // Ранние возвраты объявлялись недоказуемыми по одному, а мартовский
+        // пропуск не должен исчезнуть вместе со свёрткой.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = график_купонов(
-            &[date!(2025 - 12 - 15), date!(2026 - 03 - 15)],
+            &[
+                date!(2025 - 09 - 15),
+                date!(2025 - 12 - 15),
+                date!(2026 - 03 - 15),
+            ],
             date!(2026 - 12 - 15),
         );
         let events = vec![восстановленная_позиция(
@@ -5349,6 +5461,25 @@ mod tests {
             date!(2021 - 05 - 01),
         )];
         let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        // Две одинаковые недоказуемости должны слиться только после
+        // полного обхода, не поглотив отдельное обвинение ниже.
+        assert!(
+            report
+                .data_quality
+                .material_issues
+                .iter()
+                .any(|issue| matches!(
+                    issue,
+                    MaterialIssue::ScheduledPostingsUnverifiable {
+                        reason: UnverifiableReason::HistoryStartsAfterSchedule,
+                        count: 2,
+                        first_date,
+                        last_date,
+                        ..
+                    } if *first_date == date!(2025 - 09 - 15)
+                        && *last_date == date!(2025 - 12 - 15)
+                ))
+        );
 
         let даты: Vec<_> = непринятые(&report)
             .into_iter()
@@ -5455,6 +5586,9 @@ mod tests {
             MaterialIssue::ScheduledPostingUnverifiable {
                 reason: UnverifiableReason::OwnershipUnknown,
                 ..
+            } | MaterialIssue::ScheduledPostingsUnverifiable {
+                reason: UnverifiableReason::OwnershipUnknown,
+                ..
             }
         )));
         assert!(!содержит(&report, |issue| matches!(
@@ -5470,7 +5604,11 @@ mod tests {
             .iter()
             .filter(|issue| {
                 issue.is_defect()
-                    && !matches!(issue, MaterialIssue::ScheduledPostingUnverifiable { .. })
+                    && !matches!(
+                        issue,
+                        MaterialIssue::ScheduledPostingUnverifiable { .. }
+                            | MaterialIssue::ScheduledPostingsUnverifiable { .. }
+                    )
             })
             .collect();
         assert!(другие.is_empty(), "посторонние дефекты: {другие:?}");
@@ -5498,6 +5636,9 @@ mod tests {
         assert!(содержит(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable {
+                reason: UnverifiableReason::OwnershipUnknown,
+                ..
+            } | MaterialIssue::ScheduledPostingsUnverifiable {
                 reason: UnverifiableReason::OwnershipUnknown,
                 ..
             }
@@ -5617,6 +5758,9 @@ mod tests {
         assert!(содержит(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable {
+                reason: UnverifiableReason::IncomeKindUnknown,
+                ..
+            } | MaterialIssue::ScheduledPostingsUnverifiable {
                 reason: UnverifiableReason::IncomeKindUnknown,
                 ..
             }
@@ -6159,5 +6303,147 @@ mod tests {
             hash_selected(&inputs(crate::rules::PostingMatchVersion(1))),
             hash_selected(&inputs(crate::rules::PostingMatchVersion(2)))
         );
+    }
+    #[test]
+    fn five_unverifiable_postings_with_one_reason_become_one_issue() {
+        // Одна причина уровня источника чинится одним действием, поэтому
+        // пять адресных строк должны сообщить одну проблему с полным
+        // количеством и периодом, а не пять раз повторить одно указание.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let issues = (0..5)
+            .map(|offset| MaterialIssue::ScheduledPostingUnverifiable {
+                account,
+                instrument,
+                date: date!(2026 - 01 - 15)
+                    .saturating_add(time::Duration::days(i64::from(offset) * 30)),
+                kind: PostingKind::Coupon,
+                reason: UnverifiableReason::EntitlementDateUnknown,
+            })
+            .collect();
+
+        let collapsed = collapse_scheduled_posting_unverifiable(issues);
+
+        assert!(matches!(
+            collapsed.as_slice(),
+            [MaterialIssue::ScheduledPostingsUnverifiable {
+                count: 5,
+                first_date,
+                last_date,
+                ..
+            }] if *first_date == date!(2026 - 01 - 15)
+                && *last_date == date!(2026 - 05 - 15)
+        ));
+    }
+
+    #[test]
+    fn one_unverifiable_posting_stays_an_addressed_issue() {
+        // Свёртка нужна только для повторов: одна выплата должна сохранить
+        // старую адресную форму, чтобы не создавать ложную семантику группы.
+        let issue = MaterialIssue::ScheduledPostingUnverifiable {
+            account: AccountId::new_random(),
+            instrument: InstrumentId::new_random(),
+            date: date!(2026 - 01 - 15),
+            kind: PostingKind::Coupon,
+            reason: UnverifiableReason::OwnershipUnknown,
+        };
+
+        let collapsed = collapse_scheduled_posting_unverifiable(vec![issue.clone()]);
+
+        assert_eq!(collapsed, vec![issue]);
+    }
+
+    #[test]
+    fn collapsing_unverifiable_postings_keeps_an_interleaved_missing_posting() {
+        // Обвинение в конкретном пропуске чинится поиском этого платежа,
+        // поэтому оно обязано пережить глобальную свёртку соседних причин.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let issues = vec![
+            MaterialIssue::ScheduledPostingUnverifiable {
+                account,
+                instrument,
+                date: date!(2026 - 01 - 15),
+                kind: PostingKind::Coupon,
+                reason: UnverifiableReason::PaymentDateUnknown,
+            },
+            MaterialIssue::ScheduledPostingNotReceived {
+                account,
+                instrument,
+                date: date!(2026 - 03 - 15),
+                kind: PostingKind::Coupon,
+            },
+            MaterialIssue::ScheduledPostingUnverifiable {
+                account,
+                instrument,
+                date: date!(2026 - 05 - 15),
+                kind: PostingKind::Coupon,
+                reason: UnverifiableReason::PaymentDateUnknown,
+            },
+        ];
+
+        let collapsed = collapse_scheduled_posting_unverifiable(issues);
+
+        assert_eq!(collapsed.len(), 2);
+        assert!(matches!(
+            collapsed[0],
+            MaterialIssue::ScheduledPostingsUnverifiable {
+                count: 2,
+                first_date,
+                last_date,
+                ..
+            } if first_date == date!(2026 - 01 - 15)
+                && last_date == date!(2026 - 05 - 15)
+        ));
+        assert!(matches!(
+            collapsed[1],
+            MaterialIssue::ScheduledPostingNotReceived {
+                date,
+                kind: PostingKind::Coupon,
+                ..
+            } if date == date!(2026 - 03 - 15)
+        ));
+    }
+
+    #[test]
+    fn different_unverifiable_reasons_do_not_merge() {
+        // Разные причины требуют разных исправляющих действий, поэтому
+        // одинаковая пара и вид выплаты не дают права потерять различие.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let issues = vec![
+            MaterialIssue::ScheduledPostingUnverifiable {
+                account,
+                instrument,
+                date: date!(2026 - 01 - 15),
+                kind: PostingKind::Coupon,
+                reason: UnverifiableReason::OwnershipUnknown,
+            },
+            MaterialIssue::ScheduledPostingUnverifiable {
+                account,
+                instrument,
+                date: date!(2026 - 05 - 15),
+                kind: PostingKind::Coupon,
+                reason: UnverifiableReason::PaymentDateUnknown,
+            },
+        ];
+
+        let collapsed = collapse_scheduled_posting_unverifiable(issues);
+
+        assert_eq!(collapsed.len(), 2);
+        assert!(matches!(
+            collapsed[0],
+            MaterialIssue::ScheduledPostingUnverifiable {
+                reason: UnverifiableReason::OwnershipUnknown,
+                ..
+            }
+        ));
+        assert!(matches!(
+            collapsed[1],
+            MaterialIssue::ScheduledPostingUnverifiable {
+                reason: UnverifiableReason::PaymentDateUnknown,
+                ..
+            }
+        ));
     }
 }

@@ -192,6 +192,155 @@ pub struct OperationDatesDto {
     pub paid: Option<Date>,
 }
 
+/// Уверенность владельца в количестве восстановленной позиции.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CertaintyDto {
+    Known,
+    #[default]
+    Estimated,
+}
+
+impl CertaintyDto {
+    fn to_domain(self) -> iaam_core::event::kind::Certainty {
+        match self {
+            Self::Known => iaam_core::event::kind::Certainty::Known,
+            Self::Estimated => iaam_core::event::kind::Certainty::Estimated,
+        }
+    }
+}
+
+/// Уверенность владельца в дате приобретения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DateCertaintyDto {
+    Known,
+    Estimated,
+    #[default]
+    Unknown,
+}
+
+impl DateCertaintyDto {
+    fn to_domain(self) -> iaam_core::event::kind::DateCertainty {
+        match self {
+            Self::Known => iaam_core::event::kind::DateCertainty::Known,
+            Self::Estimated => iaam_core::event::kind::DateCertainty::Estimated,
+            Self::Unknown => iaam_core::event::kind::DateCertainty::Unknown,
+        }
+    }
+}
+
+/// Уверенность в документированности налоговой стоимости.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BasisCertaintyDto {
+    Documented,
+    Estimated,
+    #[default]
+    Unknown,
+}
+
+impl BasisCertaintyDto {
+    fn to_domain(self) -> iaam_core::event::kind::BasisCertainty {
+        match self {
+            Self::Documented => iaam_core::event::kind::BasisCertainty::Documented,
+            Self::Estimated => iaam_core::event::kind::BasisCertainty::Estimated,
+            Self::Unknown => iaam_core::event::kind::BasisCertainty::Unknown,
+        }
+    }
+}
+
+/// Троичное утверждение владельца.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TristateDto {
+    Yes,
+    No,
+    #[default]
+    Unknown,
+}
+
+impl TristateDto {
+    fn to_domain(self) -> iaam_core::event::kind::Tristate {
+        match self {
+            Self::Yes => iaam_core::event::kind::Tristate::Yes,
+            Self::No => iaam_core::event::kind::Tristate::No,
+            Self::Unknown => iaam_core::event::kind::Tristate::Unknown,
+        }
+    }
+}
+
+/// Известность факта, утверждаемого владельцем.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeDto {
+    Known,
+    #[default]
+    Unknown,
+}
+
+impl KnowledgeDto {
+    fn to_domain(self) -> iaam_core::event::kind::Knowledge {
+        match self {
+            Self::Known => iaam_core::event::kind::Knowledge::Known,
+            Self::Unknown => iaam_core::event::kind::Knowledge::Unknown,
+        }
+    }
+}
+
+/// Утверждения владельца о восстановленном начале (§10.7).
+///
+/// Отсутствующее поле `assertions` означает, что владелец ничего не
+/// утверждал; значения по умолчанию сохраняют это незнание, а не
+/// выводят уверенность из заполненности других полей.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct OpeningAssertionsDto {
+    #[serde(default)]
+    pub quantity: CertaintyDto,
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub acquisition_date: Option<Date>,
+    #[serde(default)]
+    pub acquisition_date_certainty: DateCertaintyDto,
+    #[serde(default)]
+    pub tax_basis: BasisCertaintyDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis_currency: Option<CurrencyDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis_rate: Option<String>,
+    #[serde(default)]
+    pub fees_included: TristateDto,
+    #[serde(default)]
+    pub ldv_eligibility: KnowledgeDto,
+    #[serde(default)]
+    pub prior_corporate_actions: KnowledgeDto,
+}
+
+impl OpeningAssertionsDto {
+    fn to_domain(&self) -> Result<iaam_core::event::kind::OpeningAssertions, Rejection> {
+        let basis_rate = self
+            .basis_rate
+            .as_ref()
+            .map(|value| decimal(value, "assertions.basis_rate").map(Dec::new))
+            .transpose()?;
+        Ok(iaam_core::event::kind::OpeningAssertions {
+            quantity: self.quantity.to_domain(),
+            acquisition_date: self.acquisition_date,
+            acquisition_date_certainty: self.acquisition_date_certainty.to_domain(),
+            tax_basis: self.tax_basis.to_domain(),
+            basis_currency: self.basis_currency.map(CurrencyDto::to_domain),
+            basis_rate,
+            fees_included: self.fees_included.to_domain(),
+            ldv_eligibility: self.ldv_eligibility.to_domain(),
+            prior_corporate_actions: self.prior_corporate_actions.to_domain(),
+        })
+    }
+}
+
 /// Вид операции. Величины **положительные**: знак задаёт вид, а не клиент.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -258,6 +407,8 @@ pub enum OperationKindDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_basis: Option<String>,
         currency: CurrencyDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assertions: Option<OpeningAssertionsDto>,
     },
     Valuation {
         instrument: Uuid,
@@ -417,19 +568,17 @@ impl OperationDto {
                 quantity,
                 cost_basis,
                 currency,
+                assertions,
             } => OperationKind::OpeningPosition {
                 instrument: InstrumentId(*instrument),
                 custody: CustodyId(*custody),
                 quantity: Dec::new(decimal(quantity, "quantity")?),
                 cost_basis_minor: optional_minor(cost_basis.as_ref(), *currency, "cost_basis")?,
                 currency: currency.to_domain(),
-                // Утверждения о восстановленном начале (§10.7) через
-                // транспорт пока не принимаются: их DTO появится вместе
-                // с остальными маршрутами приёмки. `None` означает
-                // «владелец ничего не утверждал», и приёмка подставит
-                // умолчание, в котором всё неизвестно, — а не выдумает
-                // уверенность из наличия стоимости.
-                assertions: None,
+                assertions: assertions
+                    .as_ref()
+                    .map(OpeningAssertionsDto::to_domain)
+                    .transpose()?,
             },
             OperationKindDto::Valuation {
                 instrument,

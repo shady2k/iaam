@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::dates::TradeDate;
 use crate::event::Event;
 use crate::event::corporate_action::{BasisTransferRule, CorporateAction};
-use crate::event::kind::{EventKind, IncomeKind, TradeSide};
+use crate::event::kind::{DateCertainty, EventKind, IncomeKind, TradeSide};
 use crate::event::offer::OfferExerciseAction;
 use crate::ids::{AccountId, EventId, InstrumentId};
 use crate::money::{Money, MoneyError, PerUnitAmount, Quantity};
@@ -643,16 +643,42 @@ impl LotBook {
                 settlement,
                 rules,
             ),
-            // Утверждения восстановленного начала (§10.7) книгу лотов
-            // не меняют: они описывают, насколько можно верить
-            // количеству и стоимости, а не сами величины. Читает их
-            // отчёт о качестве данных.
+            // Утверждения восстановленного начала определяют границу
+            // владения: дата события — момент импорта, а не доказательство
+            // происхождения позиции.
             EventKind::OpeningPosition {
                 instrument,
                 quantity,
                 cost_basis,
-                assertions: _,
-            } => self.restore(event, *instrument, *quantity, *cost_basis, settlement),
+                assertions,
+            } => {
+                let acquired = match (
+                    assertions.acquisition_date,
+                    assertions.acquisition_date_certainty,
+                ) {
+                    (Some(day), DateCertainty::Known) => Some(TradeDate(day)),
+                    // Оценочная дата не должна становиться датой когорты:
+                    // иначе догадка владельца снова выдастся за факт.
+                    _ => None,
+                };
+                let settlement = match acquired {
+                    Some(day) => SettlementKnowledge::Exact(day.0),
+                    None => {
+                        // Оценка не превращается в доказанное начало:
+                        // непрерывность владения до открытия журнала
+                        // недоказуема в принципе (§3.5).
+                        SettlementKnowledge::Unbounded
+                    }
+                };
+                self.restore(
+                    event,
+                    *instrument,
+                    *quantity,
+                    *cost_basis,
+                    settlement,
+                    acquired,
+                )
+            }
             EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
@@ -1064,6 +1090,7 @@ impl LotBook {
         quantity: Quantity,
         cost_basis: Option<Money>,
         settlement: SettlementKnowledge,
+        acquired: Option<TradeDate>,
     ) -> Result<(), LotError> {
         let key = LotKey {
             account: event.account,
@@ -1082,7 +1109,7 @@ impl LotBook {
                     Lot {
                         id: LotId(event.id.inner()),
                         instrument,
-                        acquired: event.dates.trade,
+                        acquired,
                         quantity,
                         accrued_interest_paid: None,
                         received_to_date: None,
@@ -1913,7 +1940,11 @@ mod tests {
                 instrument: trade.instrument,
                 quantity: qty(50),
                 cost_basis: None,
-                assertions: crate::event::kind::OpeningAssertions::default(),
+                assertions: crate::event::kind::OpeningAssertions {
+                    acquisition_date: Some(date!(2024 - 01 - 02)),
+                    acquisition_date_certainty: crate::event::kind::DateCertainty::Known,
+                    ..crate::event::kind::OpeningAssertions::default()
+                },
             },
             vec![Leg::security(
                 trade.account,
@@ -1944,6 +1975,88 @@ mod tests {
         let entry = book.entry(&key(&trade)).unwrap();
         assert_eq!(entry.unpriced(), qty(30));
         assert_eq!(entry.realized(), None);
+    }
+    #[test]
+    fn a_known_opening_acquisition_date_proves_ownership_after_the_claimed_date() {
+        use crate::event::kind::{DateCertainty, OpeningAssertions};
+
+        let trade = sample_trade();
+        let claimed = date!(2021 - 05 - 01);
+        let mut restored = event_with(
+            trade.account,
+            date!(2026 - 01 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument: trade.instrument,
+                quantity: qty(50),
+                cost_basis: Some(rub(500_000)),
+                assertions: OpeningAssertions {
+                    acquisition_date: Some(claimed),
+                    acquisition_date_certainty: DateCertainty::Known,
+                    ..OpeningAssertions::default()
+                },
+            },
+            vec![Leg::security(
+                trade.account,
+                CustodyId::new_random(),
+                trade.instrument,
+                qty(50),
+            )],
+        );
+        // Дата события — день импорта; она не доказывает происхождение позиции.
+        restored.dates.trade = Some(crate::dates::TradeDate(date!(2026 - 01 - 01)));
+
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&restored, &rules).unwrap();
+
+        let entry = book.entry(&key(&trade)).unwrap();
+        assert_eq!(entry.ownership_at(date!(2022 - 06 - 15)), Ownership::Owned);
+        assert_eq!(
+            entry.lots()[0].acquired,
+            Some(crate::dates::TradeDate(claimed))
+        );
+    }
+
+    #[test]
+    fn an_estimated_opening_acquisition_date_does_not_prove_ownership() {
+        use crate::event::kind::{DateCertainty, OpeningAssertions};
+
+        let trade = sample_trade();
+        let mut restored = event_with(
+            trade.account,
+            date!(2026 - 01 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument: trade.instrument,
+                quantity: qty(50),
+                cost_basis: Some(rub(500_000)),
+                assertions: OpeningAssertions {
+                    acquisition_date: Some(date!(2021 - 05 - 01)),
+                    acquisition_date_certainty: DateCertainty::Estimated,
+                    ..OpeningAssertions::default()
+                },
+            },
+            vec![Leg::security(
+                trade.account,
+                CustodyId::new_random(),
+                trade.instrument,
+                qty(50),
+            )],
+        );
+        // Даже правдоподобная дата импорта не заменяет доказательство начала.
+        restored.dates.trade = Some(crate::dates::TradeDate(date!(2021 - 05 - 01)));
+
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&restored, &rules).unwrap();
+
+        assert_eq!(
+            book.entry(&key(&trade))
+                .unwrap()
+                .ownership_at(date!(2022 - 06 - 15)),
+            Ownership::Unknown
+        );
     }
 
     #[test]

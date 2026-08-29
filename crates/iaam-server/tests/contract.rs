@@ -29,6 +29,7 @@ use iaam_app::storage::{
 use iaam_broker::credentials::Key;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+use iaam_core::event::kind::{DateCertainty, EventKind};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
@@ -980,6 +981,54 @@ async fn an_invalid_amount_is_reported_as_422_with_field_expected_actual() {
     assert_eq!(response[0]["verdict"], "rejected");
     assert_eq!(response[0]["field"], "amount");
     assert_eq!(response[0]["actual"], "1000.005");
+}
+
+#[tokio::test]
+async fn opening_position_assertions_reach_the_event_through_the_api() {
+    let (harness, path) = harness_on_disk();
+    let claimed = date!(2021 - 05 - 01);
+    let body = json!({
+        "source_label": "ручной ввод",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "opening_position",
+            "instrument": harness.instrument.inner(),
+            "custody": harness.custody.inner(),
+            "quantity": "10",
+            "cost_basis": "1000.00",
+            "currency": "RUB",
+            "assertions": {
+                "acquisition_date": claimed.to_string(),
+                "acquisition_date_certainty": "known"
+            },
+            "dates": { "trade": "2026-01-01" }
+        }]
+    });
+
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let store = SqliteStore::open(&path).expect("второе соединение");
+    let events = store
+        .load_events(harness.owner)
+        .expect("события восстановленной позиции");
+    let event = events
+        .into_iter()
+        .find(|event| matches!(&event.kind, EventKind::OpeningPosition { .. }))
+        .expect("восстановленная позиция");
+    let EventKind::OpeningPosition { assertions, .. } = event.kind else {
+        unreachable!("выше найден только opening_position");
+    };
+    assert_eq!(assertions.acquisition_date, Some(claimed));
+    assert_eq!(assertions.acquisition_date_certainty, DateCertainty::Known);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

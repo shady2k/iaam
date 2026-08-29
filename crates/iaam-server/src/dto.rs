@@ -1566,11 +1566,15 @@ fn issue(value: &MaterialIssue) -> String {
         MaterialIssue::ScheduledPostingUnverifiable {
             account,
             instrument,
+            date,
+            kind,
             reason,
         } => format!(
-            "сверку выплат инструмента {} на счёте {} провести нечем: {}",
+            "сверку выплаты {} инструмента {} на счёте {} за {} провести нечем: {}",
+            posting_kind(*kind),
             instrument.inner(),
             account.inner(),
+            date,
             reason.code()
         ),
         MaterialIssue::AccruedInterestMismatch {

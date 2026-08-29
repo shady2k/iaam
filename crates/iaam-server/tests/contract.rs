@@ -3984,22 +3984,24 @@ fn an_unreceived_scheduled_posting_names_kind_instrument_account_and_date() {
     );
 }
 
-/// Причина обязана быть в тексте: без неё владелец не знает, чем чинить
-/// — дозагрузкой дат приобретения, видов дохода или ничем.
+/// Причина, дата и вид обязаны быть в тексте: без них владелец не знает,
+/// какую выплату искать и чем чинить.
 #[test]
-fn an_unverifiable_scheduled_posting_names_instrument_account_and_reason() {
+fn an_unverifiable_scheduled_posting_names_kind_instrument_account_date_and_reason() {
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
     let texts = issue_texts(vec![MaterialIssue::ScheduledPostingUnverifiable {
         account,
         instrument,
+        date: date!(2026 - 03 - 15),
+        kind: PostingKind::Coupon,
         reason: UnverifiableReason::AcquisitionDateUnknown,
     }]);
 
     assert_eq!(
         texts[0],
         format!(
-            "сверку выплат инструмента {} на счёте {} провести нечем: acquisition_date_unknown",
+            "сверку выплаты coupon инструмента {} на счёте {} за 2026-03-15 провести нечем: acquisition_date_unknown",
             instrument.inner(),
             account.inner()
         )
@@ -4025,6 +4027,8 @@ fn the_four_unverifiable_scheduled_posting_reasons_are_distinguishable() {
             .map(|reason| MaterialIssue::ScheduledPostingUnverifiable {
                 account,
                 instrument,
+                date: date!(2026 - 03 - 15),
+                kind: PostingKind::Coupon,
                 reason: *reason,
             })
             .collect(),

@@ -270,14 +270,15 @@ pub enum MaterialIssue {
         date: Date,
         kind: PostingKind,
     },
-    /// Сверку запланированных выплат провести нечем.
+    /// Сверку одной запланированной выплаты провести нечем.
     ///
-    /// Отдельный член, а не молчание: молчание выглядело бы как
-    /// «проверили, всё пришло», и воспроизвело бы ровно тот дефект,
-    /// который эта сверка устраняет.
+    /// Дата и вид делают проблему адресной: недоказуемость одной выплаты
+    /// не должна скрывать доказуемый пропуск другой выплаты той же пары.
     ScheduledPostingUnverifiable {
         account: AccountId,
         instrument: InstrumentId,
+        date: Date,
+        kind: PostingKind,
         reason: UnverifiableReason,
     },
     /// Расчётный и наблюдённый НКД разошлись больше допуска.
@@ -1592,64 +1593,73 @@ fn reconcile_past_postings(inputs: &PastReconciliationInputs<'_>) -> Vec<Materia
         as_of,
     } = *inputs;
 
-    let unverifiable = |reason| {
-        vec![MaterialIssue::ScheduledPostingUnverifiable {
-            account: key.account,
-            instrument: key.instrument,
-            reason,
-        }]
-    };
+    // Причина, названная один раз на всю пару, глушила выплаты, по которым
+    // ответ доказуем. Поэтому исход считается по каждой выплате отдельно,
+    // и недоказуемость одной не отменяет обвинения по другой.
+    let mut issues = Vec::new();
+    let mut verifiable = Vec::new();
 
-    if let Some(gap) = income.gap(&key) {
-        return unverifiable(match gap {
-            crate::projection::income::IncomeGap::IncomeKindUnknown => {
-                UnverifiableReason::IncomeKindUnknown
-            }
-            crate::projection::income::IncomeGap::PaymentDateUnknown => {
-                UnverifiableReason::PaymentDateUnknown
-            }
-        });
+    let gap = income.gap(&key);
+    let acquired = lots.and_then(crate::projection::lots::InstrumentLots::earliest_acquired);
+
+    for posting in plan.past.iter().copied().filter(|p| rule.is_due(p, as_of)) {
+        if let Some(gap) = gap {
+            let reason = match gap {
+                crate::projection::income::IncomeGap::IncomeKindUnknown => {
+                    UnverifiableReason::IncomeKindUnknown
+                }
+                crate::projection::income::IncomeGap::PaymentDateUnknown => {
+                    UnverifiableReason::PaymentDateUnknown
+                }
+            };
+            issues.push(MaterialIssue::ScheduledPostingUnverifiable {
+                account: key.account,
+                instrument: key.instrument,
+                date: posting.date,
+                kind: posting.kind,
+                reason,
+            });
+            continue;
+        }
+        let Some(acquired) = acquired else {
+            issues.push(MaterialIssue::ScheduledPostingUnverifiable {
+                account: key.account,
+                instrument: key.instrument,
+                date: posting.date,
+                kind: posting.kind,
+                reason: UnverifiableReason::AcquisitionDateUnknown,
+            });
+            continue;
+        };
+        if posting.date < acquired.0 {
+            // Купон за период, когда бумаги ещё не было, владельцу не
+            // причитается: молчим, а не обвиняем.
+            continue;
+        }
+        if history_starts.is_some_and(|start| posting.date < start) {
+            issues.push(MaterialIssue::ScheduledPostingUnverifiable {
+                account: key.account,
+                instrument: key.instrument,
+                date: posting.date,
+                kind: posting.kind,
+                reason: UnverifiableReason::HistoryStartsAfterSchedule,
+            });
+            continue;
+        }
+        verifiable.push(posting);
     }
 
-    let Some(acquired) = lots.and_then(crate::projection::lots::InstrumentLots::earliest_acquired)
-    else {
-        return unverifiable(UnverifiableReason::AcquisitionDateUnknown);
-    };
-
-    // Купон за период, когда бумаги ещё не было, владельцу не
-    // причитается: требовать под него факт значит выдумать дефект.
-    //
-    // Выплата, у которой срок ожидания к `as_of` ещё не истёк,
-    // отсеивается здесь же, а не только внутри правила: иначе она
-    // осталась бы поводом для причины недоказуемости ниже, то есть
-    // тревогой под другим именем. Про неё пока просто нечего сказать.
-    let owned: Vec<_> = plan
-        .past
-        .iter()
-        .copied()
-        .filter(|posting| posting.date >= acquired.0 && rule.is_due(posting, as_of))
-        .collect();
-
-    // Выплата, прошедшая границу владения, но датированная раньше
-    // первого события журнала: фактов под неё нет и быть не может.
-    // Граница владения этого случая не поглощает, потому что `acquired`
-    // берётся из заявленной даты сделки, а не из положения события в
-    // журнале, — `OpeningPosition` именно так и записывается.
-    if let Some(start) = history_starts
-        && owned.iter().any(|posting| posting.date < start)
-    {
-        return unverifiable(UnverifiableReason::HistoryStartsAfterSchedule);
-    }
-
-    rule.unreceived(&owned, income.postings(&key), as_of)
-        .into_iter()
-        .map(|posting| MaterialIssue::ScheduledPostingNotReceived {
-            account: key.account,
-            instrument: key.instrument,
-            date: posting.date,
-            kind: posting.kind,
-        })
-        .collect()
+    issues.extend(
+        rule.unreceived(&verifiable, income.postings(&key), as_of)
+            .into_iter()
+            .map(|posting| MaterialIssue::ScheduledPostingNotReceived {
+                account: key.account,
+                instrument: key.instrument,
+                date: posting.date,
+                kind: posting.kind,
+            }),
+    );
+    issues
 }
 
 fn bond_position_metrics(
@@ -5297,7 +5307,9 @@ mod tests {
         )];
         let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
 
-        assert!(непринятые(&report).is_empty());
+        // Июнь 2026 уже покрыт журналом, поэтому его отсутствие теперь
+        // проверяем отдельно; пять купонов 2021–2025 названы недоказуемыми.
+        assert_eq!(непринятые(&report).len(), 1);
         assert!(содержит(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable {
@@ -5306,6 +5318,40 @@ mod tests {
             }
         )));
     }
+    #[test]
+    fn a_posting_before_the_journal_does_not_silence_a_provable_miss_after_it() {
+        // Восстановленная позиция 2021 года, журнал с 01.01.2026,
+        // купоны 15.12.2025 и 15.03.2026, мартовский не пришёл.
+        // Ранний возврат объявлял недоказуемой ВСЮ пару, и мартовский
+        // пропуск исчезал вместе со статусом качества.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[date!(2025 - 12 - 15), date!(2026 - 03 - 15)],
+            date!(2026 - 12 - 15),
+        );
+        let events = vec![восстановленная_позиция(
+            account,
+            instrument,
+            date!(2026 - 01 - 01),
+            date!(2021 - 05 - 01),
+        )];
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        let даты: Vec<_> = непринятые(&report)
+            .into_iter()
+            .filter_map(|issue| match issue {
+                MaterialIssue::ScheduledPostingNotReceived { date, .. } => Some(*date),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            даты.contains(&date!(2026 - 03 - 15)),
+            "пропуск внутри покрытия обязан быть назван: {даты:?}"
+        );
+        assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
+    }
+
 
     #[test]
     fn a_posting_dated_by_the_first_journal_day_is_covered_and_stays_verifiable() {
@@ -5412,6 +5458,8 @@ mod tests {
             !MaterialIssue::ScheduledPostingUnverifiable {
                 account: AccountId::new_random(),
                 instrument: InstrumentId::new_random(),
+                date: date!(2026 - 06 - 15),
+                kind: PostingKind::Coupon,
                 reason: UnverifiableReason::HistoryStartsAfterSchedule,
             }
             .is_defect()
@@ -5429,6 +5477,8 @@ mod tests {
                 MaterialIssue::ScheduledPostingUnverifiable {
                     account: AccountId::new_random(),
                     instrument: InstrumentId::new_random(),
+                    date: date!(2026 - 06 - 15),
+                    kind: PostingKind::Coupon,
                     reason,
                 }
                 .is_defect(),

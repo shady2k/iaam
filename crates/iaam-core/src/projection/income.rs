@@ -15,6 +15,7 @@ use thiserror::Error;
 use time::Date;
 
 use crate::event::Event;
+use crate::event::corporate_action::CorporateAction;
 use crate::event::kind::{EventKind, IncomeKind};
 use crate::ids::EventId;
 use crate::money::Money;
@@ -117,9 +118,9 @@ impl IncomeLedger {
         }
     }
 
-    /// Разбор исчерпывающий намеренно: задачи о возврате номинала
-    /// и расчёте по оферте добавят свои члены, и компилятор обязан
-    /// напомнить о них, а не пропустить событие через `_`.
+    /// Разбор исчерпывающий намеренно: задача о расчёте по оферте
+    /// добавит свой член, и компилятор обязан напомнить о нём,
+    /// а не пропустить событие через `_`.
     pub fn apply(&mut self, event: &Event) -> Result<(), IncomeError> {
         match &event.kind {
             EventKind::Income {
@@ -150,9 +151,58 @@ impl IncomeLedger {
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. }
-            | EventKind::CorporateAction { .. }
             | EventKind::OfferExercise { .. } => Ok(()),
+            EventKind::CorporateAction { action } => {
+                self.apply_corporate_action(event, action);
+                Ok(())
+            }
         }
+    }
+
+    /// Возврат номинала приносит деньги двумя способами: амортизацией
+    /// (позиция остаётся) и погашением (позиция уходит). Замещение денег
+    /// не приносит и факта не создаёт.
+    ///
+    /// Записывается `compensation` — фактически поступившие деньги, а не
+    /// объявленный возвращённый номинал: они расходятся на удержанный
+    /// налог, а сверка отвечает на вопрос «пришли ли деньги».
+    ///
+    /// Дату даёт [`IncomeLedger::payment_date`], а не `effective_date`
+    /// действия: последняя говорит, когда эмитент принял решение, а не
+    /// когда деньги легли на счёт владельца.
+    fn apply_corporate_action(&mut self, event: &Event, action: &CorporateAction) {
+        let (instrument, compensation) = match action {
+            CorporateAction::PartialRedemption {
+                instrument,
+                compensation,
+                ..
+            }
+            | CorporateAction::Redemption {
+                instrument,
+                compensation,
+                ..
+            } => (*instrument, *compensation),
+            // Замещение меняет бумагу на бумагу: подтверждать им нечего,
+            // и пары в карте оно не заводит.
+            CorporateAction::Conversion { .. } => return,
+        };
+        let key = LotKey {
+            account: event.account,
+            instrument,
+        };
+        let Some(date) = Self::payment_date(event) else {
+            self.mark(key, IncomeGap::PaymentDateUnknown);
+            return;
+        };
+        self.record(
+            key,
+            ReceivedPosting {
+                event: event.id,
+                date,
+                amount: compensation,
+                kind: PostingKind::PrincipalReturn,
+            },
+        );
     }
 
     fn apply_income(
@@ -190,13 +240,16 @@ impl IncomeLedger {
 mod tests {
     use super::*;
     use crate::dates::{CashPostedDate, EventDates, PaidDate};
+    use crate::event::corporate_action::{BasisTransferRule, FractionalTreatment};
     use crate::event::kind::{EventKind, IncomeKind};
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
-    use crate::ids::{AccountId, InstrumentId};
-    use crate::money::{CurrencyCode, Money, PostedMinor};
+    use crate::ids::{AccountId, CustodyId, InstrumentId};
+    use crate::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use crate::numeric::decimal::Dec;
     use crate::projection::lots::LotKey;
     use crate::rules::PostingKind;
+    use rust_decimal::Decimal;
     use time::Date;
     use time::macros::date;
 
@@ -511,5 +564,228 @@ mod tests {
         assert!(ledger.postings(&key).is_empty());
         assert_eq!(ledger.gap(&key), None);
         assert!(ledger.is_empty());
+    }
+
+    fn qty(units: i64) -> Quantity {
+        Quantity(Dec::new(Decimal::from(units)))
+    }
+
+    fn per_unit(text: &str) -> PerUnitAmount {
+        PerUnitAmount::new(
+            Dec::new(Decimal::from_str_exact(text).unwrap()),
+            CurrencyCode::Rub,
+        )
+    }
+
+    /// Амортизация в конверте `test_support`: `cash_posted` проставлен тем же
+    /// днём, что и порядок. `effective_date` намеренно отличается от него —
+    /// это дата решения эмитента, а не день, когда деньги легли на счёт,
+    /// и факт обязан датироваться вторым, а не первым.
+    fn partial_redemption(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        minor: i64,
+    ) -> Event {
+        partial_redemption_with_withheld_tax(account, instrument, day, 3, minor)
+    }
+
+    fn partial_redemption_with_withheld_tax(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        principal_per_unit: i64,
+        compensation_minor: i64,
+    ) -> Event {
+        let compensation = rub(compensation_minor);
+        event_with(
+            account,
+            day,
+            1,
+            EventKind::CorporateAction {
+                action: CorporateAction::PartialRedemption {
+                    instrument,
+                    custody: CustodyId::new_random(),
+                    quantity: qty(100),
+                    principal_returned_per_unit: per_unit(&principal_per_unit.to_string()),
+                    compensation,
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![Leg::principal(account, instrument, compensation)],
+        )
+    }
+
+    /// Амортизация без единой даты получения денег: конверт `test_support`
+    /// ставит `cash_posted`, поэтому даты снимаются явно.
+    fn partial_redemption_without_payment_date(
+        account: AccountId,
+        instrument: InstrumentId,
+        minor: i64,
+    ) -> Event {
+        let mut event = partial_redemption(account, instrument, date!(2026 - 06 - 18), minor);
+        event.dates = EventDates::empty();
+        event
+    }
+
+    fn redemption(account: AccountId, instrument: InstrumentId, day: Date, minor: i64) -> Event {
+        let compensation = rub(minor);
+        event_with(
+            account,
+            day,
+            1,
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption {
+                    instrument,
+                    custody: CustodyId::new_random(),
+                    quantity: qty(10),
+                    principal_returned_per_unit: per_unit("100"),
+                    compensation,
+                    effective_date: date!(2026 - 09 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![Leg::principal(account, instrument, compensation)],
+        )
+    }
+
+    fn conversion(account: AccountId, day: Date) -> Event {
+        event_with(
+            account,
+            day,
+            1,
+            EventKind::CorporateAction {
+                action: CorporateAction::Conversion {
+                    predecessor: InstrumentId::new_random(),
+                    successor: InstrumentId::new_random(),
+                    custody: CustodyId::new_random(),
+                    ratio: Dec::new(Decimal::from(1)),
+                    quantity_in: qty(100),
+                    quantity_out: qty(100),
+                    fractional: FractionalTreatment::NotApplicable,
+                    compensation: None,
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                    basis_transfer: BasisTransferRule::CarryOver,
+                },
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn an_amortisation_payment_is_a_dated_principal_return() {
+        // Амортизация приходит `CorporateAction`, а не `Income`. Искать её
+        // среди купонных фактов значило бы поднимать ложную тревогу на
+        // каждой амортизируемой облигации.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&partial_redemption(
+                account,
+                instrument,
+                date!(2026 - 06 - 18),
+                300,
+            ))
+            .expect("амортизация принимается");
+
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        let postings = ledger.postings(&key);
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].kind, PostingKind::PrincipalReturn);
+        assert_eq!(postings[0].date, date!(2026 - 06 - 18));
+        assert_eq!(postings[0].amount, rub(300));
+        assert_eq!(ledger.gap(&key), None);
+    }
+
+    #[test]
+    fn the_recorded_amount_is_the_money_received_not_the_principal_declared() {
+        // `compensation` может быть меньше возвращённого номинала — на
+        // удержанный налог, например (`event/corporate_action.rs:37-40`).
+        // Сверка отвечает на вопрос «пришли ли деньги», поэтому берёт
+        // деньги, а не объявленный номинал.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&partial_redemption_with_withheld_tax(
+                account,
+                instrument,
+                date!(2026 - 06 - 18),
+                /* principal_per_unit */ 400,
+                /* compensation */ 348,
+            ))
+            .expect("принимается");
+
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        assert_eq!(ledger.postings(&key)[0].amount, rub(348));
+    }
+
+    #[test]
+    fn a_full_redemption_is_a_dated_principal_return_too() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&redemption(account, instrument, date!(2026 - 09 - 20), 1000))
+            .expect("погашение принимается");
+
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        let postings = ledger.postings(&key);
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].kind, PostingKind::PrincipalReturn);
+        assert_eq!(postings[0].date, date!(2026 - 09 - 20));
+        assert_eq!(postings[0].amount, rub(1000));
+    }
+
+    #[test]
+    fn a_conversion_brings_no_money_and_therefore_no_fact() {
+        // Замещение меняет бумагу на бумагу: подтверждать им нечего,
+        // и отсутствие факта здесь не пробел, а верный ответ.
+        let account = AccountId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&conversion(account, date!(2026 - 06 - 18)))
+            .expect("замещение принимается");
+
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_corporate_action_without_a_payment_date_cannot_be_dated() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let mut ledger = IncomeLedger::default();
+
+        ledger
+            .apply(&partial_redemption_without_payment_date(
+                account, instrument, 300,
+            ))
+            .expect("принимается");
+
+        let key = LotKey {
+            account,
+            instrument,
+        };
+        assert!(ledger.postings(&key).is_empty());
+        assert_eq!(ledger.gap(&key), Some(IncomeGap::PaymentDateUnknown));
     }
 }

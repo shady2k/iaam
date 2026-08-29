@@ -161,7 +161,11 @@ fn finam_fixture_is_recognised_by_contents_and_has_its_own_version() {
     assert!(parser.recognises(&workbook));
     assert_eq!(parser.broker().code(), "finam");
     assert_eq!(parser.format(), ReportFormat::Xls);
-    assert_eq!(parser.version(), ParserVersion("finam-xls/1".to_owned()));
+    // Версия поднята до /2 вместе с семантикой разбора: дата расчётов
+    // перестала уезжать в cash_posted, а её отсутствие перестало
+    // подставлять дату сделки (iaam-d8b.22). Отпечаток разобранной
+    // строки от этого меняется, и версия обязана это отражать.
+    assert_eq!(parser.version(), ParserVersion("finam-xls/2".to_owned()));
 }
 
 #[test]

@@ -4987,6 +4987,60 @@ mod tests {
         event
     }
 
+    /// Продажа облигации целиком одной партией. Дата сделки задаётся
+    /// отдельно от даты зачисления денег по той же причине, что
+    /// и у покупки.
+    fn продажа_облигации(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        trade: Option<Date>,
+        custody: CustodyId,
+        sequence: u32,
+    ) -> crate::event::Event {
+        let quantity = Quantity(dec("10"));
+        let gross = Money::new(PostedMinor::new(100_000), CurrencyCode::Rub);
+        let mut event = event_with(
+            account,
+            day,
+            sequence,
+            EventKind::Trade {
+                side: crate::event::kind::TradeSide::Sell,
+                instrument,
+                quantity,
+                gross,
+                fee: None,
+                accrued_interest: None,
+            },
+            vec![
+                Leg::cash(account, gross),
+                Leg::security(account, custody, instrument, Quantity(dec("-10"))),
+            ],
+        );
+        event.dates.trade = trade.map(crate::dates::TradeDate);
+        event
+    }
+
+    /// Покупка в названное место хранения. Отдельным помощником, потому
+    /// что `покупка_облигации` выдумывает депозитарий на каждый вызов,
+    /// а здесь важно, что бумага легла именно в этот.
+    fn покупка_облигации_в_депозитарии(
+        account: AccountId,
+        instrument: InstrumentId,
+        day: Date,
+        custody: CustodyId,
+        sequence: u32,
+    ) -> crate::event::Event {
+        let mut event = покупка_облигации(account, instrument, day, Some(day));
+        event.order = crate::dates::EffectiveOrder::new(day, sequence);
+        for leg in &mut event.legs {
+            if leg.quantity.is_some() {
+                leg.custody = Some(custody);
+            }
+        }
+        event
+    }
+
     fn купонный_факт(
         account: AccountId,
         instrument: InstrumentId,
@@ -5411,6 +5465,53 @@ mod tests {
         assert_eq!(непринятые(&report).len(), 1);
     }
 
+    /// Журнал здоровой бумаги: две покупки и продажа ранней партии,
+    /// все прошедшие купоны подтверждены фактами.
+    fn журнал_с_проданной_ранней_партией(
+        account: AccountId,
+        instrument: InstrumentId,
+        факты: &[Date],
+    ) -> Vec<crate::event::Event> {
+        // Одно место хранения на весь журнал: иначе продажа списала бы
+        // бумагу из депозитария, в который её не клали, и позиций стало
+        // бы три — тест проверял бы задвоение, а не границу владения.
+        let custody = CustodyId::new_random();
+        let mut events = vec![
+            пополнение(account, date!(2026 - 01 - 05)),
+            покупка_облигации_в_депозитарии(
+                account,
+                instrument,
+                date!(2026 - 01 - 10),
+                custody,
+                2,
+            ),
+            покупка_облигации_в_депозитарии(
+                account,
+                instrument,
+                date!(2026 - 04 - 10),
+                custody,
+                3,
+            ),
+            продажа_облигации(
+                account,
+                instrument,
+                date!(2026 - 07 - 10),
+                Some(date!(2026 - 07 - 10)),
+                custody,
+                4,
+            ),
+        ];
+        events.extend(факты.iter().enumerate().map(|(index, day)| {
+            купонный_факт(
+                account,
+                instrument,
+                *day,
+                5 + u32::try_from(index).expect("номер факта"),
+            )
+        }));
+        events
+    }
+
     #[test]
     fn a_coupon_whose_waiting_window_is_still_running_is_not_reported_as_missing() {
         // Деньги идут по депозитарной цепочке до трёх недель, и всё это
@@ -5477,6 +5578,62 @@ mod tests {
             date!(2026 - 08 - 22),
             date!(2021 - 05 - 01),
         )];
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        assert!(непринятые(&report).is_empty());
+        assert!(!содержит(&report, |issue| matches!(
+            issue,
+            MaterialIssue::ScheduledPostingUnverifiable { .. }
+        )));
+    }
+
+    #[test]
+    fn a_missing_coupon_is_still_named_after_the_earliest_lot_was_sold() {
+        // Граница владения — самая ранняя дата приобретения, когда-либо
+        // наблюдённая по паре. Иначе продажа январской партии подняла бы
+        // границу до апреля и спрятала мартовский пропуск.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let events =
+            журнал_с_проданной_ранней_партией(account, instrument, &[date!(2026 - 06 - 16)]);
+        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+
+        let issues = непринятые(&report);
+        assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+        assert!(matches!(
+            issues[0],
+            MaterialIssue::ScheduledPostingNotReceived { date, .. }
+                if *date == date!(2026 - 03 - 15)
+        ));
+    }
+
+    #[test]
+    fn a_healthy_history_with_a_sold_early_lot_raises_no_alarm() {
+        // Обратная сторона той же границы: полная история полученных
+        // купонов не даёт ни одной тревоги.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let schedule = график_купонов(
+            &[
+                date!(2026 - 03 - 15),
+                date!(2026 - 06 - 15),
+                date!(2026 - 12 - 15),
+            ],
+            date!(2026 - 12 - 15),
+        );
+        let events = журнал_с_проданной_ранней_партией(
+            account,
+            instrument,
+            &[date!(2026 - 03 - 16), date!(2026 - 06 - 16)],
+        );
         let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
 
         assert!(непринятые(&report).is_empty());

@@ -121,6 +121,49 @@ pub enum CohortGap {
     InconsistentOptionalMoneyOverflow,
 }
 
+/// Приобретения, когда-либо наблюдённые по паре (счёт, инструмент).
+///
+/// Отдельно от живых партий, потому что выбытие партии не отменяет
+/// того, что бумага в тот день уже была: граница владения, посчитанная
+/// по оставшимся партиям, после продажи ранней партии поднимается и
+/// прячет пропуск выплаты за период, когда бумага была на руках.
+/// Величина монотонна: выбытие её не двигает.
+///
+/// `#[serde(default)]` намеренно нет: снимок без неё выглядел бы как
+/// позиция без истории приобретений, то есть выдавал бы «не владел»
+/// за «не знаем». Снимки прежней версии отвергает `PROJECTION_VERSION`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct AcquisitionHistory {
+    /// Самая ранняя наблюдённая дата приобретения.
+    earliest: Option<TradeDate>,
+    /// Наблюдалось приобретение без даты: партия без даты сделки либо
+    /// количество, восстановленное без стоимости. Признак липкий по той
+    /// же причине, по которой липка сама дата: выбытие безымянной
+    /// партии не превращает неизвестную границу в известную.
+    undated: bool,
+}
+
+impl AcquisitionHistory {
+    fn observe(&mut self, acquired: Option<TradeDate>) {
+        match acquired {
+            Some(date) => {
+                self.earliest = Some(match self.earliest {
+                    Some(known) => known.min(date),
+                    None => date,
+                });
+            }
+            None => self.undated = true,
+        }
+    }
+
+    /// Нижняя граница владения. `None`, когда наблюдалось приобретение
+    /// без даты: любая граница по остальным партиям была бы позже
+    /// настоящей и скрыла бы пропуск.
+    const fn lower_bound(self) -> Option<TradeDate> {
+        if self.undated { None } else { self.earliest }
+    }
+}
+
 /// Лоты одного инструмента на одном счёте.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstrumentLots {
@@ -147,6 +190,8 @@ pub struct InstrumentLots {
     /// Доля известной выплаты, пришедшаяся на восстановленное количество.
     #[serde(default)]
     unpriced_income: Option<Money>,
+    /// Приобретения, когда-либо наблюдённые по паре.
+    acquisitions: AcquisitionHistory,
 }
 
 /// Пустая книга по инструменту. Пишется вручную, потому что `Quantity`
@@ -164,6 +209,7 @@ impl Default for InstrumentLots {
             income_kind_unknown: false,
             unallocated_income: None,
             unpriced_income: None,
+            acquisitions: AcquisitionHistory::default(),
         }
     }
 }
@@ -194,23 +240,37 @@ impl InstrumentLots {
         self.income_kind_unknown
     }
 
-    /// Самая ранняя дата приобретения среди текущих партий.
+    /// Самая ранняя дата приобретения, когда-либо наблюдённая по паре.
+    ///
+    /// Считается по всей истории, а не по живым партиям: продажа ранней
+    /// партии границу владения не поднимает, иначе пропуск выплаты за
+    /// период, когда бумага была на руках, остался бы неназванным.
     ///
     /// `None`, если есть количество, восстановленное без стоимости,
-    /// либо хоть у одной партии даты нет: границу владения тогда
-    /// провести нечем, а провести её приблизительно значило бы либо
-    /// выдумать дефект, либо скрыть настоящий.
+    /// либо хоть у одного приобретения даты не было: границу владения
+    /// тогда провести нечем, а провести её приблизительно значило бы
+    /// либо выдумать дефект, либо скрыть настоящий.
     #[must_use]
     pub fn earliest_acquired(&self) -> Option<TradeDate> {
         if !self.unpriced.0.is_zero() {
             return None;
         }
-        self.lots
-            .iter()
-            .map(|lot| lot.acquired)
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .min()
+        self.acquisitions.lower_bound()
+    }
+
+    /// Единственная дверь для новой партии: история приобретений
+    /// обязана пополняться вместе с партиями, иначе граница владения
+    /// разойдётся с журналом.
+    fn push_lot(&mut self, lot: Lot) {
+        self.acquisitions.observe(lot.acquired);
+        self.lots.push(lot);
+    }
+
+    /// Восстановленная партия встаёт в голову очереди FIFO: она старше
+    /// всего, что система видела.
+    fn insert_restored_lot(&mut self, lot: Lot) {
+        self.acquisitions.observe(lot.acquired);
+        self.lots.insert(0, lot);
     }
 
     /// Известная выплата, которую нельзя приписать документированному лоту.
@@ -638,7 +698,7 @@ impl LotBook {
                     Some(previous) => previous.try_add(basis)?,
                     None => basis,
                 });
-                entry.lots.push(Lot {
+                entry.push_lot(Lot {
                     // Идентификатор лота выводится из события приобретения:
                     // ядро чисто, случайных идентификаторов в нём быть не может,
                     // иначе повторная проекция того же журнала дала бы другой
@@ -912,7 +972,9 @@ impl LotBook {
         };
         let target = self.entries.entry(to).or_default();
         target.add_acquired_basis(carried_total)?;
-        target.lots.extend(moved);
+        for lot in moved {
+            target.push_lot(lot);
+        }
         Ok(())
     }
 
@@ -962,24 +1024,26 @@ impl LotBook {
                     Some(previous) => previous.try_add(basis)?,
                     None => basis,
                 });
-                entry.lots.insert(
-                    0,
-                    Lot {
-                        id: LotId(event.id.inner()),
-                        instrument,
-                        acquired: event.dates.trade,
-                        quantity,
-                        accrued_interest_paid: None,
-                        received_to_date: None,
-                        cost_basis: basis,
-                        acquisition_basis: Some(basis),
-                        principal: PrincipalState::Unknown,
-                    },
-                );
+                entry.insert_restored_lot(Lot {
+                    id: LotId(event.id.inner()),
+                    instrument,
+                    acquired: event.dates.trade,
+                    quantity,
+                    accrued_interest_paid: None,
+                    received_to_date: None,
+                    cost_basis: basis,
+                    acquisition_basis: Some(basis),
+                    principal: PrincipalState::Unknown,
+                });
             }
             None => {
                 entry.unpriced = Quantity(entry.unpriced.0.checked_add(quantity.0)?);
                 entry.gap = Some(BasisGap::RestoredWithoutBasis);
+                // Даты у восстановленного количества нет, а приобретено
+                // оно раньше всего, что система видела: граница владения
+                // по этой паре недоказуема и после того, как количество
+                // спишется.
+                entry.acquisitions.observe(None);
             }
         }
         Ok(())
@@ -1150,7 +1214,9 @@ mod tests {
         let acquired: Vec<Money> = lots.iter().map(|lot| lot.cost_basis).collect();
         let entry = book.entries.entry(bond.key()).or_default();
         entry.acquired_basis = Money::sum(&acquired, CurrencyCode::Rub).ok();
-        entry.lots = lots;
+        for lot in lots {
+            entry.push_lot(lot);
+        }
         book
     }
 
@@ -1174,12 +1240,13 @@ mod tests {
 
     #[test]
     fn граница_владения_берёт_самую_раннюю_дату_приобретения() {
+        // Партии кладутся `push_lot`, а не присваиванием: история
+        // приобретений пополняется только через него, и тест, минующий
+        // его, проверял бы фикстуру, а не книгу лотов.
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
-        entry.lots = vec![
-            лот_с_датой(instrument, Some(date!(2025 - 07 - 01))),
-            лот_с_датой(instrument, Some(date!(2024 - 03 - 01))),
-        ];
+        entry.push_lot(лот_с_датой(instrument, Some(date!(2025 - 07 - 01))));
+        entry.push_lot(лот_с_датой(instrument, Some(date!(2024 - 03 - 01))));
 
         assert_eq!(
             entry.earliest_acquired(),
@@ -1191,10 +1258,8 @@ mod tests {
     fn партия_без_даты_приобретения_не_даёт_провести_границу_владения() {
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
-        entry.lots = vec![
-            лот_с_датой(instrument, Some(date!(2024 - 03 - 01))),
-            лот_с_датой(instrument, None),
-        ];
+        entry.push_lot(лот_с_датой(instrument, Some(date!(2024 - 03 - 01))));
+        entry.push_lot(лот_с_датой(instrument, None));
 
         assert_eq!(entry.earliest_acquired(), None);
     }
@@ -1207,8 +1272,79 @@ mod tests {
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
         entry.unpriced = qty(5);
-        entry.lots = vec![лот_с_датой(instrument, Some(date!(2024 - 03 - 01)))];
+        entry.push_lot(лот_с_датой(instrument, Some(date!(2024 - 03 - 01))));
 
+        assert_eq!(entry.earliest_acquired(), None);
+    }
+
+    #[test]
+    fn граница_владения_не_поднимается_после_выбытия_ранней_партии() {
+        // Купили в январе, купили в апреле, продали январскую партию.
+        // Граница обязана остаться январской: бумага в марте была
+        // на руках, и пропущенный за март купон надо назвать.
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let январь = Trade {
+            account,
+            instrument,
+            day: date!(2026 - 01 - 10),
+            units: 10,
+            gross: 100_000,
+        };
+        let апрель = Trade {
+            day: date!(2026 - 04 - 10),
+            ..январь
+        };
+        let продажа = Trade {
+            day: date!(2026 - 07 - 10),
+            gross: 120_000,
+            ..январь
+        };
+        book.apply(&dated_buy(&январь, 1), &rules).unwrap();
+        book.apply(&dated_buy(&апрель, 2), &rules).unwrap();
+        book.apply(&sell(&продажа, 3), &rules).unwrap();
+
+        let entry = book.entry(&key(&январь)).unwrap();
+        assert_eq!(entry.lots().len(), 1, "январская партия должна быть списана");
+        assert_eq!(
+            entry.earliest_acquired(),
+            Some(TradeDate(date!(2026 - 01 - 10)))
+        );
+    }
+
+    #[test]
+    fn выбытие_партии_без_даты_не_делает_границу_владения_известной() {
+        // Партия без даты приобретена неизвестно когда, и продажа
+        // этого не проясняет. Признать границу апрельской значило бы
+        // объявить известным то, чего журнал не говорит (§4.9).
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let без_даты = Trade {
+            account,
+            instrument,
+            day: date!(2026 - 01 - 10),
+            units: 10,
+            gross: 100_000,
+        };
+        let апрель = Trade {
+            day: date!(2026 - 04 - 10),
+            ..без_даты
+        };
+        let продажа = Trade {
+            day: date!(2026 - 07 - 10),
+            gross: 120_000,
+            ..без_даты
+        };
+        book.apply(&buy(&без_даты, 1), &rules).unwrap();
+        book.apply(&dated_buy(&апрель, 2), &rules).unwrap();
+        book.apply(&sell(&продажа, 3), &rules).unwrap();
+
+        let entry = book.entry(&key(&без_даты)).unwrap();
+        assert_eq!(entry.lots().len(), 1);
         assert_eq!(entry.earliest_acquired(), None);
     }
 

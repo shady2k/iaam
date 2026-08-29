@@ -5001,7 +5001,11 @@ mod tests {
                 instrument,
                 quantity,
                 cost_basis: Some(Money::new(PostedMinor::new(100_000), CurrencyCode::Rub)),
-                assertions: Default::default(),
+                assertions: crate::event::kind::OpeningAssertions {
+                    acquisition_date: Some(trade),
+                    acquisition_date_certainty: crate::event::kind::DateCertainty::Known,
+                    ..crate::event::kind::OpeningAssertions::default()
+                },
             },
             vec![Leg::security(
                 account,
@@ -5377,12 +5381,20 @@ mod tests {
         // Дата сделки заявлена раньше журнала: границу владения купон
         // первого дня проходит, и решает его судьбу именно граница
         // истории, а не отбор по владению.
-        let events = vec![восстановленная_позиция(
+        let mut restored = восстановленная_позиция(
             account,
             instrument,
             первый_день,
             date!(2025 - 06 - 01),
-        )];
+        );
+        // Проверяем именно границу `Exact`: утверждение совпадает с днём
+        // открытия журнала, поэтому владение в этот день ещё неоднозначно.
+        let EventKind::OpeningPosition { assertions, .. } = &mut restored.kind else {
+            unreachable!("помощник создаёт opening_position");
+        };
+        assertions.acquisition_date = Some(первый_день);
+        assertions.acquisition_date_certainty = crate::event::kind::DateCertainty::Known;
+        let events = vec![restored];
         let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
 
         assert!(

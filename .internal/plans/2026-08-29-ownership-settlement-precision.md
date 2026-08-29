@@ -73,7 +73,7 @@
 **Файлы:**
 - Изменить: `crates/iaam-ingest/src/report/finam.rs:30` (версия парсера), `:153-157`
   (подстановка), `:650-663` (конструктор операции)
-- Тест: `crates/iaam-ingest/tests/report_finam.rs`
+- Тест: `crates/iaam-ingest/src/report/finam.rs`, модуль `mod tests` в том же файле
 
 **Интерфейсы:**
 - Отдаёт: `SubmittedOperation.dates` с раздельными `trade`, `settled`, `cash_posted`.
@@ -87,7 +87,12 @@
 
 - [ ] **Шаг 1: тест на три различимые даты**
 
-В `crates/iaam-ingest/tests/report_finam.rs` добавить:
+Тесты модульные, в самом `finam.rs`, а НЕ через фикстуру: `tests/fixtures` заморожен
+`MANIFEST.sha256` и входит в список файлов политики `check-diff-lint.sh`. Новая фикстура
+ради проверки маршрутизации трёх дат — это правка политики ради того, что проверяется
+вызовом функции напрямую.
+
+В `crates/iaam-ingest/src/report/finam.rs`, в `mod tests`:
 
 ```rust
 #[test]

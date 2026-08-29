@@ -243,6 +243,11 @@ impl CashflowProjection for CashflowProjectionV1 {
             }
         }
 
+        // Возврат номинала в дату исполнения оферты не включается:
+        // `OfferSettlement` заменяет погашение позиции по цене оферты,
+        // поэтому отдельный возврат дал бы двойной денежный поток.
+        // В отличие от него купон добавляется выше, поскольку
+        // `OfferSettlement` его не содержит.
         for principal_return in &input.schedule.principal_returns {
             if principal_return.repayment_date <= input.as_of {
                 past.push(principal_return.repayment_date);
@@ -803,6 +808,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_single_currency_role_mismatch() {
+        let mut schedule = valid_schedule(vec![], vec![]);
+        schedule.currency_roles = Some(CurrencyRoles {
+            denomination: CurrencyCode::Usd,
+            settlement: CurrencyCode::Rub,
+            quote: CurrencyCode::Rub,
+        });
+        let choice = OfferChoice::HoldToMaturity;
+
+        assert!(matches!(
+            CashflowProjectionV1.future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 08 - 01),
+            )),
+            Err(CashflowError::CurrencyFormulaUnknown { roles: Some(roles) })
+                if roles.denomination == CurrencyCode::Usd
+                    && roles.settlement == CurrencyCode::Rub
+                    && roles.quote == CurrencyCode::Rub
+        ));
+    }
+
+    #[test]
     fn rejects_offer_without_known_settlement_terms() {
         let window = crate::bond::OfferWindowId::derive(
             crate::ids::InstrumentId::new_random(),
@@ -943,6 +972,48 @@ mod tests {
                 date!(2026 - 08 - 01),
             ))
             .expect("coupon and settlement are both due on execution date");
+
+        assert_eq!(plan.postings.len(), 2);
+        assert_eq!(plan.postings[0].kind, PostingKind::Coupon);
+        assert_eq!(plan.postings[0].amount.value(), dec("10"));
+        assert_eq!(plan.postings[1].kind, PostingKind::OfferSettlement);
+        assert_eq!(plan.postings[1].amount.value(), dec("100"));
+    }
+
+    #[test]
+    fn principal_return_on_offer_execution_date_is_replaced_by_settlement() {
+        let window = crate::bond::OfferWindowId::derive(
+            crate::ids::InstrumentId::new_random(),
+            date!(2026 - 10 - 01),
+        );
+        let mut schedule = valid_schedule(
+            vec![period(
+                date!(2026 - 09 - 01),
+                date!(2026 - 10 - 01),
+                Some("10"),
+            )],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 10 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+        schedule.offer_windows.push(crate::bond::OfferWindowTerms {
+            window,
+            right: crate::bond::OfferRight::HolderPut,
+            execution_date: date!(2026 - 10 - 01),
+            submission_start: None,
+            submission_end: None,
+            price_percent: Some(dec("100")),
+        });
+        let choice = OfferChoice::ExerciseAtOffer { window };
+        let plan = CashflowProjectionV1
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 08 - 01),
+            ))
+            .expect("principal return on execution date is replaced by settlement");
 
         assert_eq!(plan.postings.len(), 2);
         assert_eq!(plan.postings[0].kind, PostingKind::Coupon);

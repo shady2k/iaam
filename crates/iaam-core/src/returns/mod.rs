@@ -2506,6 +2506,28 @@ mod tests {
     }
 
     #[test]
+    fn uncovered_position_alone_makes_quality_incomplete() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let positions = position_values_for_tests(vec![position_assessment(
+            account,
+            instrument,
+            Quantity(dec("1")),
+        )]);
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+
+        let quality = data_quality(&state, &request, &positions);
+
+        assert_eq!(quality.position_coverage.uncovered.len(), 1);
+        assert_eq!(quality.status, DataQualityStatus::Incomplete);
+    }
+
+    #[test]
     fn противоречие_основания_имеет_отдельную_причину_позиции() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
@@ -4370,6 +4392,78 @@ mod tests {
             report.applied_rules.expense_policy,
             crate::returns::zero_reinvestment::ExpensePolicyVersion(1)
         );
+    }
+
+    #[test]
+    fn failed_offer_scenario_keeps_matching_execution_date() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let execution_date = date!(2026 - 09 - 15);
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = position_request(&contour, &fx, &ledger, &perimeter);
+        let schedule = BondSchedule {
+            offer_windows: vec![crate::bond::OfferWindowTerms {
+                window: crate::bond::OfferWindowId::new_random(),
+                right: crate::bond::OfferRight::HolderPut,
+                execution_date,
+                submission_start: None,
+                submission_end: None,
+                price_percent: Some(dec("100")),
+            }],
+            ..BondSchedule::default()
+        };
+        let choice = OfferChoice::ExerciseAtOffer {
+            window: schedule.offer_windows[0].window,
+        };
+        let assessment = position_assessment(account, instrument, Quantity(dec("1")));
+        let (_, cashflow) = cashflow_projection_rule();
+        let (_, accrued_rule) = accrued_interest_rule();
+
+        let result = bond_scenario(
+            &BondScenarioInputs {
+                assessment: &assessment,
+                request: &request,
+                schedule: &schedule,
+                lots: None,
+                cashflow: &cashflow,
+                accrued_rule: &accrued_rule,
+            },
+            choice.clone(),
+        );
+
+        assert_eq!(result.choice, choice);
+        assert_eq!(result.prospective.terminal_date, execution_date);
+        assert!(matches!(
+            &result.prospective.metrics,
+            Computed::NotComputable {
+                reason: NotComputable::ScheduleMissing { instrument: actual }
+            } if *actual == instrument
+        ));
+    }
+
+    #[test]
+    fn zero_quantity_bond_position_is_not_reported() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let mut request = position_request(&contour, &fx, &ledger, &perimeter);
+        let schedules = BTreeMap::from([(instrument, BondSchedule::default())]);
+        request.bond_schedules = &schedules;
+        let positions = vec![PositionValue {
+            assessment: position_assessment(account, instrument, Quantity::zero()),
+            value: Ok(Dec::zero()),
+        }];
+        let state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
+
+        let metrics = bond_position_metrics(&state, &request, &positions, &OfferBook::default());
+
+        assert!(metrics.is_empty());
     }
 
     #[test]

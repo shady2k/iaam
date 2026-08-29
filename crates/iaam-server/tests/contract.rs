@@ -33,13 +33,19 @@ use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
+use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{ProjectionContext, Snapshot, project};
-use iaam_core::reconciliation::Dimension;
+use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
+use iaam_core::returns::{
+    KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
+};
 use iaam_core::rules::lot_disposal::PrincipalState;
-use iaam_core::rules::{LotRuleVersion, RuleRegistry};
+use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
+use iaam_core::valuation::{FxSource, FxTable};
 use iaam_server::auth::hash_token;
-use iaam_server::dto::VerdictDto;
+use iaam_server::dto::{ReturnsReportDto, VerdictDto};
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::market::AccruedInterestRow;
@@ -3876,4 +3882,154 @@ async fn provisioning_an_access_fills_the_channel_dictionary() {
         "заселено меньше, чем знал прежний разбор: {}",
         dictionary.len()
     );
+}
+
+/// Прогоняет проблемы через ту же конверсию, по которой текст доходит
+/// до владельца.
+///
+/// Пустой журнал здесь — не упрощение, а способ изолировать текст: сам
+/// отчёт не должен добавить ни одной своей проблемы, иначе тест
+/// закреплял бы чужие строки вместе со своими. Публичного пути к
+/// формированию отдельной строки нет, и делать его ради теста нельзя:
+/// владелец получает строки только целым отчётом.
+fn issue_texts(issues: Vec<MaterialIssue>) -> Vec<String> {
+    let events: Vec<iaam_core::event::Event> = Vec::new();
+    let contour = ContourDefinition::new(
+        ContourId(Uuid::new_v4()),
+        ContourVersion(1),
+        [AccountId::new_random()],
+    );
+    let rules = RuleRegistry::with_defaults();
+    let context = ProjectionContext {
+        contour: &contour,
+        rules: &rules,
+        lot_rule: LotRuleVersion(1),
+    };
+    let projection = project(&events, &context).expect("проекция пустого журнала");
+    let perimeter = assess(&events, PerimeterPolicy::default()).expect("периметр");
+    let ledger =
+        ReconciliationLedger::build_with(&events, &perimeter.exceptions()).expect("реестр сверки");
+    let fx = FxTable::new(FxSource::OwnerSupplied);
+    let mut report = returns_report(
+        projection.state(),
+        &ReturnsRequest {
+            contour: &contour,
+            coordinate: KnowledgeCoordinate::default(),
+            as_of: date!(2026 - 03 - 31),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
+        },
+    );
+    assert!(
+        report.data_quality.material_issues.is_empty(),
+        "пустой журнал дал собственные проблемы: {:?}",
+        report.data_quality.material_issues
+    );
+    report.data_quality.material_issues = issues;
+
+    ReturnsReportDto::from_domain(&report)
+        .data_quality
+        .material_issues
+}
+
+/// Кода у этой проблемы в ответе нет: владелец видит только строку.
+/// Незакреплённая строка молча меняется вместе с `fn issue`, и владелец
+/// получает другое сообщение без единого красного теста.
+///
+/// Проверяются все четыре величины сразу: вид выплаты — потому что
+/// «не пришёл купон» и «не пришёл возврат номинала» требуют разных
+/// действий; счёт — потому что одна бумага на двух счетах иначе даёт
+/// две неразличимые строки; инструмент и дата — потому что без них
+/// искать в журнале нечего.
+#[test]
+fn an_unreceived_scheduled_posting_names_kind_instrument_account_and_date() {
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let texts = issue_texts(vec![
+        MaterialIssue::ScheduledPostingNotReceived {
+            account,
+            instrument,
+            date: date!(2026 - 03 - 31),
+            kind: PostingKind::Coupon,
+        },
+        MaterialIssue::ScheduledPostingNotReceived {
+            account,
+            instrument,
+            date: date!(2026 - 03 - 31),
+            kind: PostingKind::PrincipalReturn,
+        },
+    ]);
+
+    assert_eq!(
+        texts[0],
+        format!(
+            "выплата coupon инструмента {} на счёте {} за 2026-03-31 не подтверждена",
+            instrument.inner(),
+            account.inner()
+        )
+    );
+    assert_eq!(
+        texts[1],
+        format!(
+            "выплата principal_return инструмента {} на счёте {} за 2026-03-31 не подтверждена",
+            instrument.inner(),
+            account.inner()
+        )
+    );
+}
+
+/// Причина обязана быть в тексте: без неё владелец не знает, чем чинить
+/// — дозагрузкой дат приобретения, видов дохода или ничем.
+#[test]
+fn an_unverifiable_scheduled_posting_names_instrument_account_and_reason() {
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let texts = issue_texts(vec![MaterialIssue::ScheduledPostingUnverifiable {
+        account,
+        instrument,
+        reason: UnverifiableReason::AcquisitionDateUnknown,
+    }]);
+
+    assert_eq!(
+        texts[0],
+        format!(
+            "сверку выплат инструмента {} на счёте {} провести нечем: acquisition_date_unknown",
+            instrument.inner(),
+            account.inner()
+        )
+    );
+}
+
+/// Четыре причины чинятся по-разному, а одна из них вообще не дефект.
+/// Совпади хотя бы две строки — владелец не отличил бы «дозагрузи даты»
+/// от «журнал начинается позже, чинить нечего».
+#[test]
+fn the_four_unverifiable_scheduled_posting_reasons_are_distinguishable() {
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let reasons = [
+        UnverifiableReason::AcquisitionDateUnknown,
+        UnverifiableReason::IncomeKindUnknown,
+        UnverifiableReason::PaymentDateUnknown,
+        UnverifiableReason::HistoryStartsAfterSchedule,
+    ];
+    let texts = issue_texts(
+        reasons
+            .iter()
+            .map(|reason| MaterialIssue::ScheduledPostingUnverifiable {
+                account,
+                instrument,
+                reason: *reason,
+            })
+            .collect(),
+    );
+
+    let distinct: std::collections::BTreeSet<&String> = texts.iter().collect();
+    assert_eq!(distinct.len(), 4, "причины неразличимы в тексте: {texts:?}");
 }

@@ -736,10 +736,7 @@ mod tests {
         .unwrap()
     }
 
-    fn lot_with_principal(
-        instrument: crate::ids::InstrumentId,
-        principal: PrincipalState,
-    ) -> Lot {
+    fn lot_with_principal(instrument: crate::ids::InstrumentId, principal: PrincipalState) -> Lot {
         Lot {
             id: LotId::new_random(),
             instrument,

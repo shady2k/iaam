@@ -227,10 +227,7 @@ mod tests {
 
     #[test]
     fn distinct_execution_dates_are_valid() {
-        let windows = [
-            terms(date!(2026 - 12 - 01)),
-            terms(date!(2027 - 12 - 01)),
-        ];
+        let windows = [terms(date!(2026 - 12 - 01)), terms(date!(2027 - 12 - 01))];
 
         assert_eq!(validate_unique_windows(&windows), Ok(()));
     }

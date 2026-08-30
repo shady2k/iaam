@@ -1,4 +1,4 @@
-//! Построение будущего денежного потока по графику облигации (§7.1).
+//! Building future cash flow from the bond schedule (§7.1).
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -12,46 +12,46 @@ use crate::money::{CalcMoney, CurrencyCode, Quantity};
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 
-/// Версия правила построения будущего потока.
+/// Version of the future cash flow construction rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CashflowProjectionVersion(pub u32);
 
-/// Причина, по которой будущий поток нельзя построить целиком.
+/// Reason why the future cash flow cannot be built in full.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CashflowError {
-    #[error("купон периода {period_start} не определён")]
+    #[error("coupon for period {period_start} is undefined")]
     CouponUndetermined { period_start: Date },
-    #[error("первоначальный номинал неизвестен")]
+    #[error("initial face value is unknown")]
     PrincipalUnknown,
-    #[error("график неполон: {reason}")]
+    #[error("schedule is incomplete: {reason}")]
     ScheduleIncomplete { reason: String },
-    #[error("полнота графика неизвестна")]
+    #[error("schedule completeness is unknown")]
     ScheduleCompletenessUnknown,
-    #[error("доли возврата номинала дают {total:?}, а не 100")]
+    #[error("principal repayment shares total {total:?}, not 100")]
     SharesDoNotSumToWhole { total: Dec },
-    #[error("эмитент объявил дефолт")]
+    #[error("issuer has declared default")]
     IssuerDefaultDeclared,
-    #[error("эмитент объявил технический дефолт")]
+    #[error("issuer has declared technical default")]
     IssuerTechnicalDefault,
-    #[error("условия выпуска неизвестны")]
+    #[error("issue terms are unknown")]
     IssueTermsUnknown,
     #[error(transparent)]
     Numeric(#[from] NumericError),
-    #[error("валютные роли не позволяют применить формулу: {roles:?}")]
+    #[error("currency roles do not allow the formula to be applied: {roles:?}")]
     CurrencyFormulaUnknown { roles: Option<CurrencyRoles> },
-    #[error("окно оферты {window:?} нельзя исполнить")]
+    #[error("offer window {window:?} cannot be exercised")]
     OfferWindowNotExercisable { window: crate::bond::OfferWindowId },
 }
-/// Причина, по которой нельзя доверять графику для сверки прошлых выплат.
+/// Reason why the schedule cannot be trusted for reconciling past payments.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ScheduleTrustError {
-    #[error("график неполон: {reason}")]
+    #[error("schedule is incomplete: {reason}")]
     ScheduleIncomplete { reason: String },
-    #[error("полнота графика неизвестна")]
+    #[error("schedule completeness is unknown")]
     ScheduleCompletenessUnknown,
-    #[error("эмитент объявил дефолт")]
+    #[error("issuer has declared default")]
     IssuerDefaultDeclared,
-    #[error("условия выпуска неизвестны")]
+    #[error("issue terms are unknown")]
     IssueTermsUnknown,
 }
 
@@ -68,7 +68,7 @@ impl From<ScheduleTrustError> for CashflowError {
     }
 }
 
-/// Входы правила построения потока.
+/// Inputs to the cash flow construction rule.
 pub struct CashflowInput<'a> {
     pub schedule: &'a BondSchedule,
     pub quantity: Quantity,
@@ -77,7 +77,7 @@ pub struct CashflowInput<'a> {
     pub report_currency: CurrencyCode,
 }
 
-/// Один ожидаемый денежный платёж.
+/// One expected cash payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpectedPosting {
     pub date: Date,
@@ -85,11 +85,11 @@ pub struct ExpectedPosting {
     pub kind: PostingKind,
 }
 
-/// Вид ожидаемого платежа.
+/// Kind of expected payment.
 ///
-/// Порядок вариантов задаёт `Ord`, а он нужен `ScheduledPosting`: без него
-/// сортировка `past` по одной дате оставляла бы выплаты одного дня в
-/// произвольном порядке, а ядро обязано быть детерминированным.
+/// Variant order defines `Ord`, which `ScheduledPosting` needs: without it
+/// sorting `past` by date alone would leave same-day payments in
+/// arbitrary order, while the core must be deterministic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PostingKind {
     Coupon,
@@ -97,41 +97,41 @@ pub enum PostingKind {
     OfferSettlement,
 }
 
-/// Запланированная выплата, срок которой уже наступил.
+/// A scheduled payment that is already due.
 ///
-/// Вид обязателен: купон подтверждается `Income`, возврат номинала —
-/// `CorporateAction`, расчёт по оферте — `OfferExercise`. Одна дата без
-/// вида не позволяет отличить неполученный купон от неполученного
-/// возврата номинала, а искать их надо в разных событиях журнала.
+/// The kind is required: a coupon is confirmed by `Income`, principal repayment —
+/// by `CorporateAction`, offer settlement — by `OfferExercise`. A date without
+/// a kind cannot distinguish a missing coupon from a missing
+/// principal repayment, and they must be sought in different journal events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ScheduledPosting {
     pub date: Date,
     pub kind: PostingKind,
-    /// Дата, на которую определяется право на выплату.
+    /// Date determining entitlement to the payment.
     ///
-    /// `None` — источник не сообщил дату фиксации. Судить по дате
-    /// платежа в этом случае запрещено, и решение принимает правило
-    /// сопоставления, а не построение плана.
+    /// `None` — the source did not report the entitlement date. Inferring it from the
+    /// payment date is prohibited in this case, and the decision is made by the
+    /// matching rule, not plan construction.
     pub entitlement: Option<Date>,
 }
 
-/// Полный результат построения потока.
+/// Complete cash flow construction result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CashflowPlan {
     pub postings: Vec<ExpectedPosting>,
     pub terminal_date: Date,
-    /// Запланированные выплаты, срок которых не позже `as_of`. Правило
-    /// не знает и не может знать, пришли ли деньги; сверку с журналом
-    /// делает вызывающая сторона правилом сопоставления.
+    /// Scheduled payments due no later than `as_of`. The rule
+    /// does not and cannot know whether the money arrived; reconciliation with the journal
+    /// is performed by the caller using the matching rule.
     pub past: Vec<ScheduledPosting>,
 }
 
-/// Правило построения будущего денежного потока.
+/// Future cash flow construction rule.
 pub trait CashflowProjection: Send + Sync + std::fmt::Debug {
     fn future_postings(&self, input: &CashflowInput) -> Result<CashflowPlan, CashflowError>;
 }
 
-/// Первая версия правила построения будущего потока.
+/// First version of the future cash flow construction rule.
 #[derive(Debug, Default)]
 pub struct CashflowProjectionV1;
 
@@ -148,16 +148,16 @@ fn amount_for_per_unit(
     Ok(CalcMoney::new(total, value.currency()))
 }
 
-/// Прошлые выплаты по графику: даты и виды, без денег.
+/// Past scheduled payments: dates and kinds, without amounts.
 ///
-/// Отдельно от `CashflowProjection`, потому что тот отказывается при
-/// неизвестном номинале, а сверке номинал не нужен: она сравнивает плановые
-/// даты с фактами журнала, а не суммы. Пока прошлое строилось сценарием,
-/// неизвестный номинал молча выключал сверку целиком.
+/// Separate from `CashflowProjection`, because it refuses to proceed when
+/// face value is unknown, while reconciliation does not need it: it compares scheduled
+/// dates with journal facts, not amounts. When the past was built by the scenario,
+/// an unknown face value silently disabled reconciliation entirely.
 ///
-/// Оферты намеренно не входят: это право владельца, а не обязанность эмитента.
-/// Их сверка идёт по `OfferBook` и состоянию заявки «предъявлена -> исполнена
-/// -> расчёт получен», а не общим правилом по графику; это отдельный бид
+/// Offers are intentionally excluded: they are the owner's right, not the issuer's obligation.
+/// They are reconciled through `OfferBook` and the application state «submitted -> executed
+/// -> settlement received», rather than the general schedule rule; this is a separate bid
 /// `iaam-d8b.19`.
 pub fn historical_schedule_postings(
     schedule: &BondSchedule,
@@ -179,8 +179,8 @@ pub fn historical_schedule_postings(
         Some(flags) => match (flags.declared, flags.technical) {
             (true, _) => return Err(ScheduleTrustError::IssuerDefaultDeclared),
             (false, true) => {
-                // Технический дефолт означает задержку, а не отмену выплаты:
-                // просрочка по сроку при нём всё равно должна попасть в сверку.
+                // Technical default means a delay, not cancellation of the payment:
+                // an overdue payment must still be included in reconciliation.
             }
             (false, false) => {}
         },
@@ -313,8 +313,8 @@ impl CashflowProjection for CashflowProjectionV1 {
             |terms| terms.execution_date,
         );
 
-        // Купон вне горизонта этого сценария не влияет на его результат.
-        // Для удержания до погашения горизонтом служит последний возврат номинала.
+        // A coupon beyond the horizon of this scenario does not affect its result.
+        // For holding to maturity, the horizon is the final principal repayment.
         for period in &input.schedule.periods {
             if period.payment_date > input.as_of
                 && period.payment_date <= terminal_date
@@ -328,8 +328,8 @@ impl CashflowProjection for CashflowProjectionV1 {
 
         let mut postings = Vec::new();
         let mut past = Vec::new();
-        // Купон в дату исполнения оферты включается: `OfferSettlement`
-        // содержит только процент от номинала, поэтому двойного счёта нет.
+        // A coupon on the offer exercise date is included: `OfferSettlement`
+        // contains only a percentage of face value, so there is no double counting.
         for period in &input.schedule.periods {
             if period.payment_date <= input.as_of {
                 past.push(ScheduledPosting {
@@ -351,11 +351,11 @@ impl CashflowProjection for CashflowProjectionV1 {
             }
         }
 
-        // Возврат номинала в дату исполнения оферты не включается:
-        // `OfferSettlement` заменяет погашение позиции по цене оферты,
-        // поэтому отдельный возврат дал бы двойной денежный поток.
-        // В отличие от него купон добавляется выше, поскольку
-        // `OfferSettlement` его не содержит.
+        // Principal repayment on the offer exercise date is excluded:
+        // `OfferSettlement` replaces redemption of the position at the offer price,
+        // so a separate repayment would create a duplicate cash flow.
+        // Unlike it, the coupon is added above, since
+        // `OfferSettlement` does not include it.
         for principal_return in &input.schedule.principal_returns {
             if principal_return.repayment_date <= input.as_of {
                 past.push(ScheduledPosting {
@@ -412,20 +412,20 @@ impl CashflowProjection for CashflowProjectionV1 {
     }
 }
 
-/// Вторая версия правила потока, передающая дату права в `past`.
+/// Second version of the cash flow rule, passing the entitlement date into `past`.
 #[derive(Debug, Default)]
 pub struct CashflowProjectionV2;
 
 impl CashflowProjection for CashflowProjectionV2 {
     fn future_postings(&self, input: &CashflowInput) -> Result<CashflowPlan, CashflowError> {
-        // Будущие выплаты V2 не отличаются от V1: меняется только прошлое,
-        // которое обогащается датой права. Копия логики V1 здесь означала бы
-        // непроверяемого близнеца — мутационный прогон это и показал.
+        // Future V2 payments do not differ from V1: only the past changes,
+        // enriched with the entitlement date. Copying V1 logic here would create
+        // an unverifiable twin — the mutation run showed exactly that.
         let mut plan = CashflowProjectionV1.future_postings(input)?;
 
-        // Оферта — право владельца, поэтому `historical_schedule_postings`
-        // намеренно не возвращает её. Подменяем только купоны и возвраты
-        // номинала, сохраняя расчёт по выбранному окну из плана V1.
+        // An offer is the owner's right, so `historical_schedule_postings`
+        // intentionally does not return it. We replace only coupons and principal
+        // repayments, preserving settlement for the selected window from the V1 plan.
         let offer_settlements = plan
             .past
             .iter()
@@ -518,7 +518,7 @@ mod tests {
         );
 
         let past = historical_schedule_postings(&schedule, date!(2026 - 08 - 01))
-            .expect("история не должна зависеть от номинала");
+            .expect("history must not depend on face value");
 
         assert_eq!(
             past,
@@ -541,13 +541,13 @@ mod tests {
     fn historical_postings_reject_incomplete_schedule_with_reason() {
         let mut schedule = valid_schedule(vec![], vec![]);
         schedule.completeness = ScheduleCompleteness::Incomplete {
-            reason: "нет даты погашения".to_owned(),
+            reason: "no maturity date".to_owned(),
         };
 
         assert!(matches!(
             historical_schedule_postings(&schedule, date!(2026 - 08 - 01)),
             Err(ScheduleTrustError::ScheduleIncomplete { reason })
-                if reason == "нет даты погашения"
+                if reason == "no maturity date"
         ));
     }
 
@@ -589,7 +589,7 @@ mod tests {
         schedule.default_flags.as_mut().unwrap().technical = true;
 
         let past = historical_schedule_postings(&schedule, date!(2026 - 08 - 15))
-            .expect("технический дефолт задерживает, но не отменяет выплаты");
+            .expect("technical default delays payments but does not cancel them");
 
         assert_eq!(past.len(), 2);
         assert_eq!(past[0].kind, PostingKind::Coupon);
@@ -622,11 +622,11 @@ mod tests {
 
         let hold_plan = CashflowProjectionV1
             .future_postings(&input(&schedule, &hold_to_maturity, as_of))
-            .expect("сценарий удержания не требует исполнения оферты");
-        // Оферта — право владельца, поэтому без предъявления по ней нет
-        // обещанного эмитентом платежа и нет основания требовать факт расчёта.
+            .expect("hold scenario does not require offer exercise");
+        // An offer is the owner's right, so without exercising it there is no
+        // issuer-promised payment and no basis to require a settlement record.
         let historical = historical_schedule_postings(&schedule, as_of)
-            .expect("проверенный график даёт историю");
+            .expect("a validated schedule provides history");
 
         assert!(
             hold_plan
@@ -667,14 +667,14 @@ mod tests {
 
         let v1 = CashflowProjectionV1
             .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01)))
-            .expect("выбранная оферта должна попасть в прошлое");
+            .expect("the selected offer must appear in the past");
         let v2 = CashflowProjectionV2
             .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01)))
-            .expect("выбранная оферта должна попасть в прошлое");
+            .expect("the selected offer must appear in the past");
 
-        // Подмена прошлого в V2 частичная: `historical_schedule_postings`
-        // намеренно не знает об офертах, поэтому расчёт по выбранному окну
-        // обязан сохраниться из плана V1.
+        // Replacement of the past in V2 is partial: `historical_schedule_postings`
+        // intentionally knows nothing about offers, so settlement for the selected window
+        // must be preserved from the V1 plan.
         assert_eq!(v2.past, v1.past);
         assert_eq!(
             v2.past,
@@ -702,10 +702,10 @@ mod tests {
         let as_of = date!(2026 - 08 - 01);
 
         let historical = historical_schedule_postings(&schedule, as_of)
-            .expect("проверенный график даёт прошлые выплаты");
+            .expect("a validated schedule provides past payments");
         let v2 = CashflowProjectionV2
             .future_postings(&input(&schedule, &choice, as_of))
-            .expect("известный номинал даёт полный план");
+            .expect("a known face value provides a complete plan");
 
         assert_eq!(historical, v2.past);
     }
@@ -964,10 +964,10 @@ mod tests {
 
     #[test]
     fn past_postings_carry_their_kind_so_reconciliation_can_match_them() {
-        // Купон и возврат номинала подтверждаются РАЗНЫМИ событиями журнала:
-        // купон приходит `Income`, амортизация — `CorporateAction`. Без вида
-        // выплаты сверка искала бы купонный факт под возврат номинала и
-        // поднимала ложную тревогу на каждой амортизируемой облигации.
+        // Coupons and principal repayments are confirmed by DIFFERENT journal events:
+        // a coupon arrives as `Income`, amortization as `CorporateAction`. Without the payment
+        // kind, reconciliation would match a coupon event to a principal repayment and
+        // raise a false alarm for every amortizing bond.
         let plan = plan_with_past_coupon_and_past_principal_return();
 
         assert_eq!(
@@ -1098,9 +1098,9 @@ mod tests {
 
     #[test]
     fn a_schedule_without_a_face_value_cannot_build_a_flow() {
-        // Номинал неизвестен — поток не строится. Ноль подставлять
-        // запрещено: «номинал ноль» и «номинал неизвестен» требуют
-        // от владельца разных действий (§4.9).
+        // Face value is unknown — no cash flow is built. Substituting zero
+        // is forbidden: «zero face value» and «unknown face value» require
+        // different actions from the owner (§4.9).
         let mut schedule = valid_schedule(vec![], vec![]);
         schedule.initial_principal = None;
         let choice = OfferChoice::HoldToMaturity;
@@ -1116,7 +1116,7 @@ mod tests {
     fn rejects_incomplete_schedule_with_reason() {
         let mut schedule = valid_schedule(vec![], vec![]);
         schedule.completeness = ScheduleCompleteness::Incomplete {
-            reason: "нет даты погашения".to_owned(),
+            reason: "no maturity date".to_owned(),
         };
         let choice = OfferChoice::HoldToMaturity;
         assert!(matches!(
@@ -1125,7 +1125,7 @@ mod tests {
                 &choice,
                 date!(2026 - 08 - 01),
             )),
-            Err(CashflowError::ScheduleIncomplete { reason }) if reason == "нет даты погашения"
+            Err(CashflowError::ScheduleIncomplete { reason }) if reason == "no maturity date"
         ));
     }
 

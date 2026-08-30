@@ -1,33 +1,33 @@
-//! Типизированные ноги движения (§4.3).
+//! Typed movement legs (§4.3).
 //!
-//! Событие раскладывается на ноги, а не хранится одной суммой:
-//! иначе амортизация номинала, НКД и разнесение комиссии
-//! невосстановимы из записанного факта.
+//! An event is split into legs rather than stored as a single total:
+//! otherwise principal amortization, accrued interest, and fee allocation
+//! cannot be recovered from the recorded fact.
 
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AccountId, CustodyId, InstrumentId};
 use crate::money::{Money, Quantity};
 
-/// Что именно движется.
+/// What exactly is moving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LegKind {
-    /// Движение денег по счёту.
+    /// Movement of cash in an account.
     Cash,
-    /// Движение количества бумаг.
+    /// Movement of securities quantity.
     SecurityQuantity,
-    /// Движение непогашенного номинала (амортизация).
+    /// Movement of outstanding principal (amortization).
     Principal,
-    /// Комиссия.
+    /// Fee.
     Fee,
-    /// Налог.
+    /// Tax.
     Tax,
 }
 
-/// Одна нога движения.
+/// One movement leg.
 ///
-/// Знак задаёт направление: положительный — приход в указанный счёт
-/// или custody, отрицательный — расход.
+/// The sign sets the direction: positive — inflow to the specified account
+/// or custody, negative — outflow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Leg {
     pub kind: LegKind,
@@ -104,8 +104,8 @@ impl Leg {
         }
     }
 
-    /// Денежное содержание ноги, если оно есть.
-    /// Комиссия и налог — тоже деньги: они уменьшают денежный остаток.
+    /// The leg's cash value, if any.
+    /// Fees and taxes are also cash: they reduce the cash balance.
     #[must_use]
     pub const fn cash_effect(&self) -> Option<Money> {
         match self.kind {
@@ -197,8 +197,8 @@ mod tests {
 
     #[test]
     fn every_money_bearing_kind_counts_as_cash_effect() {
-        // Налог и амортизация номинала тоже уменьшают или увеличивают
-        // денежный остаток: пропустить их — потерять часть движения.
+        // Tax and principal amortization also reduce or increase
+        // the cash balance: skipping them means losing part of the movement.
         let account = AccountId::new_random();
         let m = rub(-1_300);
         assert_eq!(Leg::cash(account, m).cash_effect(), Some(m));

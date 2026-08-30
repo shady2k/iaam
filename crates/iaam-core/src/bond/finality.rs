@@ -1,13 +1,14 @@
-//! Окончательность возврата номинала (§6 спеки E3.4.4, бид iaam-d8b.4.3).
+//! Finality of principal returns (§6 of spec E3.4.4, bead iaam-d8b.4.3).
 //!
-//! Правило одно: возврат окончателен, когда накопленная сумма долей
-//! достигает 100 %. Код источника не читается — у шести бумаг из
-//! пятидесяти проверенных строки погашения нет вовсе.
+//! One rule: a return is final when the accumulated share reaches 100%.
+//! Source codes are not read — six of the fifty reviewed securities have no
+//! maturity-code row at all.
 //!
-//! Признак наблюдением не записывается: он свойство проекции (ADR-0002).
-//! Инвариант полноты в `iaam_market::schedule::completeness` считает ту
-//! же сумму, но принадлежит ПРОФИЛЮ ИСТОЧНИКА и отвечает на другой
-//! вопрос — цела ли выгрузка.
+//! This is not recorded as an observation: it is a projection property
+//! (ADR-0002). The completeness invariant in
+//! `iaam_market::schedule::completeness` calculates the same total, but
+//! belongs to the SOURCE PROFILE and answers a different question — whether
+//! the export is intact.
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -16,18 +17,18 @@ use crate::bond::PrincipalReturn;
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 
-/// Окончателен ли возврат номинала.
+/// Whether a principal return is final.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrincipalReturnFinality {
-    /// Накопленная доля достигла 100 %: номинал возвращён целиком.
+    /// The accumulated share reached 100%: all principal was returned.
     Final,
-    /// Часть номинала, после которой останется непогашенный остаток.
+    /// Part of the principal after which a remainder remains outstanding.
     Partial,
-    /// Доли не дают 100 %: сказать нечего ни про одну строку.
+    /// Shares do not reach 100%: no row can be called final.
     Unknown,
 }
 
-/// Разметить ряд возвратов признаком окончательности.
+/// Mark a sequence of principal returns with finality.
 pub fn finality_of(
     returns: &[PrincipalReturn],
 ) -> Result<Vec<(PrincipalReturn, PrincipalReturnFinality)>, NumericError> {
@@ -41,8 +42,8 @@ pub fn finality_of(
             .collect());
     }
 
-    // Порядок источника не гарантирован, а накопление зависит от него
-    // целиком: без сортировки окончательной окажется случайная строка.
+    // Source row order is not guaranteed, while accumulation depends on it
+    // completely: without sorting, a random row would be marked final.
     let mut ordered = returns.to_vec();
     ordered.sort_by_key(|r| r.repayment_date);
 
@@ -76,9 +77,9 @@ mod tests {
 
     #[test]
     fn six_amortisations_without_a_maturity_code_still_end_finally() {
-        // У шести бумаг из пятидесяти проверенных последний возврат
-        // приходит обычной строкой амортизации, без кода погашения.
-        // Читать код источника значит потерять окончательность у них.
+        // For six of fifty reviewed securities, the last return arrives as an
+        // ordinary amortisation row without a maturity code.
+        // Reading the source code would lose their finality.
         let returns = vec![
             ret(date!(2027 - 01 - 15), "10"),
             ret(date!(2028 - 01 - 15), "10"),
@@ -94,9 +95,8 @@ mod tests {
 
     #[test]
     fn shares_short_of_a_hundred_make_nobody_final() {
-        // Усечённая страница даёт правдоподобный, но неполный ряд.
-        // Объявить последнюю строку окончательной значит закрыть
-        // бумагу на десять лет раньше срока.
+        // A truncated page gives a plausible but incomplete sequence.
+        // Marking the last row final would close the security ten years early.
         let returns = vec![
             ret(date!(2027 - 01 - 15), "40"),
             ret(date!(2028 - 01 - 15), "35"),
@@ -111,8 +111,8 @@ mod tests {
 
     #[test]
     fn returns_are_walked_in_date_order_not_in_source_order() {
-        // Источник порядок строк не гарантирует, а накопление доли
-        // от порядка зависит целиком.
+        // Source row order is not guaranteed, while share accumulation depends
+        // on it completely.
         let returns = vec![
             ret(date!(2028 - 01 - 15), "60"),
             ret(date!(2027 - 01 - 15), "40"),

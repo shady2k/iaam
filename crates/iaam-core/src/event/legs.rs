@@ -1,19 +1,19 @@
-//! Ожидания от ног события (§15.2).
+//! Expectations for event legs (§15.2).
 //!
-//! Существующие помощники `expect_single_cash` и `validate_trade` сверяют
-//! вид ноги, сумму и знак — но не счёт, не бумагу и не место хранения.
-//! Заслон, пропускающий ногу по чужой бумаге, декоративен: событие
-//! с посторонним движением не является тем событием, которым назвалось.
+//! Existing helpers `expect_single_cash` and `validate_trade` compare
+//! the leg kind, amount and sign — but not the account, security or custody location.
+//! A guard that accepts a leg for another security is decorative: the event
+//! with an unrelated movement is not the event it claims to be.
 
 use super::leg::{Leg, LegKind};
 use super::{Event, EventValidationError};
 use crate::ids::{AccountId, CustodyId, InstrumentId};
 use crate::money::{Money, Quantity};
 
-/// Ожидание от одной ноги.
+/// Expectation for one leg.
 ///
-/// Незаполненное поле не проверяется — заполненное обязано совпасть.
-/// Вид и счёт обязательны: нога без них не описана вовсе.
+/// An unset field is not checked — a set one must match.
+/// Kind and account are required: without them, a leg is not described at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LegExpectation {
     pub kind: LegKind,
@@ -25,12 +25,12 @@ pub struct LegExpectation {
 }
 
 impl Event {
-    /// **Ровно** перечисленные ноги, в любом порядке.
+    /// **Exactly** the listed legs, in any order.
     ///
-    /// Лишняя нога — такая же ошибка, как недостающая: событие
-    /// с посторонним движением не является тем событием, которым
-    /// назвалось. Порядок ног не проверяется: источник волен записать
-    /// их как угодно.
+    /// An extra leg is as much an error as a missing one: an event
+    /// with an unrelated movement is not the event it
+    /// claims to be. Leg order is not checked: the source may record
+    /// them however it likes.
     pub fn expect_legs(
         &self,
         name: &'static str,
@@ -43,19 +43,19 @@ impl Event {
         Err(self.diagnose(name, expected))
     }
 
-    /// Почему раскладка не сошлась. Точность диагноза важна: «ног не
-    /// столько» ничего не говорит тому, кто читает отказ импорта.
+    /// Why the matching failed. Diagnostic precision matters: «wrong
+    /// number of legs» tells the reader of an import rejection nothing.
     fn diagnose(&self, name: &'static str, expected: &[LegExpectation]) -> EventValidationError {
         let found = self.legs.len();
         let want = expected.len();
-        // Ожидание, к которому не подходит ни одна нога, — самая точная
-        // жалоба: она называет поле, а не число.
+        // An expectation that no leg matches is the most precise
+        // complaint: it names the field, not the count.
         for expectation in expected {
             if self.legs.iter().any(|leg| matches(leg, expectation)) {
                 continue;
             }
-            // Ни одна нога не подошла, поэтому у любой ноги того же вида
-            // найдётся несовпавшее поле — а его имя и есть диагноз.
+            // Since no leg matched, every leg of the same kind
+            // has a mismatched field — and its name is the diagnosis.
             let mismatch = self
                 .legs
                 .iter()
@@ -75,9 +75,9 @@ impl Event {
                 },
             };
         }
-        // Каждое ожидание выполнимо по отдельности — значит, дело
-        // в числе ног: либо нога осталась лишней, либо два ожидания
-        // претендуют на одну и ту же.
+        // Each expectation can be met separately — so the problem
+        // is the number of legs: either an extra leg remains, or two expectations
+        // claim the same one.
         if found < want {
             return EventValidationError::MissingLeg {
                 event: name,
@@ -94,11 +94,11 @@ impl Event {
     }
 }
 
-/// Полный перебор с возвратом, а не жадная раскладка.
+/// Exhaustive backtracking, not greedy matching.
 ///
-/// Жадная сопоставила бы незаполненное ожидание первой подошедшей ноге
-/// и объявила бы событие неправильным, хотя раскладка существует.
-/// Ног у события единицы, поэтому цена перебора неощутима.
+/// A greedy algorithm would match the unset expectation to the first matching leg
+/// and declare the event invalid, although a matching exists.
+/// Events have only a few legs, so the search cost is negligible.
 fn assign(legs: &[Leg], expected: &[LegExpectation], taken: &mut [bool]) -> bool {
     let Some((first, rest)) = expected.split_first() else {
         return true;
@@ -120,9 +120,9 @@ fn matches(leg: &Leg, expectation: &LegExpectation) -> bool {
     first_difference(leg, expectation).is_none()
 }
 
-/// Имя первого несовпавшего поля, если оно есть. Порядок полей
-/// фиксирован: диагноз обязан быть воспроизводимым, иначе один и тот же
-/// брак объясняется каждый раз по-разному.
+/// The name of the first mismatched field, if any. Field order
+/// is fixed: the diagnosis must be reproducible, otherwise the same
+/// defect is explained differently each time.
 fn first_difference(leg: &Leg, expectation: &LegExpectation) -> Option<&'static str> {
     if leg.kind != expectation.kind {
         return Some("kind");
@@ -145,8 +145,8 @@ fn first_difference(leg: &Leg, expectation: &LegExpectation) -> Option<&'static 
     None
 }
 
-/// Незаполненное ожидание не проверяется; заполненное обязано совпасть,
-/// в том числе с пустым полем ноги.
+/// An unset expectation is not checked; a set one must match,
+/// including an empty leg field.
 fn differs<T: PartialEq>(actual: Option<T>, wanted: Option<T>) -> bool {
     wanted.is_some_and(|wanted| actual != Some(wanted))
 }
@@ -293,8 +293,8 @@ mod tests {
 
     #[test]
     fn a_quantity_of_the_wrong_sign_is_refused() {
-        // Выбытие записывается отрицательным количеством: та же величина
-        // с обратным знаком — противоположное движение, а не описка.
+        // An outflow is recorded as a negative quantity: the same magnitude
+        // with the opposite sign is the opposite movement, not a typo.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
@@ -370,8 +370,8 @@ mod tests {
 
     #[test]
     fn matching_legs_pass_regardless_of_the_order_they_were_written_in() {
-        // Порядок ног в событии не несёт смысла: источник волен записать
-        // их как угодно, и заслон, зависящий от порядка, ловил бы порядок.
+        // Leg order within an event has no meaning: the source may record
+        // them however it likes, and an order-dependent guard would be checking order.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let event = with_legs(
@@ -399,8 +399,8 @@ mod tests {
 
     #[test]
     fn two_expectations_never_settle_on_the_same_leg() {
-        // Жадная раскладка сопоставила бы обе ноги одному ожиданию
-        // и объявила бы событие правильным, потеряв вторую ногу.
+        // Greedy matching would match both legs to one expectation
+        // and declare the event valid, losing the second leg.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let event = with_legs(
@@ -420,8 +420,8 @@ mod tests {
             quantity: None,
         };
 
-        // Незаполненное ожидание подходит к обеим ногам; заполненное —
-        // только к одной. Раскладка обязана найти её, а не сдаться.
+        // An unset expectation matches both legs; the set one —
+        // only one. The matching must find it, not give up.
         assert_eq!(
             event.expect_legs(
                 "x",
@@ -436,8 +436,8 @@ mod tests {
 
     #[test]
     fn two_expectations_and_one_matching_leg_report_a_missing_leg() {
-        // Каждое ожидание по отдельности выполнимо, но одновременно —
-        // нет: одна нога не может закрыть две ноги.
+        // Each expectation can be met separately, but together —
+        // they cannot: one leg cannot satisfy two expected legs.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let event = with_legs(
@@ -459,8 +459,8 @@ mod tests {
 
     #[test]
     fn equal_counts_that_do_not_pair_up_report_an_unexpected_leg() {
-        // Ног столько же, сколько ожиданий, но раскладки нет: обе
-        // претендуют на одну ногу, а вторая осталась лишней.
+        // There are as many legs as expectations, but no matching exists: both
+        // claim the same leg, while the second remains extra.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let event = with_legs(
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn an_unfilled_expectation_field_is_not_checked() {
-        // Незаполненное поле — «не проверяется», а не «обязано быть пустым».
+        // An unset field — «not checked», not «must be empty».
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let event = with_legs(
@@ -510,8 +510,8 @@ mod tests {
 
     #[test]
     fn an_event_with_no_legs_meets_an_empty_expectation() {
-        // Поданная заявка по оферте ног не имеет: ни денег, ни бумаг она
-        // не двигает. Заслон обязан это подтверждать, а не отказывать.
+        // A submitted tender offer order has no legs: it moves no cash, nor does it move
+        // securities. The guard must confirm this, not reject it.
         let account = AccountId::new_random();
         let event = with_legs(account, Vec::new());
         assert_eq!(event.expect_legs("x", &[]), Ok(()));

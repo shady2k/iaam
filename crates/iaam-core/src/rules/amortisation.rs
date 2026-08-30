@@ -1,10 +1,10 @@
-//! Распределение возвращённой стоимости при амортизации (§6.5).
+//! Allocating returned basis on amortisation (§6.5).
 //!
-//! Отдельный трейт и отдельная версия, а не расширение
-//! [`super::lot_disposal::LotDisposalRule`]: списание лотов — выбор
-//! владельца (FIFO против прочих), амортизация — событие выпуска.
-//! Общий номер версии связал бы два независимых решения, и смена метода
-//! списания задним числом переписала бы историю амортизаций.
+//! A separate trait and version, not an extension of
+//! [`super::lot_disposal::LotDisposalRule`]: lot disposal is the owner's
+//! choice (FIFO versus others), while amortisation is an issue event.
+//! A shared version number would couple two independent decisions, and changing
+//! the disposal method retroactively would rewrite amortisation history.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,7 +14,7 @@ use crate::money::Money;
 use crate::numeric::NumericError;
 use crate::rules::ReturnedShare;
 
-/// Версия правила амортизации. Своя, не общая со списанием лотов.
+/// Amortisation rule version. Separate from lot disposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AmortisationRuleVersion(pub u32);
 
@@ -26,25 +26,25 @@ pub enum AmortisationError {
     Disposal(#[from] DisposalError),
 }
 
-/// Сколько налоговой стоимости лота возвращается вместе с номиналом.
+/// How much of a lot's tax basis is returned with the principal.
 pub trait AmortisationRule: Send + Sync + std::fmt::Debug {
-    /// Аргумент безразмерный: суммы в формуле сокращаются, и правилу
-    /// незачем знать ни первоначальный номинал, ни остаток. Долю уже
-    /// вычислило приложение и сохранило в самом факте.
+    /// The argument is dimensionless: amounts cancel in the formula, so the
+    /// rule need not know either initial principal or the remainder. The
+    /// application has already computed the share and stored it in the fact.
     fn basis_returned(&self, lot: &Lot, share: ReturnedShare) -> Result<Money, AmortisationError>;
 }
 
-/// Доля стоимости, пропорциональная доле возвращённого номинала.
+/// Share of the value proportional to the share of principal repaid.
 #[derive(Debug, Default)]
 pub struct ProRataV1;
 
 impl AmortisationRule for ProRataV1 {
     fn basis_returned(&self, lot: &Lot, share: ReturnedShare) -> Result<Money, AmortisationError> {
-        // Округление и обрезка живут в `split_basis`: она решает ровно
-        // задачу «доля от суммы» с конвенцией «половина к чётному»,
-        // и своя конвенция внутри одного ядра означала бы два разных
-        // ответа на один вопрос. Знаменатель — единица: доля уже взята
-        // от остатка до события.
+        // Rounding and truncation live in `split_basis`: it solves exactly the
+        // “share of an amount” problem with the “half to even” convention, and
+        // a separate convention inside one core would produce two answers to
+        // one question. The denominator is one: the share is already from the
+        // pre-event remainder.
         Ok(split_basis(
             lot.cost_basis,
             share.inner().inner(),
@@ -74,7 +74,7 @@ mod tests {
     }
 
     fn share(text: &str) -> ReturnedShare {
-        ReturnedShare::new(dec(text)).expect("доля в пределах инварианта")
+        ReturnedShare::new(dec(text)).expect("share is within the invariant")
     }
 
     fn lot(cost_basis: Money) -> Lot {
@@ -101,9 +101,9 @@ mod tests {
 
     #[test]
     fn the_whole_basis_comes_back_when_the_whole_remainder_does() {
-        // Последняя амортизация возвращает весь остаток номинала.
-        // Бумага при этом остаётся в позиции: её выбытие — отдельный
-        // факт, а не следствие возврата денег.
+        // The final amortisation returns the entire principal remainder.
+        // The security remains in the position: its disposal is a separate
+        // fact, not a consequence of the cash return.
         let lot = lot(rub(100_000));
         assert_eq!(
             ProRataV1.basis_returned(&lot, share("1")).unwrap(),
@@ -113,9 +113,9 @@ mod tests {
 
     #[test]
     fn rounding_follows_the_half_to_even_convention_of_split_basis() {
-        // 101 копейка пополам — 50, а не 51: конвенция «половина
-        // к чётному» живёт в `split_basis` и остаётся единственной
-        // в ядре.
+        // 101 kopecks split in half is 50, not 51: the “half to even”
+        // convention lives in `split_basis` and remains the only one
+        // in the core.
         let lot = lot(rub(101));
         assert_eq!(
             ProRataV1.basis_returned(&lot, share("0.5")).unwrap(),

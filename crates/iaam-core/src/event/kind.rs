@@ -1,9 +1,9 @@
-//! Семейство типов событий (§4.6).
+//! Family of event types (§4.6).
 //!
-//! На этапе 1 реализовано подмножество, достаточное для ручного ввода
-//! и расчёта XIRR до налога. Остальные варианты добавляются на своих
-//! этапах — добавление варианта обязано сломать сборку везде, где
-//! разбор не полон.
+//! Stage 1 implements the subset sufficient for manual input
+//! and pre-tax XIRR calculation. Other variants are added in their
+//! respective stages — adding a variant must break the build wherever
+//! handling is incomplete.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,14 +15,14 @@ use crate::numeric::decimal::Dec;
 use crate::reconciliation::claim::{AssertionPeriod, ControlClaim};
 use crate::valuation::PriceQuality;
 
-/// Уверенность в количестве (§10.7).
+/// Confidence in the quantity (§10.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Certainty {
     Known,
     Estimated,
 }
 
-/// Уверенность в дате приобретения.
+/// Confidence in the acquisition date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DateCertainty {
     Known,
@@ -30,7 +30,7 @@ pub enum DateCertainty {
     Unknown,
 }
 
-/// Уверенность в налоговой стоимости.
+/// Confidence in the tax basis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BasisCertainty {
     Documented,
@@ -38,7 +38,7 @@ pub enum BasisCertainty {
     Unknown,
 }
 
-/// Троичный ответ. `Unknown` — полноценное значение, а не «нет» (§4.9).
+/// A three-valued answer. `Unknown` is a full-fledged value, not “no” (§4.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tristate {
     Yes,
@@ -46,20 +46,20 @@ pub enum Tristate {
     Unknown,
 }
 
-/// Известно ли что-то вообще.
+/// Is anything known at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Knowledge {
     Known,
     Unknown,
 }
 
-/// Восстановленное начало как **набор утверждений с уверенностью**
-/// (§10.7), а не строка с ценой.
+/// Reconstructed opening as a **set of assertions with confidence**
+/// (§10.7), not a string with a price.
 ///
-/// Умолчание — «неизвестно» по каждому пункту. Это не заглушка: событие,
-/// записанное до появления этого поля, действительно ничего из
-/// перечисленного не утверждало, и приписать ему `Known` значило бы
-/// задним числом объявить документированным то, чего никто не видел.
+/// Each item defaults to “unknown”. This is not a placeholder: an event,
+/// recorded before this field was introduced, truly asserted none of
+/// the listed facts, and marking them `Known` would mean
+/// retroactively declaring as documented something no one had seen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpeningAssertions {
     pub quantity: Certainty,
@@ -76,9 +76,9 @@ pub struct OpeningAssertions {
 impl Default for OpeningAssertions {
     fn default() -> Self {
         Self {
-            // Количество восстановленной позиции — оценка, пока владелец
-            // не сказал иного: «известно» по умолчанию означало бы, что
-            // система сама подтвердила то, что ей продиктовали.
+            // The reconstructed position quantity is an estimate until the owner
+            // says otherwise: defaulting to “known” would mean that
+            // the system itself confirmed what it was told.
             quantity: Certainty::Estimated,
             acquisition_date: None,
             acquisition_date_certainty: DateCertainty::Unknown,
@@ -93,156 +93,156 @@ impl Default for OpeningAssertions {
 }
 
 impl OpeningAssertions {
-    /// Достаточно ли известно, чтобы считать налоговую стоимость.
+    /// Is enough known to calculate the tax basis.
     ///
-    /// Используется отчётом: если стоимость неизвестна, налоговый отчёт
-    /// обязан вернуть диапазон или `not_computable`, но не точную цифру
-    /// (§10.7). Сам расчёт появится в E5.
+    /// The report uses this: if the basis is unknown, the tax report
+    /// must return a range or `not_computable`, not an exact number
+    /// (§10.7). The calculation itself will appear in E5.
     #[must_use]
     pub const fn basis_is_documented(&self) -> bool {
         matches!(self.tax_basis, BasisCertainty::Documented)
     }
 }
 
-/// Направление сделки.
+/// Trade direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TradeSide {
     Buy,
     Sell,
 }
 
-/// Вид выплаченного дохода.
+/// Type of income paid.
 ///
-/// Варианта `Other` нет намеренно: мешок, по которому нельзя принять
-/// решение, не отличается от незнания, а §4.9 требует именно различимого
-/// незнания — его выражает `None` в самом поле.
+/// There is intentionally no `Other` variant: a catch-all on which no
+/// decision can be based is indistinguishable from not knowing, while §4.9 requires
+/// that unknown state to be explicit — `None` expresses it in the field itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IncomeKind {
-    /// Купон по облигации.
+    /// Bond coupon.
     Coupon,
-    /// Дивиденд по долевой бумаге.
+    /// Equity dividend.
     Dividend,
-    /// Выплаченные проценты по вкладу (на него обопрётся E3.5).
+    /// Deposit interest paid (E3.5 will build on this).
     DepositInterest,
 }
 
-/// Тип события. Исчерпаемый — `#[non_exhaustive]` намеренно **не**
-/// применяется: внешних потребителей у ядра нет, а исчерпаемость даёт
-/// проверку полноты разбора (§15.1).
+/// The event type is exhaustive — `#[non_exhaustive]` is intentionally **not**
+/// used: the core has no external consumers, and exhaustiveness enables
+/// complete handling checks (§15.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
-    /// Покупка или продажа.
+    /// Purchase or sale.
     Trade {
         side: TradeSide,
         instrument: InstrumentId,
         quantity: Quantity,
         gross: Money,
         fee: Option<Money>,
-        /// НКД, уплаченный продавцу или полученный от покупателя (§7.2).
+        /// Accrued coupon interest paid to the seller or received from the buyer (§7.2).
         accrued_interest: Option<Money>,
     },
-    /// Деньги вошли в контур извне (§4.10).
+    /// Money entered the contour from outside (§4.10).
     CashIn { amount: Money },
-    /// Деньги вышли из контура.
+    /// Money left the contour.
     CashOut { amount: Money },
-    /// Движение денег между счетами.
+    /// Money moved between accounts.
     ///
-    /// **Оба счёта хранятся в самом событии.** Классификация относительно
-    /// контура невозможна без второго счёта: перевод с внешнего вклада на
-    /// внутренний брокерский счёт — внешний поток, а между двумя внутренними
-    /// счетами — нет. Событие необратимо, поэтому недостающая семантика
-    /// здесь означала бы миграцию журнала позже (§16.1).
+    /// **Both accounts are stored in the event itself.** Classification relative
+    /// to the contour is impossible without the second account: a transfer from an external deposit to
+    /// an internal brokerage account is an external flow, while one between two internal
+    /// accounts is not. The event is immutable, so missing semantics
+    /// here would require a journal migration later (§16.1).
     CashTransfer {
         transfer_id: TransferId,
         from: AccountId,
         to: AccountId,
         amount: Money,
     },
-    /// Купон, дивиденд, фактически выплаченные проценты.
+    /// Coupon, dividend, or interest actually paid.
     Income {
         instrument: Option<InstrumentId>,
         gross: Money,
-        /// Вид дохода, если источник его назвал.
+        /// Type of income, if the source named it.
         ///
-        /// `#[serde(default)]` обязателен: журнал append-only, и уже
-        /// записанные выплаты этого поля не содержат. `None` означает
-        /// «не утверждалось», а не «дивиденд»: подстановка вида задним
-        /// числом объявила бы известным то, чего никто не сказал (§4.9).
+        /// `#[serde(default)]` is required: the journal is append-only, and already
+        /// recorded payments do not contain this field. `None` means
+        /// “was not asserted”, not “dividend”: retroactively supplying a type
+        /// would declare known something no one stated (§4.9).
         #[serde(default)]
         kind: Option<IncomeKind>,
     },
-    /// Комиссия, не привязанная к сделке.
+    /// Fee not tied to a trade.
     Fee { amount: Money, origin: FeeOrigin },
-    /// Восстановленная позиция для счёта без истории (§10.7).
+    /// Reconstructed position for an account with no history (§10.7).
     OpeningPosition {
         instrument: InstrumentId,
         quantity: Quantity,
         cost_basis: Option<Money>,
-        /// Набор утверждений о восстановленном начале (§10.7).
+        /// Set of assertions about the reconstructed opening (§10.7).
         ///
-        /// `#[serde(default)]` обязателен: журнал append-only, и уже
-        /// записанные события этого поля не содержат. Отсутствие поля
-        /// означает «ничего из этого не утверждалось», а не выдуманные
-        /// значения.
+        /// `#[serde(default)]` is required: the journal is append-only, and already
+        /// recorded events do not contain this field. An absent field
+        /// means “none of this was asserted”, not invented
+        /// values.
         #[serde(default)]
         assertions: OpeningAssertions,
     },
-    /// Восстановленный денежный остаток.
+    /// Reconstructed cash balance.
     OpeningCash { amount: Money },
-    /// Оценка инструмента по цене за единицу (§5.4).
+    /// Valuation of an instrument at a per-unit price (§5.4).
     ///
-    /// Факт с provenance, а не расчёт: цену кто-то опубликовал или назвал,
-    /// и без неё стоимость позиции неизвестна. На этапе 1 источник —
-    /// владелец или внешний агент; в E3 тот же вариант заполняет
-    /// `iaam-market`, и схема от этого не меняется.
+    /// A fact with provenance, not a calculation: someone published or supplied the price,
+    /// and without it the position's value is unknown. At stage 1, the source is
+    /// the owner or an external agent; in E3 the same variant is populated by
+    /// `iaam-market`, and the schema remains unchanged.
     ///
-    /// Денег не двигает: ног у события нет.
+    /// Moves no money: the event has no legs.
     Valuation {
         instrument: InstrumentId,
         price: Dec,
         currency: CurrencyCode,
         quality: PriceQuality,
     },
-    /// Контрольное утверждение источника о полноте интервала (§10.3).
+    /// The source's control assertion about interval completeness (§10.3).
     ///
-    /// Факт с provenance, а не расчёт: контрольная секция отчёта — это
-    /// то, что источник о себе сказал. Сверка сравнивает её с тем, что
-    /// насчитала проекция, и из совпадения рождается основание повышения
-    /// статуса. Денег не двигает: ног у события нет.
+    /// A fact with provenance, not a calculation: the report's control section is
+    /// what the source said about itself. Reconciliation compares it with what
+    /// the projection computed, and a match provides grounds for raising the
+    /// status. Moves no money: the event has no legs.
     ControlAssertion {
         period: AssertionPeriod,
         claim: ControlClaim,
     },
-    /// Корпоративное действие по бумаге: амортизация, погашение,
-    /// замещение (§4.7).
+    /// Corporate action on a security: amortization, redemption,
+    /// replacement (§4.7).
     ///
-    /// Одним вариантом с типизированным семейством внутри, а не тремя
-    /// вариантами `EventKind`: члены семейства разделяют идентичность
-    /// («что решил эмитент по этой бумаге») и обрабатываются вместе
-    /// везде, где важно именно это.
+    /// A single variant with a typed family inside, rather than three
+    /// `EventKind` variants: family members share an identity
+    /// (“what the issuer decided for this security”) and are handled together
+    /// wherever that is what matters.
     CorporateAction { action: CorporateAction },
-    /// Исполнение оферты — право владельца, а не решение эмитента,
-    /// поэтому отдельный вариант, а не член корпоративного действия.
+    /// Exercising an offer is the holder's right, not an issuer decision,
+    /// so it is a separate variant, not a corporate-action member.
     OfferExercise { action: OfferExerciseAction },
 }
 
-/// Происхождение комиссии. Нужно уже на этапе 1, потому что проценты
-/// по марже импортируются как комиссия с пометкой (§11).
+/// Fee origin. Required as early as stage 1 because margin interest
+/// is imported as a tagged fee (§11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FeeOrigin {
     Brokerage,
     Depositary,
     AccountMaintenance,
-    /// Проценты по марже. Позиция вне периметра, но денежный эффект сохраняется.
+    /// Margin interest. The position is outside the perimeter, but its cash effect is retained.
     MarginInterest,
     Other,
 }
 
 impl EventKind {
-    /// Короткое машиночитаемое имя. Используется в API и хранилище.
+    /// Short machine-readable name. Used in the API and storage.
     ///
-    /// Реализовано исчерпывающим `match` без ветки `_`: добавление
-    /// варианта обязано сломать сборку здесь.
+    /// Implemented with an exhaustive `match` and no `_` arm: adding
+    /// a variant must break the build here.
     #[must_use]
     pub const fn discriminant(&self) -> &'static str {
         match self {
@@ -261,12 +261,12 @@ impl EventKind {
         }
     }
 
-    /// Куда и откуда движутся деньги.
+    /// Where the money comes from and goes.
     ///
-    /// Само по себе событие **не знает**, пересекает ли оно границу контура:
-    /// это свойство пары «событие + определение контура». Классификацию
-    /// делает классификатор контура (модуль `contour`, следующая задача),
-    /// а здесь описываются только конечные точки движения.
+    /// By itself, the event **does not know** whether it crosses the contour boundary:
+    /// that is a property of the “event + contour definition” pair. Classification
+    /// is performed by the contour classifier (module `contour`, the next task),
+    /// while only the movement endpoints are described here.
     #[must_use]
     pub const fn flow_endpoints(&self) -> FlowEndpoints {
         match self {
@@ -283,27 +283,27 @@ impl EventKind {
             | Self::OpeningCash { .. }
             | Self::Valuation { .. }
             | Self::ControlAssertion { .. }
-            // Деньги не приходят в контур извне: бумага уже внутри, и
-            // амортизация возвращает вложенное, а не приносит новое.
-            // `InboundFromOutside` завысил бы внесённое в контур и
-            // испортил XIRR — ровно так же, как испортил бы его купон,
-            // который здесь классифицирован так же.
+            // Money does not enter the contour from outside: the security is already inside, and
+            // amortization returns invested capital rather than bringing in new money.
+            // `InboundFromOutside` would overstate contributions to the contour and
+            // corrupt XIRR — just as a coupon would,
+            // which is classified the same way here.
             | Self::CorporateAction { .. }
             | Self::OfferExercise { .. } => FlowEndpoints::WithinAccount,
         }
     }
 }
 
-/// Конечные точки денежного движения события.
+/// Endpoints of an event's cash movement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowEndpoints {
-    /// Деньги пришли от контрагента, которого система не наблюдает.
+    /// Money came from a counterparty the system does not observe.
     InboundFromOutside,
-    /// Деньги ушли контрагенту, которого система не наблюдает.
+    /// Money went to a counterparty the system does not observe.
     OutboundToOutside,
-    /// Движение между двумя известными счетами.
+    /// Movement between two known accounts.
     BetweenAccounts { from: AccountId, to: AccountId },
-    /// Движение внутри одного счёта: покупка, купон, комиссия.
+    /// Movement within one account: purchase, coupon, fee.
     WithinAccount,
 }
 
@@ -362,9 +362,9 @@ mod tests {
 
     #[test]
     fn the_new_variants_move_money_within_the_account() {
-        // Деньги не приходят в контур извне: бумага уже внутри.
-        // `InboundFromOutside` завысил бы внесённое в контур и испортил
-        // XIRR — ровно так же, как испортил бы его купон.
+        // Money does not enter the contour from outside: the security is already inside.
+        // `InboundFromOutside` would overstate contributions to the contour and corrupt
+        // XIRR — just as a coupon would.
         assert_eq!(
             amortisation().flow_endpoints(),
             FlowEndpoints::WithinAccount
@@ -377,9 +377,9 @@ mod tests {
 
     #[test]
     fn an_income_written_before_the_kind_existed_reads_as_not_asserted() {
-        // Значение снимается с сегодняшнего Income и лишается поля kind —
-        // ровно то, что лежит в уже записанном журнале. Форму JSON
-        // не сочиняем: у EventKind нет rename_all.
+        // The value is taken from today's Income and stripped of the kind field —
+        // exactly what is in the already-recorded journal. We do not invent the JSON
+        // shape: EventKind has no rename_all.
         let income = EventKind::Income {
             instrument: Some(InstrumentId::new_random()),
             gross: rub(1_000_000),
@@ -389,7 +389,7 @@ mod tests {
         value
             .get_mut("Income")
             .and_then(serde_json::Value::as_object_mut)
-            .expect("вариант сериализуется объектом")
+            .expect("variant serializes as an object")
             .remove("kind");
         let restored: EventKind = serde_json::from_value(value).unwrap();
         assert!(matches!(restored, EventKind::Income { kind: None, .. }));
@@ -436,12 +436,12 @@ mod tests {
         }
     }
 
-    // --- Дискриминант ---
+    // --- Discriminant ---
 
     #[test]
     fn every_variant_has_its_own_discriminant() {
-        // Имена уходят в API и хранилище: их совпадение или подмена
-        // означала бы, что два разных факта записаны одинаково.
+        // The names go into the API and storage: a collision or substitution
+        // would mean that two different facts were recorded identically.
         assert_eq!(trade(TradeSide::Buy).discriminant(), "trade");
         assert_eq!(
             EventKind::CashIn { amount: rub(1) }.discriminant(),
@@ -478,15 +478,15 @@ mod tests {
 
     #[test]
     fn the_side_of_a_trade_does_not_change_its_discriminant() {
-        // Покупка и продажа — один тип события с разным направлением,
-        // а не два типа: списание лотов различает их по `side`.
+        // Purchase and sale are one event type with different directions,
+        // not two types: lot disposal distinguishes them by `side`.
         assert_eq!(
             trade(TradeSide::Buy).discriminant(),
             trade(TradeSide::Sell).discriminant()
         );
     }
 
-    // --- Конечные точки движения ---
+    // --- Movement endpoints ---
 
     #[test]
     fn external_cash_has_outside_endpoints() {
@@ -518,9 +518,9 @@ mod tests {
 
     #[test]
     fn transfer_endpoints_keep_their_direction() {
-        // Перепутанные местами счета — другое событие: перевод
-        // со вклада на брокерский счёт и обратный ему классифицируются
-        // контуром по-разному.
+        // Swapping the accounts produces a different event: a transfer
+        // from a deposit to a brokerage account and the reverse are classified
+        // differently by the contour.
         let from = AccountId::new_random();
         let to = AccountId::new_random();
         let kind = EventKind::CashTransfer {
@@ -563,8 +563,8 @@ mod tests {
 
     #[test]
     fn fee_and_opening_balances_stay_within_the_account() {
-        // Комиссия и восстановленные остатки не пересекают границу контура
-        // сами по себе: восстановленный остаток — не внешний приток денег.
+        // Fees and reconstructed balances do not cross the contour boundary
+        // by themselves: a reconstructed balance is not an external cash inflow.
         assert_eq!(
             EventKind::Fee {
                 amount: rub(-3_500),

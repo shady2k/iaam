@@ -1,9 +1,9 @@
-//! Пересчёт котировки в деньги за бумагу (§10.2).
+//! Converting a quotation into money per security (§10.2).
 //!
-//! Отдельное версионированное правило, а не арифметика на месте:
-//! умножение количества на цену живёт в двух местах —
-//! `returns::position_value` и `returns::xirr::account_values`, — и два
-//! независимых пересчёта неизбежно разъедутся (§10.4).
+//! A separate versioned rule, not inline arithmetic:
+//! multiplying quantity by price lives in two places —
+//! `returns::position_value` and `returns::xirr::account_values` — and two
+//! independent recalculations inevitably drift (§10.4).
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -14,24 +14,24 @@ use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 use crate::valuation::QuotationBasis;
 
-/// Версия правила пересчёта котировки в деньги.
+/// Quotation-to-money rule version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct QuotationRuleVersion(pub u32);
 
-/// Причина, по которой котировку нельзя пересчитать в деньги.
+/// Why a quotation cannot be converted into money.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum QuotationError {
-    #[error("основание котировки неизвестно")]
+    #[error("quotation basis is unknown")]
     BasisUnknown,
-    #[error("непогашенный номинал неизвестен")]
+    #[error("outstanding principal is unknown")]
     PrincipalUnknown,
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
 
-/// Пересчёт цены источника в деньги за одну бумагу.
+/// Convert the source price into money per security.
 pub trait QuotationRule: Send + Sync + std::fmt::Debug {
-    /// Деньги за одну бумагу и валюта этих денег.
+    /// Money per security and its currency.
     fn money_per_unit(
         &self,
         basis: QuotationBasis,
@@ -41,7 +41,7 @@ pub trait QuotationRule: Send + Sync + std::fmt::Debug {
     ) -> Result<(Dec, CurrencyCode), QuotationError>;
 }
 
-/// Первая версия правила пересчёта котировки.
+/// First version of the quotation conversion rule.
 #[derive(Debug, Default)]
 pub struct QuotationV1;
 
@@ -54,18 +54,18 @@ impl QuotationRule for QuotationV1 {
         remaining_face: Option<PerUnitAmount>,
     ) -> Result<(Dec, CurrencyCode), QuotationError> {
         match basis {
-            // Валюта наблюдения остаётся валютой числа, как и было.
+            // The observation's currency remains the number's currency.
             QuotationBasis::MoneyPerUnit => Ok((price, venue_currency)),
             QuotationBasis::PercentOfRemainingFace => {
                 let face = remaining_face.ok_or(QuotationError::PrincipalUnknown)?;
                 let fraction = price.checked_div(Dec::new(Decimal::ONE_HUNDRED))?;
                 let money = fraction.checked_mul(face.value())?;
-                // Денежная валюта приходит из номинала: само число
-                // безразмерно, и валюта площадки к нему не относится.
+                // The money currency comes from principal: the number is
+                // dimensionless, so the venue currency does not apply.
                 Ok((money, face.currency()))
             }
-            // Наблюдение, происхождение которого не доказано, оценке
-            // не подлежит: догадка занизила бы облигацию молча.
+            // An observation whose provenance is unproven cannot be valued:
+            // a guess would silently understate the bond.
             QuotationBasis::Unknown => Err(QuotationError::BasisUnknown),
         }
     }
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn a_percent_quote_becomes_money_through_the_remaining_face() {
-        // 98.5% от непогашенного номинала 1000 ₽ — это 985 ₽, а не 98.5 ₽.
+        // 98.5% of 1,000 ₽ outstanding principal is 985 ₽, not 98.5 ₽.
         assert_eq!(
             QuotationV1
                 .money_per_unit(
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn a_percent_quote_takes_its_currency_from_the_face_not_from_the_venue() {
-        // Число 98.5 безразмерно: валютой результата становится валюта номинала.
+        // The number 98.5 is dimensionless: the result takes the principal's currency.
         let (_, currency) = QuotationV1
             .money_per_unit(
                 QuotationBasis::PercentOfRemainingFace,

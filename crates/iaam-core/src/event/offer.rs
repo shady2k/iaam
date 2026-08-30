@@ -1,10 +1,10 @@
-//! Исполнение оферты (§4.7).
+//! Offer execution (§4.7).
 //!
-//! Оферта **не** корпоративное действие: это право владельца, а не
-//! решение эмитента. Свести выкуп к погашению значило бы потерять
-//! и происхождение выбытия, и то, что владелец мог не предъявлять
-//! бумагу вовсе — а сценарий «предъявил или додержал» и есть то, ради
-//! чего оферту отслеживают.
+//! An offer is **not** a corporate action: it is the holder’s right, not
+//! the issuer’s decision. Treating the buyback as redemption would lose
+//! both the cause of the disposal and the fact that the holder might not tender
+//! the security at all — and the «tendered or held to maturity» scenario is precisely
+//! why the offer is tracked.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,11 +12,11 @@ use uuid::Uuid;
 use crate::ids::{CustodyId, InstrumentId};
 use crate::money::{Money, Quantity};
 
-/// Поданная заявка на предъявление бумаги к оферте.
+/// A submitted request to tender a security under the offer.
 ///
-/// Собственная идентичность, а не идентификатор события: одна заявка
-/// связывает цепочку из нескольких фактов — подачу, отзыв и один или
-/// несколько расчётов.
+/// Its own identity, not an event identifier: one request
+/// links a chain of several facts — submission, withdrawal, and one or
+/// more settlements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OfferSubmissionId(pub Uuid);
 
@@ -32,11 +32,11 @@ impl OfferSubmissionId {
     }
 }
 
-/// Окно приёма заявок по оферте.
+/// Offer request submission window.
 ///
-/// В части 1 — непрозрачная идентичность: реестра окон нет, и проверка
-/// «окно существует, заявка подана в срок» отложена в E3.4.6 **явно**.
-/// Записать идентичность сейчас дешевле, чем восстанавливать связь потом.
+/// In Part 1, identity is opaque: there is no window registry, and the check
+/// «the window exists, the request was submitted on time» is deferred to E3.4.6 **explicitly**.
+/// Recording the identity now is cheaper than reconstructing the link later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OfferWindowId(pub Uuid);
 
@@ -52,31 +52,31 @@ impl OfferWindowId {
     }
 }
 
-/// Что произошло с заявкой по оферте.
+/// What happened to the offer request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OfferExerciseAction {
-    /// Поданная заявка. Ног не имеет: ни денег, ни бумаг она не двигает —
-    /// как `ControlAssertion`. Отсутствие ног — тоже форма, и она
-    /// проверяется наравне с остальными.
+    /// Submitted request. It has no legs: it moves neither cash nor securities —
+    /// like `ControlAssertion`. Having no legs is itself a form, and it
+    /// is checked like all the others.
     Submitted {
         submission: OfferSubmissionId,
         window: OfferWindowId,
         instrument: InstrumentId,
         quantity: Quantity,
     },
-    /// Отзыв заявки целиком или частично.
+    /// Full or partial withdrawal of the request.
     ///
-    /// Третий член, а не отсутствие расчёта: §3.5 называет отзыв наряду
-    /// с частичным исполнением, и без него незакрытая заявка висела бы
-    /// вечно, искажая ожидаемое выбытие.
+    /// A third member, not the absence of settlement: §3.5 lists withdrawal alongside
+    /// partial execution, and without it an outstanding request would remain
+    /// forever, distorting the expected disposal.
     Cancelled {
         submission: OfferSubmissionId,
         quantity: Quantity,
     },
-    /// Совершённый выкуп. Ноги — `Cash` и отрицательная
-    /// `SecurityQuantity`; ноги `Principal` нет: бумага выбывает,
-    /// а не возвращает номинал. Расчётов по одной заявке бывает
-    /// несколько.
+    /// Completed buyback. The legs are `Cash` and a negative
+    /// `SecurityQuantity`; there is no `Principal` leg: the security is disposed of,
+    /// not redeemed at face value. A single request may have
+    /// multiple settlements.
     Settled {
         submission: OfferSubmissionId,
         instrument: InstrumentId,
@@ -89,7 +89,7 @@ pub enum OfferExerciseAction {
 }
 
 impl OfferExerciseAction {
-    /// Имя члена для диагностики и заслонов.
+    /// Member name for diagnostics and guardrails.
     #[must_use]
     pub const fn discriminant(&self) -> &'static str {
         match self {
@@ -99,8 +99,8 @@ impl OfferExerciseAction {
         }
     }
 
-    /// Заявка, к которой относится факт: связь цепочки, доступная без
-    /// разбора семейства.
+    /// The request this fact belongs to: chain linkage available without
+    /// parsing the family.
     #[must_use]
     pub const fn submission(&self) -> OfferSubmissionId {
         match self {
@@ -110,7 +110,7 @@ impl OfferExerciseAction {
         }
     }
 
-    /// Количество бумаг, которого касается факт.
+    /// Quantity of securities affected by the fact.
     #[must_use]
     pub const fn quantity(&self) -> Quantity {
         match self {
@@ -185,8 +185,8 @@ mod tests {
 
     #[test]
     fn every_offer_action_names_the_submission_it_belongs_to() {
-        // Цепочка «подал — отозвал — рассчитались» связывается заявкой,
-        // и связь обязана доставаться без разбора семейства.
+        // The «submitted — withdrew — settled» chain is linked by the request,
+        // and the link must be available without parsing the family.
         let submission = OfferSubmissionId::new_random();
         let action = OfferExerciseAction::Cancelled {
             submission,
@@ -197,9 +197,9 @@ mod tests {
 
     #[test]
     fn the_third_member_is_cancellation_not_an_afterthought() {
-        // §3.5 называет отзыв наряду с частичным исполнением: без него
-        // незакрытая заявка висела бы вечно и искажала бы ожидаемое
-        // выбытие.
+        // §3.5 lists withdrawal alongside partial execution: without it
+        // an outstanding request would remain forever and distort the expected
+        // disposal.
         assert!(matches!(
             sample_cancelled(),
             OfferExerciseAction::Cancelled { .. }

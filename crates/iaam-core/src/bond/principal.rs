@@ -1,8 +1,8 @@
-//! Непогашенный остаток номинала на дату (§6.5).
+//! Remaining principal on a date (§6.5).
 //!
-//! Остаток не хранится нигде: он выводится из первоначального номинала
-//! и ряда возвратов. Хранить его вторым полем значило бы завести второй
-//! источник истины, который разойдётся с первым молча.
+//! The remainder is stored nowhere: it is derived from the initial principal
+//! and the sequence of returns. Storing it as a second field would create a
+//! second source of truth that could silently diverge from the first.
 
 use thiserror::Error;
 use time::Date;
@@ -15,26 +15,26 @@ use crate::numeric::decimal::Dec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RemainingPrincipalError {
-    #[error("первоначальный номинал неизвестен")]
+    #[error("initial principal is unknown")]
     Unknown,
-    #[error("график не проверен: остаток из него брать нельзя")]
+    #[error("schedule is not validated: its remainder cannot be used")]
     ScheduleNotValidated,
-    #[error("доля возврата номинала не положительна")]
+    #[error("principal return share is not positive")]
     ShareNotPositive,
-    #[error("доли возвратов до даты дают больше 100%")]
+    #[error("returns through this date exceed 100%")]
     PrefixAboveHundred,
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
 
-/// Непогашенный номинал на одну бумагу на дату `on`.
+/// Remaining principal per security as of `on`.
 ///
-/// Граница включающая: в день возврата остаток уже уменьшен.
+/// Inclusive boundary: on the return date, the remainder is already reduced.
 ///
-/// Доверие к графику проверяется здесь, а не у вызывающего: раньше
-/// котировка брала остаток из лота и от графика не зависела вовсе,
-/// теперь зависит. Цена из графика, которому система не доверяет,
-/// хуже отсутствия цены.
+/// Trust in the schedule is checked here rather than by the caller: quotation
+/// used to take the remainder from the lot and did not depend on the schedule,
+/// but now it does. A price from a schedule the system does not trust is worse
+/// than no price.
 pub fn remaining_principal(
     schedule: &BondSchedule,
     on: Date,
@@ -82,13 +82,13 @@ mod tests {
     use time::macros::{date, format_description};
 
     fn dec(text: &str) -> Dec {
-        Dec::new(text.parse::<Decimal>().expect("десятичное число"))
+        Dec::new(text.parse::<Decimal>().expect("decimal number"))
     }
 
     fn rub(text: &str) -> PerUnitAmount {
         PerUnitAmount::new(
             dec(text),
-            CurrencyCode::from_code("RUB").expect("код валюты"),
+            CurrencyCode::from_code("RUB").expect("currency code"),
         )
     }
 
@@ -99,7 +99,7 @@ mod tests {
                 .iter()
                 .map(|(day, share)| PrincipalReturn {
                     repayment_date: Date::parse(day, format_description!("[year]-[month]-[day]"))
-                        .expect("дата"),
+                        .expect("date"),
                     share_percent: dec(share),
                 })
                 .collect(),

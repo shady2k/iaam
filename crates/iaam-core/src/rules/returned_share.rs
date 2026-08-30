@@ -1,34 +1,34 @@
-//! Доля непогашенного номинала, возвращённая одним событием (§6.5).
+//! Share of outstanding principal returned by one event (§6.5).
 //!
-//! Безразмерная величина, а не сумма: разнесение налоговой стоимости
-//! сокращает суммы, и хранение доли делает факт независимым от того,
-//! что справочник будет знать о номинале завтра.
+//! A dimensionless value, not an amount: basis allocation reduces amounts,
+//! and storing the share keeps the fact independent of what the reference
+//! data will know about principal tomorrow.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::numeric::decimal::Dec;
 
-/// Доля возврата от непогашенного остатка **до** события.
+/// Return share from the outstanding remainder **before** the event.
 ///
-/// Единица допустима: последняя амортизация возвращает весь остаток,
-/// и юридическое выбытие бумаги — отдельный факт, а не следствие
-/// (`event/corporate_action.rs`, `PartialRedemption` против `Redemption`).
+/// One is valid: the final amortisation returns the entire remainder, and
+/// legal disposal of the security is a separate fact, not a consequence
+/// (`event/corporate_action.rs`, `PartialRedemption` versus `Redemption`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ReturnedShare(Dec);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ReturnedShareError {
-    #[error("доля возврата не положительна: событие ничего не вернуло")]
+    #[error("return share is not positive: the event returned nothing")]
     NotPositive,
-    #[error("доля возврата больше единицы: вернуть больше остатка нельзя")]
+    #[error("return share exceeds one: more than the remainder cannot be returned")]
     AboveOne,
 }
 
 impl ReturnedShare {
-    /// Конструктор, а не публичное поле: собранное вручную значение
-    /// обошло бы обе проверки.
+    /// A constructor, not a public field: manually assembled values would
+    /// bypass both checks.
     pub fn new(value: Dec) -> Result<Self, ReturnedShareError> {
         if !value.is_positive() {
             return Err(ReturnedShareError::NotPositive);
@@ -53,8 +53,8 @@ impl TryFrom<Dec> for ReturnedShare {
     }
 }
 
-// `#[derive(Deserialize)]` собрал бы newtype в обход конструктора,
-// поэтому разбор идёт через `TryFrom`.
+// `#[derive(Deserialize)]` would assemble the newtype without the constructor,
+// so deserialisation goes through `TryFrom`.
 impl<'de> Deserialize<'de> for ReturnedShare {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -71,7 +71,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     fn dec(text: &str) -> Dec {
-        Dec::new(text.parse::<Decimal>().expect("десятичное число"))
+        Dec::new(text.parse::<Decimal>().expect("decimal number"))
     }
 
     #[test]
@@ -106,14 +106,14 @@ mod tests {
     #[test]
     fn json_deserialisation_does_not_bypass_the_invariant() {
         let error = serde_json::from_str::<ReturnedShare>("\"1.5\"")
-            .expect_err("невалидная доля обязана не разобраться");
-        assert!(error.to_string().contains("больше единицы"), "{error}");
+            .expect_err("invalid share must fail to deserialize");
+        assert!(error.to_string().contains("exceeds one"), "{error}");
     }
 
     #[test]
     fn cbor_deserialisation_does_not_bypass_the_invariant() {
         let mut body = Vec::new();
-        ciborium::into_writer(&dec("2"), &mut body).expect("запись");
+        ciborium::into_writer(&dec("2"), &mut body).expect("write");
         assert!(ciborium::from_reader::<ReturnedShare, _>(body.as_slice()).is_err());
     }
 }

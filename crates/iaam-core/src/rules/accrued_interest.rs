@@ -1,8 +1,8 @@
-//! Накопленный купонный доход (§3.2 спеки E3.4.4).
+//! Accrued coupon income (§3.2 of spec E3.4.4).
 //!
-//! Версионированное правило, а не арифметика на месте: включительность
-//! границы периода и стратегия округления меняют сумму при одинаковом
-//! `inputs_hash` (§2.7 основной спеки E3.4).
+//! A versioned rule, not inline arithmetic: period-boundary inclusion and
+//! rounding strategy change the amount even with the same `inputs_hash`
+//! (§2.7 of the main spec E3.4).
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -14,24 +14,24 @@ use crate::money::PerUnitAmount;
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 
-/// Версия правила НКД.
+/// Accrued-interest rule version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AccruedInterestRuleVersion(pub u32);
 
-/// Причина, по которой НКД не считается.
+/// Why accrued interest cannot be calculated.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AccruedInterestError {
-    #[error("дата вне покрытия графика")]
+    #[error("date is outside schedule coverage")]
     OutsideCoverage,
-    #[error("дата покрыта несколькими периодами")]
+    #[error("date is covered by multiple periods")]
     OverlappingCoverage,
-    #[error("сумма купона периода не определена")]
+    #[error("period coupon amount is undetermined")]
     CouponUndetermined,
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
 
-/// Начисленный на дату купонный доход на одну бумагу.
+/// Coupon income accrued per security as of a date.
 pub trait AccruedInterestRule: Send + Sync + std::fmt::Debug {
     fn accrued_per_unit(
         &self,
@@ -40,14 +40,15 @@ pub trait AccruedInterestRule: Send + Sync + std::fmt::Debug {
     ) -> Result<PerUnitAmount, AccruedInterestError>;
 }
 
-/// Линейное начисление внутри периода.
+/// Linear accrual within a period.
 ///
-/// Базы начисления дней правило НЕ требует: доля периода
-/// самонормируется. Это существенно — MOEX базы не даёт вовсе (§2.11
-/// основной спеки), а подставленная база даёт правдоподобно неверный НКД.
+/// The rule does NOT require a day-count basis: the period fraction
+/// self-normalises. This matters — MOEX provides no basis at all (§2.11 of
+/// the main spec), and an invented basis produces plausibly wrong accrued
+/// interest.
 ///
-/// Эквивалентность ACT/365 проверена живьём на 6814 наблюдениях по пяти
-/// бумагам, включая нерегулярный период в 175 дней: ноль расхождений.
+/// ACT/365 equivalence was checked live on 6814 observations for five
+/// securities, including an irregular 175-day period: zero discrepancies.
 #[derive(Debug, Default)]
 pub struct AccruedInterestV1;
 
@@ -57,10 +58,10 @@ impl AccruedInterestRule for AccruedInterestV1 {
         periods: &[AccrualPeriod],
         as_of: Date,
     ) -> Result<PerUnitAmount, AccruedInterestError> {
-        // Граница полуоткрыта: [period_start, accrual_end). На accrual_end
-        // купон начислен целиком и принадлежит прошедшему периоду, а
-        // следующий период стартует с нуля — инвариант замкнутой цепи
-        // (completeness.rs) это гарантирует.
+        // Half-open boundary: [period_start, accrual_end). At accrual_end the
+        // coupon is fully accrued and belongs to the elapsed period, while the
+        // next period starts at zero — the closed-chain invariant
+        // (completeness.rs) guarantees this.
         let covering: Vec<_> = periods
             .iter()
             .filter(|period| period.period_start <= as_of && as_of < period.accrual_end)
@@ -78,8 +79,8 @@ impl AccruedInterestRule for AccruedInterestV1 {
 
         let elapsed = (as_of - period.period_start).whole_days();
         let whole = (period.accrual_end - period.period_start).whole_days();
-        // Период нулевой длины разделить нельзя; график с таким периодом
-        // структурно неверен, и молчаливый ноль его бы спрятал.
+        // A zero-length period cannot be divided; a schedule with one is
+        // structurally invalid, and a silent zero would hide it.
         if whole <= 0 {
             return Err(AccruedInterestError::OutsideCoverage);
         }
@@ -103,8 +104,8 @@ mod tests {
         Dec::new(Decimal::from_str_exact(text).unwrap())
     }
 
-    /// Купонный период ОФЗ SU26238RMFS4, проверенный живьём 2026-08-27:
-    /// 2026-06-03 → 2026-12-02, купон 35.40 ₽ на бумагу.
+    /// Coupon period for OFZ SU26238RMFS4, checked live on 2026-08-27:
+    /// 2026-06-03 → 2026-12-02, coupon 35.40 ₽ per security.
     fn ofz_periods() -> Vec<AccrualPeriod> {
         vec![
             AccrualPeriod {
@@ -126,9 +127,9 @@ mod tests {
 
     #[test]
     fn the_rule_reproduces_the_kopeck_the_exchange_published() {
-        // Три точки сняты живым вызовом ISS: 15.17, 15.37 и 15.95.
-        // Это эталон против конкретного источника, а не абстрактное
-        // свойство: если правило разъедется с биржей, разъедется тут.
+        // Three points captured from live ISS calls: 15.17, 15.37, and 15.95.
+        // This is a reference against a specific source, not an abstract
+        // property: if the rule drifts from the exchange, it will drift here.
         let rule = AccruedInterestV1;
         let periods = ofz_periods();
         for (day, expected) in [
@@ -139,16 +140,16 @@ mod tests {
             assert_eq!(
                 rule.accrued_per_unit(&periods, day).unwrap().value(),
                 dec(expected),
-                "расхождение на {day}"
+                "discrepancy on {day}"
             );
         }
     }
 
     #[test]
     fn on_the_accrual_end_the_next_period_starts_at_zero() {
-        // Главная ловушка полуоткрытой границы: на accrual_end купон
-        // уже начислен целиком и относится к ПРОШЕДШЕМУ периоду.
-        // Включительная граница показала бы целый купон вместо нуля.
+        // The main half-open-boundary trap: at accrual_end the coupon is
+        // already fully accrued and belongs to the ELAPSED period.
+        // An inclusive boundary would show a whole coupon instead of zero.
         let rule = AccruedInterestV1;
         assert_eq!(
             rule.accrued_per_unit(&ofz_periods(), date!(2026 - 12 - 02))
@@ -160,7 +161,8 @@ mod tests {
 
     #[test]
     fn a_date_outside_the_schedule_is_refused_not_zeroed() {
-        // Ноль здесь неотличим от незнания и молча занизил бы NAV.
+        // Zero is indistinguishable from unknown here and would silently
+        // understate NAV.
         let rule = AccruedInterestV1;
         assert!(matches!(
             rule.accrued_per_unit(&ofz_periods(), date!(2026 - 01 - 01)),
@@ -193,7 +195,7 @@ mod tests {
 
     #[test]
     fn an_undetermined_coupon_is_refused_not_zeroed() {
-        // Флоатер с неназванной суммой: правильный ответ — «не знаем».
+        // A floater with no stated amount: the correct answer is “unknown”.
         let rule = AccruedInterestV1;
         let periods = vec![AccrualPeriod {
             period_start: date!(2026 - 06 - 03),

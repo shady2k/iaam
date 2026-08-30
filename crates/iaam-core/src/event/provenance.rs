@@ -1,22 +1,22 @@
-//! Происхождение факта (§4.1).
+//! Origin of the fact (§4.1).
 //!
-//! Восстановить эти данные позже невозможно, поэтому они обязательны
-//! с первого коммита (§16.1).
+//! These data cannot be recovered later, so they are mandatory
+//! from the first commit (§16.1).
 
 use serde::{Deserialize, Serialize};
 
 use crate::ids::SourceId;
 
-/// Хеш сырой записи источника. Шестнадцатеричная строка SHA-256.
+/// Hash of the raw source record. A hexadecimal SHA-256 string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RawHash(String);
 
 impl RawHash {
-    /// Принимает только корректный шестнадцатеричный SHA-256.
+    /// Accepts only a valid hexadecimal SHA-256.
     ///
-    /// Логика проверки живёт здесь, а не в конструкторе с именем `new`:
-    /// `cargo-mutants` молча пропускает функции с этим именем, и проверка
-    /// формы хеша осталась бы невидимой мутационному заслону.
+    /// Validation logic lives here, not in a constructor named `new`:
+    /// `cargo-mutants` silently skips functions with this name, so validation
+    /// of the hash format would remain invisible to the mutation gate.
     #[must_use]
     pub fn parse(hex: &str) -> Option<Self> {
         let ok = hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit());
@@ -29,17 +29,17 @@ impl RawHash {
     }
 }
 
-/// Версия парсера, породившего факт. Без неё нельзя отличить ошибку
-/// источника от ошибки разбора, исправленной в более поздней версии.
+/// Version of the parser that produced the fact. Without it, a source
+/// error cannot be distinguished from a parsing error fixed in a later version.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ParserVersion(pub String);
 
-/// Указание на конкретную строку исходного документа.
+/// Reference to a specific line in the source document.
 ///
-/// Документ назван хешом, а не именем файла: имя не является
-/// тождеством — тот же отчёт, сохранённый под другим именем, перестал
-/// бы дедуплицироваться (§10.6, уровень 4). Человеческое имя документа
-/// хранится рядом с сырьём и разрешается по этому хешу.
+/// The document is identified by its hash, not its filename: the name is not
+/// its identity — the same report saved under another name would no longer
+/// be deduplicated (§10.6, level 4). The human-readable document name
+/// is stored alongside the raw data and resolved by this hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowLocator {
     pub document: RawHash,
@@ -47,7 +47,7 @@ pub struct RowLocator {
     pub row: u64,
 }
 
-/// Происхождение. Сконструировать без хеша сырья и версии парсера нельзя.
+/// Provenance. Cannot be constructed without a raw data hash and parser version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     source: SourceId,
@@ -58,10 +58,10 @@ pub struct Provenance {
 }
 
 impl Provenance {
-    /// Тривиальная упаковка полей: проверять при сборке нечего, обязательность
-    /// хеша и версии парсера обеспечивает сама сигнатура, а не тело. Логики,
-    /// которую стоило бы вынести из-под слепоты `cargo-mutants` к имени `new`,
-    /// здесь нет (ср. [`crate::money::Money::new`]).
+    /// Trivial field packaging: there is nothing to validate during construction; the required
+    /// hash and parser version are enforced by the signature itself, not the body. There is no logic
+    /// worth moving out of `cargo-mutants`' blind spot around the name `new`,
+    /// here (cf. [`crate::money::Money::new`]).
     #[must_use]
     pub fn new(source: SourceId, raw_hash: RawHash, parser_version: ParserVersion) -> Self {
         Self {
@@ -95,8 +95,8 @@ impl Provenance {
         &self.raw_hash
     }
 
-    /// Версия парсера. Читаема наравне с хешом: происхождение, из которого
-    /// нельзя достать версию разбора, не отвечает на вопрос «чем это разобрано».
+    /// Parser version. Readable alongside the hash: provenance from which
+    /// the parser version cannot be retrieved does not answer «what parsed this».
     #[must_use]
     pub const fn parser_version(&self) -> &ParserVersion {
         &self.parser_version
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn raw_hash_rejects_the_right_length_with_a_wrong_character() {
-        // 64 символа, но не шестнадцатеричные: длины одной мало.
+        // 64 characters, but not hexadecimal: length alone is not enough.
         let mut s = "a".repeat(63);
         s.push('z');
         assert_eq!(s.len(), 64);
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn optional_provenance_details_are_absent_until_set() {
-        // Неизвестное — None, а не пустая строка (§4.9).
+        // Unknown is None, not an empty string (§4.9).
         let p = Provenance::new(
             SourceId::new_random(),
             hash("b"),

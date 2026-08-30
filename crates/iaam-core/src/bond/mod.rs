@@ -1,10 +1,11 @@
-//! Доменные типы графика выплат, нужные расчёту (§7 плана E3.4.4).
+//! Domain types for an instrument's payment schedule, needed for calculation
+//! (§7 of plan E3.4.4).
 //!
-//! Это НЕ зеркало `iaam_market::schedule`. Ядро не зависит от крейт
-//! воркспейса (§3.2), а правило НКД — политика и обязано жить здесь,
-//! рядом с `ValuationPolicyV1`. Перевод снимка источника в эти типы
-//! делает `iaam-app` и делает **структурно**: любое условие в нём —
-//! признак, что правило утекло из ядра.
+//! This is NOT a mirror of `iaam_market::schedule`. The core does not depend
+//! on the workspace crate (§3.2), and the accrued-interest rule is policy that
+//! must live here beside `ValuationPolicyV1`. `iaam-app` translates the source
+//! snapshot into these types, and does so **structurally**: any condition in
+//! that layer is evidence that a rule leaked out of the core.
 
 use serde::{Deserialize, Serialize};
 use time::Date;
@@ -22,67 +23,67 @@ pub use offer::{
 };
 pub use principal::{RemainingPrincipalError, remaining_principal};
 
-/// Объявленный дефолт по выпуску.
+/// Declared issue default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefaultFlags {
     pub declared: bool,
     pub technical: bool,
 }
 
-/// Купонный период: начисление и платёж — разные даты.
+/// Coupon period: accrual and payment are different dates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccrualPeriod {
     pub period_start: Date,
-    /// Конец начисления. По нему считается НКД.
+    /// Accrual end. Accrued interest is calculated through this date.
     pub accrual_end: Date,
-    /// Дата платежа. Двигается переносом с выходного.
+    /// Payment date. Moved when it falls on a weekend.
     pub payment_date: Date,
-    /// Дата фиксации реестра — она решает, КОМУ платят.
+    /// Record date — it determines WHO is paid.
     ///
-    /// `None` означает «источник не сообщил». Подставлять вместо неё
-    /// дату платежа запрещено: зазор между ними непостоянен (0–5 дней
-    /// по фикстурам), и в 157 случаях из 275 он равен одному дню —
-    /// ровно тем дням, когда сделка меняет ответ.
+    /// `None` means “the source did not report it.” Substituting the payment
+    /// date is forbidden: the gap between them is not constant (0–5 days in
+    /// fixtures), and in 157 of 275 cases it is one day — exactly the days
+    /// when a trade changes the answer.
     pub record_date: Option<Date>,
-    /// Сумма купона за период на одну бумагу.
+    /// Coupon amount for the period per security.
     ///
-    /// `None` — сумма не определена (флоатер, будущий период). Ноль
-    /// означал бы бумагу, которая ничего не платит.
+    /// `None` means the amount is undetermined (a floater or future period).
+    /// Zero would mean a security that pays nothing.
     pub coupon_per_unit: Option<PerUnitAmount>,
 }
 
-/// Возврат части номинала.
+/// Return of part of the principal.
 ///
-/// Доля, а не сумма: сумма зависит от остатка, а остаток выводится
-/// из первоначального номинала и ряда возвратов.
+/// A share, not an amount: the amount depends on the remainder, and the
+/// remainder is derived from the initial principal and the sequence of returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalReturn {
     pub repayment_date: Date,
-    /// Доля ПЕРВОНАЧАЛЬНОГО номинала, в процентах.
+    /// Share of the INITIAL principal, in percent.
     pub share_percent: Dec,
 }
 
-/// График выплат облигации на координату знания.
+/// An instrument's payment schedule at a knowledge coordinate.
 ///
-/// Это компактный доменный вход ядра, а не зеркало структуры источника:
-/// перевод снимка в него выполняет слой приложения.
+/// This is a compact domain input to the core, not a mirror of the source
+/// structure: the application layer translates the snapshot into it.
 ///
-/// `Default` нужен для тестовых литералов через `..Default::default()`.
-/// В рабочем коде `BondSchedule::default()` вызывать нельзя: пустой график
-/// с полнотой `Unknown` означает неизвестный источник, а не отсутствие графика.
+/// `Default` is needed for test literals using `..Default::default()`.
+/// Production code must not call `BondSchedule::default()`: an empty schedule
+/// with completeness `Unknown` means an unknown source, not an absent schedule.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BondSchedule {
     pub periods: Vec<AccrualPeriod>,
     pub principal_returns: Vec<PrincipalReturn>,
-    /// Первоначальный номинал на одну бумагу.
+    /// Initial principal per security.
     ///
-    /// `None` — источник не сообщил либо бумага не долговая. Ноль
-    /// подставлять запрещено (§4.9): «номинал ноль» и «номинал
-    /// неизвестен» требуют от владельца разных действий.
+    /// `None` means the source did not report it or the security is not debt.
+    /// Substituting zero is forbidden (§4.9): “zero principal” and “unknown
+    /// principal” require different actions from the owner.
     ///
-    /// Текущий номинал здесь отсутствует намеренно: остаток выводится
-    /// из первоначального и ряда возвратов, и второй источник истины
-    /// разошёлся бы с первым молча.
+    /// Current principal is intentionally absent: the remainder is derived
+    /// from the initial value and the sequence of returns, and a second source
+    /// of truth would silently diverge from the first.
     #[serde(default)]
     pub initial_principal: Option<PerUnitAmount>,
     #[serde(default)]
@@ -102,8 +103,9 @@ mod tests {
 
     #[test]
     fn an_accrual_period_keeps_accrual_end_and_payment_date_apart() {
-        // НКД считается по accrual_end, ближайшая выплата — по
-        // payment_date. Перенос с выходного двигает второе, но не первое.
+        // Accrued interest is calculated through accrual_end; the nearest
+        // payment is determined by payment_date. Moving a weekend shifts the
+        // latter, not the former.
         let period = AccrualPeriod {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),
@@ -116,8 +118,8 @@ mod tests {
 
     #[test]
     fn an_undetermined_coupon_is_absent_not_zero() {
-        // Ноль купона означал бы бумагу, которая ничего не платит,
-        // и занизил бы и НКД, и все метрики §7.1.
+        // A zero coupon would mean a security that pays nothing,
+        // and would understate accrued interest and all §7.1 metrics.
         let period = AccrualPeriod {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),

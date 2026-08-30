@@ -219,6 +219,47 @@ pub fn schedule_completeness_from_row(
     }
 }
 
+pub(crate) const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
+
+/// Собирает единый доменный график из сохранённого снимка и условий выпуска.
+///
+/// Обе точки входа — отчёт и приёмка журнального факта — обязаны получать
+/// график через этот перевод, чтобы добавление поля или изменение разбора
+/// не разошлось между двумя копиями. `None` означает отсутствие снимка, а
+/// `snapshot_id` возвращается вместе с графиком для отпечатка входов
+/// вычисления доли. Замок хранилища принадлежит вызывающему.
+pub fn schedule_from_store(
+    store: &iaam_store::market::MarketStore,
+    instrument: InstrumentId,
+    knowledge_as_of: &str,
+    offer_kinds: &BTreeMap<String, String>,
+    currency_roles: Option<iaam_core::instrument::CurrencyRoles>,
+) -> Result<Option<(iaam_core::bond::BondSchedule, String)>, AppError> {
+    let instrument_id = instrument.inner().to_string();
+    let Some(snapshot) = store
+        .schedule_at_or_before(&instrument_id, MOEX_ISS_SOURCE_ID, knowledge_as_of)
+        .map_err(|error| AppError::Store(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let completeness_row = store
+        .schedule_completeness(&snapshot.snapshot_id)
+        .map_err(|error| AppError::Store(error.to_string()))?;
+    let terms = store
+        .issue_terms_at_or_before(&instrument_id, MOEX_ISS_SOURCE_ID, knowledge_as_of)
+        .map_err(|error| AppError::Store(error.to_string()))?;
+    let schedule = iaam_core::bond::BondSchedule {
+        periods: accrual_periods_from_snapshot(&snapshot)?,
+        principal_returns: principal_returns_from_snapshot(&snapshot)?,
+        initial_principal: initial_principal_from_terms(terms.as_ref()),
+        offer_windows: offer_windows_from_snapshot(&snapshot, instrument, offer_kinds)?,
+        completeness: schedule_completeness_from_row(completeness_row.as_ref()),
+        default_flags: default_flags_from_terms(terms.as_ref()),
+        currency_roles,
+    };
+    Ok(Some((schedule, snapshot.snapshot_id)))
+}
+
 /// Перевести известные условия выпуска в типизированные флаги дефолта.
 pub fn default_flags_from_terms(row: Option<&IssueTermsRow>) -> Option<DefaultFlags> {
     row.map(|terms| DefaultFlags {
@@ -250,14 +291,19 @@ mod tests {
     };
     use iaam_market::moex::parse::{MarketSegment, parse_history};
     use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
-    use iaam_store::schedule::{CouponPeriodRow, IssueTermsRow, OfferWindowRow, StoredSnapshot};
+    use iaam_store::market::MarketStore;
+    use iaam_store::schedule::{
+        CouponPeriodRow, IssueTermsRow, OfferWindowRow, PrincipalRepaymentRow, ScheduleSnapshotRow,
+        StoredSnapshot,
+    };
     use rust_decimal::Decimal;
     use std::collections::BTreeMap;
     use time::macros::{date, datetime};
 
     use super::{
-        accrual_periods_from_snapshot, candidate_from_market_observation, default_flags_from_terms,
-        initial_principal_from_terms, offer_windows_from_snapshot, schedule_completeness_from_row,
+        MOEX_ISS_SOURCE_ID, accrual_periods_from_snapshot, candidate_from_market_observation,
+        default_flags_from_terms, initial_principal_from_terms, offer_windows_from_snapshot,
+        schedule_completeness_from_row, schedule_from_store,
     };
 
     #[test]
@@ -423,10 +469,120 @@ mod tests {
                 reason: "график оборван".to_owned()
             }
         );
+
         assert_eq!(
             schedule_completeness_from_row(None),
             iaam_core::bond::offer::ScheduleCompleteness::Unknown
         );
+    }
+
+    #[test]
+    fn report_and_ingest_paths_share_store_schedule_translation() {
+        let mut store = MarketStore::open_in_memory().expect("хранилище");
+        let instrument = iaam_core::ids::InstrumentId::new_random();
+        store
+            .upsert_instrument(&iaam_store::reference::InstrumentRecord {
+                id: instrument,
+                kind: Some(iaam_core::instrument::InstrumentKind::Bond),
+                symbol: "BOND".to_owned(),
+                title: "Test bond".to_owned(),
+                currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
+                lineage: None,
+            })
+            .expect("инструмент");
+        let observed_at = "2026-08-27T12:00:00Z";
+        let header = ScheduleSnapshotRow {
+            instrument_id: instrument.inner().to_string(),
+            source_id: MOEX_ISS_SOURCE_ID.to_owned(),
+            observed_at: observed_at.to_owned(),
+            content_hash: "schedule-hash".to_owned(),
+        };
+        let coupon_periods = vec![CouponPeriodRow {
+            period_start: "2026-06-03".to_owned(),
+            accrual_end: "2026-12-02".to_owned(),
+            payment_date: "2026-12-03".to_owned(),
+            record_date: Some("2026-11-30".to_owned()),
+            amount_status: "amount_fixed".to_owned(),
+            amount_per_unit: Some("12.50".to_owned()),
+            amount_currency: Some("RUB".to_owned()),
+            rate_percent: None,
+            source_entry_id: Some("coupon-1".to_owned()),
+        }];
+        let principal_repayments = vec![PrincipalRepaymentRow {
+            repayment_date: "2026-12-02".to_owned(),
+            share_percent: "25".to_owned(),
+            source_kind: "partial".to_owned(),
+            source_entry_id: Some("repayment-1".to_owned()),
+        }];
+        let offer_windows = vec![OfferWindowRow {
+            execution_date: "2026-12-01".to_owned(),
+            submission_start: Some("2026-11-01".to_owned()),
+            submission_end: Some("2026-11-20".to_owned()),
+            price_percent: Some("100".to_owned()),
+            agent: None,
+            source_kind: "put".to_owned(),
+            source_entry_id: Some("offer-1".to_owned()),
+        }];
+        let outcome = store
+            .record_schedule_snapshot(
+                &header,
+                &coupon_periods,
+                &principal_repayments,
+                &offer_windows,
+            )
+            .expect("снимок");
+        store
+            .record_schedule_completeness(&outcome.snapshot_id, true, true, None, &[0])
+            .expect("полнота");
+        store
+            .record_issue_terms(&IssueTermsRow {
+                instrument_id: instrument.inner().to_string(),
+                source_id: MOEX_ISS_SOURCE_ID.to_owned(),
+                observed_at: observed_at.to_owned(),
+                effective_from: Some("2026-06-03".to_owned()),
+                maturity_date: Some("2027-06-03".to_owned()),
+                initial_face_value: Some("1000".to_owned()),
+                face_currency_code: Some("RUB".to_owned()),
+                coupon_periods_per_year: Some(2),
+                day_count: Some("act/365".to_owned()),
+                calendar: Some("MOEX".to_owned()),
+                default_declared: true,
+                default_technical: false,
+            })
+            .expect("условия выпуска");
+
+        let offer_kinds = BTreeMap::from([("put".to_owned(), "put_option".to_owned())]);
+        let (report_schedule, report_snapshot_id) = schedule_from_store(
+            &store,
+            instrument,
+            "2026-08-28T00:00:00Z",
+            &offer_kinds,
+            Some(iaam_core::instrument::CurrencyRoles::uniform(
+                CurrencyCode::Rub,
+            )),
+        )
+        .expect("график отчёта")
+        .expect("снимок отчёта");
+        let (ingest_schedule, ingest_snapshot_id) = schedule_from_store(
+            &store,
+            instrument,
+            "2026-08-28T00:00:00Z",
+            &offer_kinds,
+            None,
+        )
+        .expect("график приёмки")
+        .expect("снимок приёмки");
+
+        assert_eq!(report_snapshot_id, ingest_snapshot_id);
+        assert_eq!(
+            report_schedule.currency_roles,
+            Some(iaam_core::instrument::CurrencyRoles::uniform(
+                CurrencyCode::Rub,
+            ))
+        );
+        let mut report_without_roles = report_schedule;
+        report_without_roles.currency_roles = None;
+        assert_eq!(report_without_roles, ingest_schedule);
     }
 
     #[test]

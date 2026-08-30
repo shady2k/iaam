@@ -346,7 +346,7 @@ impl MarketScheduler {
             .store
             .load_events_through(owner, Date::MAX)
             .await?;
-        let active = active_instruments(&events);
+        let active = active_instruments(&events).map_err(AppError::Schedule)?;
         let jobs = self
             .jobs
             .lock()
@@ -502,7 +502,7 @@ mod tests {
         // цены живой бумаги.
         let instrument = InstrumentId::new_random();
         let events = vec![bought(instrument, 10), amortised(instrument)];
-        assert!(active_instruments(&events).contains(&instrument));
+        assert!(active_instruments(&events).unwrap().contains(&instrument));
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
             Vec::new(),
         );
         let events = vec![bought(instrument, 10), redeemed];
-        assert!(!active_instruments(&events).contains(&instrument));
+        assert!(!active_instruments(&events).unwrap().contains(&instrument));
     }
 
     #[test]
@@ -557,7 +557,7 @@ mod tests {
             },
             Vec::new(),
         );
-        let active = active_instruments(&[bought(predecessor, 10), converted]);
+        let active = active_instruments(&[bought(predecessor, 10), converted]).unwrap();
         assert!(!active.contains(&predecessor));
         assert!(active.contains(&successor));
     }
@@ -580,7 +580,7 @@ mod tests {
             Vec::new(),
         );
         let events = vec![bought(instrument, 10), settled];
-        assert!(!active_instruments(&events).contains(&instrument));
+        assert!(!active_instruments(&events).unwrap().contains(&instrument));
     }
 
     #[test]

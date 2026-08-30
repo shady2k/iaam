@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::AppServices;
 use crate::error::AppError;
+use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::Principal;
 /// Запрос отчёта о доходности.
 #[derive(Debug, Clone)]
@@ -139,7 +140,6 @@ pub async fn returns(
         &reconciliation_events,
     )
 }
-pub(crate) const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
 
 struct ReportMarketInputs {
     candidates: Vec<PriceCandidate>,
@@ -240,47 +240,14 @@ async fn market_price_candidates(
             candidates.push(market_candidate_from_row(row)?);
         }
 
-        if let Some(snapshot) = store
-            .schedule_at_or_before(
-                &instrument.inner().to_string(),
-                MOEX_ISS_SOURCE_ID,
-                &knowledge_as_of,
-            )
-            .map_err(|error| AppError::Store(error.to_string()))?
-        {
-            let completeness_row = store
-                .schedule_completeness(&snapshot.snapshot_id)
-                .map_err(|error| AppError::Store(error.to_string()))?;
-            let terms = store
-                .issue_terms_at_or_before(
-                    &instrument.inner().to_string(),
-                    MOEX_ISS_SOURCE_ID,
-                    &knowledge_as_of,
-                )
-                .map_err(|error| AppError::Store(error.to_string()))?;
-            let default_flags = crate::market_candidate::default_flags_from_terms(terms.as_ref());
-            schedules.insert(
-                instrument,
-                BondSchedule {
-                    periods: crate::market_candidate::accrual_periods_from_snapshot(&snapshot)?,
-                    principal_returns: crate::market_candidate::principal_returns_from_snapshot(
-                        &snapshot,
-                    )?,
-                    initial_principal: crate::market_candidate::initial_principal_from_terms(
-                        terms.as_ref(),
-                    ),
-                    offer_windows: crate::market_candidate::offer_windows_from_snapshot(
-                        &snapshot,
-                        instrument,
-                        &offer_kinds,
-                    )?,
-                    completeness: crate::market_candidate::schedule_completeness_from_row(
-                        completeness_row.as_ref(),
-                    ),
-                    default_flags,
-                    currency_roles: currency_roles.get(&instrument).copied().flatten(),
-                },
-            );
+        if let Some((schedule, _snapshot_id)) = crate::market_candidate::schedule_from_store(
+            &store,
+            instrument,
+            &knowledge_as_of,
+            &offer_kinds,
+            currency_roles.get(&instrument).copied().flatten(),
+        )? {
+            schedules.insert(instrument, schedule);
         }
 
         for venue in venues {

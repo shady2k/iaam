@@ -63,6 +63,12 @@ pub enum AppError {
     /// не повтором запроса, а отзывом действующей записи.
     #[error("{what}")]
     Conflict { what: String },
+    /// Расписание синхронизации построить нечем: вывод активных бумаг
+    /// из журнала переполнился. Отдельно от `Reconciliation`, потому
+    /// что сверка здесь ни при чём, а «сверка не построена» отправило бы
+    /// разбирающегося читать реестр сверки вместо журнала количеств.
+    #[error("расписание синхронизации не построено: {0}")]
+    Schedule(#[source] iaam_core::numeric::NumericError),
 }
 
 impl From<ObserveError> for AppError {
@@ -103,6 +109,7 @@ impl AppError {
             Self::DirectoryInvariant { .. } => "directory_invariant_violated",
             Self::Projection(_) => "projection_failed",
             Self::Reconciliation(_) => "reconciliation_failed",
+            Self::Schedule(_) => "schedule_not_built",
             Self::Perimeter(_) => "perimeter_assessment_failed",
             Self::NotConfigured { .. } => "not_configured",
             Self::Random(_) => "random_unavailable",

@@ -400,11 +400,20 @@ impl Event {
             CorporateAction::PartialRedemption {
                 instrument,
                 quantity,
+                principal_returned_per_unit,
                 compensation,
                 ..
             } => {
                 require_positive(name, "compensation", compensation.amount().raw())?;
                 require_positive_quantity(name, "quantity", *quantity)?;
+                // Возврат номинала проверяется здесь, а не в правиле
+                // разнесения: правило считает по безразмерной доле и
+                // сырое денежное утверждение события больше не видит.
+                require_positive_per_unit(
+                    name,
+                    "principal_returned_per_unit",
+                    *principal_returned_per_unit,
+                )?;
                 self.expect_legs(
                     name,
                     &[principal_leg(self.account, *instrument, *compensation)],
@@ -789,6 +798,22 @@ fn require_positive(
     }
 }
 
+fn require_positive_per_unit(
+    name: &'static str,
+    field: &'static str,
+    amount: crate::money::PerUnitAmount,
+) -> Result<(), EventValidationError> {
+    if amount.value().is_positive() {
+        Ok(())
+    } else {
+        Err(EventValidationError::NonPositive {
+            kind: name,
+            field,
+            value: amount.value().inner().to_string(),
+        })
+    }
+}
+
 fn require_positive_quantity(
     name: &'static str,
     field: &'static str,
@@ -1020,13 +1045,17 @@ mod tests {
         }
 
         fn amortisation(&self, legs: Vec<Leg>) -> Event {
+            self.amortisation_returning("200", legs)
+        }
+
+        fn amortisation_returning(&self, returned: &str, legs: Vec<Leg>) -> Event {
             event(
                 EventKind::CorporateAction {
                     action: CorporateAction::PartialRedemption {
                         instrument: self.instrument,
                         custody: self.custody,
                         quantity: qty(10),
-                        principal_returned_per_unit: Self::per_unit("200"),
+                        principal_returned_per_unit: Self::per_unit(returned),
                         compensation: rub(100_000),
                         effective_date: date!(2026 - 06 - 15),
                         record_date: None,
@@ -1088,6 +1117,34 @@ mod tests {
             .validate_structure(),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_partial_redemption_returning_nothing_is_rejected() {
+        let bond = Bond::new();
+        let event = bond.amortisation_returning(
+            "0",
+            vec![Leg::principal(bond.account, bond.instrument, rub(100_000))],
+        );
+        // Поле названо явно: отказ по compensation или quantity прошёл
+        // бы этот тест, ничего не доказав про возврат номинала.
+        assert!(matches!(
+            event.validate_structure().unwrap_err(),
+            EventValidationError::NonPositive { field, .. } if field == "principal_returned_per_unit"
+        ));
+    }
+
+    #[test]
+    fn a_partial_redemption_returning_a_negative_principal_is_rejected() {
+        let bond = Bond::new();
+        let event = bond.amortisation_returning(
+            "-100",
+            vec![Leg::principal(bond.account, bond.instrument, rub(100_000))],
+        );
+        assert!(matches!(
+            event.validate_structure().unwrap_err(),
+            EventValidationError::NonPositive { field, .. } if field == "principal_returned_per_unit"
+        ));
     }
 
     #[test]

@@ -35,7 +35,7 @@ use crate::numeric::approx::SolverPolicy;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverRefusal};
 use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
-use crate::projection::lots::{LotBook, LotKey};
+use crate::projection::lots::LotKey;
 use crate::projection::offers::{OfferBook, unresolved_submissions};
 use crate::projection::ownership::Ownership;
 use crate::projection::state::LedgerState;
@@ -100,8 +100,6 @@ pub enum NotComputable {
     QuotationBasisContradictsEvidence { instrument: InstrumentId },
     /// Номинал бумаги неизвестен.
     RemainingFaceUnknown { instrument: InstrumentId },
-    /// Лоты одной пары «счёт и бумага» несут разные номиналы.
-    RemainingFaceAmbiguous { instrument: InstrumentId },
     /// Для пересчёта котировки не передан номинал.
     PrincipalUnknown,
     /// Решатель отказался: корня нет, корней несколько, не сошлось.
@@ -170,7 +168,6 @@ impl NotComputable {
             Self::QuotationBasisUnknown { .. } => "quotation_basis_unknown",
             Self::RemainingFaceUnknown { .. } => "remaining_face_unknown",
             Self::PrincipalUnknown => "principal_unknown",
-            Self::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
             Self::SolverRefused { .. } => "solver_refused",
             Self::NoExternalFlows => "no_external_flows",
             Self::StateNewerThanReport { .. } => "state_newer_than_report",
@@ -1938,13 +1935,14 @@ fn position_assessments(
                 instrument: key.instrument,
                 quantity,
                 raw_price,
-                remaining_face: remaining_face(
-                    state.book(),
-                    LotKey {
-                        account: key.account,
-                        instrument: key.instrument,
-                    },
-                ),
+                remaining_face: request
+                    .bond_schedules
+                    .get(&key.instrument)
+                    .map(|schedule| {
+                        crate::bond::remaining_principal(schedule, request.as_of)
+                            .map_err(|error| remaining_principal_reason(error, key.instrument))
+                    })
+                    .transpose(),
                 kind,
             }
         })
@@ -2022,27 +2020,30 @@ struct PositionQuotation<'a> {
     rule: &'a dyn QuotationRule,
 }
 
-/// Возвращает единый остаточный номинал лотов пары «счёт и бумага».
-fn remaining_face(book: &LotBook, key: LotKey) -> Result<Option<PerUnitAmount>, NotComputable> {
-    let Some(entry) = book.entry(&key) else {
-        return Ok(None);
-    };
-    let mut found = None;
-    for lot in entry.lots() {
-        let Some(remaining) = lot.principal.remaining_per_unit() else {
-            continue;
-        };
-        match found {
-            None => found = Some(remaining),
-            Some(previous) if previous == remaining => {}
-            Some(_) => {
-                return Err(NotComputable::RemainingFaceAmbiguous {
-                    instrument: key.instrument,
-                });
-            }
+/// Почему остаток номинала не выведен из графика.
+///
+/// Отказ доверия к графику отображается отдельно от неизвестного
+/// номинала: в первом случае владельцу нужен проверенный снимок
+/// выпуска, во втором — сам номинал.
+fn remaining_principal_reason(
+    error: crate::bond::RemainingPrincipalError,
+    instrument: InstrumentId,
+) -> NotComputable {
+    match error {
+        crate::bond::RemainingPrincipalError::Unknown => {
+            NotComputable::RemainingFaceUnknown { instrument }
         }
+        crate::bond::RemainingPrincipalError::ScheduleNotValidated => {
+            NotComputable::ScheduleMissing { instrument }
+        }
+        crate::bond::RemainingPrincipalError::ShareNotPositive
+        | crate::bond::RemainingPrincipalError::PrefixAboveHundred => {
+            NotComputable::ScheduleMissing { instrument }
+        }
+        crate::bond::RemainingPrincipalError::Numeric(_) => NotComputable::Numeric {
+            code: "remaining_principal",
+        },
     }
-    Ok(found)
 }
 
 fn quotation_error(error: QuotationError, instrument: InstrumentId) -> NotComputable {
@@ -3083,34 +3084,6 @@ mod tests {
                 &request,
             ),
             Err(NotComputable::QuotationBasisUnknown { instrument }),
-        );
-    }
-
-    #[test]
-    fn lots_that_disagree_about_the_remaining_face_refuse_instead_of_averaging() {
-        let account = AccountId::new_random();
-        let instrument = InstrumentId::new_random();
-        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
-        let fx = FxTable::new(FxSource::OwnerSupplied);
-        let ledger = ReconciliationLedger::default();
-        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
-        let request = position_request(&contour, &fx, &ledger, &perimeter);
-        let assessment = position_assessment(account, instrument, Quantity(dec("10")));
-        let (_, rule) = quotation_rule();
-
-        assert_eq!(
-            position_value(
-                &assessment,
-                PositionQuotation {
-                    price: dec("98.5"),
-                    basis: QuotationBasis::PercentOfRemainingFace,
-                    venue_currency: CurrencyCode::Rub,
-                    remaining_face: Err(NotComputable::RemainingFaceAmbiguous { instrument }),
-                    rule: &rule,
-                },
-                &request,
-            ),
-            Err(NotComputable::RemainingFaceAmbiguous { instrument }),
         );
     }
 
@@ -4232,6 +4205,7 @@ mod tests {
 
     fn отчёт_процентной_цены_по_покупкам(
         faces: &[&str],
+        schedule: Option<BondSchedule>,
     ) -> ReturnsReport {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
@@ -4243,7 +4217,7 @@ mod tests {
                 покупка_для_номинала(
                     account,
                     instrument,
-                    date!(2026 - 08 - 01),
+                    date!(2026 - 08 - 01) + time::Duration::days(index as i64),
                     u32::try_from(index + 1).expect("номер покупки"),
                 )
             })
@@ -4268,33 +4242,53 @@ mod tests {
         let mut candidate = рыночная_цена(instrument, date!(2026 - 08 - 25));
         candidate.price = dec("98.5");
         candidate.basis = QuotationBasis::PercentOfRemainingFace;
-        отчёт_с_рыночной_ценой(&state, &contour, candidate)
+        let bond_schedules = schedule
+            .map(|schedule| BTreeMap::from([(instrument, schedule)]))
+            .unwrap_or_default();
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: std::slice::from_ref(&candidate),
+            bond_schedules: &bond_schedules,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+        };
+        returns_report(&state, &request)
     }
 
     #[test]
-    fn процентная_цена_в_отчёте_использует_найденный_номинал_лота() {
-        let report = отчёт_процентной_цены_по_покупкам(&["1000"]);
+    fn a_percent_quote_uses_the_issue_remainder_for_every_lot() {
+        // Остаток принадлежит выпуску: две партии, купленные в разные
+        // дни, оцениваются по одному и тому же непогашенному номиналу.
+        let mut schedule =
+            график_купонов(&[date!(2026 - 06 - 01)], date!(2026 - 08 - 15));
+        schedule.principal_returns[0].share_percent = dec("30");
+        let report = отчёт_процентной_цены_по_покупкам(
+            &["100", "200"],
+            Some(schedule),
+        );
 
-        assert_eq!(report.terminal_value, Computed::Value(dec("9850")));
+        // 20 бумаг × 700 остатка × 98.5% = 13_790.
+        assert_eq!(report.terminal_value, Computed::Value(dec("13790")));
     }
 
     #[test]
-    fn одинаковый_номинал_лотов_остаётся_вычислимым_в_отчёте() {
+    fn a_percent_quote_without_a_schedule_is_not_computable_with_a_named_reason() {
         let report =
-            отчёт_процентной_цены_по_покупкам(&["1000", "1000"]);
-
-        assert_eq!(report.terminal_value, Computed::Value(dec("19700")));
-    }
-
-    #[test]
-    fn разные_номиналы_лотов_дают_явную_ошибку_в_отчёте() {
-        let report =
-            отчёт_процентной_цены_по_покупкам(&["1000", "2000"]);
+            отчёт_процентной_цены_по_покупкам(&["1000"], None);
 
         assert!(matches!(
             report.terminal_value,
             Computed::NotComputable {
-                reason: NotComputable::RemainingFaceAmbiguous { .. }
+                reason: NotComputable::RemainingFaceUnknown { .. }
             }
         ));
     }

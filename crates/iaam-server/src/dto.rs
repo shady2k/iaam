@@ -744,12 +744,6 @@ fn describe(reason: &NotComputable) -> String {
                 instrument.inner()
             )
         }
-        NotComputable::RemainingFaceAmbiguous { instrument } => {
-            format!(
-                "неоднозначен остаточный номинал инструмента {}",
-                instrument.inner()
-            )
-        }
         NotComputable::SolverRefused { refusal } => refusal.to_string(),
         NotComputable::NoExternalFlows => "нет потоков, пересекающих границу контура".into(),
         NotComputable::StateNewerThanReport { last_event, as_of } => {
@@ -2388,7 +2382,6 @@ mod tests {
                         "quotation_basis_contradicts_evidence"
                     }
                     NotComputable::RemainingFaceUnknown { .. } => "remaining_face_unknown",
-                    NotComputable::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
                     NotComputable::SolverRefused { .. } => "solver_refused",
                     NotComputable::NoExternalFlows => "no_external_flows",
                     NotComputable::StateNewerThanReport { .. } => "state_newer_than_report",
@@ -2447,9 +2440,6 @@ mod tests {
             },
             UncoveredReason::NotComputable {
                 reason: NotComputable::RemainingFaceUnknown { instrument },
-            },
-            UncoveredReason::NotComputable {
-                reason: NotComputable::RemainingFaceAmbiguous { instrument },
             },
             UncoveredReason::NotComputable {
                 reason: NotComputable::SolverRefused {

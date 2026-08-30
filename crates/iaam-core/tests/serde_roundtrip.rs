@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates, TradeDate};
+use iaam_core::event::allocation::{AllocationGap, BasisAllocation};
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
 use iaam_core::event::leg::Leg;
@@ -172,6 +173,7 @@ fn every_kind() -> Vec<Event> {
                     effective_date: date!(2026 - 06 - 15),
                     record_date: Some(date!(2026 - 06 - 13)),
                     grounds: Some("решение эмитента №4".to_owned()),
+                    basis_allocation: BasisAllocation::default(),
                 },
             },
             vec![Leg::principal(account, instrument, rub(200_000))],
@@ -314,6 +316,24 @@ fn every_event_kind_survives_a_json_round_trip() {
         let back: Event = serde_json::from_str(&json).expect("разбор");
         assert_eq!(back, event, "round-trip изменил событие: {json}");
     }
+}
+
+#[test]
+fn a_partial_redemption_written_before_the_allocation_field_reads_as_unknown() {
+    // Тело записано до появления `basis_allocation`. Читаться обязано,
+    // и доля обязана быть неизвестной, а не нулевой.
+    let text = r#"{"PartialRedemption":{"instrument":"8e27804a-de75-417e-a6ad-a68e919aed97","custody":"269bd88e-c7f0-422b-85ac-e56b0eba6485","quantity":"10","principal_returned_per_unit":{"value":"200.0000","currency":"Rub"},"compensation":{"amount":200000,"currency":"Rub"},"effective_date":[2026,166],"record_date":[2026,164],"grounds":"решение эмитента №4"}}"#;
+    let action: CorporateAction = serde_json::from_str(text).expect("старое тело читается");
+    let CorporateAction::PartialRedemption {
+        basis_allocation, ..
+    } = action
+    else {
+        panic!("ожидалась амортизация");
+    };
+    assert_eq!(
+        basis_allocation,
+        BasisAllocation::Unknown(AllocationGap::NotComputed)
+    );
 }
 
 #[test]

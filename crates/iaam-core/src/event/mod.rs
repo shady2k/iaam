@@ -1,5 +1,6 @@
 //! Envelope события журнала (§4.1).
 
+pub mod allocation;
 pub mod corporate_action;
 pub mod correction;
 pub mod kind;
@@ -1060,6 +1061,7 @@ mod tests {
                         effective_date: date!(2026 - 06 - 15),
                         record_date: None,
                         grounds: None,
+                        basis_allocation: crate::event::allocation::BasisAllocation::default(),
                     },
                 },
                 legs,

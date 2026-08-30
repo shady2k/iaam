@@ -228,6 +228,7 @@ fn частичное_погашение(день: Date, номер: u32) -> Eve
                 effective_date: день,
                 record_date: None,
                 grounds: None,
+                basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
             },
         },
         vec![Leg::principal(СЧЁТ, БУМАГА, компенсация)],

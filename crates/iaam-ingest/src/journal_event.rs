@@ -351,6 +351,7 @@ mod tests {
             effective_date: date!(2026 - 05 - 20),
             record_date: Some(date!(2026 - 05 - 18)),
             grounds: None,
+            basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
         }
     }
 
@@ -580,6 +581,7 @@ mod tests {
                     effective_date: date!(2026 - 05 - 20),
                     record_date: None,
                     grounds: None,
+                    basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
                 },
             )),
             context(),

@@ -41,6 +41,12 @@ pub enum CorporateAction {
         effective_date: Date,
         record_date: Option<Date>,
         grounds: Option<String>,
+        /// Доля непогашенного номинала, возвращённая этим событием.
+        ///
+        /// Умолчание `Unknown` честное: событие, записанное до появления
+        /// поля, действительно ничего не утверждало.
+        #[serde(default)]
+        basis_allocation: crate::event::allocation::BasisAllocation,
     },
     /// Окончательное погашение: номинал возвращён целиком и бумага
     /// выбывает из позиции.
@@ -173,6 +179,7 @@ mod tests {
             effective_date: date!(2026 - 06 - 15),
             record_date: Some(date!(2026 - 06 - 13)),
             grounds: Some("решение эмитента №4".to_owned()),
+            basis_allocation: crate::event::allocation::BasisAllocation::default(),
         }
     }
 

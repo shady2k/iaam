@@ -3415,6 +3415,7 @@ impl CorporateActionDto {
                 effective_date: *effective_date,
                 record_date: *record_date,
                 grounds: grounds.clone(),
+                basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
             },
             Self::Redemption {
                 instrument,

@@ -1,13 +1,13 @@
-//! Книга заявок по оферте (§3.5).
+//! Order book for the offer (§3.5).
 //!
-//! Отдельная проекция, а не поля [`super::lots::LotBook`]: заявка живёт
-//! своей цепочкой «подал — отозвал — рассчитались», её состояние не
-//! является свойством партии приобретения, и снимок книги лотов
-//! от появления оферты не меняется.
+//! A separate projection rather than fields of [`super::lots::LotBook`]: a submission has
+//! its own chain of “submitted — cancelled — settled”; its state is not
+//! a property of the acquisition lot, and the lot book snapshot
+//! does not change when the offer appears.
 //!
-//! Инвариант «исполнено плюс отозвано не больше поданного» — свойство
-//! **цепочки**, а не одного факта, поэтому живёт здесь, а не
-//! в структурной проверке события.
+//! The invariant “settled plus cancelled does not exceed submitted” is a property
+//! of the **chain**, not of a single fact, so it belongs here rather than
+//! in the event's structural validation.
 
 use std::collections::BTreeMap;
 
@@ -21,26 +21,26 @@ use crate::numeric::NumericError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum OfferError {
-    #[error("по заявке {submission:?} заявлено {claimed:?} при поданных {submitted:?}")]
+    #[error("submission {submission:?} claims {claimed:?} with {submitted:?} submitted")]
     OverSettled {
         submission: OfferSubmissionId,
         submitted: Quantity,
         claimed: Quantity,
     },
-    #[error("заявка {submission:?} не подавалась")]
+    #[error("submission {submission:?} was not submitted")]
     UnknownSubmission { submission: OfferSubmissionId },
-    #[error("заявка {submission:?} подана повторно")]
+    #[error("submission {submission:?} was submitted more than once")]
     DuplicateSubmission { submission: OfferSubmissionId },
-    #[error("по заявке {submission:?} количество не положительно")]
+    #[error("quantity for submission {submission:?} is not positive")]
     NonPositiveQuantity { submission: OfferSubmissionId },
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
 
-/// Состояние одной заявки.
+/// State of a single submission.
 ///
-/// Хранятся три накопителя, а не один остаток: отозванное и
-/// исполненное — разные исходы, и различать их придётся отчёту.
+/// Three accumulators are stored rather than a single remainder: cancelled and
+/// settled are different outcomes, and the report will need to distinguish them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmissionState {
     pub window: OfferWindowId,
@@ -51,33 +51,33 @@ pub struct SubmissionState {
 }
 
 impl SubmissionState {
-    /// Сколько по заявке ещё не решено.
+    /// How much of the submission remains unresolved.
     ///
-    /// Инвариант `cancelled + settled <= submitted` держит [`OfferBook::apply`],
-    /// поэтому разность не уходит ни в минус, ни в переполнение.
-    /// `debug_assert` ловит нарушение инварианта в тестах; в релизе
-    /// остаётся ноль — величина, которая не соблазнит вызывающего
-    /// действовать по испорченному состоянию.
+    /// The `cancelled + settled <= submitted` invariant is maintained by [`OfferBook::apply`],
+    /// so the subtraction neither goes negative nor overflows.
+    /// `debug_assert` catches invariant violations in tests; in release builds
+    /// zero remains — a value that will not tempt the caller
+    /// to act on corrupted state.
     #[must_use]
     pub fn outstanding(&self) -> Quantity {
         let claimed = self.cancelled.0.checked_add(self.settled.0);
         let left = claimed.and_then(|claimed| self.submitted.0.checked_sub(claimed));
         debug_assert!(
             left.is_ok_and(|left| !left.is_negative()),
-            "инвариант заявки нарушен: отозвано плюс исполнено больше поданного"
+            "submission invariant violated: cancelled plus settled exceeds submitted"
         );
         left.map_or_else(|_| Quantity::zero(), Quantity)
     }
 }
 
-/// Книга заявок по оферте.
+/// Order book for the offer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OfferBook {
     submissions: BTreeMap<OfferSubmissionId, SubmissionState>,
 }
 
 impl OfferBook {
-    /// Применить факт оферты к книге.
+    /// Apply an offer fact to the book.
     pub fn apply(&mut self, action: &OfferExerciseAction) -> Result<(), OfferError> {
         let submission = action.submission();
         if !action.quantity().0.is_positive() {
@@ -91,8 +91,8 @@ impl OfferBook {
                 ..
             } => {
                 if self.submissions.contains_key(&submission) {
-                    // Повторная подача под тем же идентификатором —
-                    // не вторая заявка, а потерянная первая.
+                    // Repeated submission under the same identifier is
+                    // not a second submission, but a lost first one.
                     return Err(OfferError::DuplicateSubmission { submission });
                 }
                 self.submissions.insert(
@@ -124,9 +124,9 @@ impl OfferBook {
         }
     }
 
-    /// Сколько по заявке ещё не решено. У заявки, которой не подавали,
-    /// непогашенного требования нет: `apply` не принимает фактов
-    /// о неизвестной заявке, поэтому и требованию взяться неоткуда.
+    /// How much of the submission remains unresolved. A submission that was never made
+    /// has no outstanding claim: `apply` does not accept facts
+    /// about an unknown submission, so no claim can arise.
     #[must_use]
     pub fn outstanding(&self, submission: OfferSubmissionId) -> Quantity {
         self.submissions
@@ -134,7 +134,7 @@ impl OfferBook {
             .map_or_else(Quantity::zero, SubmissionState::outstanding)
     }
 
-    /// Состояние заявки целиком.
+    /// The entire state of the submission.
     #[must_use]
     pub fn submission(&self, submission: OfferSubmissionId) -> Option<&SubmissionState> {
         self.submissions.get(&submission)
@@ -150,10 +150,10 @@ impl OfferBook {
     }
 }
 
-/// Перечислить заявки, чьи записанные окна отсутствуют в реестре графика.
+/// List submissions whose recorded windows are absent from the schedule registry.
 ///
-/// Старые факты журнала не переписываются и не сопоставляются с окнами по
-/// похожей дате: у заявки есть только сохранённый идентификатор окна.
+/// Old journal facts are not rewritten or matched to windows by
+/// a similar date: a submission has only its stored window identifier.
 #[must_use]
 pub fn unresolved_submissions(
     book: &OfferBook,
@@ -171,10 +171,10 @@ pub fn unresolved_submissions(
         .collect()
 }
 
-/// Отозванное плюс исполненное не превосходит поданного.
+/// Cancelled plus settled does not exceed submitted.
 ///
-/// Инвариант цепочки: отдельный факт расчёта сам по себе безупречен,
-/// нарушение видно только вместе с предыдущими.
+/// Chain invariant: an individual settlement fact is valid on its own;
+/// the violation is visible only together with the preceding facts.
 fn check_claim(
     submission: OfferSubmissionId,
     state: &SubmissionState,
@@ -272,8 +272,8 @@ mod tests {
 
     #[test]
     fn a_cancellation_beyond_the_outstanding_quantity_is_refused() {
-        // Отозвать больше, чем осталось непогашенным по заявке, нельзя:
-        // такой факт противоречит цепочке.
+        // More than the amount remaining outstanding for the submission cannot be cancelled:
+        // such a fact contradicts the chain.
         let submission = OfferSubmissionId::new_random();
         let mut book = OfferBook::default();
         book.apply(&submitted(submission, qty("10"))).unwrap();
@@ -290,8 +290,8 @@ mod tests {
 
     #[test]
     fn several_settlements_of_one_submission_accumulate() {
-        // Расчётов по одной заявке бывает несколько: агент рассчитывает
-        // частями, и каждый расчёт — отдельный факт.
+        // There may be several settlements for one submission: the agent settles
+        // in parts, and each settlement is a separate fact.
         let submission = OfferSubmissionId::new_random();
         let mut book = OfferBook::default();
         book.apply(&submitted(submission, qty("10"))).unwrap();
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn a_settlement_of_a_submission_nobody_filed_is_refused() {
-        // Расчёт без заявки — не оферта, а неучтённое выбытие.
+        // A settlement without a submission is not an offer, but an unrecorded disposal.
         let submission = OfferSubmissionId::new_random();
         let mut book = OfferBook::default();
         assert_eq!(
@@ -339,8 +339,8 @@ mod tests {
 
     #[test]
     fn a_submission_nobody_filed_has_nothing_outstanding() {
-        // `apply` не принимает фактов о неизвестной заявке, поэтому
-        // неизвестный идентификатор не несёт непогашенного требования.
+        // `apply` does not accept facts about an unknown submission, so
+        // an unknown identifier carries no outstanding claim.
         let book = OfferBook::default();
         assert_eq!(
             book.outstanding(OfferSubmissionId::new_random()),
@@ -350,8 +350,8 @@ mod tests {
 
     #[test]
     fn the_book_reports_the_whole_state_of_a_submission() {
-        // Отозванное и исполненное — разные исходы, и различать их
-        // придётся отчёту: одного остатка для этого мало.
+        // Cancelled and settled are different outcomes, and the report
+        // will need to distinguish them: a single remainder is not enough.
         let submission = OfferSubmissionId::new_random();
         let window = OfferWindowId::new_random();
         let instrument = InstrumentId::new_random();
@@ -366,7 +366,7 @@ mod tests {
         book.apply(&cancelled(submission, qty("1"))).unwrap();
         book.apply(&settled(submission, qty("6"))).unwrap();
 
-        let state = book.submission(submission).expect("заявка известна");
+        let state = book.submission(submission).expect("submission is known");
         assert_eq!(state.window, window);
         assert_eq!(state.instrument, instrument);
         assert_eq!(state.submitted, qty("10"));
@@ -377,14 +377,14 @@ mod tests {
 
     #[test]
     fn a_submission_nobody_filed_has_no_state_at_all() {
-        // «Нет заявки» и «по заявке ничего не осталось» — разные вещи.
+        // “No submission” and “nothing remains for the submission” are different things.
         let book = OfferBook::default();
         assert!(book.submission(OfferSubmissionId::new_random()).is_none());
     }
 
     #[test]
     fn the_book_survives_a_json_round_trip() {
-        // Книга попадает в снимок проекции наравне с остальными.
+        // The book is included in the projection snapshot alongside the others.
         let submission = OfferSubmissionId::new_random();
         let mut book = OfferBook::default();
         book.apply(&submitted(submission, qty("10"))).unwrap();

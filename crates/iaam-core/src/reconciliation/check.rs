@@ -1,17 +1,17 @@
-//! Сопоставление утверждения источника с наблюдаемым (§10.3, §10.4).
+//! Reconciliation of a source assertion against observed data (§10.3, §10.4).
 //!
-//! **Допуска нет.** Обе стороны — проведённые суммы в минимальных
-//! единицах валюты, и различие в копейку является различием. Порог
-//! невязки существует там, где сравниваются расчётная величина и
-//! проведённая (начисления по вкладу, §8.3), — это E3, и порог там
-//! берётся из алгоритма округления договора, а не назначается здесь.
+//! **No tolerance is allowed.** Both sides are posted amounts in minor
+//! currency units, and a one-kopeck difference is a difference. A discrepancy
+//! threshold exists where a calculated value is compared with a
+//! posted value (deposit interest accruals, §8.3) — that is E3, and the threshold there
+//! comes from the contract's rounding algorithm rather than being set here.
 
 use super::claim::ControlClaim;
 use super::observed::{ObservedTotals, Turnover};
 use crate::money::{CurrencyCode, PostedMinor, Quantity};
 use crate::numeric::decimal::Dec;
 
-/// Величина одной стороны сравнения.
+/// Value on one side of the comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimValue {
     Money {
@@ -21,30 +21,30 @@ pub enum ClaimValue {
     Quantity(Quantity),
 }
 
-/// Расхождение: что заявлено, что наблюдается, какова разница.
+/// Discrepancy: what was asserted, what was observed, and the difference.
 ///
-/// Разница считается как заявленное минус наблюдаемое: положительная
-/// означает «источник видит больше, чем мы».
+/// The difference is calculated as asserted minus observed: a positive value
+/// means «the source sees more than we do».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Discrepancy {
-    /// Поле утверждения, которое не сошлось. Для оборотов называет
-    /// сторону: `debit` или `credit`.
+    /// The assertion field that did not match. For turnovers, identifies
+    /// the side: `debit` or `credit`.
     pub field: &'static str,
     pub claimed: ClaimValue,
     pub observed: ClaimValue,
     pub delta: ClaimValue,
 }
 
-/// Почему сравнение невозможно.
+/// Why comparison is impossible.
 ///
-/// Невозможность сравнить — **не** расхождение. Расхождение означает
-/// «цифры разошлись, разберитесь»; невозможность означает «сверять
-/// не с чем», и это разные ответы владельцу (§10.4).
+/// Inability to compare is **not** a discrepancy. A discrepancy means
+/// «the numbers do not match; investigate»; inability means «there is
+/// nothing to compare against», and these are different answers to the owner (§10.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotComparable {
-    /// У счёта нет ни одного события: подтверждать нечего.
+    /// The account has no events at all: there is nothing to confirm.
     NoJournalCoverage,
-    /// Налоговых фактов система пока не записывает (E5).
+    /// The system does not yet record tax facts (E5).
     TaxFactsNotRecorded,
 }
 
@@ -58,15 +58,15 @@ impl NotComparable {
     }
 }
 
-/// Расхождение, объяснённое границей периметра (§11).
+/// A discrepancy explained by the perimeter boundary (§11).
 ///
-/// Существует, чтобы владелец не получал задание «починить» то, что
-/// система намеренно не поддерживает.
+/// Exists so that the owner is not assigned a task to «fix» something that
+/// the system intentionally does not support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconciliationException {
-    /// Количества разошлись из-за обременения бумаг по РЕПО.
+    /// The quantities differ because the securities are encumbered under REPO.
     UnsupportedRepoEncumbrance,
-    /// В периоде присутствует финансирование вне периметра (маржа).
+    /// The period includes financing outside the perimeter (margin).
     UnsupportedFinancingPresent,
 }
 
@@ -80,7 +80,7 @@ impl ReconciliationException {
     }
 }
 
-/// Итог сверки одного утверждения.
+/// Result of reconciling one assertion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOutcome {
     Matched,
@@ -88,18 +88,18 @@ pub enum ClaimOutcome {
     NotComparable {
         reason: NotComparable,
     },
-    /// Расхождение объяснено границей периметра и не требует действий
-    /// владельца (§11). Основанием повышения статуса не является.
+    /// The discrepancy is explained by the perimeter boundary and requires no action
+    /// from the owner (§11). It does not justify elevating the status.
     Excepted {
         exception: ReconciliationException,
     },
 }
 
 impl ClaimOutcome {
-    /// Даёт ли исход право повысить статус измерения.
+    /// Does the outcome allow the measurement status to be elevated.
     ///
-    /// Исключение периметра не даёт: «мы знаем, почему не сходится» —
-    /// это не «сошлось».
+    /// A perimeter exception does not grant that right: «we know why it does not match» —
+    /// does not mean «it matched».
     #[must_use]
     pub const fn confirms(&self) -> bool {
         match self {
@@ -119,7 +119,7 @@ impl ClaimOutcome {
     }
 }
 
-/// Сверка одного утверждения с наблюдаемыми величинами.
+/// Reconciliation of one assertion against observed values.
 #[must_use]
 pub fn check_claim(claim: &ControlClaim, observed: &ObservedTotals) -> ClaimOutcome {
     if observed.events_seen() == 0 {
@@ -196,7 +196,7 @@ pub fn check_claim(claim: &ControlClaim, observed: &ObservedTotals) -> ClaimOutc
     }
 }
 
-/// Сравнение проведённых сумм. Точное: допуска нет.
+/// Comparison of posted amounts. Exact: no tolerance.
 fn compare_money(
     field: &'static str,
     currency: CurrencyCode,
@@ -206,9 +206,9 @@ fn compare_money(
     if claimed == observed {
         return ClaimOutcome::Matched;
     }
-    // Переполнение разницы означает величины, между которыми разрыв
-    // больше диапазона денежного типа: это расхождение в любом случае,
-    // и сообщается оно насыщением, а не паникой.
+    // Difference overflow means that the gap between the values
+    // exceeds the range of the monetary type: it is a discrepancy in any case,
+    // and is reported using saturation rather than a panic.
     let delta = claimed.raw().saturating_sub(observed.raw());
     ClaimOutcome::Discrepant(Discrepancy {
         field,
@@ -231,9 +231,9 @@ fn compare_quantity(claimed: Quantity, observed: Quantity) -> ClaimOutcome {
     if claimed == observed {
         return ClaimOutcome::Matched;
     }
-    // Невычислимая разница всё равно является расхождением: стороны
-    // уже названы, и сообщать о ней отказом значило бы потерять сам
-    // факт несовпадения.
+    // An uncomputable difference is still a discrepancy: the sides
+    // have already been identified, and reporting an inability to compare would mean losing the
+    // fact of the mismatch itself.
     let delta = claimed
         .0
         .checked_sub(observed.0)
@@ -279,10 +279,10 @@ mod tests {
 
     #[test]
     fn an_exact_match_is_accepted_and_one_kopeck_is_not() {
-        // Допуска нет. Обе стороны — проведённые суммы в минимальных
-        // единицах; «почти сошлось» на копейку означает потерянную
-        // копейку, а потерянная копейка — это ошибка разнесения,
-        // которая на длинной истории вырастает.
+        // No tolerance. Both sides are posted amounts in minor
+        // units; «off by only one kopeck» means a missing
+        // kopeck, and a missing kopeck is a posting error
+        // that accumulates over a long history.
         let account = AccountId::new_random();
         let observed = observe(
             &journal_with_one_deposit(account, 100_000),
@@ -305,7 +305,7 @@ mod tests {
         };
         let outcome = check_claim(&off_by_one, &observed);
         let ClaimOutcome::Discrepant(discrepancy) = outcome else {
-            panic!("расхождение в одну копейку обязано быть расхождением: {outcome:?}");
+            panic!("a one-kopeck difference must be a discrepancy: {outcome:?}");
         };
         assert_eq!(discrepancy.field, "amount");
         assert_eq!(
@@ -314,16 +314,16 @@ mod tests {
                 amount: PostedMinor::new(1),
                 currency: CurrencyCode::Rub
             },
-            "разница считается как заявленное минус наблюдаемое"
+            "the difference is calculated as asserted minus observed"
         );
     }
 
     #[test]
     fn an_empty_journal_is_not_comparable_rather_than_wrong() {
-        // Утверждение «на счёте 100 000» при пустом журнале не является
-        // расхождением на 100 000: сверять не с чем. Расхождение здесь
-        // отправило бы владельца искать ошибку там, где её нет,
-        // а нужен ему вердикт needs_reconciliation.
+        // The assertion «the account has 100 000» with an empty journal is not
+        // a discrepancy of 100 000: there is nothing to compare against. A discrepancy here
+        // would send the owner looking for an error where none exists,
+        // when what they need is the needs_reconciliation verdict.
         let account = AccountId::new_random();
         let observed = observe(&[], account, march()).unwrap();
         let claim = ControlClaim::CashBalance {
@@ -341,10 +341,10 @@ mod tests {
 
     #[test]
     fn a_currency_without_movement_is_compared_as_zero_when_history_exists() {
-        // История счёта есть, движения в долларах — нет. Утверждение
-        // «на счёте 0 USD» подтверждается, а «на счёте 500 USD» —
-        // расходится. Отдать здесь NotComparable значило бы навсегда
-        // оставить непроверяемой любую валюту, в которой ничего не было.
+        // The account has history, but no dollar activity. The assertion
+        // «the account has 0 USD» is confirmed, while «the account has 500 USD»
+        // does not match. Returning NotComparable here would permanently
+        // leave any currency with no activity unverifiable.
         let account = AccountId::new_random();
         let observed = observe(
             &journal_with_one_deposit(account, 100_000),
@@ -373,9 +373,9 @@ mod tests {
 
     #[test]
     fn a_turnover_names_the_side_that_disagrees() {
-        // «Обороты не сошлись» без указания стороны заставляет владельца
-        // сверять обе колонки вручную — ровно та работа, которую §10.2
-        // отказывается на него перекладывать.
+        // «Turnovers do not match» without identifying the side forces the owner
+        // to reconcile both columns manually — exactly the work that §10.2
+        // refuses to shift onto them.
         let account = AccountId::new_random();
         let observed = observe(
             &journal_with_one_deposit(account, 100_000),
@@ -390,16 +390,16 @@ mod tests {
             credit: PostedMinor::new(700),
         };
         let ClaimOutcome::Discrepant(discrepancy) = check_claim(&claim, &observed) else {
-            panic!("расход 700 против нуля обязан быть расхождением");
+            panic!("an outflow of 700 versus zero must be a discrepancy");
         };
         assert_eq!(discrepancy.field, "credit");
     }
 
     #[test]
     fn tax_without_tax_facts_is_not_comparable() {
-        // Налоговых фактов не производит ни один путь записи до E5.
-        // Ноль с нашей стороны означает «не считаем», и объявить
-        // удержанные брокером 1 300 расхождением было бы ложью.
+        // No recording path produces tax facts before E5.
+        // A zero on our side means «we do not calculate it», and calling
+        // 1 300 withheld by the broker a discrepancy would be false.
         let account = AccountId::new_random();
         let observed = observe(
             &journal_with_one_deposit(account, 100_000),
@@ -421,9 +421,9 @@ mod tests {
 
     #[test]
     fn a_position_quantity_is_compared_per_custody() {
-        // То же количество в другом депозитарии — это другая позиция:
-        // перевод бумаг между депозитариями внутри одного брокера
-        // является реальной операцией (§4.5).
+        // The same quantity in another depository is a different position:
+        // a transfer of securities between depositories within the same broker
+        // is a real transaction (§4.5).
         let account = AccountId::new_random();
         let custody = CustodyId::new_random();
         let instrument = InstrumentId::new_random();
@@ -464,9 +464,9 @@ mod tests {
 
     #[test]
     fn each_reason_for_incomparability_has_a_distinct_code() {
-        // «Нечего сверять» и «налоговых фактов нет» — разные ответы
-        // владельцу: первый требует назвать остаток, второй не требует
-        // ничего до E5. Один код на оба сделал бы их неразличимыми.
+        // «Nothing to reconcile» and «there are no tax facts» are different answers
+        // to the owner: the first requires stating a balance, while the second requires
+        // nothing before E5. Using one code for both would make them indistinguishable.
         assert_eq!(
             NotComparable::NoJournalCoverage.code(),
             "no_journal_coverage"
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn an_exception_neither_confirms_nor_is_a_discrepancy() {
-        // §11: «мы знаем, почему не сходится» — это не «сошлось».
+        // §11: «we know why it does not match» — does not mean «it matched».
         let excepted = ClaimOutcome::Excepted {
             exception: ReconciliationException::UnsupportedRepoEncumbrance,
         };

@@ -1,9 +1,9 @@
-//! Денежные потоки границы контура (§4.10, §6.1).
+//! Cash flows across the contour boundary (§4.10, §6.1).
 //!
-//! Из-за путаницы именно здесь сервисы показывают доходность, в которой
-//! собственные пополнения выглядят заработком. Классификацию делает
-//! `contour::classify`, этот модуль лишь превращает её в датированный
-//! ряд сумм и следит, чтобы знак суммы не противоречил направлению.
+//! Because of confusion here, services report returns in which
+//! contributions appear as earnings. Classification is performed by
+//! `contour::classify`; this module merely turns it into a dated
+//! series of amounts and ensures that the amount's sign matches the direction.
 
 use std::collections::BTreeMap;
 
@@ -18,9 +18,9 @@ use crate::money::{CurrencyCode, Money, PostedMinor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum FlowDirection {
-    /// Деньги вошли в контур извне.
+    /// Money entered the contour from outside.
     In,
-    /// Деньги вышли из контура.
+    /// Money left the contour.
     Out,
 }
 
@@ -34,10 +34,10 @@ impl FlowDirection {
     }
 }
 
-/// Поток, пересёкший границу контура.
+/// A flow that crossed the contour boundary.
 ///
-/// Сумма — **проведённая**, в валюте счёта. Перевод в валюту отчёта
-/// делается позже и даёт расчётную величину (§3.4).
+/// The amount is **posted**, in the account currency. Conversion to the reporting currency
+/// is done later and produces an estimated value (§3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalFlow {
     pub event: EventId,
@@ -50,11 +50,11 @@ pub struct ExternalFlow {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FlowError {
-    #[error("событие {event:?} пересекает границу контура, но не имеет даты")]
+    #[error("event {event:?} crosses the contour boundary but has no date")]
     FlowWithoutDate { event: EventId },
     #[error(
-        "событие {event:?} классифицировано как {direction:?}, \
-         но денежный эффект на счетах контура равен {amount} в {currency:?}"
+        "event {event:?} was classified as {direction:?}, \
+         but its cash effect on the contour accounts is {amount} in {currency:?}"
     )]
     DirectionContradictsAmount {
         event: EventId,
@@ -62,11 +62,11 @@ pub enum FlowError {
         amount: i64,
         currency: CurrencyCode,
     },
-    #[error("переполнение при суммировании ног события {event:?}")]
+    #[error("overflow while summing the legs of event {event:?}")]
     Overflow { event: EventId },
 }
 
-/// Ряд внешних потоков плюс счётчик внутренних движений.
+/// A series of external flows plus a count of internal movements.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowLog {
     external: Vec<ExternalFlow>,
@@ -85,12 +85,12 @@ impl FlowLog {
         &self.external
     }
 
-    /// Число **денежных** движений внутри контура.
+    /// Number of **cash** movements within the contour.
     ///
-    /// Считаются только события, двигавшие деньги: событие оценки денег
-    /// не двигает и движением не является, хотя относится к контуру.
-    /// Ноль внешних потоков при ненулевом внутреннем счётчике — законная
-    /// ситуация: перевод между своими счетами доходность не меняет (§15.9).
+    /// Only events that moved money are counted: a cash valuation event
+    /// does not move money and is not a movement, even though it belongs to the contour.
+    /// Zero external flows with a nonzero internal movement count is a valid
+    /// situation: a transfer between own accounts does not change returns (§15.9).
     #[must_use]
     pub const fn internal(&self) -> u64 {
         self.internal
@@ -138,19 +138,19 @@ impl FlowLog {
     }
 }
 
-/// Двигало ли событие деньги хоть где-нибудь.
+/// Whether the event moved money anywhere.
 ///
-/// Проверяется по ногам, а не по типу события: тип отвечает на вопрос
-/// «что произошло», а ноги — «что при этом сдвинулось».
+/// This is determined from the legs, not the event type: the type answers
+/// “what happened”, while the legs answer “what moved as a result”.
 fn moves_money(event: &Event) -> bool {
     event.legs.iter().any(|leg| leg.cash_effect().is_some())
 }
 
-/// Денежный эффект события **на счетах контура**, по валютам.
+/// The event's cash effect **on the contour accounts**, by currency.
 ///
-/// Для перевода извне внутрь это сумма только входящей ноги: исходящая
-/// нога лежит на счёте вне контура и границу не пересекает — она и есть
-/// внешний мир.
+/// For a transfer from outside to inside, this is the sum of only the incoming leg: the outgoing
+/// leg belongs to an account outside the contour and does not cross the boundary—it is
+/// the external world.
 fn contour_cash_effect(
     event: &Event,
     contour: &ContourDefinition,
@@ -173,11 +173,11 @@ fn contour_cash_effect(
     Ok(totals)
 }
 
-/// Знак суммы обязан соответствовать направлению.
+/// The amount's sign must match the direction.
 ///
-/// Расхождение означает, что классификатор и ноги события говорят разное,
-/// и молча взять модуль здесь — способ получить доходность, в которой
-/// вывод средств выглядит доходом.
+/// A mismatch means that the classifier and the event legs disagree,
+/// and silently taking the absolute value here is a way to produce returns in which
+/// a withdrawal appears as income.
 fn require_sign_matches(
     event: EventId,
     direction: FlowDirection,
@@ -243,10 +243,10 @@ mod tests {
 
     #[test]
     fn an_event_that_moved_no_money_is_not_counted_as_a_movement() {
-        // Оценка относится к контуру, но денег не двигает: ног у неё нет.
-        // Счётчик внутренних движений — это счётчик движений, а не
-        // счётчик событий, иначе «переводов между своими счетами не было»
-        // и «была переоценка» становятся неразличимы в блоке качества.
+        // A valuation belongs to the contour but does not move money: it has no legs.
+        // The internal movement count counts movements, not
+        // events; otherwise, “there were no transfers between own accounts”
+        // and “there was a revaluation” become indistinguishable in the quality section.
         let account = AccountId::new_random();
         let contour = contour_of([account]);
         let valuation = event_with(
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(log.internal(), 0);
         assert_eq!(log.external().len(), 0);
 
-        // А перевод между своими счетами — движение, и он считается.
+        // But a transfer between own accounts is a movement, so it is counted.
         let other = AccountId::new_random();
         let both = ContourDefinition::new(
             crate::contour::ContourId::new_random(),
@@ -302,8 +302,8 @@ mod tests {
 
     #[test]
     fn a_transfer_between_two_accounts_of_the_contour_is_internal() {
-        // Именно из-за этой ветки в чужих сервисах перевод со вклада
-        // на брокерский счёт выглядит доходом (§4.10).
+        // This exact branch is why other services make a transfer from a savings account
+        // to a brokerage account appear as income (§4.10).
         let from = AccountId::new_random();
         let to = AccountId::new_random();
         let contour = ContourDefinition::new(
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn a_purchase_does_not_cross_the_boundary() {
-        // Покупка бумаги меняет состав контура, а не его размер.
+        // Buying a security changes the composition of the contour, not its size.
         let account = AccountId::new_random();
         let contour = contour_of([account]);
         let event = event_with(
@@ -373,8 +373,8 @@ mod tests {
 
     #[test]
     fn a_direction_that_contradicts_the_sign_is_an_error() {
-        // Классификатор сказал «приход», а ноги показывают расход.
-        // Взять модуль здесь — способ выдать вывод средств за доход.
+        // The classifier said “inflow”, but the legs show an outflow.
+        // Taking the absolute value here is a way to pass off a withdrawal as income.
         let account = AccountId::new_random();
         let contour = contour_of([account]);
         let mut event = event_with(
@@ -399,10 +399,10 @@ mod tests {
 
     #[test]
     fn the_sign_check_is_strict_at_zero() {
-        // Нулевая сумма не является ни приходом, ни расходом. Через
-        // публичный путь ноль не проходит (нулевые суммы отсеиваются
-        // раньше), поэтому граница проверяется прямо на функции —
-        // иначе `>` и `>=` здесь неразличимы.
+        // A zero amount is neither an inflow nor an outflow. Zero does not pass through
+        // the public path (zero amounts are filtered out
+        // earlier), so the boundary is tested directly on the function—
+        // otherwise, `>` and `>=` would be indistinguishable here.
         let event = EventId::new_random();
         assert!(require_sign_matches(event, FlowDirection::In, rub(1)).is_ok());
         assert!(require_sign_matches(event, FlowDirection::In, rub(0)).is_err());

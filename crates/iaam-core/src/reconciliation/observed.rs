@@ -1,15 +1,15 @@
-//! Те же величины, посчитанные из журнала (§10.3).
+//! The same quantities, calculated from the journal (§10.3).
 //!
-//! Это **вторая сторона** сверки. Первая — то, что сказал источник
-//! ([`super::claim`]). Стороны обязаны считаться независимо: общий
-//! помощник между ними превратил бы проверку в тавтологию, и
-//! компенсирующая ошибка разбора перестала бы ловиться — ровно то,
-//! ради чего §10.3 вводит три уровня достоверности, а не два.
+//! This is the **second side** of the reconciliation. The first is what the source reported
+//! ([`super::claim`]). The sides must be calculated independently: a shared
+//! helper between them would turn the check into a tautology, and
+//! a compensating parsing error would no longer be caught — exactly
+//! why §10.3 introduces three levels of confidence, not two.
 //!
-//! Остатки берутся у [`Balances`] — уже проверенной проекции. Это не
-//! нарушает независимость: `Balances` считает по журналу, а не по
-//! контрольной секции документа, и общего кода с разбором отчёта у неё
-//! нет.
+//! Balances are taken from [`Balances`] — an already verified projection. This does not
+//! compromise independence: `Balances` calculates from the journal, not from the
+//! document's control section, and it shares no code with report parsing.
+//!
 
 use std::collections::BTreeMap;
 
@@ -24,11 +24,11 @@ use crate::money::{CurrencyCode, PostedMinor, Quantity};
 use crate::numeric::NumericError;
 use crate::projection::balances::{BalanceError, Balances, PositionKey};
 
-/// Обороты по счёту за интервал.
+/// Account turnover over an interval.
 ///
-/// Обе стороны — **модули**. `debit` — приход, `credit` — расход;
-/// соответствие колонкам конкретного отчёта устанавливает парсер,
-/// а не эта структура.
+/// Both sides are **absolute values**. `debit` is inflow, `credit` is outflow;
+/// the parser establishes how they map to the columns of a specific report,
+/// not this structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Turnover {
     pub debit: PostedMinor,
@@ -36,12 +36,12 @@ pub struct Turnover {
 }
 
 impl Default for Turnover {
-    /// Нулевой оборот пишется здесь руками, а не выводится из
-    /// `Default` для [`PostedMinor`]: денежный тип намеренно не имеет
-    /// умолчания, потому что нулевая заглушка вместо неизвестной суммы
-    /// — это ровно то, что запрещает §4.9. У оборота ноль осмыслен:
-    /// он означает «движений не было», и накопитель начинает с него
-    /// только там, где счёт уже признан существующим.
+    /// Zero turnover is written explicitly here rather than derived from
+    /// `Default` for [`PostedMinor`]: the monetary type deliberately has no
+    /// default, because using a zero placeholder instead of an unknown amount
+    /// is exactly what §4.9 prohibits. For turnover, zero is meaningful:
+    /// it means «there were no movements», and the accumulator starts from it
+    /// only where the account is already known to exist.
     fn default() -> Self {
         Self {
             debit: PostedMinor::new(0),
@@ -52,9 +52,9 @@ impl Default for Turnover {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ObserveError {
-    #[error("событие {event:?} не имеет ни одной даты и не попадает ни в один период")]
+    #[error("event {event:?} has no date and falls within no period")]
     EventWithoutDate { event: EventId },
-    #[error("переполнение при подсчёте величины {field}")]
+    #[error("overflow while calculating quantity {field}")]
     Overflow { field: &'static str },
     #[error(transparent)]
     Balance(#[from] BalanceError),
@@ -62,7 +62,7 @@ pub enum ObserveError {
     Numeric(#[from] NumericError),
 }
 
-/// Наблюдаемые величины за интервал.
+/// Observed quantities over an interval.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObservedTotals {
     cash_opening: BTreeMap<CurrencyCode, PostedMinor>,
@@ -119,28 +119,28 @@ impl ObservedTotals {
         self.tax_withheld.get(&currency).copied()
     }
 
-    /// Записан ли в журнале хоть один факт удержанного налога.
+    /// Whether at least one withheld-tax fact has been recorded in the journal.
     ///
-    /// Ложь означает «сравнивать не с чем», а не «налог равен нулю».
-    /// Налоговые факты появляются в E5; до тех пор утверждение отчёта
-    /// об удержанном налоге не является расхождением.
+    /// False means «there is nothing to compare against», not «the tax is zero».
+    /// Tax facts appear in E5; until then, the report's claim
+    /// about withheld tax is not a discrepancy.
     #[must_use]
     pub const fn tax_facts_recorded(&self) -> bool {
         self.tax_facts_recorded
     }
 
-    /// Сколько событий счёта видел журнал за интервал и до него.
-    /// Ноль означает, что подтверждать нечего: истории нет.
+    /// How many account events the journal saw during and before the interval.
+    /// Zero means there is nothing to verify: no history exists.
     #[must_use]
     pub const fn events_seen(&self) -> u64 {
         self.events_seen
     }
 }
 
-/// Подсчёт наблюдаемых величин за интервал.
+/// Calculation of observed quantities over an interval.
 ///
-/// Логика вынесена из конструктора с именем `new` намеренно:
-/// `cargo-mutants` молча пропускает функции с этим именем (§15.7).
+/// The logic was deliberately moved out of a constructor named `new`:
+/// `cargo-mutants` silently skips functions with that name (§15.7).
 pub fn observe(
     events: &[Event],
     account: AccountId,
@@ -170,8 +170,8 @@ pub fn observe(
                 accumulate(&mut totals, event, account)?;
             }
         }
-        // События позже конца интервала не применяются ни к чему:
-        // остаток на конец марта не знает про апрель.
+        // Events after the end of the interval do not apply to anything:
+        // the end-of-March balance knows nothing about April.
     }
 
     snapshot_cash(&opening, account, &mut totals.cash_opening);
@@ -207,16 +207,16 @@ fn snapshot_positions(
         if *owner != account {
             continue;
         }
-        // Утверждение отчёта всегда называет депозитарий, поэтому
-        // позиция, записанная без него, сверке не подлежит и в срез
-        // не попадает: сравнить её было бы не с чем.
+        // The report's claim always names a depository, so
+        // a position recorded without one is not eligible for reconciliation and is
+        // not included in the snapshot: there would be nothing to compare it against.
         if let Some(custody) = custody {
             into.insert((*instrument, *custody), quantity);
         }
     }
 }
 
-/// Накопление величин интервала по ногам **нашего** счёта.
+/// Accumulation of interval quantities from the legs of **our** account.
 fn accumulate(
     totals: &mut ObservedTotals,
     event: &Event,
@@ -266,8 +266,8 @@ fn accumulate(
     Ok(())
 }
 
-/// Прибавление модуля величины: контрольные суммы отчёта — модули,
-/// знак в них несёт название колонки, а не число.
+/// Adding the absolute value of a quantity: the report's control totals are absolute values,
+/// and the sign is conveyed by the column name, not the number.
 fn add_magnitude(
     into: &mut BTreeMap<CurrencyCode, PostedMinor>,
     currency: CurrencyCode,
@@ -312,10 +312,10 @@ mod tests {
         )
     }
 
-    /// Позиция по облигации на начало марта плюс корпоративное действие.
+    /// Bond position at the beginning of March plus a corporate action.
     ///
-    /// Открывающая позиция нужна, чтобы у среза было что показывать:
-    /// амортизация количества не двигает, и без неё сравнивать нечего.
+    /// The opening position is needed so that the snapshot has something to show:
+    /// amortisation does not change the quantity, and without it there is nothing to compare.
     fn bond_events(
         account: AccountId,
         instrument: InstrumentId,
@@ -348,8 +348,8 @@ mod tests {
 
     #[test]
     fn amortisation_moves_cash_but_not_the_position_count() {
-        // §6.5: выплата есть, выбытия нет. Изменение количества здесь
-        // означало бы расхождение с брокерским отчётом на ровном месте.
+        // §6.5: there is a payment, but no disposal. Changing the quantity here
+        // would create a spurious discrepancy with the broker report.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
@@ -375,18 +375,18 @@ mod tests {
         assert_eq!(
             observed.turnover(CurrencyCode::Rub).map(|t| t.debit),
             Some(PostedMinor::new(200_000)),
-            "нога Principal обязана попасть в оборот: она уже денежная"
+            "the Principal leg must be included in turnover: it is already monetary"
         );
         assert_eq!(
             observed.position_at(BalancePoint::Closing, instrument, custody),
             Some(qty(10)),
-            "амортизация не выводит бумагу из позиции"
+            "amortisation does not remove the security from the position"
         );
     }
 
     #[test]
     fn amortisation_is_not_counted_as_income() {
-        // Возврат собственного капитала доходом не является (§6.5).
+        // Return of capital is not income (§6.5).
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
@@ -445,15 +445,15 @@ mod tests {
         assert_eq!(
             observed.position_at(BalancePoint::Closing, instrument, custody),
             Some(qty(0)),
-            "погашенная бумага не остаётся в позиции"
+            "a redeemed security does not remain in the position"
         );
     }
 
     #[test]
     fn opening_excludes_the_period_and_closing_includes_it() {
-        // Остаток на начало марта — это состояние до первого мартовского
-        // события. Включить март в «начало» значит сверять отчёт с самим
-        // собой: обе стороны съедут одинаково, и расхождение исчезнет.
+        // The opening balance for March is the state before the first March
+        // event. Including March in «opening» means reconciling the report against
+        // itself: both sides would shift identically, and the discrepancy would disappear.
         let account = AccountId::new_random();
         let events = vec![
             event_with(
@@ -491,16 +491,16 @@ mod tests {
         assert_eq!(
             observed.cash_at(BalancePoint::Closing, CurrencyCode::Rub),
             Some(PostedMinor::new(150_000)),
-            "апрельское событие не имеет права попасть в остаток на конец марта"
+            "an April event must not be included in the end-of-March balance"
         );
     }
 
     #[test]
     fn turnover_counts_every_cash_leg_including_fees() {
-        // Оборот по счёту — это всё движение денег, а не только ноги
-        // типа Cash. Комиссия, списанная с того же счёта, в обороте
-        // брокерского отчёта присутствует, и не учесть её значит
-        // получить расхождение на ровном месте.
+        // Account turnover is every movement of money, not just legs
+        // of type Cash. A fee charged to the same account is present in the
+        // broker report's turnover, and failing to include it would
+        // create a spurious discrepancy.
         let account = AccountId::new_random();
         let events = vec![
             event_with(
@@ -526,15 +526,19 @@ mod tests {
 
         let observed = observe(&events, account, march()).unwrap();
         let turnover = observed.turnover(CurrencyCode::Rub).unwrap();
-        assert_eq!(turnover.debit, PostedMinor::new(100_000), "приход");
-        assert_eq!(turnover.credit, PostedMinor::new(350), "расход модулем");
+        assert_eq!(turnover.debit, PostedMinor::new(100_000), "inflow");
+        assert_eq!(
+            turnover.credit,
+            PostedMinor::new(350),
+            "outflow as an absolute value"
+        );
     }
 
     #[test]
     fn fees_are_collected_from_trades_too() {
-        // Комиссия внутри сделки — та же комиссия. Контрольная секция
-        // отчёта суммирует все, и собирать только отдельные события Fee
-        // значит недосчитать ровно на комиссиях сделок.
+        // A fee within a trade is still a fee. The report's control section
+        // totals all of them, and collecting only standalone Fee events
+        // means undercounting by exactly the trade fees.
         let account = AccountId::new_random();
         let custody = CustodyId::new_random();
         let instrument = InstrumentId::new_random();
@@ -572,16 +576,16 @@ mod tests {
         assert_eq!(
             observed.fees(CurrencyCode::Rub),
             Some(PostedMinor::new(200)),
-            "120 внутри сделки плюс 80 отдельным событием, модулем"
+            "120 within the trade plus 80 as a separate event, as an absolute value"
         );
     }
 
     #[test]
     fn an_event_on_the_first_day_belongs_to_the_period_not_before_it() {
-        // Граница интервала включается: событие первого марта — это
-        // март, а не «до марта». Сдвиг границы на один день перенёс бы
-        // операцию в остаток на начало, и обе стороны сверки съехали бы
-        // одинаково — то есть ошибка стала бы невидимой.
+        // The interval boundary is inclusive: an event on March 1 belongs to
+        // March, not «before March». Shifting the boundary by one day would move
+        // the transaction into the opening balance, and both sides of the reconciliation would shift
+        // identically — making the error invisible.
         let account = AccountId::new_random();
         let events = vec![event_with(
             account,
@@ -596,7 +600,7 @@ mod tests {
         assert_eq!(
             observed.cash_at(BalancePoint::Opening, CurrencyCode::Rub),
             None,
-            "первого марта в остатке на начало марта ещё нет"
+            "March 1 is not yet included in the opening balance for March"
         );
         assert_eq!(
             observed.cash_at(BalancePoint::Closing, CurrencyCode::Rub),
@@ -605,14 +609,14 @@ mod tests {
         assert_eq!(
             observed.turnover(CurrencyCode::Rub).unwrap().debit,
             PostedMinor::new(100_000),
-            "операция первого марта входит в оборот марта"
+            "the March 1 transaction is included in March turnover"
         );
     }
 
     #[test]
     fn every_touching_event_is_counted_once() {
-        // Счётчик решает, есть ли у счёта история вообще: по нему
-        // сверка отличает «не сошлось» от «сверять не с чем».
+        // The counter determines whether the account has any history at all: it lets
+        // the reconciliation distinguish «a mismatch» from «nothing to reconcile».
         let account = AccountId::new_random();
         let events = vec![
             event_with(
@@ -641,16 +645,16 @@ mod tests {
         assert_eq!(
             observed.events_seen(),
             3,
-            "считаются и события до интервала, и события внутри него"
+            "events both before the interval and within it are counted"
         );
     }
 
     #[test]
     fn absence_of_movement_is_not_zero() {
-        // `None` и `Some(0)` — разные утверждения. Первое означает
-        // «данных нет», второе «данные есть, и остаток нулевой».
-        // Схлопнуть их значит выдать отсутствие истории за
-        // подтверждённый ноль (§4.9, §10.7).
+        // `None` and `Some(0)` are different claims. The first means
+        // «there is no data», the second «there is data, and the balance is zero».
+        // Collapsing them would present the absence of history as
+        // a confirmed zero (§4.9, §10.7).
         let account = AccountId::new_random();
         let observed = observe(&[], account, march()).unwrap();
         assert_eq!(
@@ -663,9 +667,9 @@ mod tests {
 
     #[test]
     fn tax_is_not_comparable_until_a_tax_leg_exists() {
-        // Ног налога не производит ни один путь записи: налоги — E5.
-        // Пока их нет, удержанный налог сравнивать не с чем, и ноль
-        // с нашей стороны означает «не считаем», а не «брокер не удержал».
+        // No write path produces tax legs: taxes are E5.
+        // Until they exist, there is nothing to compare withheld tax against, and zero
+        // on our side means «we do not count it», not «the broker withheld nothing».
         let account = AccountId::new_random();
         let events = vec![event_with(
             account,
@@ -681,10 +685,10 @@ mod tests {
 
     #[test]
     fn a_tax_leg_makes_the_dimension_comparable() {
-        // Обратная сторона предыдущего теста: как только налоговый факт
-        // появляется, сравнение становится возможным само собой — без
-        // правки сверки. Это и есть проверка, что признак считается
-        // по журналу, а не зашит константой «в E2 налогов нет».
+        // The converse of the previous test: as soon as a tax fact
+        // appears, comparison becomes possible on its own — without
+        // changing the reconciliation. This verifies that the flag is calculated
+        // from the journal, rather than hard-coded as «there are no taxes in E2».
         let account = AccountId::new_random();
         let events = vec![event_with(
             account,
@@ -705,15 +709,15 @@ mod tests {
         assert_eq!(
             observed.tax_withheld(CurrencyCode::Rub),
             Some(PostedMinor::new(1_300)),
-            "удержанный налог собирается модулем"
+            "withheld tax is accumulated as an absolute value"
         );
     }
 
     #[test]
     fn income_is_summed_from_income_events_only() {
-        // Приход денег и доход — разные вещи. Пополнение счёта владельцем
-        // деньгами является, доходом — нет, и попасть в контрольную сумму
-        // купонов и дивидендов не должно.
+        // Cash received and income are different things. An owner's account contribution
+        // is cash, but not income, and must not be included in the control total
+        // for coupons and dividends.
         let account = AccountId::new_random();
         let events = vec![
             event_with(
@@ -746,8 +750,8 @@ mod tests {
 
     #[test]
     fn another_account_does_not_leak_into_the_totals() {
-        // Утверждение делается о счёте. Ноги чужого счёта в обороте —
-        // это подтверждение, полученное чужими деньгами.
+        // The claim is about the account. Legs from another account in the turnover are
+        // confirmation obtained using someone else's money.
         let ours = AccountId::new_random();
         let theirs = AccountId::new_random();
         let events = vec![event_with(
@@ -764,9 +768,9 @@ mod tests {
 
     #[test]
     fn an_event_without_a_date_is_a_typed_error() {
-        // Событие без даты не попадает ни в один период. Пропустить его
-        // молча значит посчитать сверку по неполному срезу и объявить
-        // расхождение там, где его нет.
+        // An event without a date falls within no period. Silently skipping it
+        // means calculating the reconciliation over an incomplete snapshot and reporting
+        // a discrepancy where none exists.
         let account = AccountId::new_random();
         let mut event = event_with(
             account,

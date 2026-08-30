@@ -1,14 +1,14 @@
-//! Книга лотов (§4.12).
+//! Lot book (§4.12).
 //!
-//! Лоты строятся **по типу события**: покупка добавляет партию, продажа
-//! списывает её версионированным правилом из реестра. Количество бумаг
-//! при этом считается независимо — по ногам события (`super::balances`).
+//! Lots are built **by event type**: a purchase adds a lot, while a sale
+//! disposes of it using a versioned registry rule. The quantity of securities
+//! is calculated independently from the event legs (`super::balances`).
 //!
-//! Восстановленная позиция без документированной стоимости (§10.7)
-//! **не превращается в лот с нулевой стоимостью**: она хранится отдельным
-//! количеством, списывается первой и делает реализованный результат
-//! невычислимым. Нулевая заглушка здесь означала бы выдуманную прибыль,
-//! равную всей выручке.
+//! A reconstructed position without documented cost (§10.7)
+//! **does not become a zero-cost lot**: it is stored as a separate
+//! quantity, disposed of first, and makes the realised result
+//! uncomputable. A zero placeholder here would imply fabricated profit
+//! equal to the entire proceeds.
 
 use super::ownership::Ownership;
 use std::collections::BTreeMap;
@@ -33,8 +33,8 @@ use crate::rules::lot_disposal::{
 use crate::rules::{LotRuleVersion, RuleRegistry};
 use crate::settlement::{SettlementKnowledge, SettlementLagPolicy};
 
-/// Лоты не различают место хранения: перевод бумаги между депозитариями
-/// не является приобретением и не создаёт новой партии.
+/// Lots do not distinguish custody location: transferring a security between depositories
+/// is not an acquisition and does not create a new lot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LotKey {
     pub account: AccountId,
@@ -43,18 +43,18 @@ pub struct LotKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LotError {
-    #[error("в реестре нет правила списания версии {version:?}")]
+    #[error("the registry has no disposal rule for version {version:?}")]
     UnknownRule { version: LotRuleVersion },
-    #[error("продажа {event:?} без предшествующей позиции по инструменту {instrument:?}")]
+    #[error("sale {event:?} without a preceding position in instrument {instrument:?}")]
     SaleWithoutPosition {
         event: EventId,
         instrument: InstrumentId,
     },
-    #[error("в реестре нет правила амортизации версии {version:?}")]
+    #[error("the registry has no amortisation rule for version {version:?}")]
     UnknownAmortisationRule { version: AmortisationRuleVersion },
     #[error(
-        "событие названо на количество {declared:?}, а на счёте по этой бумаге {held:?}: \
-         корпоративное действие касается всей позиции, и расхождение — брак источника"
+        "the event declares quantity {declared:?}, but the account holds {held:?} of this security: \
+         the corporate action applies to the entire position, and the discrepancy is a source defect"
     )]
     QuantityMismatch { held: Quantity, declared: Quantity },
     #[error(transparent)]
@@ -67,14 +67,14 @@ pub enum LotError {
     Numeric(#[from] NumericError),
 }
 
-/// Почему реализованный результат по инструменту не вычисляется.
+/// Why the realised result for the instrument cannot be computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BasisGap {
-    /// Позиция восстановлена без документированной стоимости (§10.7).
+    /// The position was reconstructed without documented cost (§10.7).
     RestoredWithoutBasis,
-    /// Доля разнесения неизвестна, поэтому долю возвращённой при
-    /// амортизации стоимости считать не от чего (§4.9). Факт применён,
-    /// реализованный результат — невычислим.
+    /// The allocation ratio is unknown, so there is no basis for calculating
+    /// the share of cost returned through amortisation (§4.9). The fact is applied,
+    /// but the realised result is uncomputable.
     AmortisationAllocationUnknown,
 }
 
@@ -88,7 +88,7 @@ impl BasisGap {
     }
 }
 
-/// Группа лотов, приобретённых в одну дату.
+/// A group of lots acquired on the same date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cohort {
     pub acquired: TradeDate,
@@ -100,46 +100,46 @@ pub struct Cohort {
     pub received_to_date: Option<Money>,
 }
 
-/// Почему пожизненная метрика по когортам не вычисляется.
+/// Why the lifetime cohort metric cannot be computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum CohortGap {
-    #[error("дата приобретения неизвестна")]
+    #[error("acquisition date is unknown")]
     AcquisitionDateUnknown,
-    #[error("вид дохода неизвестен")]
+    #[error("income type is unknown")]
     IncomeKindUnknown,
-    #[error("позиция восстановлена без документированной стоимости")]
+    #[error("position was reconstructed without documented cost")]
     RestoredWithoutBasis,
-    #[error("количество лотов переполняется при сложении")]
+    #[error("lot quantity overflows when added")]
     InconsistentQuantity,
-    #[error("валюты стоимостей лотов различаются")]
+    #[error("lot cost currencies differ")]
     InconsistentCostBasisCurrency,
-    #[error("стоимость лотов переполняется при сложении")]
+    #[error("lot cost overflows when added")]
     InconsistentCostBasisOverflow,
-    #[error("валюты дополнительных денежных величин лотов различаются")]
+    #[error("currencies of additional lot monetary amounts differ")]
     InconsistentOptionalMoneyCurrency,
-    #[error("дополнительные денежные величины лотов переполняются при сложении")]
+    #[error("additional lot monetary amounts overflow when added")]
     InconsistentOptionalMoneyOverflow,
 }
 
-/// Приобретения, когда-либо наблюдённые по паре (счёт, инструмент).
+/// Acquisitions ever observed for the (account, instrument) pair.
 ///
-/// Отдельно от живых партий, потому что выбытие партии не отменяет
-/// того, что бумага в тот день уже была: граница владения, посчитанная
-/// по оставшимся партиям, после продажи ранней партии поднимается и
-/// прячет пропуск выплаты за период, когда бумага была на руках.
-/// Величина монотонна: выбытие её не двигает.
+/// Kept separately from live lots because disposal of a lot does not erase
+/// the fact that the security was already held on that date: an ownership boundary calculated
+/// from the remaining lots would move forward after an early lot is sold and
+/// hide a missing payment for a period when the security was held.
+/// The value is monotonic: disposal does not change it.
 ///
-/// `#[serde(default)]` намеренно нет: снимок без неё выглядел бы как
-/// позиция без истории приобретений, то есть выдавал бы «не владел»
-/// за «не знаем». Снимки прежней версии отвергает `PROJECTION_VERSION`.
+/// `#[serde(default)]` is intentionally omitted: a snapshot without it would look like
+/// a position with no acquisition history, thereby reporting «did not own»
+/// as «unknown». `PROJECTION_VERSION` rejects snapshots from the previous version.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct AcquisitionHistory {
-    /// Самая ранняя наблюдённая дата приобретения.
+    /// The earliest observed acquisition date.
     earliest: Option<TradeDate>,
-    /// Наблюдалось приобретение без даты: партия без даты сделки либо
-    /// количество, восстановленное без стоимости. Признак липкий по той
-    /// же причине, по которой липка сама дата: выбытие безымянной
-    /// партии не превращает неизвестную границу в известную.
+    /// An acquisition without a date was observed: either a lot without a trade date or
+    /// a quantity reconstructed without cost. The flag is sticky for the
+    /// same reason as the date itself: disposing of an undated
+    /// lot does not turn an unknown boundary into a known one.
     undated: bool,
 }
 
@@ -156,52 +156,52 @@ impl AcquisitionHistory {
         }
     }
 
-    /// Нижняя граница владения. `None`, когда наблюдалось приобретение
-    /// без даты: любая граница по остальным партиям была бы позже
-    /// настоящей и скрыла бы пропуск.
+    /// Lower ownership boundary. `None` when an acquisition
+    /// without a date was observed: any boundary based on the other lots would be later
+    /// than the actual one and would hide the omission.
     const fn lower_bound(self) -> Option<TradeDate> {
         if self.undated { None } else { self.earliest }
     }
 }
 
-/// Лоты одного инструмента на одном счёте.
+/// Lots for one instrument in one account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstrumentLots {
-    /// Количество, восстановленное без стоимости. Списывается первым:
-    /// оно приобретено раньше всего, что система видела.
+    /// Quantity reconstructed without cost. Disposed of first:
+    /// it was acquired before everything else the system has seen.
     unpriced: Quantity,
-    /// Партии в порядке приобретения.
+    /// Lots in acquisition order.
     lots: Vec<Lot>,
-    /// Реализованный результат до налога. `None`, если хотя бы одно
-    /// выбытие затронуло количество без стоимости.
+    /// Pretax realised result. `None` if at least one
+    /// disposal affected a quantity without cost.
     realized: Option<Money>,
-    /// Суммарная стоимость всех приобретений с документированной ценой.
+    /// Total cost of all acquisitions with a documented price.
     acquired_basis: Option<Money>,
-    /// Суммарная стоимость, списанная при выбытиях.
+    /// Total cost disposed of through disposals.
     released_basis: Option<Money>,
     gap: Option<BasisGap>,
-    /// Факт выплаты неизвестного вида, который нельзя приписать лотам.
+    /// A payment of unknown type that cannot be attributed to lots.
     #[serde(default)]
     income_kind_unknown: bool,
-    /// Известная выплата, часть которой пришлась на восстановленное
-    /// количество либо на позицию без лотов.
+    /// A known payment, part of which was attributable to a reconstructed
+    /// quantity or to a position without lots.
     #[serde(default)]
     unallocated_income: Option<Money>,
-    /// Доля известной выплаты, пришедшаяся на восстановленное количество.
+    /// The share of a known payment attributable to the reconstructed quantity.
     #[serde(default)]
     unpriced_income: Option<Money>,
-    /// Приобретения, когда-либо наблюдённые по паре.
+    /// Acquisitions ever observed for the pair.
     acquisitions: AcquisitionHistory,
-    /// История изменений количества со знанием о расчёте.
+    /// Quantity-change history with settlement knowledge.
     ///
-    /// `#[serde(default)]` намеренно нет: снимок без истории нельзя честно
-    /// считать позицией без владения; его должен отвергнуть номер проекции.
+    /// `#[serde(default)]` is intentionally omitted: a snapshot without history cannot honestly
+    /// be treated as a position without ownership; the projection version must reject it.
     ownership: super::ownership::OwnershipHistory,
 }
 
-/// Пустая книга по инструменту. Пишется вручную, потому что `Quantity`
-/// намеренно не реализует `Default`: нулевое количество должно возникать
-/// осознанно, а не как значение по умолчанию неизвестного поля (§4.9).
+/// An empty book for an instrument. Implemented manually because `Quantity`
+/// intentionally does not implement `Default`: a zero quantity must be created
+/// explicitly, not as the default value of an unknown field (§4.9).
 impl Default for InstrumentLots {
     fn default() -> Self {
         Self {
@@ -246,16 +246,16 @@ impl InstrumentLots {
         self.income_kind_unknown
     }
 
-    /// Самая ранняя дата приобретения, когда-либо наблюдённая по паре.
+    /// The earliest acquisition date ever observed for the pair.
     ///
-    /// Считается по всей истории, а не по живым партиям: продажа ранней
-    /// партии границу владения не поднимает, иначе пропуск выплаты за
-    /// период, когда бумага была на руках, остался бы неназванным.
+    /// Calculated from the entire history, not from live lots: selling an early
+    /// lot does not move the ownership boundary forward, otherwise a missing payment for
+    /// a period when the security was held would remain unidentified.
     ///
-    /// `None`, если есть количество, восстановленное без стоимости,
-    /// либо хоть у одного приобретения даты не было: границу владения
-    /// тогда провести нечем, а провести её приблизительно значило бы
-    /// либо выдумать дефект, либо скрыть настоящий.
+    /// `None` if there is a quantity reconstructed without cost,
+    /// or if at least one acquisition had no date: there is then no basis
+    /// for establishing the ownership boundary, while approximating it would
+    /// either fabricate a defect or hide a real one.
     #[must_use]
     pub fn earliest_acquired(&self) -> Option<TradeDate> {
         if !self.unpriced.0.is_zero() {
@@ -264,15 +264,15 @@ impl InstrumentLots {
         self.acquisitions.lower_bound()
     }
 
-    /// Статус владения на дату с учётом всех изменений количества.
+    /// Ownership status as of a date, accounting for all quantity changes.
     #[must_use]
     pub fn ownership_at(&self, day: time::Date) -> Ownership {
         self.ownership.ownership_at(day)
     }
 
-    /// Единственная дверь для новой партии: история приобретений
-    /// обязана пополняться вместе с партиями, иначе граница владения
-    /// разойдётся с журналом.
+    /// The only entry point for a new lot: the acquisition history
+    /// must be updated together with the lots, otherwise the ownership boundary
+    /// will diverge from the journal.
     #[cfg(test)]
     fn push_lot(&mut self, lot: Lot) {
         self.push_lot_with_settlement(lot, SettlementKnowledge::Unbounded);
@@ -284,28 +284,28 @@ impl InstrumentLots {
         self.lots.push(lot);
     }
 
-    /// Восстановленная партия встаёт в голову очереди FIFO: она старше
-    /// всего, что система видела.
+    /// A reconstructed lot goes to the front of the FIFO queue: it is older
+    /// than everything else the system has seen.
     fn insert_restored_lot_with_settlement(&mut self, lot: Lot, settlement: SettlementKnowledge) {
         self.acquisitions.observe(lot.acquired);
         self.ownership.observe(lot.quantity, settlement);
         self.lots.insert(0, lot);
     }
 
-    /// Известная выплата, которую нельзя приписать документированному лоту.
+    /// A known payment that cannot be attributed to a documented lot.
     #[must_use]
     pub const fn unallocated_income(&self) -> Option<Money> {
         self.unallocated_income
     }
 
-    /// Доля известных выплат, пришедшаяся на восстановленное количество.
+    /// The share of known payments attributable to the reconstructed quantity.
     #[must_use]
     pub const fn unpriced_income(&self) -> Option<Money> {
         self.unpriced_income
     }
 
-    /// Стоимость приобретений. Вместе с [`Self::released_basis`] образует
-    /// проверяемое тождество: приобретено = осталось + списано.
+    /// Acquisition cost. Together with [`Self::released_basis`] it forms
+    /// a verifiable identity: acquired = remaining + disposed.
     #[must_use]
     pub const fn acquired_basis(&self) -> Option<Money> {
         self.acquired_basis
@@ -316,7 +316,7 @@ impl InstrumentLots {
         self.released_basis
     }
 
-    /// Стоимость непроданных партий.
+    /// Cost of unsold lots.
     pub fn remaining_basis(&self) -> Result<Option<Money>, MoneyError> {
         let Some(first) = self.lots.first() else {
             return Ok(None);
@@ -325,23 +325,23 @@ impl InstrumentLots {
         Money::sum(&amounts, first.cost_basis.currency()).map(Some)
     }
 
-    /// Партии для правки внутри модуля.
+    /// Lots for modification within the module.
     ///
-    /// Метод-аксессор, а не прямой доступ к приватному полю: правка
-    /// партий — операция книги, и её место видно по вызовам.
+    /// An accessor method rather than direct access to the private field: modifying
+    /// lots is a book operation, and its location is visible at call sites.
     fn lots_mut(&mut self) -> &mut [Lot] {
         &mut self.lots
     }
 
-    /// Отметить разрыв в стоимости. Реализованный результат при этом
-    /// становится невычислимым: один разрыв делает невычислимым весь
-    /// инструмент, а не «почти всё».
+    /// Mark a gap in cost. The realised result then
+    /// becomes uncomputable: one gap makes the entire instrument
+    /// uncomputable, not «almost all of it».
     fn mark_basis_gap(&mut self, gap: BasisGap) {
         self.gap = Some(gap);
         self.realized = None;
     }
 
-    /// Прибавить реализованный результат, если он ещё вычислим.
+    /// Add to the realised result if it is still computable.
     fn add_realised(&mut self, amount: Money) -> Result<(), MoneyError> {
         if self.gap.is_some() {
             return Ok(());
@@ -353,8 +353,8 @@ impl InstrumentLots {
         Ok(())
     }
 
-    /// Прибавить списанную стоимость: тождество «приобретено = осталось
-    /// плюс списано» проверяется инвариантом проекции.
+    /// Add the disposed cost: the identity «acquired = remaining
+    /// plus disposed» is checked by a projection invariant.
     fn add_released_basis(&mut self, amount: Money) -> Result<(), MoneyError> {
         self.released_basis = Some(match self.released_basis {
             Some(previous) => previous.try_add(amount)?,
@@ -371,18 +371,18 @@ impl InstrumentLots {
         Ok(())
     }
 
-    /// Суммарное количество: партии плюс восстановленный остаток.
+    /// Total quantity: lots plus the reconstructed balance.
     pub fn quantity(&self) -> Result<Quantity, NumericError> {
         self.lots
             .iter()
             .try_fold(self.unpriced.0, |acc, lot| acc.checked_add(lot.quantity.0))
             .map(Quantity)
     }
-    /// Добавляет фактическую выплату лотам пропорционально количеству.
+    /// Allocates an actual payment to lots in proportion to quantity.
     ///
-    /// В знаменатель входит и восстановленное количество. Его доля
-    /// сохраняется как нераспределённая: у него нет лота, которому можно
-    /// приписать выплату.
+    /// The denominator also includes the reconstructed quantity. Its share
+    /// is retained as unallocated: it has no lot to which the payment
+    /// can be attributed.
     fn add_received(&mut self, amount: Money) -> Result<(), LotError> {
         let total_quantity = self.quantity()?.0.inner();
         if total_quantity.is_zero() {
@@ -425,7 +425,7 @@ impl InstrumentLots {
         Ok(())
     }
 
-    /// Группирует оставшиеся партии по дате приобретения.
+    /// Groups the remaining lots by acquisition date.
     pub fn cohorts(&self) -> Result<Vec<Cohort>, CohortGap> {
         if !self.unpriced.0.is_zero() {
             return Err(CohortGap::AcquisitionDateUnknown);
@@ -502,9 +502,9 @@ impl InstrumentLots {
     }
 }
 
-/// Факты сделки, нужные книге лотов. Отдельная структура, а не восемь
-/// аргументов: порог `too-many-arguments-threshold = 6` в `clippy.toml`
-/// действует, а подавлять линт запрещено (§15.7).
+/// Trade facts needed by the lot book. A separate structure rather than eight
+/// arguments: the `too-many-arguments-threshold = 6` threshold in `clippy.toml`
+/// is enforced, and suppressing the lint is prohibited (§15.7).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TradeFacts {
     side: TradeSide,
@@ -515,7 +515,7 @@ struct TradeFacts {
     accrued_interest: Option<Money>,
 }
 
-/// Факты амортизации, нужные книге лотов.
+/// Amortisation facts needed by the lot book.
 #[derive(Debug, Clone, PartialEq)]
 struct AmortisationFacts {
     instrument: InstrumentId,
@@ -523,7 +523,7 @@ struct AmortisationFacts {
     allocation: BasisAllocation,
     compensation: Money,
 }
-/// Факты замещения, нужные книге лотов.
+/// Substitution facts needed by the lot book.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ConversionFacts {
     predecessor: InstrumentId,
@@ -534,10 +534,10 @@ struct ConversionFacts {
     basis_transfer: BasisTransferRule,
     effective_date: time::Date,
 }
-/// Данные одной восстановленной позиции: инструмент, количество, стоимость и
-/// заявленная дата приобретения. Эти четыре значения описывают саму позицию,
-/// поэтому группируются вместе, а событие и знание о расчёте остаются
-/// обстоятельствами записи.
+/// Data for one reconstructed position: instrument, quantity, cost, and
+/// declared acquisition date. These four values describe the position itself,
+/// so they are grouped together, while the event and settlement knowledge remain
+/// circumstances of the record.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RestoreFacts {
     instrument: InstrumentId,
@@ -546,9 +546,9 @@ struct RestoreFacts {
     acquired: Option<TradeDate>,
 }
 
-/// Данные одного выбытия: ключ лота, количество и выручка. Эти значения
-/// составляют одну операцию выбытия и передаются вместе, тогда как событие,
-/// правило и знание о расчёте являются её контекстом.
+/// Data for one disposal: lot key, quantity, and proceeds. These values
+/// constitute one disposal operation and are passed together, while the event,
+/// rule, and settlement knowledge are its context.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DisposalFacts {
     key: LotKey,
@@ -556,27 +556,27 @@ struct DisposalFacts {
     proceeds: Money,
 }
 
-/// Книга лотов и применённое правило.
+/// Lot book and applied rule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LotBook {
     entries: BTreeMap<LotKey, InstrumentLots>,
     rule_version: LotRuleVersion,
     applied_rule: Option<RuleId>,
-    /// Версия правила амортизации. Отдельная от версии списания:
-    /// списание лотов — выбор владельца, амортизация — событие выпуска.
+    /// Amortisation rule version. Separate from the disposal version:
+    /// lot disposal is the owner's choice, while amortisation is an issuer event.
     ///
-    /// `#[serde(default)]` обязателен: снимки проекций записаны до E3.4
-    /// и этого поля не содержат.
+    /// `#[serde(default)]` is required: projection snapshots were written before E3.4
+    /// and do not contain this field.
     #[serde(default = "default_amortisation_version")]
     amortisation_version: AmortisationRuleVersion,
     settlement_policy: SettlementLagPolicy,
 }
 
-/// Версия правила амортизации в снимке, записанном до E3.4.
+/// Amortisation rule version in a snapshot written before E3.4.
 ///
-/// Единица, а не «неизвестно»: до E3.4 амортизация не применялась вовсе,
-/// поэтому продолжение такого снимка ничего не пересчитывает задним
-/// числом — оно применяет правило к фактам, которых раньше не было.
+/// One, not «unknown»: before E3.4 amortisation was not applied at all,
+/// so continuing from such a snapshot does not recalculate anything
+/// retroactively — it applies the rule to facts that did not previously exist.
 fn default_amortisation_version() -> AmortisationRuleVersion {
     AmortisationRuleVersion(1)
 }
@@ -593,13 +593,13 @@ impl LotBook {
         }
     }
 
-    /// Книга с явно выбранной версией правила амортизации.
+    /// A book with an explicitly selected amortisation rule version.
     #[must_use]
     pub fn with_amortisation_version(mut self, version: AmortisationRuleVersion) -> Self {
         self.amortisation_version = version;
         self
     }
-    /// Выбрать таблицу полос расчётов для этой книги.
+    /// Select the calculation-band table for this book.
     #[must_use]
     pub fn with_settlement_lag_policy(mut self, policy: SettlementLagPolicy) -> Self {
         self.settlement_policy = policy;
@@ -616,8 +616,8 @@ impl LotBook {
         self.rule_version
     }
 
-    /// Идентификатор правила, которым фактически списывались лоты.
-    /// Входит в отчёт и в след аудита: без него цифру не воспроизвести (§3.2).
+    /// Identifier of the rule actually used to dispose of lots.
+    /// Included in the report and audit trail: without it, the figure cannot be reproduced (§3.2).
     #[must_use]
     pub const fn applied_rule(&self) -> Option<&RuleId> {
         self.applied_rule.as_ref()
@@ -632,10 +632,10 @@ impl LotBook {
         self.entries.iter()
     }
 
-    /// Применение события к книге лотов.
+    /// Applying an event to the lot book.
     ///
-    /// Диспетчер исчерпывающий: новый тип события обязан сломать сборку
-    /// здесь, а не молча не создать лот.
+    /// The dispatcher is exhaustive: a new event type must break the build
+    /// here rather than silently fail to create a lot.
     pub fn apply(&mut self, event: &Event, rules: &RuleRegistry) -> Result<(), LotError> {
         let settlement = self
             .settlement_policy
@@ -661,9 +661,9 @@ impl LotBook {
                 settlement,
                 rules,
             ),
-            // Утверждения восстановленного начала определяют границу
-            // владения: дата события — момент импорта, а не доказательство
-            // происхождения позиции.
+            // Assertions about the reconstructed opening state determine the
+            // ownership boundary: the event date is the import time, not evidence
+            // of the position's origin.
             EventKind::OpeningPosition {
                 instrument,
                 quantity,
@@ -675,16 +675,16 @@ impl LotBook {
                     assertions.acquisition_date_certainty,
                 ) {
                     (Some(day), DateCertainty::Known) => Some(TradeDate(day)),
-                    // Оценочная дата не должна становиться датой когорты:
-                    // иначе догадка владельца снова выдастся за факт.
+                    // An estimated date must not become the cohort date:
+                    // otherwise the owner's guess would again be presented as fact.
                     _ => None,
                 };
                 let settlement = match acquired {
                     Some(day) => SettlementKnowledge::Exact(day.0),
                     None => {
-                        // Оценка не превращается в доказанное начало:
-                        // непрерывность владения до открытия журнала
-                        // недоказуема в принципе (§3.5).
+                        // An estimate does not become a proven start:
+                        // continuity of ownership before the journal was opened
+                        // is fundamentally unprovable (§3.5).
                         SettlementKnowledge::Unbounded
                     }
                 };
@@ -745,11 +745,11 @@ impl LotBook {
         }
     }
 
-    /// Стоимость приобретения включает комиссию и **не включает НКД**:
-    /// накопленный купонный доход возвращается купоном, а не продажей,
-    /// поэтому он не является стоимостью бумаги (§7.2). Налоговая
-    /// стоимость по ст. 214.1 считается иначе и появится в E5 —
-    /// поэтому она и версионирована правилом.
+    /// Acquisition cost includes commission and **excludes accrued coupon interest**:
+    /// accrued coupon interest is returned through the coupon, not through the sale,
+    /// so it is not part of the security's cost (§7.2). The tax
+    /// basis under Art. 214.1 is calculated differently and will appear in E5 —
+    /// which is why it is versioned by the rule.
     fn apply_trade(
         &mut self,
         event: &Event,
@@ -782,15 +782,15 @@ impl LotBook {
                 });
                 entry.push_lot_with_settlement(
                     Lot {
-                        // Идентификатор лота выводится из события приобретения:
-                        // ядро чисто, случайных идентификаторов в нём быть не может,
-                        // иначе повторная проекция того же журнала дала бы другой
-                        // результат (§3.1, §15.3).
+                        // The lot identifier is derived from the acquisition event:
+                        // the core is pure and cannot contain random identifiers,
+                        // otherwise reprojection of the same journal would produce a different
+                        // result (§3.1, §15.3).
                         id: LotId(event.id.inner()),
                         instrument,
                         acquired: event.dates.trade,
                         quantity,
-                        // Отсутствующий НКД оставляем неизвестным, а не нулём.
+                        // Missing accrued coupon interest remains unknown rather than zero.
                         accrued_interest_paid: accrued_interest,
                         received_to_date: None,
                         cost_basis: basis,
@@ -819,10 +819,10 @@ impl LotBook {
         }
     }
 
-    /// Корпоративное действие по бумаге (§4.7).
+    /// Corporate action on a security (§4.7).
     ///
-    /// Диспетчер исчерпывающий: новый член семейства обязан сломать
-    /// сборку здесь, а не молча оставить лоты прежними.
+    /// The dispatcher is exhaustive: a new member of the family must break
+    /// the build here rather than silently leave the lots unchanged.
     fn apply_corporate_action(
         &mut self,
         event: &Event,
@@ -847,11 +847,11 @@ impl LotBook {
                 },
                 rules,
             ),
-            // Погашение возвращает номинал целиком и выводит бумагу
-            // из позиции: это выбытие всей позиции, и считается оно тем
-            // же путём, что продажа. Порядок списания при полном выбытии
-            // безразличен, поэтому выбор правила владельцем ничего
-            // не меняет — но след аудита остаётся тот же.
+            // Redemption returns the full face value and removes the security
+            // from the position: this is a disposal of the entire position and is processed
+            // through the same path as a sale. Disposal order for a full disposal
+            // is irrelevant, so the owner's rule choice changes nothing
+            // — but the audit trail remains the same.
             CorporateAction::Redemption {
                 instrument,
                 quantity,
@@ -899,7 +899,7 @@ impl LotBook {
         }
     }
 
-    /// Исполнение оферты (§3.5).
+    /// Offer execution (§3.5).
     fn apply_offer_exercise(
         &mut self,
         event: &Event,
@@ -908,11 +908,11 @@ impl LotBook {
         rules: &RuleRegistry,
     ) -> Result<(), LotError> {
         match action {
-            // Заявка и её отзыв лотов не двигают: бумага остаётся
-            // у владельца, пока выкуп не состоялся. Их состояние ведёт
-            // отдельная проекция `super::offers::OfferBook`.
+            // Submitting and canceling the offer do not move lots: the security remains
+            // with the owner until the repurchase occurs. Their state is managed by
+            // the separate `super::offers::OfferBook` projection.
             OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => Ok(()),
-            // Выкуп — выбытие: бумага уходит, деньги приходят.
+            // A repurchase is a disposal: the security leaves and the money arrives.
             OfferExerciseAction::Settled {
                 instrument,
                 quantity,
@@ -946,11 +946,11 @@ impl LotBook {
         }
     }
 
-    /// Амортизация: остаток номинала уменьшается, количество — нет (§6.5).
+    /// Amortisation: the remaining face value decreases, while quantity does not (§6.5).
     ///
-    /// Целимся по паре «счёт и бумага»: [`LotKey`] намеренно не различает
-    /// место хранения, и custody из события — факт о выплате, а не ключ
-    /// выборки лотов.
+    /// Target the «account and security» pair: [`LotKey`] intentionally does not distinguish
+    /// custody location, and custody from the event is a fact about the payment, not a lot
+    /// selection key.
     fn apply_amortisation(
         &mut self,
         event: &Event,
@@ -975,9 +975,9 @@ impl LotBook {
                 instrument: facts.instrument,
             })?;
 
-        // Считаем на копии и подменяем целиком: иначе отказ на втором
-        // лоте оставил бы первый уже изменённым, а половина применённого
-        // факта хуже неприменённого.
+        // Compute using a copy and replace the whole value: otherwise failure on the second
+        // lot would leave the first one already modified, and a half-applied
+        // fact is worse than an unapplied one.
         let mut next = entry.clone();
         let mut returned_total = Money::zero(facts.compensation.currency());
         match facts.allocation {
@@ -988,10 +988,10 @@ impl LotBook {
                     returned_total = returned_total.try_add(returned)?;
                 }
             }
-            // Доля неизвестна — факт всё равно применяется, а
-            // реализованный результат становится невычислимым (§4.9).
-            // Разносить было не по чему, а отказать в приёме факта
-            // нельзя: деньги пришли.
+            // The allocation ratio is unknown — the fact is still applied, while
+            // the realised result becomes uncomputable (§4.9).
+            // There was no basis for allocation, but the fact cannot
+            // be rejected: the money arrived.
             BasisAllocation::Unknown(_) => {
                 next.mark_basis_gap(BasisGap::AmortisationAllocationUnknown);
             }
@@ -1000,14 +1000,14 @@ impl LotBook {
         if !returned_total.is_zero() {
             next.add_released_basis(returned_total)?;
         }
-        // Возврат собственного капитала доходом не является: при
-        // компенсации, равной возвращённой стоимости, реализуется ноль.
+        // A return of capital is not income: when
+        // compensation equals the returned cost, the realised result is zero.
         next.add_realised(facts.compensation.try_sub(returned_total)?)?;
         self.entries.insert(key, next);
         Ok(())
     }
 
-    /// Замещение: партии предшественника становятся партиями преемника.
+    /// Substitution: predecessor lots become successor lots.
     fn apply_conversion(
         &mut self,
         event: &Event,
@@ -1034,10 +1034,10 @@ impl LotBook {
         let mut carried = Vec::with_capacity(source.lots().len());
         for (index, lot) in source.lots().iter().enumerate() {
             let last = index + 1 == source.lots().len();
-            // Последней партии достаётся остаток: дробь округляли
-            // на уровне всего замещения, и раскладывать её обратно
-            // по партиям нечем. Так сумма партий равна количеству
-            // из факта точно, а не почти.
+            // The final lot receives the remainder: the fraction was rounded
+            // at the level of the entire substitution, and there is no basis
+            // for allocating it back across lots. This makes the sum of lot
+            // quantities exactly equal to the quantity from the fact, not approximately.
             let quantity = if last {
                 Quantity(facts.quantity_out.0.checked_sub(assigned)?)
             } else {
@@ -1049,16 +1049,16 @@ impl LotBook {
                 id: lot.id,
                 instrument: facts.successor,
                 acquired: match facts.basis_transfer {
-                    // Срок владения переходит целиком: замещение
-                    // не является приобретением (§16.1).
+                    // The holding period carries over in full: substitution
+                    // is not an acquisition (§16.1).
                     BasisTransferRule::CarryOver => lot.acquired,
-                    // Замещение приравнено к продаже и покупке.
+                    // The substitution is treated as a sale and purchase.
                     BasisTransferRule::Restart => Some(TradeDate(facts.effective_date)),
                 },
                 quantity,
-                // Стоимость переносится как есть. Компенсация дробей
-                // из неё **не** вычитается: как она влияет на базу —
-                // правило E5, и решать за него часть 1 не вправе.
+                // The cost is carried over unchanged. Fractional compensation
+                // is **not** deducted from it: how it affects the basis is
+                // an E5 rule, and part 1 must not decide on its behalf.
                 cost_basis: lot.cost_basis,
                 acquisition_basis: lot.acquisition_basis,
                 accrued_interest_paid: lot.accrued_interest_paid,
@@ -1067,8 +1067,8 @@ impl LotBook {
         }
         let currency = match carried.first() {
             Some(first) => first.currency(),
-            // Позиция без партий: замещать нечего, но и ошибки нет —
-            // количество уже сверено с фактом.
+            // A position without lots: there is nothing to substitute, but this is not an error —
+            // the quantity has already been reconciled with the fact.
             None => return Ok(()),
         };
         let carried_total = Money::sum(&carried, currency)?;
@@ -1087,19 +1087,19 @@ impl LotBook {
         target.add_acquired_basis(carried_total)?;
         target.ownership.observe(facts.quantity_out, settlement);
         for lot in moved {
-            // Перенос лота не является новым приобретением: старую
-            // AcquisitionHistory сохраняем отдельно от дельты владения.
+            // Moving a lot is not a new acquisition: the old
+            // AcquisitionHistory is retained separately from the ownership delta.
             target.acquisitions.observe(lot.acquired);
             target.lots.push(lot);
         }
         Ok(())
     }
 
-    /// Корпоративное действие касается всей позиции по бумаге на счёте.
+    /// A corporate action applies to the entire position in the security on the account.
     ///
-    /// Расхождение — брак источника, а не повод уменьшить номинал
-    /// пропорционально: масштабирование выдало бы испорченные данные
-    /// за корректный расчёт.
+    /// A discrepancy is a source defect, not a reason to reduce face value
+    /// proportionally: scaling would present corrupted data
+    /// as a correct calculation.
     fn require_whole_position(
         &self,
         event: &Event,
@@ -1139,8 +1139,8 @@ impl LotBook {
         };
         let entry = self.entries.entry(key).or_default();
         match cost_basis {
-            // Восстановленная партия старше всего, что система видела,
-            // поэтому встаёт в голову очереди FIFO, а не в хвост.
+            // A reconstructed lot is older than everything else the system has seen,
+            // so it goes to the front of the FIFO queue, not the back.
             Some(basis) => {
                 entry.acquired_basis = Some(match entry.acquired_basis {
                     Some(previous) => previous.try_add(basis)?,
@@ -1163,10 +1163,10 @@ impl LotBook {
             None => {
                 entry.unpriced = Quantity(entry.unpriced.0.checked_add(quantity.0)?);
                 entry.gap = Some(BasisGap::RestoredWithoutBasis);
-                // Даты у восстановленного количества нет, а приобретено
-                // оно раньше всего, что система видела: граница владения
-                // по этой паре недоказуема и после того, как количество
-                // спишется.
+                // The reconstructed quantity has no date and was acquired
+                // before everything else the system has seen: the ownership boundary
+                // for this pair remains unprovable even after the quantity
+                // is disposed of.
                 entry.acquisitions.observe(None);
                 entry.ownership.observe(quantity, settlement);
             }
@@ -1200,10 +1200,10 @@ impl LotBook {
                 instrument: key.instrument,
             })?;
 
-        // Восстановленное количество списывается первым: оно приобретено
-        // раньше всего, что система наблюдала. Стоимости у него нет,
-        // поэтому реализованный результат по инструменту становится
-        // невычислимым — но количество списывается честно.
+        // The reconstructed quantity is disposed of first: it was acquired
+        // before everything else the system observed. It has no cost,
+        // so the realised result for the instrument becomes
+        // uncomputable — but the quantity is disposed of correctly.
         let from_unpriced = entry.unpriced.0.min(quantity.0);
         if !from_unpriced.is_zero() {
             entry.unpriced = Quantity(entry.unpriced.0.checked_sub(from_unpriced)?);
@@ -1227,9 +1227,9 @@ impl LotBook {
         });
         self.applied_rule = Some(result.rule.clone());
 
-        // Реализованный результат до налога: выручка минус списанная
-        // стоимость. Он не суммируется с невычислимым: один разрыв делает
-        // невычислимым весь инструмент, а не «почти всё».
+        // Pretax realised result: proceeds minus disposed
+        // cost. It is not added to an uncomputable result: one gap makes
+        // the entire instrument uncomputable, not «almost all of it».
         if entry.gap.is_none() {
             let realized = proceeds.try_sub(result.basis_released)?;
             entry.realized = Some(match entry.realized {
@@ -1265,7 +1265,7 @@ mod tests {
         Quantity(Dec::new(Decimal::from(units)))
     }
 
-    // --- корпоративные действия и оферта ---
+    // --- corporate actions and offer ---
 
     fn per_unit(text: &str) -> PerUnitAmount {
         PerUnitAmount::new(
@@ -1278,8 +1278,8 @@ mod tests {
         Dec::new(Decimal::from_str_exact(text).unwrap())
     }
 
-    /// Позиция по облигации, собранная напрямую: событие покупки
-    /// номинала не знает, а тесту он нужен как исходное состояние.
+    /// A bond position assembled directly: the purchase event
+    /// does not know the face value, while the test needs it as the initial state.
     struct Bond {
         account: AccountId,
         instrument: InstrumentId,
@@ -1290,12 +1290,12 @@ mod tests {
             share: crate::rules::ReturnedShare::new(
                 dec(returned)
                     .checked_div(dec("1000"))
-                    .expect("номинал тестовой облигации ненулевой"),
+                    .expect("test bond face value is nonzero"),
             )
-            .expect("доля в пределах инварианта"),
+            .expect("ratio is within the invariant"),
             evidence: crate::event::allocation::AllocationEvidence {
                 inputs_hash: crate::event::allocation::AllocationInputsHash::new("a".repeat(64))
-                    .expect("хеш входов"),
+                    .expect("input hash"),
                 knowledge_as_of: time::OffsetDateTime::UNIX_EPOCH,
                 algorithm_version: crate::event::allocation::AllocationAlgorithmVersion(1),
             },
@@ -1408,9 +1408,9 @@ mod tests {
 
     #[test]
     fn ownership_boundary_uses_earliest_acquisition_date() {
-        // Партии кладутся `push_lot`, а не присваиванием: история
-        // приобретений пополняется только через него, и тест, минующий
-        // его, проверял бы фикстуру, а не книгу лотов.
+        // Lots are inserted with `push_lot`, not by assignment: the acquisition
+        // history is updated only through it, and a test bypassing
+        // it would test the fixture, not the lot book.
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
         entry.push_lot(lot_with_acquired_date(
@@ -1443,9 +1443,9 @@ mod tests {
 
     #[test]
     fn restored_quantity_cannot_establish_ownership_boundary() {
-        // Оно приобретено раньше всего, что система видела, и даты у
-        // него нет: любая граница по оставшимся партиям была бы позже
-        // настоящей и скрыла бы пропуск.
+        // It was acquired before everything else the system has seen and has
+        // no date: any boundary based on the remaining lots would be later
+        // than the actual one and would hide the omission.
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots {
             unpriced: qty(5),
@@ -1461,9 +1461,9 @@ mod tests {
 
     #[test]
     fn ownership_boundary_does_not_rise_after_early_lot_disposal() {
-        // Купили в январе, купили в апреле, продали январскую партию.
-        // Граница обязана остаться январской: бумага в марте была
-        // на руках, и пропущенный за март купон надо назвать.
+        // Bought in January, bought in April, sold the January lot.
+        // The boundary must remain in January: the security was held
+        // in March, and the missing March coupon must be identified.
         let rules = RuleRegistry::with_defaults();
         let mut book = LotBook::new(LotRuleVersion(1));
         let account = AccountId::new_random();
@@ -1489,11 +1489,7 @@ mod tests {
         book.apply(&sell(&sale, 3), &rules).unwrap();
 
         let entry = book.entry(&key(&january)).unwrap();
-        assert_eq!(
-            entry.lots().len(),
-            1,
-            "январская партия должна быть списана"
-        );
+        assert_eq!(entry.lots().len(), 1, "the January lot must be disposed of");
         assert_eq!(
             entry.earliest_acquired(),
             Some(TradeDate(date!(2026 - 01 - 10)))
@@ -1502,9 +1498,9 @@ mod tests {
 
     #[test]
     fn disposing_lot_without_date_does_not_make_ownership_boundary_known() {
-        // Партия без даты приобретена неизвестно когда, и продажа
-        // этого не проясняет. Признать границу апрельской значило бы
-        // объявить известным то, чего журнал не говорит (§4.9).
+        // An undated lot was acquired at an unknown time, and its sale
+        // does not clarify this. Treating April as the boundary would mean
+        // declaring known what the journal does not state (§4.9).
         let rules = RuleRegistry::with_defaults();
         let mut book = LotBook::new(LotRuleVersion(1));
         let account = AccountId::new_random();
@@ -1549,8 +1545,8 @@ mod tests {
 
     #[test]
     fn an_amortisation_for_a_different_quantity_is_an_error_not_a_scaling() {
-        // Амортизация касается всех бумаг на счёте. Несовпадение — брак
-        // источника, а не повод уменьшить номинал пропорционально.
+        // Amortisation applies to all securities on the account. A mismatch is a source
+        // defect, not a reason to reduce face value proportionally.
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
         let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
@@ -1563,7 +1559,7 @@ mod tests {
 
     #[test]
     fn an_amortisation_returning_exactly_the_basis_realises_nothing() {
-        // §6.5: возврат собственного капитала доходом не является.
+        // §6.5: a return of capital is not income.
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
         let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
@@ -1578,15 +1574,15 @@ mod tests {
         assert_eq!(
             entry.lots()[0].acquisition_basis,
             Some(rub(1_000_000)),
-            "амортизация не уменьшает историческую стоимость"
+            "amortisation does not reduce historical cost"
         );
     }
 
     #[test]
     fn amortisation_reduces_current_basis_but_preserves_historical_purchase_cost() {
-        // Пожизненный поток включает уже полученные 200 и будущие 800.
-        // Если знаменатель взять из уменьшенного cost_basis (800 вместо
-        // исторических 1000), HPR ошибочно выйдет 25 % вместо 0 %.
+        // The lifetime cash flow includes 200 already received and 800 to come.
+        // If the denominator is taken from the reduced cost_basis (800 instead of
+        // the historical 1000), HPR would incorrectly be 25 % instead of 0 %.
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
         let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
@@ -1603,13 +1599,13 @@ mod tests {
     fn an_amortisation_paying_above_the_returned_basis_realises_the_difference() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        // Куплена с дисконтом: стоимость 900 000 при номинале 1000 × 10.
+        // Purchased at a discount: cost 900 000 at a face value of 1000 × 10.
         let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 900_000)]);
 
         book.apply(&bond.amortisation(10, "200", 200_000), &rules)
             .unwrap();
 
-        // Возвращена пятая часть стоимости — 180 000; выплачено 200 000.
+        // One fifth of the cost was returned — 180 000; 200 000 was paid.
         let entry = book.entry(&bond.key()).unwrap();
         assert_eq!(entry.released_basis(), Some(rub(180_000)));
         assert_eq!(entry.realized(), Some(rub(20_000)));
@@ -1627,7 +1623,7 @@ mod tests {
         let entry = book.entry(&bond.key()).unwrap();
         assert_eq!(entry.gap(), Some(BasisGap::AmortisationAllocationUnknown));
         assert_eq!(entry.realized(), None);
-        // Количество и стоимость не тронуты: считать было не от чего.
+        // Quantity and cost are unchanged: there was no basis for calculation.
         assert_eq!(entry.quantity().unwrap(), qty(10));
         assert_eq!(entry.remaining_basis().unwrap(), Some(rub(1_000_000)));
     }
@@ -1643,7 +1639,7 @@ mod tests {
             custody: bond.custody,
         };
 
-        // Позиции на том счёте нет вовсе: факт к этой книге не относится.
+        // There is no position in that account at all: the fact does not apply to this book.
         assert!(matches!(
             book.apply(&elsewhere.amortisation(10, "200", 200_000), &rules),
             Err(LotError::SaleWithoutPosition { .. })
@@ -1835,7 +1831,7 @@ mod tests {
 
     #[test]
     fn a_purchase_creates_a_lot_including_the_fee() {
-        // Комиссия входит в стоимость приобретения; НКД — нет (§7.2).
+        // Commission is included in acquisition cost; accrued coupon interest is not (§7.2).
         let trade = sample_trade();
         let rules = RuleRegistry::with_defaults();
         let mut book = LotBook::new(LotRuleVersion(1));
@@ -1849,8 +1845,8 @@ mod tests {
 
     #[test]
     fn lot_identity_comes_from_the_acquisition_event_not_from_randomness() {
-        // Ядро чисто: повторная проекция того же журнала обязана дать
-        // те же идентификаторы лотов, иначе снимки несравнимы (§3.1).
+        // The core is pure: reprojection of the same journal must produce
+        // the same lot identifiers, otherwise snapshots are not comparable (§3.1).
         let trade = sample_trade();
         let rules = RuleRegistry::with_defaults();
         let event = buy(&trade, 1);
@@ -1866,9 +1862,9 @@ mod tests {
 
     #[test]
     fn a_partial_sale_releases_basis_and_records_realized_result() {
-        // Куплено 100 за 1 010 000, продано 40 за 500 000 минус комиссия.
-        // Списанная стоимость: 1 010 000 * 40 / 100 = 404 000.
-        // Реализовано: 490 000 − 404 000 = 86 000.
+        // Purchased 100 for 1 010 000, sold 40 for 500 000 minus commission.
+        // Disposed cost: 1 010 000 * 40 / 100 = 404 000.
+        // Realised: 490 000 − 404 000 = 86 000.
         let trade = sample_trade();
         let rules = RuleRegistry::with_defaults();
         let mut book = LotBook::new(LotRuleVersion(1));
@@ -1893,16 +1889,16 @@ mod tests {
 
     #[test]
     fn remaining_basis_completes_the_identity_acquired_equals_remaining_plus_released() {
-        // Тождество §6.3 в его денежной части. Ожидания посчитаны вручную:
-        // куплено 100 за 1 010 000, продано 40 — списано 404 000,
-        // значит на непроданных 60 бумагах осталось 606 000.
+        // The monetary part of the §6.3 identity. Expected values were calculated manually:
+        // purchased 100 for 1 010 000, sold 40 — disposed cost 404 000,
+        // so 606 000 remains on the 60 unsold securities.
         let trade = sample_trade();
         let rules = RuleRegistry::with_defaults();
         let mut book = LotBook::new(LotRuleVersion(1));
         assert_eq!(
             book.entry(&key(&trade)).and_then(|entry| entry
                 .remaining_basis()
-                .expect("пустая книга не считает стоимость")),
+                .expect("an empty book does not calculate cost")),
             None
         );
 
@@ -1920,14 +1916,14 @@ mod tests {
         assert_eq!(
             entry.acquired_basis(),
             Some(rub(1_010_000)),
-            "приобретено = осталось + списано"
+            "acquired = remaining + disposed"
         );
         assert_eq!(entry.released_basis(), Some(rub(404_000)));
     }
 
     #[test]
     fn a_restored_position_without_basis_does_not_become_a_zero_cost_lot() {
-        // Нулевая стоимость означала бы прибыль, равную всей выручке (§4.9).
+        // Zero cost would imply profit equal to the entire proceeds (§4.9).
         let trade = sample_trade();
         let rules = RuleRegistry::with_defaults();
         let mut book = LotBook::new(LotRuleVersion(1));
@@ -1952,8 +1948,8 @@ mod tests {
                 qty(50),
             )],
         );
-        // Точная дата расчёта позволяет проверить, что восстановленное
-        // количество участвует во владении так же, как документированный лот.
+        // The exact settlement date makes it possible to verify that the reconstructed
+        // quantity participates in ownership in the same way as a documented lot.
         restored.dates.settled = Some(crate::dates::SettledDate(date!(2024 - 01 - 02)));
         book.apply(&restored, &rules).unwrap();
         let entry = book.entry(&key(&trade)).unwrap();
@@ -1962,8 +1958,8 @@ mod tests {
         assert_eq!(entry.gap(), Some(BasisGap::RestoredWithoutBasis));
         assert_eq!(entry.ownership_at(date!(2024 - 01 - 03)), Ownership::Owned);
 
-        // Продажа из восстановленного количества уменьшает позицию,
-        // но реализованный результат остаётся невычислимым.
+        // Selling from the reconstructed quantity reduces the position,
+        // but the realised result remains uncomputable.
         let partial = Trade {
             units: 20,
             gross: 300_000,
@@ -2002,7 +1998,7 @@ mod tests {
                 qty(50),
             )],
         );
-        // Дата события — день импорта; она не доказывает происхождение позиции.
+        // The event date is the import date; it does not prove the position's origin.
         restored.dates.trade = Some(crate::dates::TradeDate(date!(2026 - 01 - 01)));
 
         let rules = RuleRegistry::with_defaults();
@@ -2043,7 +2039,7 @@ mod tests {
                 qty(50),
             )],
         );
-        // Даже правдоподобная дата импорта не заменяет доказательство начала.
+        // Even a plausible import date does not replace proof of the start.
         restored.dates.trade = Some(crate::dates::TradeDate(date!(2021 - 05 - 01)));
 
         let rules = RuleRegistry::with_defaults();
@@ -2087,11 +2083,11 @@ mod tests {
         let mut book = LotBook::new(LotRuleVersion(1));
         book.apply(&buy(&trade, 1), &rules).unwrap();
 
-        assert_eq!(book.iter().count(), 1, "книга обязана отдавать записи");
+        assert_eq!(book.iter().count(), 1, "the book must return entries");
         let (found_key, entry) = book.iter().next().unwrap();
         assert_eq!(*found_key, key(&trade));
-        // Приобретено = тело + комиссия; вместе со списанным образует
-        // проверяемое тождество сохранения стоимости.
+        // Acquired = principal + commission; together with the disposed amount it forms
+        // a verifiable cost-conservation identity.
         assert_eq!(entry.acquired_basis(), Some(rub(1_010_000)));
         assert_eq!(entry.released_basis(), None);
         assert_eq!(book.rule_version(), LotRuleVersion(1));
@@ -2099,7 +2095,7 @@ mod tests {
 
     #[test]
     fn the_basis_gap_has_a_machine_readable_code() {
-        // Код уходит в API: агент разбирает его, а не текст.
+        // The code is exposed through the API: the agent parses it, not the text.
         assert_eq!(
             BasisGap::RestoredWithoutBasis.code(),
             "restored_without_basis"

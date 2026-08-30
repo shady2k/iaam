@@ -1,14 +1,14 @@
-//! Контрольные утверждения источника (§10.3).
+//! Source reconciliation assertions (§10.3).
 //!
-//! Отчёт брокера содержит не только операции, но и контрольные секции:
-//! остатки на начало и конец периода, обороты Dt/Kt, количества бумаг,
-//! суммы комиссий, купонов и дивидендов, удержанный налог. Это **факты
-//! источника**, а не расчёт, поэтому они записываются в журнал наравне
-//! с операциями — с provenance, версией парсера и локатором строки.
+//! A broker report contains not only transactions but also reconciliation sections:
+//! opening and closing balances, Dt/Kt turnover, security quantities,
+//! totals for fees, coupons and dividends, and tax withheld. These are **source
+//! facts**, not calculations, so they are recorded in the journal alongside
+//! transactions — with provenance, parser version, and line locator.
 //!
-//! Утверждение денег не двигает: ног у события нет, как у `Valuation`.
-//! Нога здесь означала бы, что контрольная секция попала в остаток
-//! вторым экземпляром.
+//! An assertion does not move money: the event has no legs, just like `Valuation`.
+//! A leg here would mean that the reconciliation section was included in the balance
+//! a second time.
 
 use serde::{Deserialize, Serialize};
 use time::Date;
@@ -17,8 +17,8 @@ use super::Dimension;
 use crate::ids::{CustodyId, InstrumentId};
 use crate::money::{CurrencyCode, PostedMinor, Quantity};
 
-/// Интервал, о котором говорит утверждение. Границы включаются с обеих
-/// сторон: отчёт за март говорит и о первом, и о тридцать первом марта.
+/// The interval covered by the assertion. Both boundaries are inclusive:
+/// a report for March covers both the first and the thirty-first of March.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AssertionPeriod {
     pub from: Date,
@@ -26,24 +26,24 @@ pub struct AssertionPeriod {
 }
 
 impl AssertionPeriod {
-    /// Интервал с началом позже конца не создаётся.
+    /// An interval whose start is later than its end cannot be created.
     ///
-    /// Такой интервал — не «пустой период», а неверно разобранный
-    /// документ: перепутанные местами даты дают сверку, которая никогда
-    /// ни с чем не сойдётся и потому вечно висит расхождением.
+    /// Such an interval is not an «empty period», but an incorrectly parsed
+    /// document: swapped dates produce a reconciliation that will never
+    /// match anything and therefore remains a discrepancy forever.
     ///
-    /// Проверка живёт не в `new`: `cargo-mutants` молча пропускает
-    /// функции с этим именем (§15.7).
+    /// The check is not in `new`: `cargo-mutants` silently skips
+    /// functions with that name (§15.7).
     #[must_use]
     pub fn between(from: Date, to: Date) -> Option<Self> {
         (from <= to).then_some(Self { from, to })
     }
 
-    /// Корректен ли интервал.
+    /// Whether the interval is valid.
     ///
-    /// Нужен отдельно от конструктора: событие приходит и из JSON, где
-    /// конструктор не вызывался, и валидация формы обязана проверять
-    /// состояние, а не полагаться на то, что его кто-то собрал верно.
+    /// This is needed separately from the constructor: the event can also come from JSON, where
+    /// the constructor was not called, and shape validation must check
+    /// the state rather than assume that someone assembled it correctly.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         self.from <= self.to
@@ -55,12 +55,12 @@ impl AssertionPeriod {
     }
 }
 
-/// На какой момент интервала сделано утверждение об остатке.
+/// The point in the interval for which the balance assertion was made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BalancePoint {
-    /// Остаток на начало: состояние **до** первого события интервала.
+    /// Opening balance: the state **before** the first event in the interval.
     Opening,
-    /// Остаток на конец: состояние, включающее последнее событие интервала.
+    /// Closing balance: the state including the last event in the interval.
     Closing,
 }
 
@@ -74,44 +74,44 @@ impl BalancePoint {
     }
 }
 
-/// Что именно утверждает контрольная секция.
+/// What exactly the reconciliation section asserts.
 ///
-/// Величины оборотов и итогов — **модули**: знак несёт сторона
-/// (дебет/кредит) и смысл поля, а не само число. Денежный остаток —
-/// исключение: он может быть отрицательным, и это законное
-/// состояние (§11).
+/// Turnover and total values are **absolute values**: the side
+/// (debit/credit) and field semantics carry the sign, not the number itself. A cash balance is
+/// the exception: it may be negative, and that is a valid
+/// state (§11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlClaim {
-    /// Остаток денег на начало или конец интервала.
+    /// Cash balance at the start or end of the interval.
     CashBalance {
         currency: CurrencyCode,
         amount: PostedMinor,
         at: BalancePoint,
     },
-    /// Количество бумаг на начало или конец интервала.
+    /// Security quantity at the start or end of the interval.
     PositionQuantity {
         instrument: InstrumentId,
         custody: CustodyId,
         quantity: Quantity,
         at: BalancePoint,
     },
-    /// Обороты по счёту за интервал, обе стороны модулями.
+    /// Account turnover over the interval, with both sides as absolute values.
     CashTurnover {
         currency: CurrencyCode,
         debit: PostedMinor,
         credit: PostedMinor,
     },
-    /// Сумма комиссий за интервал.
+    /// Total fees over the interval.
     FeesTotal {
         currency: CurrencyCode,
         amount: PostedMinor,
     },
-    /// Сумма купонов и дивидендов за интервал.
+    /// Total coupons and dividends over the interval.
     IncomeTotal {
         currency: CurrencyCode,
         amount: PostedMinor,
     },
-    /// Удержанный налоговым агентом налог за интервал.
+    /// Tax withheld by the tax agent over the interval.
     TaxWithheldTotal {
         currency: CurrencyCode,
         amount: PostedMinor,
@@ -119,12 +119,12 @@ pub enum ControlClaim {
 }
 
 impl ControlClaim {
-    /// Какое измерение ограничивает это утверждение (§10.3).
+    /// Which dimension this assertion constrains (§10.3).
     ///
-    /// Комиссии отнесены к деньгам, а не к доходам: комиссия — это
-    /// денежное списание, и сходится она с денежной проекцией.
-    /// Удержанный налог — единственное, что говорит о `TaxBasis`,
-    /// и говорит он только об агрегате (основание 8).
+    /// Fees are assigned to money rather than income: a fee is a
+    /// cash outflow, and it reconciles with the cash projection.
+    /// Withheld tax is the only item that says anything about `TaxBasis`,
+    /// and it does so only for the aggregate (rationale 8).
     #[must_use]
     pub const fn dimension(&self) -> Dimension {
         match self {
@@ -137,7 +137,7 @@ impl ControlClaim {
         }
     }
 
-    /// Машиночитаемое имя вида утверждения.
+    /// Machine-readable name of the assertion kind.
     #[must_use]
     pub const fn discriminant(&self) -> &'static str {
         match self {
@@ -150,20 +150,20 @@ impl ControlClaim {
         }
     }
 
-    /// Величина, которая обязана быть неотрицательной, и имя её поля.
+    /// The value that must be non-negative, and the name of its field.
     ///
-    /// `None` означает «отрицательное значение законно»: денежный
-    /// остаток (§11) и количество, проверяемое отдельно как величина
-    /// периметра, а не как знак итога.
+    /// `None` means «a negative value is valid»: the cash
+    /// balance (§11), and quantity, which is checked separately as a perimeter
+    /// value rather than as the sign of a total.
     #[must_use]
     pub const fn non_negative_field(&self) -> Option<(&'static str, i64)> {
         match self {
             Self::CashBalance { .. } | Self::PositionQuantity { .. } => None,
             Self::CashTurnover { debit, credit, .. } => {
-                // Проверяется меньшая из двух сторон: неотрицательная
-                // меньшая означает неотрицательные обе. Взять первую
-                // попавшуюся значило бы пропускать отрицательный кредит
-                // при положительном дебете.
+                // The smaller of the two sides is checked: if the smaller is non-negative,
+                // both are non-negative. Taking the first one encountered
+                // would allow a negative credit to pass
+                // when the debit is positive.
                 let smaller = if debit.raw() <= credit.raw() {
                     debit.raw()
                 } else {
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn a_single_day_period_is_valid() {
-        // Отчёт за один день — законный документ, а не вырожденный случай.
+        // A one-day report is a valid document, not a degenerate case.
         let day = date!(2026 - 03 - 15);
         let period = AssertionPeriod::between(day, day).unwrap();
         assert!(period.is_well_formed());
@@ -216,8 +216,8 @@ mod tests {
 
     #[test]
     fn a_period_built_around_the_constructor_is_recognised_as_malformed() {
-        // Ровно тот случай, ради которого проверка живёт отдельно от
-        // конструктора: структура собрана полями, минуя `between`.
+        // This is exactly why the check is separate from
+        // the constructor: the struct was assembled field by field, bypassing `between`.
         let inverted = AssertionPeriod {
             from: date!(2026 - 03 - 31),
             to: date!(2026 - 03 - 01),
@@ -227,9 +227,9 @@ mod tests {
 
     #[test]
     fn each_claim_constrains_exactly_one_dimension() {
-        // Измерение выводится из вида утверждения, а не назначается
-        // вызывающим: назначаемое измерение позволило бы объявить
-        // сошедшийся остаток подтверждением налоговой базы.
+        // The dimension is derived from the assertion kind rather than assigned
+        // by the caller: an assignable dimension would allow a reconciled
+        // balance to be declared confirmation of the tax basis.
         let cash = ControlClaim::CashBalance {
             currency: CurrencyCode::Rub,
             amount: rub(100),
@@ -297,14 +297,14 @@ mod tests {
         let count = names.len();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), count, "имена видов утверждений совпали");
+        assert_eq!(names.len(), count, "assertion kind names collided");
     }
 
     #[test]
     fn a_turnover_reports_the_smaller_side_for_the_sign_check() {
-        // Проверяется меньшая из двух сторон независимо от того, какая
-        // именно отрицательна: иначе отрицательный кредит при
-        // положительном дебете прошёл бы проверку.
+        // The smaller of the two sides is checked regardless of which
+        // one is negative: otherwise a negative credit with a
+        // positive debit would pass validation.
         let claim = ControlClaim::CashTurnover {
             currency: CurrencyCode::Rub,
             debit: rub(500),
@@ -322,8 +322,8 @@ mod tests {
 
     #[test]
     fn each_balance_point_has_a_distinct_machine_readable_code() {
-        // Момент остатка уходит наружу кодом: «на начало» и «на конец» —
-        // разные утверждения, и слипшийся код превратил бы одно в другое.
+        // The balance point is exposed as a code: «at start» and «at end» are
+        // distinct assertions, and using the same code would turn one into the other.
         assert_eq!(BalancePoint::Opening.code(), "opening");
         assert_eq!(BalancePoint::Closing.code(), "closing");
         assert_ne!(BalancePoint::Opening.code(), BalancePoint::Closing.code());
@@ -331,8 +331,8 @@ mod tests {
 
     #[test]
     fn a_negative_cash_balance_is_not_a_sign_violation() {
-        // §11: технический овердрафт и тайминги расчётов дают минус,
-        // и он обязан войти в NAV обязательством, а не быть отвергнут.
+        // §11: technical overdrafts and settlement timing can produce a negative balance,
+        // and it must be included in NAV as a liability rather than rejected.
         let claim = ControlClaim::CashBalance {
             currency: CurrencyCode::Rub,
             amount: rub(-5_000),

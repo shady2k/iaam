@@ -1,8 +1,8 @@
-//! Проекция ненулевых позиций из среза журнала.
+//! Projection of nonzero positions from a journal slice.
 //!
-//! Результат нужен оболочке только для выбора инструментов, которые следует
-//! синхронизировать. Это множество идентификаторов, а не отчётное число:
-//! функция не рассчитывает и не публикует денежные или иные итоговые суммы.
+//! The shell needs the result only to select the instruments that should be
+//! synchronized. This is a set of identifiers, not a reporting figure:
+//! the function does not calculate or publish monetary or other totals.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,24 +14,24 @@ use crate::ids::InstrumentId;
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 
-/// Смена знака количества. Отказ отрицания передаётся вызывающему, потому
-/// что «невозможно вычислить» нельзя подменить исходным количеством.
+/// Negating the quantity. A negation failure is propagated to the caller because
+/// “cannot compute” must not be replaced with the original quantity.
 fn negated(quantity: Dec) -> Result<Dec, NumericError> {
     quantity.checked_neg()
 }
 
-/// Инструменты, у которых итоговое количество не равно нулю.
+/// Instruments whose resulting quantity is not zero.
 ///
-/// Это чистая проекция событий ядра: оболочка использует её только для
-/// выбора инструментов синхронизации. Переполнение накопления количества —
-/// явный отказ, потому что продолжение со старым значением теряет дельту и
-/// создаёт неверное множество активных инструментов.
+/// This is a pure projection of core events: the shell uses it only to
+/// select instruments for synchronization. Quantity accumulation overflow is
+/// an explicit failure because continuing with the old value loses the delta and
+/// produces an incorrect set of active instruments.
 pub fn active_instruments(events: &[Event]) -> Result<BTreeSet<InstrumentId>, NumericError> {
     let mut quantities = BTreeMap::<InstrumentId, Dec>::new();
     for event in events {
-        // Список пар, а не одна пара: замещение двигает количество сразу
-        // по двум бумагам, и свести его к одной значило бы оставить
-        // предшественника вечно активным.
+        // A list of pairs, not a single pair: replacement moves the quantity across
+        // two securities at once, and reducing it to one would leave the
+        // predecessor permanently active.
         let deltas: Vec<(InstrumentId, Dec)> = match &event.kind {
             EventKind::Trade {
                 side,
@@ -51,8 +51,8 @@ pub fn active_instruments(events: &[Event]) -> Result<BTreeSet<InstrumentId>, Nu
                 ..
             } => vec![(*instrument, quantity.0)],
             EventKind::CorporateAction { action } => match action {
-                // Амортизация выплачивает деньги, но количество бумаг
-                // не меняет (§6.5): нулевая дельта, а не пропуск.
+                // Amortisation pays out money but does not change the number
+                // of securities (§6.5): a zero delta, not an omission.
                 CorporateAction::PartialRedemption { instrument, .. } => {
                     vec![(*instrument, Dec::zero())]
                 }
@@ -73,7 +73,7 @@ pub fn active_instruments(events: &[Event]) -> Result<BTreeSet<InstrumentId>, Nu
                 ],
             },
             EventKind::OfferExercise { action } => match action {
-                // Подача и отзыв заявки бумаг не двигают.
+                // Placing and canceling an order do not move securities.
                 OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {
                     Vec::new()
                 }

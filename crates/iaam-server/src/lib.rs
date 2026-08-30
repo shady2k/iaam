@@ -1,9 +1,9 @@
-//! REST-транспорт (§13).
+//! REST transport (§13).
 //!
-//! API отдаёт **готовые отчёты**, а не сырые данные: числа считает ядро,
-//! транспорт их сериализует. Агенту запрещена собственная арифметика,
-//! и требование проверяемо — число в ответе агента, отсутствующее
-//! в ответах API, является ошибкой.
+//! The API returns **fully prepared reports**, not raw data: the core calculates the figures,
+//! and the transport serialises them. The agent must not perform its own arithmetic,
+//! and the requirement is testable — any number in the agent's response that is absent
+//! from the API responses is an error.
 
 pub mod auth;
 pub mod claim;
@@ -27,20 +27,20 @@ use crate::claim::ClaimCode;
 use crate::openapi::ApiDoc;
 use crate::rate_limit::RateLimiter;
 
-/// Состояние сервера.
+/// Server state.
 #[derive(Clone)]
 pub struct ServerState {
     pub services: Arc<AppServices>,
     pub limiter: Arc<RateLimiter>,
-    /// Планировщик рыночных серий. Другие виды заданий сюда не попадают.
+    /// The market-series scheduler. No other task types reach it.
     pub market_scheduler: Arc<MarketScheduler>,
-    /// Код присвоения экземпляра. `None` — присваивать нечего:
-    /// владелец либо уже есть, либо код уже использован.
+    /// The instance claim code. `None` means there is nothing to claim:
+    /// either it already has an owner, or the code has already been used.
     ///
-    /// В памяти процесса и только в ней: утечка файла базы не должна
-    /// отдавать экземпляр (§14). Мьютекс стандартный, а не `tokio`:
-    /// под ним не ждут ввода-вывода, а `Option` меняется одной
-    /// операцией — асинхронный мьютекс здесь стоил бы дороже, чем даёт.
+    /// Kept in process memory and nowhere else: leaking the database file must not
+    /// allow the instance to be taken over (§14). The mutex is standard, not `tokio`:
+    /// no I/O is awaited while it is held, and `Option` changes in a single
+    /// operation — an asynchronous mutex would cost more here than it offers.
     claim: Arc<Mutex<Option<ClaimCode>>>,
 }
 
@@ -55,23 +55,23 @@ impl ServerState {
         }
     }
 
-    /// Зарегистрировать одну рыночную серию до запуска сервера.
+    /// Register one market series before starting the server.
     pub fn register_market_job(&self, job: Arc<MarketSyncJob>) {
         self.market_scheduler.register(job);
     }
 
-    /// Взвести код присвоения. Зовётся при старте — см. `claim::arm`.
+    /// Arm the claim code. Called at start-up — see `claim::arm`.
     pub fn arm_claim(&self, code: ClaimCode) {
         *self.locked_claim() = Some(code);
     }
 
-    /// Принять код, если он верен, и **стереть** его.
+    /// Accept the code if it is valid, and **erase** it.
     ///
-    /// Проверка и стирание — одна операция под одним замком: разделив
-    /// их, два одновременных запроса с верным кодом получили бы по
-    /// токену владельца каждый. Неверный код кода не стирает: иначе
-    /// любой посторонний одним запросом с мусором закрывал бы
-    /// присвоение навсегда.
+    /// Checking and erasing are one operation under one lock: separating
+    /// them would let two simultaneous requests with the valid code each receive an owner
+    /// token. An invalid code does not erase the code: otherwise
+    /// any outsider could disable claiming with a single junk request
+    /// forever.
     pub fn accept_claim(&self, code: &str) -> bool {
         let mut guard = self.locked_claim();
         match guard.as_ref() {
@@ -83,11 +83,11 @@ impl ServerState {
         }
     }
 
-    /// Замок над кодом присвоения.
+    /// The lock protecting the claim code.
     ///
-    /// Отравленный мьютекс восстанавливается, а не приводит к панике:
-    /// паника в одном запросе не должна выводить из строя весь сервис,
-    /// а `Option<ClaimCode>` паника предыдущего вызова не повреждает.
+    /// A poisoned mutex is recovered rather than causing a panic:
+    /// a panic in one request must not bring down the entire service,
+    /// and a panic in the previous call cannot corrupt `Option<ClaimCode>`.
     fn locked_claim(&self) -> std::sync::MutexGuard<'_, Option<ClaimCode>> {
         match self.claim.lock() {
             Ok(guard) => guard,
@@ -96,17 +96,17 @@ impl ServerState {
     }
 }
 
-/// Сборка приложения axum вместе с порождённой спекой.
+/// Builds the axum application together with the generated specification.
 ///
-/// Публичными остаются `/v1/health`, сама спека и присвоение
-/// экземпляра: аутентификация с первого дня, и отложенной она не станет
-/// никогда (§14). Присвоение — исключение по необходимости, а не по
-/// слабости: токена у того, кто присваивает, ещё нет, и позвать
-/// защищённый маршрут ему нечем. Вместо токена его пускает одноразовый
-/// код, прочитанный с консоли, — см. `claim`.
+/// The public endpoints remain `/v1/health`, the specification itself and instance
+/// claiming: authentication is required from day one, and will never be deferred
+/// (§14). Claiming is an exception born of necessity, not
+/// weakness: the claimant does not yet have a token, and has no means to call
+/// a protected route. Instead of a token, they are admitted by a one-time
+/// code read from the console — see `claim`.
 pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
-    // В рабочем процессе build вызывается внутри tokio runtime. Проверка
-    // сохраняет возможность собирать Router в обычном синхронном тесте.
+    // In production, build is called from within the tokio runtime. This check
+    // preserves the ability to build a Router in a normal synchronous test.
     if tokio::runtime::Handle::try_current().is_ok() {
         std::mem::drop(state.market_scheduler.clone().spawn());
     }

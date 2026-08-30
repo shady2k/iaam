@@ -1,4 +1,4 @@
-//! Синхронизация графика: пагинация, отказ на неизвестный код, дедуп.
+//! Schedule synchronisation: pagination, failure on an unknown code, deduplication.
 
 use std::sync::Mutex;
 
@@ -15,11 +15,11 @@ use iaam_store::SqliteStore;
 use iaam_store::market_source_codes::SourceCodeEntry;
 use iaam_store::reference::InstrumentRecord;
 
-/// Транспорт, отдающий заготовленные страницы **по порядку обращения**.
+/// Transport returning predefined pages **in request order**.
 ///
-/// По порядку, а не по совпадению URL, намеренно: подделка, отвечающая
-/// одним и тем же телом на любой запрос, пропустила бы отсутствие
-/// пагинации — сценарий сходил бы один раз и выглядел бы исправным.
+/// Request order, rather than URL matching, is deliberate: a fake returning
+/// the same body for every request would mask missing
+/// pagination — the scenario would make one request and appear correct.
 struct Pages {
     bodies: Mutex<Vec<&'static str>>,
     urls: Mutex<Vec<String>>,
@@ -34,18 +34,15 @@ impl Pages {
     }
 
     fn urls(&self) -> Vec<String> {
-        self.urls.lock().expect("журнал запросов").clone()
+        self.urls.lock().expect("request log").clone()
     }
 }
 
 #[async_trait]
 impl OutboundHttp for Pages {
     async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError> {
-        self.urls
-            .lock()
-            .expect("журнал запросов")
-            .push(request.url());
-        let mut bodies = self.bodies.lock().expect("страницы");
+        self.urls.lock().expect("request log").push(request.url());
+        let mut bodies = self.bodies.lock().expect("pages");
         let body = if bodies.is_empty() {
             EMPTY_PAGE
         } else {
@@ -59,10 +56,10 @@ impl OutboundHttp for Pages {
     }
 }
 
-/// Транспорт, у которого страницы никогда не кончаются.
+/// Transport whose pages never end.
 ///
-/// Нужен ради предохранителя `MAX_PAGES`: источник, отдающий строки
-/// бесконечно, обязан давать отказ, а не тихо оборванный график.
+/// Needed for the `MAX_PAGES` safeguard: a source returning rows
+/// indefinitely must fail, rather than silently truncate the schedule.
 struct Endless;
 
 #[async_trait]
@@ -83,8 +80,8 @@ const EMPTY_PAGE: &str = r#"{
   "offers": {"columns": ["offerdate", "offertype"], "data": []}
 }"#;
 
-/// Первая страница: амортизации и оферты уже кончились, купоны — нет.
-/// Ровно та форма, на которой остановка по пустому блоку обрезает график.
+/// First page: amortisations and offers have already ended, but coupons have not.
+/// Exactly the shape where stopping at an empty block truncates the schedule.
 const PAGE_ONE: &str = r#"{
   "amortizations": {"columns": ["amortdate", "valueprc", "data_source"], "data": []},
   "coupons": {
@@ -144,12 +141,12 @@ const PAGE_WITH_UNKNOWN_OFFER_KIND: &str = r#"{
   },
   "offers": {
     "columns": ["offerdate", "offertype"],
-    "data": [["2026-11-20", "Досрочное погашение"]]
+    "data": [["2026-11-20", "Early redemption"]]
   }
 }"#;
 
-/// График, отличающийся от `PAGE_ONE`/`PAGE_TWO`: эмитент отменил один
-/// купон. Нужен ради проверки, что изменившийся график **пишется**.
+/// A schedule differing from `PAGE_ONE`/`PAGE_TWO`: the issuer cancelled one
+/// coupon. Used to verify that a changed schedule **is written**.
 const PAGE_CHANGED: &str = r#"{
   "amortizations": {
     "columns": ["amortdate", "valueprc", "data_source"],
@@ -163,22 +160,22 @@ const PAGE_CHANGED: &str = r#"{
 }"#;
 
 fn store() -> (SqliteStore, InstrumentId) {
-    let mut store = SqliteStore::open_in_memory().expect("база в памяти");
+    let mut store = SqliteStore::open_in_memory().expect("in-memory database");
     let instrument = InstrumentId::new_random();
     store
         .upsert_instrument(&InstrumentRecord {
             id: instrument,
             kind: Some(InstrumentKind::Bond),
             symbol: "SU46020RMFS2".to_owned(),
-            title: "ОФЗ 46020".to_owned(),
+            title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент заведён");
+        .expect("instrument created");
     store
         .extend_market_source_codes(
             SOURCE_ID,
-            "профиль источника 2026-08-27",
+            "source profile 2026-08-27",
             &[
                 SourceCodeEntry {
                     domain: "currency".to_owned(),
@@ -197,7 +194,7 @@ fn store() -> (SqliteStore, InstrumentId) {
                 },
             ],
         )
-        .expect("словарь заселён");
+        .expect("dictionary populated");
     (store, instrument)
 }
 
@@ -210,20 +207,20 @@ fn request(instrument: InstrumentId) -> ScheduleSyncRequest {
 
 #[tokio::test]
 async fn pagination_continues_while_any_block_still_returns_rows() {
-    // Смещение общее на три блока: на второй странице амортизации и
-    // оферты пусты, купоны продолжаются. Остановка по пустому блоку
-    // обрезала бы график, и он выглядел бы замкнутым.
+    // The offset is shared across all three blocks: on the second page, amortisations and
+    // offers are empty, while coupons continue. Stopping at an empty block
+    // would truncate the schedule, making it appear complete.
     let (mut store, instrument) = store();
     let transport = Pages::new(&[PAGE_ONE, PAGE_TWO]);
     let result = sync_schedule(&mut store, &transport, request(instrument))
         .await
-        .expect("синхронизация");
+        .expect("synchronisation");
 
     let urls = transport.urls();
     assert_eq!(
         urls.len(),
         3,
-        "две страницы с данными и одна пустая: {urls:?}"
+        "two pages with data and one empty page: {urls:?}"
     );
     assert!(urls[0].contains("start=0"), "{urls:?}");
     assert!(urls[1].contains("start=100"), "{urls:?}");
@@ -235,24 +232,24 @@ async fn pagination_continues_while_any_block_still_returns_rows() {
             SOURCE_ID,
             "2100-01-01T00:00:00Z",
         )
-        .expect("чтение")
-        .expect("снимок найден");
-    assert_eq!(stored.coupon_periods.len(), 2, "купоны обеих страниц");
+        .expect("read")
+        .expect("snapshot found");
+    assert_eq!(stored.coupon_periods.len(), 2, "coupons from both pages");
     assert_eq!(result.completeness, Completeness::Validated);
 }
 
 #[tokio::test]
 async fn an_unknown_source_code_is_refused_by_name() {
-    // Пропуск строки с незнакомым кодом молча укоротил бы график.
-    // Отказ обязан назвать код, иначе владельцу нечего вносить в словарь.
+    // Silently skipping a row with an unknown code would shorten the schedule.
+    // The error must name the code; otherwise the owner would not know what to add to the dictionary.
     let (mut store, instrument) = store();
     let transport = Pages::new(&[PAGE_WITH_UNKNOWN_KIND]);
     let error = sync_schedule(&mut store, &transport, request(instrument))
         .await
-        .expect_err("неизвестный код обязан быть отказом");
+        .expect_err("an unknown code must cause an error");
     assert!(
         error.to_string().contains("досрочное погашение"),
-        "отказ обязан назвать код: {error}"
+        "error must name the code: {error}"
     );
 }
 
@@ -265,37 +262,37 @@ async fn a_second_run_over_an_unchanged_schedule_writes_no_new_snapshot() {
         request(instrument),
     )
     .await
-    .expect("первый прогон");
+    .expect("first run");
     let second = sync_schedule(
         &mut store,
         &Pages::new(&[PAGE_ONE, PAGE_TWO]),
         request(instrument),
     )
     .await
-    .expect("второй прогон");
+    .expect("second run");
     assert!(first.written);
-    assert!(!second.written, "неизменный график писаться не должен");
+    assert!(!second.written, "an unchanged schedule must not be written");
     assert_eq!(first.snapshot_id, second.snapshot_id);
 }
 
 #[tokio::test]
 async fn a_broken_invariant_does_not_cancel_the_snapshot() {
-    // Снимок — то, что источник действительно прислал. Стереть его
-    // значит потерять свидетельство. Отменяется пригодность к расчёту,
-    // а не запись наблюдения.
+    // The snapshot is what the source actually sent. Deleting it
+    // would mean losing the evidence. Its suitability for calculation is revoked,
+    // not the observation record.
     let (mut store, instrument) = store();
     let result = sync_schedule(&mut store, &Pages::new(&[PAGE_ONE]), request(instrument))
         .await
-        .expect("синхронизация");
+        .expect("synchronisation");
     assert!(matches!(result.completeness, Completeness::Unknown));
-    assert!(result.written, "снимок обязан быть записан");
+    assert!(result.written, "the snapshot must be written");
 }
 
 #[tokio::test]
 async fn an_offer_kind_known_to_the_dictionary_passes_and_an_unknown_one_does_not() {
-    // Проверка вида оферты обязана отвергать НЕизвестное, а не известное.
-    // Перевёрнутое условие пропускало бы незнакомый код и спотыкалось на
-    // знакомом — и то и другое молча меняет состав графика.
+    // Offer type validation must reject the UNKNOWN, not the known.
+    // The inverted condition would let an unknown code through and trip over
+    // with a known one — both silently alter the schedule composition.
     let (mut accepting, known) = store();
     let accepted = sync_schedule(
         &mut accepting,
@@ -303,7 +300,7 @@ async fn an_offer_kind_known_to_the_dictionary_passes_and_an_unknown_one_does_no
         request(known),
     )
     .await
-    .expect("известный словарю вид оферты обязан проходить");
+    .expect("an offer type recognised by the dictionary must be accepted");
     assert!(accepted.written);
 
     let (mut fresh, other) = store();
@@ -313,33 +310,33 @@ async fn an_offer_kind_known_to_the_dictionary_passes_and_an_unknown_one_does_no
         request(other),
     )
     .await
-    .expect_err("неизвестный вид оферты обязан быть отказом");
+    .expect_err("an unknown offer type must be rejected");
     assert!(
-        error.to_string().contains("Досрочное погашение"),
-        "отказ обязан назвать код: {error}"
+        error.to_string().contains("Early redemption"),
+        "the rejection must name the code: {error}"
     );
 }
 
 #[tokio::test]
 async fn a_source_that_never_runs_out_of_pages_is_refused_not_truncated() {
-    // Предохранитель по числу страниц существует ради источника, который
-    // отдаёт строки бесконечно. Тихий возврат на потолке был бы тем же
-    // усечением, только нашими руками, — поэтому здесь отказ.
+    // The page-count guard exists for a source that
+    // returns rows indefinitely. Silently returning at the limit would be the same
+    // truncation, only by our own hand — so this must be an error.
     let (mut store, instrument) = store();
     let error = sync_schedule(&mut store, &Endless, request(instrument))
         .await
-        .expect_err("бесконечный источник обязан давать отказ");
+        .expect_err("an infinite source must produce an error");
     assert!(
         error.to_string().contains("100"),
-        "отказ обязан назвать потолок: {error}"
+        "the error must name the limit: {error}"
     );
 }
 
 #[tokio::test]
 async fn a_changed_schedule_is_written_as_a_new_snapshot() {
-    // Обратная сторона дедупа: если содержимое изменилось, новый снимок
-    // обязан появиться. Постоянный хэш прошёл бы проверку на повторе и
-    // молча похоронил бы каждую правку эмитента.
+    // The other side of deduplication: if the content has changed, a new snapshot
+    // must be created. A constant hash would pass the duplicate check and
+    // silently bury every issuer amendment.
     let (mut store, instrument) = store();
     let first = sync_schedule(
         &mut store,
@@ -347,14 +344,14 @@ async fn a_changed_schedule_is_written_as_a_new_snapshot() {
         request(instrument),
     )
     .await
-    .expect("первый прогон");
+    .expect("first run");
     let second = sync_schedule(
         &mut store,
         &Pages::new(&[PAGE_CHANGED]),
         request(instrument),
     )
     .await
-    .expect("прогон по изменившемуся графику");
-    assert!(second.written, "изменившийся график обязан записаться");
+    .expect("run with a changed schedule");
+    assert!(second.written, "a changed schedule must be written");
     assert_ne!(first.snapshot_id, second.snapshot_id);
 }

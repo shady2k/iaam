@@ -1,8 +1,8 @@
-//! Порт хранилища поверх `iaam-store`.
+//! Storage port over `iaam-store`.
 //!
-//! Здесь и только здесь пересекается граница async/blocking (§3.2).
-//! `rusqlite` блокирует поток; вызов его прямо из обработчика `axum`
-//! останавливает исполнитель, поэтому каждая операция уходит в
+//! The async/blocking boundary is crossed here and only here (§3.2).
+//! `rusqlite` blocks the thread; calling it directly from an `axum` handler
+//! stalls the executor, so every operation is sent to
 //! `spawn_blocking`.
 
 use std::sync::{Arc, Mutex};
@@ -38,16 +38,16 @@ use crate::ports::{
 };
 use crate::tokens::{hash_token, secret_hex};
 
-/// Соединение под мьютексом: `rusqlite::Connection` не `Sync`, а писатель
-/// у однопользовательской базы один. Пул появится тогда, когда появится
-/// второй писатель, а не раньше.
+/// Connection behind a mutex: `rusqlite::Connection` is not `Sync`, and a
+/// single-user database has only one writer. A pool will be added when there is
+/// a second writer, not before.
 pub struct SqliteAdapter {
     store: Arc<Mutex<SqliteStore>>,
-    /// Ключ шифрования брокерских доступов. Живёт вне базы и потому
-    /// приходит извне, а не из неё. `None` — ключ не задан настройкой,
-    /// и тогда брокерские доступы не заводятся и не читаются: заводить
-    /// их «пока без шифрования» означало бы положить чужой токен
-    /// открытым и обнаружить это по утечке базы (§14).
+    /// The encryption key for broker credentials. It lives outside the database and therefore
+    /// is supplied externally, not by the database. `None` — no key is configured,
+    /// so broker credentials are neither created nor read: creating
+    /// them «without encryption for now» would mean storing someone else's token
+    /// in plaintext and discovering this through a database leak (§14).
     broker_key: Option<Key>,
 }
 
@@ -57,7 +57,7 @@ impl SqliteAdapter {
         Self::with_broker_key(store, None)
     }
 
-    /// Тот же адаптер с ключом шифрования брокерских доступов.
+    /// The same adapter with an encryption key for broker credentials.
     #[must_use]
     pub fn with_broker_key(store: SqliteStore, key: Option<Key>) -> Self {
         Self {
@@ -66,23 +66,23 @@ impl SqliteAdapter {
         }
     }
 
-    /// Ключ или отказ.
+    /// The key or an error.
     ///
-    /// Отказ отдельным вариантом, а не `Store`: отсутствие ключа —
-    /// это незаконченная настройка сервера, а не сбой хранилища, и
-    /// повтор запроса её не исправит.
+    /// A separate error variant, not `Store`: a missing key is
+    /// incomplete server configuration, not a storage failure, and
+    /// retrying the request will not fix it.
     fn key(&self) -> Result<&Key, AppError> {
         self.broker_key.as_ref().ok_or(AppError::NotConfigured {
-            what: "шифрование доступа к брокеру",
+            what: "broker access encryption",
         })
     }
 
-    /// Выполнение блокирующей операции.
+    /// Runs a blocking operation.
     ///
-    /// Отравленный мьютекс восстанавливается, а не приводит к панике:
-    /// паника в одном запросе не должна выводить из строя весь сервис,
-    /// а состояние `SqliteStore` — это соединение, которое паника
-    /// предыдущего вызова не повреждает.
+    /// Mutex poisoning is recovered from rather than causing a panic:
+    /// a panic in one request must not bring down the entire service,
+    /// and the state of `SqliteStore` — a connection that a panic
+    /// in the previous call does not corrupt.
     async fn blocking<T, F>(&self, work: F) -> Result<T, AppError>
     where
         T: Send + 'static,
@@ -97,7 +97,7 @@ impl SqliteAdapter {
             work(&mut guard)
         })
         .await
-        .map_err(|error| AppError::Store(format!("блокирующая задача не выполнена: {error}")))?
+        .map_err(|error| AppError::Store(format!("blocking task failed: {error}")))?
     }
 }
 
@@ -105,13 +105,13 @@ fn store_error(error: iaam_store::StoreError) -> AppError {
     AppError::Store(error.to_string())
 }
 
-/// Три случая резолвинга обязаны остаться различимыми и по эту сторону
-/// порта: слитые в один `NotFound` они перестают отвечать на вопрос
-/// «новая это бумага или испорченная дата» (E3.1, §5.1 спеки задачи).
+/// The three resolution cases must remain distinguishable on this side
+/// of the port too: merged into one `NotFound`, they no longer answer the question
+/// «is this a new security or an incorrect date» (E3.1, §5.1 of the task specification).
 fn resolve_error(error: iaam_store::ResolveError) -> AppError {
     match error {
         iaam_store::ResolveError::Unknown { namespace, value } => AppError::NotFound {
-            what: "инструмент по коду",
+            what: "instrument by code",
             id: format!("{namespace}:{value}"),
         },
         iaam_store::ResolveError::NotOnDate {
@@ -122,8 +122,8 @@ fn resolve_error(error: iaam_store::ResolveError) -> AppError {
             known_to,
         } => AppError::Invalid {
             field: "on".to_owned(),
-            expected: format!("дата в интервале действия кода {known_from}..{known_to}"),
-            actual: format!("{namespace}:{value} на {on}"),
+            expected: format!("date within code validity interval {known_from}..{known_to}"),
+            actual: format!("{namespace}:{value} on {on}"),
         },
         iaam_store::ResolveError::Ambiguous {
             namespace,
@@ -133,8 +133,8 @@ fn resolve_error(error: iaam_store::ResolveError) -> AppError {
         } => AppError::DirectoryInvariant {
             correlation: Uuid::new_v4(),
             detail: format!(
-                "код {namespace}:{value} на {on} разрешается в {candidates} инструментов: \
-                 триггер instrument_aliases_do_not_overlap пробит"
+                "code {namespace}:{value} on {on} resolves to {candidates} instruments: \
+                 the instrument_aliases_do_not_overlap trigger has been breached"
             ),
         },
         iaam_store::ResolveError::Store(error) => store_error(error),
@@ -171,11 +171,11 @@ fn custody_view(record: iaam_store::reference::CustodyRecord) -> CustodyView {
     }
 }
 
-/// Права токена: из хранилища в порт.
+/// Token permissions: from the store to the port.
 ///
-/// Перевод в обе стороны исчерпывающим `match`, а не по строке-коду:
-/// новое право обязано сломать сборку здесь, а не молча превратиться
-/// в «читатель» при разборе неизвестного кода (§15.1).
+/// Conversion in both directions uses an exhaustive `match`, not a code string:
+/// a new permission must break the build here, rather than silently turn
+/// into a «reader» when an unknown code is parsed (§15.1).
 const fn scope_from_store(scope: TokenScope) -> Scope {
     match scope {
         TokenScope::Owner => Scope::Owner,
@@ -397,7 +397,7 @@ impl InstrumentDirectory for SqliteAdapter {
         let Some(namespace) = AliasNamespace::from_code(namespace) else {
             return Err(AppError::Invalid {
                 field: "namespace".to_owned(),
-                expected: "isin, moex_secid, ticker, figi или broker_code".to_owned(),
+                expected: "isin, moex_secid, ticker, figi or broker_code".to_owned(),
                 actual: namespace.to_owned(),
             });
         };
@@ -463,45 +463,45 @@ impl BrokerVault for SqliteAdapter {
         let key = self.key()?;
         let code = BrokerCode::parse(&broker).ok_or_else(|| AppError::Invalid {
             field: "broker".to_owned(),
-            expected: "непустой код брокера".to_owned(),
+            expected: "non-empty broker code".to_owned(),
             actual: broker.clone(),
         })?;
-        // Обрамляющие пробелы не часть токена: заголовок с лишним
-        // пробелом брокер отвергнет, а причину назовёт невнятно.
+        // Leading or trailing whitespace is not part of the token: the broker will reject a header with an extra
+        // space, and give a vague reason.
         let token = Zeroizing::new(token.trim().to_owned());
         if token.is_empty() {
             return Err(AppError::Invalid {
                 field: "token".to_owned(),
-                expected: "непустой токен".to_owned(),
-                // Значение не называется даже здесь: текст ошибки —
-                // это то, что точно попадёт в лог (§14).
-                actual: "пустая строка".to_owned(),
+                expected: "non-empty token".to_owned(),
+                // The value is not named even here: the error text —
+                // exactly what is certain to end up in the log (§14).
+                actual: "empty string".to_owned(),
             });
         }
 
-        // Шифрование до ухода в блокирующую задачу: открытым токен
-        // не пересекает границу потоков и не копируется в замыкание.
+        // Encrypt before handing off to the blocking task: the plaintext token
+        // does not cross a thread boundary and is not copied into the closure.
         let sealed = seal(key, &token);
         let access = NewBrokerAccess {
             id: Uuid::new_v4(),
             owner,
             broker: code,
-            // Среда приходит снаружи, и это единственное место, где она
-            // называется: дальше её берут из записи. Заведение — момент,
-            // когда человек знает, какой токен держит в руках. Перевод
-            // словаря порта в словарь брокера идёт здесь: адаптер —
-            // единственный, кто знает оба.
+            // The environment is supplied externally, and this is the only place where it is
+            // specified: thereafter it is taken from the record. During setup,
+            // the person knows which token they hold. The mapping
+            // from the port's vocabulary to the broker's happens here: the adapter is
+            // the only component that knows both.
             environment: broker_environment(environment).code().to_owned(),
-            // Область прав задаётся здесь, а не приходит снаружи:
-            // торговые права не запрашиваются ни при каких условиях (§14).
+            // The permission scope is set here rather than supplied externally:
+            // trading permissions are never requested under any circumstances (§14).
             scope: BrokerScope::ReadOnly.code().to_owned(),
             nonce: sealed.nonce().to_vec(),
             ciphertext: sealed.ciphertext().to_vec(),
         };
-        // Запись и чтение обратно — одной блокирующей задачей. Момент
-        // заведения ставит хранилище, и собрать представление здесь
-        // значило бы показать владельцу выдуманное время; а вторым
-        // вызовом читать нельзя — между ними доступ успевают отозвать.
+        // Writing and reading back are done in a single blocking task. The
+        // setup time is assigned by the store, and constructing the representation here
+        // would mean showing the owner a fabricated time; nor can it be read in a second
+        // call — the access could be revoked between the two calls.
         let owner_of_access = access.owner;
         let broker_of_access = access.broker.clone();
         let environment_of_access = access.environment.clone();
@@ -510,29 +510,29 @@ impl BrokerVault for SqliteAdapter {
                 .insert_broker_access(&access)
                 .map_err(|error| match error {
                     iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
-                        what: format!("{what} уже заведён: сначала отзовите действующий"),
+                        what: format!("{what} is already set up: revoke the active one first"),
                     },
                     other => store_error(other),
                 })?;
 
-            // Словарь видов операций заселяется здесь, в тот же момент
-            // и той же задачей: заведённый доступ без словаря отклонит
-            // первую же выгрузку целиком, и владелец пойдёт разбираться
-            // с брокером вместо настройки.
+            // The operation-type dictionary is populated here, at the same time
+            // and by the same task: access set up without a dictionary would reject
+            // the very first import entirely, and the owner would troubleshoot
+            // the broker rather than the configuration.
             //
-            // Сети этот шаг не требует: контракт перечисляет коды, но
-            // не сообщает, во что они превращаются у нас, — заселять
-            // приходится собственным знанием (`dictionary_seed`).
-            // Сверка с контрактом существует отдельно и зовётся явно.
+            // This step requires no network access: the contract lists the codes, but
+            // does not say what they map to in our system — the dictionary must be populated
+            // from our own knowledge (`dictionary_seed`).
+            // The contract cross-check is separate and invoked explicitly.
             //
-            // Пополнение существующие строки не трогает: заведение
-            // доступа заново не имеет права отменить решение владельца.
+            // Seeding leaves existing rows untouched: setting up
+            // access again must not override the owner's decision.
             let Some((dictionary, entries)) =
                 iaam_broker::operation_kind::seed_for(broker_of_access.as_str())
             else {
                 return Err(AppError::Invalid {
                     field: "broker".to_owned(),
-                    expected: "брокер, для которого известен словарь видов операций".to_owned(),
+                    expected: "a broker with a known operation-type dictionary".to_owned(),
                     actual: broker_of_access.as_str().to_owned(),
                 });
             };
@@ -550,7 +550,7 @@ impl BrokerVault for SqliteAdapter {
                 .find_broker_access(owner_of_access, &broker_of_access, &environment_of_access)
                 .map_err(store_error)?
                 .ok_or(AppError::Store(
-                    "доступ заведён, но не прочитан обратно".to_owned(),
+                    "access was set up but not read back".to_owned(),
                 ))?;
             Ok(BrokerAccessView {
                 id: stored.id,
@@ -565,9 +565,9 @@ impl BrokerVault for SqliteAdapter {
     }
 
     async fn list_access(&self, owner: OwnerId) -> Result<Vec<BrokerAccessView>, AppError> {
-        // Ключ требуется и на чтении списка: без него показанный доступ
-        // обещал бы то, чем воспользоваться нельзя, и разбираться с этим
-        // пришлось бы по пустому ответу брокера, а не по настройке.
+        // The key is also required when listing: without it, the listed access
+        // would promise something unusable, and the issue would have to be diagnosed
+        // from an empty broker response rather than the configuration.
         self.key()?;
         self.blocking(move |store| {
             let history = store.broker_access_history(owner).map_err(store_error)?;
@@ -590,14 +590,14 @@ impl BrokerVault for SqliteAdapter {
         self.key()?;
         self.blocking(move |store| {
             store.revoke_broker_access(owner, id).map_err(|error| {
-                // Отсутствующий доступ — ошибка запроса, а не сбой
-                // хранилища: повтор её не исправит, и `500` отправил бы
-                // владельца искать поломку там, где её нет. Чужой доступ
-                // даёт тот же ответ намеренно — иначе он сообщал бы
-                // постороннему, что такая запись существует (§14).
+                // Missing access is a request error, not a failure of the
+                // store: retrying will not fix it, and a `500` would send
+                // the owner looking for a fault where none exists. Someone else's access
+                // deliberately returns the same response — otherwise it would reveal
+                // to an outsider that such a record exists (§14).
                 match error {
                     iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
-                        what: "доступ к брокеру",
+                        what: "broker access",
                         id: id.to_string(),
                     },
                     other => store_error(other),
@@ -633,7 +633,7 @@ impl BrokerChannelFactory for SqliteAdapter {
     async fn open(&self, owner: OwnerId, broker: &str) -> Result<Arc<dyn BrokerChannel>, AppError> {
         let code = BrokerCode::parse(broker).ok_or_else(|| AppError::Invalid {
             field: "broker".to_owned(),
-            expected: "поддерживаемый код брокера".to_owned(),
+            expected: "a supported broker code".to_owned(),
             actual: broker.to_owned(),
         })?;
         if code.as_str() != "tinkoff" {
@@ -657,13 +657,13 @@ impl BrokerChannelFactory for SqliteAdapter {
                     });
                 let Some(first) = active.next() else {
                     return Err(AppError::NotConfigured {
-                        what: "доступ к брокеру",
+                        what: "broker access",
                     });
                 };
                 if active.next().is_some() {
                     return Err(AppError::Invalid {
                         field: "broker".to_owned(),
-                        expected: "ровно один действующий доступ".to_owned(),
+                        expected: "exactly one active access".to_owned(),
                         actual: broker,
                     });
                 }
@@ -687,33 +687,33 @@ impl BrokerChannelFactory for SqliteAdapter {
         let environment =
             Environment::parse(&access.environment).ok_or_else(|| AppError::Invalid {
                 field: "environment".to_owned(),
-                expected: "prod или sandbox".to_owned(),
+                expected: "prod or sandbox".to_owned(),
                 actual: access.environment.clone(),
             })?;
         let token =
             open(&key, &SealedToken::of(access.nonce, access.ciphertext)).map_err(|_| {
                 AppError::NotConfigured {
-                    what: "доступ к брокеру",
+                    what: "broker access",
                 }
             })?;
         let client = TinkoffClient::new(environment, token)
-            .map_err(|error| AppError::Store(format!("клиент брокера не создан: {error}")))?;
-        // Словарь читается здесь, а не в разборе: `iaam-broker` про
-        // хранилище не знает намеренно (см. его `lib.rs`), и связывает
-        // их адаптер — тем же приёмом, что уже сделан для SQLite.
+            .map_err(|error| AppError::Store(format!("failed to create broker client: {error}")))?;
+        // The dictionary is read here, not during parsing: `iaam-broker` intentionally
+        // knows nothing about storage (see its `lib.rs`), and the adapter links
+        // them — using the same approach already used for SQLite.
         let code = code.clone();
         let rows = self
             .blocking(move |store| store.broker_operation_kinds(&code).map_err(store_error))
             .await?;
         let (dictionary, unreadable) = OperationKindDictionary::build(rows);
-        // Строка словаря, которую эта сборка не понимает, означает, что
-        // база новее кода. Молча её отбросив, канал превратил бы
-        // известный код брокера в неизвестный — то есть выдал бы отказ
-        // импорта, из текста которого о рассинхронизации не догадаться.
+        // A dictionary row not understood by this build means that the
+        // database is newer than the code. Silently discarding it would turn
+        // a known broker code into an unknown one — that is, it would reject
+        // the import without its message indicating the mismatch.
         if let Some(first) = unreadable.first() {
             return Err(AppError::Invalid {
                 field: "broker_operation_kinds".to_owned(),
-                expected: "вид операции, известный этой сборке".to_owned(),
+                expected: "an operation type known to this build".to_owned(),
                 actual: format!("{} -> {}", first.source_kind, first.kind),
             });
         }
@@ -765,7 +765,7 @@ impl ClassificationRuleStore for SqliteAdapter {
             }
             .map_err(|error| match error {
                 iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
-                    what: "действующее правило классификации",
+                    what: "an active classification rule",
                     id: replaces.map_or_else(String::new, |id| id.to_string()),
                 },
                 iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
@@ -784,7 +784,7 @@ impl ClassificationRuleStore for SqliteAdapter {
                 .retire_rule(owner, ClassificationRuleId(id))
                 .map_err(|error| match error {
                     iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
-                        what: "действующее правило классификации",
+                        what: "an active classification rule",
                         id: id.to_string(),
                     },
                     other => store_error(other),
@@ -794,10 +794,10 @@ impl ClassificationRuleStore for SqliteAdapter {
     }
 }
 
-/// Среда порта в среду брокера.
+/// Convert the port environment to the broker environment.
 ///
-/// Перевод, а не общий тип: транспорт зовёт порт и про `iaam-broker`
-/// не знает — заслон архитектуры это проверяет.
+/// A conversion, not a shared type: the transport invokes the port and knows nothing about `iaam-broker`
+/// — the architecture guard checks this.
 const fn broker_environment(environment: BrokerEnvironment) -> Environment {
     match environment {
         BrokerEnvironment::Prod => Environment::Prod,
@@ -819,21 +819,21 @@ impl TokenAdmin for SqliteAdapter {
         .await
     }
 
-    /// Выпуск токена: случайные 32 байта, хеш в базу, сам токен наружу.
+    /// Token issuance: 32 random bytes, the hash goes into the database, the token itself goes out.
     ///
-    /// 32 байта из системного источника, а не «достаточно длинная»
-    /// строка: токен — это ключ от чужих денег, и стойкость здесь
-    /// задаётся один раз на всю систему. Токен возвращается открытым
-    /// ровно один раз — в базе остаётся только хеш, и утечка файла базы
-    /// не отдаёт доступ к API (§14).
+    /// 32 bytes from the system source, not a «long enough»
+    /// string: a token is the key to someone else's money, and its strength here
+    /// is set once for the entire system. The token is returned in plaintext
+    /// exactly once — only the hash remains in the database, so a leak of the database file
+    /// does not grant access to the API (§14).
     async fn issue_token(
         &self,
         owner: OwnerId,
         label: String,
         scope: Scope,
     ) -> Result<IssuedToken, AppError> {
-        // Секрет порождается до ухода в блокирующую задачу: отказ
-        // источника случайности не должен выглядеть как отказ базы.
+        // The secret is generated before entering the blocking task: failure
+        // of the randomness source must not look like a database failure.
         let token = secret_hex(32)?;
         let hash = hash_token(&token);
         let record = TokenRecord {
@@ -874,13 +874,13 @@ impl TokenAdmin for SqliteAdapter {
     async fn revoke_token(&self, owner: OwnerId, id: Uuid) -> Result<(), AppError> {
         self.blocking(move |store| {
             store.revoke_token(owner, id).map_err(|error| {
-                // Отсутствующий токен — ошибка запроса, а не сбой
-                // хранилища: повтор её не исправит. Чужой токен даёт
-                // тот же ответ намеренно — иначе он сообщал бы
-                // постороннему, что такая запись существует (§14).
+                // A missing token is a request error, not a storage
+                // failure: retrying will not fix it. A token belonging to someone else deliberately produces
+                // the same response — otherwise it would tell
+                // an outsider that such a record exists (§14).
                 match error {
                     iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
-                        what: "токен",
+                        what: "token",
                         id: id.to_string(),
                     },
                     other => store_error(other),
@@ -921,7 +921,7 @@ mod tests {
         assert!(matches!(
             &unknown,
             AppError::NotFound {
-                what: "инструмент по коду",
+                what: "instrument by code",
                 id,
             } if id == "isin:RU000A"
         ));
@@ -932,18 +932,18 @@ mod tests {
                 expected,
                 actual,
             } if field == "on"
-                && expected == "дата в интервале действия кода 2020-01-01..2025-12-31"
-                && actual == "isin:RU000A на 2026-08-25"
+                && expected == "date within code validity interval 2020-01-01..2025-12-31"
+                && actual == "isin:RU000A on 2026-08-25"
         ));
         assert!(matches!(
             &ambiguous,
             AppError::DirectoryInvariant { detail, .. }
                 if detail
-                    == "код ticker:ABC на 2026-08-25 разрешается в 2 инструментов: \
-                       триггер instrument_aliases_do_not_overlap пробит"
+                    == "code ticker:ABC on 2026-08-25 resolves to 2 instruments: \
+                       the instrument_aliases_do_not_overlap trigger has been breached"
         ));
         let message = ambiguous.to_string();
-        assert!(message.contains("инвариант справочника"));
+        assert!(message.contains("reference data invariant"));
         assert!(message.contains("ticker:ABC"));
         assert!(message.contains("2026-08-25"));
         assert!(message.contains("2"));

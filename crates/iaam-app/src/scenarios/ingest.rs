@@ -1,4 +1,4 @@
-//! Приёмка операций.
+//! Operation ingestion.
 
 use iaam_core::event::Event;
 use iaam_core::event::corporate_action::CorporateAction;
@@ -16,15 +16,15 @@ use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::{Principal, Recorded};
 
-/// Отправка пачки операций.
+/// Submitting a batch of operations.
 ///
-/// Вердикт выдаётся **на каждую строку**: одна непонятая операция
-/// не отменяет остальные (§10.1). Порядковые номера выдаются
-/// хранилищем по дате, поэтому две операции одного дня не сливаются
-/// в одну позицию порядка.
+/// A verdict is issued **for each line**: one unrecognised operation
+/// does not cancel the others (§10.1). Sequence numbers are assigned
+/// by the store by date, so two operations on the same day do not merge
+/// into a single ordering position.
 ///
-/// Разбор живёт здесь, запись — ниже, в [`submit_candidates`]: у входа
-/// для журнальных фактов разбор свой, а журнал и его заслоны те же.
+/// Parsing lives here, writing is below, in [`submit_candidates`]: the input
+/// for journal facts has its own parser, while the journal and its safeguards are shared.
 pub async fn submit_operations(
     services: &AppServices,
     principal: &Principal,
@@ -47,11 +47,11 @@ pub async fn submit_operations(
     submit_candidates(services, principal, "operation", candidates).await
 }
 
-/// Приёмка журнальных фактов с обогащением амортизации графиком.
+/// Ingestion of journal facts with schedule-based depreciation enrichment.
 ///
-/// График и координату знания читает приложение. Нормализатор получает
-/// только готовое [`JournalEventEnrichment`], поэтому остаётся чистой
-/// функцией и не зависит от справочника или хранилища.
+/// The application reads the schedule and the knowledge coordinate. The normaliser receives
+/// only a prepared [`JournalEventEnrichment`], so it remains a pure
+/// function and does not depend on reference data or storage.
 pub async fn submit_journal_events(
     services: &AppServices,
     principal: &Principal,
@@ -115,20 +115,20 @@ pub async fn submit_journal_events(
     submit_candidates(services, principal, "fact", candidates).await
 }
 
-/// Приёмка готовых кандидатов: право отправки, форма, запись, вердикт.
+/// Ingestion of prepared candidates: submission permission, form, writing, verdict.
 ///
-/// Нижний уровень, общий для всех входов. Разбор у каждого входа свой —
-/// операции, CSV, журнальные факты, — а вот право отправки, структурная
-/// проверка ядра и запись в append-only журнал обязаны быть одни: три
-/// копии этого куска разошлись бы молча, и разошлись бы именно в том
-/// месте, где ошибка уже неисправима.
+/// The lower layer shared by all inputs. Each input has its own parsing —
+/// operations, CSV, journal facts, — but submission permission, structural
+/// core validation and writing to the append-only journal must be shared: three
+/// copies of this code would silently diverge, precisely at the
+/// point where an error can no longer be corrected.
 ///
-/// Проверка права стоит здесь, а не у каждого входа, ровно поэтому:
-/// вход, который забудет её позвать, записать ничего не сможет.
+/// The permission check is here, rather than at each input, for exactly this reason:
+/// an input that forgets to call it cannot write anything.
 ///
-/// `field` — имя поля, которым отказ называется клиенту: у операций это
-/// `operation`, у журнальных фактов — своё. Отказ, называющий чужое имя
-/// поля, отправляет клиента чинить то, чего он не отправлял (§10.4).
+/// `field` is the field name used to identify the rejection to the client: for operations it is
+/// `operation`, while journal facts have their own. A rejection naming an unrelated
+/// field sends the client to fix something they did not submit (§10.4).
 pub async fn submit_candidates(
     services: &AppServices,
     principal: &Principal,
@@ -138,16 +138,16 @@ pub async fn submit_candidates(
     if !principal.scope.may_submit() {
         return Err(AppError::Invalid {
             field: "scope".into(),
-            expected: "право отправки операций".into(),
+            expected: "permission to submit operations".into(),
             actual: principal.scope.code().to_owned(),
         });
     }
 
     let mut verdicts = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        // Порядковый номер внутри дня назначает хранилище в той же
-        // транзакции, что и вставку: «узнать следующий» отдельным
-        // вызовом — гонка, дающая двум событиям один номер (§4.8).
+        // The sequence number within a day is assigned by the store in the same
+        // transaction as the insert: calling «get next» separately is
+        // a race that gives two events the same number (§4.8).
         let event = match candidate {
             Ok(event) => event,
             Err(rejection) => {
@@ -160,10 +160,10 @@ pub async fn submit_candidates(
     Ok(verdicts)
 }
 
-/// Записать одного кандидата и назвать исход.
+/// Write one candidate and report the outcome.
 ///
-/// Структурная проверка ядра идёт до записи: журнал append-only,
-/// и неверное по форме событие из него уже не убрать (§4.8).
+/// Structural core validation happens before writing: the journal is append-only,
+/// and a malformed event cannot then be removed from it (§4.8).
 pub async fn record_candidate(
     services: &AppServices,
     event: Event,
@@ -173,7 +173,7 @@ pub async fn record_candidate(
         return Ok(Verdict::Rejected {
             rejection: Rejection {
                 field: field.to_owned(),
-                expected: "форма события, соответствующая его типу".into(),
+                expected: "event shape matching its type".into(),
                 actual: error.to_string(),
             },
         });
@@ -188,8 +188,8 @@ pub async fn record_candidate(
         None => Verdict::Rejected {
             rejection: Rejection {
                 field: "storage".into(),
-                expected: "запись события".into(),
-                actual: "хранилище не вернуло результата".into(),
+                expected: "event record".into(),
+                actual: "store returned no result".into(),
             },
         },
     })

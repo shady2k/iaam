@@ -1,7 +1,7 @@
-//! Сценарии статусов сверки.
+//! Reconciliation status scenarios.
 //!
-//! Здесь нет расчётов: срез журнала передаётся ядру, а наружу возвращаются
-//! его статусы, исходы утверждений и основания повышения.
+//! There are no calculations here: a journal slice is passed to the core, and
+//! its statuses, assertion outcomes, and grounds for escalation are returned.
 
 use iaam_core::dates::{EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
@@ -17,7 +17,7 @@ use crate::AppServices;
 use crate::error::AppError;
 use crate::ports::{Principal, Recorded};
 
-/// Баланс, названный владельцем. Состав намеренно ограничен §10.4.
+/// Balance stated by the owner. Its composition is deliberately limited by §10.4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerBalance {
     pub account: AccountId,
@@ -28,7 +28,7 @@ pub struct OwnerBalance {
     pub raw_hash: RawHash,
 }
 
-/// Строит статусы по интервалам, пересекающим запрошенный диапазон.
+/// Builds statuses for intervals intersecting the requested range.
 pub async fn statuses(
     services: &AppServices,
     principal: &Principal,
@@ -39,7 +39,7 @@ pub async fn statuses(
     let Some(period) = AssertionPeriod::between(from, to) else {
         return Err(AppError::Invalid {
             field: "period".into(),
-            expected: "from не позже to".into(),
+            expected: "from no later than to".into(),
             actual: format!("{from}..{to}"),
         });
     };
@@ -59,7 +59,7 @@ pub async fn statuses(
         .collect())
 }
 
-/// Записывает только денежные и позиционные утверждения владельца.
+/// Records only the owner's cash and position assertions.
 pub async fn record_owner_balance(
     services: &AppServices,
     principal: &Principal,
@@ -68,7 +68,7 @@ pub async fn record_owner_balance(
     if !principal.scope.may_submit() {
         return Err(AppError::Invalid {
             field: "scope".into(),
-            expected: "право отправки операций".into(),
+            expected: "right to submit transactions".into(),
             actual: principal.scope.code().to_owned(),
         });
     }
@@ -99,8 +99,8 @@ pub async fn record_owner_balance(
     if claims.is_empty() {
         return Err(AppError::Invalid {
             field: "balance".into(),
-            expected: "cash или positions".into(),
-            actual: "пусто".into(),
+            expected: "cash or positions".into(),
+            actual: "empty".into(),
         });
     }
     let events = claims

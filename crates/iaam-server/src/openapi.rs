@@ -1,9 +1,9 @@
-//! Спека OpenAPI, порождённая из типов обработчиков (§17.1).
+//! OpenAPI spec generated from handler types (§17.1).
 //!
-//! Порождение устраняет расхождение **схемы данных**, но не поведения:
-//! коды ответов в рантайме, требования аутентификации и фактическая
-//! сериализация собственных типов остаются вне генерации. Поэтому
-//! существуют чёрноящичные контрактные тесты (задача 15).
+//! Generation eliminates **data schema** discrepancies, but not behavioural ones:
+//! runtime response codes, authentication requirements, and actual
+//! serialisation of custom types remain outside generation. Therefore,
+//! black-box contract tests exist (task 15).
 
 use utoipa::Modify;
 use utoipa::OpenApi;
@@ -32,8 +32,8 @@ use crate::dto::{
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 
-/// Схема аутентификации. Объявляется отдельно: `utoipa` порождает её
-/// из типов, а требование `Bearer` типом не выражается.
+/// Authentication scheme. Declared separately: `utoipa` generates it
+/// from types, but the `Bearer` requirement cannot be expressed by a type.
 pub struct BearerSecurity;
 
 impl Modify for BearerSecurity {
@@ -45,9 +45,7 @@ impl Modify for BearerSecurity {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("opaque")
-                        .description(Some(
-                            "Агентский токен. Выдаётся владельцем, отзывается им же (§14).",
-                        ))
+                        .description(Some("Agent token. Issued and revoked by the owner (§14)."))
                         .build(),
                 ),
             );
@@ -60,7 +58,7 @@ impl Modify for BearerSecurity {
     info(
         title = "IAAM",
         version = "1.0.0",
-        description = "Учёт инвестиций. Этап 1: денежные потоки и XIRR до налога."
+        description = "Investment accounting. Stage 1: cash flows and pre-tax XIRR."
     ),
     modifiers(&BearerSecurity),
     components(schemas(

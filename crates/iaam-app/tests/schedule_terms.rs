@@ -1,4 +1,4 @@
-//! Синхронизация условий выпуска: незнание доходит до базы незнанием.
+//! Synchronisation of issue terms: unknown information reaches the database as unknown.
 
 use std::sync::Mutex;
 
@@ -34,7 +34,7 @@ struct Body(&'static str, Mutex<Vec<String>>);
 #[async_trait]
 impl OutboundHttp for Body {
     async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError> {
-        self.1.lock().expect("журнал").push(request.url());
+        self.1.lock().expect("log").push(request.url());
         Ok(OutboundResponse {
             status: 200,
             body: self.0.as_bytes().to_vec(),
@@ -44,42 +44,42 @@ impl OutboundHttp for Body {
 }
 
 fn store() -> (SqliteStore, InstrumentId) {
-    let mut store = SqliteStore::open_in_memory().expect("база в памяти");
+    let mut store = SqliteStore::open_in_memory().expect("in-memory database");
     let instrument = InstrumentId::new_random();
     store
         .upsert_instrument(&InstrumentRecord {
             id: instrument,
             kind: Some(InstrumentKind::Bond),
             symbol: "SU46020RMFS2".to_owned(),
-            title: "ОФЗ 46020".to_owned(),
+            title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент заведён");
+        .expect("instrument created");
     store
         .extend_market_source_codes(
             SOURCE_ID,
-            "профиль источника 2026-08-27",
+            "source profile 2026-08-27",
             &[SourceCodeEntry {
                 domain: "currency".to_owned(),
                 source_code: "SUR".to_owned(),
                 meaning: "RUB".to_owned(),
             }],
         )
-        .expect("словарь заселён");
+        .expect("dictionary populated");
     (store, instrument)
 }
 
 #[tokio::test]
 async fn unknown_day_count_reaches_the_database_as_null() {
-    // Источник не даёт ни базы начисления дней, ни календаря. Значение
-    // по умолчанию дало бы правдоподобно неверный НКД, которого не
-    // покажет ни один тест на бумаге с целым числом периодов.
+    // The source provides neither a day-count basis nor a calendar. The default
+    // would produce a plausibly incorrect accrued coupon interest that no test
+    // using a bond with a whole number of periods would reveal.
     let (mut store, instrument) = store();
     let transport = Body(DESCRIPTION, Mutex::new(Vec::new()));
     sync_issue_terms(&mut store, &transport, instrument, "SU46020RMFS2")
         .await
-        .expect("синхронизация условий");
+        .expect("term synchronisation");
 
     let terms = store
         .issue_terms_at_or_before(
@@ -87,8 +87,8 @@ async fn unknown_day_count_reaches_the_database_as_null() {
             SOURCE_ID,
             "2100-01-01T00:00:00Z",
         )
-        .expect("чтение")
-        .expect("условия найдены");
+        .expect("read")
+        .expect("terms found");
     assert_eq!(terms.day_count, None);
     assert_eq!(terms.calendar, None);
     assert_eq!(terms.effective_from, None);
@@ -96,42 +96,42 @@ async fn unknown_day_count_reaches_the_database_as_null() {
 
 #[tokio::test]
 async fn the_source_currency_code_is_stored_verbatim() {
-    // SUR здесь и RUB в графике — два кода одного источника на одну
-    // валюту. Хранится код источника, переводит его словарь.
+    // SUR here and RUB in the schedule are two codes used by the same source for the same
+    // currency. The source code is stored and translated by the dictionary.
     let (mut store, instrument) = store();
     let transport = Body(DESCRIPTION, Mutex::new(Vec::new()));
     sync_issue_terms(&mut store, &transport, instrument, "SU46020RMFS2")
         .await
-        .expect("синхронизация условий");
+        .expect("term synchronisation");
     let terms = store
         .issue_terms_at_or_before(
             &instrument.inner().to_string(),
             SOURCE_ID,
             "2100-01-01T00:00:00Z",
         )
-        .expect("чтение")
-        .expect("условия найдены");
+        .expect("read")
+        .expect("terms found");
     assert_eq!(terms.face_currency_code.as_deref(), Some("SUR"));
 }
 
 #[tokio::test]
 async fn both_default_flags_survive_the_trip() {
-    // Объявленный дефолт делает будущий график недостоверным. Потерять
-    // признак по дороге значит посчитать метрику так, будто выплаты
-    // состоятся.
+    // A declared default makes the future schedule unreliable. Losing
+    // the flag along the way means calculating the metric as though the payments
+    // will be made.
     let (mut store, instrument) = store();
     let transport = Body(DESCRIPTION, Mutex::new(Vec::new()));
     sync_issue_terms(&mut store, &transport, instrument, "SU46020RMFS2")
         .await
-        .expect("синхронизация условий");
+        .expect("term synchronisation");
     let terms = store
         .issue_terms_at_or_before(
             &instrument.inner().to_string(),
             SOURCE_ID,
             "2100-01-01T00:00:00Z",
         )
-        .expect("чтение")
-        .expect("условия найдены");
+        .expect("read")
+        .expect("terms found");
     assert!(!terms.default_declared);
     assert!(terms.default_technical);
 }

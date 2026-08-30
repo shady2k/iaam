@@ -1,8 +1,8 @@
-//! Аутентификация (§14).
+//! Authentication (§14).
 //!
-//! Аутентификация с первого дня: отложенная не добавляется никогда.
-//! В базе лежит **хеш** токена; сравнение — за постоянное время, чтобы
-//! время ответа не выдавало правильный префикс.
+//! Authentication from day one: if deferred, it is never added.
+//! The database stores the token **hash**; comparison is constant-time so that
+//! response time does not reveal the correct prefix.
 
 use axum::extract::{Request, State};
 use axum::http::header::AUTHORIZATION;
@@ -13,16 +13,16 @@ use iaam_app::ports::Principal;
 use crate::ServerState;
 use crate::error::ApiFailure;
 
-/// Хеш токена. Живёт в `iaam-app`, потому что тот же хеш считает
-/// адаптер при выпуске токена, а до транспорта ему не дотянуться:
-/// зависимость идёт сверху вниз. Переэкспорт, а не вторая реализация —
-/// разойдясь, они дали бы выпущенный токен, который не находится
-/// при проверке, и искать причину пришлось бы не там, где она есть.
-/// Обоснование выбора SHA-256 и отсутствия сравнения за постоянное
-/// время — в документации самой функции.
+/// Token hash. Lives in `iaam-app` because the adapter computes the same hash
+/// when issuing a token, but cannot reach the transport layer from there:
+/// dependencies run from top to bottom. This is a re-export, not a second implementation —
+/// if they diverged, they could produce an issued token that cannot be found
+/// during verification, forcing the cause to be sought in the wrong place.
+/// The rationale for choosing SHA-256 and not using constant-time
+/// comparison is in the function's own documentation.
 pub use iaam_app::tokens::hash_token;
 
-/// Извлечение токена из заголовка `Authorization: Bearer …`.
+/// Extracting the token from the `Authorization: Bearer …` header.
 #[must_use]
 pub fn bearer(request: &Request) -> Option<String> {
     let value = request.headers().get(AUTHORIZATION)?.to_str().ok()?;
@@ -33,11 +33,11 @@ pub fn bearer(request: &Request) -> Option<String> {
     Some(token.to_owned())
 }
 
-/// Слой аутентификации и ограничения частоты.
+/// Authentication and rate-limiting layer.
 ///
-/// Журнал использования токена пишется на **каждый** запрос, включая
-/// отклонённый: попытки с отозванным токеном — это то, ради чего
-/// журнал и нужен (§14).
+/// Token usage is logged for **every** request, including
+/// rejected ones: attempts using a revoked token are precisely why
+/// the log is needed (§14).
 pub async fn authenticate(
     State(state): State<ServerState>,
     mut request: Request,
@@ -50,7 +50,7 @@ pub async fn authenticate(
     let hash = hash_token(&token);
 
     if !state.limiter.allow(&hash) {
-        tracing::warn!(%route, "превышена частота запросов");
+        tracing::warn!(%route, "request rate exceeded");
         return Err(ApiFailure::too_many_requests());
     }
 
@@ -62,11 +62,11 @@ pub async fn authenticate(
         .map_err(ApiFailure::from)?;
 
     let Some(principal) = principal else {
-        // Неизвестный токен НЕ пишется в журнал использования: журнал
-        // ведётся по токену, а токена здесь нет. Запись на каждую
-        // попытку превращала бы поток случайных строк в неограниченный
-        // рост базы через единственный незащищённый путь (§14).
-        tracing::warn!(%route, "предъявлен неизвестный токен");
+        // An unknown token is NOT written to the usage log: the log
+        // is maintained per token, and there is no token here. Recording every
+        // attempt would turn a stream of random strings into unbounded
+        // database growth through the only unprotected path (§14).
+        tracing::warn!(%route, "unknown token presented");
         return Err(ApiFailure::unauthorized());
     };
 
@@ -80,7 +80,7 @@ pub async fn authenticate(
     Ok(next.run(request).await)
 }
 
-/// Извлечение опознанного носителя токена в обработчике.
+/// Extracting the recognised token bearer in a handler.
 pub fn principal(request: &Request) -> Result<Principal, ApiFailure> {
     request
         .extensions()
@@ -94,11 +94,11 @@ mod tests {
 
     #[test]
     fn the_hash_is_stable_and_does_not_contain_the_token() {
-        let hash = hash_token("секрет");
-        assert_eq!(hash, hash_token("секрет"));
+        let hash = hash_token("secret");
+        assert_eq!(hash, hash_token("secret"));
         assert_eq!(hash.len(), 64);
-        assert!(!hash.contains("секрет"));
-        assert_ne!(hash, hash_token("секрет "));
+        assert!(!hash.contains("secret"));
+        assert_ne!(hash, hash_token("secret "));
     }
 
     #[test]

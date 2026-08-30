@@ -1,4 +1,4 @@
-//! Метаморфное свойство: повторная синхронизация ничего не меняет.
+//! Metamorphic property: repeated synchronisation changes nothing.
 
 use std::sync::{Arc, Mutex};
 
@@ -52,7 +52,7 @@ struct Pages(Mutex<Vec<&'static str>>);
 #[async_trait]
 impl OutboundHttp for Pages {
     async fn send(&self, _request: HttpRequest) -> Result<OutboundResponse, AppError> {
-        let mut bodies = self.0.lock().expect("страницы");
+        let mut bodies = self.0.lock().expect("pages");
         let body = if bodies.is_empty() {
             EMPTY
         } else {
@@ -67,22 +67,22 @@ impl OutboundHttp for Pages {
 }
 
 fn store() -> (SqliteStore, InstrumentId) {
-    let mut store = SqliteStore::open_in_memory().expect("база в памяти");
+    let mut store = SqliteStore::open_in_memory().expect("in-memory database");
     let instrument = InstrumentId::new_random();
     store
         .upsert_instrument(&InstrumentRecord {
             id: instrument,
             kind: Some(InstrumentKind::Bond),
             symbol: "SU46020RMFS2".to_owned(),
-            title: "ОФЗ 46020".to_owned(),
+            title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент заведён");
+        .expect("instrument created");
     store
         .extend_market_source_codes(
             SOURCE_ID,
-            "профиль источника 2026-08-27",
+            "source profile 2026-08-27",
             &[
                 SourceCodeEntry {
                     domain: "currency".to_owned(),
@@ -96,7 +96,7 @@ fn store() -> (SqliteStore, InstrumentId) {
                 },
             ],
         )
-        .expect("словарь заселён");
+        .expect("dictionary populated");
     (store, instrument)
 }
 
@@ -116,7 +116,7 @@ fn fixture_services() -> (
     ContourDefinition,
 ) {
     let adapter = Arc::new(SqliteAdapter::new(
-        SqliteStore::open_in_memory().expect("база приложения"),
+        SqliteStore::open_in_memory().expect("application database"),
     ));
     let services = AppServices::new(
         adapter.clone(),
@@ -150,12 +150,12 @@ async fn seed_report_position(
             },
         )
         .await
-        .expect("счёт");
+        .expect("account");
     services
         .store
         .insert_contour_version(owner, contour.clone(), "bond".to_owned(), vec![account])
         .await
-        .expect("контур");
+        .expect("scope");
     let operation = SubmittedOperation {
         account,
         kind: OperationKind::OpeningPosition {
@@ -182,13 +182,13 @@ async fn seed_report_position(
             source: SourceId::new_random(),
         },
     )
-    .expect("нормализация")
+    .expect("normalisation")
     .event;
     services
         .store
         .append_events(vec![event])
         .await
-        .expect("событие");
+        .expect("event");
 }
 
 async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
@@ -205,15 +205,15 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
             id: instrument,
             kind: Some(InstrumentKind::Bond),
             symbol: "SU46020RMFS2".to_owned(),
-            title: "ОФЗ 46020".to_owned(),
+            title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("рыночный инструмент");
+        .expect("market instrument");
     store
         .extend_market_source_codes(
             SOURCE_ID,
-            "профиль источника",
+            "source profile",
             &[
                 SourceCodeEntry {
                     domain: "currency".to_owned(),
@@ -227,7 +227,7 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
                 },
             ],
         )
-        .expect("словарь источника");
+        .expect("source dictionary");
     let run = store
         .begin_run(
             series,
@@ -235,7 +235,7 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
             to,
             time::OffsetDateTime::now_utc() + Duration::hours(1),
         )
-        .expect("рыночный запуск");
+        .expect("market run");
     store
         .record_prices(
             &run,
@@ -254,10 +254,10 @@ async fn seed_market_price(services: &AppServices, instrument: InstrumentId) {
                 executability: "executable".to_owned(),
             }],
         )
-        .expect("рыночная цена");
+        .expect("market price");
     store
         .finish_run(&run, RunOutcome::Succeeded, Some(Coverage { from, to }))
-        .expect("завершение рыночного запуска");
+        .expect("market run completion");
 }
 
 async fn sync_fixture_schedule(services: &AppServices, instrument: InstrumentId) {
@@ -271,7 +271,7 @@ async fn sync_fixture_schedule(services: &AppServices, instrument: InstrumentId)
         },
     )
     .await
-    .expect("синхронизация графика");
+    .expect("schedule synchronisation");
 }
 
 fn principal(owner: OwnerId) -> Principal {
@@ -284,10 +284,10 @@ fn principal(owner: OwnerId) -> Principal {
 
 #[tokio::test]
 async fn a_second_sync_of_an_unchanged_schedule_changes_nothing() {
-    // Синхронизация — не событие: если источник прислал то же самое,
-    // нового снимка быть не должно, и чтение на любую координату обязано
-    // дать тот же ответ. Иначе ежедневный прогон раздувает ряд и делает
-    // ось «когда мы узнали» бессмысленной.
+    // Synchronisation is not an event: if the source sent the same data,
+    // there must be no new snapshot, and reading at any coordinate must
+    // return the same response. Otherwise, the daily run bloats the series and makes
+    // the «when we learnt» axis meaningless.
     let (mut store, instrument) = store();
     let request = || ScheduleSyncRequest {
         instrument,
@@ -296,29 +296,29 @@ async fn a_second_sync_of_an_unchanged_schedule_changes_nothing() {
 
     sync_schedule(&mut store, &Pages(Mutex::new(vec![WHOLE])), request())
         .await
-        .expect("первый прогон");
+        .expect("first run");
     let after_first = store
         .schedule_at_or_before(
             &instrument.inner().to_string(),
             SOURCE_ID,
             "2100-01-01T00:00:00Z",
         )
-        .expect("чтение")
-        .expect("снимок найден");
+        .expect("read")
+        .expect("snapshot found");
 
     sync_schedule(&mut store, &Pages(Mutex::new(vec![WHOLE])), request())
         .await
-        .expect("второй прогон");
+        .expect("second run");
     let after_second = store
         .schedule_at_or_before(
             &instrument.inner().to_string(),
             SOURCE_ID,
             "2100-01-01T00:00:00Z",
         )
-        .expect("чтение")
-        .expect("снимок найден");
+        .expect("read")
+        .expect("snapshot found");
 
-    assert_eq!(after_first, after_second, "повтор изменил ответ");
+    assert_eq!(after_first, after_second, "repeat changed the response");
 }
 
 #[tokio::test]
@@ -338,11 +338,11 @@ async fn resyncing_changes_no_bond_attribute_at_a_fixed_coordinate() {
     };
     let before = returns(&services, &principal(owner), &query)
         .await
-        .expect("первый отчёт");
+        .expect("first report");
     sync_fixture_schedule(&services, instrument).await;
     let after = returns(&services, &principal(owner), &query)
         .await
-        .expect("второй отчёт");
+        .expect("second report");
 
     assert_eq!(before.bond_attributes, after.bond_attributes);
     assert_eq!(before.bond_attributes.len(), 1);

@@ -285,7 +285,7 @@ async fn partial_operations_do_not_create_control_assertions() {
             .clone(),
         quarantined: vec![iaam_app::ports::Quarantined {
             raw: serde_json::json!({"row": "bad"}),
-            reason: "неполная выгрузка".to_owned(),
+            reason: "incomplete export".to_owned(),
         }],
     });
 

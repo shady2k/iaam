@@ -1,7 +1,7 @@
-//! Справочные ряды рынка для транспорта и агента.
+//! Market reference series for transport and the agent.
 //!
-//! Сценарий владеет чтением `MarketStore` и преобразованием его строк в
-//! типы приложения. Сервер не знает ни SQLite, ни форматов источников.
+//! The scenario owns the reading of `MarketStore` and conversion of its rows into
+//! application types. The server knows neither SQLite nor the source formats.
 
 use crate::AppServices;
 use crate::error::AppError;
@@ -286,10 +286,7 @@ fn key_rate_view(
         })
         .max_by_key(|observation| observation.observed_at)
         .ok_or_else(|| {
-            invalid_value(
-                "key_rate",
-                "интервал не имеет исходного наблюдения".to_owned(),
-            )
+            invalid_value("key_rate", "interval has no source observation".to_owned())
         })?;
     let inferred = matches!(interval.boundary, Boundary::InferredAcrossNonTradingDays);
     Ok(MarketKeyRateView {
@@ -313,7 +310,7 @@ fn validate_range(from: Date, to: Date) -> Result<(), AppError> {
     if to < from {
         return Err(AppError::Invalid {
             field: "to".to_owned(),
-            expected: "дата не раньше from".to_owned(),
+            expected: "date no earlier than from".to_owned(),
             actual: to.to_string(),
         });
     }
@@ -346,7 +343,7 @@ fn format_timestamp(value: OffsetDateTime) -> Result<String, AppError> {
 fn invalid_value(field: &'static str, actual: String) -> AppError {
     AppError::Invalid {
         field: field.to_owned(),
-        expected: "значение в формате источника".to_owned(),
+        expected: "value in source format".to_owned(),
         actual,
     }
 }
@@ -396,7 +393,7 @@ mod tests {
             },
             None,
         )
-        .expect("строка миграции допустима для витрины");
+        .expect("migration row is valid for the view");
 
         assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
         assert_eq!(view.quotation_basis_status, QuotationBasisStatus::NotProven);
@@ -412,7 +409,7 @@ mod tests {
             ),
             None,
         )
-        .expect("строка цены");
+        .expect("price row");
 
         assert_eq!(view.quotation_basis, QuotationBasis::PercentOfRemainingFace);
         assert_eq!(view.quotation_basis_status, QuotationBasisStatus::Proven);
@@ -425,7 +422,7 @@ mod tests {
             price_row("money_per_unit", "iss:engines/stock/markets/bonds"),
             None,
         )
-        .expect("строка цены");
+        .expect("price row");
 
         assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
         assert_eq!(
@@ -437,8 +434,7 @@ mod tests {
 
     #[test]
     fn missing_evidence_has_not_proven_status() {
-        let view =
-            price_view(price_row("money_per_unit", "test:market"), None).expect("строка цены");
+        let view = price_view(price_row("money_per_unit", "test:market"), None).expect("price row");
 
         assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
         assert_eq!(view.quotation_basis_status, QuotationBasisStatus::NotProven);

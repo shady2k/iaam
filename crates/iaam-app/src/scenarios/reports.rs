@@ -1,4 +1,4 @@
-//! Отчёты.
+//! Reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,7 +29,7 @@ use crate::AppServices;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::Principal;
-/// Запрос отчёта о доходности.
+/// Yield report request.
 #[derive(Debug, Clone)]
 pub struct ReturnsQuery {
     pub contour: ContourId,
@@ -43,14 +43,14 @@ pub struct ReturnsQuery {
 struct ReportInputs<'a> {
     fx: &'a FxTable,
     market_prices: &'a [PriceCandidate],
-    /// График на координату знания, по инструменту.
+    /// Schedule at the knowledge coordinate, by instrument.
     schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
-    /// Наблюдённый НКД на одну бумагу, с привязкой к площадке и дате сделки.
+    /// Observed accrued coupon interest per security, tied to the venue and trade date.
     accrued_observations: &'a BTreeMap<(InstrumentId, CoreVenue, Date), PerUnitAmount>,
     knowledge_as_of: OffsetDateTime,
 }
 
-/// Отчёт по контуру.
+/// Report for a scope.
 pub async fn returns(
     services: &AppServices,
     principal: &Principal,
@@ -67,8 +67,8 @@ pub async fn returns(
                 id: query.contour.0.to_string(),
             })?,
     };
-    // Контур загружается ВМЕСТЕ с владельцем: чужой контур не находится,
-    // а не находится и отклоняется потом (§14).
+    // The scope is loaded TOGETHER with its owner: someone else's scope is not found,
+    // rather than found and rejected later (§14).
     let definition = services
         .store
         .load_contour(principal.owner, query.contour, version)
@@ -177,20 +177,20 @@ async fn market_price_candidates(
                 let denomination = CurrencyCode::from_code(&view.denomination_currency)
                     .ok_or_else(|| {
                         AppError::Store(format!(
-                            "неизвестная валюта обязательства: {}",
+                            "unknown obligation currency: {}",
                             view.denomination_currency
                         ))
                     })?;
                 let settlement =
                     CurrencyCode::from_code(&view.settlement_currency).ok_or_else(|| {
                         AppError::Store(format!(
-                            "неизвестная валюта расчётов: {}",
+                            "unknown settlement currency: {}",
                             view.settlement_currency
                         ))
                     })?;
                 let quote = CurrencyCode::from_code(&view.quote_currency).ok_or_else(|| {
                     AppError::Store(format!(
-                        "неизвестная валюта котировки: {}",
+                        "unknown quotation currency: {}",
                         view.quote_currency
                     ))
                 })?;
@@ -267,7 +267,10 @@ async fn market_price_candidates(
                 .parse::<Decimal>()
                 .map_err(|error| AppError::Store(error.to_string()))?;
             let currency = CurrencyCode::from_code(&row.currency).ok_or_else(|| {
-                AppError::Store(format!("неизвестная валюта НКД: {}", row.currency))
+                AppError::Store(format!(
+                    "unknown accrued coupon interest currency: {}",
+                    row.currency
+                ))
             })?;
             let trade_date = Date::parse(&row.trade_date, &Iso8601::DATE)
                 .map_err(|error| AppError::Store(error.to_string()))?;
@@ -306,7 +309,7 @@ fn market_candidate_from_row(row: PriceRow) -> Result<PriceCandidate, AppError> 
         "admitted_quote" => PriceKind::AdmittedQuote,
         kind => {
             return Err(AppError::Store(format!(
-                "неизвестный вид рыночной цены: {kind}"
+                "unknown market price type: {kind}"
             )));
         }
     };
@@ -319,19 +322,15 @@ fn market_candidate_from_row(row: PriceRow) -> Result<PriceCandidate, AppError> 
         .parse::<Decimal>()
         .map_err(|error| AppError::Store(error.to_string()))?;
     let currency = CurrencyCode::from_code(&row.currency)
-        .ok_or_else(|| AppError::Store(format!("неизвестная валюта цены: {}", row.currency)))?;
-    let basis = QuotationBasis::from_code(&row.quotation_basis).ok_or_else(|| {
-        AppError::Store(format!(
-            "неизвестное основание цены: {}",
-            row.quotation_basis
-        ))
-    })?;
+        .ok_or_else(|| AppError::Store(format!("unknown price currency: {}", row.currency)))?;
+    let basis = QuotationBasis::from_code(&row.quotation_basis)
+        .ok_or_else(|| AppError::Store(format!("unknown price basis: {}", row.quotation_basis)))?;
     let executability = match row.executability.as_str() {
         "executable" => Executability::Executable,
         "indicative_previous_close" => Executability::IndicativePreviousClose,
         quality => {
             return Err(AppError::Store(format!(
-                "неизвестная исполнимость рыночной цены: {quality}"
+                "unknown market price executability: {quality}"
             )));
         }
     };
@@ -418,18 +417,18 @@ async fn official_fx_table(
     Ok(table)
 }
 
-/// Можно ли сохранить снимок, построенный по этому срезу.
+/// Whether a snapshot built from this slice may be saved.
 ///
-/// Только для отчёта на сегодня: ключ снимка — контур, его версия и
-/// версия правила, поэтому снимок по срезу на прошлую дату лёг бы под
-/// тем же ключом и молча подменил бы состояние следующему запросу.
+/// Only for a report as at today: the snapshot key is the scope, its version and
+/// the rule version, so a snapshot for a slice at a past date would be stored under
+/// the same key and silently give the next request the wrong state.
 ///
-/// Вынесено отдельной функцией ради проверяемости: сравнение дат внутри
-/// сценария проверяется только через поднятый сервер и базу, а ошибка
-/// здесь не выглядит ошибкой — она даёт цифру, просто не ту.
+/// Kept as a separate function for testability: comparing dates within the
+/// scenario can otherwise be tested only through a running server and database, while an error
+/// here does not look like one — it produces a figure, just not the right one.
 const fn snapshot_may_be_saved(as_of: Date, today: Date) -> bool {
-    // `Date` не реализует `PartialEq` в const-контексте через `==`
-    // для ссылок, но для значения — реализует.
+    // `Date` does not implement `PartialEq` in a const context via `==`
+    // for references, but for values — it does.
     as_of.ordinal() == today.ordinal() && as_of.year() == today.year()
 }
 fn offer_book_through(
@@ -487,29 +486,29 @@ fn report_from_projection(
         &offer_book,
     ))
 }
-/// Стоит ли пересчитывать журнал целиком после отказа `advance`.
+/// Whether to recompute the entire journal after `advance` fails.
 ///
-/// Снимок — кэш, и его непригодность не является ошибкой работы: почти
-/// любой отказ — законный повод пересчитать. Кроме одного: нарушение
-/// инварианта пересчёт не исправит, он даст ровно то же самое, и вместо
-/// двойной работы отказ уходит наверх с идентификатором корреляции
+/// A snapshot is a cache, and being unusable is not an operational error: almost
+/// any failure is a legitimate reason to recompute. Except one: an invariant
+/// violation will not be fixed by recomputation; it will produce exactly the same result, so we avoid
+/// doing the work twice and propagate the failure with a correlation ID
 /// (§15.2).
 fn recompute_is_worth_it(error: &ProjectionError) -> bool {
     !error.is_invariant_violation()
 }
 
-/// Построение проекции: продвижение снимка, если оно применимо,
-/// иначе полный пересчёт.
+/// Building the projection: advancing the snapshot if applicable,
+/// otherwise a full recomputation.
 ///
-/// Срез передаётся в `advance` **целиком**: решение о том, что уже
-/// свёрнуто, принимает ядро. Оболочка не имеет права отбирать «только
-/// новое» — событие, пришедшее задним числом до границы снимка, при
-/// таком отборе исчезло бы из расчёта молча.
+/// The slice is passed to `advance` **in full**: the core decides what has
+/// already been incorporated. The wrapper must not select «only
+/// new» — an event arriving later with a date before the snapshot boundary would,
+/// under such filtering, silently disappear from the calculation.
 ///
-/// Любой отказ `advance` — законный повод пересчитать журнал целиком:
-/// снимок является кэшем, и его непригодность не является ошибкой
-/// работы. Нарушение инварианта при этом никуда не денется — оно
-/// проявится и при полном пересчёте.
+/// Any `advance` failure is a legitimate reason to recompute the entire journal:
+/// the snapshot is a cache, and being unusable is not an operational error.
+/// An invariant violation will not go away — it
+/// will also occur during full recomputation.
 async fn build_projection(
     services: &AppServices,
     owner: iaam_core::ids::OwnerId,
@@ -527,15 +526,15 @@ async fn build_projection(
         match advance(&snapshot, events, context) {
             Ok(projection) => return Ok(projection),
             Err(error) if !recompute_is_worth_it(&error) => {
-                // Нарушение инварианта — не повод пересчитывать: полный
-                // пересчёт даст то же самое. Отдаём его наверх, чтобы
-                // оно попало в лог с идентификатором корреляции (§15.2).
+                // An invariant violation is no reason to recompute: a full
+                // recomputation will produce the same result. We propagate it so that
+                // it is logged with a correlation ID (§15.2).
                 return Err(AppError::from_projection(error));
             }
             Err(error) => tracing::info!(
                 contour = %definition.id().0,
                 reason = error.code(),
-                "снимок непригоден, пересчитываем журнал целиком"
+                "snapshot is unusable, recomputing the entire journal"
             ),
         }
     }
@@ -692,21 +691,21 @@ mod tests {
 
     #[test]
     fn a_snapshot_is_saved_only_for_a_report_dated_today() {
-        // Вчерашний срез под сегодняшним ключом — это подмена состояния
-        // следующему запросу, а не экономия.
+        // Putting yesterday's slice under today's key gives the next request the wrong state,
+        // rather than saving work.
         let today = date!(2026 - 01 - 01);
         assert!(snapshot_may_be_saved(today, today));
         assert!(!snapshot_may_be_saved(date!(2025 - 12 - 31), today));
         assert!(!snapshot_may_be_saved(date!(2026 - 01 - 02), today));
-        // Тот же день другого года — не тот же день.
+        // The same day in a different year is not the same date.
         assert!(!snapshot_may_be_saved(date!(2025 - 01 - 01), today));
     }
 
     #[test]
     fn every_failure_except_a_broken_invariant_is_worth_a_full_recompute() {
-        // Непригодный снимок — обычное дело: пересчитываем. Нарушенный
-        // инвариант пересчёт повторит слово в слово, поэтому отдаём его
-        // наверх сразу.
+        // An unusable snapshot is routine: recalculate. A violated
+        // invariant will be reproduced verbatim by recalculation, so propagate it
+        // immediately.
         assert!(recompute_is_worth_it(
             &ProjectionError::SnapshotFingerprintMismatch
         ));

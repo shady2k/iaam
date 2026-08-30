@@ -1,4 +1,4 @@
-//! Преобразование рыночных наблюдений в доменные кандидаты.
+//! Conversion of market observations into domain candidates.
 use std::collections::BTreeMap;
 
 use crate::error::AppError;
@@ -21,7 +21,7 @@ use rust_decimal::Decimal;
 use time::Date;
 use time::format_description::well_known::Iso8601;
 
-/// Преобразует рыночное наблюдение в кандидата доменной оценки.
+/// Converts a market observation into a domain valuation candidate.
 #[must_use]
 pub fn candidate_from_market_observation(observation: PriceObservation) -> PriceCandidate {
     let kind = match observation.kind {
@@ -55,7 +55,7 @@ pub fn candidate_from_market_observation(observation: PriceObservation) -> Price
     }
 }
 
-/// Преобразует строки снимка графика в доменные купонные периоды.
+/// Converts schedule snapshot rows into domain coupon periods.
 pub fn accrual_periods_from_snapshot(
     snapshot: &StoredSnapshot,
 ) -> Result<Vec<AccrualPeriod>, AppError> {
@@ -70,8 +70,8 @@ pub fn accrual_periods_from_snapshot(
             let payment_date = Date::parse(&row.payment_date, &Iso8601::DEFAULT)
                 .map_err(|error| AppError::Store(error.to_string()))?;
 
-            // Транспонирование, а не unwrap_or: нераспарсенная дата —
-            // это отказ, а отсутствующая — законное «источник не сообщил».
+            // Transpose, rather than unwrap_or: an unparsed date is a failure —
+            // but an absent one is a legitimate «source did not report it».
             let record_date = row
                 .record_date
                 .as_deref()
@@ -83,18 +83,18 @@ pub fn accrual_periods_from_snapshot(
                 "amount_fixed" => {
                     let amount_per_unit = row.amount_per_unit.as_deref().ok_or_else(|| {
                         AppError::Store(
-                            "известная сумма купона не содержит amount_per_unit".to_owned(),
+                            "known coupon amount does not contain amount_per_unit".to_owned(),
                         )
                     })?;
                     let amount_currency = row.amount_currency.as_deref().ok_or_else(|| {
                         AppError::Store(
-                            "известная сумма купона не содержит amount_currency".to_owned(),
+                            "known coupon amount does not contain amount_currency".to_owned(),
                         )
                     })?;
                     let amount = Decimal::from_str_exact(amount_per_unit)
                         .map_err(|error| AppError::Store(error.to_string()))?;
                     let currency = CurrencyCode::from_code(amount_currency).ok_or_else(|| {
-                        AppError::Store(format!("неизвестная валюта купона: {amount_currency}"))
+                        AppError::Store(format!("unknown coupon currency: {amount_currency}"))
                     })?;
                     Some(PerUnitAmount::new(Dec::new(amount), currency))
                 }
@@ -112,7 +112,7 @@ pub fn accrual_periods_from_snapshot(
         .collect()
 }
 
-/// Преобразует строки снимка графика в доменные возвраты номинала.
+/// Converts schedule snapshot rows into domain principal repayments.
 pub fn principal_returns_from_snapshot(
     snapshot: &StoredSnapshot,
 ) -> Result<Vec<PrincipalReturn>, AppError> {
@@ -133,7 +133,7 @@ pub fn principal_returns_from_snapshot(
         .collect()
 }
 
-/// Преобразует строки окон снимка в типизированные права и условия.
+/// Converts snapshot window rows into typed rights and terms.
 pub fn offer_windows_from_snapshot(
     snapshot: &StoredSnapshot,
     instrument: InstrumentId,
@@ -147,13 +147,13 @@ pub fn offer_windows_from_snapshot(
                 .get(&row.source_kind)
                 .ok_or_else(|| AppError::Invalid {
                     field: "offer_kind".to_owned(),
-                    expected: "код, известный словарю источника".to_owned(),
+                    expected: "a code known to the source dictionary".to_owned(),
                     actual: row.source_kind.clone(),
                 })?;
             let right = OfferRight::from_dictionary_meaning(meaning).map_err(|error| {
                 AppError::Invalid {
                     field: "offer_kind".to_owned(),
-                    expected: "известное доменное значение права".to_owned(),
+                    expected: "a known domain right value".to_owned(),
                     actual: error.to_string(),
                 }
             })?;
@@ -191,13 +191,13 @@ pub fn offer_windows_from_snapshot(
         .collect::<Result<Vec<_>, AppError>>()?;
     validate_unique_windows(&windows).map_err(|error| AppError::Invalid {
         field: "offer_windows".to_owned(),
-        expected: "одна строка на дату исполнения".to_owned(),
+        expected: "one row per exercise date".to_owned(),
         actual: error.to_string(),
     })?;
     Ok(windows)
 }
 
-/// Перевести сохранённый вердикт полноты без повторной проверки графика.
+/// Convert the stored completeness verdict without rechecking the schedule.
 pub fn schedule_completeness_from_row(
     row: Option<&iaam_store::schedule::ScheduleCompletenessRow>,
 ) -> ScheduleCompleteness {
@@ -212,7 +212,7 @@ pub fn schedule_completeness_from_row(
         }
     } else if !row.fetch_exhausted {
         ScheduleCompleteness::Incomplete {
-            reason: "источник не вычитан до конца".to_owned(),
+            reason: "source was not read to the end".to_owned(),
         }
     } else {
         ScheduleCompleteness::Unknown
@@ -221,13 +221,13 @@ pub fn schedule_completeness_from_row(
 
 pub(crate) const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
 
-/// Собирает единый доменный график из сохранённого снимка и условий выпуска.
+/// Builds a unified domain schedule from the stored snapshot and issue terms.
 ///
-/// Обе точки входа — отчёт и приёмка журнального факта — обязаны получать
-/// график через этот перевод, чтобы добавление поля или изменение разбора
-/// не разошлось между двумя копиями. `None` означает отсутствие снимка, а
-/// `snapshot_id` возвращается вместе с графиком для отпечатка входов
-/// вычисления доли. Замок хранилища принадлежит вызывающему.
+/// Both entry points — reporting and journal fact acceptance — must obtain
+/// the schedule through this conversion, so that adding a field or changing parsing
+/// cannot diverge between two copies. `None` means no snapshot, while
+/// `snapshot_id` is returned with the schedule for fingerprinting the inputs
+/// to the share calculation. The store lock is owned by the caller.
 pub fn schedule_from_store(
     store: &iaam_store::market::MarketStore,
     instrument: InstrumentId,
@@ -260,7 +260,7 @@ pub fn schedule_from_store(
     Ok(Some((schedule, snapshot.snapshot_id)))
 }
 
-/// Перевести известные условия выпуска в типизированные флаги дефолта.
+/// Convert known issue terms into typed default flags.
 pub fn default_flags_from_terms(row: Option<&IssueTermsRow>) -> Option<DefaultFlags> {
     row.map(|terms| DefaultFlags {
         declared: terms.default_declared,
@@ -268,11 +268,11 @@ pub fn default_flags_from_terms(row: Option<&IssueTermsRow>) -> Option<DefaultFl
     })
 }
 
-/// Первоначальный номинал из строки условий выпуска.
+/// Initial face value from the issue terms row.
 ///
-/// Валюта обязательна: номинал без валюты — не число, а догадка.
-/// Неразобранное значение даёт `None`, потому что «номинал неизвестен»
-/// и «номинал ноль» требуют от владельца разных действий (§4.9).
+/// Currency is mandatory: a face value without a currency is not a number but a guess.
+/// An unparsed value yields `None`, because «face value is unknown»
+/// and «face value is zero» require different actions from the owner (§4.9).
 #[must_use]
 pub fn initial_principal_from_terms(terms: Option<&IssueTermsRow>) -> Option<PerUnitAmount> {
     let terms = terms?;
@@ -453,7 +453,11 @@ mod tests {
             &dictionary,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("несколько окон оферты"));
+        assert!(matches!(
+            error,
+            crate::error::AppError::Invalid { field, expected, .. }
+                if field == "offer_windows" && expected == "one row per exercise date"
+        ));
     }
 
     #[test]
@@ -461,12 +465,12 @@ mod tests {
         let row = iaam_store::schedule::ScheduleCompletenessRow {
             fetch_exhausted: true,
             structurally_validated: false,
-            incomplete_reason: Some("график оборван".to_owned()),
+            incomplete_reason: Some("schedule truncated".to_owned()),
         };
         assert_eq!(
             schedule_completeness_from_row(Some(&row)),
             iaam_core::bond::offer::ScheduleCompleteness::Incomplete {
-                reason: "график оборван".to_owned()
+                reason: "schedule truncated".to_owned()
             }
         );
 
@@ -478,7 +482,7 @@ mod tests {
 
     #[test]
     fn report_and_ingest_paths_share_store_schedule_translation() {
-        let mut store = MarketStore::open_in_memory().expect("хранилище");
+        let mut store = MarketStore::open_in_memory().expect("store");
         let instrument = iaam_core::ids::InstrumentId::new_random();
         store
             .upsert_instrument(&iaam_store::reference::InstrumentRecord {
@@ -489,7 +493,7 @@ mod tests {
                 currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
             })
-            .expect("инструмент");
+            .expect("instrument");
         let observed_at = "2026-08-27T12:00:00Z";
         let header = ScheduleSnapshotRow {
             instrument_id: instrument.inner().to_string(),
@@ -530,10 +534,10 @@ mod tests {
                 &principal_repayments,
                 &offer_windows,
             )
-            .expect("снимок");
+            .expect("snapshot");
         store
             .record_schedule_completeness(&outcome.snapshot_id, true, true, None, &[0])
-            .expect("полнота");
+            .expect("completeness");
         store
             .record_issue_terms(&IssueTermsRow {
                 instrument_id: instrument.inner().to_string(),
@@ -549,7 +553,7 @@ mod tests {
                 default_declared: true,
                 default_technical: false,
             })
-            .expect("условия выпуска");
+            .expect("issue terms");
 
         let offer_kinds = BTreeMap::from([("put".to_owned(), "put_option".to_owned())]);
         let (report_schedule, report_snapshot_id) = schedule_from_store(
@@ -561,8 +565,8 @@ mod tests {
                 CurrencyCode::Rub,
             )),
         )
-        .expect("график отчёта")
-        .expect("снимок отчёта");
+        .expect("report schedule")
+        .expect("report snapshot");
         let (ingest_schedule, ingest_snapshot_id) = schedule_from_store(
             &store,
             instrument,
@@ -570,8 +574,8 @@ mod tests {
             &offer_kinds,
             None,
         )
-        .expect("график приёмки")
-        .expect("снимок приёмки");
+        .expect("acceptance schedule")
+        .expect("acceptance snapshot");
 
         assert_eq!(report_snapshot_id, ingest_snapshot_id);
         assert_eq!(
@@ -613,7 +617,7 @@ mod tests {
         assert_eq!(
             initial_principal_from_terms(Some(&terms)),
             Some(PerUnitAmount::new(
-                Dec::new("1000".parse().expect("номинал")),
+                Dec::new("1000".parse().expect("face value")),
                 CurrencyCode::Rub
             ))
         );
@@ -633,7 +637,7 @@ mod tests {
 
     #[test]
     fn a_malformed_face_value_is_unknown_and_does_not_panic() {
-        let terms = terms_row(Some("не число"), Some("RUB"));
+        let terms = terms_row(Some("not a number"), Some("RUB"));
         assert_eq!(initial_principal_from_terms(Some(&terms)), None);
     }
 
@@ -665,7 +669,7 @@ mod tests {
     fn market_kind(candidate: &iaam_core::valuation::PriceCandidate) -> CorePriceKind {
         match &candidate.origin {
             PriceOrigin::Market { kind, .. } => *kind,
-            _ => panic!("рыночное наблюдение должно стать Market-кандидатом"),
+            _ => panic!("market observation should become a Market candidate"),
         }
     }
     #[test]
@@ -675,7 +679,7 @@ mod tests {
             Executability::Executable,
         ));
         let PriceOrigin::Market { venue, .. } = candidate.origin else {
-            panic!("рыночное наблюдение должно стать Market-кандидатом");
+            panic!("market observation should become a Market candidate");
         };
         assert_eq!(venue.board, "TQBR");
         assert_eq!(venue.session, 3);
@@ -756,7 +760,7 @@ mod tests {
                 market: "shares",
             },
         )
-        .expect("разбор фикстуры");
+        .expect("fixture parsing");
         let candidates: Vec<_> = observations
             .into_iter()
             .filter(|observation| observation.trade_date == TradeDate(date!(2026 - 08 - 03)))
@@ -774,7 +778,7 @@ mod tests {
             let candidate = candidates
                 .iter()
                 .find(|candidate| market_kind(candidate).as_str() == kind)
-                .unwrap_or_else(|| panic!("нет кандидата для {kind}"));
+                .unwrap_or_else(|| panic!("no candidate for {kind}"));
             assert_eq!(candidate.price.inner(), price);
             assert_eq!(candidate.instrument, instrument);
             assert_eq!(candidate.currency, CurrencyCode::Rub);
@@ -801,7 +805,7 @@ mod tests {
                 market: "shares",
             },
         )
-        .expect("разбор фикстуры");
+        .expect("fixture parsing");
         let mut candidates: Vec<_> = observations
             .into_iter()
             .filter(|observation| observation.trade_date == TradeDate(date!(2026 - 08 - 03)))
@@ -825,9 +829,7 @@ mod tests {
             },
             &candidates,
         );
-        let selected = result
-            .selected()
-            .expect("MarketPrice2 должен покрывать строку");
+        let selected = result.selected().expect("MarketPrice2 must cover the row");
 
         assert_eq!(
             selected.provenance.price_kind.as_deref(),

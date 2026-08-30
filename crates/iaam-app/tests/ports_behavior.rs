@@ -24,7 +24,7 @@ fn issued_token_debug_redacts_the_secret_but_keeps_context() {
 
     let rendered = format!("{issued:?}");
     assert!(rendered.contains("IssuedToken"));
-    assert!(rendered.contains("<скрыт>"));
+    assert!(rendered.contains("<hidden>"));
     assert!(!rendered.contains(secret));
 }
 
@@ -33,34 +33,34 @@ async fn unavailable_rule_store_reports_configuration_error() {
     let error = UnavailableClassificationRuleStore
         .list_rules(OwnerId::new_random())
         .await
-        .expect_err("недоступное хранилище обязано отказать");
+        .expect_err("an unavailable store must reject the operation");
 
     assert!(matches!(
         error,
         AppError::NotConfigured {
-            what: "правила классификации"
+            what: "classification rules"
         }
     ));
 }
 
-/// Отзыв правила проверяется отдельно от чтения списка.
+/// Rule revocation is tested separately from reading the list.
 ///
-/// Заглушка обязана отказывать КАЖДЫМ методом, а не только теми, что
-/// возвращают данные. Метод, отвечающий `Ok(())` без настроенного
-/// хранилища, сообщает вызывающему, что правило отозвано, — и правило
-/// продолжает действовать. Это хуже отказа: отказ виден, а мнимый успех
-/// нет.
+/// The stub must reject EVERY method, not just those that
+/// return data. A method returning `Ok(())` without a configured
+/// store tells the caller that the rule has been revoked — yet the rule
+/// remains in force. This is worse than failure: failure is visible, but false success
+/// is not.
 #[tokio::test]
 async fn unavailable_rule_store_refuses_to_retire_a_rule() {
     let error = UnavailableClassificationRuleStore
         .retire_rule(OwnerId::new_random(), uuid::Uuid::new_v4())
         .await
-        .expect_err("мнимый успех отзыва оставил бы правило действующим");
+        .expect_err("false revocation success would leave the rule in force");
 
     assert!(matches!(
         error,
         AppError::NotConfigured {
-            what: "правила классификации"
+            what: "classification rules"
         }
     ));
 }

@@ -1,9 +1,9 @@
-//! Ответы об ошибках.
+//! Error responses.
 //!
-//! Ошибка валидации — `422` с указанием поля, ожидаемого и полученного
-//! значения (§13). Нарушение инварианта наружу уходит как `500`
-//! с идентификатором корреляции и **без** числа: выдать результат
-//! после доказанного нарушения тождества нельзя (§15.2).
+//! A validation error is a `422` specifying the field, expected and received
+//! values (§13). An invariant violation is returned externally as a `500`
+//! with a correlation identifier and **without** a number: a result cannot be returned
+//! after a proven violation of the identity (§15.2).
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -12,22 +12,22 @@ use iaam_app::error::AppError;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-/// Тело ответа об ошибке.
+/// Error response body.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ApiError {
-    /// Машиночитаемый код. Агент разбирает его, а не текст.
+    /// Machine-readable code. The agent parses this, not the text.
     pub code: String,
-    /// Пояснение для человека.
+    /// Human-readable explanation.
     pub message: String,
-    /// Поле запроса, вызвавшее отказ.
+    /// Request field that caused the rejection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual: Option<String>,
-    /// Идентификатор корреляции: по нему нарушение инварианта ищется
-    /// в логах. Наружу не уходит ничего, кроме него.
+    /// Correlation identifier: used to find the invariant violation
+    /// in the logs. Nothing else is returned externally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
 }
@@ -46,11 +46,11 @@ impl ApiError {
     }
 }
 
-/// Ошибка обработчика.
+/// Handler error.
 ///
-/// Тело в `Box`: `Result<T, ApiFailure>` возвращают все обработчики,
-/// и `clippy::result_large_err` справедливо возражает против варианта
-/// ошибки размером в полтораста байт на каждом успешном пути.
+/// The body is in a `Box`: every handler returns `Result<T, ApiFailure>`,
+/// and `clippy::result_large_err` rightly objects to an error variant
+/// being 150 bytes in size on every successful path.
 #[derive(Debug)]
 pub struct ApiFailure {
     pub status: StatusCode,
@@ -70,7 +70,7 @@ impl ApiFailure {
     pub fn unauthorized() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
-            ApiError::simple("unauthorized", "требуется действующий токен"),
+            ApiError::simple("unauthorized", "a valid token is required"),
         )
     }
 
@@ -80,7 +80,7 @@ impl ApiFailure {
             StatusCode::FORBIDDEN,
             ApiError::simple(
                 "forbidden",
-                format!("права токена ({scope}) не позволяют эту операцию"),
+                format!("the token's permissions ({scope}) do not allow this operation"),
             ),
         )
     }
@@ -89,7 +89,7 @@ impl ApiFailure {
     pub fn too_many_requests() -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
-            ApiError::simple("rate_limited", "слишком много запросов"),
+            ApiError::simple("rate_limited", "too many requests"),
         )
     }
 }
@@ -118,26 +118,26 @@ impl From<AppError> for ApiFailure {
                     correlation_id: None,
                 },
             ),
-            // Действующая запись уже есть: повтор запроса её не заменит,
-            // и `500` отправил бы владельца искать поломку вместо отзыва
-            // старой записи.
+            // An active record already exists: retrying the request will not replace it,
+            // and a `500` would send the owner looking for a fault instead of revoking
+            // the old record.
             AppError::Conflict { ref what } => Self::new(
                 StatusCode::CONFLICT,
                 ApiError::simple("already_exists", what.clone()),
             ),
             AppError::NotFound { what, ref id } => Self::new(
                 StatusCode::NOT_FOUND,
-                ApiError::simple("not_found", format!("не найдено: {what} {id}")),
+                ApiError::simple("not_found", format!("not found: {what} {id}")),
             ),
             AppError::Invariant { correlation, .. } => {
-                // Подробности остаются в логе: наружу уходит только код
-                // и идентификатор корреляции.
-                tracing::error!(%correlation, error = %error, "нарушен инвариант проекции");
+                // Details remain in the log: only the code
+                // and correlation identifier are returned externally.
+                tracing::error!(%correlation, error = %error, "projection invariant violated");
                 Self::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ApiError {
                         code: "invariant_violated".into(),
-                        message: "результат не может быть выдан: нарушен внутренний инвариант"
+                        message: "result cannot be returned: internal invariant violated"
                             .into(),
                         field: None,
                         expected: None,
@@ -147,14 +147,14 @@ impl From<AppError> for ApiFailure {
                 )
             }
             AppError::DirectoryInvariant { correlation, .. } => {
-                // Подробности остаются в логе: наружу уходит только код
-                // и идентификатор корреляции.
-                tracing::error!(%correlation, error = %error, "нарушен инвариант справочника");
+                // Details remain in the log: only the code
+                // and correlation identifier are returned externally.
+                tracing::error!(%correlation, error = %error, "reference-data invariant violated");
                 Self::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ApiError {
                         code: "directory_invariant_violated".into(),
-                        message: "результат не может быть выдан: нарушен инвариант справочника"
+                        message: "result cannot be returned: reference-data invariant violated"
                             .into(),
                         field: None,
                         expected: None,
@@ -163,15 +163,15 @@ impl From<AppError> for ApiFailure {
                     },
                 )
             }
-            // Возможность не включена настройкой, а не сломана: повтор
-            // запроса её не исправит, поэтому 503 с указанием, что
-            // именно задать. Текст называет переменную окружения:
-            // «сервис недоступен» без причины нечинибельно.
+            // The feature is not enabled by configuration, rather than broken: retrying
+            // the request will not fix it, so use 503 stating what
+            // exactly to set. The text names the environment variable:
+            // «service unavailable» without a reason cannot be acted upon.
             AppError::NotConfigured { what } => {
-                let message = if what == "шифрование доступа к брокеру" {
-                    format!("{what} не настроено: задайте IAAM_BROKER_KEY_FILE и перезапустите сервер")
+                let message = if what == "broker access encryption" {
+                    format!("{what} is not configured: set IAAM_BROKER_KEY_FILE and restart the server")
                 } else {
-                    format!("{what} не настроено")
+                    format!("{what} is not configured")
                 };
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -180,20 +180,20 @@ impl From<AppError> for ApiFailure {
             }
             AppError::Store(_)
             | AppError::Projection(_)
-            // Сверка и оценка периметра отказывают по той же причине,
-            // что и проекция: срез журнала не годится. Наружу уходит
-            // код, подробности — в лог.
+            // Reconciliation and perimeter assessment fail for the same reason,
+            // as projection: the journal slice is unusable. Only the
+            // code is returned externally, with details in the log.
             | AppError::Reconciliation(_)
             | AppError::Perimeter(_)
-            // Планировщик отказал на выводе активных бумаг: это отказ
-            // сервера, а не ошибка запроса.
+            // The scheduler failed while listing active documents: this is a
+            // server failure, not a request error.
             | AppError::Schedule(_)
-            // Отказ источника случайности — тоже `500`: секрет не выдан,
-            // и это отказ сервера, а не ошибка запроса. Повтор запроса
-            // имеет смысл, а вот подмена запасным генератором — нет,
-            // поэтому наружу уходит отказ, а не токен (§14).
+            // Failure of the randomness source is also a `500`: no secret was issued,
+            // and this is a server failure, not a request error. Retrying the request
+            // makes sense, but substituting a fallback generator does not,
+            // therefore a denial is returned rather than a token (§14).
             | AppError::Random(_) => {
-                tracing::error!(error = %error, "сценарий не выполнен");
+                tracing::error!(error = %error, "scenario was not completed");
                 Self::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ApiError::simple(error.code(), error.to_string()),

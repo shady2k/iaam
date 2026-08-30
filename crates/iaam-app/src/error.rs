@@ -1,8 +1,8 @@
-//! Ошибки сценариев.
+//! Scenario errors.
 //!
-//! Разделение по §15.2: неполнота данных ошибкой не является и уходит
-//! в отчёт блоком качества; нарушение инварианта отменяет отчёт и уходит
-//! в лог с идентификатором корреляции.
+//! Distinction under §15.2: incomplete data is not an error and goes
+//! into the report as a quality block; an invariant violation aborts the report and goes
+//! into the log with a correlation identifier.
 
 use iaam_core::perimeter::PerimeterError;
 use iaam_core::projection::ProjectionError;
@@ -12,62 +12,62 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[error("хранилище недоступно: {0}")]
+    #[error("store unavailable: {0}")]
     Store(String),
-    #[error("не найдено: {what} {id}")]
+    #[error("not found: {what} {id}")]
     NotFound { what: &'static str, id: String },
-    #[error("запрос некорректен: поле {field}, ожидалось {expected}, получено {actual}")]
+    #[error("request is invalid: field {field}, expected {expected}, received {actual}")]
     Invalid {
         field: String,
         expected: String,
         actual: String,
     },
-    #[error("нарушен внутренний инвариант, идентификатор корреляции {correlation}")]
+    #[error("internal invariant violated, correlation identifier {correlation}")]
     Invariant {
         correlation: Uuid,
         #[source]
         source: ProjectionError,
     },
-    /// Инвариант справочника нарушен: код разрешается более чем в один
-    /// инструмент, то есть пробит триггер
+    /// Reference data invariant violated: a code resolves to more than one
+    /// instrument, meaning that the trigger has fired
     /// `instrument_aliases_do_not_overlap`.
-    /// Отдельно от `Invariant`, потому что тот несёт источник из домена
-    /// проекции: подставить туда любой вариант ради сигнатуры значит
-    /// отправить разбирающегося смотреть снимки вместо схемы справочника.
-    #[error("нарушен инвариант справочника, идентификатор корреляции {correlation}: {detail}")]
+    /// Separate from `Invariant`, because that carries a source from the projection domain
+    /// projection: putting any variant there merely to satisfy the signature would
+    /// send an investigator to inspect snapshots instead of the reference data schema.
+    #[error("reference data invariant violated, correlation identifier {correlation}: {detail}")]
     DirectoryInvariant { correlation: Uuid, detail: String },
-    #[error("проекция не построена: {0}")]
+    #[error("projection not built: {0}")]
     Projection(#[source] ProjectionError),
-    /// Срез журнала не годится для сверки: событие без даты,
-    /// переполнение остатка. Отдельно от `Projection`, потому что
-    /// внешнему агенту это разные поводы: одно означает неверный срез,
-    /// другое — невозможность подтвердить данные.
-    #[error("сверка не построена: {0}")]
+    /// A journal slice is unsuitable for reconciliation: an undated event,
+    /// a balance overflow. Separate from `Projection`, because
+    /// these are different causes for an external agent: one means an invalid slice,
+    /// the other — an inability to verify the data.
+    #[error("reconciliation not built: {0}")]
     Reconciliation(#[source] ObserveError),
-    #[error("периметр не оценён: {0}")]
+    #[error("perimeter not assessed: {0}")]
     Perimeter(#[source] PerimeterError),
-    /// Возможность не включена настройкой, а не сломана: шифрование
-    /// доступа к брокеру без ключа. Отдельно от `Store`, потому что
-    /// внешнему агенту это разные поводы: одно чинится настройкой
-    /// сервера, другое — повтором запроса.
-    #[error("{what} не настроено")]
+    /// The capability is not enabled by configuration, not broken: encryption
+    /// of access to the broker without a key. Separate from `Store`, because
+    /// these are different causes for an external agent: one is fixed by configuring
+    /// the server, the other — by retrying the request.
+    #[error("{what} is not configured")]
     NotConfigured { what: &'static str },
-    /// Системный источник случайности отказал. Отдельно от `Store`,
-    /// потому что это не сбой хранилища и чинится не повтором запроса,
-    /// а состоянием машины; и отдельно потому, что выдать секрет,
-    /// полученный неизвестно чем, нельзя ни при каких условиях (§14).
-    #[error("источник случайности недоступен: {0}")]
+    /// The system source of randomness has failed. Separate from `Store`,
+    /// because this is not a store failure and is not fixed by retrying the request,
+    /// but by correcting the machine state; it is also separate because a secret,
+    /// obtained by unknown means, must never be issued under any circumstances (§14).
+    #[error("randomness source unavailable: {0}")]
     Random(String),
-    /// Запись уже есть, и вторая такая же означала бы, что неизвестно,
-    /// какой из них пользуются. Отдельно от `Store`, потому что чинится
-    /// не повтором запроса, а отзывом действующей записи.
+    /// The record already exists, and a second identical one would mean that it is unclear,
+    /// which one is being used. Separate from `Store`, because it is fixed
+    /// not by retrying the request, but by revoking the active record.
     #[error("{what}")]
     Conflict { what: String },
-    /// Расписание синхронизации построить нечем: вывод активных бумаг
-    /// из журнала переполнился. Отдельно от `Reconciliation`, потому
-    /// что сверка здесь ни при чём, а «сверка не построена» отправило бы
-    /// разбирающегося читать реестр сверки вместо журнала количеств.
-    #[error("расписание синхронизации не построено: {0}")]
+    /// There is no way to build the synchronisation schedule: deriving active securities
+    /// from the journal overflowed. Separate from `Reconciliation`, because
+    /// reconciliation is irrelevant here, while «reconciliation not built» would send
+    /// an investigator to inspect the reconciliation register instead of the quantity journal.
+    #[error("synchronisation schedule not built: {0}")]
     Schedule(#[source] iaam_core::numeric::NumericError),
 }
 
@@ -84,9 +84,9 @@ impl From<PerimeterError> for AppError {
 }
 
 impl AppError {
-    /// Проекция превращается в ошибку приложения так, чтобы нарушение
-    /// инварианта нельзя было спутать с обычным отказом: у первого
-    /// появляется идентификатор корреляции для логов (§15.2).
+    /// A projection is converted into an application error so that an invariant
+    /// violation cannot be confused with an ordinary failure: the former
+    /// gets a correlation identifier for the logs (§15.2).
     #[must_use]
     pub fn from_projection(error: ProjectionError) -> Self {
         if error.is_invariant_violation() {
@@ -124,17 +124,17 @@ mod tests {
 
     #[test]
     fn every_app_error_has_a_machine_readable_code() {
-        // Код уходит в тело ответа: внешний агент решает по нему,
-        // повторять ли запрос. Пустая строка неотличима от «кода нет»,
-        // а один код на все ошибки — от «что-то пошло не так».
+        // The code goes in the response body: the external agent uses it to decide,
+        // whether to retry the request. An empty string is indistinguishable from «no code»,
+        // and a single code for all errors — from «something went wrong».
         assert_eq!(
-            AppError::Store("нет соединения".into()).code(),
+            AppError::Store("no connection".into()).code(),
             "store_unavailable"
         );
         assert_eq!(
             AppError::NotFound {
-                what: "контур",
-                id: "нет такого".into(),
+                what: "environment",
+                id: "does not exist".into(),
             }
             .code(),
             "not_found"
@@ -142,8 +142,8 @@ mod tests {
         assert_eq!(
             AppError::Invalid {
                 field: "as_of".into(),
-                expected: "дата вида ГГГГ-ММ-ДД".into(),
-                actual: "вчера".into(),
+                expected: "date in YYYY-MM-DD format".into(),
+                actual: "yesterday".into(),
             }
             .code(),
             "invalid_request"
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(
             AppError::DirectoryInvariant {
                 correlation: Uuid::new_v4(),
-                detail: "код ticker:ABC на 2026-08-25 разрешается в 2 инструмента".into(),
+                detail: "code ticker:ABC on 2026-08-25 resolves to 2 instruments".into(),
             }
             .code(),
             "directory_invariant_violated"
@@ -170,18 +170,18 @@ mod tests {
         );
         assert_eq!(
             AppError::NotConfigured {
-                what: "шифрование доступа к брокеру",
+                what: "broker access encryption",
             }
             .code(),
             "not_configured"
         );
         assert_eq!(
-            AppError::Random("источник закрыт".into()).code(),
+            AppError::Random("source closed".into()).code(),
             "random_unavailable"
         );
         assert_eq!(
             AppError::Conflict {
-                what: "доступ уже заведён".into(),
+                what: "access already configured".into(),
             }
             .code(),
             "already_exists"

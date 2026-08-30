@@ -345,6 +345,7 @@ fn every_new_fact(owner: OwnerId, account: AccountId) -> Vec<Event> {
                     effective_date: date!(2026 - 06 - 15),
                     record_date: Some(date!(2026 - 06 - 13)),
                     grounds: Some("решение эмитента №4".to_owned()),
+                    basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
                 },
             },
             vec![Leg::principal(account, instrument, money(200_000))],

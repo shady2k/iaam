@@ -139,7 +139,7 @@ pub async fn returns(
         &reconciliation_events,
     )
 }
-const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
+pub(crate) const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
 
 struct ReportMarketInputs {
     candidates: Vec<PriceCandidate>,
@@ -266,6 +266,9 @@ async fn market_price_candidates(
                     principal_returns: crate::market_candidate::principal_returns_from_snapshot(
                         &snapshot,
                     )?,
+                    initial_principal: crate::market_candidate::initial_principal_from_terms(
+                        terms.as_ref(),
+                    ),
                     offer_windows: crate::market_candidate::offer_windows_from_snapshot(
                         &snapshot,
                         instrument,

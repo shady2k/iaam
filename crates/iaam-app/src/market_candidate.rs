@@ -227,9 +227,22 @@ pub fn default_flags_from_terms(row: Option<&IssueTermsRow>) -> Option<DefaultFl
     })
 }
 
+/// Первоначальный номинал из строки условий выпуска.
+///
+/// Валюта обязательна: номинал без валюты — не число, а догадка.
+/// Неразобранное значение даёт `None`, потому что «номинал неизвестен»
+/// и «номинал ноль» требуют от владельца разных действий (§4.9).
+#[must_use]
+pub fn initial_principal_from_terms(terms: Option<&IssueTermsRow>) -> Option<PerUnitAmount> {
+    let terms = terms?;
+    let value = terms.initial_face_value.as_ref()?.parse::<Decimal>().ok()?;
+    let currency = CurrencyCode::from_code(terms.face_currency_code.as_ref()?)?;
+    Some(PerUnitAmount::new(Dec::new(value), currency))
+}
+
 #[cfg(test)]
 mod tests {
-    use iaam_core::money::CurrencyCode;
+    use iaam_core::money::{CurrencyCode, PerUnitAmount};
     use iaam_core::numeric::decimal::Dec;
     use iaam_core::rules::{ValuationPolicyV1, ValuationRule};
     use iaam_core::valuation::{
@@ -237,14 +250,14 @@ mod tests {
     };
     use iaam_market::moex::parse::{MarketSegment, parse_history};
     use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
-    use iaam_store::schedule::{CouponPeriodRow, OfferWindowRow, StoredSnapshot};
+    use iaam_store::schedule::{CouponPeriodRow, IssueTermsRow, OfferWindowRow, StoredSnapshot};
     use rust_decimal::Decimal;
     use std::collections::BTreeMap;
     use time::macros::{date, datetime};
 
     use super::{
         accrual_periods_from_snapshot, candidate_from_market_observation, default_flags_from_terms,
-        offer_windows_from_snapshot, schedule_completeness_from_row,
+        initial_principal_from_terms, offer_windows_from_snapshot, schedule_completeness_from_row,
     };
 
     #[test]
@@ -419,6 +432,58 @@ mod tests {
     #[test]
     fn missing_issue_terms_keep_default_flags_unknown() {
         assert_eq!(default_flags_from_terms(None), None);
+    }
+
+    fn terms_row(face: Option<&str>, currency: Option<&str>) -> IssueTermsRow {
+        IssueTermsRow {
+            instrument_id: "instrument".to_owned(),
+            source_id: "source".to_owned(),
+            observed_at: "2026-08-27T12:00:00Z".to_owned(),
+            effective_from: Some("2026-08-01".to_owned()),
+            maturity_date: Some("2026-12-02".to_owned()),
+            initial_face_value: face.map(str::to_owned),
+            face_currency_code: currency.map(str::to_owned),
+            coupon_periods_per_year: Some(1),
+            day_count: Some("act/365".to_owned()),
+            calendar: Some("MOEX".to_owned()),
+            default_declared: false,
+            default_technical: false,
+        }
+    }
+
+    #[test]
+    fn the_initial_face_value_travels_from_the_terms_row() {
+        let terms = terms_row(Some("1000"), Some("RUB"));
+        assert_eq!(
+            initial_principal_from_terms(Some(&terms)),
+            Some(PerUnitAmount::new(
+                Dec::new("1000".parse().expect("номинал")),
+                CurrencyCode::Rub
+            ))
+        );
+    }
+
+    #[test]
+    fn a_face_value_without_a_currency_is_unknown_and_never_zero() {
+        let terms = terms_row(Some("1000"), None);
+        assert_eq!(initial_principal_from_terms(Some(&terms)), None);
+    }
+
+    #[test]
+    fn a_missing_face_value_is_unknown_and_never_zero() {
+        let terms = terms_row(None, Some("RUB"));
+        assert_eq!(initial_principal_from_terms(Some(&terms)), None);
+    }
+
+    #[test]
+    fn a_malformed_face_value_is_unknown_and_does_not_panic() {
+        let terms = terms_row(Some("не число"), Some("RUB"));
+        assert_eq!(initial_principal_from_terms(Some(&terms)), None);
+    }
+
+    #[test]
+    fn missing_terms_make_the_initial_principal_unknown() {
+        assert_eq!(initial_principal_from_terms(None), None);
     }
 
     const FIXTURE: &str = include_str!("../../../tests/fixtures/market/moex-iss-history-sber.json");

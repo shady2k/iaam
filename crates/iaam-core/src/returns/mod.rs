@@ -35,7 +35,7 @@ use crate::numeric::approx::SolverPolicy;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverRefusal};
 use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
-use crate::projection::lots::{LotBook, LotKey};
+use crate::projection::lots::{BasisGap, LotKey};
 use crate::projection::offers::{OfferBook, unresolved_submissions};
 use crate::projection::ownership::Ownership;
 use crate::projection::state::LedgerState;
@@ -100,8 +100,6 @@ pub enum NotComputable {
     QuotationBasisContradictsEvidence { instrument: InstrumentId },
     /// Номинал бумаги неизвестен.
     RemainingFaceUnknown { instrument: InstrumentId },
-    /// Лоты одной пары «счёт и бумага» несут разные номиналы.
-    RemainingFaceAmbiguous { instrument: InstrumentId },
     /// Для пересчёта котировки не передан номинал.
     PrincipalUnknown,
     /// Решатель отказался: корня нет, корней несколько, не сошлось.
@@ -135,8 +133,6 @@ pub enum NotComputable {
     NonPositiveInitialCapital,
     /// Терминальное благосостояние отрицательно.
     NegativeTerminalWealth,
-    /// Лоты несут разные состояния номинала.
-    PrincipalStateAmbiguous { instrument: InstrumentId },
     /// Историческая стоимость приобретения когорты неизвестна.
     AcquisitionBasisUnknown,
     /// Уплаченный при приобретении НКД неизвестен.
@@ -170,7 +166,6 @@ impl NotComputable {
             Self::QuotationBasisUnknown { .. } => "quotation_basis_unknown",
             Self::RemainingFaceUnknown { .. } => "remaining_face_unknown",
             Self::PrincipalUnknown => "principal_unknown",
-            Self::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
             Self::SolverRefused { .. } => "solver_refused",
             Self::NoExternalFlows => "no_external_flows",
             Self::StateNewerThanReport { .. } => "state_newer_than_report",
@@ -185,7 +180,6 @@ impl NotComputable {
             Self::NonPositiveDuration { .. } => "non_positive_duration",
             Self::NonPositiveInitialCapital => "non_positive_initial_capital",
             Self::NegativeTerminalWealth => "negative_terminal_wealth",
-            Self::PrincipalStateAmbiguous { .. } => "principal_state_ambiguous",
             Self::AcquisitionBasisUnknown => "acquisition_basis_unknown",
             Self::AccruedInterestAtAcquisitionUnknown => "accrued_interest_at_acquisition_unknown",
             Self::HistoricalReceiptsUnknown => "historical_receipts_unknown",
@@ -236,6 +230,13 @@ impl DataQualityStatus {
 pub enum MaterialIssue {
     /// Позиция восстановлена без документированной стоимости (§10.7).
     RestoredWithoutBasis { account: AccountId },
+    /// Доля разнесения амортизации не выведена, поэтому возвращённая
+    /// стоимость и реализованный результат по позиции не считаются
+    /// (§4.9). Чинится проверенным графиком выпуска.
+    AmortisationAllocationUnknown {
+        account: AccountId,
+        instrument: InstrumentId,
+    },
     /// Отрицательный денежный остаток — обязательство в NAV (§15.9).
     NegativeCash {
         account: AccountId,
@@ -334,7 +335,7 @@ impl MaterialIssue {
             // Горизонт журнала зеркалит `HistoryStartsAt`: это факт о
             // периоде, а не дефект. Владелец, чей журнал начинается
             // позже выпуска бумаги, иначе получил бы вечный `Incomplete`
-            // Остальные шесть причин чинятся дозагрузкой фактов и потому
+            // Остальные причины чинятся дозагрузкой фактов и потому
             // являются дефектами.
             Self::ScheduledPostingUnverifiable { reason, .. }
             | Self::ScheduledPostingsUnverifiable { reason, .. } => {
@@ -342,6 +343,7 @@ impl MaterialIssue {
             }
             Self::AccruedInterestMismatch { .. }
             | Self::RestoredWithoutBasis { .. }
+            | Self::AmortisationAllocationUnknown { .. }
             | Self::NegativeCash { .. }
             | Self::Discrepancy { .. }
             | Self::UnsupportedFinancing { .. }
@@ -1494,17 +1496,13 @@ fn scenario_plan(
         assessment,
         request,
         schedule,
-        lots,
+        lots: _,
         cashflow,
         accrued_rule: _,
     } = *inputs;
-    let principal = lots
-        .map(|lots| zero_reinvestment::common_principal_state(lots, assessment.instrument))
-        .unwrap_or(Ok(crate::rules::lot_disposal::PrincipalState::Unknown))?;
     cashflow
         .future_postings(&CashflowInput {
             schedule,
-            principal,
             quantity: assessment.quantity,
             choice,
             as_of: request.as_of,
@@ -1942,13 +1940,14 @@ fn position_assessments(
                 instrument: key.instrument,
                 quantity,
                 raw_price,
-                remaining_face: remaining_face(
-                    state.book(),
-                    LotKey {
-                        account: key.account,
-                        instrument: key.instrument,
-                    },
-                ),
+                remaining_face: request
+                    .bond_schedules
+                    .get(&key.instrument)
+                    .map(|schedule| {
+                        crate::bond::remaining_principal(schedule, request.as_of)
+                            .map_err(|error| remaining_principal_reason(error, key.instrument))
+                    })
+                    .transpose(),
                 kind,
             }
         })
@@ -2026,27 +2025,30 @@ struct PositionQuotation<'a> {
     rule: &'a dyn QuotationRule,
 }
 
-/// Возвращает единый остаточный номинал лотов пары «счёт и бумага».
-fn remaining_face(book: &LotBook, key: LotKey) -> Result<Option<PerUnitAmount>, NotComputable> {
-    let Some(entry) = book.entry(&key) else {
-        return Ok(None);
-    };
-    let mut found = None;
-    for lot in entry.lots() {
-        let Some(remaining) = lot.principal.remaining_per_unit() else {
-            continue;
-        };
-        match found {
-            None => found = Some(remaining),
-            Some(previous) if previous == remaining => {}
-            Some(_) => {
-                return Err(NotComputable::RemainingFaceAmbiguous {
-                    instrument: key.instrument,
-                });
-            }
+/// Почему остаток номинала не выведен из графика.
+///
+/// Отказ доверия к графику отображается отдельно от неизвестного
+/// номинала: в первом случае владельцу нужен проверенный снимок
+/// выпуска, во втором — сам номинал.
+fn remaining_principal_reason(
+    error: crate::bond::RemainingPrincipalError,
+    instrument: InstrumentId,
+) -> NotComputable {
+    match error {
+        crate::bond::RemainingPrincipalError::Unknown => {
+            NotComputable::RemainingFaceUnknown { instrument }
         }
+        crate::bond::RemainingPrincipalError::ScheduleNotValidated => {
+            NotComputable::ScheduleMissing { instrument }
+        }
+        crate::bond::RemainingPrincipalError::ShareNotPositive
+        | crate::bond::RemainingPrincipalError::PrefixAboveHundred => {
+            NotComputable::ScheduleMissing { instrument }
+        }
+        crate::bond::RemainingPrincipalError::Numeric(_) => NotComputable::Numeric {
+            code: "remaining_principal",
+        },
     }
-    Ok(found)
 }
 
 fn quotation_error(error: QuotationError, instrument: InstrumentId) -> NotComputable {
@@ -2110,6 +2112,14 @@ fn data_quality(
     let mut issues = Vec::new();
     for account in state.coverage().restored_accounts() {
         issues.push(MaterialIssue::RestoredWithoutBasis { account: *account });
+    }
+    for (key, lots) in state.book().iter() {
+        if matches!(lots.gap(), Some(BasisGap::AmortisationAllocationUnknown)) {
+            issues.push(MaterialIssue::AmortisationAllocationUnknown {
+                account: key.account,
+                instrument: key.instrument,
+            });
+        }
     }
     for (account, money) in state.balances().negative_cash() {
         issues.push(MaterialIssue::NegativeCash {
@@ -3087,34 +3097,6 @@ mod tests {
                 &request,
             ),
             Err(NotComputable::QuotationBasisUnknown { instrument }),
-        );
-    }
-
-    #[test]
-    fn lots_that_disagree_about_the_remaining_face_refuse_instead_of_averaging() {
-        let account = AccountId::new_random();
-        let instrument = InstrumentId::new_random();
-        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
-        let fx = FxTable::new(FxSource::OwnerSupplied);
-        let ledger = ReconciliationLedger::default();
-        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
-        let request = position_request(&contour, &fx, &ledger, &perimeter);
-        let assessment = position_assessment(account, instrument, Quantity(dec("10")));
-        let (_, rule) = quotation_rule();
-
-        assert_eq!(
-            position_value(
-                &assessment,
-                PositionQuotation {
-                    price: dec("98.5"),
-                    basis: QuotationBasis::PercentOfRemainingFace,
-                    venue_currency: CurrencyCode::Rub,
-                    remaining_face: Err(NotComputable::RemainingFaceAmbiguous { instrument }),
-                    rule: &rule,
-                },
-                &request,
-            ),
-            Err(NotComputable::RemainingFaceAmbiguous { instrument }),
         );
     }
 
@@ -4152,60 +4134,8 @@ mod tests {
             } if actual == instrument
         ));
     }
-    fn состояние_с_номиналами(
-        state: LedgerState,
-        faces: &[&str],
-    ) -> LedgerState {
-        fn known(face: &str) -> ciborium::Value {
-            let principal = crate::rules::lot_disposal::PrincipalState::known(
-                PerUnitAmount::new(dec(face), CurrencyCode::Rub),
-                PerUnitAmount::new(dec(face), CurrencyCode::Rub),
-            )
-            .expect("известный номинал");
-            let mut bytes = Vec::new();
-            ciborium::ser::into_writer(&principal, &mut bytes).expect("сериализация номинала");
-            ciborium::de::from_reader(bytes.as_slice()).expect("разбор номинала")
-        }
 
-        fn replace(value: &mut ciborium::Value, faces: &[&str], next: &mut usize) {
-            match value {
-                ciborium::Value::Map(entries) => {
-                    for (key, value) in entries {
-                        if matches!(key, ciborium::Value::Text(text) if text == "principal") {
-                            let face = faces
-                                .get(*next)
-                                .copied()
-                                .expect("для каждой партии задан номинал");
-                            *value = known(face);
-                            *next += 1;
-                        } else {
-                            replace(value, faces, next);
-                        }
-                    }
-                }
-                ciborium::Value::Array(values) => {
-                    for value in values {
-                        replace(value, faces, next);
-                    }
-                }
-                ciborium::Value::Tag(_, value) => replace(value, faces, next),
-                _ => {}
-            }
-        }
-
-        let mut bytes = Vec::new();
-        ciborium::ser::into_writer(&state, &mut bytes).expect("сериализация состояния");
-        let mut value: ciborium::Value =
-            ciborium::de::from_reader(bytes.as_slice()).expect("разбор состояния");
-        let mut next = 0;
-        replace(&mut value, faces, &mut next);
-        assert_eq!(next, faces.len(), "все партии должны получить номинал");
-        let mut bytes = Vec::new();
-        ciborium::ser::into_writer(&value, &mut bytes).expect("сериализация изменённого состояния");
-        ciborium::de::from_reader(bytes.as_slice()).expect("разбор изменённого состояния")
-    }
-
-    fn покупка_для_номинала(
+    fn покупка_с_известной_стоимостью(
         account: AccountId,
         instrument: InstrumentId,
         day: Date,
@@ -4235,70 +4165,155 @@ mod tests {
     }
 
     fn отчёт_процентной_цены_по_покупкам(
-        faces: &[&str],
+        lot_count: usize,
+        schedule: Option<BondSchedule>,
     ) -> ReturnsReport {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
-        let events: Vec<_> = faces
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                покупка_для_номинала(
+        let events: Vec<_> = (0..lot_count)
+            .map(|index| {
+                покупка_с_известной_стоимостью(
                     account,
                     instrument,
-                    date!(2026 - 08 - 01),
+                    date!(2026 - 08 - 01) + time::Duration::days(index as i64),
                     u32::try_from(index + 1).expect("номер покупки"),
                 )
             })
             .collect();
-        let state = состояние_из_события(&contour, &events[0]);
-        let state = if events.len() == 1 {
-            состояние_с_номиналами(state, faces)
-        } else {
-            let rules = RuleRegistry::with_defaults();
-            let context = ProjectionContext {
-                contour: &contour,
-                rules: &rules,
-                lot_rule: LotRuleVersion(1),
-            };
-            let state = project(&events, &context)
-                .expect("проекция покупок")
-                .snapshot()
-                .state()
-                .clone();
-            состояние_с_номиналами(state, faces)
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
         };
+        let state = project(&events, &context)
+            .expect("проекция покупок")
+            .snapshot()
+            .state()
+            .clone();
         let mut candidate = рыночная_цена(instrument, date!(2026 - 08 - 25));
         candidate.price = dec("98.5");
         candidate.basis = QuotationBasis::PercentOfRemainingFace;
-        отчёт_с_рыночной_ценой(&state, &contour, candidate)
+        let bond_schedules = schedule
+            .map(|schedule| BTreeMap::from([(instrument, schedule)]))
+            .unwrap_or_default();
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let request = ReturnsRequest {
+            contour: &contour,
+            as_of: date!(2026 - 08 - 26),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            coordinate: KnowledgeCoordinate::default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: std::slice::from_ref(&candidate),
+            bond_schedules: &bond_schedules,
+            accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+        };
+        returns_report(&state, &request)
     }
 
     #[test]
-    fn процентная_цена_в_отчёте_использует_найденный_номинал_лота() {
-        let report = отчёт_процентной_цены_по_покупкам(&["1000"]);
-
-        assert_eq!(report.terminal_value, Computed::Value(dec("9850")));
-    }
-
-    #[test]
-    fn одинаковый_номинал_лотов_остаётся_вычислимым_в_отчёте() {
+    fn a_percent_quote_uses_the_issue_remainder_for_every_lot() {
+        // Остаток принадлежит выпуску: две партии, купленные в разные
+        // дни, оцениваются по одному и тому же непогашенному номиналу.
+        let mut schedule =
+            график_купонов(&[date!(2026 - 06 - 01)], date!(2026 - 08 - 15));
+        schedule.principal_returns[0].share_percent = dec("30");
         let report =
-            отчёт_процентной_цены_по_покупкам(&["1000", "1000"]);
+            отчёт_процентной_цены_по_покупкам(2, Some(schedule));
 
-        assert_eq!(report.terminal_value, Computed::Value(dec("19700")));
+        // 20 бумаг × 700 остатка × 98.5% = 13_790.
+        assert_eq!(report.terminal_value, Computed::Value(dec("13790")));
     }
 
     #[test]
-    fn разные_номиналы_лотов_дают_явную_ошибку_в_отчёте() {
-        let report =
-            отчёт_процентной_цены_по_покупкам(&["1000", "2000"]);
+    fn a_position_with_unpriced_quantity_still_projects_a_flow_but_has_no_lifetime_metrics() {
+        // Номинал принадлежит выпуску, поэтому неизвестность стоимости
+        // части позиции не мешает построить поток на всё количество.
+        // Пожизненные метрики при этом остаются невычислимыми.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let custody = CustodyId::new_random();
+        let mut priced = покупка_с_известной_стоимостью(
+            account,
+            instrument,
+            date!(2026 - 08 - 01),
+            1,
+        );
+        for leg in &mut priced.legs {
+            if leg.quantity.is_some() {
+                leg.custody = Some(custody);
+            }
+        }
+        let mut unpriced = покупка_с_известной_стоимостью(
+            account,
+            instrument,
+            date!(2026 - 08 - 02),
+            2,
+        );
+        for leg in &mut unpriced.legs {
+            if leg.quantity.is_some() {
+                leg.custody = Some(custody);
+            }
+        }
+        let EventKind::OpeningPosition { cost_basis, .. } = &mut unpriced.kind else {
+            panic!("ожидалась открытая позиция");
+        };
+        *cost_basis = None;
+        let events = vec![priced, unpriced];
+        let rules = RuleRegistry::with_defaults();
+        let context = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let state = project(&events, &context)
+            .expect("проекция смешанной позиции")
+            .snapshot()
+            .state()
+            .clone();
+        let schedule = график_купонов(&[date!(2026 - 09 - 01)], date!(2027 - 08 - 15));
+        let candidate = рыночная_цена(instrument, date!(2026 - 08 - 25));
+        let fx = FxTable::new(FxSource::OwnerSupplied);
+        let ledger = ReconciliationLedger::default();
+        let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
+        let schedules = BTreeMap::from([(instrument, schedule)]);
+        let report = returns_report(
+            &state,
+            &ReturnsRequest {
+                contour: &contour,
+                as_of: date!(2026 - 08 - 26),
+                report_currency: CurrencyCode::Rub,
+                fx: &fx,
+                solver_policy: SolverPolicy::returns_default(),
+                coordinate: KnowledgeCoordinate::default(),
+                ledger: &ledger,
+                perimeter: &perimeter,
+                market_prices: std::slice::from_ref(&candidate),
+                bond_schedules: &schedules,
+                accrued_observations: &EMPTY_ACCRUED_OBSERVATIONS,
+            },
+        );
+        assert_eq!(report.bond_metrics.len(), 1);
+        let scenario = &report.bond_metrics[0].scenarios[0];
+        assert!(matches!(scenario.prospective.metrics, Computed::Value(_)));
+        assert!(matches!(scenario.lifetime, Computed::NotComputable { .. }));
+    }
+
+    #[test]
+    fn a_percent_quote_without_a_schedule_is_not_computable_with_a_named_reason() {
+        let report = отчёт_процентной_цены_по_покупкам(1, None);
 
         assert!(matches!(
             report.terminal_value,
             Computed::NotComputable {
-                reason: NotComputable::RemainingFaceAmbiguous { .. }
+                reason: NotComputable::RemainingFaceUnknown { .. }
             }
         ));
     }
@@ -4675,6 +4690,7 @@ mod tests {
                 repayment_date: date!(2026 - 12 - 02),
                 share_percent: dec("100"),
             }],
+            initial_principal: Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub)),
             offer_windows: vec![crate::bond::OfferWindowTerms {
                 window: crate::bond::OfferWindowId::new_random(),
                 right: crate::bond::OfferRight::HolderPut,
@@ -5006,6 +5022,7 @@ mod tests {
                 repayment_date: repayment,
                 share_percent: dec("100"),
             }],
+            initial_principal: Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub)),
             offer_windows: offers
                 .iter()
                 .map(|execution_date| crate::bond::OfferWindowTerms {
@@ -5196,22 +5213,18 @@ mod tests {
 
     /// Отчёт по журналу облигации.
     ///
-    /// Номинал проставляется лотам отдельно: событие покупки его не
-    /// знает, а без него правило потока отказывается строить план.
     /// Позиция получает биржевую цену, потому что непокрытая позиция
     /// сама делает отчёт неполным и скрыла бы вклад сверки в статус.
     fn отчёт_сверки(
         accounts: &[AccountId],
         instrument: InstrumentId,
         events: &[crate::event::Event],
-        faces: &[&str],
         schedule: &BondSchedule,
     ) -> ReturnsReport {
         отчёт_сверки_на(
             accounts,
             instrument,
             events,
-            faces,
             schedule,
             date!(2026 - 08 - 26),
         )
@@ -5224,7 +5237,6 @@ mod tests {
         accounts: &[AccountId],
         instrument: InstrumentId,
         events: &[crate::event::Event],
-        faces: &[&str],
         schedule: &BondSchedule,
         as_of: Date,
     ) -> ReturnsReport {
@@ -5244,13 +5256,6 @@ mod tests {
             .snapshot()
             .state()
             .clone();
-        let state = if faces.is_empty() {
-            // Пустой список намеренно оставляет номинал неизвестным:
-            // сценарий должен отказаться, а независимая сверка — продолжить.
-            state
-        } else {
-            состояние_с_номиналами(state, faces)
-        };
         // Цена наблюдена накануне отчёта: политика отбора цену из
         // будущего не берёт, и позиция осталась бы непокрытой.
         let candidate =
@@ -5325,7 +5330,6 @@ mod tests {
             &[account],
             instrument,
             &журнал_с_пропущенным_купоном(account, instrument),
-            &["1000"],
             &schedule,
         );
 
@@ -5367,7 +5371,7 @@ mod tests {
                 Some(date!(2026 - 07 - 05)),
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         // Оба купона раньше первого события счёта: здесь нельзя обвинять
         // эмитента, даже если книга уже знает, что покупка была позже.
@@ -5423,7 +5427,7 @@ mod tests {
             date!(2026 - 01 - 01),
             date!(2021 - 05 - 01),
         )];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         // Июнь 2026 уже покрыт журналом, поэтому его отсутствие теперь
         // проверяем отдельно; пять купонов 2021–2025 названы недоказуемыми.
@@ -5461,7 +5465,7 @@ mod tests {
             date!(2026 - 01 - 01),
             date!(2021 - 05 - 01),
         )];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
         // Две одинаковые недоказуемости должны слиться только после
         // полного обхода, не поглотив отдельное обвинение ниже.
         assert!(
@@ -5527,7 +5531,7 @@ mod tests {
         assertions.acquisition_date = Some(первый_день);
         assertions.acquisition_date_certainty = crate::event::kind::DateCertainty::Known;
         let events = vec![restored];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert!(
             !содержит(&report, |issue| matches!(
@@ -5580,7 +5584,7 @@ mod tests {
             пополнение(account, date!(2026 - 01 - 05)),
             покупка_облигации(account, instrument, date!(2026 - 01 - 10), None),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert!(содержит(&report, |issue| matches!(
             issue,
@@ -5631,7 +5635,7 @@ mod tests {
         );
         purchase.dates.settled = None;
         let events = vec![пополнение(account, date!(2026 - 01 - 05)), purchase];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert!(непринятые(&report).is_empty());
         assert!(содержит(&report, |issue| matches!(
@@ -5753,7 +5757,7 @@ mod tests {
                 vec![Leg::cash(account, amount)],
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert!(непринятые(&report).is_empty());
         assert!(содержит(&report, |issue| matches!(
@@ -5787,7 +5791,6 @@ mod tests {
             &[account],
             instrument,
             &журнал_с_пропущенным_купоном(account, instrument),
-            &["1000"],
             &schedule,
         );
 
@@ -5867,7 +5870,6 @@ mod tests {
             &[account],
             instrument,
             &events,
-            &["1000"],
             &schedule,
             date!(2026 - 07 - 05),
         );
@@ -5887,7 +5889,6 @@ mod tests {
             &[account],
             instrument,
             &events,
-            &["1000"],
             &schedule,
             date!(2026 - 07 - 06),
         );
@@ -5918,7 +5919,7 @@ mod tests {
             date!(2026 - 08 - 22),
             date!(2021 - 05 - 01),
         )];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert!(непринятые(&report).is_empty());
         assert!(!содержит(&report, |issue| matches!(
@@ -5954,7 +5955,7 @@ mod tests {
                 3,
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &[], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert!(report.bond_metrics.is_empty());
         let issues = непринятые(&report);
@@ -5972,7 +5973,7 @@ mod tests {
         // сценария не должен выключать проверку пропущенного купона.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let mut schedule = график_купонов(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5980,6 +5981,7 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
+        schedule.initial_principal = None;
         let events = vec![
             пополнение(account, date!(2026 - 01 - 05)),
             покупка_облигации(
@@ -5989,7 +5991,7 @@ mod tests {
                 Some(date!(2026 - 01 - 10)),
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &[], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert!(matches!(
             report.bond_metrics[0].scenarios[0].prospective.metrics,
@@ -6028,7 +6030,7 @@ mod tests {
                 Some(date!(2026 - 01 - 10)),
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         let refusals: Vec<_> = report
             .data_quality
@@ -6068,7 +6070,7 @@ mod tests {
             instrument,
             &[date!(2026 - 06 - 16)],
         );
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         let issues = непринятые(&report);
         assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
@@ -6098,7 +6100,7 @@ mod tests {
             instrument,
             &[date!(2026 - 03 - 16), date!(2026 - 06 - 16)],
         );
-        let report = отчёт_сверки(&[account], instrument, &events, &["1000"], &schedule);
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert!(непринятые(&report).is_empty());
         assert!(!содержит(&report, |issue| matches!(
@@ -6127,13 +6129,7 @@ mod tests {
             instrument,
             &[date!(2026 - 03 - 16)],
         );
-        let report = отчёт_сверки(
-            &[account],
-            instrument,
-            &events,
-            &["1000", "1000"],
-            &schedule,
-        );
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert_eq!(
             report.bond_metrics.len(),
@@ -6165,13 +6161,7 @@ mod tests {
             instrument,
             &[date!(2026 - 03 - 16), date!(2026 - 06 - 16)],
         );
-        let report = отчёт_сверки(
-            &[account],
-            instrument,
-            &events,
-            &["1000", "1000"],
-            &schedule,
-        );
+        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
 
         assert_eq!(report.bond_metrics.len(), 2);
         assert!(непринятые(&report).is_empty());
@@ -6232,13 +6222,7 @@ mod tests {
         events.extend(журнал_с_пропущенным_купоном(
             second, instrument,
         ));
-        let report = отчёт_сверки(
-            &[first, second],
-            instrument,
-            &events,
-            &["1000", "1000"],
-            &schedule,
-        );
+        let report = отчёт_сверки(&[first, second], instrument, &events, &schedule);
 
         let accounts: std::collections::BTreeSet<_> = report
             .data_quality

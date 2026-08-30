@@ -26,9 +26,19 @@ strip_comments() {
   awk '{
     body = $0
     sub(/^[^:]*:[0-9]+:/, "", body)
-    if (body !~ /^[[:space:]]*(\/\/|\*\/|\*|\/\*)/) print
+    if (body !~ /^[[:space:]]*(\/\/|\*\/|\*([[:space:]]|$)|\/\*)/) print
   }'
 }
+
+# Сам заслон проверяет собственную границу: разыменование со звездой —
+# исполняемый Rust-код, а строка комментария с той же арифметикой — нет.
+strip_probe=$(printf '%s\n' \
+  'probe.rs:1: *x = y.checked_add(z)' \
+  'probe.rs:2: // x.checked_add(z)' | strip_comments)
+if [ "$strip_probe" != 'probe.rs:1: *x = y.checked_add(z)' ]; then
+  err "strip_comments неверно классифицирует разыменование или комментарий"
+  printf '%s\n' "$strip_probe" >&2
+fi
 
 # cargo metadata читается ОДИН раз: четыре вызова в цикле заслона — это
 # четыре шанса, что один из них молча упадёт и заслон пропустит нарушение.

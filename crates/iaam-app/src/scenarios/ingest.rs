@@ -1,13 +1,21 @@
 //! Приёмка операций.
 
+use iaam_core::bond::BondSchedule;
 use iaam_core::event::Event;
+use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::ids::SourceId;
 use iaam_ingest::operation::NormalizationContext;
-use iaam_ingest::{Rejection, SubmittedOperation, Verdict, normalize};
+use iaam_ingest::{
+    JournalEventEnrichment, JournalFact, Rejection, SubmittedJournalEvent, SubmittedOperation,
+    Verdict, normalize, normalize_journal_event,
+};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::AppServices;
 use crate::error::AppError;
 use crate::ports::{Principal, Recorded};
+use crate::scenarios::reports::MOEX_ISS_SOURCE_ID;
 
 /// Отправка пачки операций.
 ///
@@ -38,6 +46,117 @@ pub async fn submit_operations(
         })
         .collect();
     submit_candidates(services, principal, "operation", candidates).await
+}
+
+/// Приёмка журнальных фактов с обогащением амортизации графиком.
+///
+/// График и координату знания читает приложение. Нормализатор получает
+/// только готовое [`JournalEventEnrichment`], поэтому остаётся чистой
+/// функцией и не зависит от справочника или хранилища.
+pub async fn submit_journal_events(
+    services: &AppServices,
+    principal: &Principal,
+    source: SourceId,
+    events: &[SubmittedJournalEvent],
+) -> Result<Vec<Verdict>, AppError> {
+    let knowledge_as_of = OffsetDateTime::now_utc();
+    let knowledge_as_of_wire = knowledge_as_of
+        .format(&Rfc3339)
+        .map_err(|error| AppError::Store(error.to_string()))?;
+    let context = NormalizationContext {
+        owner: principal.owner,
+        source,
+    };
+    let mut candidates = Vec::with_capacity(events.len());
+
+    for submitted in events {
+        let enrichment = match &submitted.fact {
+            JournalFact::CorporateAction(CorporateAction::PartialRedemption {
+                instrument,
+                principal_returned_per_unit,
+                effective_date,
+                ..
+            }) => {
+                let loaded_schedule = {
+                    let store = services.market_store.lock().await;
+                    match store
+                        .schedule_at_or_before(
+                            &instrument.inner().to_string(),
+                            MOEX_ISS_SOURCE_ID,
+                            &knowledge_as_of_wire,
+                        )
+                        .map_err(|error| AppError::Store(error.to_string()))?
+                    {
+                        None => None,
+                        Some(snapshot) => {
+                            let completeness_row = store
+                                .schedule_completeness(&snapshot.snapshot_id)
+                                .map_err(|error| AppError::Store(error.to_string()))?;
+                            let terms = store
+                                .issue_terms_at_or_before(
+                                    &instrument.inner().to_string(),
+                                    MOEX_ISS_SOURCE_ID,
+                                    &knowledge_as_of_wire,
+                                )
+                                .map_err(|error| AppError::Store(error.to_string()))?;
+                            let offer_kinds = store
+                                .market_source_codes(MOEX_ISS_SOURCE_ID, "offer_kind")
+                                .map_err(|error| AppError::Store(error.to_string()))?;
+                            let schedule = BondSchedule {
+                                periods: crate::market_candidate::accrual_periods_from_snapshot(
+                                    &snapshot,
+                                )?,
+                                principal_returns:
+                                    crate::market_candidate::principal_returns_from_snapshot(
+                                        &snapshot,
+                                    )?,
+                                initial_principal:
+                                    crate::market_candidate::initial_principal_from_terms(
+                                        terms.as_ref(),
+                                    ),
+                                offer_windows:
+                                    crate::market_candidate::offer_windows_from_snapshot(
+                                        &snapshot,
+                                        *instrument,
+                                        &offer_kinds,
+                                    )?,
+                                completeness:
+                                    crate::market_candidate::schedule_completeness_from_row(
+                                        completeness_row.as_ref(),
+                                    ),
+                                default_flags: crate::market_candidate::default_flags_from_terms(
+                                    terms.as_ref(),
+                                ),
+                                currency_roles: None,
+                            };
+                            Some((schedule, snapshot.snapshot_id.clone()))
+                        }
+                    }
+                };
+                let (schedule, snapshot_id) = match loaded_schedule {
+                    Some((schedule, snapshot_id)) => (Some(schedule), snapshot_id),
+                    None => (None, String::new()),
+                };
+                JournalEventEnrichment {
+                    basis_allocation: iaam_core::rules::resolve_basis_allocation(
+                        *principal_returned_per_unit,
+                        *effective_date,
+                        schedule.as_ref(),
+                        &snapshot_id,
+                        knowledge_as_of,
+                    ),
+                }
+            }
+            _ => JournalEventEnrichment::default(),
+        };
+
+        candidates.push(
+            normalize_journal_event(submitted, &enrichment, context)
+                .map(|normalized| normalized.event),
+        );
+    }
+
+    submit_candidates(services, principal, "fact", candidates).await
 }
 
 /// Приёмка готовых кандидатов: право отправки, форма, запись, вердикт.

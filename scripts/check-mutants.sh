@@ -196,6 +196,14 @@ MODULES=(
   "crates/iaam-core/src/event/offer.rs"
   "crates/iaam-core/src/event/legs.rs"
   "crates/iaam-core/src/rules/amortisation.rs"
+  # Эти правила не складывают деньги, но определяют смысл уже посчитанной
+  # суммы: returned_share удерживает долю возврата, а allocation выбирает,
+  # какая часть налоговой стоимости возвращается владельцу при амортизации.
+  # Ошибка в границе или распределении оставит цифры правдоподобными, но
+  # подменит экономическую базу расчёта — тот же риск, что у instrument.rs
+  # и reconciliation.
+  "crates/iaam-core/src/rules/returned_share.rs"
+  "crates/iaam-core/src/rules/allocation.rs"
   # Правило НКД и выводы по графику. Добавлено при исполнении E3.4.4
   # (iaam-pa0m). accrued_interest.rs держит полуоткрытость границы
   # периода и стратегию округления: обе меняют сумму при одинаковом
@@ -207,6 +215,11 @@ MODULES=(
   "crates/iaam-core/src/rules/accrued_interest.rs"
   "crates/iaam-core/src/bond/finality.rs"
   "crates/iaam-core/src/bond/posting.rs"
+  # principal.rs выводит непогашенный остаток из последовательности возвратов.
+  # Сдвиг границы этой последовательности не меняет сумму напрямую, зато
+  # тихо меняет базу всех последующих расчётов по бумаге; поэтому модуль
+  # стережётся отдельно рядом с finality.rs и posting.rs.
+  "crates/iaam-core/src/bond/principal.rs"
   "crates/iaam-core/src/projection/offers.rs"
   # График выплат (E3.4 часть 2). Ошибка в инвариантах полноты не меняет
   # ни одной суммы — она меняет то, что система считает полным графиком,

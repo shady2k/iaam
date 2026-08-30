@@ -5,11 +5,13 @@
 //! Реестр закрытый: плагины в рантайме не нужны.
 
 mod accrued_interest;
+pub mod allocation;
 pub mod amortisation;
 pub mod cashflow;
 pub mod lot_disposal;
 pub mod posting_match;
 pub mod quotation;
+pub mod returned_share;
 pub mod valuation;
 
 use std::collections::BTreeMap;
@@ -19,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use accrued_interest::{
     AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
 };
+pub use allocation::resolve_basis_allocation;
 use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
 use lot_disposal::{FifoV1, LotDisposalRule};
 
@@ -29,6 +32,7 @@ pub use cashflow::{
 };
 pub use posting_match::{PostingMatchV1, PostingMatchV2, PostingMatchVersion, Verdict};
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
+pub use returned_share::{ReturnedShare, ReturnedShareError};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,
     ValuationRule,
@@ -209,7 +213,7 @@ mod tests {
         use crate::ids::InstrumentId;
         use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
         use crate::numeric::decimal::Dec;
-        use lot_disposal::{DisposalInput, Lot, LotId, PrincipalState};
+        use lot_disposal::{DisposalInput, Lot, LotId};
         use rust_decimal::Decimal;
         use time::macros::date;
 
@@ -228,7 +232,6 @@ mod tests {
             acquisition_basis: None,
             accrued_interest_paid: None,
             received_to_date: None,
-            principal: PrincipalState::Unknown,
         }];
         let out = rule
             .apply(&DisposalInput {

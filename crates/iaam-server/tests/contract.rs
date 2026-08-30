@@ -12,7 +12,6 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use ciborium::value::Value as CborValue;
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
@@ -33,16 +32,14 @@ use iaam_core::event::kind::{DateCertainty, EventKind};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
-use iaam_core::money::{CurrencyCode, PerUnitAmount};
+use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::approx::SolverPolicy;
-use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
-use iaam_core::projection::{ProjectionContext, Snapshot, project};
+use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
 use iaam_core::returns::{
     KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
 };
-use iaam_core::rules::lot_disposal::PrincipalState;
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable};
 use iaam_server::auth::hash_token;
@@ -55,7 +52,6 @@ use iaam_store::schedule::{
     CouponPeriodRow, IssueTermsRow, OfferWindowRow, PrincipalRepaymentRow, ScheduleSnapshotRow,
 };
 use serde_json::{Value, json};
-use std::io::Cursor;
 use std::time::Duration;
 use time::macros::date;
 use time::{Date, Duration as TimeDuration, OffsetDateTime};
@@ -667,84 +663,6 @@ async fn seed_bond_market(harness: &Harness) {
         .expect("условия выпуска");
 }
 
-fn replace_unknown_principal(value: &mut CborValue, known: &CborValue) -> usize {
-    match value {
-        CborValue::Map(entries) => {
-            let mut replaced = 0;
-            for (key, value) in entries {
-                let is_principal = matches!(key, CborValue::Text(name) if name == "principal");
-                if is_principal && matches!(value, CborValue::Text(name) if name == "Unknown") {
-                    *value = known.clone();
-                    replaced += 1;
-                } else {
-                    replaced += replace_unknown_principal(value, known);
-                }
-            }
-            replaced
-        }
-        CborValue::Array(values) => values
-            .iter_mut()
-            .map(|value| replace_unknown_principal(value, known))
-            .sum(),
-        CborValue::Tag(_, value) => replace_unknown_principal(value, known),
-        _ => 0,
-    }
-}
-
-fn install_known_principal_snapshot(
-    path: &std::path::Path,
-    owner: OwnerId,
-    account: AccountId,
-    contour_id: Uuid,
-) {
-    let store = SqliteStore::open(path).expect("второе соединение для снимка");
-    let events = store
-        .load_events_through(owner, Date::MAX)
-        .expect("события позиции");
-    let contour = ContourDefinition::new(ContourId(contour_id), ContourVersion(1), [account]);
-    let rules = RuleRegistry::with_defaults();
-    let context = ProjectionContext {
-        contour: &contour,
-        rules: &rules,
-        lot_rule: LotRuleVersion(1),
-    };
-    let projection = project(&events, &context).expect("проекция позиции");
-
-    let principal = PrincipalState::known(
-        PerUnitAmount::new(
-            Dec::new("1000".parse().expect("номинал")),
-            CurrencyCode::Rub,
-        ),
-        PerUnitAmount::new(
-            Dec::new("1000".parse().expect("остаток номинала")),
-            CurrencyCode::Rub,
-        ),
-    )
-    .expect("известный номинал");
-    let mut encoded_principal = Vec::new();
-    ciborium::ser::into_writer(&principal, &mut encoded_principal).expect("кодирование номинала");
-    let known: CborValue =
-        ciborium::de::from_reader(Cursor::new(encoded_principal)).expect("разбор номинала");
-
-    let mut encoded_state = Vec::new();
-    ciborium::ser::into_writer(projection.snapshot().state(), &mut encoded_state)
-        .expect("кодирование состояния");
-    let mut state_value: CborValue =
-        ciborium::de::from_reader(Cursor::new(encoded_state)).expect("разбор состояния");
-    let replaced = replace_unknown_principal(&mut state_value, &known);
-    assert_eq!(replaced, 1, "только лот тестовой облигации требует номинал");
-    let mut patched_state_bytes = Vec::new();
-    ciborium::ser::into_writer(&state_value, &mut patched_state_bytes)
-        .expect("кодирование исправленного состояния");
-    let mut parts = projection.snapshot().clone().into_parts();
-    parts.state = ciborium::de::from_reader(Cursor::new(patched_state_bytes))
-        .expect("исправленное состояние");
-    parts.fingerprint = parts.state.fingerprint();
-    store
-        .save_snapshot(owner, &Snapshot::restore(parts))
-        .expect("снимок с известным номиналом");
-}
-
 async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = router
         .clone()
@@ -866,10 +784,10 @@ async fn health_is_public_and_reports_versions() {
     // агент читает эту цифру, чтобы понять, разберёт ли он ответ, —
     // поэтому она закреплена здесь, а не выводится из кода.
     assert_eq!(body["schema_version"], 4);
-    // Версия 6: книга лотов хранит историю изменений количества со знанием
-    // о расчётах, поэтому снимок без неё нельзя честно трактовать как
-    // позицию без владения.
-    assert_eq!(body["projection_version"], 6);
+    // Версия 7: номинал ушёл из лота, а отпечаток префикса покрывает
+    // содержимое события, а не только идентичность подачи. Снимок
+    // версии 6 несовместим и вызывает полный пересчёт.
+    assert_eq!(body["projection_version"], 7);
 }
 
 #[tokio::test]
@@ -1354,12 +1272,6 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
             .iter()
             .all(|verdict| verdict["verdict"] == "provisional"),
         "{verdicts}"
-    );
-    install_known_principal_snapshot(
-        &path,
-        harness.owner,
-        harness.account,
-        contour_id.parse().expect("идентификатор контура"),
     );
 
     let (status, report) = call(
@@ -3704,6 +3616,158 @@ async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "rejected", "{response}");
     assert_eq!(response[0]["field"], "fact", "{response}");
+}
+#[tokio::test]
+async fn the_ingest_route_ignores_a_client_supplied_allocation() {
+    let (harness, path) = harness_on_disk();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                "compensation": { "amount": "1000.00", "currency": "RUB" },
+                "effective_date": "2026-05-20",
+                "basis_allocation": { "state": "known", "share": "0.9" }
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let store = SqliteStore::open(&path).expect("второе соединение");
+    let allocation = store
+        .load_events_through(harness.owner, Date::MAX)
+        .expect("события амортизации")
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::CorporateAction {
+                action:
+                    iaam_core::event::corporate_action::CorporateAction::PartialRedemption {
+                        basis_allocation,
+                        ..
+                    },
+            } => Some(basis_allocation),
+            _ => None,
+        })
+        .expect("амортизация");
+    assert!(
+        matches!(
+            &allocation,
+            iaam_core::event::allocation::BasisAllocation::Unknown(
+                iaam_core::event::allocation::AllocationGap::ScheduleMissing
+            )
+        ),
+        "доля должна быть выведена приложением без графика: {allocation:?}"
+    );
+    assert!(
+        !matches!(
+            &allocation,
+            iaam_core::event::allocation::BasisAllocation::Known { .. }
+        ),
+        "клиентская доля не должна попасть в событие: {allocation:?}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn an_unknown_allocation_is_named_to_the_owner() {
+    let harness = harness();
+    let contour = json!({
+        "title": "Портфель с амортизацией",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("контур")
+        .to_owned();
+
+    let operations = json!({
+        "source_label": "тест",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "buy",
+            "instrument": harness.instrument.inner(),
+            "custody": harness.custody.inner(),
+            "quantity": "10",
+            "amount": "1000.00",
+            "currency": "RUB",
+            "dates": { "trade": "2026-05-01", "cash_posted": "2026-05-01" }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let journal = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                "compensation": { "amount": "1000.00", "currency": "RUB" },
+                "effective_date": "2026-05-20"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &journal),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-05-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["data_quality"]["status"], "incomplete", "{report}");
+    let expected = format!(
+        "доля разнесения амортизации инструмента {} на счёте {} не выведена: дозагрузите проверенный график выпуска",
+        harness.instrument.inner(),
+        harness.account.inner()
+    );
+    assert!(
+        report["data_quality"]["material_issues"]
+            .as_array()
+            .expect("материальные проблемы")
+            .iter()
+            .any(|issue| issue.as_str() == Some(expected.as_str())),
+        "владелец не увидел разрыв: {report}"
+    );
 }
 
 #[tokio::test]

@@ -335,6 +335,7 @@ mod tests {
                 effective_date: time::macros::date!(2026 - 06 - 15),
                 record_date: None,
                 grounds: None,
+                basis_allocation: crate::event::allocation::BasisAllocation::default(),
             },
         }
     }

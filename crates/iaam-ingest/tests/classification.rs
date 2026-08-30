@@ -552,6 +552,7 @@ fn amortisation_event(journal: &Journal) -> Event {
                 effective_date: date!(2026 - 06 - 15),
                 record_date: None,
                 grounds: None,
+                basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
             },
         },
         vec![Leg::principal(journal.account, instrument, compensation)],

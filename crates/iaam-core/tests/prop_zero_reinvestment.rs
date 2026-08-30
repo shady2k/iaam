@@ -24,8 +24,7 @@ use iaam_core::returns::zero_reinvestment::{
     ZeroReinvestmentMetrics, lifetime_cohort_metrics, zero_reinvestment_metrics,
 };
 use iaam_core::returns::{Computed, ReturnsRequest, returns_report};
-use iaam_core::rules::lot_disposal::Lot;
-use iaam_core::rules::lot_disposal::{FifoV1, LotDisposalRule, PrincipalState};
+use iaam_core::rules::lot_disposal::{FifoV1, Lot, LotDisposalRule};
 use iaam_core::rules::{
     CashflowPlan, CashflowProjection, CashflowProjectionV1, ExpectedPosting, LotRuleVersion,
     PostingKind, RuleRegistry,
@@ -151,7 +150,6 @@ proptest! {
             acquisition_basis: Some(rub(1_000_000)),
             accrued_interest_paid: None,
             received_to_date: received.map(rub),
-            principal: PrincipalState::Unknown,
         };
         let result = FifoV1
             .apply(&iaam_core::rules::lot_disposal::DisposalInput {
@@ -238,6 +236,7 @@ proptest! {
             completeness: iaam_core::bond::ScheduleCompleteness::Validated,
             default_flags: Some(DefaultFlags { declared: false, technical: false }),
             currency_roles: Some(CurrencyRoles::uniform(CurrencyCode::Rub)),
+            initial_principal: Some(principal),
             ..BondSchedule::default()
         };
         let original = common(
@@ -285,7 +284,6 @@ proptest! {
         let original_plan = CashflowProjectionV1
             .future_postings(&iaam_core::rules::CashflowInput {
                 schedule: &original,
-                principal: PrincipalState::known(principal, principal).unwrap(),
                 quantity: qty(1),
                 choice: &hold,
                 as_of,
@@ -295,7 +293,6 @@ proptest! {
         let extended_plan = CashflowProjectionV1
             .future_postings(&iaam_core::rules::CashflowInput {
                 schedule: &extended,
-                principal: PrincipalState::known(principal, principal).unwrap(),
                 quantity: qty(1),
                 choice: &hold,
                 as_of,

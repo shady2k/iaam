@@ -7,6 +7,7 @@
 //!
 //! Снимки и кэш хранит **оболочка**: ядро остаётся без состояния.
 
+pub mod active_instruments;
 pub mod balances;
 pub mod flows;
 pub mod income;
@@ -15,6 +16,8 @@ pub mod lots;
 pub mod offers;
 pub mod ownership;
 pub mod state;
+
+pub use active_instruments::active_instruments;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -35,7 +38,11 @@ use state::{LedgerState, StateHash};
 
 /// Версия формата проекции. Снимок, построенный другой версией,
 /// продвигать нельзя: смысл полей мог измениться.
-pub const PROJECTION_VERSION: u32 = 6;
+///
+/// Версия 7: номинал ушёл из лота, отпечаток префикса покрывает
+/// содержимое события (`prefix_digest/v2`). Снимки версии 6 несовместимы
+/// и вызывают полный пересчёт.
+pub const PROJECTION_VERSION: u32 = 7;
 
 /// Неизменяемый вход проекции: границы контура и версии правил.
 ///

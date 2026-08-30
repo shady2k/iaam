@@ -71,7 +71,6 @@ impl From<ScheduleTrustError> for CashflowError {
 /// Входы правила построения потока.
 pub struct CashflowInput<'a> {
     pub schedule: &'a BondSchedule,
-    pub principal: crate::rules::lot_disposal::PrincipalState,
     pub quantity: Quantity,
     pub choice: &'a OfferChoice,
     pub as_of: Date,
@@ -243,14 +242,10 @@ impl CashflowProjection for CashflowProjectionV1 {
             return Err(CashflowError::CurrencyFormulaUnknown { roles });
         }
 
-        let original = match input.principal {
-            crate::rules::lot_disposal::PrincipalState::Unknown => {
-                return Err(CashflowError::PrincipalUnknown);
-            }
-            crate::rules::lot_disposal::PrincipalState::Known {
-                original_per_unit, ..
-            } => original_per_unit,
-        };
+        let original = input
+            .schedule
+            .initial_principal
+            .ok_or(CashflowError::PrincipalUnknown)?;
 
         if original.currency() != input.report_currency
             || input.schedule.periods.iter().any(|period| {
@@ -452,7 +447,6 @@ mod tests {
     use crate::instrument::CurrencyRoles;
     use crate::money::{CurrencyCode, PerUnitAmount, Quantity};
     use crate::numeric::decimal::Dec;
-    use crate::rules::lot_disposal::PrincipalState;
     use rust_decimal::Decimal;
     use time::macros::date;
 
@@ -466,10 +460,6 @@ mod tests {
 
     fn quantity(value: &str) -> Quantity {
         Quantity(dec(value))
-    }
-
-    fn known_principal(original: &str, remaining: &str) -> PrincipalState {
-        PrincipalState::known(per_unit(original), per_unit(remaining)).expect("valid principal")
     }
 
     fn period(start: time::Date, payment: time::Date, coupon: Option<&str>) -> AccrualPeriod {
@@ -495,19 +485,18 @@ mod tests {
                 technical: false,
             }),
             currency_roles: Some(CurrencyRoles::uniform(CurrencyCode::Rub)),
+            initial_principal: Some(per_unit("100")),
             ..BondSchedule::default()
         }
     }
 
     fn input<'a>(
         schedule: &'a BondSchedule,
-        principal: PrincipalState,
         choice: &'a OfferChoice,
         as_of: time::Date,
     ) -> CashflowInput<'a> {
         CashflowInput {
             schedule,
-            principal,
             quantity: quantity("1"),
             choice,
             as_of,
@@ -632,12 +621,7 @@ mod tests {
         let as_of = date!(2026 - 08 - 01);
 
         let hold_plan = CashflowProjectionV1
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &hold_to_maturity,
-                as_of,
-            ))
+            .future_postings(&input(&schedule, &hold_to_maturity, as_of))
             .expect("сценарий удержания не требует исполнения оферты");
         // Оферта — право владельца, поэтому без предъявления по ней нет
         // обещанного эмитентом платежа и нет основания требовать факт расчёта.
@@ -682,20 +666,10 @@ mod tests {
         let choice = OfferChoice::ExerciseAtOffer { window };
 
         let v1 = CashflowProjectionV1
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            ))
+            .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01)))
             .expect("выбранная оферта должна попасть в прошлое");
         let v2 = CashflowProjectionV2
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            ))
+            .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01)))
             .expect("выбранная оферта должна попасть в прошлое");
 
         // Подмена прошлого в V2 частичная: `historical_schedule_postings`
@@ -730,12 +704,7 @@ mod tests {
         let historical = historical_schedule_postings(&schedule, as_of)
             .expect("проверенный график даёт прошлые выплаты");
         let v2 = CashflowProjectionV2
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                as_of,
-            ))
+            .future_postings(&input(&schedule, &choice, as_of))
             .expect("известный номинал даёт полный план");
 
         assert_eq!(historical, v2.past);
@@ -756,12 +725,7 @@ mod tests {
         let choice = OfferChoice::HoldToMaturity;
 
         let plan = CashflowProjectionV2
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 09 - 15),
-            ))
+            .future_postings(&input(&schedule, &choice, date!(2026 - 09 - 15)))
             .expect("past coupon is computable");
 
         assert_eq!(
@@ -790,12 +754,7 @@ mod tests {
         let choice = OfferChoice::HoldToMaturity;
 
         let plan = CashflowProjectionV2
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 09 - 15),
-            ))
+            .future_postings(&input(&schedule, &choice, date!(2026 - 09 - 15)))
             .expect("past coupon is computable");
 
         assert_eq!(plan.past[0].entitlement, None);
@@ -829,7 +788,6 @@ mod tests {
         let plan = CashflowProjectionV1
             .future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal: known_principal("100", "100"),
                 quantity: quantity("3"),
                 choice: &choice,
                 as_of: date!(2026 - 08 - 01),
@@ -863,7 +821,6 @@ mod tests {
         let plan = CashflowProjectionV1
             .future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal: known_principal("100", "70"),
                 quantity: quantity("2"),
                 choice: &choice,
                 as_of: date!(2026 - 08 - 01),
@@ -911,7 +868,6 @@ mod tests {
         let plan = CashflowProjectionV1
             .future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal: known_principal("100", "100"),
                 quantity: quantity("3"),
                 choice: &choice,
                 as_of: date!(2026 - 08 - 01),
@@ -929,12 +885,12 @@ mod tests {
             vec![],
             vec![
                 PrincipalReturn {
-                    repayment_date: date!(2026 - 09 - 01),
-                    share_percent: dec("50"),
+                    repayment_date: date!(2026 - 07 - 01),
+                    share_percent: dec("80"),
                 },
                 PrincipalReturn {
-                    repayment_date: date!(2026 - 10 - 01),
-                    share_percent: dec("50"),
+                    repayment_date: date!(2026 - 09 - 01),
+                    share_percent: dec("20"),
                 },
             ],
         );
@@ -942,7 +898,6 @@ mod tests {
         let plan = CashflowProjectionV1
             .future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal: known_principal("100", "20"),
                 quantity: quantity("1"),
                 choice: &choice,
                 as_of: date!(2026 - 08 - 01),
@@ -950,7 +905,7 @@ mod tests {
             })
             .expect("known principal is computable");
 
-        assert_eq!(plan.postings[0].amount.value(), dec("50"));
+        assert_eq!(plan.postings[0].amount.value(), dec("20"));
     }
 
     #[test]
@@ -968,12 +923,7 @@ mod tests {
         );
         let choice = OfferChoice::HoldToMaturity;
         let plan = CashflowProjectionV1
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            ))
+            .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01)))
             .expect("past payments are listed separately from future postings");
 
         assert!(plan.postings.is_empty());
@@ -1008,12 +958,7 @@ mod tests {
         );
         let choice = OfferChoice::HoldToMaturity;
         CashflowProjectionV1
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 07 - 01),
-            ))
+            .future_postings(&input(&schedule, &choice, date!(2026 - 07 - 01)))
             .expect("past coupon and past principal return are computable")
     }
 
@@ -1070,7 +1015,6 @@ mod tests {
         let plan = CashflowProjectionV1
             .future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal: known_principal("100", "100"),
                 quantity: quantity("2"),
                 choice: &choice,
                 as_of: date!(2026 - 08 - 01),
@@ -1106,13 +1050,11 @@ mod tests {
             submission_end: None,
             price_percent: Some(dec("100")),
         });
-        let principal = known_principal("100", "100");
         let hold = OfferChoice::HoldToMaturity;
         let offer = OfferChoice::ExerciseAtOffer { window };
         let hold_plan = CashflowProjectionV1
             .future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal,
                 quantity: quantity("1"),
                 choice: &hold,
                 as_of: date!(2026 - 08 - 01),
@@ -1122,7 +1064,6 @@ mod tests {
         let offer_plan = CashflowProjectionV1
             .future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal,
                 quantity: quantity("1"),
                 choice: &offer,
                 as_of: date!(2026 - 08 - 01),
@@ -1147,7 +1088,6 @@ mod tests {
         assert!(matches!(
             CashflowProjectionV1.future_postings(&input(
                 &schedule,
-                known_principal("100", "100"),
                 &choice,
                 date!(2026 - 08 - 01),
             )),
@@ -1157,18 +1097,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_principal() {
-        let schedule = valid_schedule(vec![], vec![]);
+    fn a_schedule_without_a_face_value_cannot_build_a_flow() {
+        // Номинал неизвестен — поток не строится. Ноль подставлять
+        // запрещено: «номинал ноль» и «номинал неизвестен» требуют
+        // от владельца разных действий (§4.9).
+        let mut schedule = valid_schedule(vec![], vec![]);
+        schedule.initial_principal = None;
         let choice = OfferChoice::HoldToMaturity;
-        assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                PrincipalState::Unknown,
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
-            Err(CashflowError::PrincipalUnknown)
-        ));
+        assert_eq!(
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 01 - 01),))
+                .unwrap_err(),
+            CashflowError::PrincipalUnknown
+        );
     }
 
     #[test]
@@ -1181,7 +1122,6 @@ mod tests {
         assert!(matches!(
             CashflowProjectionV1.future_postings(&input(
                 &schedule,
-                known_principal("100", "100"),
                 &choice,
                 date!(2026 - 08 - 01),
             )),
@@ -1195,12 +1135,8 @@ mod tests {
         schedule.completeness = ScheduleCompleteness::Unknown;
         let choice = OfferChoice::HoldToMaturity;
         assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01),)),
             Err(CashflowError::ScheduleCompletenessUnknown)
         ));
     }
@@ -1218,7 +1154,6 @@ mod tests {
         assert!(matches!(
             CashflowProjectionV1.future_postings(&input(
                 &schedule,
-                known_principal("100", "100"),
                 &choice,
                 date!(2026 - 08 - 01),
             )),
@@ -1232,12 +1167,8 @@ mod tests {
         schedule.default_flags.as_mut().unwrap().declared = true;
         let choice = OfferChoice::HoldToMaturity;
         assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01),)),
             Err(CashflowError::IssuerDefaultDeclared)
         ));
     }
@@ -1248,12 +1179,8 @@ mod tests {
         schedule.default_flags.as_mut().unwrap().technical = true;
         let choice = OfferChoice::HoldToMaturity;
         assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01),)),
             Err(CashflowError::IssuerTechnicalDefault)
         ));
     }
@@ -1264,12 +1191,8 @@ mod tests {
         schedule.default_flags = None;
         let choice = OfferChoice::HoldToMaturity;
         assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01),)),
             Err(CashflowError::IssueTermsUnknown)
         ));
     }
@@ -1280,12 +1203,8 @@ mod tests {
         schedule.currency_roles = None;
         let choice = OfferChoice::HoldToMaturity;
         assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01),)),
             Err(CashflowError::CurrencyFormulaUnknown { roles: None })
         ));
     }
@@ -1302,7 +1221,6 @@ mod tests {
         assert!(matches!(
             CashflowProjectionV1.future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal: known_principal("100", "100"),
                 quantity: quantity("1"),
                 choice: &choice,
                 as_of: date!(2026 - 08 - 01),
@@ -1326,7 +1244,6 @@ mod tests {
         assert!(matches!(
             CashflowProjectionV1.future_postings(&input(
                 &schedule,
-                known_principal("100", "100"),
                 &choice,
                 date!(2026 - 08 - 01),
             )),
@@ -1362,7 +1279,6 @@ mod tests {
         assert!(matches!(
             CashflowProjectionV1.future_postings(&input(
                 &schedule,
-                known_principal("100", "100"),
                 &choice,
                 date!(2026 - 08 - 01),
             )),
@@ -1387,7 +1303,6 @@ mod tests {
         assert!(matches!(
             CashflowProjectionV1.future_postings(&input(
                 &schedule,
-                known_principal("100", "100"),
                 &choice,
                 date!(2026 - 08 - 01),
             )),
@@ -1421,12 +1336,7 @@ mod tests {
         });
         let offer = OfferChoice::ExerciseAtOffer { window };
         let offer_plan = CashflowProjectionV1
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &offer,
-                date!(2026 - 08 - 01),
-            ))
+            .future_postings(&input(&schedule, &offer, date!(2026 - 08 - 01)))
             .expect("post-offer unknown coupons are outside the scenario horizon");
         assert_eq!(offer_plan.terminal_date, date!(2026 - 10 - 01));
         assert_eq!(offer_plan.postings.len(), 2);
@@ -1435,7 +1345,6 @@ mod tests {
         assert!(matches!(
             CashflowProjectionV1.future_postings(&input(
                 &schedule,
-                known_principal("100", "100"),
                 &hold,
                 date!(2026 - 08 - 01),
             )),
@@ -1471,12 +1380,7 @@ mod tests {
         });
         let choice = OfferChoice::ExerciseAtOffer { window };
         let plan = CashflowProjectionV1
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            ))
+            .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01)))
             .expect("coupon and settlement are both due on execution date");
 
         assert_eq!(plan.postings.len(), 2);
@@ -1513,12 +1417,7 @@ mod tests {
         });
         let choice = OfferChoice::ExerciseAtOffer { window };
         let plan = CashflowProjectionV1
-            .future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            ))
+            .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01)))
             .expect("principal return on execution date is replaced by settlement");
 
         assert_eq!(plan.postings.len(), 2);
@@ -1544,12 +1443,8 @@ mod tests {
         );
         let choice = OfferChoice::HoldToMaturity;
         assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01),)),
             Err(CashflowError::Numeric(_))
         ));
 
@@ -1558,10 +1453,10 @@ mod tests {
             share_percent: dec("100"),
         }];
         let original = PerUnitAmount::new(Dec::new(Decimal::MAX), CurrencyCode::Rub);
+        schedule.initial_principal = Some(original);
         assert!(matches!(
             CashflowProjectionV1.future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal: PrincipalState::known(original, original).unwrap(),
                 quantity: quantity("2"),
                 choice: &choice,
                 as_of: date!(2026 - 08 - 01),
@@ -1581,21 +1476,17 @@ mod tests {
         });
         let choice = OfferChoice::HoldToMaturity;
         assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01),)),
             Err(CashflowError::CurrencyFormulaUnknown { .. })
         ));
 
         let original = PerUnitAmount::new(dec("100"), CurrencyCode::Usd);
+        schedule.initial_principal = Some(original);
         schedule.currency_roles = Some(CurrencyRoles::uniform(CurrencyCode::Rub));
         assert!(matches!(
             CashflowProjectionV1.future_postings(&CashflowInput {
                 schedule: &schedule,
-                principal: PrincipalState::known(original, original).unwrap(),
                 quantity: quantity("1"),
                 choice: &choice,
                 as_of: date!(2026 - 08 - 01),
@@ -1612,12 +1503,8 @@ mod tests {
             coupon_per_unit: Some(PerUnitAmount::new(dec("1"), CurrencyCode::Usd)),
         }];
         assert!(matches!(
-            CashflowProjectionV1.future_postings(&input(
-                &schedule,
-                known_principal("100", "100"),
-                &choice,
-                date!(2026 - 08 - 01),
-            )),
+            CashflowProjectionV1
+                .future_postings(&input(&schedule, &choice, date!(2026 - 08 - 01),)),
             Err(CashflowError::CurrencyFormulaUnknown { .. })
         ));
     }
@@ -1652,7 +1539,6 @@ mod tests {
             assert!(matches!(
                 CashflowProjectionV1.future_postings(&input(
                     &schedule,
-                    known_principal("100", "100"),
                     &choice,
                     date!(2026 - 08 - 01),
                 )),

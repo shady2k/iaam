@@ -18,12 +18,14 @@
 //! и денежный итог расчёта считаются здесь.
 
 use iaam_core::dates::{EffectiveOrder, EntitlementDate, EventDates, SettledDate, TradeDate};
+use iaam_core::event::allocation::BasisAllocation;
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::offer::OfferExerciseAction;
 use iaam_core::event::provenance::{ParserVersion, Provenance};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+
 use iaam_core::ids::{AccountId, EventId};
 use iaam_core::money::{Money, Quantity};
 use serde::{Deserialize, Serialize};
@@ -73,6 +75,15 @@ pub struct SubmittedJournalEvent {
     pub source_operation_id: Option<String>,
 }
 
+/// Дополнительное значение, вычисленное приложением перед нормализацией.
+///
+/// Приёмка не знает ни графика, ни хранилища: она получает только готовую
+/// долю и сохраняет её в амортизации.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct JournalEventEnrichment {
+    pub basis_allocation: BasisAllocation,
+}
+
 /// Превращение журнального факта в событие журнала.
 ///
 /// Форму события — какие ноги обязаны быть у каждого члена — проверяет
@@ -80,10 +91,11 @@ pub struct SubmittedJournalEvent {
 /// нормализатор. Двойная проверка разошлась бы с ядром молча.
 pub fn normalize_journal_event(
     submitted: &SubmittedJournalEvent,
+    enrichment: &JournalEventEnrichment,
     context: NormalizationContext,
 ) -> Result<Normalized, Rejection> {
     let (dates, day) = dates_of(&submitted.fact);
-    let (kind, legs) = build(submitted.account, &submitted.fact)?;
+    let (kind, legs) = build(submitted.account, &submitted.fact, enrichment)?;
     // Отпечаток считается там же, где дедупликация: второй экземпляр
     // этой функции разошёлся бы с первым молча (§10.6).
     let raw_hash = crate::dedup::fingerprint_journal_event(submitted);
@@ -167,15 +179,26 @@ fn dates_of(fact: &JournalFact) -> (EventDates, Date) {
 /// Построение типа события и ног.
 ///
 /// Диспетчер исчерпывающий: новый член семьи обязан сломать сборку.
-fn build(account: AccountId, fact: &JournalFact) -> Result<(EventKind, Vec<Leg>), Rejection> {
+fn build(
+    account: AccountId,
+    fact: &JournalFact,
+    enrichment: &JournalEventEnrichment,
+) -> Result<(EventKind, Vec<Leg>), Rejection> {
     let legs = match fact {
         JournalFact::CorporateAction(action) => corporate_action_legs(account, action)?,
         JournalFact::OfferExercise { action, .. } => offer_legs(account, action)?,
     };
     let kind = match fact {
-        JournalFact::CorporateAction(action) => EventKind::CorporateAction {
-            action: action.clone(),
-        },
+        JournalFact::CorporateAction(action) => {
+            let mut action = action.clone();
+            if let CorporateAction::PartialRedemption {
+                basis_allocation, ..
+            } = &mut action
+            {
+                *basis_allocation = enrichment.basis_allocation.clone();
+            }
+            EventKind::CorporateAction { action }
+        }
         JournalFact::OfferExercise { action, .. } => EventKind::OfferExercise {
             action: action.clone(),
         },
@@ -302,6 +325,7 @@ fn retired(quantity: Quantity) -> Result<Quantity, Rejection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iaam_core::event::allocation::{AllocationGap, BasisAllocation};
     use iaam_core::event::corporate_action::{
         BasisTransferRule, CorporateAction, FractionalTreatment,
     };
@@ -351,6 +375,7 @@ mod tests {
             effective_date: date!(2026 - 05 - 20),
             record_date: Some(date!(2026 - 05 - 18)),
             grounds: None,
+            basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
         }
     }
 
@@ -358,9 +383,13 @@ mod tests {
     /// строить ровно те ноги, которых ядро ждёт, иначе запись отклонят
     /// уже после — на общем шве.
     fn normalized_and_valid(fact: JournalFact) -> iaam_core::event::Event {
-        let event = normalize_journal_event(&submitted(fact), context())
-            .expect("нормализация обязана пройти")
-            .event;
+        let event = normalize_journal_event(
+            &submitted(fact),
+            &JournalEventEnrichment::default(),
+            context(),
+        )
+        .expect("нормализация обязана пройти")
+        .event;
         event
             .validate_structure()
             .expect("ноги обязаны совпасть с формой, которую ждёт ядро");
@@ -580,8 +609,10 @@ mod tests {
                     effective_date: date!(2026 - 05 - 20),
                     record_date: None,
                     grounds: None,
+                    basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
                 },
             )),
+            &JournalEventEnrichment::default(),
             context(),
         )
         .expect("нормализация формы не проверяет")
@@ -609,6 +640,7 @@ mod tests {
                 },
                 day: date!(2026 - 04 - 20),
             }),
+            &JournalEventEnrichment::default(),
             context(),
         )
         .expect_err("выкуп с комиссией в чужой валюте обязан быть отклонён");
@@ -630,6 +662,7 @@ mod tests {
                 },
                 day: date!(2026 - 04 - 20),
             }),
+            &JournalEventEnrichment::default(),
             context(),
         )
         .expect_err("накопленный купон в чужой валюте обязан быть отклонён");
@@ -647,6 +680,7 @@ mod tests {
                 idempotency_key: None,
                 source_operation_id: Some("амортизация-7".into()),
             },
+            &JournalEventEnrichment::default(),
             context(),
         )
         .expect("нормализация обязана пройти")
@@ -655,6 +689,30 @@ mod tests {
             event.provenance.source_operation_id(),
             Some("амортизация-7")
         );
+    }
+
+    #[test]
+    fn enrichment_is_stored_only_in_an_amortisation() {
+        let expected = BasisAllocation::Unknown(AllocationGap::CurrencyMismatch);
+        let event = normalize_journal_event(
+            &submitted(JournalFact::CorporateAction(partial_redemption())),
+            &JournalEventEnrichment {
+                basis_allocation: expected.clone(),
+            },
+            context(),
+        )
+        .expect("нормализация обязана пройти")
+        .event;
+        let EventKind::CorporateAction { action } = event.kind else {
+            panic!("ожидалось корпоративное действие")
+        };
+        let CorporateAction::PartialRedemption {
+            basis_allocation, ..
+        } = action
+        else {
+            panic!("ожидалась амортизация")
+        };
+        assert_eq!(basis_allocation, expected);
     }
 
     /// Отпечаток называет факт, а не подачу: тот же факт с другим ключом

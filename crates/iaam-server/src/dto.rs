@@ -744,12 +744,6 @@ fn describe(reason: &NotComputable) -> String {
                 instrument.inner()
             )
         }
-        NotComputable::RemainingFaceAmbiguous { instrument } => {
-            format!(
-                "неоднозначен остаточный номинал инструмента {}",
-                instrument.inner()
-            )
-        }
         NotComputable::SolverRefused { refusal } => refusal.to_string(),
         NotComputable::NoExternalFlows => "нет потоков, пересекающих границу контура".into(),
         NotComputable::StateNewerThanReport { last_event, as_of } => {
@@ -794,12 +788,6 @@ fn describe(reason: &NotComputable) -> String {
         }
         NotComputable::NonPositiveInitialCapital => "начальная стоимость не положительна".into(),
         NotComputable::NegativeTerminalWealth => "терминальное благосостояние отрицательно".into(),
-        NotComputable::PrincipalStateAmbiguous { instrument } => {
-            format!(
-                "неоднозначное состояние номинала инструмента {}",
-                instrument.inner()
-            )
-        }
         NotComputable::AcquisitionBasisUnknown => {
             "историческая стоимость приобретения неизвестна".into()
         }
@@ -1676,6 +1664,14 @@ fn issue(value: &MaterialIssue) -> String {
             "счёт {} восстановлен без документированной стоимости",
             account.inner()
         ),
+        MaterialIssue::AmortisationAllocationUnknown {
+            account,
+            instrument,
+        } => format!(
+            "доля разнесения амортизации инструмента {} на счёте {} не выведена: дозагрузите проверенный график выпуска",
+            instrument.inner(),
+            account.inner()
+        ),
         MaterialIssue::NegativeCash { account, currency } => format!(
             "отрицательный остаток на счёте {} в {}",
             account.inner(),
@@ -2388,7 +2384,6 @@ mod tests {
                         "quotation_basis_contradicts_evidence"
                     }
                     NotComputable::RemainingFaceUnknown { .. } => "remaining_face_unknown",
-                    NotComputable::RemainingFaceAmbiguous { .. } => "remaining_face_ambiguous",
                     NotComputable::SolverRefused { .. } => "solver_refused",
                     NotComputable::NoExternalFlows => "no_external_flows",
                     NotComputable::StateNewerThanReport { .. } => "state_newer_than_report",
@@ -2408,7 +2403,6 @@ mod tests {
                     NotComputable::NonPositiveDuration { .. } => "non_positive_duration",
                     NotComputable::NonPositiveInitialCapital => "non_positive_initial_capital",
                     NotComputable::NegativeTerminalWealth => "negative_terminal_wealth",
-                    NotComputable::PrincipalStateAmbiguous { .. } => "principal_state_ambiguous",
                     NotComputable::AcquisitionBasisUnknown => "acquisition_basis_unknown",
                     NotComputable::AccruedInterestAtAcquisitionUnknown => {
                         "accrued_interest_at_acquisition_unknown"
@@ -2447,9 +2441,6 @@ mod tests {
             },
             UncoveredReason::NotComputable {
                 reason: NotComputable::RemainingFaceUnknown { instrument },
-            },
-            UncoveredReason::NotComputable {
-                reason: NotComputable::RemainingFaceAmbiguous { instrument },
             },
             UncoveredReason::NotComputable {
                 reason: NotComputable::SolverRefused {
@@ -3415,6 +3406,7 @@ impl CorporateActionDto {
                 effective_date: *effective_date,
                 record_date: *record_date,
                 grounds: grounds.clone(),
+                basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
             },
             Self::Redemption {
                 instrument,

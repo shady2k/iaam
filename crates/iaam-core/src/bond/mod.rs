@@ -35,6 +35,13 @@ pub struct AccrualPeriod {
     pub accrual_end: Date,
     /// Дата платежа. Двигается переносом с выходного.
     pub payment_date: Date,
+    /// Дата фиксации реестра — она решает, КОМУ платят.
+    ///
+    /// `None` означает «источник не сообщил». Подставлять вместо неё
+    /// дату платежа запрещено: зазор между ними непостоянен (0–5 дней
+    /// по фикстурам), и в 157 случаях из 275 он равен одному дню —
+    /// ровно тем дням, когда сделка меняет ответ.
+    pub record_date: Option<Date>,
     /// Сумма купона за период на одну бумагу.
     ///
     /// `None` — сумма не определена (флоатер, будущий период). Ноль
@@ -88,6 +95,7 @@ mod tests {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),
             payment_date: date!(2026 - 12 - 03),
+            record_date: None,
             coupon_per_unit: None,
         };
         assert_ne!(period.accrual_end, period.payment_date);
@@ -101,6 +109,7 @@ mod tests {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),
             payment_date: date!(2026 - 12 - 02),
+            record_date: None,
             coupon_per_unit: None,
         };
         assert!(period.coupon_per_unit.is_none());

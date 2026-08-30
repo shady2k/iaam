@@ -245,6 +245,7 @@ proptest! {
                 period_start: as_of,
                 accrual_end: first_date,
                 payment_date: first_date,
+                record_date: None,
                 coupon_per_unit: Some(first_coupon),
             }],
             vec![PrincipalReturn {
@@ -258,12 +259,14 @@ proptest! {
                     period_start: as_of,
                     accrual_end: first_date,
                     payment_date: first_date,
+                    record_date: None,
                     coupon_per_unit: Some(first_coupon),
                 },
                 AccrualPeriod {
                     period_start: first_date,
                     accrual_end: second_date,
                     payment_date: second_date,
+                    record_date: None,
                     coupon_per_unit: Some(second_coupon),
                 },
             ],

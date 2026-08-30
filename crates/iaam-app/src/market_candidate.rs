@@ -70,6 +70,15 @@ pub fn accrual_periods_from_snapshot(
             let payment_date = Date::parse(&row.payment_date, &Iso8601::DEFAULT)
                 .map_err(|error| AppError::Store(error.to_string()))?;
 
+            // Транспонирование, а не unwrap_or: нераспарсенная дата —
+            // это отказ, а отсутствующая — законное «источник не сообщил».
+            let record_date = row
+                .record_date
+                .as_deref()
+                .map(|value| Date::parse(value, &Iso8601::DEFAULT))
+                .transpose()
+                .map_err(|error| AppError::Store(error.to_string()))?;
+
             let coupon_per_unit = match row.amount_status.as_str() {
                 "amount_fixed" => {
                     let amount_per_unit = row.amount_per_unit.as_deref().ok_or_else(|| {
@@ -96,6 +105,7 @@ pub fn accrual_periods_from_snapshot(
                 period_start,
                 accrual_end,
                 payment_date,
+                record_date,
                 coupon_per_unit,
             })
         })
@@ -258,6 +268,56 @@ mod tests {
         };
         let periods = accrual_periods_from_snapshot(&snapshot).unwrap();
         assert!(periods[0].coupon_per_unit.is_none());
+    }
+
+    #[test]
+    fn record_date_is_translated_into_an_accrual_period() {
+        let snapshot = StoredSnapshot {
+            snapshot_id: "s1".to_owned(),
+            observed_at: "2026-08-27T12:00:00Z".to_owned(),
+            coupon_periods: vec![CouponPeriodRow {
+                period_start: "2026-06-03".to_owned(),
+                accrual_end: "2026-12-02".to_owned(),
+                payment_date: "2026-12-03".to_owned(),
+                record_date: Some("2026-11-30".to_owned()),
+                amount_status: "undetermined".to_owned(),
+                amount_per_unit: None,
+                amount_currency: None,
+                rate_percent: None,
+                source_entry_id: None,
+            }],
+            principal_repayments: Vec::new(),
+            offer_windows: Vec::new(),
+        };
+
+        let periods = accrual_periods_from_snapshot(&snapshot).unwrap();
+
+        assert_eq!(periods[0].record_date, Some(date!(2026 - 11 - 30)));
+    }
+
+    #[test]
+    fn missing_record_date_stays_unknown_in_an_accrual_period() {
+        let snapshot = StoredSnapshot {
+            snapshot_id: "s1".to_owned(),
+            observed_at: "2026-08-27T12:00:00Z".to_owned(),
+            coupon_periods: vec![CouponPeriodRow {
+                period_start: "2026-06-03".to_owned(),
+                accrual_end: "2026-12-02".to_owned(),
+                payment_date: "2026-12-03".to_owned(),
+                record_date: None,
+                amount_status: "undetermined".to_owned(),
+                amount_per_unit: None,
+                amount_currency: None,
+                rate_percent: None,
+                source_entry_id: None,
+            }],
+            principal_repayments: Vec::new(),
+            offer_windows: Vec::new(),
+        };
+
+        let periods = accrual_periods_from_snapshot(&snapshot).unwrap();
+
+        assert_eq!(periods[0].record_date, None);
     }
 
     #[test]

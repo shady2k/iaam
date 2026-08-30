@@ -31,7 +31,7 @@ impl RawHash {
 
 /// Версия парсера, породившего факт. Без неё нельзя отличить ошибку
 /// источника от ошибки разбора, исправленной в более поздней версии.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ParserVersion(pub String);
 
 /// Указание на конкретную строку исходного документа.

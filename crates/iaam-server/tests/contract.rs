@@ -29,17 +29,24 @@ use iaam_app::storage::{
 use iaam_broker::credentials::Key;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+use iaam_core::event::kind::{DateCertainty, EventKind};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
+use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{ProjectionContext, Snapshot, project};
-use iaam_core::reconciliation::Dimension;
+use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
+use iaam_core::returns::{
+    KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
+};
 use iaam_core::rules::lot_disposal::PrincipalState;
-use iaam_core::rules::{LotRuleVersion, RuleRegistry};
+use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
+use iaam_core::valuation::{FxSource, FxTable};
 use iaam_server::auth::hash_token;
-use iaam_server::dto::VerdictDto;
+use iaam_server::dto::{ReturnsReportDto, VerdictDto};
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::market::AccruedInterestRow;
@@ -859,7 +866,10 @@ async fn health_is_public_and_reports_versions() {
     // агент читает эту цифру, чтобы понять, разберёт ли он ответ, —
     // поэтому она закреплена здесь, а не выводится из кода.
     assert_eq!(body["schema_version"], 4);
-    assert_eq!(body["projection_version"], 3);
+    // Версия 6: книга лотов хранит историю изменений количества со знанием
+    // о расчётах, поэтому снимок без неё нельзя честно трактовать как
+    // позицию без владения.
+    assert_eq!(body["projection_version"], 6);
 }
 
 #[tokio::test]
@@ -971,6 +981,54 @@ async fn an_invalid_amount_is_reported_as_422_with_field_expected_actual() {
     assert_eq!(response[0]["verdict"], "rejected");
     assert_eq!(response[0]["field"], "amount");
     assert_eq!(response[0]["actual"], "1000.005");
+}
+
+#[tokio::test]
+async fn opening_position_assertions_reach_the_event_through_the_api() {
+    let (harness, path) = harness_on_disk();
+    let claimed = date!(2021 - 05 - 01);
+    let body = json!({
+        "source_label": "ручной ввод",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "opening_position",
+            "instrument": harness.instrument.inner(),
+            "custody": harness.custody.inner(),
+            "quantity": "10",
+            "cost_basis": "1000.00",
+            "currency": "RUB",
+            "assertions": {
+                "acquisition_date": claimed.to_string(),
+                "acquisition_date_certainty": "known"
+            },
+            "dates": { "trade": "2026-01-01" }
+        }]
+    });
+
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let store = SqliteStore::open(&path).expect("второе соединение");
+    let events = store
+        .load_events(harness.owner)
+        .expect("события восстановленной позиции");
+    let event = events
+        .into_iter()
+        .find(|event| matches!(&event.kind, EventKind::OpeningPosition { .. }))
+        .expect("восстановленная позиция");
+    let EventKind::OpeningPosition { assertions, .. } = event.kind else {
+        unreachable!("выше найден только opening_position");
+    };
+    assert_eq!(assertions.acquisition_date, Some(claimed));
+    assert_eq!(assertions.acquisition_date_certainty, DateCertainty::Known);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -3872,4 +3930,163 @@ async fn provisioning_an_access_fills_the_channel_dictionary() {
         "заселено меньше, чем знал прежний разбор: {}",
         dictionary.len()
     );
+}
+
+/// Прогоняет проблемы через ту же конверсию, по которой текст доходит
+/// до владельца.
+///
+/// Пустой журнал здесь — не упрощение, а способ изолировать текст: сам
+/// отчёт не должен добавить ни одной своей проблемы, иначе тест
+/// закреплял бы чужие строки вместе со своими. Публичного пути к
+/// формированию отдельной строки нет, и делать его ради теста нельзя:
+/// владелец получает строки только целым отчётом.
+fn issue_texts(issues: Vec<MaterialIssue>) -> Vec<String> {
+    let events: Vec<iaam_core::event::Event> = Vec::new();
+    let contour = ContourDefinition::new(
+        ContourId(Uuid::new_v4()),
+        ContourVersion(1),
+        [AccountId::new_random()],
+    );
+    let rules = RuleRegistry::with_defaults();
+    let context = ProjectionContext {
+        contour: &contour,
+        rules: &rules,
+        lot_rule: LotRuleVersion(1),
+    };
+    let projection = project(&events, &context).expect("проекция пустого журнала");
+    let perimeter = assess(&events, PerimeterPolicy::default()).expect("периметр");
+    let ledger =
+        ReconciliationLedger::build_with(&events, &perimeter.exceptions()).expect("реестр сверки");
+    let fx = FxTable::new(FxSource::OwnerSupplied);
+    let mut report = returns_report(
+        projection.state(),
+        &ReturnsRequest {
+            contour: &contour,
+            coordinate: KnowledgeCoordinate::default(),
+            as_of: date!(2026 - 03 - 31),
+            report_currency: CurrencyCode::Rub,
+            fx: &fx,
+            solver_policy: SolverPolicy::returns_default(),
+            ledger: &ledger,
+            perimeter: &perimeter,
+            market_prices: &[],
+            bond_schedules: &std::collections::BTreeMap::new(),
+            accrued_observations: &std::collections::BTreeMap::new(),
+        },
+    );
+    assert!(
+        report.data_quality.material_issues.is_empty(),
+        "пустой журнал дал собственные проблемы: {:?}",
+        report.data_quality.material_issues
+    );
+    report.data_quality.material_issues = issues;
+
+    ReturnsReportDto::from_domain(&report)
+        .data_quality
+        .material_issues
+}
+
+/// Кода у этой проблемы в ответе нет: владелец видит только строку.
+/// Незакреплённая строка молча меняется вместе с `fn issue`, и владелец
+/// получает другое сообщение без единого красного теста.
+///
+/// Проверяются все четыре величины сразу: вид выплаты — потому что
+/// «не пришёл купон» и «не пришёл возврат номинала» требуют разных
+/// действий; счёт — потому что одна бумага на двух счетах иначе даёт
+/// две неразличимые строки; инструмент и дата — потому что без них
+/// искать в журнале нечего.
+#[test]
+fn an_unreceived_scheduled_posting_names_kind_instrument_account_and_date() {
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let texts = issue_texts(vec![
+        MaterialIssue::ScheduledPostingNotReceived {
+            account,
+            instrument,
+            date: date!(2026 - 03 - 31),
+            kind: PostingKind::Coupon,
+        },
+        MaterialIssue::ScheduledPostingNotReceived {
+            account,
+            instrument,
+            date: date!(2026 - 03 - 31),
+            kind: PostingKind::PrincipalReturn,
+        },
+    ]);
+
+    assert_eq!(
+        texts[0],
+        format!(
+            "выплата coupon инструмента {} на счёте {} за 2026-03-31 не подтверждена",
+            instrument.inner(),
+            account.inner()
+        )
+    );
+    assert_eq!(
+        texts[1],
+        format!(
+            "выплата principal_return инструмента {} на счёте {} за 2026-03-31 не подтверждена",
+            instrument.inner(),
+            account.inner()
+        )
+    );
+}
+
+/// Причина, дата и вид обязаны быть в тексте: без них владелец не знает,
+/// какую выплату искать и чем чинить.
+#[test]
+fn an_unverifiable_scheduled_posting_names_kind_instrument_account_date_and_reason() {
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let texts = issue_texts(vec![MaterialIssue::ScheduledPostingUnverifiable {
+        account,
+        instrument,
+        date: date!(2026 - 03 - 15),
+        kind: PostingKind::Coupon,
+        reason: UnverifiableReason::AcquisitionDateUnknown,
+    }]);
+
+    assert_eq!(
+        texts[0],
+        format!(
+            "сверку выплаты coupon инструмента {} на счёте {} за 2026-03-15 провести нечем: acquisition_date_unknown",
+            instrument.inner(),
+            account.inner()
+        )
+    );
+}
+
+/// Шесть причин чинятся по-разному, а одна из них относится ко всему
+/// графику и тоже должна иметь отдельный текст.
+/// Совпади хотя бы две строки — владелец не отличил бы «уточни даты
+/// расчётов» от «догрузи дату фиксации», «журнал начинается позже» или
+/// «догрузи доверенный график».
+#[test]
+fn the_seven_unverifiable_scheduled_posting_reasons_are_distinguishable() {
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let reasons = [
+        UnverifiableReason::AcquisitionDateUnknown,
+        UnverifiableReason::OwnershipUnknown,
+        UnverifiableReason::EntitlementDateUnknown,
+        UnverifiableReason::IncomeKindUnknown,
+        UnverifiableReason::PaymentDateUnknown,
+        UnverifiableReason::HistoryStartsAfterSchedule,
+        UnverifiableReason::ScheduleNotTrusted,
+    ];
+    let texts = issue_texts(
+        reasons
+            .iter()
+            .map(|reason| MaterialIssue::ScheduledPostingUnverifiable {
+                account,
+                instrument,
+                date: date!(2026 - 03 - 15),
+                kind: PostingKind::Coupon,
+                reason: *reason,
+            })
+            .collect(),
+    );
+
+    let distinct: std::collections::BTreeSet<&String> = texts.iter().collect();
+    assert_eq!(distinct.len(), 7, "причины неразличимы в тексте: {texts:?}");
 }

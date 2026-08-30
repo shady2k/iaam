@@ -93,6 +93,7 @@ fn schedule_from_fixture(raw: &str, instrument: InstrumentId) -> BondSchedule {
             period_start: required_date(&coupon_columns, row, "startdate"),
             accrual_end: required_date(&coupon_columns, row, "coupondate"),
             payment_date: required_date(&coupon_columns, row, "coupondate"),
+            record_date: None,
             coupon_per_unit: optional_dec(&coupon_columns, row, "value")
                 .map(|value| PerUnitAmount::new(value, CurrencyCode::Rub)),
         })

@@ -17,4 +17,5 @@ pub mod projection;
 pub mod reconciliation;
 pub mod returns;
 pub mod rules;
+pub mod settlement;
 pub mod valuation;

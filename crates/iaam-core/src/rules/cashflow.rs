@@ -42,6 +42,31 @@ pub enum CashflowError {
     #[error("окно оферты {window:?} нельзя исполнить")]
     OfferWindowNotExercisable { window: crate::bond::OfferWindowId },
 }
+/// Причина, по которой нельзя доверять графику для сверки прошлых выплат.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ScheduleTrustError {
+    #[error("график неполон: {reason}")]
+    ScheduleIncomplete { reason: String },
+    #[error("полнота графика неизвестна")]
+    ScheduleCompletenessUnknown,
+    #[error("эмитент объявил дефолт")]
+    IssuerDefaultDeclared,
+    #[error("условия выпуска неизвестны")]
+    IssueTermsUnknown,
+}
+
+impl From<ScheduleTrustError> for CashflowError {
+    fn from(error: ScheduleTrustError) -> Self {
+        match error {
+            ScheduleTrustError::ScheduleIncomplete { reason } => {
+                Self::ScheduleIncomplete { reason }
+            }
+            ScheduleTrustError::ScheduleCompletenessUnknown => Self::ScheduleCompletenessUnknown,
+            ScheduleTrustError::IssuerDefaultDeclared => Self::IssuerDefaultDeclared,
+            ScheduleTrustError::IssueTermsUnknown => Self::IssueTermsUnknown,
+        }
+    }
+}
 
 /// Входы правила построения потока.
 pub struct CashflowInput<'a> {
@@ -62,11 +87,33 @@ pub struct ExpectedPosting {
 }
 
 /// Вид ожидаемого платежа.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Порядок вариантов задаёт `Ord`, а он нужен `ScheduledPosting`: без него
+/// сортировка `past` по одной дате оставляла бы выплаты одного дня в
+/// произвольном порядке, а ядро обязано быть детерминированным.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PostingKind {
     Coupon,
     PrincipalReturn,
     OfferSettlement,
+}
+
+/// Запланированная выплата, срок которой уже наступил.
+///
+/// Вид обязателен: купон подтверждается `Income`, возврат номинала —
+/// `CorporateAction`, расчёт по оферте — `OfferExercise`. Одна дата без
+/// вида не позволяет отличить неполученный купон от неполученного
+/// возврата номинала, а искать их надо в разных событиях журнала.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ScheduledPosting {
+    pub date: Date,
+    pub kind: PostingKind,
+    /// Дата, на которую определяется право на выплату.
+    ///
+    /// `None` — источник не сообщил дату фиксации. Судить по дате
+    /// платежа в этом случае запрещено, и решение принимает правило
+    /// сопоставления, а не построение плана.
+    pub entitlement: Option<Date>,
 }
 
 /// Полный результат построения потока.
@@ -74,10 +121,10 @@ pub enum PostingKind {
 pub struct CashflowPlan {
     pub postings: Vec<ExpectedPosting>,
     pub terminal_date: Date,
-    /// Запланированные даты не позже `as_of`. Правило не знает и не может
-    /// знать, пришли ли деньги; сверку с журналом делает вызывающая сторона,
-    /// сравнивая эти даты с `received_to_date` лотов.
-    pub past: Vec<Date>,
+    /// Запланированные выплаты, срок которых не позже `as_of`. Правило
+    /// не знает и не может знать, пришли ли деньги; сверку с журналом
+    /// делает вызывающая сторона правилом сопоставления.
+    pub past: Vec<ScheduledPosting>,
 }
 
 /// Правило построения будущего денежного потока.
@@ -100,6 +147,68 @@ fn amount_for_per_unit(
 ) -> Result<CalcMoney, CashflowError> {
     let total = value.value().checked_mul(quantity.0)?.checked_mul(factor)?;
     Ok(CalcMoney::new(total, value.currency()))
+}
+
+/// Прошлые выплаты по графику: даты и виды, без денег.
+///
+/// Отдельно от `CashflowProjection`, потому что тот отказывается при
+/// неизвестном номинале, а сверке номинал не нужен: она сравнивает плановые
+/// даты с фактами журнала, а не суммы. Пока прошлое строилось сценарием,
+/// неизвестный номинал молча выключал сверку целиком.
+///
+/// Оферты намеренно не входят: это право владельца, а не обязанность эмитента.
+/// Их сверка идёт по `OfferBook` и состоянию заявки «предъявлена -> исполнена
+/// -> расчёт получен», а не общим правилом по графику; это отдельный бид
+/// `iaam-d8b.19`.
+pub fn historical_schedule_postings(
+    schedule: &BondSchedule,
+    as_of: Date,
+) -> Result<Vec<ScheduledPosting>, ScheduleTrustError> {
+    match &schedule.completeness {
+        ScheduleCompleteness::Validated => {}
+        ScheduleCompleteness::Incomplete { reason } => {
+            return Err(ScheduleTrustError::ScheduleIncomplete {
+                reason: reason.clone(),
+            });
+        }
+        ScheduleCompleteness::Unknown => {
+            return Err(ScheduleTrustError::ScheduleCompletenessUnknown);
+        }
+    }
+
+    match schedule.default_flags {
+        Some(flags) => match (flags.declared, flags.technical) {
+            (true, _) => return Err(ScheduleTrustError::IssuerDefaultDeclared),
+            (false, true) => {
+                // Технический дефолт означает задержку, а не отмену выплаты:
+                // просрочка по сроку при нём всё равно должна попасть в сверку.
+            }
+            (false, false) => {}
+        },
+        None => return Err(ScheduleTrustError::IssueTermsUnknown),
+    }
+
+    let mut past = Vec::new();
+    for period in &schedule.periods {
+        if period.payment_date <= as_of {
+            past.push(ScheduledPosting {
+                date: period.payment_date,
+                kind: PostingKind::Coupon,
+                entitlement: period.record_date,
+            });
+        }
+    }
+    for principal_return in &schedule.principal_returns {
+        if principal_return.repayment_date <= as_of {
+            past.push(ScheduledPosting {
+                date: principal_return.repayment_date,
+                kind: PostingKind::PrincipalReturn,
+                entitlement: None,
+            });
+        }
+    }
+    past.sort_by_key(|posting| (posting.date, posting.kind));
+    Ok(past)
 }
 
 impl CashflowProjection for CashflowProjectionV1 {
@@ -228,7 +337,11 @@ impl CashflowProjection for CashflowProjectionV1 {
         // содержит только процент от номинала, поэтому двойного счёта нет.
         for period in &input.schedule.periods {
             if period.payment_date <= input.as_of {
-                past.push(period.payment_date);
+                past.push(ScheduledPosting {
+                    date: period.payment_date,
+                    kind: PostingKind::Coupon,
+                    entitlement: None,
+                });
             } else if cutoff.is_none_or(|date| period.payment_date <= date) {
                 let Some(coupon) = period.coupon_per_unit else {
                     return Err(CashflowError::CouponUndetermined {
@@ -250,7 +363,11 @@ impl CashflowProjection for CashflowProjectionV1 {
         // `OfferSettlement` его не содержит.
         for principal_return in &input.schedule.principal_returns {
             if principal_return.repayment_date <= input.as_of {
-                past.push(principal_return.repayment_date);
+                past.push(ScheduledPosting {
+                    date: principal_return.repayment_date,
+                    kind: PostingKind::PrincipalReturn,
+                    entitlement: None,
+                });
             } else if cutoff.is_none_or(|date| principal_return.repayment_date < date) {
                 postings.push(ExpectedPosting {
                     date: principal_return.repayment_date,
@@ -276,7 +393,11 @@ impl CashflowProjection for CashflowProjectionV1 {
                 price_percent.checked_div(dec_hundred())?,
             )?;
             if terms.execution_date <= input.as_of {
-                past.push(terms.execution_date);
+                past.push(ScheduledPosting {
+                    date: terms.execution_date,
+                    kind: PostingKind::OfferSettlement,
+                    entitlement: None,
+                });
             } else {
                 postings.push(ExpectedPosting {
                     date: terms.execution_date,
@@ -293,6 +414,34 @@ impl CashflowProjection for CashflowProjectionV1 {
             terminal_date,
             past,
         })
+    }
+}
+
+/// Вторая версия правила потока, передающая дату права в `past`.
+#[derive(Debug, Default)]
+pub struct CashflowProjectionV2;
+
+impl CashflowProjection for CashflowProjectionV2 {
+    fn future_postings(&self, input: &CashflowInput) -> Result<CashflowPlan, CashflowError> {
+        // Будущие выплаты V2 не отличаются от V1: меняется только прошлое,
+        // которое обогащается датой права. Копия логики V1 здесь означала бы
+        // непроверяемого близнеца — мутационный прогон это и показал.
+        let mut plan = CashflowProjectionV1.future_postings(input)?;
+
+        // Оферта — право владельца, поэтому `historical_schedule_postings`
+        // намеренно не возвращает её. Подменяем только купоны и возвраты
+        // номинала, сохраняя расчёт по выбранному окну из плана V1.
+        let offer_settlements = plan
+            .past
+            .iter()
+            .copied()
+            .filter(|posting| posting.kind == PostingKind::OfferSettlement)
+            .collect::<Vec<_>>();
+        let mut past = historical_schedule_postings(input.schedule, input.as_of)?;
+        past.extend(offer_settlements);
+        past.sort_by_key(|posting| (posting.date, posting.kind));
+        plan.past = past;
+        Ok(plan)
     }
 }
 
@@ -328,6 +477,7 @@ mod tests {
             period_start: start,
             accrual_end: payment,
             payment_date: payment,
+            record_date: None,
             coupon_per_unit: coupon.map(per_unit),
         }
     }
@@ -363,6 +513,303 @@ mod tests {
             as_of,
             report_currency: CurrencyCode::Rub,
         }
+    }
+
+    #[test]
+    fn historical_postings_are_available_without_principal() {
+        let schedule = valid_schedule(
+            vec![AccrualPeriod {
+                record_date: Some(date!(2026 - 07 - 30)),
+                ..period(date!(2026 - 07 - 01), date!(2026 - 08 - 01), None)
+            }],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 08 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+
+        let past = historical_schedule_postings(&schedule, date!(2026 - 08 - 01))
+            .expect("история не должна зависеть от номинала");
+
+        assert_eq!(
+            past,
+            vec![
+                ScheduledPosting {
+                    date: date!(2026 - 08 - 01),
+                    kind: PostingKind::Coupon,
+                    entitlement: Some(date!(2026 - 07 - 30)),
+                },
+                ScheduledPosting {
+                    date: date!(2026 - 08 - 01),
+                    kind: PostingKind::PrincipalReturn,
+                    entitlement: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn historical_postings_reject_incomplete_schedule_with_reason() {
+        let mut schedule = valid_schedule(vec![], vec![]);
+        schedule.completeness = ScheduleCompleteness::Incomplete {
+            reason: "нет даты погашения".to_owned(),
+        };
+
+        assert!(matches!(
+            historical_schedule_postings(&schedule, date!(2026 - 08 - 01)),
+            Err(ScheduleTrustError::ScheduleIncomplete { reason })
+                if reason == "нет даты погашения"
+        ));
+    }
+
+    #[test]
+    fn historical_postings_reject_unknown_schedule_completeness() {
+        let mut schedule = valid_schedule(vec![], vec![]);
+        schedule.completeness = ScheduleCompleteness::Unknown;
+
+        assert!(matches!(
+            historical_schedule_postings(&schedule, date!(2026 - 08 - 01)),
+            Err(ScheduleTrustError::ScheduleCompletenessUnknown)
+        ));
+    }
+
+    #[test]
+    fn historical_postings_reject_declared_default() {
+        let mut schedule = valid_schedule(vec![], vec![]);
+        schedule.default_flags.as_mut().unwrap().declared = true;
+
+        assert!(matches!(
+            historical_schedule_postings(&schedule, date!(2026 - 08 - 01)),
+            Err(ScheduleTrustError::IssuerDefaultDeclared)
+        ));
+    }
+
+    #[test]
+    fn historical_postings_include_payments_for_technical_default() {
+        let mut schedule = valid_schedule(
+            vec![period(
+                date!(2026 - 07 - 01),
+                date!(2026 - 08 - 01),
+                Some("10"),
+            )],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 08 - 15),
+                share_percent: dec("100"),
+            }],
+        );
+        schedule.default_flags.as_mut().unwrap().technical = true;
+
+        let past = historical_schedule_postings(&schedule, date!(2026 - 08 - 15))
+            .expect("технический дефолт задерживает, но не отменяет выплаты");
+
+        assert_eq!(past.len(), 2);
+        assert_eq!(past[0].kind, PostingKind::Coupon);
+        assert_eq!(past[1].kind, PostingKind::PrincipalReturn);
+    }
+
+    #[test]
+    fn historical_postings_exclude_unexercised_offer() {
+        let window = crate::bond::OfferWindowId::derive(
+            crate::ids::InstrumentId::new_random(),
+            date!(2026 - 07 - 15),
+        );
+        let mut schedule = valid_schedule(
+            vec![],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 12 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+        schedule.offer_windows.push(crate::bond::OfferWindowTerms {
+            window,
+            right: crate::bond::OfferRight::HolderPut,
+            execution_date: date!(2026 - 07 - 15),
+            submission_start: None,
+            submission_end: None,
+            price_percent: Some(dec("100")),
+        });
+        let hold_to_maturity = OfferChoice::HoldToMaturity;
+        let as_of = date!(2026 - 08 - 01);
+
+        let hold_plan = CashflowProjectionV1
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &hold_to_maturity,
+                as_of,
+            ))
+            .expect("сценарий удержания не требует исполнения оферты");
+        // Оферта — право владельца, поэтому без предъявления по ней нет
+        // обещанного эмитентом платежа и нет основания требовать факт расчёта.
+        let historical = historical_schedule_postings(&schedule, as_of)
+            .expect("проверенный график даёт историю");
+
+        assert!(
+            hold_plan
+                .past
+                .iter()
+                .all(|posting| posting.kind != PostingKind::OfferSettlement)
+        );
+        assert!(
+            historical
+                .iter()
+                .all(|posting| posting.kind != PostingKind::OfferSettlement)
+        );
+        assert!(historical.is_empty());
+    }
+
+    #[test]
+    fn v2_keeps_selected_past_offer_settlement() {
+        let window = crate::bond::OfferWindowId::derive(
+            crate::ids::InstrumentId::new_random(),
+            date!(2026 - 07 - 15),
+        );
+        let mut schedule = valid_schedule(
+            vec![],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 12 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+        schedule.offer_windows.push(crate::bond::OfferWindowTerms {
+            window,
+            right: crate::bond::OfferRight::HolderPut,
+            execution_date: date!(2026 - 07 - 15),
+            submission_start: None,
+            submission_end: None,
+            price_percent: Some(dec("100")),
+        });
+        let choice = OfferChoice::ExerciseAtOffer { window };
+
+        let v1 = CashflowProjectionV1
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 08 - 01),
+            ))
+            .expect("выбранная оферта должна попасть в прошлое");
+        let v2 = CashflowProjectionV2
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 08 - 01),
+            ))
+            .expect("выбранная оферта должна попасть в прошлое");
+
+        // Подмена прошлого в V2 частичная: `historical_schedule_postings`
+        // намеренно не знает об офертах, поэтому расчёт по выбранному окну
+        // обязан сохраниться из плана V1.
+        assert_eq!(v2.past, v1.past);
+        assert_eq!(
+            v2.past,
+            vec![ScheduledPosting {
+                date: date!(2026 - 07 - 15),
+                kind: PostingKind::OfferSettlement,
+                entitlement: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn historical_postings_match_v2_past_for_known_principal() {
+        let schedule = valid_schedule(
+            vec![AccrualPeriod {
+                record_date: Some(date!(2026 - 06 - 30)),
+                ..period(date!(2026 - 06 - 01), date!(2026 - 07 - 01), Some("10"))
+            }],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 07 - 10),
+                share_percent: dec("100"),
+            }],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+        let as_of = date!(2026 - 08 - 01);
+
+        let historical = historical_schedule_postings(&schedule, as_of)
+            .expect("проверенный график даёт прошлые выплаты");
+        let v2 = CashflowProjectionV2
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                as_of,
+            ))
+            .expect("известный номинал даёт полный план");
+
+        assert_eq!(historical, v2.past);
+    }
+
+    #[test]
+    fn v2_carries_coupon_record_date_into_entitlement() {
+        let schedule = valid_schedule(
+            vec![AccrualPeriod {
+                record_date: Some(date!(2026 - 08 - 30)),
+                ..period(date!(2026 - 07 - 01), date!(2026 - 09 - 01), Some("10"))
+            }],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 10 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+
+        let plan = CashflowProjectionV2
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 09 - 15),
+            ))
+            .expect("past coupon is computable");
+
+        assert_eq!(
+            plan.past,
+            vec![ScheduledPosting {
+                date: date!(2026 - 09 - 01),
+                kind: PostingKind::Coupon,
+                entitlement: Some(date!(2026 - 08 - 30)),
+            }]
+        );
+    }
+
+    #[test]
+    fn v2_keeps_coupon_entitlement_unknown_when_record_date_is_missing() {
+        let schedule = valid_schedule(
+            vec![period(
+                date!(2026 - 07 - 01),
+                date!(2026 - 09 - 01),
+                Some("10"),
+            )],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 10 - 01),
+                share_percent: dec("100"),
+            }],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+
+        let plan = CashflowProjectionV2
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 09 - 15),
+            ))
+            .expect("past coupon is computable");
+
+        assert_eq!(plan.past[0].entitlement, None);
+    }
+
+    #[test]
+    fn historical_postings_reject_unknown_issue_terms() {
+        let mut schedule = valid_schedule(vec![], vec![]);
+        schedule.default_flags = None;
+
+        assert!(matches!(
+            historical_schedule_postings(&schedule, date!(2026 - 08 - 01)),
+            Err(ScheduleTrustError::IssueTermsUnknown)
+        ));
     }
 
     #[test]
@@ -532,7 +979,66 @@ mod tests {
         assert!(plan.postings.is_empty());
         assert_eq!(
             plan.past,
-            vec![date!(2026 - 08 - 01), date!(2026 - 08 - 01)]
+            vec![
+                ScheduledPosting {
+                    date: date!(2026 - 08 - 01),
+                    kind: PostingKind::Coupon,
+                    entitlement: None,
+                },
+                ScheduledPosting {
+                    date: date!(2026 - 08 - 01),
+                    kind: PostingKind::PrincipalReturn,
+                    entitlement: None,
+                },
+            ]
+        );
+    }
+
+    fn plan_with_past_coupon_and_past_principal_return() -> CashflowPlan {
+        let schedule = valid_schedule(
+            vec![period(
+                date!(2026 - 01 - 15),
+                date!(2026 - 03 - 15),
+                Some("10"),
+            )],
+            vec![PrincipalReturn {
+                repayment_date: date!(2026 - 06 - 15),
+                share_percent: dec("100"),
+            }],
+        );
+        let choice = OfferChoice::HoldToMaturity;
+        CashflowProjectionV1
+            .future_postings(&input(
+                &schedule,
+                known_principal("100", "100"),
+                &choice,
+                date!(2026 - 07 - 01),
+            ))
+            .expect("past coupon and past principal return are computable")
+    }
+
+    #[test]
+    fn past_postings_carry_their_kind_so_reconciliation_can_match_them() {
+        // Купон и возврат номинала подтверждаются РАЗНЫМИ событиями журнала:
+        // купон приходит `Income`, амортизация — `CorporateAction`. Без вида
+        // выплаты сверка искала бы купонный факт под возврат номинала и
+        // поднимала ложную тревогу на каждой амортизируемой облигации.
+        let plan = plan_with_past_coupon_and_past_principal_return();
+
+        assert_eq!(
+            plan.past,
+            vec![
+                ScheduledPosting {
+                    date: date!(2026 - 03 - 15),
+                    kind: PostingKind::Coupon,
+                    entitlement: None,
+                },
+                ScheduledPosting {
+                    date: date!(2026 - 06 - 15),
+                    kind: PostingKind::PrincipalReturn,
+                    entitlement: None,
+                },
+            ]
         );
     }
 
@@ -1102,6 +1608,7 @@ mod tests {
             period_start: date!(2026 - 08 - 01),
             accrual_end: date!(2026 - 09 - 01),
             payment_date: date!(2026 - 09 - 01),
+            record_date: None,
             coupon_per_unit: Some(PerUnitAmount::new(dec("1"), CurrencyCode::Usd)),
         }];
         assert!(matches!(

@@ -66,6 +66,14 @@ MODULES=(
   "crates/iaam-core/src/reconciliation/check.rs"
   "crates/iaam-core/src/reconciliation/evidence.rs"
   "crates/iaam-core/src/reconciliation/mod.rs"
+  # Владение и дата расчёта решают, кому причиталась выплата. Мутант
+  # здесь не меняет ни одной суммы — он меняет то, чему сумма
+  # соответствует, ровно как в instrument.rs и reconciliation.
+  # Первый кандидат — `latest < day` в settlement.rs: сдвиг границы
+  # на `<=` делает недоказуемое доказанным.
+  "crates/iaam-core/src/settlement.rs"
+  "crates/iaam-core/src/projection/ownership.rs"
+  "crates/iaam-core/src/rules/posting_match.rs"
   # Периметр решает, где система отказывается считать (§11). Мутант,
   # снимающий отказ, выдаёт экономику неподдерживаемого финансирования
   # за посчитанную.
@@ -236,9 +244,18 @@ if [ "${#MODULES[@]}" -eq 0 ]; then
   exit 1
 fi
 
+# Прогон однопоточный, и это решение, а не умолчание. Параллельные
+# потоки cargo-mutants не делят каталог сборки: каждый поток заводит
+# свой временный каталог и заново компилирует зависимости пакета —
+# от 25 с на iaam-core до 134 с на iaam-store. Замер на 20 мутантах
+# iaam-core при трёх потоках: 5 мин против 2,7 мин пофайлового прогона,
+# то есть тройная холодная пересборка съедает выигрыш целиком. На шести
+# ядрах с 12 ГБ памяти, из которых 3 ГБ уже в свопе, добавлять потоки
+# нечем. Ускорение ищется в числе проверок, а не в их одновременности.
+
 # Инструменты проверяются заранее: `command not found` посреди пайпа читается
 # хуже, чем явное сообщение, а под `|| true` вообще прошёл бы как успех.
-for tool in cargo jq; do
+for tool in cargo jq awk; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "МУТАНТЫ: $tool недоступен — заслон не может быть проверен." >&2
     exit 1
@@ -272,24 +289,30 @@ package_of() {
   printf '%s' "$name"
 }
 
-# Число строк в выводе `--list`. Пустая строка — это ноль мутантов, а не один:
-# `printf '%s\n' "" | wc -l` вернул бы 1 и спрятал пустой список.
-count_lines() {
-  if [ -z "$1" ]; then
+# Сколько строк вывода `--list` относится к файлу. Сравнение по префиксу
+# через `index`, а не grep по регулярке: точка в пути под регуляркой
+# совпадает с любым символом, и счётчики поехали бы между соседними
+# модулями. Пустой вывод — это ноль строк, а не одна: `printf '%s\n' ""`
+# дал бы `wc -l` = 1 и спрятал пустой список.
+count_for_file() {
+  local listing="$1" file="$2"
+  if [ -z "$listing" ]; then
     printf '0'
-  else
-    printf '%s\n' "$1" | wc -l | tr -d ' '
+    return
   fi
+  printf '%s\n' "$listing" |
+    awk -v prefix="$file:" 'index($0, prefix) == 1' | wc -l | tr -d ' '
 }
 
-# `cargo mutants --list` для модуля. Код возврата проверяется явно: `|| true`
-# на пайплайне превратил бы падение инструмента в «мутантов нет».
+# `cargo mutants --list` для пакета сразу по всем его модулям. Код возврата
+# проверяется явно: `|| true` на пайплайне превратил бы падение инструмента
+# в «мутантов нет».
 list_mutants() {
-  local package="$1" module="$2"
-  shift 2
+  local package="$1"
+  shift
   local out
-  if ! out=$(cargo mutants --list --package "$package" --file "$module" "$@" 2>"$ERR_FILE"); then
-    echo "МУТАНТЫ: cargo mutants --list не выполнился для $module" >&2
+  if ! out=$(cargo mutants --list --package "$package" "$@" 2>"$ERR_FILE"); then
+    echo "МУТАНТЫ: cargo mutants --list не выполнился для пакета $package" >&2
     cat "$ERR_FILE" >&2
     return 1
   fi
@@ -301,14 +324,24 @@ checked=0
 skipped=0
 inert=0
 
+# Модули группируются по пакетам, и `cargo mutants` вызывается ОДИН раз
+# на пакет со всеми его файлами сразу.
+#
+# Раньше вызов был пофайловым, и каждый из них заново собирал baseline:
+# по логу полного прогона от 25 с на iaam-core до 134 с на iaam-store,
+# то есть больше часа чистой пересборки на 66 модулей. Отвечает заслон
+# по-прежнему за модуль: список, порог и разбор выживших ниже идут
+# пофайлово, файл каждого мутанта берётся из outcomes.json. Дешевеет
+# исполнение заслона, а не его строгость.
+declare -A PACKAGE_FILES=()
+PACKAGES=()
+
 for module in "${MODULES[@]}"; do
   if [ ! -f "$module" ]; then
     echo "пропуск (ещё не создан): $module"
     skipped=$((skipped + 1))
     continue
   fi
-
-  echo "=== $module ==="
 
   package=$(package_of "$module")
   if [ -z "$package" ]; then
@@ -317,50 +350,101 @@ for module in "${MODULES[@]}"; do
     continue
   fi
 
+  if [ -z "${PACKAGE_FILES[$package]+присутствует}" ]; then
+    PACKAGES+=("$package")
+    PACKAGE_FILES[$package]="$module"
+  else
+    PACKAGE_FILES[$package]+=$'\n'"$module"
+  fi
+done
+
+# Значения ошибок для мутантов из функций, возвращающих Result. Раньше
+# лежали в .cargo/mutants.toml и применялись ко ВСЕМ пакетам, хотя
+# `crate::numeric::NumericError` и `crate::money::MoneyError` объявлены
+# только в iaam-core: в любом другом пакете такой мутант не собирается
+# никогда, но полную сборку ради этого вывода оплачивает. По отчётам
+# прогона в iaam-store нежизнеспособны все 70 из 70 таких мутантов —
+# половина мутантов пакета. В iaam-core из 206 таких мутантов 31 убит
+# тестами, поэтому здесь они остаются.
+#
+# Флаги идут и в `--list`, и в прогон: разойдись они, объявленное
+# «мутантов к проверке» перестало бы совпадать с проверенным.
+error_values_for() {
+  case "$1" in
+    iaam-core)
+      printf '%s\n' \
+        --error 'crate::numeric::NumericError::Overflow' \
+        --error 'crate::money::MoneyError::Overflow'
+      ;;
+  esac
+}
+
+for package in "${PACKAGES[@]}"; do
+  mapfile -t files <<<"${PACKAGE_FILES[$package]}"
+  echo "=== пакет $package: модулей ${#files[@]} ==="
+
+  mapfile -t error_args < <(error_values_for "$package")
+
+  list_args=()
+  for file in "${files[@]}"; do
+    list_args+=(--file "$file")
+  done
+
   # --- Заслон против «настроенного, но не работающего» заслона ---
   # `cargo mutants` завершается кодом 0, когда мутантов НОЛЬ: и когда файл
   # исключён через exclude_globs/exclude_re в .cargo/mutants.toml, и когда
   # путь в списке модулей содержит опечатку. Проверено исполнением на
   # cargo-mutants 27.1.0: «Found 0 mutants to test», код возврата 0.
-  # Без этой проверки помодульный прогон печатал бы «выживших нет» для
-  # модуля, который вообще не тестировался — то есть исключение доменного
-  # модуля из конфигурации выглядело бы как пройденный заслон.
+  # Без этой проверки прогон печатал бы «выживших нет» для модуля,
+  # который вообще не тестировался — то есть исключение доменного модуля
+  # из конфигурации выглядело бы как пройденный заслон.
   #
   # Различаем две причины пустого списка сравнением с --no-config:
   #   конфиг подавляет мутантов -> отказ, домен прятать нельзя;
   #   мутантов нет и без конфига -> в файле нет мутируемого кода.
-  if ! with_config=$(list_mutants "$package" "$module"); then
+  if ! with_config=$(list_mutants "$package" "${list_args[@]}" "${error_args[@]}"); then
     fail=1
     continue
   fi
-  if ! without_config=$(list_mutants "$package" "$module" --no-config); then
-    fail=1
-    continue
-  fi
-  n_with=$(count_lines "$with_config")
-  n_without=$(count_lines "$without_config")
-
-  if [ "$n_with" -eq 0 ] && [ "$n_without" -gt 0 ]; then
-    echo "  ОТКАЗ: конфигурация подавляет мутантов в $module" >&2
-    echo "  без конфигурации мутантов: $n_without, с конфигурацией: 0." >&2
-    echo "  Исключение доменного модуля из мутационного тестирования — способ" >&2
-    echo "  спрятать подложные тесты. Уберите модуль из .cargo/mutants.toml." >&2
+  if ! without_config=$(list_mutants "$package" "${list_args[@]}" "${error_args[@]}" --no-config); then
     fail=1
     continue
   fi
 
-  if [ "$n_with" -eq 0 ]; then
-    # Файл существует и не подавлен, но мутируемого кода в нём нет
-    # (например, одни объявления типов). Молчать нельзя: со стороны это
-    # неотличимо от пройденной проверки.
-    echo "  БЕЗ МУТАНТОВ: в $module нет мутируемого кода — проверять нечего."
-    inert=$((inert + 1))
+  run_files=()
+  run_args=()
+  for file in "${files[@]}"; do
+    n_with=$(count_for_file "$with_config" "$file")
+    n_without=$(count_for_file "$without_config" "$file")
+
+    if [ "$n_with" -eq 0 ] && [ "$n_without" -gt 0 ]; then
+      echo "  ОТКАЗ: конфигурация подавляет мутантов в $file" >&2
+      echo "  без конфигурации мутантов: $n_without, с конфигурацией: 0." >&2
+      echo "  Исключение доменного модуля из мутационного тестирования — способ" >&2
+      echo "  спрятать подложные тесты. Уберите модуль из .cargo/mutants.toml." >&2
+      fail=1
+      continue
+    fi
+
+    if [ "$n_with" -eq 0 ]; then
+      # Файл существует и не подавлен, но мутируемого кода в нём нет
+      # (например, одни объявления типов). Молчать нельзя: со стороны это
+      # неотличимо от пройденной проверки.
+      echo "  БЕЗ МУТАНТОВ: в $file нет мутируемого кода — проверять нечего."
+      inert=$((inert + 1))
+      continue
+    fi
+
+    echo "  $file: мутантов к проверке $n_with"
+    run_files+=("$file")
+    run_args+=(--file "$file")
+  done
+
+  if [ "${#run_files[@]}" -eq 0 ]; then
     continue
   fi
 
-  echo "  мутантов к проверке: $n_with"
-
-  # Какими тестами проверять модуль.
+  # Какими тестами проверять пакет.
   #
   # По умолчанию cargo-mutants при `--package X` гоняет тесты ТОЛЬКО
   # пакета X. Для большинства модулей это верно: их тесты лежат рядом.
@@ -373,12 +457,13 @@ for module in "${MODULES[@]}"; do
   # прогон всего набора тестов на каждого мутанта поднимает цену
   # с полутора секунд до тринадцати, то есть примерно в девять раз.
   extra_test_packages=()
-  case "$module" in
-    crates/iaam-app/src/*)
+  case "$package" in
+    iaam-app)
       extra_test_packages=(--test-package iaam-app --test-package iaam-server)
       ;;
   esac
-  out_dir="target/mutants/$(printf '%s' "$module" | tr '/' '_')"
+
+  out_dir="target/mutants/$package"
   # `--output DIR` не создаёт промежуточные каталоги: без mkdir прогон падает
   # с «create output parent directory», а по коду возврата это неотличимо
   # от выживших мутантов.
@@ -389,10 +474,17 @@ for module in "${MODULES[@]}"; do
   # в "$out_dir/mutants.out/", а не в "$out_dir/".
   report="$out_dir/mutants.out"
 
-  if cargo mutants --package "$package" --file "$module" \
-      "${extra_test_packages[@]}" --output "$out_dir"; then
-    echo "  выживших нет ($n_with мутантов убито)"
-    checked=$((checked + 1))
+  # `--profile mutant` — отдельный профиль с урезанной отладочной
+  # информацией (обоснование в Cargo.toml). Мутант — это линковка всех
+  # тестовых целей пакета заново, а при `debug = 2` три четверти
+  # тестового бинарника составляет отладочная информация.
+  if cargo mutants --package "$package" "${run_args[@]}" \
+      "${extra_test_packages[@]}" "${error_args[@]}" \
+      --profile mutant --jobs 1 --output "$out_dir"; then
+    for file in "${run_files[@]}"; do
+      echo "  выживших нет: $file"
+      checked=$((checked + 1))
+    done
     continue
   fi
 
@@ -403,7 +495,7 @@ for module in "${MODULES[@]}"; do
   # берётся из отчёта, а не угадывается по коду возврата. Нет отчёта —
   # это сбой самого прогона, и называть его «выжившими» нельзя.
   if [ ! -f "$report/outcomes.json" ]; then
-    echo "  ОТКАЗ: прогон $module завершился с ошибкой и не оставил отчёта" >&2
+    echo "  ОТКАЗ: прогон пакета $package завершился с ошибкой и не оставил отчёта" >&2
     echo "  ($report/outcomes.json отсутствует). Это сбой инструмента," >&2
     echo "  а не результат проверки." >&2
     continue
@@ -416,15 +508,39 @@ for module in "${MODULES[@]}"; do
     continue
   fi
   IFS=$'\t' read -r n_missed n_timeout n_unviable n_total <<<"$counters"
-  echo "  всего: $n_total, выжило: $n_missed, таймаут: $n_timeout, нежизнеспособных: $n_unviable" >&2
+  echo "  пакет $package: всего $n_total, выжило $n_missed, таймаут $n_timeout," \
+    "нежизнеспособных $n_unviable" >&2
 
-  if [ "${n_missed:-0}" -gt 0 ]; then
-    echo "  ВЫЖИВШИЕ МУТАНТЫ в $module:" >&2
-    jq -r '.outcomes[] | select(.summary=="MissedMutant") | "    " + .scenario.Mutant.name' \
-      "$report/outcomes.json" >&2
-  else
-    echo "  Прогон не прошёл без выживших мутантов — смотрите $report/" >&2
+  if [ "${n_missed:-0}" -eq 0 ] && [ "${n_timeout:-0}" -eq 0 ]; then
+    # Прогон упал не на мутантах: сборка, окружение, сам инструмент.
+    # Приписывать это модулям нельзя, и «проверено» они тоже не получают.
+    echo "  Прогон пакета $package не прошёл без выживших мутантов —" >&2
+    echo "  смотрите $report/" >&2
+    continue
   fi
+
+  # Разбор идёт по файлам: пакетный прогон дешевле пофайлового, но
+  # отвечать заслон обязан за модуль. Иначе один выживший пачкает весь
+  # пакет, и искать его негде.
+  for file in "${run_files[@]}"; do
+    if ! survivors=$(jq -r --arg f "$file" \
+        '.outcomes[]
+         | select(.summary == "MissedMutant" or .summary == "Timeout")
+         | select(.scenario.Mutant.file == $f)
+         | "    " + .summary + ": " + .scenario.Mutant.name' \
+        "$report/outcomes.json" 2>"$ERR_FILE"); then
+      echo "  ОТКАЗ: не удалось разобрать выживших по $file" >&2
+      cat "$ERR_FILE" >&2
+      continue
+    fi
+
+    if [ -n "$survivors" ]; then
+      echo "  ВЫЖИВШИЕ МУТАНТЫ в $file:" >&2
+      printf '%s\n' "$survivors" >&2
+    else
+      checked=$((checked + 1))
+    fi
+  done
 done
 
 echo ""

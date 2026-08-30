@@ -1,6 +1,5 @@
 //! Приёмка операций.
 
-use iaam_core::bond::BondSchedule;
 use iaam_core::event::Event;
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::ids::SourceId;
@@ -14,8 +13,8 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::AppServices;
 use crate::error::AppError;
+use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::{Principal, Recorded};
-use crate::scenarios::reports::MOEX_ISS_SOURCE_ID;
 
 /// Отправка пачки операций.
 ///
@@ -79,59 +78,16 @@ pub async fn submit_journal_events(
             }) => {
                 let loaded_schedule = {
                     let store = services.market_store.lock().await;
-                    match store
-                        .schedule_at_or_before(
-                            &instrument.inner().to_string(),
-                            MOEX_ISS_SOURCE_ID,
-                            &knowledge_as_of_wire,
-                        )
-                        .map_err(|error| AppError::Store(error.to_string()))?
-                    {
-                        None => None,
-                        Some(snapshot) => {
-                            let completeness_row = store
-                                .schedule_completeness(&snapshot.snapshot_id)
-                                .map_err(|error| AppError::Store(error.to_string()))?;
-                            let terms = store
-                                .issue_terms_at_or_before(
-                                    &instrument.inner().to_string(),
-                                    MOEX_ISS_SOURCE_ID,
-                                    &knowledge_as_of_wire,
-                                )
-                                .map_err(|error| AppError::Store(error.to_string()))?;
-                            let offer_kinds = store
-                                .market_source_codes(MOEX_ISS_SOURCE_ID, "offer_kind")
-                                .map_err(|error| AppError::Store(error.to_string()))?;
-                            let schedule = BondSchedule {
-                                periods: crate::market_candidate::accrual_periods_from_snapshot(
-                                    &snapshot,
-                                )?,
-                                principal_returns:
-                                    crate::market_candidate::principal_returns_from_snapshot(
-                                        &snapshot,
-                                    )?,
-                                initial_principal:
-                                    crate::market_candidate::initial_principal_from_terms(
-                                        terms.as_ref(),
-                                    ),
-                                offer_windows:
-                                    crate::market_candidate::offer_windows_from_snapshot(
-                                        &snapshot,
-                                        *instrument,
-                                        &offer_kinds,
-                                    )?,
-                                completeness:
-                                    crate::market_candidate::schedule_completeness_from_row(
-                                        completeness_row.as_ref(),
-                                    ),
-                                default_flags: crate::market_candidate::default_flags_from_terms(
-                                    terms.as_ref(),
-                                ),
-                                currency_roles: None,
-                            };
-                            Some((schedule, snapshot.snapshot_id.clone()))
-                        }
-                    }
+                    let offer_kinds = store
+                        .market_source_codes(MOEX_ISS_SOURCE_ID, "offer_kind")
+                        .map_err(|error| AppError::Store(error.to_string()))?;
+                    crate::market_candidate::schedule_from_store(
+                        &store,
+                        *instrument,
+                        &knowledge_as_of_wire,
+                        &offer_kinds,
+                        None,
+                    )?
                 };
                 let (schedule, snapshot_id) = match loaded_schedule {
                     Some((schedule, snapshot_id)) => (Some(schedule), snapshot_id),

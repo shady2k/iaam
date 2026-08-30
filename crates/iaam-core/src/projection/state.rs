@@ -237,22 +237,37 @@ impl LedgerState {
 /// «те ли это события». Событие, добавленное задним числом **до** границы
 /// снимка, не меняет ни границу, ни состояние снимка — и без этой
 /// проверки просто исчезло бы из расчёта.
+///
+/// В отпечаток входит каноническое CBOR-тело каждого события, а не только
+/// его идентичность. `provenance.raw_hash()` для этой роли не годится:
+/// это отпечаток сырого поданного факта, который не меняется, когда
+/// приложение выводит производное поле. При этом `raw_hash` обязан
+/// оставаться прежним для дедупликации: повтор того же брокерского факта
+/// должен остаться дубликатом.
+///
+/// Отпечаток чувствителен к любому будущему полю [`Event`]. Добавление
+/// поля обесценит все снимки и вызовет полный пересчёт. Это осознанная
+/// цена: молча посчитать по устаревшему снимку хуже, чем пересчитать.
 #[must_use]
 pub fn prefix_digest(events: &[&Event]) -> StateHash {
     let mut hasher = Sha256::new();
-    hasher.update(b"iaam/journal-prefix/v1");
+    hasher.update(b"iaam/journal-prefix/v2");
     hasher.update(
         u64::try_from(events.len())
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
     for event in events {
+        // Идентичность подаётся отдельно, хотя тело её и содержит:
+        // так покрытие ключевых полей не зависит от того, что однажды
+        // сделают с их сериализацией.
         hasher.update(event.id.inner().as_bytes());
         feed_date(&mut hasher, event.order.date());
         hasher.update(event.order.sequence().to_be_bytes());
-        // Содержимое, а не только идентичность: подменённая запись
-        // в хранилище обязана поменять отпечаток.
-        hasher.update(event.provenance.raw_hash().as_str().as_bytes());
+        let mut body = Vec::new();
+        ciborium::into_writer(event, &mut body)
+            .expect("событие сериализуемо: обратное — дефект типа, а не данных");
+        hasher.update(&body);
     }
     StateHash(hasher.finalize().into())
 }
@@ -265,12 +280,23 @@ fn feed_date(hasher: &mut Sha256, date: Date) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::allocation::{
+        AllocationAlgorithmVersion, AllocationEvidence, AllocationInputsHash, BasisAllocation,
+    };
+    use crate::event::corporate_action::CorporateAction;
     use crate::event::kind::EventKind;
     use crate::event::leg::Leg;
+    use crate::event::provenance::{ParserVersion, Provenance, RawHash};
     use crate::event::test_support::event_with;
-    use crate::money::{CurrencyCode, Money, PostedMinor};
+    use crate::ids::{CustodyId, EventId, InstrumentId, OwnerId, SourceId};
+    use crate::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use crate::numeric::decimal::Dec;
     use crate::rules::LotRuleVersion;
+    use crate::rules::ReturnedShare;
+    use rust_decimal::Decimal;
+    use time::OffsetDateTime;
     use time::macros::date;
+    use uuid::Uuid;
 
     fn rub(minor: i64) -> Money {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
@@ -286,6 +312,76 @@ mod tests {
             },
             vec![Leg::cash(account, rub(10_000))],
         )
+    }
+
+    fn known_allocation() -> BasisAllocation {
+        BasisAllocation::Known {
+            share: ReturnedShare::new(Dec::new(Decimal::new(1, 1)))
+                .expect("доля в пределах инварианта"),
+            evidence: AllocationEvidence {
+                inputs_hash: AllocationInputsHash::new("a".repeat(64)).expect("хеш входов"),
+                knowledge_as_of: OffsetDateTime::UNIX_EPOCH,
+                algorithm_version: AllocationAlgorithmVersion(1),
+            },
+        }
+    }
+
+    fn amortisation_event(basis_allocation: BasisAllocation) -> Event {
+        let account = AccountId(Uuid::from_u128(1));
+        let instrument = InstrumentId(Uuid::from_u128(2));
+        let custody = CustodyId(Uuid::from_u128(3));
+        let mut event = event_with(
+            account,
+            date!(2026 - 06 - 15),
+            5,
+            EventKind::CorporateAction {
+                action: CorporateAction::PartialRedemption {
+                    instrument,
+                    custody,
+                    quantity: Quantity(Dec::new(Decimal::from(1))),
+                    principal_returned_per_unit: PerUnitAmount::new(
+                        Dec::new(Decimal::from(100)),
+                        CurrencyCode::Rub,
+                    ),
+                    compensation: rub(10),
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                    basis_allocation,
+                },
+            },
+            vec![Leg::principal(account, instrument, rub(10))],
+        );
+        event.id = EventId(Uuid::from_u128(4));
+        event.owner = OwnerId(Uuid::from_u128(5));
+        event.provenance = Provenance::new(
+            SourceId(Uuid::from_u128(6)),
+            RawHash::parse(&"d".repeat(64)).expect("хеш сырого факта"),
+            ParserVersion("test/1".into()),
+        );
+        event
+    }
+
+    #[test]
+    fn two_events_differing_only_in_allocation_get_different_digests() {
+        let unknown = amortisation_event(BasisAllocation::default());
+        let known = amortisation_event(known_allocation());
+        assert_ne!(
+            prefix_digest(&[&unknown]),
+            prefix_digest(&[&known]),
+            "отпечаток обязан покрывать содержимое события"
+        );
+    }
+
+    #[test]
+    fn those_same_events_keep_one_raw_hash_so_deduplication_still_works() {
+        let unknown = amortisation_event(BasisAllocation::default());
+        let known = amortisation_event(known_allocation());
+        assert_eq!(
+            unknown.provenance.raw_hash(),
+            known.provenance.raw_hash(),
+            "повтор того же брокерского факта обязан оставаться дубликатом"
+        );
     }
 
     #[test]

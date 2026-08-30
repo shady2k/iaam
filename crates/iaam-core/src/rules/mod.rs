@@ -10,6 +10,7 @@ pub mod cashflow;
 pub mod lot_disposal;
 pub mod posting_match;
 pub mod quotation;
+pub mod returned_share;
 pub mod valuation;
 
 use std::collections::BTreeMap;
@@ -29,6 +30,7 @@ pub use cashflow::{
 };
 pub use posting_match::{PostingMatchV1, PostingMatchV2, PostingMatchVersion, Verdict};
 pub use quotation::{QuotationError, QuotationRule, QuotationRuleVersion, QuotationV1};
+pub use returned_share::{ReturnedShare, ReturnedShareError};
 pub use valuation::{
     PriceSelectionResult, SourcePriorityVersion, ValuationPolicyV1, ValuationPolicyVersion,
     ValuationRule,

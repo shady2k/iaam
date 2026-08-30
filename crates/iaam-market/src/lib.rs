@@ -1,12 +1,13 @@
-//! Рыночные данные: MOEX ISS и ЦБ РФ (§12).
+//! Market data: MOEX ISS and CBR (§12).
 //!
-//! Крейта **описывает запрос и разбирает ответ**. HTTP она не знает —
-//! транспорт живёт в `iaam-http`, и это охраняется правилом 11
-//! `scripts/check-architecture.sh`. Отсюда главное свойство: разбор
-//! проверяется на замороженных эталонах **без сети и без подмены HTTP**.
+//! This crate **describes requests and parses responses**. It knows no HTTP—
+//! transport lives in `iaam-http`, enforced by rule 11 of
+//! `scripts/check-architecture.sh`. The key property follows: parsing is
+//! checked against frozen references **without network access or HTTP mocks**.
 //!
-//! Крейта не решает, какую цену применить: она отдаёт все наблюдения,
-//! какие дал источник. Выбор между ними — политика оценки (E3.3).
+//! The crate does not decide which price to apply: it returns every
+//! observation supplied by the source. Choosing among them is valuation policy
+//! (E3.3).
 
 pub mod cbr;
 pub mod error;

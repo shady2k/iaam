@@ -1,15 +1,16 @@
-//! Начальный словарь видов операций Finam (§14).
+//! Initial dictionary of Finam operation kinds (§14).
 //!
-//! Воспроизводит прежний `match` из `parse.rs` (коммит 5320fb0).
-//! Коды здесь в верхнем регистре, потому что разбор канала приводит
-//! их к нему: приведение — свойство этого канала, а не словаря.
+//! Reproduces the former `match` in `parse.rs` (commit 5320fb0).
+//! The codes are upper-case here because channel parsing converts them to
+//! upper case: that conversion belongs to this channel, not the dictionary.
 //!
-//! Канал приложением пока не подключён, и словарь ему не нужен
-//! сегодня. Таблица заведена всё равно: знание о том, что `INTEREST`
-//! у Finam — купон, а `TRADE_BUY` — покупка, иначе осталось бы только
-//! в истории git, и подключающий канал восстанавливал бы его заново.
+//! The application does not currently connect this channel, so it does not
+//! need the dictionary today. The table exists anyway: knowing that `INTEREST`
+//! means a coupon for Finam and `TRADE_BUY` means a purchase would otherwise
+//! live only in git history, and a channel connected later would have to
+//! reconstruct it.
 
-/// Пары «код канала → имя вида» для первого заселения.
+/// “Channel code → kind name” pairs for initial seeding.
 pub const FINAM_OPERATION_KINDS: &[(&str, &str)] = &[
     ("BUY", "buy"),
     ("PURCHASE", "buy"),
@@ -29,8 +30,8 @@ pub const FINAM_OPERATION_KINDS: &[(&str, &str)] = &[
     ("FEE", "commission"),
 ];
 
-/// Как назвать источник этих строк в записи о происхождении.
-pub const FINAM_SEED_NAME: &str = "встроенный словарь finam";
+/// Name for the source of these rows in the provenance record.
+pub const FINAM_SEED_NAME: &str = "embedded Finam dictionary";
 
 #[cfg(test)]
 mod tests {
@@ -49,7 +50,7 @@ mod tests {
             assert_eq!(
                 *code,
                 code.to_ascii_uppercase(),
-                "разбор канала отдаёт код в верхнем регистре, словарь обязан совпасть"
+                "channel parsing returns an upper-case code; the dictionary must agree"
             );
         }
     }

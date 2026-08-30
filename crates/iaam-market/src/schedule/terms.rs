@@ -1,9 +1,8 @@
-//! Параметры выпуска: две оси времени и знание по каждому атрибуту (§2.4).
+//! Issue terms: two time axes and knowledge for every attribute (§2.4).
 //!
-//! Ось `observed_at` отвечает на вопрос «когда мы узнали», ось
-//! `effective_from` — «с какой даты условия действуют». Одна ось на оба
-//! вопроса заставляет отчёт воспроизвести условия, которых на выбранную
-//! дату не существовало.
+//! `observed_at` answers “when did we learn it?”; `effective_from` answers
+//! “from what date are these terms active?”. One axis for both questions makes
+//! a report reproduce terms that did not exist on its selected date.
 
 pub use iaam_core::bond::DefaultFlags;
 use iaam_core::ids::InstrumentId;
@@ -14,38 +13,39 @@ use time::Date;
 use crate::observation::ObservedAt;
 use crate::schedule::Knowledge;
 
-/// Снимок условий выпуска — набор утверждений **одного** источника
-/// на **один** `observed_at`.
+/// Issue-terms snapshot: assertions from **one** source at **one** `observed_at`.
 ///
-/// Собрать одну спецификацию из полей разных наблюдений нельзя: получится
-/// выпуск, которого не существовало ни в один момент времени.
+/// Combining fields from different observations would create an issue that did
+/// not exist at any point in time.
 ///
-/// Текущего номинала здесь нет намеренно: он выводится из первоначального
-/// и ряда возвратов. Хранить оба значило бы завести два источника истины.
+/// Current principal is intentionally absent: it is derived from initial
+/// principal and the return series. Storing both would create two sources of
+/// truth.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueTerms {
     pub instrument: InstrumentId,
     pub observed_at: ObservedAt,
-    /// С какой даты условия действуют. MOEX её не сообщает.
+    /// Date from which the terms apply. MOEX does not report it.
     pub effective_from: Knowledge<Date>,
     pub maturity_date: Knowledge<Date>,
     pub initial_face_value: Knowledge<Dec>,
-    /// Код валюты **как его назвал источник**. Перевод — словарём (§2.5).
+    /// Currency code **as named by the source**. Translation is by dictionary (§2.5).
     pub face_currency_code: Knowledge<String>,
     pub coupon_periods_per_year: Knowledge<u32>,
-    /// База начисления дней. У MOEX всегда `Unknown` (§2.11).
+    /// Day-count basis. MOEX always reports `Unknown` (§2.11).
     pub day_count: Knowledge<String>,
-    /// Календарь. У MOEX всегда `Unknown` (§2.11).
+    /// Calendar. MOEX always reports `Unknown` (§2.11).
     pub calendar: Knowledge<String>,
     pub default_flags: DefaultFlags,
 }
 
 impl IssueTerms {
-    /// Действуют ли эти условия на дату `as_of`.
+    /// Whether these terms apply on `as_of`.
     ///
-    /// При неизвестной `effective_from` снимок описывает условия на момент
-    /// наблюдения и к более ранним датам не применяется: там действует
-    /// предыдущий снимок либо `unknown`. Это отказ вместо угадывания.
+    /// With unknown `effective_from`, the snapshot describes terms at its
+    /// observation time and does not apply to earlier dates: the previous
+    /// snapshot or `unknown` governs there. This is a refusal rather than a
+    /// guess.
     #[must_use]
     pub fn applies_at(&self, as_of: Date) -> bool {
         match &self.effective_from {
@@ -81,10 +81,9 @@ mod tests {
 
     #[test]
     fn effective_from_is_a_separate_axis_from_observed_at() {
-        // Правка эмитента, вступающая в силу с будущей даты, при одной оси
-        // либо применяется ко всей истории, либо игнорируется на as_of.
-        // Подставить observed_at вместо неизвестной даты вступления в силу
-        // значит выдать догадку за факт.
+        // An issuer change effective on a future date, with one axis, would
+        // either apply to the whole history or be ignored for as_of. Replacing
+        // an unknown effective date with observed_at would turn a guess into a fact.
         let terms = minimal();
         assert!(matches!(terms.effective_from, Knowledge::Unknown));
         assert!(terms.applies_at(date!(2026 - 08 - 27)));
@@ -93,8 +92,8 @@ mod tests {
 
     #[test]
     fn day_count_and_calendar_have_no_default() {
-        // MOEX не даёт ни того, ни другого — ни в графике, ни в описании
-        // выпуска. Подставленный day-count даёт правдоподобно неверный НКД.
+        // MOEX supplies neither, in the schedule or issue description. A
+        // substituted day-count produces plausibly wrong accrued interest.
         let terms = minimal();
         assert!(terms.day_count.known().is_none());
         assert!(terms.calendar.known().is_none());

@@ -1,4 +1,4 @@
-//! Ключ шифрования доступа как файл (§14).
+//! Encryption key for broker access as a file (§14).
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -19,7 +19,7 @@ impl TempDir {
         );
         let path = std::env::temp_dir().join(format!("iaam-key-{label}-{nonce}"));
         let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("каталог под ключ");
+        fs::create_dir_all(&path).expect("key directory");
         Self { path }
     }
 
@@ -48,8 +48,8 @@ fn a_generated_key_opens_what_it_sealed() {
 
 #[test]
 fn two_generated_keys_are_not_the_same_key() {
-    // Генератор, дающий один и тот же ключ, превратил бы шифрование
-    // в кодирование: файл базы открывался бы чужой копией программы.
+    // A generator returning the same key would turn encryption into encoding:
+    // a database file could be opened by another copy of the program.
     let directory = TempDir::create("distinct");
     let first = directory.file("first");
     let second = directory.file("second");
@@ -65,8 +65,8 @@ fn two_generated_keys_are_not_the_same_key() {
 
 #[test]
 fn an_existing_key_file_is_never_overwritten() {
-    // Перезапись ключа делает нечитаемыми все ранее зашифрованные
-    // доступы — молча и необратимо.
+    // Overwriting the key makes every previously encrypted access unreadable—
+    // silently and irreversibly.
     let directory = TempDir::create("keep");
     let path = directory.file("broker-key");
     Key::create_at(&path).unwrap();
@@ -79,26 +79,26 @@ fn an_existing_key_file_is_never_overwritten() {
             .unwrap()
             .expose(),
         SECRET,
-        "прежний ключ остался на месте"
+        "previous key remains in place"
     );
 }
 
 #[test]
 fn a_key_file_is_readable_only_by_its_owner() {
-    // Ключ, доступный на чтение группе или всем, защищает ровно ни от
-    // кого на общей машине.
+    // A key readable by the group or everyone protects against nobody on a
+    // shared machine.
     let directory = TempDir::create("mode");
     let path = directory.file("broker-key");
     Key::create_at(&path).unwrap();
 
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "режим доступа к ключу: {mode:o}");
+    assert_eq!(mode, 0o600, "key-file access mode: {mode:o}");
 }
 
 #[test]
 fn a_missing_key_file_is_an_error_not_a_default_key() {
     let directory = TempDir::create("missing");
-    let path = directory.file("нет-такого");
+    let path = directory.file("missing-key");
 
     assert!(matches!(
         Key::from_file(&path),
@@ -110,7 +110,7 @@ fn a_missing_key_file_is_an_error_not_a_default_key() {
 fn a_key_file_that_is_not_a_key_is_refused() {
     let directory = TempDir::create("rubbish");
     let path = directory.file("broker-key");
-    fs::write(&path, "это не ключ").unwrap();
+    fs::write(&path, "this is not a key").unwrap();
 
     assert!(matches!(
         Key::from_file(&path),

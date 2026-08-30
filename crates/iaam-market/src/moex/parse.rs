@@ -1,9 +1,9 @@
-//! Разбор ответа ISS.
+//! Parsing an ISS response.
 //!
-//! Ответ приходит табличным: массив `columns` с именами и массив `data`
-//! со строками. Индексы колонок берутся из `columns` по имени, а не
-//! зашиваются числами: ISS добавляет колонки, и позиционный разбор
-//! однажды прочитает объём как цену.
+//! The response is tabular: `columns` is an array of names and `data` is an array
+//! of rows. Column indices come from `columns` by name, not
+//! hard-coded numbers: ISS adds columns, and positional parsing
+//! will eventually read volume as price.
 
 use iaam_core::ids::InstrumentId;
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
@@ -20,9 +20,9 @@ use crate::observation::{
     Venue,
 };
 
-/// Ценовые колонки ISS и их смысл.
+/// ISS price columns and their meanings.
 ///
-/// Все шесть равноправны: выбор между ними — политика оценки (E3.3).
+/// All six are equal candidates: choosing among them is valuation policy (E3.3).
 const PRICE_COLUMNS: [(&str, PriceKind); 6] = [
     ("CLOSE", PriceKind::Close),
     ("LEGALCLOSEPRICE", PriceKind::LegalClose),
@@ -32,12 +32,12 @@ const PRICE_COLUMNS: [(&str, PriceKind); 6] = [
     ("ADMITTEDQUOTE", PriceKind::AdmittedQuote),
 ];
 
-/// Код валюты источника в доменный код.
+/// Map a source currency code to a domain code.
 ///
-/// `SUR` — код советского рубля из старого стандарта, который биржа
-/// не меняла. Без этого отображения разбор либо падает на каждой
-/// рублёвой бумаге, либо заводит вторую валюту рядом с рублём,
-/// и позиции разъезжаются по двум валютам с одним смыслом.
+/// `SUR` — the Soviet rouble code from an old standard that the exchange
+/// never changed. Without this mapping, parsing either fails on every
+/// rouble-denominated security or creates a second currency beside the rouble,
+/// splitting positions across two currencies with one meaning.
 pub(crate) fn currency_of(code: &str) -> Result<CurrencyCode, MarketError> {
     match code {
         "SUR" | "RUB" => Ok(CurrencyCode::Rub),
@@ -47,10 +47,10 @@ pub(crate) fn currency_of(code: &str) -> Result<CurrencyCode, MarketError> {
     }
 }
 
-/// Сегмент ISS, из которого взята строка котировки.
+/// ISS segment from which the quote row was taken.
 ///
-/// Это те же `engine` и `market`, из которых собран путь запроса
-/// (`super::history_request`), поэтому основание известно адаптеру заранее.
+/// These are the same `engine` and `market` used to build the request path
+/// (`super::history_request`), so the adapter knows the basis in advance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketSegment<'a> {
     pub engine: &'a str,
@@ -58,11 +58,11 @@ pub struct MarketSegment<'a> {
 }
 
 impl MarketSegment<'_> {
-    /// Основание котировки и признак, по которому оно выведено.
+    /// Quotation basis and the evidence from which it was derived.
     ///
-    /// Таблица описывает пары пути запроса, а не род инструмента.
-    /// Незнакомая пара остаётся неизвестной, чтобы не выдать догадку
-    /// за доказанное денежное значение.
+    /// The table describes request-path pairs, not instrument type.
+    /// An unknown pair remains unknown so a guess is not presented
+    /// as a proven monetary value.
     #[must_use]
     pub fn quotation_basis(self) -> (QuotationBasis, String) {
         let basis = match (self.engine, self.market) {
@@ -78,12 +78,12 @@ impl MarketSegment<'_> {
     }
 }
 
-/// Основание, выведенное из полного признака ISS.
+/// Basis derived from the complete ISS segment.
 ///
-/// `None` означает отсутствие доказательства или признак другого источника.
-/// Неизвестный, но правильно оформленный ISS-сегмент возвращает
-/// `Some(Unknown)`: формат признака доказан, а таблица сегментов его пока
-/// не знает.
+/// `None` means no evidence or evidence from another source.
+/// An unknown but well-formed ISS segment returns
+/// `Some(Unknown)`: the segment format is proven, but the segment table does not yet
+/// know it.
 #[must_use]
 pub fn quotation_basis_from_evidence(evidence: &str) -> Option<QuotationBasis> {
     let path = evidence.strip_prefix("iss:engines/")?;
@@ -94,11 +94,11 @@ pub fn quotation_basis_from_evidence(evidence: &str) -> Option<QuotationBasis> {
     Some(MarketSegment { engine, market }.quotation_basis().0)
 }
 
-/// Сверяет записанное основание с доказательством из строки.
+/// Compare the recorded basis with evidence from the row.
 ///
-/// Возвращает эффективное основание и признак противоречия. Отсутствие
-/// доказательства не является противоречием: в таком случае известное
-/// записанное основание просто гасится до `Unknown`.
+/// Return the effective basis and a contradiction flag. Missing
+/// evidence is not a contradiction: in that case a known
+/// recorded basis is simply reduced to `Unknown`.
 #[must_use]
 pub fn reconcile_quotation_basis(
     recorded: QuotationBasis,
@@ -116,10 +116,10 @@ pub fn reconcile_quotation_basis(
     }
 }
 
-/// Разбор страницы истории в наблюдения.
+/// Parse a history page into observations.
 ///
-/// `observed_at` приходит **снаружи**: в ответе ISS момента наблюдения
-/// нет вовсе, и назначать его обязана система.
+/// `observed_at` comes **from outside**: the ISS response contains no
+/// observation time, so the system must assign it.
 pub fn parse_history(
     body: &str,
     instrument: InstrumentId,
@@ -131,12 +131,12 @@ pub fn parse_history(
         serde_json::from_str(body).map_err(|error| MarketError::Malformed(error.to_string()))?;
     let block = root
         .get("history")
-        .ok_or_else(|| MarketError::Malformed("нет блока history".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing block history".to_owned()))?;
     let names = column_names(block)?;
     let rows = block
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| MarketError::Malformed("нет history.data".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing history.data".to_owned()))?;
 
     ensure_page_is_whole(&root, rows.len())?;
 
@@ -144,29 +144,29 @@ pub fn parse_history(
     for row in rows {
         let row = row
             .as_array()
-            .ok_or_else(|| MarketError::Malformed("строка history.data не массив".to_owned()))?;
+            .ok_or_else(|| MarketError::Malformed("history.data row is not an array".to_owned()))?;
         let get = |name: &str| index_of(&names, name).and_then(|i| row.get(i));
         let trade_date = TradeDate(parse_date(
             get("TRADEDATE")
                 .and_then(Value::as_str)
-                .ok_or_else(|| MarketError::Malformed("строка без TRADEDATE".to_owned()))?,
+                .ok_or_else(|| MarketError::Malformed("row is missing TRADEDATE".to_owned()))?,
         )?);
         let currency = currency_of(
             get("CURRENCYID")
                 .and_then(Value::as_str)
-                .ok_or_else(|| MarketError::Malformed("строка без CURRENCYID".to_owned()))?,
+                .ok_or_else(|| MarketError::Malformed("row is missing CURRENCYID".to_owned()))?,
         )?;
         let venue = Venue {
             board: get("BOARDID")
                 .and_then(Value::as_str)
-                .ok_or_else(|| MarketError::Malformed("строка без BOARDID".to_owned()))?
+                .ok_or_else(|| MarketError::Malformed("row is missing BOARDID".to_owned()))?
                 .to_owned(),
             session: get("TRADINGSESSION").and_then(Value::as_i64).unwrap_or(0),
         };
         for (column, kind) in PRICE_COLUMNS {
-            // Пустая колонка наблюдения не порождает: отсутствующее
-            // значение это Option, а не ноль (§4.9). Ноль в цене
-            // означал бы «бумага ничего не стоит».
+            // An empty observation column creates no observation: a missing
+            // value is an Option, not zero (§4.9). Zero as a price
+            // would mean “the security is worthless”.
             let Some(value) = get(column) else {
                 continue;
             };
@@ -174,7 +174,9 @@ pub fn parse_history(
                 if value.is_null() {
                     continue;
                 }
-                return Err(MarketError::Malformed(format!("колонка {column} не число")));
+                return Err(MarketError::Malformed(format!(
+                    "column {column} is not a number"
+                )));
             };
             let price = number
                 .to_string()
@@ -190,9 +192,9 @@ pub fn parse_history(
                 currency,
                 basis,
                 basis_evidence: basis_evidence.clone(),
-                // Дневная история даёт цену закрытия, а не исполнимый bid.
-                // Помечать её исполнимой значило бы выдать ориентир
-                // за цену выхода (§5.1, §5.3).
+                // Daily history gives a closing price, not an executable bid.
+                // Marking it executable would present an indicative value
+                // as an exit price (§5.1, §5.3).
                 executability: Executability::IndicativePreviousClose,
             });
         }
@@ -200,11 +202,11 @@ pub fn parse_history(
     Ok(observations)
 }
 
-/// Разбор наблюдений НКД из той же страницы истории.
+/// Parse accrued-interest observations from the same history page.
 ///
-/// Отдельная функция, а не ветка внутри `parse_history`: величины разной
-/// размерности (процент номинала против денег) и разной судьбы —
-/// смешивать их в одном цикле значит однажды записать одну вместо другой.
+/// A separate function rather than a branch inside `parse_history`: values have different
+/// dimensions (a principal percentage versus money) and different fates—
+/// mixing them in one loop would eventually record one in place of the other.
 pub fn parse_accrued_interest(
     body: &str,
     instrument: InstrumentId,
@@ -214,14 +216,14 @@ pub fn parse_accrued_interest(
         serde_json::from_str(body).map_err(|error| MarketError::Malformed(error.to_string()))?;
     let block = root
         .get("history")
-        .ok_or_else(|| MarketError::Malformed("нет блока history".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing block history".to_owned()))?;
     let names = column_names(block)?;
     let rows = block
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| MarketError::Malformed("нет history.data".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing history.data".to_owned()))?;
     ensure_page_is_whole(&root, rows.len())?;
-    // Колонки нет вовсе — это не облигационный сегмент, а не поломка.
+    // No column at all means this is not a bond segment, not a failure.
     if index_of(&names, "ACCINT").is_none() {
         return Ok(Vec::new());
     }
@@ -230,10 +232,10 @@ pub fn parse_accrued_interest(
     for row in rows {
         let row = row
             .as_array()
-            .ok_or_else(|| MarketError::Malformed("строка history.data не массив".to_owned()))?;
+            .ok_or_else(|| MarketError::Malformed("history.data row is not an array".to_owned()))?;
         let get = |name: &str| index_of(&names, name).and_then(|i| row.get(i));
-        // Пустое значение наблюдения не порождает: ноль НКД означал бы
-        // начало купонного периода, а не отсутствие торгов.
+        // An empty observation value creates no observation: zero accrued interest would mean
+        // the start of a coupon period, not an absence of trading.
         let Some(value) = get("ACCINT").and_then(Value::as_number) else {
             continue;
         };
@@ -241,23 +243,23 @@ pub fn parse_accrued_interest(
             .to_string()
             .parse::<Decimal>()
             .map_err(|error| MarketError::Malformed(error.to_string()))?;
-        // Валюта НКД — валюта номинала (FACEUNIT), а не валюта расчётов
-        // площадки (CURRENCYID). В одной строке они различаются.
+        // Accrued-interest currency is the principal currency (FACEUNIT), not the venue’s
+        // settlement currency (CURRENCYID). They differ in one row.
         let currency =
             currency_of(get("FACEUNIT").and_then(Value::as_str).ok_or_else(|| {
-                MarketError::Malformed("строка с ACCINT без FACEUNIT".to_owned())
+                MarketError::Malformed("ACCINT row is missing FACEUNIT".to_owned())
             })?)?;
         let trade_date = TradeDate(parse_date(
             get("TRADEDATE")
                 .and_then(Value::as_str)
-                .ok_or_else(|| MarketError::Malformed("строка без TRADEDATE".to_owned()))?,
+                .ok_or_else(|| MarketError::Malformed("row is missing TRADEDATE".to_owned()))?,
         )?);
         observations.push(AccruedInterestObservation {
             instrument,
             venue: Venue {
                 board: get("BOARDID")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| MarketError::Malformed("строка без BOARDID".to_owned()))?
+                    .ok_or_else(|| MarketError::Malformed("row is missing BOARDID".to_owned()))?
                     .to_owned(),
                 session: get("TRADINGSESSION").and_then(Value::as_i64).unwrap_or(0),
             },
@@ -269,11 +271,11 @@ pub fn parse_accrued_interest(
     Ok(observations)
 }
 
-/// Страница пришла целиком.
+/// The page arrived complete.
 ///
-/// Курсор ISS даёт `INDEX`, `TOTAL` и `PAGESIZE`. Неполная страница,
-/// принятая за полную, даёт пробел в ряду, который потом невозможно
-/// отличить от нерабочего дня — то есть тихую порчу истории.
+/// The ISS cursor provides `INDEX`, `TOTAL`, and `PAGESIZE`. A partial page
+/// mistaken for a complete page creates a gap in the series that cannot later be
+/// distinguished from a non-trading day—silently corrupting history.
 fn ensure_page_is_whole(root: &Value, got: usize) -> Result<(), MarketError> {
     let Some(cursor) = root.get("history.cursor") else {
         return Ok(());
@@ -309,12 +311,12 @@ fn column_names(block: &Value) -> Result<Vec<String>, MarketError> {
     block
         .get("columns")
         .and_then(Value::as_array)
-        .ok_or_else(|| MarketError::Malformed("нет columns".to_owned()))?
+        .ok_or_else(|| MarketError::Malformed("missing columns".to_owned()))?
         .iter()
         .map(|name| {
             name.as_str()
                 .map(str::to_owned)
-                .ok_or_else(|| MarketError::Malformed("имя колонки не строка".to_owned()))
+                .ok_or_else(|| MarketError::Malformed("column name is not a string".to_owned()))
         })
         .collect()
 }
@@ -325,7 +327,7 @@ fn index_of(names: &[String], name: &str) -> Option<usize> {
 
 fn parse_date(value: &str) -> Result<Date, MarketError> {
     Date::parse(value, &Iso8601::DATE)
-        .map_err(|error| MarketError::Malformed(format!("дата {value}: {error}")))
+        .map_err(|error| MarketError::Malformed(format!("date {value}: {error}")))
 }
 #[cfg(test)]
 mod tests {
@@ -363,10 +365,10 @@ mod tests {
 
     #[test]
     fn moex_reports_the_rouble_as_sur_and_it_resolves_to_rub() {
-        // SUR — код советского рубля из старого стандарта, который биржа
-        // не меняла. Разбор, не знающий этого, либо падает, либо заводит
-        // вторую валюту рядом с рублём.
-        assert_eq!(currency_of("SUR").expect("рубль"), CurrencyCode::Rub);
+        // SUR — the Soviet rouble code from an old standard that the exchange
+        // never changed. A parser unaware of this either fails or creates
+        // a second currency beside the rouble.
+        assert_eq!(currency_of("SUR").expect("rouble"), CurrencyCode::Rub);
     }
 
     #[test]
@@ -380,30 +382,30 @@ mod tests {
     #[test]
     fn one_row_yields_one_observation_per_non_empty_price_column() {
         let observations =
-            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("разбор фикстуры");
+            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("parsing fixture");
         let first_day: Vec<_> = observations
             .iter()
             .filter(|o| o.trade_date == TradeDate(date!(2026 - 08 - 03)))
             .collect();
-        // В фикстуре у первой строки ADMITTEDQUOTE пуст, остальные пять
-        // колонок заполнены.
+        // In the fixture the first row has empty ADMITTEDQUOTE; the other five
+        // columns are populated.
         assert_eq!(
             first_day.len(),
             5,
-            "ожидалось пять наблюдений на день, получено {}",
+            "expected five observations for the day, got {}",
             first_day.len()
         );
         assert!(
             !first_day.iter().any(|o| o.kind == PriceKind::AdmittedQuote),
-            "пустая колонка не должна порождать наблюдение"
+            "an empty column must not create an observation"
         );
     }
 
     #[test]
     fn the_venue_and_session_travel_with_the_observation() {
         let observations =
-            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("разбор фикстуры");
-        let first = observations.first().expect("хотя бы одно наблюдение");
+            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("parsing fixture");
+        let first = observations.first().expect("at least one observation");
         assert_eq!(first.venue.board, "TQBR");
         assert_eq!(first.venue.session, 3);
         assert_eq!(first.currency, CurrencyCode::Rub);
@@ -411,11 +413,11 @@ mod tests {
 
     #[test]
     fn the_knowledge_axis_comes_from_the_caller_not_the_response() {
-        // В ответе ISS нет момента наблюдения вовсе. Он назначается
-        // системой: доверить его источнику значит сделать ось знания
-        // подделываемой ответом.
+        // The ISS response contains no observation time. It is assigned
+        // by the system: trusting the source would make the knowledge axis
+        // forgeable by the response.
         let observations =
-            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("разбор фикстуры");
+            parse_history(FIXTURE, instrument(), observed(), SHARES).expect("parsing fixture");
         assert!(observations.iter().all(|o| o.observed_at == observed()));
     }
 
@@ -441,7 +443,7 @@ mod tests {
 
     #[test]
     fn an_unfamiliar_market_does_not_default_to_money_per_unit() {
-        // Неизвестный рынок котирует неизвестно как, а не по умолчанию деньгами.
+        // An unknown market has an unknown quotation basis, not money per unit by default.
         let segment = MarketSegment {
             engine: "currency",
             market: "selt",
@@ -451,7 +453,7 @@ mod tests {
 
     #[test]
     fn the_basis_comes_from_the_segment_not_from_the_response_body() {
-        // Основание задаётся рынком, а не содержимым строки ответа.
+        // The market supplies the basis, not the response row contents.
         let instrument = InstrumentId::new_random();
         let observed_at = ObservedAt(datetime!(2026-08-21 19:00:00 UTC));
         let as_shares = parse_history(FIXTURE, instrument, observed_at, SHARES).unwrap();
@@ -459,7 +461,7 @@ mod tests {
 
         assert_eq!(as_shares[0].basis, QuotationBasis::MoneyPerUnit);
         assert_eq!(as_bonds[0].basis, QuotationBasis::PercentOfRemainingFace);
-        assert_eq!(as_shares[0].price, as_bonds[0].price, "цена не меняется");
+        assert_eq!(as_shares[0].price, as_bonds[0].price, "price is unchanged");
     }
     #[test]
     fn matching_known_basis_is_proven() {
@@ -490,8 +492,8 @@ mod tests {
     fn unproven_unknown_basis_is_accepted() {
         for evidence in ["", "test:market", "iss:engines/stock/markets/futures"] {
             let (basis, contradicts) = reconcile_quotation_basis(QuotationBasis::Unknown, evidence);
-            assert_eq!(basis, QuotationBasis::Unknown, "признак: {evidence}");
-            assert!(!contradicts, "признак: {evidence}");
+            assert_eq!(basis, QuotationBasis::Unknown, "evidence: {evidence}");
+            assert!(!contradicts, "evidence: {evidence}");
         }
     }
 
@@ -500,8 +502,8 @@ mod tests {
         for evidence in ["", "test:market", "iss:engines/stock/markets/futures"] {
             let (basis, contradicts) =
                 reconcile_quotation_basis(QuotationBasis::MoneyPerUnit, evidence);
-            assert_eq!(basis, QuotationBasis::Unknown, "признак: {evidence}");
-            assert!(!contradicts, "признак: {evidence}");
+            assert_eq!(basis, QuotationBasis::Unknown, "evidence: {evidence}");
+            assert!(!contradicts, "evidence: {evidence}");
         }
     }
 
@@ -559,15 +561,19 @@ mod tests {
 
     #[test]
     fn accrued_interest_takes_its_currency_from_face_unit_not_from_currency_id() {
-        // В одной строке источник называет валюту дважды и по-разному:
-        // CURRENCYID=SUR и FACEUNIT=RUB. НКД выражен в валюте номинала.
+        // In one row the source names the currency twice, differently:
+        // CURRENCYID=SUR and FACEUNIT=RUB. Accrued interest is in principal currency.
         let observations = parse_accrued_interest(
             BOND_HISTORY,
             InstrumentId::new_random(),
             ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
         )
         .unwrap();
-        assert_eq!(observations.len(), 1, "строка с null наблюдения не даёт");
+        assert_eq!(
+            observations.len(),
+            1,
+            "a row with null observation creates none"
+        );
         assert_eq!(observations[0].per_unit.currency(), CurrencyCode::Rub);
         assert_eq!(
             observations[0].per_unit.value(),
@@ -594,8 +600,8 @@ mod tests {
 
     #[test]
     fn a_response_without_the_column_yields_nothing_rather_than_failing() {
-        // Ответ по акции колонки ACCINT не содержит вовсе. Отказ здесь
-        // сломал бы синхронизацию всех необлигаций.
+        // An equity response has no ACCINT column at all. Refusing here
+        // would break synchronisation for all non-bonds.
         let body = r#"{"history":{"columns":["BOARDID","TRADEDATE","CLOSE","CURRENCYID","TRADINGSESSION"],
             "data":[["TQBR","2026-08-20",300.5,"SUR",3]]}}"#;
         let observations = parse_accrued_interest(

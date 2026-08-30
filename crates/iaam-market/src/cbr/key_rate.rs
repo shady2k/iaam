@@ -1,9 +1,10 @@
-//! Ключевая ставка ЦБ РФ через SOAP.
-//! Ключевая ставка ЦБ РФ (раздел 8 дизайна E3.2).
+//! CBR key rate through SOAP.
+//! CBR key rate (design E3.2, section 8).
 //!
-//! Единственный документированный машинный интерфейс истории —
-//! SOAP-сервис `DailyInfoWebServ`. Полноценный SOAP-фреймворк не нужен:
-//! конверт статический, ответ разбирается тем же `quick-xml`, что и курсы.
+//! The only documented machine interface for historical data is the
+//! `DailyInfoWebServ` SOAP service. A full SOAP framework is unnecessary:
+//! the envelope is static, and the response is parsed with the same
+//! `quick-xml` used for exchange rates.
 
 use iaam_core::numeric::decimal::Dec;
 use iaam_http::{Destination, HttpRequest, RequestBody};
@@ -16,12 +17,11 @@ use time::{Date, Duration, OffsetDateTime};
 
 use crate::error::MarketError;
 use crate::observation::{KeyRateObservation, ObservedAt, TradeDate};
-
-/// Действие сервиса. Без этого заголовка сервис отвечает отказом,
-/// а не ошибкой разбора, и причина неочевидна.
+/// Service action. Without this header the service returns a refusal rather
+/// than a parse error, and the reason is not obvious.
 const SOAP_ACTION: &str = "http://web.cbr.ru/KeyRateXML";
 
-/// Формирует SOAP-запрос истории ключевой ставки.
+/// Build a SOAP request for key-rate history.
 #[must_use]
 pub fn key_rate_request(from: Date, till: Date) -> HttpRequest {
     let envelope = format!(
@@ -47,15 +47,14 @@ pub fn key_rate_request(from: Date, till: Date) -> HttpRequest {
 
 fn iso(date: Date) -> String {
     date.format(&Iso8601::DATE)
-        .expect("дата форматируется в ISO-8601")
+        .expect("date formats as ISO-8601")
 }
 
-/// Разбирает дневные наблюдения `DT`/`Rate` из элементов `KeyRate/KR`.
+/// Parse daily `DT`/`Rate` observations from `KeyRate/KR` elements.
 ///
-/// `DT` разбирается как `OffsetDateTime`, чтобы входной offset был
-/// проверен и не потерян молча. В ставке важен календарный день,
-/// записанный источником в его offset, поэтому UTC-конверсия намеренно
-/// не выполняется.
+/// Parse `DT` as `OffsetDateTime` so the input offset is checked and not
+/// silently lost. The calendar day recorded by the source in its offset is
+/// what matters for a rate, so UTC conversion is intentionally not performed.
 pub fn parse_key_rate(
     xml: &str,
     observed_at: ObservedAt,
@@ -71,7 +70,7 @@ pub fn parse_key_rate(
         match reader.read_event() {
             Ok(Event::Start(element)) if element.local_name().as_ref() == b"KR" => {
                 if in_kr {
-                    return Err(MarketError::Malformed("вложенный элемент KR".to_owned()));
+                    return Err(MarketError::Malformed("nested KR element".to_owned()));
                 }
                 in_kr = true;
                 current_date = None;
@@ -94,13 +93,13 @@ pub fn parse_key_rate(
             Ok(Event::End(element)) if element.local_name().as_ref() == b"KR" => {
                 if !in_kr {
                     return Err(MarketError::Malformed(
-                        "закрывающий KR без открывающего".to_owned(),
+                        "closing KR without an opening element".to_owned(),
                     ));
                 }
-                let trade_date =
-                    current_date.ok_or_else(|| MarketError::Malformed("в KR нет DT".to_owned()))?;
+                let trade_date = current_date
+                    .ok_or_else(|| MarketError::Malformed("KR has no DT".to_owned()))?;
                 let rate = current_rate
-                    .ok_or_else(|| MarketError::Malformed("в KR нет Rate".to_owned()))?;
+                    .ok_or_else(|| MarketError::Malformed("KR has no Rate".to_owned()))?;
                 observations.push(KeyRateObservation {
                     trade_date: TradeDate(trade_date),
                     observed_at,
@@ -117,11 +116,13 @@ pub fn parse_key_rate(
     }
 
     if in_kr {
-        return Err(MarketError::Malformed("ответ оборван внутри KR".to_owned()));
+        return Err(MarketError::Malformed(
+            "response is truncated inside KR".to_owned(),
+        ));
     }
     if observations.is_empty() {
         return Err(MarketError::Malformed(
-            "ответ не содержит элементов KR".to_owned(),
+            "response contains no KR elements".to_owned(),
         ));
     }
     Ok(observations)
@@ -130,53 +131,52 @@ pub fn parse_key_rate(
 fn parse_key_rate_date(value: &str) -> Result<Date, MarketError> {
     OffsetDateTime::parse(value.trim(), &time::format_description::well_known::Rfc3339)
         .map(|timestamp| timestamp.date())
-        .map_err(|error| MarketError::Malformed(format!("дата {value}: {error}")))
+        .map_err(|error| MarketError::Malformed(format!("date {value}: {error}")))
 }
 
 fn parse_key_rate_decimal(value: &str) -> Result<Dec, MarketError> {
     Decimal::from_str(value.trim())
         .map(Dec::new)
-        .map_err(|error| MarketError::Malformed(format!("ставка {value}: {error}")))
+        .map_err(|error| MarketError::Malformed(format!("rate {value}: {error}")))
 }
 
-/// Текст элемента в строку.
+/// Convert element text to a string.
 ///
-/// В `quick-xml` 0.41 `read_text` отдаёт `BytesText`, а не строку:
-/// декодирование стало явным шагом. Версия поднята с 0.38 из-за
-/// RUSTSEC-2026-0194 и RUSTSEC-2026-0195 — квадратичное время на
-/// дубликатах атрибутов и неограниченное выделение памяти под
-/// объявления пространств имён.
+/// In `quick-xml` 0.41, `read_text` returns `BytesText`, not a string:
+/// decoding is an explicit step. The version was raised from 0.38 because of
+/// RUSTSEC-2026-0194 and RUSTSEC-2026-0195—quadratic time on duplicate
+/// attributes and unbounded allocation for namespace declarations.
 fn decode_text(value: &quick_xml::events::BytesText<'_>) -> Result<String, MarketError> {
     core::str::from_utf8(value.as_ref())
         .map(str::to_owned)
-        .map_err(|error| MarketError::Malformed(format!("текст элемента: {error}")))
+        .map_err(|error| MarketError::Malformed(format!("element text: {error}")))
 }
 
-/// Как получена левая граница интервала.
+/// How the interval's left boundary was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Boundary {
-    /// Первое наблюдение ряда: дата наблюдена, а не выведена.
+    /// First observation in the series: the date was observed, not derived.
     Observed,
-    /// Между соседними наблюдениями лежат нерабочие дни.
+    /// Non-trading days lie between adjacent observations.
     InferredAcrossNonTradingDays,
 }
 
-/// Интервал действия ставки, выводимый из дневных наблюдений.
+/// Rate-application interval derived from daily observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateInterval {
     pub from: Date,
-    /// `None` у последнего интервала: он открыт справа.
+    /// `None` for the last interval: it is open on the right.
     pub until: Option<Date>,
     pub rate: Dec,
     pub boundary: Boundary,
 }
 
-/// Выводит интервалы из отсортированного по дате ряда наблюдений.
+/// Derive intervals from observations sorted by date.
 ///
-/// Входной SOAP-ответ ЦБ обычно идёт от новых дат к старым, поэтому
-/// перед выводом ряд нормализуется по `trade_date`. Дата `until` — первое
-/// наблюдение следующей ставки; если перед ним есть пропуск календарных
-/// дней, левая граница нового интервала помечается как выведенная.
+/// A CBR SOAP response usually runs from newer dates to older ones, so the
+/// series is normalised by `trade_date` first. `until` is the first observation
+/// of the next rate; if calendar days are missing before it, the new interval's
+/// left boundary is marked as derived.
 #[must_use]
 pub fn derive_intervals(observations: &[KeyRateObservation]) -> Vec<RateInterval> {
     if observations.is_empty() {
@@ -235,14 +235,14 @@ mod tests {
         assert_eq!(
             request.soap_action(),
             Some("http://web.cbr.ru/KeyRateXML"),
-            "без SOAPAction сервис отвечает отказом, а не ошибкой разбора"
+            "without SOAPAction the service returns a refusal, not a parse error"
         );
     }
 
     #[test]
     fn the_soap_envelope_uses_iso_dates_for_both_bounds() {
         let request = key_rate_request(date!(2026 - 02 - 01), date!(2026 - 04 - 30));
-        let body = request.body().expect("SOAP-запрос должен иметь тело");
+        let body = request.body().expect("SOAP request must have a body");
         let payload = body.payload();
 
         assert!(payload.contains("<fromDate>2026-02-01T00:00:00</fromDate>"));
@@ -251,14 +251,14 @@ mod tests {
 
     #[test]
     fn the_source_gives_business_day_observations_not_intervals() {
-        let observations = parse_key_rate(FIXTURE, observed()).expect("разбор");
+        let observations = parse_key_rate(FIXTURE, observed()).expect("parsed");
         assert_eq!(observations.len(), 63);
         assert!(
             !observations.iter().any(|o| matches!(
                 o.trade_date.0.weekday(),
                 time::Weekday::Saturday | time::Weekday::Sunday
             )),
-            "в ряду только рабочие дни"
+            "the series contains business days only"
         );
     }
 
@@ -276,7 +276,7 @@ mod tests {
             </Envelope>
         "#;
 
-        let observations = parse_key_rate(xml, observed()).expect("разбор");
+        let observations = parse_key_rate(xml, observed()).expect("parsed");
 
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].trade_date, TradeDate(date!(2026 - 08 - 04)));
@@ -284,36 +284,36 @@ mod tests {
 
     #[test]
     fn intervals_are_derived_and_their_boundaries_are_marked_inferred() {
-        let observations = parse_key_rate(FIXTURE, observed()).expect("разбор");
+        let observations = parse_key_rate(FIXTURE, observed()).expect("parsed");
         let intervals = derive_intervals(&observations);
-        // Три перехода в фикстуре: 16,00 → 15,50 → 15,00 → 14,50.
-        assert_eq!(intervals.len(), 4, "получено {intervals:?}");
-        // Каждая смена приходится на понедельник после пятницы: между
-        // последним наблюдением старой ставки и первым наблюдением новой
-        // лежат выходные, и точная дата вступления источником не названа.
+        // Three transitions in the fixture: 16.00 → 15.50 → 15.00 → 14.50.
+        assert_eq!(intervals.len(), 4, "received {intervals:?}");
+        // Each change occurs on the Monday after Friday: a weekend lies
+        // between the last observation of the old rate and the first of the
+        // new rate, and the source does not name the exact effective date.
         for interval in intervals.iter().skip(1) {
             assert_eq!(
                 interval.boundary,
                 Boundary::InferredAcrossNonTradingDays,
-                "граница {interval:?} обязана быть помечена выведенной"
+                "boundary {interval:?} must be marked as derived"
             );
         }
     }
 
     #[test]
     fn the_first_interval_starts_at_an_observed_date() {
-        let observations = parse_key_rate(FIXTURE, observed()).expect("разбор");
+        let observations = parse_key_rate(FIXTURE, observed()).expect("parsed");
         let intervals = derive_intervals(&observations);
-        let first = intervals.first().expect("хотя бы один интервал");
+        let first = intervals.first().expect("at least one interval");
         assert_eq!(first.boundary, Boundary::Observed);
         assert_eq!(first.from, date!(2026 - 02 - 02));
     }
 
     #[test]
     fn the_last_interval_is_open_on_the_right() {
-        let observations = parse_key_rate(FIXTURE, observed()).expect("разбор");
+        let observations = parse_key_rate(FIXTURE, observed()).expect("parsed");
         let intervals = derive_intervals(&observations);
-        assert!(intervals.last().expect("интервал").until.is_none());
+        assert!(intervals.last().expect("interval").until.is_none());
     }
     #[test]
     fn adjacent_rate_change_has_an_observed_boundary() {
@@ -321,17 +321,17 @@ mod tests {
             KeyRateObservation {
                 trade_date: TradeDate(date!(2026 - 02 - 02)),
                 observed_at: observed(),
-                rate: Dec::new(Decimal::from_str("16.00").expect("ставка")),
+                rate: Dec::new(Decimal::from_str("16.00").expect("rate")),
             },
             KeyRateObservation {
                 trade_date: TradeDate(date!(2026 - 02 - 03)),
                 observed_at: observed(),
-                rate: Dec::new(Decimal::from_str("16.00").expect("ставка")),
+                rate: Dec::new(Decimal::from_str("16.00").expect("rate")),
             },
             KeyRateObservation {
                 trade_date: TradeDate(date!(2026 - 02 - 04)),
                 observed_at: observed(),
-                rate: Dec::new(Decimal::from_str("15.50").expect("ставка")),
+                rate: Dec::new(Decimal::from_str("15.50").expect("rate")),
             },
         ];
 

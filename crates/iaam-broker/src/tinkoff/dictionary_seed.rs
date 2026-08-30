@@ -1,27 +1,28 @@
-//! Начальный словарь видов операций T-Invest (§14).
+//! Initial dictionary of T-Invest operation kinds (§14).
 //!
-//! Это **наше** знание, а не брокерское: контракт перечисляет коды,
-//! но не сообщает, что `OPERATION_TYPE_DIV_EXT` и
-//! `OPERATION_TYPE_DIVIDEND` для нас оба дивиденд, а
-//! `OPERATION_TYPE_OVER_COM` — комиссия. Поэтому таблица живёт в коде
-//! и попадает в базу один раз, при заведении доступа.
+//! This is **our** knowledge, not the broker's: the contract lists codes but
+//! does not say that `OPERATION_TYPE_DIV_EXT` and
+//! `OPERATION_TYPE_DIVIDEND` are both dividends for us, or that
+//! `OPERATION_TYPE_OVER_COM` is a fee. Therefore the table lives in code and
+//! is inserted into the database once, when access is configured.
 //!
-//! Дальше она **не** источник истины: словарь редактируется в базе,
-//! и пополнение отсюда существующие строки не трогает. Иначе решение
-//! владельца отменялось бы при каждом заведении доступа.
+//! It is **not** the source of truth afterwards: the dictionary is edited in
+//! the database, and seeding from here does not touch existing rows. Otherwise
+//! the owner's decision would be cancelled on every access setup.
 //!
-//! Содержимое воспроизводит прежний `match` из `parse.rs` (коммит
-//! 5320fb0) слово в слово. Пропущенный синоним здесь — это код,
-//! который после переезда молча стал бы неизвестным, и импорт перестал
-//! бы разбирать то, что разбирал вчера.
+//! The contents reproduce the former `match` in `parse.rs` (commit 5320fb0)
+//! word for word. A missing synonym here is a code that would silently become
+//! unknown after migration, and imports would stop parsing what they parsed
+//! yesterday.
 //!
-//! Амортизации и погашения здесь нет намеренно: их коды
-//! (`OPERATION_TYPE_BOND_REPAYMENT`, `OPERATION_TYPE_BOND_REPAYMENT_FULL`)
-//! контракт объявляет, но канал не сообщает ни возвращённого номинала
-//! на единицу, ни места хранения — построить из них факт нечем.
-//! Внести их владелец сможет решением, когда появится чем.
+//! Amortisation and redemption are intentionally absent: the contract
+//! declares their codes (`OPERATION_TYPE_BOND_REPAYMENT`,
+//! `OPERATION_TYPE_BOND_REPAYMENT_FULL`), but the channel reports neither the
+//! returned principal per unit nor its storage location, so no fact can be
+//! built from them. The owner can add them by decision once the necessary data
+//! exists.
 
-/// Пары «код канала → имя вида» для первого заселения.
+/// “Channel code → kind name” pairs for initial seeding.
 pub const TINKOFF_OPERATION_KINDS: &[(&str, &str)] = &[
     ("OPERATION_TYPE_BUY", "buy"),
     ("OPERATION_TYPE_BUY_CARD", "buy"),
@@ -60,17 +61,17 @@ pub const TINKOFF_OPERATION_KINDS: &[(&str, &str)] = &[
     ("OPERATION_TYPE_TRANS_BS_BS", "transfer"),
 ];
 
-/// Как назвать источник этих строк в записи о происхождении.
-pub const TINKOFF_SEED_NAME: &str = "встроенный словарь t-invest";
+/// Name for the source of these rows in the provenance record.
+pub const TINKOFF_SEED_NAME: &str = "embedded T-Invest dictionary";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::operation_kind::{ChannelOperationKind, OperationKindDictionary};
 
-    /// Каждое имя вида обязано быть известно сборке: строка, которую
-    /// не читает `parse`, легла бы в базу и стала бы отказом импорта,
-    /// а не заселением.
+    /// Every kind name must be known to this build: a string that `parse`
+    /// cannot read would enter the database and become an import refusal,
+    /// rather than a seed.
     #[test]
     fn every_seeded_kind_is_readable_by_this_build() {
         let (_, unreadable) =
@@ -78,22 +79,22 @@ mod tests {
         assert!(unreadable.is_empty(), "{unreadable:?}");
     }
 
-    /// Код не может значить два разных вида. Дубль с расхождением
-    /// молча выиграл бы порядком вставки.
+    /// A code cannot mean two different kinds. A conflicting duplicate would
+    /// silently win according to insertion order.
     #[test]
     fn no_code_is_listed_twice() {
         let mut seen = std::collections::BTreeMap::new();
         for (code, kind) in TINKOFF_OPERATION_KINDS {
             if let Some(previous) = seen.insert(*code, *kind) {
-                assert_eq!(previous, *kind, "код {code} назван дважды и по-разному");
-                panic!("код {code} перечислен дважды");
+                assert_eq!(previous, *kind, "code {code} has two different names");
+                panic!("code {code} is listed twice");
             }
         }
     }
 
-    /// Заслон против тихой потери синонима: словарь обязан разбирать
-    /// ровно то, что разбирал прежний `match`. Проверяются те коды,
-    /// на которых потеря заметна не сразу, — синонимы.
+    /// Guard against silently losing a synonym: the dictionary must parse
+    /// exactly what the former `match` parsed. These are the synonyms for
+    /// which loss is not immediately obvious.
     #[test]
     fn the_synonyms_that_the_old_match_knew_are_all_here() {
         let (dictionary, _) =

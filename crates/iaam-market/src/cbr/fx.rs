@@ -1,7 +1,7 @@
-//! Разбор курсов ЦБ РФ.
+//! Parsing CBR exchange rates.
 //!
-//! Две конвенции источника, которые легко пропустить и обе тихие:
-//! ответ приходит в `windows-1251`, а десятичный разделитель — запятая.
+//! Two source conventions are easy to miss, and both fail silently:
+//! the response uses `windows-1251`, and the decimal separator is a comma.
 
 use encoding_rs::WINDOWS_1251;
 use iaam_core::money::CurrencyCode;
@@ -14,12 +14,12 @@ use time::{Date, Month, Weekday};
 use crate::error::MarketError;
 use crate::observation::{FxObservation, ObservedAt, TradeDate};
 
-/// Одна сырая запись ЦБ до отображения в доменную валюту.
+/// One raw CBR record before mapping to a domain currency.
 ///
-/// `char_code` остаётся строкой намеренно: справочник ЦБ шире
-/// [`CurrencyCode`], и неизвестная системе валюта не должна ломать весь
-/// ответ. Для динамического ответа в поле помещается идентификатор ЦБ,
-/// потому что в элементах `Record` нет `CharCode`.
+/// `char_code` intentionally remains a string: the CBR dictionary is broader than
+/// [`CurrencyCode`], and an unknown currency must not break the entire
+/// response. For dynamic responses the field carries the CBR identifier,
+/// because `Record` elements have no `CharCode`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CbrRate {
     pub char_code: String,
@@ -29,70 +29,70 @@ pub struct CbrRate {
     pub date: Date,
 }
 
-/// Байты ответа ЦБ в строку.
+/// CBR response bytes as a string.
 ///
-/// Отдельная функция, а не `String::from_utf8_lossy`: lossy подставил бы
-/// вопросительные знаки вместо названий валют и сделал бы порчу
-/// незаметной. `windows-1251` объявлена в прологе самого ответа.
+/// A separate function rather than `String::from_utf8_lossy`: lossy decoding would insert
+/// question marks instead of currency names and make corruption
+/// invisible. `windows-1251` is declared in the response preamble.
 #[must_use]
 pub fn decode_cp1251(bytes: &[u8]) -> String {
     let (text, _, _) = WINDOWS_1251.decode(bytes);
     text.into_owned()
 }
 
-/// Число в конвенции ЦБ: десятичная запятая.
+/// Number in the CBR convention: decimal comma.
 ///
-/// Точка отвергается намеренно. Принять оба разделителя значило бы
-/// перестать замечать, что источник сменил конвенцию, — а смена
-/// конвенции у источника истины обязана быть отказом, а не догадкой.
+/// A dot is rejected intentionally. Accepting both separators would mean
+/// we would stop noticing that the source changed convention—and a change
+/// in the source-of-truth convention must be a refusal, not a guess.
 pub(crate) fn parse_cbr_decimal(value: &str) -> Result<Decimal, MarketError> {
     if !value.contains(',') && value.contains('.') {
         return Err(MarketError::Malformed(format!(
-            "разделитель ЦБ — запятая, получено {value}"
+            "CBR separator is a comma, got {value}"
         )));
     }
     value
         .replace(',', ".")
         .parse::<Decimal>()
-        .map_err(|error| MarketError::Malformed(format!("число {value}: {error}")))
+        .map_err(|error| MarketError::Malformed(format!("number {value}: {error}")))
 }
 
-/// Дата в конвенции ЦБ: `DD.MM.YYYY`.
+/// Date in the CBR convention: `DD.MM.YYYY`.
 pub(crate) fn parse_cbr_date(value: &str) -> Result<Date, MarketError> {
     let parts: Vec<&str> = value.split('.').collect();
     let [day, month, year] = parts.as_slice() else {
         return Err(MarketError::Malformed(format!(
-            "дата ЦБ ожидается как DD.MM.YYYY, получено {value}"
+            "CBR date expected as DD.MM.YYYY, got {value}"
         )));
     };
     let parsed = |part: &str| {
         part.parse::<u16>()
-            .map_err(|error| MarketError::Malformed(format!("дата {value}: {error}")))
+            .map_err(|error| MarketError::Malformed(format!("date {value}: {error}")))
     };
     let month = Month::try_from(u8::try_from(parsed(month)?).unwrap_or(0))
-        .map_err(|error| MarketError::Malformed(format!("месяц {value}: {error}")))?;
+        .map_err(|error| MarketError::Malformed(format!("month {value}: {error}")))?;
     Date::from_calendar_date(
         i32::from(parsed(year)?),
         month,
         u8::try_from(parsed(day)?).unwrap_or(0),
     )
-    .map_err(|error| MarketError::Malformed(format!("дата {value}: {error}")))
+    .map_err(|error| MarketError::Malformed(format!("date {value}: {error}")))
 }
 
-/// Разбирает дневной XML в сырой слой, не отбрасывая неизвестные валюты.
+/// Parse daily XML into the raw layer without dropping unknown currencies.
 pub fn parse_daily_raw(xml: &str) -> Result<Vec<CbrRate>, MarketError> {
     parse_rates(xml, RateContainer::Daily)
 }
 
-/// Разбирает дневные курсы и оставляет только известные ядру валюты.
+/// Parse daily rates and retain only currencies known to core.
 pub fn parse_daily(xml: &str, observed_at: ObservedAt) -> Result<Vec<FxObservation>, MarketError> {
     let raw = parse_daily_raw(xml)?;
     Ok(raw
         .into_iter()
         .filter_map(|rate| {
-            // ЦБ публикует больше валют, чем знает доменное ядро.
-            // Незнакомые коды пропускаются намеренно, а не считаются
-            // ошибкой всего ответа.
+            // CBR publishes more currencies than the domain core knows.
+            // Unknown codes are skipped intentionally, rather than treated as
+            // an error in the whole response.
             currency_from_iso(&rate.char_code).map(|from| FxObservation {
                 from,
                 to: CurrencyCode::Rub,
@@ -106,7 +106,7 @@ pub fn parse_daily(xml: &str, observed_at: ObservedAt) -> Result<Vec<FxObservati
         .collect())
 }
 
-/// Разбирает ряд одной валюты, отбрасывая выходные.
+/// Parse one currency series, dropping weekends.
 pub fn parse_dynamic(
     xml: &str,
     to: CurrencyCode,
@@ -117,9 +117,9 @@ pub fn parse_dynamic(
         .into_iter()
         .filter(|rate| !matches!(rate.date.weekday(), Weekday::Saturday | Weekday::Sunday))
         .filter_map(|rate| {
-            // В XML_dynamic у Record есть только CBR ID. Известные
-            // идентификаторы отображаются в исчерпаемый enum ядра;
-            // остальные записи, как и неизвестные CharCode, пропускаются.
+            // XML_dynamic records contain only a CBR ID. Known
+            // identifiers map to core’s exhaustive enum;
+            // the remaining records, like unknown CharCode values, are skipped.
             currency_from_cbr_id(&rate.char_code).map(|from| FxObservation {
                 from,
                 to,
@@ -161,20 +161,22 @@ impl RateBuilder {
         let char_code = self
             .char_code
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| MarketError::Malformed("у записи ЦБ отсутствует код валюты".into()))?;
+            .ok_or_else(|| {
+                MarketError::Malformed("CBR record is missing a currency code".into())
+            })?;
         let nominal = self
             .nominal
             .filter(|value| *value > 0)
-            .ok_or_else(|| MarketError::Malformed("у записи ЦБ отсутствует номинал".into()))?;
+            .ok_or_else(|| MarketError::Malformed("CBR record is missing a nominal".into()))?;
         let value = self
             .value
-            .ok_or_else(|| MarketError::Malformed("у записи ЦБ отсутствует Value".into()))?;
+            .ok_or_else(|| MarketError::Malformed("CBR record is missing Value".into()))?;
         let unit_rate = self
             .unit_rate
-            .ok_or_else(|| MarketError::Malformed("у записи ЦБ отсутствует VunitRate".into()))?;
+            .ok_or_else(|| MarketError::Malformed("CBR record is missing VunitRate".into()))?;
         let date = self
             .date
-            .ok_or_else(|| MarketError::Malformed("у записи ЦБ отсутствует дата".into()))?;
+            .ok_or_else(|| MarketError::Malformed("CBR record is missing a date".into()))?;
         Ok(CbrRate {
             char_code,
             nominal,
@@ -190,7 +192,7 @@ impl RateBuilder {
             Field::Nominal => {
                 self.nominal =
                     Some(text.parse::<u32>().map_err(|error| {
-                        MarketError::Malformed(format!("номинал {text}: {error}"))
+                        MarketError::Malformed(format!("nominal {text}: {error}"))
                     })?)
             }
             Field::Value => self.value = Some(parse_cbr_decimal(text)?),
@@ -220,7 +222,7 @@ fn parse_rates(xml: &str, container: RateContainer) -> Result<Vec<CbrRate>, Mark
                     root_id = attribute(&start, b"ID")?;
                 } else if is_container(name.as_ref(), container) {
                     if current.is_some() {
-                        return Err(MarketError::Malformed("вложенная запись ЦБ".into()));
+                        return Err(MarketError::Malformed("nested CBR record".into()));
                     }
                     let mut builder = RateBuilder {
                         char_code: match container {
@@ -248,7 +250,7 @@ fn parse_rates(xml: &str, container: RateContainer) -> Result<Vec<CbrRate>, Mark
             Ok(Event::Text(text)) => {
                 if let (Some(builder), Some(field)) = (&mut current, field) {
                     let value = text.decode().map_err(|error| {
-                        MarketError::Malformed(format!("текст XML ЦБ: {error}"))
+                        MarketError::Malformed(format!("CBR XML text: {error}"))
                     })?;
                     builder.set(field, value.trim())?;
                 }
@@ -257,7 +259,7 @@ fn parse_rates(xml: &str, container: RateContainer) -> Result<Vec<CbrRate>, Mark
                 let name = end.name();
                 if is_container(name.as_ref(), container) {
                     let builder = current.take().ok_or_else(|| {
-                        MarketError::Malformed("закрыта незаполненная запись ЦБ".into())
+                        MarketError::Malformed("closed incomplete CBR record".into())
                     })?;
                     rates.push(builder.finish()?);
                     field = None;
@@ -268,17 +270,17 @@ fn parse_rates(xml: &str, container: RateContainer) -> Result<Vec<CbrRate>, Mark
             Ok(Event::Eof) => break,
             Ok(_) => {}
             Err(error) => {
-                return Err(MarketError::Malformed(format!("XML ЦБ: {error}")));
+                return Err(MarketError::Malformed(format!("CBR XML: {error}")));
             }
         }
     }
 
     if current.is_some() {
-        return Err(MarketError::Malformed("оборванная запись ЦБ".into()));
+        return Err(MarketError::Malformed("truncated CBR record".into()));
     }
     if matches!(container, RateContainer::Daily) && root_date.is_none() {
         return Err(MarketError::Malformed(
-            "у дневного ответа ЦБ отсутствует Date".into(),
+            "CBR daily response is missing Date".into(),
         ));
     }
     Ok(rates)
@@ -304,12 +306,12 @@ fn field_for(name: &[u8]) -> Option<Field> {
 fn attribute(start: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>, MarketError> {
     for attribute in start.attributes() {
         let attribute = attribute
-            .map_err(|error| MarketError::Malformed(format!("атрибут XML ЦБ: {error}")))?;
+            .map_err(|error| MarketError::Malformed(format!("CBR XML attribute: {error}")))?;
         if attribute.key.as_ref() == key {
             return attribute
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(|value| Some(value.into_owned()))
-                .map_err(|error| MarketError::Malformed(format!("атрибут XML ЦБ: {error}")));
+                .map_err(|error| MarketError::Malformed(format!("CBR XML attribute: {error}")));
         }
     }
     Ok(None)
@@ -351,44 +353,44 @@ mod tests {
 
     #[test]
     fn the_response_is_cp1251_and_utf8_decoding_would_fail() {
-        // Пролог ответа объявляет windows-1251, и в названиях валют
-        // лежат байты, которые UTF-8 не принимает.
+        // The response preamble declares windows-1251, and currency names contain
+        // bytes that UTF-8 rejects.
         let bytes = DAILY.to_vec();
         assert!(
             core::str::from_utf8(&bytes).is_err(),
-            "фикстура перестала быть cp1251 — её подменили"
+            "fixture is no longer cp1251—it was replaced"
         );
         let text = decode_cp1251(DAILY);
         assert!(
             text.contains("Австралийский доллар"),
-            "декодирование не дало кириллицы"
+            "decoding produced no Cyrillic text"
         );
     }
 
     #[test]
     fn a_decimal_comma_is_the_source_convention_not_a_typo() {
         assert_eq!(
-            parse_cbr_decimal("85,1293").expect("число").to_string(),
+            parse_cbr_decimal("85,1293").expect("number").to_string(),
             "85.1293"
         );
         assert!(
             parse_cbr_decimal("85.1293").is_err(),
-            "точка не является конвенцией ЦБ"
+            "a dot is not the CBR convention"
         );
     }
 
     #[test]
     fn mixed_decimal_separators_report_a_malformed_number() {
-        let error = parse_cbr_decimal("85,1293.").expect_err("смешанные разделители недопустимы");
+        let error = parse_cbr_decimal("85,1293.").expect_err("mixed separators are forbidden");
 
         match error {
             MarketError::Malformed(message) => {
                 assert!(
-                    message.starts_with("число 85,1293.:"),
-                    "ожидалась ошибка разбора числа, получено: {message}"
+                    message.starts_with("number 85,1293.:"),
+                    "expected a number parse error, got: {message}"
                 );
             }
-            other => panic!("ожидалась ошибка числа, получено: {other:?}"),
+            other => panic!("expected a number error, got: {other:?}"),
         }
     }
 
@@ -402,70 +404,70 @@ mod tests {
             date: Some(date!(2026 - 08 - 04)),
         }
         .finish()
-        .expect_err("нулевой номинал не является записью ЦБ");
+        .expect_err("zero nominal is not a CBR record");
 
         assert_eq!(
             error,
-            MarketError::Malformed("у записи ЦБ отсутствует номинал".to_owned())
+            MarketError::Malformed("CBR record is missing a nominal".to_owned())
         );
     }
 
     #[test]
     fn nominal_and_unit_rate_are_both_kept() {
-        // Проверяется на СЫРОМ слое, а не на наблюдениях, и это не обход:
-        // у всех валют, которые знает ядро (RUB, USD, EUR, CNY), номинал
-        // ЦБ равен единице, и различие value/unit_rate на них ненаблюдаемо.
-        // Номинал больше единицы есть у иены (100) и лиры (10) — валют,
-        // которых в ядре нет. Сырой слой существует именно поэтому:
-        // разбор обязан быть проверяем независимо от того, какие валюты
-        // система учитывает сегодня.
+        // Checked in the RAW layer, not observations, and this is not a workaround:
+        // for every currency known to core (RUB, USD, EUR, CNY), CBR nominal
+        // is one, so value/unit_rate cannot differ observably there.
+        // Nominals above one occur for yen (100) and lira (10), currencies
+        // that core does not know. That is exactly why the raw layer exists:
+        // parsing must be testable regardless of which currencies
+        // the system accounts for today.
         let text = decode_cp1251(DAILY);
-        let raw = parse_daily_raw(&text).expect("разбор");
+        let raw = parse_daily_raw(&text).expect("parsing");
         let jpy = raw
             .iter()
             .find(|r| r.char_code == "JPY")
-            .expect("иена есть в справочнике ЦБ");
-        assert_eq!(jpy.nominal, 100, "ЦБ публикует иену за сто единиц");
+            .expect("yen is in the CBR dictionary");
+        assert_eq!(jpy.nominal, 100, "CBR publishes yen per one hundred units");
         assert_ne!(
             jpy.value, jpy.unit_rate,
-            "значение за номинал и за единицу совпали — номинал потерян"
+            "nominal and per-unit values are equal—the nominal was lost"
         );
     }
 
     #[test]
     fn a_currency_the_core_does_not_know_is_skipped_not_an_error() {
-        // Справочник ЦБ содержит десятки валют, которых система
-        // не учитывает. Объявить их ошибкой значило бы уронить разбор
-        // всего ответа из-за валюты, которая никому не нужна.
+        // The CBR dictionary contains dozens of currencies the system
+        // does not account for. Calling them errors would break parsing
+        // of the whole response because of a currency nobody needs.
         let text = decode_cp1251(DAILY);
-        let raw = parse_daily_raw(&text).expect("разбор");
-        let observations = parse_daily(&text, observed()).expect("разбор");
+        let raw = parse_daily_raw(&text).expect("parsing");
+        let observations = parse_daily(&text, observed()).expect("parsing");
         assert!(
             !observations.is_empty(),
-            "дневной ответ должен дать известные валюты, а не только пропуски"
+            "daily response must yield known currencies, not only omissions"
         );
         for expected in [CurrencyCode::Usd, CurrencyCode::Eur, CurrencyCode::Cny] {
             assert!(
                 observations
                     .iter()
                     .any(|observation| observation.from == expected),
-                "известная валюта {expected:?} не попала в наблюдения"
+                "known currency {expected:?} did not appear in observations"
             );
         }
 
         assert!(
             raw.len() > observations.len(),
-            "в справочнике ЦБ больше валют, чем знает ядро: {} против {}",
+            "CBR dictionary has more currencies than core knows: {} versus {}",
             raw.len(),
             observations.len()
         );
         assert!(
             raw.iter().any(|r| r.char_code == "JPY"),
-            "иена в сыром слое есть"
+            "yen exists in the raw layer"
         );
         assert!(
             observations.iter().all(|o| o.from != CurrencyCode::Rub),
-            "рубль не является исходной валютой в котировках ЦБ"
+            "rouble is not a source currency in CBR quotes"
         );
     }
 
@@ -483,7 +485,7 @@ mod tests {
             assert_eq!(
                 currency_from_iso(source),
                 Some(expected),
-                "код источника {source} должен быть известен ядру"
+                "source code {source} must be known to core"
             );
         }
     }
@@ -505,7 +507,7 @@ mod tests {
             assert_eq!(
                 currency_from_cbr_id(source),
                 Some(expected),
-                "идентификатор ЦБ {source} должен быть известен ядру"
+                "CBR identifier {source} must be known to core"
             );
         }
     }
@@ -518,7 +520,7 @@ mod tests {
     #[test]
     fn the_series_covers_business_days_only() {
         let text = decode_cp1251(DYNAMIC);
-        let series = parse_dynamic(&text, CurrencyCode::Rub, observed()).expect("разбор");
+        let series = parse_dynamic(&text, CurrencyCode::Rub, observed()).expect("parsing");
         assert!(!series.is_empty());
         let has_weekend = series.iter().any(|o| {
             matches!(
@@ -528,14 +530,14 @@ mod tests {
         });
         assert!(
             !has_weekend,
-            "в ряду ЦБ выходных нет — курса на воскресенье не существует"
+            "the CBR series has no weekends—a Sunday rate does not exist"
         );
     }
 
     #[test]
     fn the_source_date_format_is_dotted_not_iso() {
         assert_eq!(
-            parse_cbr_date("04.08.2026").expect("дата"),
+            parse_cbr_date("04.08.2026").expect("date"),
             date!(2026 - 08 - 04)
         );
         assert!(parse_cbr_date("2026-08-04").is_err());

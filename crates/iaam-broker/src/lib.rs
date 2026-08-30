@@ -1,10 +1,10 @@
-//! Доступ к брокерским каналам (§14).
+//! Broker channel access (§14).
 //!
-//! Крейта знает про шифрование доступа и про то, какими правами
-//! система ходит к брокеру. Она **не** знает ни про приложение, ни про
-//! хранилище: порт `BrokerChannel` живёт в `iaam-app`, потому что
-//! объектобезопасные асинхронные трейты существуют только там (§3.2),
-//! а связывает их адаптер приложения — как это уже сделано для SQLite.
+//! This crate knows about access encryption and the permissions with which
+//! the system talks to a broker. It knows **nothing** about the application
+//! or storage: the `BrokerChannel` port lives in `iaam-app`, because
+//! object-safe async traits exist only there (§3.2), and the application
+//! adapter connects them, as it already does for SQLite.
 
 pub mod credentials;
 pub mod environment;

@@ -1,21 +1,21 @@
-//! Отказы разбора.
+//! Parsing refusals.
 
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MarketError {
-    #[error("ответ источника не разобран: {0}")]
+    #[error("source response could not be parsed: {0}")]
     Malformed(String),
-    /// Неизвестный код валюты. Отдельный вариант, а не `Malformed`:
-    /// код `SUR` у MOEX означает рубль, и молчаливое превращение
-    /// незнакомого кода в ошибку разбора спрятало бы причину.
-    #[error("неизвестный код валюты источника: {0}")]
+    /// Unknown currency code. A separate variant rather than `Malformed`:
+    /// MOEX's `SUR` means the rouble, and silently turning an unfamiliar code
+    /// into a parse error would hide the cause.
+    #[error("unknown source currency code: {0}")]
     UnknownCurrency(String),
-    /// Ответ с пагинацией оборван.
+    /// A paginated response is truncated.
     ///
-    /// Отдельный отказ, а не «сколько пришло, столько и ладно»:
-    /// неполная страница, принятая за полную, даёт пробел в ряду,
-    /// который потом невозможно отличить от нерабочего дня.
-    #[error("страница неполна: получено {got} из {total}")]
+    /// A separate refusal rather than “accept whatever arrived”: treating an
+    /// incomplete page as complete creates a gap that later cannot be
+    /// distinguished from a non-trading day.
+    #[error("page is incomplete: received {got} of {total}")]
     Truncated { got: usize, total: usize },
 }

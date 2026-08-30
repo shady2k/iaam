@@ -1,16 +1,16 @@
-//! Разбор графика выплат MOEX ISS.
+//! Parsing the MOEX ISS payment schedule.
 //!
-//! Ответ табличный: `columns` с именами и `data` со строками. Индексы
-//! берутся из `columns` по имени, а не зашиваются числами: ISS добавляет
-//! колонки, и позиционный разбор однажды прочитает долю как дату.
+//! The response is tabular: `columns` contains names and `data` contains rows. Indices
+//! come from `columns` by name rather than hard-coded numbers: ISS adds
+//! columns, and positional parsing would eventually read a share as a date.
 //!
-//! Разборщик **не толкует коды**. Вид возврата номинала и вид права по
-//! оферте доходят до домена как есть; перевод — словарём (§2.5). У MOEX
-//! вид права это свободный русский текст, и `match` по нему сломался бы
-//! от правки формулировки на стороне биржи.
+//! The parser **does not interpret codes**. Principal-return kind and offer-right kind
+//! reach the domain unchanged; translation is by dictionary (§2.5). For MOEX
+//! the right kind is free Russian text, and a `match` on it would break after
+//! the exchange edited its wording.
 //!
-//! Поле номинала в строке игнорируется целиком: это номинал бумаги на
-//! момент запроса, а не номинал периода (§2.11).
+//! The row nominal field is ignored entirely: it is the security nominal at
+//! request time, not the period nominal (§2.11).
 
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -23,39 +23,38 @@ use crate::error::MarketError;
 use crate::observation::ObservedAt;
 use crate::schedule::{CouponAmount, CouponPeriod, Knowledge, OfferWindow, PrincipalRepayment};
 
-/// Одна страница ответа. Пагинация — забота вызывающего (§2.10).
+/// One response page. Pagination is the caller’s responsibility (§2.10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BondizationPage {
     pub coupon_periods: Vec<CouponPeriod>,
     pub principal_repayments: Vec<PrincipalRepayment>,
     pub offer_windows: Vec<OfferWindow>,
-    /// Сколько строк пришло во всех блоках вместе.
+    /// Number of rows received across all blocks.
     ///
-    /// Нужно вызывающему, чтобы отличить «страница пуста» от «блок пуст»:
-    /// смещение у блоков общее, и амортизации кончаются раньше купонов.
+    /// The caller needs this to distinguish “page empty” from “block empty”:
+    /// blocks share an offset, and amortisation ends before coupons.
     pub total_rows: usize,
 }
 
 fn block<'a>(root: &'a Value, name: &str) -> Result<(&'a Vec<Value>, Vec<String>), MarketError> {
     let node = root
         .get(name)
-        .ok_or_else(|| MarketError::Malformed(format!("нет блока {name}")))?;
+        .ok_or_else(|| MarketError::Malformed(format!("missing block {name}")))?;
     let columns = node
         .get("columns")
         .and_then(Value::as_array)
-        .ok_or_else(|| MarketError::Malformed(format!("нет columns у {name}")))?
+        .ok_or_else(|| MarketError::Malformed(format!("missing columns in {name}")))?
         .iter()
         .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| MarketError::Malformed(format!("имя колонки {name} не строка")))
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                MarketError::Malformed(format!("column name {name} is not a string"))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let data = node
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| MarketError::Malformed(format!("нет data у {name}")))?;
+        .ok_or_else(|| MarketError::Malformed(format!("missing data in {name}")))?;
     Ok((data, columns))
 }
 
@@ -71,15 +70,15 @@ fn date_of(columns: &[String], row: &Value, name: &str) -> Result<Option<Date>, 
     };
     let text = value
         .as_str()
-        .ok_or_else(|| MarketError::Malformed(format!("{name} не строка")))?;
+        .ok_or_else(|| MarketError::Malformed(format!("{name} is not a string")))?;
     Date::parse(text, &Iso8601::DATE)
         .map(Some)
-        .map_err(|_| MarketError::Malformed(format!("{name} не дата: {text}")))
+        .map_err(|_| MarketError::Malformed(format!("{name} is not a date: {text}")))
 }
 
 fn required_date(columns: &[String], row: &Value, name: &str) -> Result<Date, MarketError> {
     date_of(columns, row, name)?
-        .ok_or_else(|| MarketError::Malformed(format!("{name} обязателен и пуст")))
+        .ok_or_else(|| MarketError::Malformed(format!("{name} is required but empty")))
 }
 
 fn decimal_of(columns: &[String], row: &Value, name: &str) -> Result<Option<Dec>, MarketError> {
@@ -93,7 +92,7 @@ fn decimal_of(columns: &[String], row: &Value, name: &str) -> Result<Option<Dec>
     };
     text.parse::<Decimal>()
         .map(|decimal| Some(Dec::new(decimal)))
-        .map_err(|_| MarketError::Malformed(format!("{name} не число: {text}")))
+        .map_err(|_| MarketError::Malformed(format!("{name} is not a number: {text}")))
 }
 
 fn text_of(columns: &[String], row: &Value, name: &str) -> Option<String> {
@@ -104,10 +103,10 @@ fn knowledge<T>(value: Option<T>) -> Knowledge<T> {
     value.map_or(Knowledge::Unknown, Knowledge::Known)
 }
 
-/// Разобрать одну страницу ответа `/bondization`.
+/// Parse one `/bondization` response page.
 ///
-/// `observed_at` назначает вызывающий: доверить ось знания часам источника
-/// значит сделать её подделываемой ответом.
+/// The caller assigns `observed_at`: trusting the source clock for the knowledge axis
+/// would make it forgeable by the response.
 pub fn parse_bondization_page(
     body: &[u8],
     _observed_at: ObservedAt,
@@ -119,14 +118,14 @@ pub fn parse_bondization_page(
     let mut coupon_periods = Vec::with_capacity(coupon_rows.len());
     for row in coupon_rows {
         let period_start = required_date(&coupon_columns, row, "startdate")?;
-        // Конец начисления и дата платежа — разные смыслы. Источник даёт
-        // одно значение на оба; различие сохраняется, потому что перенос
-        // с выходного двигает вторую, но не первый.
+        // Accrual end and payment date have different meanings. The source gives
+        // one value for both; the distinction is preserved because shifting
+        // from a weekend moves the latter, not the former.
         let coupon_date = required_date(&coupon_columns, row, "coupondate")?;
         let per_unit = decimal_of(&coupon_columns, row, "value")?;
         let rate_percent = decimal_of(&coupon_columns, row, "valueprc")?;
         let currency = text_of(&coupon_columns, row, "faceunit");
-        // Поля толкуются независимо: null у суммы не делает нулём ставку.
+        // Fields are interpreted independently: null amount does not turn the rate into zero.
         let amount = match (per_unit, rate_percent, currency) {
             (Some(per_unit), _, Some(code)) => CouponAmount::AmountFixed {
                 per_unit,
@@ -152,10 +151,12 @@ pub fn parse_bondization_page(
     for row in amort_rows {
         principal_repayments.push(PrincipalRepayment {
             repayment_date: required_date(&amort_columns, row, "amortdate")?,
-            share_percent: decimal_of(&amort_columns, row, "valueprc")?
-                .ok_or_else(|| MarketError::Malformed("возврат номинала без доли".to_owned()))?,
-            source_kind: text_of(&amort_columns, row, "data_source")
-                .ok_or_else(|| MarketError::Malformed("возврат номинала без вида".to_owned()))?,
+            share_percent: decimal_of(&amort_columns, row, "valueprc")?.ok_or_else(|| {
+                MarketError::Malformed("principal return without a share".to_owned())
+            })?,
+            source_kind: text_of(&amort_columns, row, "data_source").ok_or_else(|| {
+                MarketError::Malformed("principal return without a kind".to_owned())
+            })?,
             source_entry_id: None,
         });
     }
@@ -170,7 +171,7 @@ pub fn parse_bondization_page(
             price_percent: knowledge(decimal_of(&offer_columns, row, "price")?),
             agent: knowledge(text_of(&offer_columns, row, "agent")),
             source_kind: text_of(&offer_columns, row, "offertype")
-                .ok_or_else(|| MarketError::Malformed("окно оферты без вида".to_owned()))?,
+                .ok_or_else(|| MarketError::Malformed("offer window without a kind".to_owned()))?,
             source_entry_id: None,
         });
     }
@@ -189,10 +190,10 @@ mod tests {
     use super::*;
     use time::macros::datetime;
 
-    // Эталоны сняты живыми вызовами ISS 2026-08-27 и заморожены
-    // (`tests/fixtures/MANIFEST.sha256`). Литерал, сконструированный
-    // по памяти, проверяет наше представление об источнике, а не сам
-    // источник, — и расходится с ним молча.
+    // References were captured by live ISS calls on 2026-08-27 and frozen
+    // (`tests/fixtures/MANIFEST.sha256`). A literal constructed
+    // from memory tests our model of the source, not the source itself,
+    // and can silently diverge from it.
     const FLOATER: &[u8] =
         include_bytes!("../../../../tests/fixtures/market/moex-iss-bondization-floater.json");
     const AMORTISED: &[u8] =
@@ -210,14 +211,14 @@ mod tests {
 
     fn parsed(body: &[u8]) -> BondizationPage {
         parse_bondization_page(body, ObservedAt(datetime!(2026-08-27 12:00:00 UTC)))
-            .expect("страница разобрана")
+            .expect("page parsed")
     }
 
     #[test]
     fn a_missing_amount_stays_unknown_and_does_not_become_zero() {
-        // У проверенного флоатера прошедший купон приходит без суммы и без
-        // ставки. Ноль здесь занизил бы и поток, и YTM, и сделал бы это
-        // правдоподобно.
+        // For the checked floating-rate issue, the past coupon has neither amount nor
+        // rate. Zero would understate both cashflow and YTM, plausibly.
+        // plausibly.
         let page = parsed(FLOATER);
         assert_eq!(page.coupon_periods[0].amount, CouponAmount::Undetermined);
     }
@@ -233,20 +234,23 @@ mod tests {
 
     #[test]
     fn a_foreign_face_value_keeps_its_own_currency() {
-        // Валюта номинала — не рубль по умолчанию. Подставить рубль значит
-        // сложить доллары с рублями и получить правдоподобное число.
+        // Principal currency is not rouble by default. Substituting rouble would
+        // add dollars to roubles and produce a plausible number.
         let page = parsed(FOREIGN_FACE);
         let CouponAmount::AmountFixed { currency, .. } = page.coupon_periods[0].amount else {
-            panic!("сумма купона известна: {:?}", page.coupon_periods[0].amount);
+            panic!(
+                "coupon amount is known: {:?}",
+                page.coupon_periods[0].amount
+            );
         };
         assert_eq!(currency.code(), "USD");
     }
 
     #[test]
     fn the_source_kind_arrives_uninterpreted() {
-        // Разборщик кодов не толкует: вид права по оферте у MOEX это
-        // свободный русский текст, и match по нему сломается от правки
-        // формулировки на стороне биржи.
+        // The code parser does not interpret values: MOEX offer-right kind is
+        // free Russian text, and a match on it would break after the exchange edited
+        // its wording.
         assert_eq!(
             parsed(AMORTISED).principal_repayments[0].source_kind,
             "amortization"
@@ -260,13 +264,13 @@ mod tests {
 
     #[test]
     fn the_row_face_value_is_ignored_entirely() {
-        // Поле номинала в строке — номинал бумаги НА МОМЕНТ ЗАПРОСА:
-        // у бумаги, прошедшей часть амортизаций, все строки за все годы
-        // показывают текущий остаток. Принять его за номинал периода
-        // значит задним числом пересчитать всю историю.
+        // The row nominal is the security nominal AT REQUEST TIME:
+        // for an issue that has undergone amortisation, all rows for all years
+        // show the current balance. Treating it as the period principal
+        // would recalculate the entire history retroactively.
         let page = parsed(AMORTISED);
-        // Возврат несёт долю первоначального номинала, а не сумму,
-        // выведенную из показанного номинала строки.
+        // A return carries a share of initial principal, not an amount
+        // derived from the row’s displayed principal.
         assert_eq!(
             page.principal_repayments[0]
                 .share_percent
@@ -278,8 +282,8 @@ mod tests {
 
     #[test]
     fn an_offer_without_conditions_is_unknown() {
-        // У одного и того же выпуска окна приходят и с ценой, и без неё.
-        // Пустая цена — незнание условий, а не выкуп даром.
+        // The same issue can return windows both with and without a price.
+        // An empty price means unknown terms, not a free redemption.
         let page = parsed(OFFERS);
         assert!(matches!(
             page.offer_windows[0].price_percent,
@@ -293,9 +297,9 @@ mod tests {
 
     #[test]
     fn the_first_page_of_a_long_issue_looks_whole_and_is_not() {
-        // Эталон конкретной ловушки: первая страница замкнута по цепи и
-        // короче настоящего графика на десять лет. Ловит её только
-        // несовпадение хвоста с последним возвратом номинала.
+        // Reference for the exact trap: the first page is closed by chain and
+        // ten years shorter than the real schedule. Only
+        // a mismatch between the tail and the last principal return catches it.
         let page = parsed(PAGE_ONE);
         assert_eq!(page.coupon_periods.len(), 100);
         let outcome = crate::schedule::completeness::validate_moex_profile(
@@ -307,24 +311,20 @@ mod tests {
                 outcome,
                 crate::schedule::completeness::Completeness::Incomplete { .. }
             ),
-            "усечённая страница обязана давать Incomplete: {outcome:?}"
+            "truncated page must yield Incomplete: {outcome:?}"
         );
     }
 
     #[test]
     fn the_second_page_closes_the_chain_the_first_left_open() {
-        // Вторая страница продолжает тот же ряд: её первый период
-        // начинается там, где кончился последний период первой, и вместе
-        // они дают полный график. Это и есть доказательство, что
-        // остановка на первой странице была усечением.
+        // The second page continues the same series: its first period
+        // starts where the first page’s last period ended, and together
+        // they form the complete schedule. This proves that
+        // stopping at the first page was truncation.
         let first = parsed(PAGE_ONE);
         let second = parsed(PAGE_TWO);
         assert_eq!(
-            first
-                .coupon_periods
-                .last()
-                .expect("хвост первой")
-                .accrual_end,
+            first.coupon_periods.last().expect("first tail").accrual_end,
             second.coupon_periods[0].period_start
         );
         let mut coupons = first.coupon_periods;
@@ -339,13 +339,13 @@ mod tests {
 
     #[test]
     fn a_rate_without_an_amount_is_not_a_zero_amount() {
-        // Литерал, а не эталон, намеренно: MOEX такую строку не отдаёт
-        // ни в одном из проверенных выпусков — он заполняет `value`
-        // и `valueprc` вместе либо не заполняет ни одного. Состояние
-        // «ставка известна, сумма ещё нет» объявлено спекой (§2.3) и
-        // хранится схемой, поэтому разбор обязан его строить, а не
-        // схлопывать в `Undetermined`: схлопывание потеряло бы
-        // известную ставку флоатера.
+        // A literal rather than a reference intentionally: MOEX does not return this row
+        // in any checked issue—it fills `value`
+        // and `valueprc` together, or fills neither. The state
+        // “rate known, amount not yet determined” is defined by the spec (§2.3) and
+        // is preserved by the schema, so parsing must construct it rather than
+        // collapse it into `Undetermined`: collapsing would lose the
+        // known floating rate.
         const RATE_ONLY: &str = r#"{
           "amortizations": {"columns": ["amortdate", "valueprc", "data_source"], "data": []},
           "coupons": {
@@ -359,7 +359,7 @@ mod tests {
             &page.coupon_periods[0].amount
         else {
             panic!(
-                "ставка известна, сумма нет: {:?}",
+                "rate is known, amount is not: {:?}",
                 page.coupon_periods[0].amount
             );
         };
@@ -368,10 +368,10 @@ mod tests {
 
     #[test]
     fn the_row_count_covers_all_three_blocks_together() {
-        // Счётчик строк — единственное, по чему вызывающий отличает
-        // «страница пуста» от «пуст один блок». Счёт по одному блоку
-        // остановил бы пагинацию там, где кончились амортизации,
-        // и обрезал бы купоны.
+        // Row count is the only way the caller distinguishes
+        // “page empty” from “one block empty”. Counting one block would
+        // stop pagination when amortisation ends,
+        // truncating coupons.
         let page = parsed(OFFERS);
         assert_eq!(page.coupon_periods.len(), 40);
         assert_eq!(page.principal_repayments.len(), 1);

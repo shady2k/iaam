@@ -1,8 +1,8 @@
 use iaam_core::event::provenance::ParserVersion;
 
-// Реэкспорт, чтобы `tinkoff::ChannelOperationKind` и
-// `finam::ChannelOperationKind` продолжали означать один и тот же тип:
-// имя у каналов привычное, а тип за ним теперь общий.
+// Re-export so `tinkoff::ChannelOperationKind` and
+// `finam::ChannelOperationKind` continue to mean the same type:
+// channel names remain familiar while the type behind them is shared.
 pub use crate::operation_kind::ChannelOperationKind;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -14,49 +14,49 @@ use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
-/// Версия разбора ответов Finam Trade API.
+/// Finam Trade API response parser version.
 pub const FINAM_PARSER_VERSION: &str = "finam-api/1";
 
-/// Ошибка разбора ответа Finam.
+/// Error while parsing a Finam response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseError {
-    #[error("ответ Finam не разобран как JSON: {0}")]
+    #[error("Finam response is not valid JSON: {0}")]
     Json(String),
-    #[error("в ответе Finam отсутствует поле {field}")]
+    #[error("Finam response is missing field {field}")]
     MissingField { field: &'static str },
-    #[error("поле {field} ответа Finam содержит недопустимое значение {value}")]
+    #[error("Finam response field {field} contains invalid value {value}")]
     InvalidField { field: &'static str, value: String },
-    #[error("поле {field} не является timestamp RFC 3339")]
+    #[error("field {field} is not an RFC 3339 timestamp")]
     InvalidTimestamp { field: &'static str },
-    #[error("поле {field} не является UUID: {value}")]
+    #[error("field {field} is not a UUID: {value}")]
     InvalidIdentifier { field: &'static str, value: String },
-    #[error("неизвестная валюта Finam: {value}")]
+    #[error("unsupported Finam currency: {value}")]
     UnsupportedCurrency { value: String },
-    #[error("поле {field} нельзя представить минимальной единицей валюты {currency:?}")]
+    #[error("field {field} cannot be represented in currency minor units {currency:?}")]
     NonRepresentableFraction {
         field: &'static str,
         currency: CurrencyCode,
     },
-    #[error("переполнение точного числа в поле {field}")]
+    #[error("exact number overflow in field {field}")]
     NumericOverflow { field: &'static str },
-    #[error("ответ Finam с пагинацией оборван: отсутствует токен следующей страницы")]
+    #[error("Finam paginated response is truncated: next-page token is missing")]
     PartialResponse,
 }
 
-/// Денежная величина операции в минимальных единицах валюты.
+/// An operation's monetary value in currency minor units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelMoney {
     pub amount: PostedMinor,
     pub currency: CurrencyCode,
 }
 
-/// Транзакция, полученная из Finam API.
+/// A transaction received from the Finam API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelOperation {
     pub date: Option<Date>,
     pub operation_id: String,
-    /// Как вид операции назвал сам канал. Во что она превращается,
-    /// решает словарь канала, а он живёт в данных.
+    /// The operation kind as named by the channel. The channel dictionary
+    /// decides what it becomes, and that dictionary lives in data.
     pub source_kind: String,
     pub symbol: Option<String>,
     pub quantity: Option<Quantity>,
@@ -78,7 +78,7 @@ impl ChannelOperation {
     }
 }
 
-/// Разбирает страницу транзакций без сетевых обращений.
+/// Parse a transaction page without network access.
 pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError> {
     let response: RawTransactionsResponse = parse_json(body)?;
     let has_more = response.has_more.unwrap_or(false);
@@ -104,7 +104,7 @@ pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError>
         .collect())
 }
 
-/// Разбирает остатки денег и позиции счёта в утверждения источника.
+/// Parse account cash and positions into source claims.
 pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
     let response: RawPortfolioResponse = parse_json(body)?;
     let mut claims = Vec::new();
@@ -186,9 +186,9 @@ fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {
     ChannelOperation {
         date: timestamp,
         operation_id: operation_id.clone(),
-        // Приведение к верхнему регистру и обрезка — свойство ЭТОГО
-        // канала, а не словаря: Finam пишет вид как придётся, и словарь,
-        // которому пришлось бы знать про регистр, стал бы кодом.
+        // Upper-casing and trimming belong to THIS channel, not the
+        // dictionary: Finam writes the kind inconsistently, and a dictionary
+        // that had to know about case would become code.
         source_kind: category.trim().to_ascii_uppercase(),
         symbol: nonempty(item.symbol),
         quantity,

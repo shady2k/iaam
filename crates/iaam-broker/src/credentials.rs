@@ -1,12 +1,12 @@
-//! Шифрование доступа к брокеру (§14).
+//! Broker access encryption (§14).
 //!
-//! Утечка файла базы не должна давать доступа к брокерскому счёту,
-//! поэтому токен лежит в базе только шифротекстом, а ключ живёт вне
-//! базы — в окружении процесса.
+//! A leaked database file must not grant access to a brokerage account,
+//! so the token is stored in the database only as ciphertext, while the key
+//! lives outside the database—in the process environment.
 //!
-//! **Секрет не печатается никогда.** У всех типов этого модуля `Debug`
-//! ручной: производный напечатал бы содержимое, и первый же `{:?}`
-//! в логе отправил бы токен туда, откуда его не убрать.
+//! **The secret is never printed.** Every type in this module has a manual
+//! `Debug` implementation: a derived one would print the contents, and the
+//! first `{:?}` in a log would send the token somewhere it could not be removed.
 
 use std::env;
 use std::fmt;
@@ -22,42 +22,42 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-/// Длина ключа ChaCha20-Poly1305.
+/// ChaCha20-Poly1305 key length.
 const KEY_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CryptoError {
-    #[error("переменная окружения {variable} с ключом шифрования не задана")]
+    #[error("encryption-key environment variable {variable} is not set")]
     KeyMissing { variable: String },
-    #[error("ключ шифрования не является base64")]
+    #[error("encryption key is not base64")]
     KeyNotBase64,
-    #[error("ключ шифрования длиной {found} байт вместо 32")]
+    #[error("encryption key is {found} bytes long instead of 32")]
     KeyLength { found: usize },
-    // Текст намеренно не содержит ни ключа, ни шифротекста: сообщение
-    // об ошибке — это то, что точно попадёт в лог.
-    #[error("доступ не расшифровывается: ключ не тот или запись подделана")]
+    // The text intentionally contains neither key nor ciphertext: the error
+    // message is certain to reach the log.
+    #[error("access cannot be decrypted: wrong key or forged record")]
     NotAuthentic,
-    #[error("расшифрованный доступ не является текстом")]
+    #[error("decrypted access is not text")]
     NotText,
-    #[error("файл ключа {path} не читается: {detail}")]
+    #[error("key file {path} cannot be read: {detail}")]
     KeyFileUnreadable { path: String, detail: String },
     #[error(
-        "файл ключа {path} уже существует: перезапись сделала бы нечитаемыми все заведённые доступы"
+        "key file {path} already exists: overwriting it would make every configured access unreadable"
     )]
     KeyFileExists { path: String },
-    #[error("файл ключа {path} не записан: {detail}")]
+    #[error("key file {path} was not written: {detail}")]
     KeyFileNotWritten { path: String, detail: String },
 }
 
-/// Ключ шифрования доступа. Живёт вне базы.
+/// Encryption key for broker access. It lives outside the database.
 #[derive(Clone)]
 pub struct Key {
     bytes: Zeroizing<[u8; KEY_BYTES]>,
 }
 
 impl Key {
-    /// Ключ из готовых байтов. Нужен тестам и вызывающему, который
-    /// берёт ключ не из окружения.
+    /// Key from ready-made bytes. Needed by tests and callers that obtain the
+    /// key from somewhere other than the environment.
     #[must_use]
     pub fn from_bytes(bytes: [u8; KEY_BYTES]) -> Self {
         Self {
@@ -65,11 +65,11 @@ impl Key {
         }
     }
 
-    /// Ключ из base64. Сырые 32 байта в переменной окружения не
-    /// переживают ни один копипаст, поэтому ключ передаётся текстом.
+    /// Key from base64. Raw 32-byte environment values do not survive copy and
+    /// paste, so the key is passed as text.
     ///
-    /// Ключ другой длины — отказ, а не дополнение нулями: дополненный
-    /// ключ выглядит рабочим и защищает не тем, чем обещает.
+    /// A key of another length is refused, not padded with zeroes: a padded
+    /// key looks usable while providing different protection than promised.
     pub fn from_base64(encoded: &str) -> Result<Self, CryptoError> {
         let decoded = Zeroizing::new(
             STANDARD
@@ -86,11 +86,11 @@ impl Key {
         Ok(Self::from_bytes(bytes))
     }
 
-    /// Ключ из файла.
+    /// Key from a file.
     ///
-    /// Основной способ в бою: переменная окружения видна
-    /// в `/proc/<pid>/environ` тому же пользователю и наследуется
-    /// каждым дочерним процессом, а файл — нет.
+    /// The primary production path: an environment variable is visible in
+    /// `/proc/<pid>/environ` to the same user and is inherited by every child
+    /// process, while a file is not.
     pub fn from_file(path: &Path) -> Result<Self, CryptoError> {
         let encoded = Zeroizing::new(fs::read_to_string(path).map_err(|error| {
             CryptoError::KeyFileUnreadable {
@@ -101,25 +101,24 @@ impl Key {
         Self::from_base64(&encoded)
     }
 
-    /// Заведение нового случайного ключа в файле.
+    /// Create a new random key in a file.
     ///
-    /// Возвращает `()`, а не ключ: то, чего вызывающий не получил, он
-    /// не может ни напечатать, ни записать в лог. Ключ существует
-    /// только в файле, доступном одному владельцу процесса.
+    /// Returns `()`, not the key: a caller cannot print or log what it never
+    /// received. The key exists only in a file accessible to one process owner.
     ///
-    /// Существующий файл **не перезаписывается**: новый ключ на месте
-    /// старого делает нечитаемыми все ранее заведённые доступы — молча
-    /// и необратимо.
+    /// An existing file is **never overwritten**: a new key in place of the old
+    /// one makes every previously configured access unreadable—silently and
+    /// irreversibly.
     pub fn create_at(path: &Path) -> Result<(), CryptoError> {
-        // Ключ берётся у криптографического источника библиотеки шифра,
-        // а не у общего генератора: ключ — это доступ к чужим деньгам,
-        // и слабый источник здесь дороже всего остального в этом файле.
+        // The key comes from the cipher library's cryptographic source, not a
+        // general-purpose generator: this key grants access to someone else's
+        // money, so a weak source is the most expensive failure in this file.
         let generated = AeadKey::<ChaCha20Poly1305>::generate();
         let mut material = Zeroizing::new([0_u8; KEY_BYTES]);
         material.copy_from_slice(&generated);
         let encoded = Zeroizing::new(STANDARD.encode(&material[..]));
-        // Режим задаётся при создании, а не после: файл, на мгновение
-        // доступный всем, доступен всем.
+        // Set the mode while creating the file, not afterwards: a file
+        // temporarily available to everyone is available to everyone.
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -140,8 +139,8 @@ impl Key {
                 detail: error.to_string(),
             }
         })?;
-        // Умаска могла срезать биты доступа при создании: режим
-        // подтверждается явно, а не предполагается.
+        // The umask may have removed permission bits during creation: confirm
+        // the mode explicitly rather than assuming it.
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
             CryptoError::KeyFileNotWritten {
                 path: path.display().to_string(),
@@ -151,11 +150,10 @@ impl Key {
         Ok(())
     }
 
-    /// Ключ из переменной окружения.
+    /// Key from an environment variable.
     ///
-    /// Отсутствие переменной — отказ. Умолчания у ключа шифрования нет
-    /// и быть не может: ключ «по умолчанию» известен каждому, кто читал
-    /// исходники.
+    /// A missing variable is a refusal. There can be no encryption-key
+    /// default: a “default” key would be known to everyone who read the source.
     pub fn from_env(variable: &str) -> Result<Self, CryptoError> {
         let encoded = env::var(variable).map_err(|_| CryptoError::KeyMissing {
             variable: variable.to_owned(),
@@ -166,11 +164,11 @@ impl Key {
 
 impl fmt::Debug for Key {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Key(<скрыт>)")
+        formatter.write_str("Key(<hidden>)")
     }
 }
 
-/// Зашифрованный доступ: то, что лежит в базе.
+/// Encrypted access: the value stored in the database.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SealedToken {
     nonce: Vec<u8>,
@@ -178,7 +176,7 @@ pub struct SealedToken {
 }
 
 impl SealedToken {
-    /// Сборка из байтов, прочитанных из хранилища.
+    /// Assemble from bytes read from storage.
     #[must_use]
     pub const fn of(nonce: Vec<u8>, ciphertext: Vec<u8>) -> Self {
         Self { nonce, ciphertext }
@@ -196,8 +194,8 @@ impl SealedToken {
 }
 
 impl fmt::Debug for SealedToken {
-    /// Печатается длина, а не содержимое: шифротекст в логе бесполезен
-    /// читателю и полезен тому, кто получит лог вместе с ключом.
+    /// Print lengths, not contents: ciphertext in a log is useless to a reader
+    /// and useful to anyone who obtains the log together with the key.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SealedToken")
@@ -207,19 +205,18 @@ impl fmt::Debug for SealedToken {
     }
 }
 
-/// Расшифрованный доступ.
+/// Decrypted access.
 ///
-/// Обёртка над зануляемой памятью, а не голый `Zeroizing<String>`:
-/// `Zeroizing` зануляет память при уничтожении, но его собственный
-/// `Debug` печатает содержимое, и секрет утёк бы в лог через первый же
-/// `{:?}`.
+/// A wrapper around zeroizing memory, not a bare `Zeroizing<String>`:
+/// `Zeroizing` clears memory on destruction, but its own `Debug` prints the
+/// contents, so the secret would leak into the log through the first `{:?}`.
 pub struct BrokerToken {
     secret: Zeroizing<String>,
 }
 
 impl BrokerToken {
-    /// Значение токена. Имя длинное намеренно: строка `token.expose()`
-    /// в обзоре видна, а `token.value()` — нет.
+    /// Token value. The long name is intentional: `token.expose()` is visible
+    /// during review, while `token.value()` is not.
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.secret
@@ -228,20 +225,20 @@ impl BrokerToken {
 
 impl fmt::Debug for BrokerToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("BrokerToken(<скрыт>)")
+        formatter.write_str("BrokerToken(<hidden>)")
     }
 }
 
-/// Зашифровать доступ.
+/// Encrypt access.
 ///
-/// Nonce случаен на каждую запись: постоянный nonce у потокового шифра
-/// позволяет восстановить открытый текст по двум записям.
+/// The nonce is random for every record: a constant nonce in a stream cipher
+/// allows the plaintext to be recovered from two records.
 #[must_use]
 pub fn seal(key: &Key, token: &str) -> SealedToken {
     let cipher = ChaCha20Poly1305::new((&*key.bytes).into());
     let nonce = Nonce::generate();
-    // Отказ шифрования при корректном ключе и nonce невозможен: он
-    // означал бы нехватку памяти под буфер, а не ошибку данных.
+    // Encryption cannot refuse with a valid key and nonce: that would mean
+    // insufficient memory for the buffer, not a data error.
     let ciphertext = cipher
         .encrypt(&nonce, token.as_bytes())
         .unwrap_or_else(|_| unreachable_encryption());
@@ -251,10 +248,10 @@ pub fn seal(key: &Key, token: &str) -> SealedToken {
     }
 }
 
-/// Расшифровать доступ.
+/// Decrypt access.
 ///
-/// Неверный ключ и подделанная запись дают одну ошибку намеренно:
-/// разные ответы сообщили бы, какая из двух причин верна.
+/// A wrong key and a forged record produce one error intentionally: different
+/// responses would reveal which of the two causes is true.
 pub fn open(key: &Key, sealed: &SealedToken) -> Result<BrokerToken, CryptoError> {
     let cipher = ChaCha20Poly1305::new((&*key.bytes).into());
     let nonce = Nonce::try_from(sealed.nonce.as_slice()).map_err(|_| CryptoError::NotAuthentic)?;
@@ -269,19 +266,18 @@ pub fn open(key: &Key, sealed: &SealedToken) -> Result<BrokerToken, CryptoError>
     })
 }
 
-/// Отдельная функция вместо `unwrap`: `unwrap` здесь читался бы как
-/// «а вдруг», хотя отказ означает нехватку памяти, а не ошибку данных.
+/// Separate function instead of `unwrap`: `unwrap` would read as “what if?”,
+/// although refusal means insufficient memory, not a data error.
 fn unreachable_encryption() -> ! {
-    panic!("шифрование при корректном ключе и nonce не отказывает")
+    panic!("encryption with a valid key and nonce cannot refuse")
 }
 
-/// Права, с которыми заведён доступ к брокеру.
+/// Permissions with which broker access was configured.
 ///
-/// Вариант ровно один: **торговые права не запрашиваются ни при каких
-/// условиях** (§14). Перечисление, а не отсутствие поля, потому что
-/// область прав записывается рядом с доступом и разбирается перед
-/// вызовом: строка, обещающая полный доступ, не толкуется как доступ,
-/// а даёт отказ.
+/// Exactly one variant exists: **trading permissions are never requested**
+/// (§14). An enum rather than an absent field because the permission scope is
+/// stored beside access and parsed before the call: a string promising full
+/// access is not interpreted as access; it produces a refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BrokerScope {
     ReadOnly,
@@ -295,11 +291,11 @@ impl BrokerScope {
         }
     }
 
-    /// Разбор области прав.
+    /// Parse a permission scope.
     ///
-    /// Не `trim` и не приведение регистра: значение пишет система,
-    /// а не человек, и «почти то же самое» здесь означает, что запись
-    /// изменил кто-то другой.
+    /// No `trim` and no case folding: the value is written by the system,
+    /// not a person, and “almost the same” here means another party changed
+    /// the record.
     #[must_use]
     pub fn parse(code: &str) -> Option<Self> {
         match code {

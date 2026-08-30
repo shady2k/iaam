@@ -1,15 +1,15 @@
-//! Разбор описания выпуска MOEX ISS.
+//! Parsing an MOEX ISS issue description.
 //!
-//! Ответ приходит парами «имя поля → значение», а не табличной строкой.
+//! The response arrives as “field name → value” pairs, not a table row.
 //!
-//! Базы начисления дней и календаря в ответе нет вовсе — ни здесь, ни в
-//! графике. Это `Unknown`, а не повод для значения по умолчанию:
-//! подставленный day-count даёт правдоподобно неверный НКД, которого не
-//! покажет ни один тест на бумаге с целым числом периодов.
+//! The response contains no day-count basis or calendar—neither here nor in the
+//! schedule. This is `Unknown`, not a reason for a default value:
+//! a substituted day-count produces plausibly wrong accrued interest that no
+//! test on an issue with whole periods will expose.
 //!
-//! Текущий номинал источник даёт, и он сюда НЕ попадает: остаток выводится
-//! из первоначального номинала и ряда возвратов, а два источника истины
-//! расходятся молча.
+//! The source supplies current principal, but it does NOT belong here: the balance
+//! is derived from initial principal and the return series; two sources of truth
+//! would silently diverge.
 
 use std::collections::BTreeMap;
 
@@ -27,7 +27,7 @@ use crate::observation::ObservedAt;
 use crate::schedule::Knowledge;
 use crate::schedule::terms::{DefaultFlags, IssueTerms};
 
-/// Запрос описания выпуска.
+/// Request an issue description.
 #[must_use]
 pub fn terms_request(secid: &str) -> HttpRequest {
     let path = format!("/iss/securities/{secid}.json");
@@ -39,23 +39,23 @@ pub fn terms_request(secid: &str) -> HttpRequest {
 fn fields(root: &Value) -> Result<BTreeMap<String, String>, MarketError> {
     let node = root
         .get("description")
-        .ok_or_else(|| MarketError::Malformed("нет блока description".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing block description".to_owned()))?;
     let columns = node
         .get("columns")
         .and_then(Value::as_array)
-        .ok_or_else(|| MarketError::Malformed("нет columns у description".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing columns in description".to_owned()))?;
     let name_at = columns
         .iter()
         .position(|column| column.as_str() == Some("name"))
-        .ok_or_else(|| MarketError::Malformed("нет колонки name".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing name column".to_owned()))?;
     let value_at = columns
         .iter()
         .position(|column| column.as_str() == Some("value"))
-        .ok_or_else(|| MarketError::Malformed("нет колонки value".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing value column".to_owned()))?;
     let data = node
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| MarketError::Malformed("нет data у description".to_owned()))?;
+        .ok_or_else(|| MarketError::Malformed("missing data in description".to_owned()))?;
     let mut map = BTreeMap::new();
     for row in data {
         let (Some(name), Some(value)) = (row.get(name_at), row.get(value_at)) else {
@@ -78,7 +78,7 @@ fn flag(fields: &BTreeMap<String, String>, name: &str) -> bool {
     fields.get(name).map(String::as_str) == Some("1")
 }
 
-/// Разобрать описание выпуска в снимок условий.
+/// Parse an issue description into a terms snapshot.
 pub fn parse_description(
     body: &[u8],
     instrument: InstrumentId,
@@ -91,30 +91,28 @@ pub fn parse_description(
     let maturity_date = match fields.get("MATDATE") {
         Some(text) => Knowledge::Known(
             Date::parse(text, &Iso8601::DATE)
-                .map_err(|_| MarketError::Malformed(format!("MATDATE не дата: {text}")))?,
+                .map_err(|_| MarketError::Malformed(format!("MATDATE is not a date: {text}")))?,
         ),
         None => Knowledge::Unknown,
     };
-    let initial_face_value =
-        match fields.get("INITIALFACEVALUE") {
-            Some(text) => Knowledge::Known(Dec::new(text.parse::<Decimal>().map_err(|_| {
-                MarketError::Malformed(format!("INITIALFACEVALUE не число: {text}"))
-            })?)),
-            None => Knowledge::Unknown,
-        };
+    let initial_face_value = match fields.get("INITIALFACEVALUE") {
+        Some(text) => Knowledge::Known(Dec::new(text.parse::<Decimal>().map_err(|_| {
+            MarketError::Malformed(format!("INITIALFACEVALUE is not a number: {text}"))
+        })?)),
+        None => Knowledge::Unknown,
+    };
     let coupon_periods_per_year = match fields.get("COUPONFREQUENCY") {
-        Some(text) => Knowledge::Known(
-            text.parse::<u32>()
-                .map_err(|_| MarketError::Malformed(format!("COUPONFREQUENCY не целое: {text}")))?,
-        ),
+        Some(text) => Knowledge::Known(text.parse::<u32>().map_err(|_| {
+            MarketError::Malformed(format!("COUPONFREQUENCY is not an integer: {text}"))
+        })?),
         None => Knowledge::Unknown,
     };
 
     Ok(IssueTerms {
         instrument,
         observed_at,
-        // Источник даты вступления условий в силу не сообщает.
-        // Подставить observed_at значит выдать догадку за факт.
+        // The source does not report the terms’ effective date.
+        // Substituting observed_at would turn a guess into a fact.
         effective_from: Knowledge::Unknown,
         maturity_date,
         initial_face_value,
@@ -123,7 +121,7 @@ pub fn parse_description(
             .cloned()
             .map_or(Knowledge::Unknown, Knowledge::Known),
         coupon_periods_per_year,
-        // Источник не даёт ни того, ни другого — ни здесь, ни в графике.
+        // The source provides neither, here or in the schedule.
         day_count: Knowledge::Unknown,
         calendar: Knowledge::Unknown,
         default_flags: DefaultFlags {
@@ -139,9 +137,9 @@ mod tests {
     use iaam_core::ids::InstrumentId;
     use time::macros::{date, datetime};
 
-    // Живой ответ ISS 2026-08-27, замороженный эталон. Ни базы начисления
-    // дней, ни календаря в нём нет — это свойство источника, а не нашего
-    // литерала, и проверять его надо на источнике.
+    // Live ISS response from 2026-08-27, frozen as a reference. It has no day-count
+    // basis or calendar—this is a source property, not a property of our
+    // literal, and must be checked against the source.
     const DESCRIPTION: &[u8] =
         include_bytes!("../../../../tests/fixtures/market/moex-iss-description-amortised.json");
 
@@ -151,7 +149,7 @@ mod tests {
             InstrumentId::new_random(),
             ObservedAt(datetime!(2026-08-27 12:00:00 UTC)),
         )
-        .expect("описание разобрано")
+        .expect("description parsed")
     }
 
     #[test]
@@ -163,8 +161,8 @@ mod tests {
 
     #[test]
     fn the_currency_code_arrives_untranslated() {
-        // SUR здесь и RUB в графике — два кода одного источника на одну
-        // валюту. Переводит их словарь, а не разборщик.
+        // SUR here and RUB in the schedule are two source codes for one
+        // currency. The dictionary translates them, not the parser.
         let terms = parsed();
         assert_eq!(terms.face_currency_code, Knowledge::Known("SUR".to_owned()));
     }
@@ -183,9 +181,9 @@ mod tests {
 
     #[test]
     fn both_default_flags_are_parsed() {
-        // Оба признака, а не один: технический дефолт и объявленный —
-        // разные состояния, и потерять второй значит посчитать метрику
-        // по бумаге в дефолте так, будто выплаты состоятся.
+        // Both flags, not one: technical default and declared default are
+        // different states, and losing the second would compute a metric
+        // for a defaulted issue as if payments would occur.
         let terms = parsed();
         assert!(!terms.default_flags.declared);
         assert!(!terms.default_flags.technical);

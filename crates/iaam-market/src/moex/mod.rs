@@ -1,8 +1,8 @@
-//! MOEX ISS: описание запроса истории торгов.
+//! MOEX ISS: trading-history request description.
 //!
-//! Официальная дневная история, **не свечи**. Свечной эндпойнт
-//! (`/candles.json`) существует, но официальной истории не заменяет:
-//! это другой источник, и смешивать их в одной серии нельзя.
+//! Official daily history, **not candles**. The candle endpoint
+//! (`/candles.json`) exists but does not replace the official history:
+//! it is another source, and the two cannot be mixed in one series.
 
 pub mod bondization;
 pub mod description;
@@ -13,37 +13,37 @@ use iaam_http::{Destination, HttpRequest};
 use time::Date;
 use time::format_description::well_known::Iso8601;
 
-/// Координата запроса дневной истории.
+/// Daily-history request coordinate.
 ///
-/// Поля собраны в тип, а не разложены по параметрам: четыре из них —
-/// строки, и по позиции они взаимозаменяемы. Перестановка `market`
-/// с `board` даёт валидный путь к другой площадке, то есть тихо другое
-/// наблюдение; имя поля такую ошибку останавливает, а порядок аргументов
-/// нет. Порог §17 (`too-many-arguments-threshold = 6`) на семи параметрах
-/// говорил ровно об этом.
+/// Fields are collected in a type rather than split into parameters: four are
+/// strings and interchangeable by position. Swapping `market`
+/// with `board` yields a valid path to another venue, silently changing the
+/// observation; field names stop that mistake, while argument order does not.
+/// The §17 threshold (`too-many-arguments-threshold = 6`) for seven parameters
+/// exists precisely for this reason.
 ///
-/// `board` полем, а не константой: путь зависит от engine/market/board,
-/// и площадка входит в идентичность наблюдения. Зашить `TQBR` значило бы
-/// молча решить, что других режимов нет.
+/// `board` is a field, not a constant: the path depends on engine/market/board,
+/// and the venue is part of observation identity. Hard-coding `TQBR` would
+/// silently decide that no other boards exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryQuery<'a> {
-    /// Торговая система, например `stock`.
+    /// Trading engine, for example `stock`.
     pub engine: &'a str,
-    /// Рынок внутри системы, например `shares`.
+    /// Market within the engine, for example `shares`.
     pub market: &'a str,
-    /// Режим торгов, например `TQBR`.
+    /// Trading board, for example `TQBR`.
     pub board: &'a str,
-    /// Код бумаги на площадке.
+    /// Security code on the venue.
     pub secid: &'a str,
-    /// Начало интервала включительно.
+    /// Interval start, inclusive.
     pub from: Date,
-    /// Конец интервала включительно.
+    /// Interval end, inclusive.
     pub till: Date,
-    /// Смещение страницы: ISS отдаёт историю порциями.
+    /// Page offset: ISS returns history in chunks.
     pub start: u32,
 }
 
-/// Запрос дневной истории по бумаге за интервал.
+/// Request daily history for a security over an interval.
 #[must_use]
 pub fn history_request(query: HistoryQuery<'_>) -> HttpRequest {
     let HistoryQuery {
@@ -64,30 +64,30 @@ pub fn history_request(query: HistoryQuery<'_>) -> HttpRequest {
         .with_query("start", &start.to_string())
 }
 
-/// Фактический потолок страницы у источника.
+/// Source’s actual page-size ceiling.
 ///
-/// Не пожелание, а измеренная величина: запрошенный лимит 1000 отдаёт
-/// 100 строк **без всякой ошибки**. У проверенного выпуска с погашением
-/// в 2048 году первая страница вернула 100 купонов с хвостом 2038 и
-/// замкнутой цепью периодов — график выглядел полным и был короче на
-/// десять лет.
+/// This is measured, not a wish: requesting limit 1000 returns
+/// 100 rows **without any error**. For the checked issue maturing
+/// in 2048, the first page returned 100 coupons ending in 2038 with a
+/// closed period chain—the schedule looked complete but was shorter by
+/// ten years.
 pub const PAGE_LIMIT: u32 = 100;
 
-/// Координата запроса графика выплат.
+/// Payment-schedule request coordinate.
 ///
-/// Смещение полем, а не константой: пагинация обязательна, и запрос,
-/// умеющий только первую страницу, молча укорачивает длинные выпуски.
+/// Offset as a field, not a constant: pagination is mandatory, and a request
+/// that knows only the first page silently shortens long issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduleQuery<'a> {
-    /// Код бумаги на площадке.
+    /// Security code on the venue.
     pub secid: &'a str,
-    /// Смещение страницы. Общее на все три блока ответа: на второй
-    /// странице амортизации и оферты уже пусты, а купоны продолжаются,
-    /// поэтому пустота одного блока концом выборки не является.
+    /// Page offset. Shared by all three response blocks: on the second
+    /// page amortisation and offers are already empty while coupons continue,
+    /// so one empty block is not the end of the result.
     pub start: u32,
 }
 
-/// Запрос одной страницы графика выплат по бумаге.
+/// Request one page of an issue payment schedule.
 #[must_use]
 pub fn schedule_request(query: ScheduleQuery<'_>) -> HttpRequest {
     let ScheduleQuery { secid, start } = query;
@@ -120,7 +120,7 @@ mod tests {
         });
         assert!(
             request.url().contains("/boards/SMAL/"),
-            "площадка обязана попадать в путь: {}",
+            "venue must be part of the path: {}",
             request.url()
         );
     }
@@ -143,9 +143,9 @@ mod tests {
 
     #[test]
     fn the_schedule_request_carries_an_explicit_offset() {
-        // Запрос без смещения возвращает первую страницу, а первая
-        // страница у длинного выпуска короче графика на годы — и при этом
-        // выглядит замкнутой.
+        // A request without an offset returns the first page, and the first
+        // page of a long issue is years shorter than the schedule while still
+        // appearing closed.
         let request = schedule_request(ScheduleQuery {
             secid: "SU46020RMFS2",
             start: 100,
@@ -160,9 +160,9 @@ mod tests {
 
     #[test]
     fn the_page_limit_is_the_actual_ceiling_not_a_wish() {
-        // Источник молча режет запрошенный лимит до сотни: лимит 1000
-        // отдаёт 100 строк без всякой ошибки. Просить больше потолка
-        // значит договориться с собой о размере страницы, которого нет.
+        // The source silently cuts the requested limit to one hundred: limit 1000
+        // returns 100 rows without any error. Asking above the ceiling
+        // means pretending that a page size exists when it does not.
         assert_eq!(PAGE_LIMIT, 100);
     }
 }

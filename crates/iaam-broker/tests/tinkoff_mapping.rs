@@ -1,7 +1,7 @@
-//! Обезличенные образцы ответов T-Invest, снятые с песочницы.
+//! Anonymised T-Invest response samples captured from the sandbox.
 //!
-//! Ожидаемые значения выписаны вручную из образцов, а не вычисляются
-//! тем же кодом, который проверяют тесты.
+//! Expected values are written out manually from the samples, rather than
+//! computed by the same code the tests exercise.
 
 use std::error::Error;
 
@@ -19,9 +19,9 @@ fn parses_operations_without_sharing_report_parser_code() -> Result<(), Box<dyn 
     let operation = operations
         .iter()
         .find(|operation| operation.operation_id == "06896b3e-038c-4970-85f2-fd5fc2dfb306")
-        .ok_or("образец не содержит покупки SBER")?;
-    // Разбор больше не классифицирует: он доносит слово источника
-    // нетронутым, а во что оно превращается, решает словарь канала.
+        .ok_or("sample does not contain the SBER purchase")?;
+    // Parsing no longer classifies: it preserves the source word unchanged,
+    // while the channel dictionary decides what it becomes.
     assert_eq!(operation.source_kind, "OPERATION_TYPE_BUY");
     assert_eq!(
         operation.broker_account_id,
@@ -56,7 +56,7 @@ fn parses_operations_without_sharing_report_parser_code() -> Result<(), Box<dyn 
     let rejected = operations
         .iter()
         .find(|operation| operation.operation_id == "7aa1cf04-71c7-4b62-81c7-7f27ec4cfb8d")
-        .ok_or("образец не содержит комиссии")?;
+        .ok_or("sample does not contain the fee")?;
     assert!(matches!(
         rejected.rejection.as_ref(),
         Some(ParseError::NonRepresentableFraction {

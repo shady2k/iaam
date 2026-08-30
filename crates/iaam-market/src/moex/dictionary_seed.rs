@@ -1,27 +1,27 @@
-//! Начальный словарь кодов MOEX ISS (§2.5).
+//! Initial dictionary of MOEX ISS codes (§2.5).
 //!
-//! Это **наше** знание, а не биржевое: источник перечисляет коды, но не
-//! сообщает, что `SUR` и `RUB` для нас один рубль, а `maturity` и
-//! `amortization` оба возвращают номинал. Поэтому таблица живёт в коде и
-//! попадает в базу один раз.
+//! This is **our** knowledge, not the exchange’s: the source lists codes but does not
+//! say that `SUR` and `RUB` are one rouble for us, or that `maturity` and
+//! `amortization` both return principal. Therefore the table lives in code and
+//! is inserted into the database once.
 //!
-//! Дальше она **не** источник истины: словарь редактируется в базе, и
-//! пополнение отсюда существующие строки не трогает.
+//! It is **not** the source of truth afterwards: the dictionary is edited in the database, and
+//! seeding from here does not touch existing rows.
 //!
-//! Виды права по оферте перечислены теми формулировками, какие наблюдались
-//! живой проверкой 2026-08-27. Формулировка — не код, и биржа вправе её
-//! поменять; неперечисленная формулировка даёт отказ, а не тихий пропуск.
+//! Offer-right kinds are listed using the wording observed
+//! in the live check on 2026-08-27. Wording is not a code, and the exchange may
+//! change it; an unlisted wording yields a refusal, not a silent skip.
 
-/// Тройки «область → код источника → доменный смысл».
+/// Triples of “area → source code → domain meaning”.
 pub const MOEX_SOURCE_CODES: &[(&str, &str, &str)] = &[
-    // Один источник, два кода на одну валюту.
+    // One source, two codes for one currency.
     ("currency", "SUR", "RUB"),
     ("currency", "RUB", "RUB"),
     ("currency", "USD", "USD"),
     ("currency", "EUR", "EUR"),
-    // Код окончательности здесь НЕ толкуется: окончательность выводится
-    // из накопленной суммы долей, потому что 'maturity' источник даёт
-    // не всегда — из 50 проверенных бумаг у шести его нет вовсе.
+    // Finality is NOT interpreted here: it is derived
+    // from the accumulated share total because the source does not always provide
+    // 'maturity'—six of 50 checked securities lacked it entirely.
     (
         "principal_repayment_kind",
         "amortization",

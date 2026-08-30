@@ -1,67 +1,66 @@
-//! Структурные инварианты полноты графика (§2.10, §2.11).
+//! Structural schedule-completeness invariants (§2.10, §2.11).
 //!
-//! Источник не даёт ни курсора, ни счётчика записей, поэтому сверить
-//! количество не с чем. Полнота доказывается структурно, и все три
-//! инварианта проверены живой выборкой из 50 бумаг TQOB и TQCB — 50/50
-//! по каждому.
+//! The source provides neither a cursor nor a record count, so there is no
+//! count to compare. Completeness is proved structurally; all three invariants
+//! were checked against a live sample of 50 TQOB and TQCB securities—50/50 for
+//! each.
 //!
-//! Инварианты принадлежат **профилю источника**, а не домену, и имеют
-//! явную область применимости: бескупонные, бессрочные и юридически
-//! нестандартные выпуски в выборку не попали.
+//! The invariants belong to the **source profile**, not the domain, and have an
+//! explicit applicability range: zero-coupon, perpetual, and legally unusual
+//! issues were absent from the sample.
 
 use rust_decimal::Decimal;
 use time::Date;
 
 use iaam_core::numeric::decimal::Dec;
 
-// `CouponAmount` и `Knowledge` здесь не нужны: инварианты смотрят на
-// даты и доли, а не на суммы. Тестам они нужны — и импортируются в блоке
-// тестов, а не тут.
+// `CouponAmount` and `Knowledge` are not needed here: invariants inspect dates
+// and shares, not amounts. Tests need them and import them in the test module.
 use crate::schedule::{CouponPeriod, PrincipalRepayment};
 
-/// Итог структурной проверки.
+/// Result of the structural check.
 ///
-/// `Incomplete` вместо `complete_prefix` намеренно: успешно скачанный,
-/// но усечённый график выглядит замкнутым и правдоподобным, и «полный
-/// префикс» звучит как «почти всё в порядке».
+/// `Incomplete` rather than `complete_prefix` is intentional: a downloaded
+/// but truncated schedule looks closed and plausible, while “complete prefix”
+/// sounds like “almost everything is fine”.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Completeness {
     Validated,
     Incomplete {
         reason: String,
     },
-    /// Выпуск вне области применимости профиля.
+    /// Issue outside the profile's applicability range.
     Unknown,
 }
 
-/// Проверить три инварианта профиля MOEX.
+/// Check the three invariants of the MOEX profile.
 #[must_use]
 pub fn validate_moex_profile(
     coupons: &[CouponPeriod],
     repayments: &[PrincipalRepayment],
 ) -> Completeness {
     if coupons.is_empty() || repayments.is_empty() {
-        // Ни бескупонного, ни бессрочного выпуска в выборке не было.
-        // Отвергнуть их корректный график — такая же ошибка, как принять
-        // усечённый, поэтому здесь незнание, а не отказ.
+        // The sample contained neither zero-coupon nor perpetual issues.
+        // Rejecting their valid schedules is as wrong as accepting a truncated
+        // one, so this is unknown rather than a refusal.
         return Completeness::Unknown;
     }
 
-    // Инвариант 1: цепь купонных периодов замкнута.
+    // Invariant 1: the coupon-period chain is closed.
     for pair in coupons.windows(2) {
         if pair[0].accrual_end != pair[1].period_start {
             return Completeness::Incomplete {
                 reason: format!(
-                    "разрыв цепи периодов: период кончается {}, следующий начинается {}",
+                    "period chain gap: period ends {}, next starts {}",
                     pair[0].accrual_end, pair[1].period_start
                 ),
             };
         }
     }
 
-    // Инвариант 2: хвост совпадает с последним возвратом номинала.
-    // Ловит именно усечённую страницу: обрыв после целого периода
-    // оставляет цепь замкнутой, и больше его ничто не замечает.
+    // Invariant 2: the tail agrees with the last principal return.
+    // This catches a truncated page: stopping after a whole period leaves the
+    // chain closed, and nothing else notices.
     let last_accrual = coupons
         .iter()
         .map(|period| period.accrual_end)
@@ -74,15 +73,13 @@ pub fn validate_moex_profile(
         .unwrap_or(Date::MIN);
     if last_accrual != last_return {
         return Completeness::Incomplete {
-            reason: format!(
-                "хвост графика {last_accrual} не сходится с последним возвратом {last_return}"
-            ),
+            reason: format!("schedule tail {last_accrual} does not meet last return {last_return}"),
         };
     }
 
-    // Инвариант 3: доли возвратов суммируются ровно в 100 %.
-    // Сложение через Dec::sum, а не через сырой Decimal: переполнение
-    // и потеря точности здесь — отказ, а не тихо неверная сумма.
+    // Invariant 3: return shares sum to exactly 100%.
+    // Sum through Dec, not raw Decimal: overflow and loss of precision here
+    // are refusals, not silently wrong totals.
     let shares = repayments
         .iter()
         .map(|repayment| repayment.share_percent)
@@ -91,13 +88,13 @@ pub fn validate_moex_profile(
         Ok(total) => total,
         Err(error) => {
             return Completeness::Incomplete {
-                reason: format!("доли возвратов номинала не суммируются: {error}"),
+                reason: format!("principal-return shares do not sum: {error}"),
             };
         }
     };
     if total != Dec::new(Decimal::from(100)) {
         return Completeness::Incomplete {
-            reason: format!("доли возвратов номинала дают {}, а не 100", total.inner()),
+            reason: format!("principal-return shares total {}, not 100", total.inner()),
         };
     }
 
@@ -146,9 +143,9 @@ mod tests {
 
     #[test]
     fn a_truncated_page_is_caught_by_the_tail_not_by_the_chain() {
-        // Это главная ловушка: усечённая страница обрывается после целого
-        // периода, цепь остаётся замкнутой, и график выглядит полным.
-        // Ловит его только совпадение хвоста с последним возвратом.
+        // This is the main trap: a truncated page stops after a whole period,
+        // leaving the chain closed and the schedule apparently complete. Only
+        // matching the tail to the last return catches it.
         let coupons = vec![coupon(date!(2026 - 02 - 15), date!(2026 - 08 - 15))];
         let repayments = vec![repayment(date!(2036 - 02 - 06), 100)];
         assert!(matches!(
@@ -166,11 +163,11 @@ mod tests {
         let repayments = vec![repayment(date!(2027 - 02 - 15), 100)];
         let outcome = validate_moex_profile(&coupons, &repayments);
         let Completeness::Incomplete { reason } = outcome else {
-            panic!("разрыв цепи обязан быть замечен: {outcome:?}");
+            panic!("period chain gap must be detected: {outcome:?}");
         };
         assert!(
             reason.contains("2026-09-15"),
-            "причина обязана назвать место: {reason}"
+            "reason must name the location: {reason}"
         );
     }
 
@@ -186,26 +183,25 @@ mod tests {
 
     #[test]
     fn an_issue_outside_the_profile_is_unknown_not_rejected() {
-        // Инварианты проверены на купонных выпусках с погашением.
-        // Бескупонные и бессрочные в выборку не попали, и отвергнуть их
-        // корректный график — такая же ошибка, как принять усечённый.
+        // Invariants were checked on coupon issues with redemption. Zero-coupon
+        // and perpetual issues were absent from the sample, and rejecting a
+        // valid schedule is as wrong as accepting a truncated one.
         assert_eq!(validate_moex_profile(&[], &[]), Completeness::Unknown);
     }
 
     #[test]
     fn coupons_without_any_repayment_are_unknown_not_incomplete() {
-        // Область применимости — купонный выпуск С погашением. Ряд
-        // купонов без единого возврата номинала за её пределами, и
-        // объявить его неполным значит отвергнуть корректный график
-        // бессрочного выпуска. Незнание — не нарушение.
+        // Applicability is a coupon issue WITH redemption. A coupon series
+        // without a principal return is outside it; declaring it incomplete
+        // would reject a valid perpetual issue. Unknown is not a violation.
         let coupons = vec![coupon(date!(2026 - 02 - 15), date!(2026 - 08 - 15))];
         assert_eq!(validate_moex_profile(&coupons, &[]), Completeness::Unknown);
     }
 
     #[test]
     fn repayments_without_any_coupon_are_unknown_too() {
-        // Бескупонный выпуск: возврат есть, купонов нет. Та же
-        // граница профиля с другой стороны.
+        // A zero-coupon issue has a return but no coupons: the same profile
+        // boundary from the other side.
         let repayments = vec![repayment(date!(2026 - 08 - 15), 100)];
         assert_eq!(
             validate_moex_profile(&[], &repayments),

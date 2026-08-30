@@ -1,61 +1,62 @@
-//! Вид операции, каким его назвал канал брокера.
+//! The operation kind named by a broker channel.
 //!
-//! Тип один на все каналы намеренно. Раньше `ChannelOperationKind` был
-//! объявлен дважды — у T-Invest и у Finam, — и два перечисления одного
-//! смысла расходятся молча: член, добавленный одному каналу, второму
-//! не мешает собираться, и разница обнаруживается не сборкой, а тем,
-//! что операция одного брокера превращается не в то, во что превратилась
-//! бы операция другого.
+//! One type is intentional across all channels. Previously,
+//! `ChannelOperationKind` was declared twice—once for T-Invest and once for
+//! Finam—and two enums with the same meaning could silently diverge: adding a
+//! member to one channel did not stop the other from compiling, and the
+//! difference surfaced not at build time but when one broker's operation was
+//! converted into something different from another broker's.
 //!
-//! **Это словарь смыслов, а не кодов брокера.** Коды у каждого канала
-//! свои, их множество открыто и меняется без нашего участия, поэтому
-//! соответствие «код источника → член этого перечисления» живёт
-//! в данных, а не в `match` (эпик iaam-d8b.2.2). Здесь перечислено
-//! то, что система умеет сделать с операцией, и новый член обязан
-//! сломать сборку везде, где разбор не полон (§15.1).
+//! **This is a vocabulary of meanings, not broker codes.** Each channel has
+//! its own open-ended set of codes that changes without our involvement, so
+//! the mapping “source code → enum member” lives in data, not in a `match`
+//! (epic iaam-d8b.2.2). This enum lists what the system can do with an
+//! operation, and every new member must break compilation wherever parsing is
+//! incomplete (§15.1).
 
-/// Что канал сообщил об операции.
+/// What the channel reported about the operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelOperationKind {
-    /// Покупка инструмента.
+    /// Instrument purchase.
     Buy,
-    /// Продажа инструмента.
+    /// Instrument sale.
     Sell,
-    /// Дивидендная выплата.
+    /// Dividend payment.
     Dividend,
-    /// Купонная выплата.
+    /// Coupon payment.
     Coupon,
-    /// Комиссия брокера или сервиса.
+    /// Broker or service fee.
     Commission,
-    /// Пополнение счёта.
+    /// Account deposit.
     Deposit,
-    /// Вывод денег или бумаг.
+    /// Withdrawal of money or securities.
     Withdrawal,
-    /// Перевод между счетами или депозитариями.
+    /// Transfer between accounts or custodians.
     Transfer,
-    /// Амортизация облигации: непогашенный номинал уменьшается, деньги
-    /// приходят, количество бумаг не меняется (§6.5).
+    /// Bond amortisation: outstanding principal decreases, cash arrives,
+    /// and the number of securities does not change (§6.5).
     ///
-    /// Отдельный член, а не доход: доход не уменьшает номинал, и учтённая
-    /// доходом амортизация завысила бы и доход, и стоимость позиции.
+    /// A separate member, not income: income does not reduce principal, and
+    /// treating amortisation as income would overstate both income and the
+    /// position's cost.
     BondAmortisation,
-    /// Окончательное погашение облигации: номинал возвращён целиком
-    /// и бумага выбывает.
+    /// Final bond redemption: principal is returned in full and the
+    /// security leaves the position.
     BondRedemption,
-    /// Вид, которого нет в словаре канала.
+    /// Kind absent from the channel dictionary.
     ///
-    /// Строка, а не отказ разбора: имя вида нужно назвать владельцу,
-    /// иначе отказ не говорит, чего именно система не знает.
+    /// A string, not a parse refusal: the owner needs the kind's name,
+    /// otherwise the refusal would not say what the system does not know.
     Other(String),
 }
 
 impl ChannelOperationKind {
-    /// Имя вида в словаре и в схеме.
+    /// Kind name in the dictionary and schema.
     ///
-    /// У `Other` имени нет намеренно: «вида не знаем» выражается
-    /// отсутствием строки в словаре, а не строкой с именем «прочее».
-    /// Записанное «прочее» означало бы решение не разбирать, а такого
-    /// решения не принимали.
+    /// `Other` intentionally has no name: “kind unknown” is expressed by
+    /// the absence of a dictionary entry, not by a string named “other”.
+    /// Recording “other” would mean deciding not to parse it, and no such
+    /// decision was made.
     #[must_use]
     pub const fn code(&self) -> Option<&'static str> {
         match self {
@@ -73,13 +74,12 @@ impl ChannelOperationKind {
         }
     }
 
-    /// Разбор имени из словаря.
+    /// Parse a dictionary name.
     ///
-    /// Неизвестное имя даёт `None`, а не `Other`: `Other` означает
-    /// «канал прислал код, которого нет в словаре», а здесь случилось
-    /// другое — в словаре лежит вид, которого не знает эта сборка.
-    /// Свести их в одно значило бы спрятать рассинхронизацию схемы
-    /// и кода за обычным неизвестным кодом брокера.
+    /// An unknown name returns `None`, not `Other`: `Other` means “the
+    /// channel sent a code absent from the dictionary”, while this means the
+    /// dictionary contains a kind unknown to this build. Merging them would
+    /// hide a schema/code mismatch behind an ordinary unknown broker code.
     #[must_use]
     pub fn parse(code: &str) -> Option<Self> {
         match code {
@@ -98,18 +98,17 @@ impl ChannelOperationKind {
     }
 }
 
-/// Словарь одного канала: как его коды превращаются в виды операций.
+/// One channel's dictionary: how its codes become operation kinds.
 ///
-/// Строится из данных хранилища и передаётся в разбор параметром.
-/// Крейта брокера про хранилище не знает намеренно (см. `lib.rs`),
-/// поэтому связывает их адаптер приложения — тем же приёмом, что уже
-/// сделан для SQLite.
+/// Built from storage data and passed to the parser as a parameter. The broker
+/// crate intentionally knows nothing about storage (see `lib.rs`), so the
+/// application adapter connects them using the same approach as SQLite.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OperationKindDictionary {
     entries: std::collections::BTreeMap<String, ChannelOperationKind>,
 }
 
-/// Строка словаря, которую эта сборка прочитать не смогла.
+/// A dictionary row that this build could not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadableEntry {
     pub source_kind: String,
@@ -117,12 +116,12 @@ pub struct UnreadableEntry {
 }
 
 impl OperationKindDictionary {
-    /// Собирает словарь из пар «код канала → имя вида».
+    /// Build a dictionary from “channel code → kind name” pairs.
     ///
-    /// Непрочитанные строки возвращаются рядом со словарём, а не
-    /// отбрасываются: строка, которую сборка не понимает, означает, что
-    /// база новее кода, и молчание об этом превратило бы известный код
-    /// брокера в неизвестный — то есть в отказ импорта без объяснения.
+    /// Unreadable rows are returned alongside the dictionary rather than
+    /// discarded: a row the build cannot understand means the database is
+    /// newer than the code. Silently ignoring it would turn a known broker
+    /// code into an unknown one—an import refusal with no explanation.
     #[must_use]
     pub fn build<I, K, V>(rows: I) -> (Self, Vec<UnreadableEntry>)
     where
@@ -147,10 +146,10 @@ impl OperationKindDictionary {
         (Self { entries }, unreadable)
     }
 
-    /// Во что канал превратил свой код.
+    /// What the channel turned its code into.
     ///
-    /// Кода нет в словаре — это `Other` с самим кодом внутри: отказ
-    /// обязан назвать, чего именно система не знает.
+    /// A code absent from the dictionary becomes `Other` containing the code:
+    /// the refusal must name what the system does not know.
     #[must_use]
     pub fn kind_of(&self, source_kind: &str) -> ChannelOperationKind {
         self.entries
@@ -159,28 +158,29 @@ impl OperationKindDictionary {
             .unwrap_or_else(|| ChannelOperationKind::Other(source_kind.to_owned()))
     }
 
-    /// Сколько кодов знает словарь.
+    /// Number of codes known to the dictionary.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Пуст ли словарь.
+    /// Whether the dictionary is empty.
     ///
-    /// Пустой словарь — не «брокер прислал непонятное», а «словарь
-    /// не заведён»: различать их обязан вызывающий, иначе владелец
-    /// получит отказ про брокера вместо отказа про настройку.
+    /// An empty dictionary does not mean “the broker sent something unknown”;
+    /// it means “the dictionary was not seeded”. The caller must distinguish
+    /// them, otherwise the owner gets a broker refusal instead of a
+    /// configuration refusal.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
 
-/// Начальный словарь канала по коду брокера.
+/// Initial channel dictionary selected by broker code.
 ///
-/// Возвращает `None` для брокера, о котором знания нет: пустая таблица
-/// означала бы «у этого канала видов операций не бывает», а это другое
-/// утверждение, и заведение доступа приняло бы его молча.
+/// Returns `None` for a broker about which there is no knowledge: an empty
+/// table would mean “this channel has no operation kinds”, which is a
+/// different claim, and access setup would accept it silently.
 #[must_use]
 pub fn seed_for(broker: &str) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
     match broker {

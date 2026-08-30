@@ -1,15 +1,15 @@
-//! Доменные типы графика выплат (§2.1 спеки E3.4).
+//! Domain types for a payment schedule (§2.1 of E3.4).
 //!
-//! Разрез идёт по роли строки в расчёте, а не по колонкам источника.
-//! `CouponPeriod` даёт поток и базу не двигает; `PrincipalRepayment` даёт
-//! поток и уменьшает непогашенный номинал; `OfferWindow` потока не даёт
-//! вовсе — он даёт опцию. Общая таблица с видом строки заставила бы
-//! каждого потребителя ветвиться по виду, то есть вернула бы тот `match`,
-//! который вынесен из разборщика в словарь базы (миграция 0009).
+//! The split follows each row's role in calculation, not source columns.
+//! `CouponPeriod` supplies cashflow without moving basis; `PrincipalRepayment`
+//! supplies cashflow and reduces outstanding principal; `OfferWindow` supplies
+//! no cashflow at all—it supplies an option. One table with a row-kind field
+//! would force every consumer to branch on kind, reintroducing the `match`
+//! moved from parsing into the database dictionary (migration 0009).
 //!
-//! Ни один тип здесь не толкует коды источника: вид возврата номинала и
-//! вид права по оферте хранятся так, как их назвал источник, и переводятся
-//! словарём на границе приложения (§2.5).
+//! No type here interprets source codes: principal-return kind and offer-right
+//! kind are stored as named by the source and translated by the dictionary at
+//! the application boundary (§2.5).
 
 pub mod completeness;
 pub mod terms;
@@ -22,12 +22,11 @@ use time::Date;
 
 use crate::observation::ObservedAt;
 
-/// Знание об атрибуте: известен или неизвестен.
+/// Knowledge of an attribute: known or unknown.
 ///
-/// Отдельный тип, а не `Option`, намеренно: `Option` соблазняет на
-/// `unwrap_or_default`, а подставленная по умолчанию база начисления дней
-/// даёт правдоподобно неверный НКД, которого не покажет ни один тест на
-/// бумаге с целым числом периодов.
+/// A separate type rather than `Option` is intentional: `Option` invites
+/// `unwrap_or_default`, and a default day-count basis produces plausible but
+/// wrong accrued interest that no test using whole periods will expose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Knowledge<T> {
     Known(T),
@@ -35,9 +34,10 @@ pub enum Knowledge<T> {
 }
 
 impl<T> Knowledge<T> {
-    /// Известное значение, если оно есть.
+    /// Known value, if present.
     ///
-    /// Существует ради чтения; значения по умолчанию тут нет и не будет.
+    /// This exists for reading; there is no default value here and there never
+    /// will be one.
     pub const fn known(&self) -> Option<&T> {
         match self {
             Self::Known(value) => Some(value),
@@ -46,80 +46,80 @@ impl<T> Knowledge<T> {
     }
 }
 
-/// Что известно о выплате за купонный период (§2.3).
+/// What is known about payment for a coupon period (§2.3).
 ///
-/// Ноль — присутствующее числовое значение, отсутствие — его отрицание.
-/// Подмена одного другим занижает и полученный поток, и YTM, и делает это
-/// правдоподобно. Статус **не выводится из даты**: у проверенного флоатера
-/// купон 2020 года пришёл без суммы и без ставки.
+/// Zero is a present numeric value; absence is its negation. Substituting one
+/// for the other understates both the resulting cashflow and YTM, plausibly.
+/// Status is **not derived from dates**: a checked floating-rate issue had a
+/// 2020 coupon with neither amount nor rate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CouponAmount {
-    /// Сумма на единицу первоначального номинала и её валюта известны.
+    /// Amount per unit of initial principal and its currency are known.
     AmountFixed {
         per_unit: Dec,
         currency: CurrencyCode,
     },
-    /// Ставка известна, сумма ещё нет.
+    /// Rate is known; amount is not yet determined.
     RateFixedAmountUndetermined { rate_percent: Dec },
-    /// Ни того, ни другого.
+    /// Neither is known.
     Undetermined,
 }
 
-/// Начисление дохода за купонный период.
+/// Income accrual for a coupon period.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CouponPeriod {
-    /// Начало периода. Эмитент его не двигает — в отличие от даты платежа.
+    /// Period start. The issuer does not move it, unlike payment date.
     pub period_start: Date,
-    /// Конец начисления. НКД считается по нему.
+    /// Accrual end. Accrued interest is calculated against it.
     pub accrual_end: Date,
-    /// Дата платежа. Двигается переносом с выходного и правкой эмитента.
+    /// Payment date. It moves when a weekend is shifted or the issuer revises it.
     pub payment_date: Date,
-    /// Дата фиксации права. Источник её сообщает не всегда.
+    /// Date on which entitlement is fixed. The source does not always report it.
     pub record_date: Knowledge<Date>,
     pub amount: CouponAmount,
-    /// Собственный идентификатор записи у источника.
+    /// Source's own entry identifier.
     ///
-    /// `Option`, потому что у MOEX его нет вовсе (§2.11). Отсутствие —
-    /// нормальное состояние, а не пустое обязательное поле.
+    /// `Option` because MOEX has none at all (§2.11). Absence is normal, not
+    /// an empty required field.
     pub source_entry_id: Option<String>,
 }
 
-/// Возврат части номинала на дату.
+/// Partial principal return on a date.
 ///
-/// Окончательность возврата здесь **не хранится**: она выводится из
-/// накопленной суммы долей (§2.1). Кода окончательности у источника может
-/// не быть вовсе, а вывод, записанный наблюдением, запрещён ADR-0002.
+/// Return finality is **not stored** here: it is derived from the accumulated
+/// share total (§2.1). The source may have no finality code, and a conclusion
+/// recorded as an observation is forbidden by ADR-0002.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalRepayment {
     pub repayment_date: Date,
-    /// Доля **первоначального** номинала, в процентах.
+    /// Share of **initial** principal, as a percentage.
     pub share_percent: Dec,
-    /// Как вид назвал источник. Здесь не толкуется.
+    /// Kind as named by the source. Not interpreted here.
     pub source_kind: String,
     pub source_entry_id: Option<String>,
 }
 
-/// Право предъявления к выкупу в окне.
+/// Right to submit for redemption during a window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferWindow {
     pub execution_date: Date,
     pub submission_start: Knowledge<Date>,
     pub submission_end: Knowledge<Date>,
-    /// Цена выкупа в процентах номинала.
+    /// Redemption price as a percentage of principal.
     pub price_percent: Knowledge<Dec>,
     pub agent: Knowledge<String>,
-    /// Как вид права назвал источник. У MOEX это свободный русский текст.
+    /// Right kind as named by the source. MOEX uses free Russian text here.
     pub source_kind: String,
     pub source_entry_id: Option<String>,
 }
 
-/// Снимок графика выпуска целиком — единица наблюдения (§2.2).
+/// Complete schedule snapshot for an issue—the observation unit (§2.2).
 ///
-/// Единицей служит снимок, а не строка, потому что построчная модель не
-/// умеет выразить **исчезновение** строки: отсутствие новой версии по
-/// старой координате неотличимо от «источник не присылал обновлений», и
-/// отменённая амортизация остаётся рядом с новым графиком. Стабильного
-/// идентификатора, которым эту беду обычно чинят, источник не даёт.
+/// The unit is a snapshot, not a row, because a row model cannot express a
+/// **disappearance**: no new version at an old coordinate is indistinguishable
+/// from “the source sent no updates”, leaving a cancelled amortisation beside
+/// the new schedule. The source provides no stable identifier with which to
+/// repair that problem.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleSnapshot {
     pub instrument: InstrumentId,
@@ -137,9 +137,9 @@ mod tests {
 
     #[test]
     fn a_coupon_period_keeps_accrual_end_and_payment_date_apart() {
-        // Перенос выплаты с выходного двигает дату платежа, но не конец
-        // начисления. Одно поле на оба смысла теряет перенос молча, а НКД
-        // считается по концу начисления.
+        // Shifting payment from a weekend moves payment date, not accrual end.
+        // One field for both meanings would silently lose the shift, while
+        // accrued interest is calculated from accrual end.
         let period = CouponPeriod {
             period_start: date!(2026 - 02 - 15),
             accrual_end: date!(2026 - 08 - 15),
@@ -153,9 +153,9 @@ mod tests {
 
     #[test]
     fn a_repayment_carries_a_share_not_an_amount() {
-        // Сумма зависит от остатка номинала, а остаток выводится из
-        // первоначального и ряда возвратов. Хранить сумму значило бы
-        // завести второй источник истины рядом с выводом.
+        // Amount depends on outstanding principal, which is derived from the
+        // initial principal and the return series. Storing amount would create
+        // a second source of truth beside that derivation.
         let repayment = PrincipalRepayment {
             repayment_date: date!(2034 - 08 - 09),
             share_percent: Dec::new(Decimal::from(25)),
@@ -167,8 +167,9 @@ mod tests {
 
     #[test]
     fn an_offer_window_without_dates_is_unknown_not_absent() {
-        // Источник массово отдаёт окна без дат подачи и без цены.
-        // Пустое окно — незнание условий, а не заявление, что окна нет.
+        // The source commonly returns windows without submission dates or a
+        // price. An empty window means the terms are unknown, not that no
+        // window exists.
         let window = OfferWindow {
             execution_date: date!(2027 - 08 - 26),
             submission_start: Knowledge::Unknown,

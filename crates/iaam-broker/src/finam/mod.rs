@@ -1,8 +1,8 @@
-//! Независимый разбор и HTTP-доступ к Finam Trade API.
+//! Independent parsing and HTTP access for the Finam Trade API.
 //!
-//! Клиент возвращает сырое тело ответа, а смысл полей и точные доменные
-//! величины живут в `parse`; это не даёт транспортному слою стать вторым
-//! парсером канала.
+//! The client returns raw response bodies, while field meanings and exact
+//! domain values live in `parse`; this keeps the transport layer from becoming
+//! a second channel parser.
 
 mod client;
 pub mod dictionary_seed;

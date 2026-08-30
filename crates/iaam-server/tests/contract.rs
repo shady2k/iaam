@@ -12,7 +12,6 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use ciborium::value::Value as CborValue;
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
@@ -33,16 +32,14 @@ use iaam_core::event::kind::{DateCertainty, EventKind};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
-use iaam_core::money::{CurrencyCode, PerUnitAmount};
+use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::approx::SolverPolicy;
-use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
-use iaam_core::projection::{ProjectionContext, Snapshot, project};
+use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
 use iaam_core::returns::{
     KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
 };
-use iaam_core::rules::lot_disposal::PrincipalState;
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable};
 use iaam_server::auth::hash_token;
@@ -55,7 +52,6 @@ use iaam_store::schedule::{
     CouponPeriodRow, IssueTermsRow, OfferWindowRow, PrincipalRepaymentRow, ScheduleSnapshotRow,
 };
 use serde_json::{Value, json};
-use std::io::Cursor;
 use std::time::Duration;
 use time::macros::date;
 use time::{Date, Duration as TimeDuration, OffsetDateTime};
@@ -667,84 +663,6 @@ async fn seed_bond_market(harness: &Harness) {
         .expect("условия выпуска");
 }
 
-fn replace_unknown_principal(value: &mut CborValue, known: &CborValue) -> usize {
-    match value {
-        CborValue::Map(entries) => {
-            let mut replaced = 0;
-            for (key, value) in entries {
-                let is_principal = matches!(key, CborValue::Text(name) if name == "principal");
-                if is_principal && matches!(value, CborValue::Text(name) if name == "Unknown") {
-                    *value = known.clone();
-                    replaced += 1;
-                } else {
-                    replaced += replace_unknown_principal(value, known);
-                }
-            }
-            replaced
-        }
-        CborValue::Array(values) => values
-            .iter_mut()
-            .map(|value| replace_unknown_principal(value, known))
-            .sum(),
-        CborValue::Tag(_, value) => replace_unknown_principal(value, known),
-        _ => 0,
-    }
-}
-
-fn install_known_principal_snapshot(
-    path: &std::path::Path,
-    owner: OwnerId,
-    account: AccountId,
-    contour_id: Uuid,
-) {
-    let store = SqliteStore::open(path).expect("второе соединение для снимка");
-    let events = store
-        .load_events_through(owner, Date::MAX)
-        .expect("события позиции");
-    let contour = ContourDefinition::new(ContourId(contour_id), ContourVersion(1), [account]);
-    let rules = RuleRegistry::with_defaults();
-    let context = ProjectionContext {
-        contour: &contour,
-        rules: &rules,
-        lot_rule: LotRuleVersion(1),
-    };
-    let projection = project(&events, &context).expect("проекция позиции");
-
-    let principal = PrincipalState::known(
-        PerUnitAmount::new(
-            Dec::new("1000".parse().expect("номинал")),
-            CurrencyCode::Rub,
-        ),
-        PerUnitAmount::new(
-            Dec::new("1000".parse().expect("остаток номинала")),
-            CurrencyCode::Rub,
-        ),
-    )
-    .expect("известный номинал");
-    let mut encoded_principal = Vec::new();
-    ciborium::ser::into_writer(&principal, &mut encoded_principal).expect("кодирование номинала");
-    let known: CborValue =
-        ciborium::de::from_reader(Cursor::new(encoded_principal)).expect("разбор номинала");
-
-    let mut encoded_state = Vec::new();
-    ciborium::ser::into_writer(projection.snapshot().state(), &mut encoded_state)
-        .expect("кодирование состояния");
-    let mut state_value: CborValue =
-        ciborium::de::from_reader(Cursor::new(encoded_state)).expect("разбор состояния");
-    let replaced = replace_unknown_principal(&mut state_value, &known);
-    assert_eq!(replaced, 1, "только лот тестовой облигации требует номинал");
-    let mut patched_state_bytes = Vec::new();
-    ciborium::ser::into_writer(&state_value, &mut patched_state_bytes)
-        .expect("кодирование исправленного состояния");
-    let mut parts = projection.snapshot().clone().into_parts();
-    parts.state = ciborium::de::from_reader(Cursor::new(patched_state_bytes))
-        .expect("исправленное состояние");
-    parts.fingerprint = parts.state.fingerprint();
-    store
-        .save_snapshot(owner, &Snapshot::restore(parts))
-        .expect("снимок с известным номиналом");
-}
-
 async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = router
         .clone()
@@ -1354,12 +1272,6 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
             .iter()
             .all(|verdict| verdict["verdict"] == "provisional"),
         "{verdicts}"
-    );
-    install_known_principal_snapshot(
-        &path,
-        harness.owner,
-        harness.account,
-        contour_id.parse().expect("идентификатор контура"),
     );
 
     let (status, report) = call(

@@ -18,6 +18,8 @@ pub mod operation;
 pub mod report;
 pub mod verdict;
 
-pub use journal_event::{JournalFact, SubmittedJournalEvent, normalize_journal_event};
+pub use journal_event::{
+    JournalEventEnrichment, JournalFact, SubmittedJournalEvent, normalize_journal_event,
+};
 pub use operation::{Normalized, OperationDates, OperationKind, SubmittedOperation, normalize};
 pub use verdict::{Rejection, Verdict};

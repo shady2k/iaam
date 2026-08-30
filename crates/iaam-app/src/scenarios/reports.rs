@@ -139,7 +139,7 @@ pub async fn returns(
         &reconciliation_events,
     )
 }
-const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
+pub(crate) const MOEX_ISS_SOURCE_ID: &str = "moex-iss";
 
 struct ReportMarketInputs {
     candidates: Vec<PriceCandidate>,

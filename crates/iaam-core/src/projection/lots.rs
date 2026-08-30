@@ -18,11 +18,12 @@ use thiserror::Error;
 
 use crate::dates::TradeDate;
 use crate::event::Event;
+use crate::event::allocation::BasisAllocation;
 use crate::event::corporate_action::{BasisTransferRule, CorporateAction};
 use crate::event::kind::{DateCertainty, EventKind, IncomeKind, TradeSide};
 use crate::event::offer::OfferExerciseAction;
 use crate::ids::{AccountId, EventId, InstrumentId};
-use crate::money::{Money, MoneyError, PerUnitAmount, Quantity};
+use crate::money::{Money, MoneyError, Quantity};
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 use crate::rules::amortisation::{AmortisationError, AmortisationRuleVersion};
@@ -74,10 +75,10 @@ pub enum LotError {
 pub enum BasisGap {
     /// Позиция восстановлена без документированной стоимости (§10.7).
     RestoredWithoutBasis,
-    /// Номинал бумаги неизвестен, поэтому долю возвращённой при
+    /// Доля разнесения неизвестна, поэтому долю возвращённой при
     /// амортизации стоимости считать не от чего (§4.9). Факт применён,
     /// реализованный результат — невычислим.
-    PrincipalUnknown,
+    AmortisationAllocationUnknown,
 }
 
 impl BasisGap {
@@ -85,7 +86,7 @@ impl BasisGap {
     pub const fn code(self) -> &'static str {
         match self {
             Self::RestoredWithoutBasis => "restored_without_basis",
-            Self::PrincipalUnknown => "principal_unknown",
+            Self::AmortisationAllocationUnknown => "amortisation_allocation_unknown",
         }
     }
 }
@@ -518,11 +519,11 @@ struct TradeFacts {
 }
 
 /// Факты амортизации, нужные книге лотов.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct AmortisationFacts {
     instrument: InstrumentId,
     quantity: Quantity,
-    returned_per_unit: PerUnitAmount,
+    allocation: BasisAllocation,
     compensation: Money,
 }
 /// Факты замещения, нужные книге лотов.
@@ -839,7 +840,7 @@ impl LotBook {
             CorporateAction::PartialRedemption {
                 instrument,
                 quantity,
-                principal_returned_per_unit,
+                basis_allocation,
                 compensation,
                 ..
             } => self.apply_amortisation(
@@ -847,7 +848,7 @@ impl LotBook {
                 AmortisationFacts {
                     instrument: *instrument,
                     quantity: *quantity,
-                    returned_per_unit: *principal_returned_per_unit,
+                    allocation: basis_allocation.clone(),
                     compensation: *compensation,
                 },
                 rules,
@@ -985,25 +986,23 @@ impl LotBook {
         // факта хуже неприменённого.
         let mut next = entry.clone();
         let mut returned_total = Money::zero(facts.compensation.currency());
-        let mut principal_unknown = false;
-        for lot in next.lots_mut() {
-            match rule.basis_returned(lot, facts.returned_per_unit) {
-                Ok(returned) => {
+        match facts.allocation {
+            BasisAllocation::Known { share, .. } => {
+                for lot in next.lots_mut() {
+                    let returned = rule.basis_returned(lot, share)?;
                     lot.cost_basis = lot.cost_basis.try_sub(returned)?;
                     returned_total = returned_total.try_add(returned)?;
-                    lot.principal = lot.principal.reduced_by(facts.returned_per_unit)?;
                 }
-                // Номинал неизвестен — факт всё равно применяется,
-                // а реализованный результат становится невычислимым
-                // (§4.9). Уменьшать нечего: остаток и был неизвестен.
-                Err(AmortisationError::UnknownPrincipal) => principal_unknown = true,
-                Err(other) => return Err(other.into()),
+            }
+            // Доля неизвестна — факт всё равно применяется, а
+            // реализованный результат становится невычислимым (§4.9).
+            // Разносить было не по чему, а отказать в приёме факта
+            // нельзя: деньги пришли.
+            BasisAllocation::Unknown(_) => {
+                next.mark_basis_gap(BasisGap::AmortisationAllocationUnknown);
             }
         }
         next.add_received(facts.compensation)?;
-        if principal_unknown {
-            next.mark_basis_gap(BasisGap::PrincipalUnknown);
-        }
         if !returned_total.is_zero() {
             next.add_released_basis(returned_total)?;
         }
@@ -1261,6 +1260,7 @@ mod tests {
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
     use crate::ids::CustodyId;
+    use crate::money::PerUnitAmount;
     use crate::money::{CurrencyCode, PostedMinor};
     use crate::numeric::decimal::Dec;
     use crate::rules::RuleRegistry;
@@ -1296,6 +1296,22 @@ mod tests {
         instrument: InstrumentId,
         custody: CustodyId,
     }
+    fn known_allocation(returned: &str) -> BasisAllocation {
+        BasisAllocation::Known {
+            share: crate::rules::ReturnedShare::new(
+                dec(returned)
+                    .checked_div(dec("1000"))
+                    .expect("номинал тестовой облигации ненулевой"),
+            )
+            .expect("доля в пределах инварианта"),
+            evidence: crate::event::allocation::AllocationEvidence {
+                inputs_hash: crate::event::allocation::AllocationInputsHash::new("a".repeat(64))
+                    .expect("хеш входов"),
+                knowledge_as_of: time::OffsetDateTime::UNIX_EPOCH,
+                algorithm_version: crate::event::allocation::AllocationAlgorithmVersion(1),
+            },
+        }
+    }
 
     impl Bond {
         fn new() -> Self {
@@ -1314,6 +1330,30 @@ mod tests {
         }
 
         fn amortisation(&self, units: i64, returned: &str, compensation: i64) -> Event {
+            self.amortisation_with_allocation(
+                units,
+                returned,
+                compensation,
+                known_allocation(returned),
+            )
+        }
+
+        fn unknown_amortisation(&self, units: i64, returned: &str, compensation: i64) -> Event {
+            self.amortisation_with_allocation(
+                units,
+                returned,
+                compensation,
+                BasisAllocation::default(),
+            )
+        }
+
+        fn amortisation_with_allocation(
+            &self,
+            units: i64,
+            returned: &str,
+            compensation: i64,
+            basis_allocation: BasisAllocation,
+        ) -> Event {
             event_with(
                 self.account,
                 date!(2026 - 06 - 15),
@@ -1328,7 +1368,7 @@ mod tests {
                         effective_date: date!(2026 - 06 - 15),
                         record_date: None,
                         grounds: None,
-                        basis_allocation: crate::event::allocation::BasisAllocation::default(),
+                        basis_allocation,
                     },
                 },
                 vec![Leg::principal(
@@ -1516,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn amortisation_reduces_principal_and_leaves_the_quantity_alone() {
+    fn amortisation_leaves_the_quantity_alone() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
         let mut book = book_with_lots(
@@ -1529,7 +1569,6 @@ mod tests {
 
         let entry = book.entry(&bond.key()).unwrap();
         assert_eq!(entry.quantity().unwrap(), qty(10));
-        assert_eq!(remaining_principal(entry), Some(per_unit("800")));
     }
 
     #[test]
@@ -1613,49 +1652,23 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_principal_records_a_basis_gap_instead_of_failing() {
+    fn an_unknown_allocation_records_a_basis_gap_instead_of_failing() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
         let mut book = book_with_lots(
             &bond,
-            vec![bond_lot(&bond, 10, PrincipalState::Unknown, 1_000_000)],
+            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
         );
 
-        book.apply(&bond.amortisation(10, "200", 200_000), &rules)
+        book.apply(&bond.unknown_amortisation(10, "200", 200_000), &rules)
             .unwrap();
 
         let entry = book.entry(&bond.key()).unwrap();
-        assert_eq!(entry.gap(), Some(BasisGap::PrincipalUnknown));
+        assert_eq!(entry.gap(), Some(BasisGap::AmortisationAllocationUnknown));
         assert_eq!(entry.realized(), None);
         // Количество и стоимость не тронуты: считать было не от чего.
         assert_eq!(entry.quantity().unwrap(), qty(10));
         assert_eq!(entry.remaining_basis().unwrap(), Some(rub(1_000_000)));
-    }
-
-    #[test]
-    fn a_failure_on_the_second_lot_leaves_the_first_untouched() {
-        // Половина применённого факта хуже неприменённого.
-        let bond = Bond::new();
-        let rules = RuleRegistry::with_defaults();
-        let usd_principal = PrincipalState::known(
-            PerUnitAmount::new(dec("1000"), CurrencyCode::Usd),
-            PerUnitAmount::new(dec("1000"), CurrencyCode::Usd),
-        )
-        .unwrap();
-        let mut book = book_with_lots(
-            &bond,
-            vec![
-                bond_lot(&bond, 10, known("1000", "1000"), 1_000_000),
-                bond_lot(&bond, 10, usd_principal, 1_000_000),
-            ],
-        );
-        let before = book.clone();
-
-        assert!(
-            book.apply(&bond.amortisation(20, "200", 400_000), &rules)
-                .is_err()
-        );
-        assert_eq!(book, before);
     }
 
     #[test]
@@ -1680,25 +1693,6 @@ mod tests {
         assert_eq!(
             remaining_principal(book.entry(&bond.key()).unwrap()),
             Some(per_unit("1000"))
-        );
-    }
-
-    #[test]
-    fn the_projection_uses_the_actual_payment_not_the_announced_schedule() {
-        // Фактическая выплата меньше объявленной: берётся факт.
-        let bond = Bond::new();
-        let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
-
-        book.apply(&bond.amortisation(10, "150", 150_000), &rules)
-            .unwrap();
-
-        assert_eq!(
-            remaining_principal(book.entry(&bond.key()).unwrap()),
-            Some(per_unit("850"))
         );
     }
 

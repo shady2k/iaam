@@ -7,6 +7,7 @@
 //!
 //! Снимки и кэш хранит **оболочка**: ядро остаётся без состояния.
 
+pub mod active_instruments;
 pub mod balances;
 pub mod flows;
 pub mod income;
@@ -15,6 +16,8 @@ pub mod lots;
 pub mod offers;
 pub mod ownership;
 pub mod state;
+
+pub use active_instruments::active_instruments;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

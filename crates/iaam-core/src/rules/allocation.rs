@@ -5,6 +5,7 @@
 //! координату знания, затем передаёт готовое значение в чистый
 //! нормализатор `iaam-ingest`.
 
+use std::cmp::Ordering;
 use std::fmt::Write as _;
 
 use crate::bond::{BondSchedule, PrincipalReturn, ScheduleCompleteness};
@@ -52,12 +53,10 @@ pub fn resolve_basis_allocation(
         if !item.share_percent.is_positive() {
             return BasisAllocation::Unknown(AllocationGap::InvalidPrefix);
         }
-        let target = if item.repayment_date == on {
-            &mut scheduled_on_date
-        } else if item.repayment_date < on {
-            &mut repaid_before
-        } else {
-            continue;
+        let target = match item.repayment_date.cmp(&on) {
+            Ordering::Equal => &mut scheduled_on_date,
+            Ordering::Less => &mut repaid_before,
+            Ordering::Greater => continue,
         };
         match target.checked_add(item.share_percent) {
             Ok(sum) => *target = sum,

@@ -4,15 +4,12 @@
 //! вид работы — синхронизация рынка. Сама политика запуска чистая и потому
 //! проверяется без сна, сети и фоновых потоков.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use iaam_core::event::Event;
-use iaam_core::event::corporate_action::CorporateAction;
-use iaam_core::event::kind::{EventKind, TradeSide};
-use iaam_core::event::offer::OfferExerciseAction;
+use iaam_core::event::kind::EventKind;
 use iaam_core::ids::InstrumentId;
-use iaam_core::numeric::decimal::Dec;
+use iaam_core::projection::active_instruments;
 use time::{Date, Duration, OffsetDateTime, Time};
 
 use crate::AppServices;
@@ -145,95 +142,6 @@ impl ScheduleState {
     pub const fn last_run(self) -> Option<Date> {
         self.last_run
     }
-}
-
-/// Смена знака количества. `i64::MIN`-подобного случая у `Dec` нет,
-/// но отказ отрицания молча оставил бы количество прежним, поэтому
-/// он вынесен в одно место.
-fn negated(quantity: Dec) -> Dec {
-    quantity.checked_neg().unwrap_or(quantity)
-}
-
-/// Инструменты, у которых итоговое количество не равно нулю.
-///
-/// Это чистая проекция только для выбора расписания. Отчётная проекция
-/// остаётся в `iaam-core`; здесь не создаётся второй источник чисел.
-#[must_use]
-pub fn active_instruments(events: &[Event]) -> BTreeSet<InstrumentId> {
-    let mut quantities = BTreeMap::<InstrumentId, Dec>::new();
-    for event in events {
-        // Список пар, а не одна пара: замещение двигает количество сразу
-        // по двум бумагам, и свести его к одной значило бы оставить
-        // предшественника вечно активным.
-        let deltas: Vec<(InstrumentId, Dec)> = match &event.kind {
-            EventKind::Trade {
-                side,
-                instrument,
-                quantity,
-                ..
-            } => vec![(
-                *instrument,
-                match side {
-                    TradeSide::Buy => quantity.0,
-                    TradeSide::Sell => negated(quantity.0),
-                },
-            )],
-            EventKind::OpeningPosition {
-                instrument,
-                quantity,
-                ..
-            } => vec![(*instrument, quantity.0)],
-            EventKind::CorporateAction { action } => match action {
-                // Амортизация выплачивает деньги, но количество бумаг
-                // не меняет (§6.5): нулевая дельта, а не пропуск.
-                CorporateAction::PartialRedemption { instrument, .. } => {
-                    vec![(*instrument, Dec::zero())]
-                }
-                CorporateAction::Redemption {
-                    instrument,
-                    quantity,
-                    ..
-                } => vec![(*instrument, negated(quantity.0))],
-                CorporateAction::Conversion {
-                    predecessor,
-                    successor,
-                    quantity_in,
-                    quantity_out,
-                    ..
-                } => vec![
-                    (*predecessor, negated(quantity_in.0)),
-                    (*successor, quantity_out.0),
-                ],
-            },
-            EventKind::OfferExercise { action } => match action {
-                // Подача и отзыв заявки бумаг не двигают.
-                OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {
-                    Vec::new()
-                }
-                OfferExerciseAction::Settled {
-                    instrument,
-                    quantity,
-                    ..
-                } => vec![(*instrument, negated(quantity.0))],
-            },
-            EventKind::CashIn { .. }
-            | EventKind::CashOut { .. }
-            | EventKind::CashTransfer { .. }
-            | EventKind::Income { .. }
-            | EventKind::Fee { .. }
-            | EventKind::OpeningCash { .. }
-            | EventKind::Valuation { .. }
-            | EventKind::ControlAssertion { .. } => Vec::new(),
-        };
-        for (instrument, delta) in deltas {
-            let current = quantities.entry(instrument).or_insert_with(Dec::zero);
-            *current = current.checked_add(delta).unwrap_or(*current);
-        }
-    }
-    quantities
-        .into_iter()
-        .filter_map(|(instrument, quantity)| (!quantity.is_zero()).then_some(instrument))
-        .collect()
 }
 
 /// Первая дата события инструмента, либо первая дата журнала для общих рядов.
@@ -509,11 +417,15 @@ mod tests {
     use time::{OffsetDateTime, Time, UtcOffset};
 
     use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::event::kind::{EventKind, TradeSide};
     use iaam_core::event::leg::Leg;
+    use iaam_core::event::offer::OfferExerciseAction;
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
     use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
     use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId, SourceId};
     use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use iaam_core::numeric::decimal::Dec;
     use rust_decimal::Decimal;
 
     fn qty(n: i64) -> Quantity {

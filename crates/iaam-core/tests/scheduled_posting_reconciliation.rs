@@ -14,15 +14,14 @@
 //!
 //! ## Про номинал
 //!
-//! `apply_trade` и восстановление позиции номинал лоту не ставят —
-//! он остаётся `PrincipalState::Unknown` (известная дыра `iaam-d8b.15`).
-//! Прошлое для сверки теперь строится прямо из графика
-//! (`historical_schedule_postings`), поэтому неизвестный номинал не должен
-//! молча отключать сверку. Остальные тесты получают подменённый номинал
-//! только для того, чтобы сделать вычислимой независимую проверку метрик
-//! позиции; последний тест закрепляет, что сама сверка без него работает.
-//! Что именно пропущенный купон всё равно называется, доказывает
-//! `without_the_face_value_the_reconciliation_still_runs`.
+//! Номинал больше не свойство партии: он приезжает из графика выпуска.
+//! Прежний хелпер подменял его прямо в CBOR-снимке состояния — приём,
+//! которым вся линия E3.4 годами проверялась на данных, каких рабочий
+//! код не видит. Хелпер снесён вместе с `Lot.principal` (T8).
+//!
+//! Пока графики здешних сценариев `initial_principal` не несут, и семь
+//! тестов файла падают с `PrincipalUnknown`. Чинит это T13, задавая
+//! номинал в графике — обычным путём, а не подменой состояния.
 
 use std::collections::BTreeMap;
 
@@ -41,14 +40,12 @@ use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity
 use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterAssessment, PerimeterPolicy};
-use iaam_core::projection::state::LedgerState;
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::returns::{
     Computed, KnowledgeCoordinate, MaterialIssue, ReturnsReport, ReturnsRequest,
     UnverifiableReason, returns_report,
 };
-use iaam_core::rules::lot_disposal::PrincipalState;
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{
     PriceCandidate, PriceKind, PriceOrigin, QuotationBasis, SourceExecutability, Venue,
@@ -68,10 +65,6 @@ const ДЕПОЗИТАРИЙ: CustodyId = CustodyId(Uuid::from_u128(4));
 const ДРУГОЙ_ДЕПОЗИТАРИЙ: CustodyId = CustodyId(Uuid::from_u128(5));
 const ИСТОЧНИК: SourceId = SourceId(Uuid::from_u128(6));
 
-/// Номинал одной бумаги. Тот же у всех партий: разные номиналы делают
-/// остаточный номинал позиции неоднозначным, и отчёт отказался бы
-/// строить поток по другой причине, чем проверяет тест.
-const НОМИНАЛ: &str = "1000";
 /// Количество бумаг в одной покупке.
 const КОЛИЧЕСТВО: &str = "10";
 /// Дата отчёта по умолчанию.
@@ -310,9 +303,6 @@ struct Сценарий<'a> {
     события: &'a [Event],
     график: &'a BondSchedule,
     дата_отчёта: Date,
-    /// `None` сохраняет неизвестный номинал лотов; он нужен только
-    /// тесту, который доказывает независимость сверки от номинала.
-    номинал: Option<&'a str>,
 }
 
 fn отчёт(сценарий: &Сценарий<'_>) -> ReturnsReport {
@@ -327,10 +317,6 @@ fn отчёт(сценарий: &Сценарий<'_>) -> ReturnsReport {
         .expect("проекция журнала облигации")
         .state()
         .clone();
-    let state = match сценарий.номинал {
-        Some(номинал) => состояние_с_номиналом(&state, номинал),
-        None => state,
-    };
     let fx = iaam_core::valuation::FxTable::new(iaam_core::valuation::FxSource::OwnerSupplied);
     let ledger = ReconciliationLedger::default();
     let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
@@ -352,69 +338,6 @@ fn отчёт(сценарий: &Сценарий<'_>) -> ReturnsReport {
             accrued_observations: &BTreeMap::new(),
         },
     )
-}
-
-/// Номинал каждой партии в состоянии проекции.
-///
-/// Живёт здесь, а не берётся из ядра: помощник ядра лежит в `mod tests`
-/// внутри `returns/mod.rs` и внешнему потребителю недоступен, а
-/// публиковать внутренности ядра ради теста нельзя. Работает через тот
-/// же публичный `serde`, что и отпечаток состояния, и исчезнет вместе
-/// с `iaam-d8b.15`: как только покупка начнёт ставить номинал, подмена
-/// станет не нужна.
-///
-/// Число замен проверяется: если поле переименуют, молчаливая подмена
-/// нуля партий вернула бы весь файл в проверку пустоты.
-fn состояние_с_номиналом(
-    state: &LedgerState, номинал: &str
-) -> LedgerState {
-    fn известный(номинал: &str) -> ciborium::Value {
-        let principal = PrincipalState::known(за_единицу(номинал), за_единицу(номинал))
-            .expect("известный номинал");
-        let mut bytes = Vec::new();
-        ciborium::ser::into_writer(&principal, &mut bytes).expect("сериализация номинала");
-        ciborium::de::from_reader(bytes.as_slice()).expect("разбор номинала")
-    }
-
-    fn подменить(
-        value: &mut ciborium::Value,
-        номинал: &ciborium::Value,
-        заменено: &mut usize,
-    ) {
-        match value {
-            ciborium::Value::Map(entries) => {
-                for (key, value) in entries {
-                    if matches!(key, ciborium::Value::Text(text) if text == "principal") {
-                        *value = номинал.clone();
-                        *заменено += 1;
-                    } else {
-                        подменить(value, номинал, заменено);
-                    }
-                }
-            }
-            ciborium::Value::Array(values) => {
-                for value in values {
-                    подменить(value, номинал, заменено);
-                }
-            }
-            ciborium::Value::Tag(_, value) => подменить(value, номинал, заменено),
-            _ => {}
-        }
-    }
-
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(state, &mut bytes).expect("сериализация состояния");
-    let mut value: ciborium::Value =
-        ciborium::de::from_reader(bytes.as_slice()).expect("разбор состояния");
-    let mut заменено = 0;
-    подменить(&mut value, &известный(номинал), &mut заменено);
-    assert!(
-        заменено > 0,
-        "ни одной партии не досталось номинала: подмена перестала работать"
-    );
-    let mut bytes = Vec::new();
-    ciborium::ser::into_writer(&value, &mut bytes).expect("сериализация изменённого состояния");
-    ciborium::de::from_reader(bytes.as_slice()).expect("разбор изменённого состояния")
 }
 
 fn непринятые(report: &ReturnsReport) -> Vec<&MaterialIssue> {
@@ -539,7 +462,6 @@ fn five_years_of_coupons_received_late_but_received_raise_no_alarm() {
         события: &журнал_пятилетней_истории(None),
         график: &график_пятилетней_бумаги(),
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     });
 
     поток_построен(&report);
@@ -594,7 +516,6 @@ fn an_amortised_bond_closes_its_principal_returns_with_partial_redemptions() {
         события: &здоровый,
         график: &график,
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     });
     проверить_недоказуемость(&report);
 
@@ -606,7 +527,6 @@ fn an_amortised_bond_closes_its_principal_returns_with_partial_redemptions() {
         события: &без_амортизации,
         график: &график,
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     });
     проверить_недоказуемость(&report);
 }
@@ -621,7 +541,6 @@ fn a_single_gap_in_the_middle_of_the_history_is_named_once_and_exactly() {
         события: &журнал_пятилетней_истории(Some(пропущенный)),
         график: &график_пятилетней_бумаги(),
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     });
 
     поток_построен(&report);
@@ -651,7 +570,6 @@ fn a_single_gap_in_the_middle_of_the_history_is_named_once_and_exactly() {
             события: &журнал_пятилетней_истории(Some(пропущенный)),
             график: &график_пятилетней_бумаги(),
             дата_отчёта: ДАТА_ОТЧЁТА,
-            номинал: Some(НОМИНАЛ),
         });
         let issues = непринятые(&report);
         assert_eq!(issues.len(), 1, "купон {пропущенный}: {issues:?}");
@@ -688,7 +606,6 @@ fn the_waiting_window_expires_exactly_twenty_one_days_after_the_scheduled_date()
             события: &события,
             график: &график,
             дата_отчёта: плановая.saturating_add(Duration::days(сдвиг)),
-            номинал: Some(НОМИНАЛ),
         })
     };
 
@@ -767,7 +684,6 @@ fn a_coupon_missed_while_the_early_lot_was_held_is_named_after_it_was_sold() {
         ),
         график: &график_двух_купонов(),
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     });
 
     поток_построен(&report);
@@ -795,7 +711,6 @@ fn two_purchases_with_a_complete_history_raise_no_alarm() {
         ]),
         график: &график_двух_купонов(),
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     });
 
     поток_построен(&report);
@@ -822,7 +737,6 @@ fn one_bond_in_two_custodies_reports_a_single_missing_coupon() {
         события: &события,
         график: &график_двух_купонов(),
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     });
 
     поток_построен(&report);
@@ -884,7 +798,6 @@ fn the_verdict_does_not_depend_on_the_order_of_the_journal() {
         события: &события,
         график: &график_пятилетней_бумаги(),
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     }));
     assert_eq!(эталон.len(), 1, "вердикт эталона: {эталон:?}");
 
@@ -898,7 +811,6 @@ fn the_verdict_does_not_depend_on_the_order_of_the_journal() {
             события: &переставленные,
             график: &график_пятилетней_бумаги(),
             дата_отчёта: ДАТА_ОТЧЁТА,
-            номинал: Some(НОМИНАЛ),
         }));
         assert_eq!(
             вердикт_перестановки, эталон,
@@ -917,7 +829,6 @@ fn the_verdict_does_not_depend_on_the_order_of_the_journal() {
             события: &обратный,
             график: &график_пятилетней_бумаги(),
             дата_отчёта: ДАТА_ОТЧЁТА,
-            номинал: Some(НОМИНАЛ),
         })),
         эталон,
         "обратный порядок изменил вердикт"
@@ -935,7 +846,6 @@ fn projecting_the_same_journal_twice_gives_the_same_verdict() {
         события: &события,
         график: &график_пятилетней_бумаги(),
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: Some(НОМИНАЛ),
     };
 
     let первый = отчёт(&сценарий);
@@ -957,7 +867,6 @@ fn without_the_face_value_the_reconciliation_still_runs() {
         события: &события,
         график: &график_пятилетней_бумаги(),
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: None,
     });
 
     let issues = непринятые(&report);
@@ -998,7 +907,6 @@ fn a_source_without_settlement_dates_cannot_accuse_anyone() {
         события: &события,
         график: &график,
         дата_отчёта: ДАТА_ОТЧЁТА,
-        номинал: None,
     });
 
     let issues = недоказуемые(&report);

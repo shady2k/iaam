@@ -16,9 +16,7 @@ use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::AliasInterval;
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::rules::lot_disposal::{
-    DisposalInput, FifoV1, Lot, LotDisposalRule, LotId, PrincipalState,
-};
+use iaam_core::rules::lot_disposal::{DisposalInput, FifoV1, Lot, LotDisposalRule, LotId};
 use iaam_core::rules::quotation::QuotationRule;
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -44,7 +42,6 @@ fn tie_rounding_preserves_total_basis() {
         acquisition_basis: None,
         accrued_interest_paid: None,
         received_to_date: None,
-        principal: PrincipalState::Unknown,
     }];
 
     let out = FifoV1
@@ -95,7 +92,6 @@ proptest! {
                 received_to_date: None,
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
                 acquisition_basis: None,
-                principal: PrincipalState::Unknown,
             })
             .collect();
 
@@ -141,7 +137,6 @@ proptest! {
                 acquisition_basis: None,
                 accrued_interest_paid: None,
                 received_to_date: None,
-                principal: PrincipalState::Unknown,
             })
             .collect();
 
@@ -179,7 +174,6 @@ proptest! {
                 quantity: Quantity(Dec::new(Decimal::from(*q))),
                 cost_basis: Money::new(PostedMinor::new(*b), CurrencyCode::Rub),
                 acquisition_basis: None,
-                principal: PrincipalState::Unknown,
             })
             .collect();
 

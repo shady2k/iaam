@@ -62,7 +62,6 @@ mod tests {
     use crate::numeric::decimal::Dec;
     use crate::rules::ReturnedShare;
     use crate::rules::lot_disposal::LotId;
-    use crate::rules::lot_disposal::PrincipalState;
     use rust_decimal::Decimal;
     use time::macros::date;
 
@@ -88,7 +87,6 @@ mod tests {
             acquisition_basis: None,
             accrued_interest_paid: None,
             received_to_date: None,
-            principal: PrincipalState::Unknown,
         }
     }
 

@@ -28,8 +28,7 @@ use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 use crate::rules::amortisation::{AmortisationError, AmortisationRuleVersion};
 use crate::rules::lot_disposal::{
-    DisposalError, DisposalInput, DisposalResult, Lot, LotId, PrincipalError, PrincipalState,
-    RuleId, split_basis,
+    DisposalError, DisposalInput, DisposalResult, Lot, LotId, RuleId, split_basis,
 };
 use crate::rules::{LotRuleVersion, RuleRegistry};
 use crate::settlement::{SettlementKnowledge, SettlementLagPolicy};
@@ -60,8 +59,6 @@ pub enum LotError {
     QuantityMismatch { held: Quantity, declared: Quantity },
     #[error(transparent)]
     Amortisation(#[from] AmortisationError),
-    #[error(transparent)]
-    Principal(#[from] PrincipalError),
     #[error(transparent)]
     Disposal(#[from] DisposalError),
     #[error(transparent)]
@@ -798,9 +795,6 @@ impl LotBook {
                         received_to_date: None,
                         cost_basis: basis,
                         acquisition_basis: Some(basis),
-                        // Номинал сюда придёт из справочника в E3.4;
-                        // подставлять ноль запрещено (§4.9).
-                        principal: PrincipalState::Unknown,
                     },
                     settlement,
                 );
@@ -1069,10 +1063,6 @@ impl LotBook {
                 acquisition_basis: lot.acquisition_basis,
                 accrued_interest_paid: lot.accrued_interest_paid,
                 received_to_date: lot.received_to_date,
-                // Номинал преемника — свойство другого выпуска, и
-                // вывести его из номинала предшественника нечем.
-                // Подставить прежний значило бы выдумать (§4.9).
-                principal: PrincipalState::Unknown,
             });
         }
         let currency = match carried.first() {
@@ -1166,7 +1156,6 @@ impl LotBook {
                         received_to_date: None,
                         cost_basis: basis,
                         acquisition_basis: Some(basis),
-                        principal: PrincipalState::Unknown,
                     },
                     settlement,
                 );
@@ -1380,7 +1369,7 @@ mod tests {
         }
     }
 
-    fn bond_lot(bond: &Bond, units: i64, principal: PrincipalState, basis: i64) -> Lot {
+    fn bond_lot(bond: &Bond, units: i64, basis: i64) -> Lot {
         Lot {
             id: LotId::new_random(),
             instrument: bond.instrument,
@@ -1390,7 +1379,6 @@ mod tests {
             acquisition_basis: Some(rub(basis)),
             accrued_interest_paid: None,
             received_to_date: None,
-            principal,
         }
     }
 
@@ -1405,10 +1393,6 @@ mod tests {
         book
     }
 
-    fn remaining_principal(entry: &InstrumentLots) -> Option<PerUnitAmount> {
-        entry.lots().first()?.principal.remaining_per_unit()
-    }
-
     fn лот_с_датой(instrument: InstrumentId, acquired: Option<Date>) -> Lot {
         Lot {
             id: LotId::new_random(),
@@ -1419,7 +1403,6 @@ mod tests {
             acquisition_basis: Some(rub(100_000)),
             accrued_interest_paid: None,
             received_to_date: None,
-            principal: PrincipalState::Unknown,
         }
     }
 
@@ -1551,18 +1534,11 @@ mod tests {
         assert_eq!(entry.earliest_acquired(), None);
     }
 
-    fn known(original: &str, remaining: &str) -> PrincipalState {
-        PrincipalState::known(per_unit(original), per_unit(remaining)).unwrap()
-    }
-
     #[test]
     fn amortisation_leaves_the_quantity_alone() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
 
         book.apply(&bond.amortisation(10, "200", 200_000), &rules)
             .unwrap();
@@ -1577,10 +1553,7 @@ mod tests {
         // источника, а не повод уменьшить номинал пропорционально.
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
 
         assert!(matches!(
             book.apply(&bond.amortisation(4, "200", 80_000), &rules),
@@ -1593,10 +1566,7 @@ mod tests {
         // §6.5: возврат собственного капитала доходом не является.
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
 
         book.apply(&bond.amortisation(10, "200", 200_000), &rules)
             .unwrap();
@@ -1619,10 +1589,7 @@ mod tests {
         // исторических 1000), HPR ошибочно выйдет 25 % вместо 0 %.
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
 
         book.apply(&bond.amortisation(10, "200", 200_000), &rules)
             .unwrap();
@@ -1637,10 +1604,7 @@ mod tests {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
         // Куплена с дисконтом: стоимость 900 000 при номинале 1000 × 10.
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 900_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 900_000)]);
 
         book.apply(&bond.amortisation(10, "200", 200_000), &rules)
             .unwrap();
@@ -1655,10 +1619,7 @@ mod tests {
     fn an_unknown_allocation_records_a_basis_gap_instead_of_failing() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
 
         book.apply(&bond.unknown_amortisation(10, "200", 200_000), &rules)
             .unwrap();
@@ -1675,10 +1636,7 @@ mod tests {
     fn an_amortisation_on_another_account_leaves_this_book_alone() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
         let elsewhere = Bond {
             account: AccountId::new_random(),
             instrument: bond.instrument,
@@ -1691,8 +1649,8 @@ mod tests {
             Err(LotError::SaleWithoutPosition { .. })
         ));
         assert_eq!(
-            remaining_principal(book.entry(&bond.key()).unwrap()),
-            Some(per_unit("1000"))
+            book.entry(&bond.key()).unwrap().quantity().unwrap(),
+            qty(10)
         );
     }
 
@@ -1700,10 +1658,7 @@ mod tests {
     fn a_redemption_empties_the_position_and_releases_the_whole_basis() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "800"), 800_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 800_000)]);
         let redemption = event_with(
             bond.account,
             date!(2026 - 12 - 15),
@@ -1738,10 +1693,7 @@ mod tests {
     fn a_submitted_offer_leaves_the_lots_alone() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
         let before = book.clone();
         let submitted = event_with(
             bond.account,
@@ -1766,10 +1718,7 @@ mod tests {
     fn a_settled_offer_disposes_the_bought_back_quantity() {
         let bond = Bond::new();
         let rules = RuleRegistry::with_defaults();
-        let mut book = book_with_lots(
-            &bond,
-            vec![bond_lot(&bond, 10, known("1000", "1000"), 1_000_000)],
-        );
+        let mut book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000)]);
         let settled = event_with(
             bond.account,
             date!(2026 - 07 - 15),
@@ -2301,10 +2250,7 @@ mod tests {
         let rules = RuleRegistry::with_defaults();
         let mut book = book_with_lots(
             &bond,
-            vec![
-                bond_lot(&bond, 30, known("1000", "1000"), 300_000),
-                bond_lot(&bond, 70, known("1000", "1000"), 700_000),
-            ],
+            vec![bond_lot(&bond, 30, 300_000), bond_lot(&bond, 70, 700_000)],
         );
 
         book.apply(&bond.amortisation(100, "1", 101), &rules)
@@ -2559,15 +2505,9 @@ mod tests {
     #[test]
     fn cohorts_report_mixed_cost_basis_currencies() {
         let bond = Bond::new();
-        let mut foreign = bond_lot(&bond, 10, known("1000", "1000"), 1_000_000);
+        let mut foreign = bond_lot(&bond, 10, 1_000_000);
         foreign.cost_basis = Money::new(PostedMinor::new(1_000_000), CurrencyCode::Usd);
-        let book = book_with_lots(
-            &bond,
-            vec![
-                bond_lot(&bond, 10, known("1000", "1000"), 1_000_000),
-                foreign,
-            ],
-        );
+        let book = book_with_lots(&bond, vec![bond_lot(&bond, 10, 1_000_000), foreign]);
 
         assert_eq!(
             book.entry(&bond.key()).unwrap().cohorts(),
@@ -2577,7 +2517,7 @@ mod tests {
     #[test]
     fn cohorts_refuse_missing_acquisition_date_and_cost_basis_overflow() {
         let bond = Bond::new();
-        let mut missing_date = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        let mut missing_date = bond_lot(&bond, 1, 1_000);
         missing_date.acquired = None;
         assert_eq!(
             book_with_lots(&bond, vec![missing_date])
@@ -2587,8 +2527,8 @@ mod tests {
             Err(CohortGap::AcquisitionDateUnknown)
         );
 
-        let mut first = bond_lot(&bond, 1, known("1000", "1000"), i64::MAX);
-        let mut second = bond_lot(&bond, 1, known("1000", "1000"), i64::MAX);
+        let mut first = bond_lot(&bond, 1, i64::MAX);
+        let mut second = bond_lot(&bond, 1, i64::MAX);
         first.acquisition_basis = None;
         second.acquisition_basis = None;
         assert_eq!(
@@ -2603,8 +2543,8 @@ mod tests {
     #[test]
     fn cohorts_refuse_quantity_and_optional_money_overflow_or_currency_mismatch() {
         let bond = Bond::new();
-        let mut first = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
-        let mut second = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        let mut first = bond_lot(&bond, 1, 1_000);
+        let mut second = bond_lot(&bond, 1, 1_000);
         first.quantity = Quantity(Dec::new(Decimal::MAX));
         second.quantity = Quantity(Dec::new(Decimal::MAX));
         assert_eq!(
@@ -2615,8 +2555,8 @@ mod tests {
             Err(CohortGap::InconsistentQuantity)
         );
 
-        let mut first = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
-        let mut second = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        let mut first = bond_lot(&bond, 1, 1_000);
+        let mut second = bond_lot(&bond, 1, 1_000);
         first.accrued_interest_paid = Some(rub(1));
         second.accrued_interest_paid = Some(Money::new(PostedMinor::new(1), CurrencyCode::Usd));
         assert_eq!(
@@ -2627,8 +2567,8 @@ mod tests {
             Err(CohortGap::InconsistentOptionalMoneyCurrency)
         );
 
-        let mut first = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
-        let mut second = bond_lot(&bond, 1, known("1000", "1000"), 1_000);
+        let mut first = bond_lot(&bond, 1, 1_000);
+        let mut second = bond_lot(&bond, 1, 1_000);
         first.accrued_interest_paid = Some(rub(i64::MAX));
         second.accrued_interest_paid = Some(rub(i64::MAX));
         assert_eq!(

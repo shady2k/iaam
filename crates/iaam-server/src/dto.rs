@@ -788,12 +788,6 @@ fn describe(reason: &NotComputable) -> String {
         }
         NotComputable::NonPositiveInitialCapital => "начальная стоимость не положительна".into(),
         NotComputable::NegativeTerminalWealth => "терминальное благосостояние отрицательно".into(),
-        NotComputable::PrincipalStateAmbiguous { instrument } => {
-            format!(
-                "неоднозначное состояние номинала инструмента {}",
-                instrument.inner()
-            )
-        }
         NotComputable::AcquisitionBasisUnknown => {
             "историческая стоимость приобретения неизвестна".into()
         }
@@ -2409,7 +2403,6 @@ mod tests {
                     NotComputable::NonPositiveDuration { .. } => "non_positive_duration",
                     NotComputable::NonPositiveInitialCapital => "non_positive_initial_capital",
                     NotComputable::NegativeTerminalWealth => "negative_terminal_wealth",
-                    NotComputable::PrincipalStateAmbiguous { .. } => "principal_state_ambiguous",
                     NotComputable::AcquisitionBasisUnknown => "acquisition_basis_unknown",
                     NotComputable::AccruedInterestAtAcquisitionUnknown => {
                         "accrued_interest_at_acquisition_unknown"

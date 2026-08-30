@@ -211,7 +211,7 @@ mod tests {
         use crate::ids::InstrumentId;
         use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
         use crate::numeric::decimal::Dec;
-        use lot_disposal::{DisposalInput, Lot, LotId, PrincipalState};
+        use lot_disposal::{DisposalInput, Lot, LotId};
         use rust_decimal::Decimal;
         use time::macros::date;
 
@@ -230,7 +230,6 @@ mod tests {
             acquisition_basis: None,
             accrued_interest_paid: None,
             received_to_date: None,
-            principal: PrincipalState::Unknown,
         }];
         let out = rule
             .apply(&DisposalInput {

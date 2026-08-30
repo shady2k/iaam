@@ -19,6 +19,7 @@ use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, Sourc
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{AssertionPeriod, ControlClaim};
+use iaam_core::rules::lot_disposal::{Lot, LotId};
 use iaam_core::valuation::PriceQuality;
 use rust_decimal::Decimal;
 use time::macros::date;
@@ -334,6 +335,25 @@ fn a_partial_redemption_written_before_the_allocation_field_reads_as_unknown() {
         basis_allocation,
         BasisAllocation::Unknown(AllocationGap::NotComputed)
     );
+}
+
+#[test]
+fn a_lot_archive_with_removed_principal_field_still_reads() {
+    let value = serde_json::json!({
+        "id": LotId::new_random(),
+        "instrument": InstrumentId::new_random(),
+        "acquired": null,
+        "quantity": qty(10),
+        "cost_basis": rub(100_000),
+        "principal": "Unknown",
+    });
+    let text = serde_json::to_string(&value).expect("старое тело сериализуется");
+    let lot: Lot = serde_json::from_str(&text).expect("старое тело читается");
+    assert_eq!(lot.quantity, qty(10));
+    assert_eq!(lot.cost_basis, rub(100_000));
+    assert_eq!(lot.acquisition_basis, None);
+    assert_eq!(lot.accrued_interest_paid, None);
+    assert_eq!(lot.received_to_date, None);
 }
 
 #[test]

@@ -1,9 +1,9 @@
-//! Соответствие продакшн-реализации списания эталонной (§15.4).
+//! Parity between the production and reference lot-disposal implementations (§15.4).
 //!
-//! Оба прогоняются на одних входных данных, и оба сверяются
-//! с замороженным ожидаемым значением. Совпадение продакшена
-//! с эталоном без сверки с фикстурой недостаточно: обе реализации
-//! могли бы ошибаться одинаково по случайности.
+//! Both run on the same inputs, and both are checked against frozen expected
+//! values. Matching the production implementation to the reference without
+//! checking the fixture is insufficient: both could happen to make the same
+//! mistake.
 
 use iaam_core::dates::TradeDate;
 use iaam_core::ids::InstrumentId;
@@ -59,11 +59,11 @@ fn to_core_lots(items: &[RefLotJson]) -> Vec<Lot> {
 #[test]
 fn production_matches_oracle_and_frozen_expectations() {
     let raw = include_str!("../../../tests/fixtures/fifo_cases.json");
-    let fixture: Fixture = serde_json::from_str(raw).expect("фикстура разбирается");
-    assert!(!fixture.cases.is_empty(), "фикстура не должна быть пустой");
+    let fixture: Fixture = serde_json::from_str(raw).expect("fixture parses");
+    assert!(!fixture.cases.is_empty(), "fixture must not be empty");
 
     for case in &fixture.cases {
-        // --- Эталон ---
+        // --- Reference ---
         let ref_lots: Vec<RefLot> = case
             .lots
             .iter()
@@ -73,67 +73,68 @@ fn production_matches_oracle_and_frozen_expectations() {
             })
             .collect();
         let oracle = dispose_fifo_rational(&ref_lots, case.sell_quantity)
-            .unwrap_or_else(|e| panic!("эталон упал на случае «{}»: {e:?}", case.name));
+            .unwrap_or_else(|e| panic!("reference failed on case “{}”: {e:?}", case.name));
 
-        // --- Продакшн ---
+        // --- Production ---
         let input = DisposalInput {
             lots: to_core_lots(&case.lots),
             quantity: qty(case.sell_quantity),
         };
         let production = FifoV1
             .apply(&input)
-            .unwrap_or_else(|e| panic!("продакшн упал на случае «{}»: {e:?}", case.name));
+            .unwrap_or_else(|e| panic!("production failed on case “{}”: {e:?}", case.name));
 
-        // --- Оба против замороженного ожидания ---
+        // --- Both against frozen expected values ---
         assert_eq!(
             oracle.basis_released_minor, case.expected_basis_released_minor,
-            "эталон разошёлся с фикстурой на случае «{}»",
+            "reference differs from fixture on case “{}”",
             case.name
         );
         assert_eq!(
             production.basis_released.amount().raw(),
             case.expected_basis_released_minor,
-            "продакшн разошёлся с фикстурой на случае «{}»",
+            "production differs from fixture on case “{}”",
             case.name
         );
 
-        // --- Остатки ---
+        // --- Remainders ---
         assert_eq!(
             oracle.remaining.len(),
             case.expected_remaining.len(),
-            "эталон: неверное число оставшихся лотов на «{}»",
+            "reference: wrong number of remaining lots for “{}”",
             case.name
         );
         assert_eq!(
             production.remaining.len(),
             case.expected_remaining.len(),
-            "продакшн: неверное число оставшихся лотов на «{}»",
+            "production: wrong number of remaining lots for “{}”",
             case.name
         );
         for (i, expected) in case.expected_remaining.iter().enumerate() {
             assert_eq!(
                 oracle.remaining[i].basis_minor, expected.basis_minor,
-                "эталон: стоимость остатка {i} на «{}»",
+                "reference: remaining lot {i} cost for “{}”",
                 case.name
             );
             assert_eq!(
                 production.remaining[i].cost_basis.amount().raw(),
                 expected.basis_minor,
-                "продакшн: стоимость остатка {i} на «{}»",
+                "production: remaining lot {i} cost for “{}”",
                 case.name
             );
-            // Количество остатка тоже заморожено фикстурой: без этой сверки
-            // поле `quantity` в `expected_remaining` не проверялось бы ничем,
-            // и разнесение стоимости могло бы попасть на неверное количество.
+            // The remaining quantity is frozen by the fixture too: without
+            // this check, `quantity` in `expected_remaining` would have no
+            // other verification, and cost allocation could use the wrong
+            // quantity.
             assert_eq!(
                 oracle.remaining[i].quantity, expected.quantity,
-                "эталон: количество остатка {i} на «{}»",
+                "reference: remaining lot {i} quantity for “{}”",
                 case.name
             );
             assert_eq!(
                 production.remaining[i].quantity,
                 qty(expected.quantity),
-                "продакшн: количество остатка {i} на «{}»",
+                "production: remaining lot {i} quantity for “{}”",
                 case.name
             );
         }

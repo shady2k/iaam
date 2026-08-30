@@ -1,4 +1,4 @@
-//! Конфигурация из окружения.
+//! Configuration from the environment.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -8,12 +8,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("переменная {name} не задана; задайте её (допустимые значения: {allowed})")]
+    #[error("variable {name} is not set; set it (allowed values: {allowed})")]
     Missing {
         name: &'static str,
         allowed: &'static str,
     },
-    #[error("переменная {name} задана неверно: {value}; допустимые значения: {allowed}")]
+    #[error("variable {name} is invalid: {value}; allowed values: {allowed}")]
     Invalid {
         name: &'static str,
         value: String,
@@ -24,11 +24,11 @@ pub enum ConfigError {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database: PathBuf,
-    /// Файл с ключом шифрования брокерских доступов.
+    /// File containing the encryption key for broker access.
     ///
-    /// Необязателен: нужен только командам, работающим с доступом
-    /// к брокеру. Умолчания у него нет и быть не может — ключ
-    /// «в известном месте» известен всем.
+    /// Optional: needed only by commands that work with broker access.
+    /// It has no default and cannot have one — a key “in a known place”
+    /// would be known to everyone.
     pub broker_key: Option<PathBuf>,
     pub listen: SocketAddr,
     pub rate_limit: u32,
@@ -36,10 +36,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// Чтение конфигурации из окружения.
+    /// Read configuration from the environment.
     ///
-    /// Умолчания есть у всего, кроме пути к базе: база в неожиданном
-    /// месте — худший вид умолчания.
+    /// Everything except the database path has a default: a database in
+    /// an unexpected location is the worst kind of default.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -50,13 +50,13 @@ impl Config {
     {
         let database = get("IAAM_DATABASE").ok_or(ConfigError::Missing {
             name: "IAAM_DATABASE",
-            allowed: "путь к файлу базы данных",
+            allowed: "database file path",
         })?;
         let listen = get("IAAM_LISTEN").unwrap_or_else(|| "127.0.0.1:8080".into());
         let listen = listen.parse().map_err(|_| ConfigError::Invalid {
             name: "IAAM_LISTEN",
             value: listen,
-            allowed: "адрес socket вида 127.0.0.1:8080",
+            allowed: "socket address such as 127.0.0.1:8080",
         })?;
         let rate_limit = parse_u32("IAAM_RATE_LIMIT", 120, &get)?;
         let rate_window =
@@ -81,7 +81,7 @@ where
         Some(value) => value.parse().map_err(|_| ConfigError::Invalid {
             name,
             value,
-            allowed: "целое число от 0 до 4294967295",
+            allowed: "integer from 0 to 4294967295",
         }),
     }
 }
@@ -112,8 +112,8 @@ mod tests {
         ));
         let text = error.to_string();
         assert!(text.contains("IAAM_DATABASE"));
-        assert!(text.contains("допустимые значения"));
-        assert!(text.contains("путь к файлу базы данных"));
+        assert!(text.contains("allowed values"));
+        assert!(text.contains("database file path"));
         assert!(!text.contains("Invalid {"));
     }
 
@@ -121,7 +121,7 @@ mod tests {
     fn invalid_listen_value_names_allowed_form() {
         let error = Config::from_lookup(values(&[
             ("IAAM_DATABASE", "db.sqlite"),
-            ("IAAM_LISTEN", "не адрес"),
+            ("IAAM_LISTEN", "not an address"),
         ]))
         .unwrap_err();
 
@@ -134,8 +134,8 @@ mod tests {
         ));
         let text = error.to_string();
         assert!(text.contains("IAAM_LISTEN"));
-        assert!(text.contains("допустимые значения"));
-        assert!(text.contains("адрес socket"));
+        assert!(text.contains("allowed values"));
+        assert!(text.contains("socket address"));
         assert!(!text.contains("Invalid {"));
     }
 }

@@ -1,9 +1,8 @@
-//! Заведение брокерского доступа (§14).
+//! Provisioning broker access (§14).
 //!
-//! Токен приходит от владельца и **немедленно** шифруется: открытым
-//! он существует ровно на время этой функции. Ни в лог, ни в базу,
-//! ни в текст ошибки он не попадает — ошибки здесь называют поле
-//! и причину, но никогда значение.
+//! The owner's token is **immediately** encrypted: plaintext exists only
+//! for the duration of this function. It never reaches logs, the database,
+//! or an error message — errors name the field and reason, never its value.
 
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
@@ -15,25 +14,25 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum ProvisionError {
-    #[error("код брокера пуст")]
+    #[error("broker code is empty")]
     BrokerNotNamed,
-    #[error("токен пуст")]
+    #[error("token is empty")]
     TokenEmpty,
-    #[error("владелец не найден: сначала выпустите токен владельца через IAAM_ISSUE_OWNER_TOKEN")]
+    #[error("owner not found: issue an owner token first through IAAM_ISSUE_OWNER_TOKEN")]
     NoOwner,
-    #[error("владельцев несколько: выбрать за вас, кому завести доступ, нельзя")]
+    #[error("multiple owners: choosing which one should receive access is impossible")]
     SeveralOwners,
-    #[error("доступ не сохранён: {0}")]
+    #[error("access was not stored: {0}")]
     NotStored(#[from] iaam_store::StoreError),
-    #[error("доступ не удалось открыть старым ключом: {0}")]
+    #[error("access could not be opened with the old key: {0}")]
     OldKey(#[from] iaam_broker::credentials::CryptoError),
 }
 
-/// Завести доступ к брокеру.
+/// Provision broker access.
 ///
-/// Возвращает идентификатор записи — по нему доступ отзывают. Сам токен
-/// не возвращается и не печатается: то, чего вызывающий не получил, он
-/// не может выдать наружу.
+/// Returns the record identifier, which is used to revoke access. The token
+/// itself is not returned or printed: what the caller did not receive cannot
+/// be exposed.
 pub fn add_broker_access(
     store: &mut SqliteStore,
     key: &Key,
@@ -57,11 +56,11 @@ pub fn add_broker_access(
         id: Uuid::new_v4(),
         owner,
         broker,
-        // Среда называется при заведении: токены у сред разные, и
-        // угадать за человека, какой он держит, нельзя.
+        // The environment is named at provisioning: tokens differ by
+        // environment, and no choice can be made for the user.
         environment: environment.code().to_owned(),
-        // Область прав задаётся здесь, а не приходит снаружи: торговые
-        // права не запрашиваются ни при каких условиях (§14).
+        // The permission scope is set here rather than accepted from the
+        // outside: trading permissions are never requested (§14).
         scope: BrokerScope::ReadOnly.code().to_owned(),
         nonce: sealed.nonce().to_vec(),
         ciphertext: sealed.ciphertext().to_vec(),
@@ -70,11 +69,11 @@ pub fn add_broker_access(
     Ok(access.id)
 }
 
-/// Перешифровать всю историю доступов в одной транзакции хранилища.
+/// Re-encrypt the entire access history in one storage transaction.
 ///
-/// Старый ключ используется только до подготовки полного списка новых
-/// шифротекстов. Хранилище ничего не меняет, пока расшифровка каждой
-/// строки не прошла успешно.
+/// The old key is used only until the complete list of new ciphertexts has
+/// been prepared. Storage changes nothing until every row has been decrypted
+/// successfully.
 pub fn rotate_broker_access(
     store: &mut SqliteStore,
     old_key: &Key,
@@ -114,7 +113,7 @@ mod tests {
     fn store_with_owner() -> (SqliteStore, OwnerId) {
         let store = SqliteStore::open_in_memory().unwrap();
         let owner = OwnerId::new_random();
-        issue(&store, owner, "ноутбук");
+        issue(&store, owner, "laptop");
         (store, owner)
     }
 
@@ -128,7 +127,7 @@ mod tests {
                     scope: TokenScope::Owner,
                     revoked: false,
                 },
-                &format!("хеш-{label}-{}", owner.inner()),
+                &format!("hash-{label}-{}", owner.inner()),
             )
             .unwrap();
     }
@@ -158,9 +157,9 @@ mod tests {
 
     #[test]
     fn surrounding_whitespace_is_not_part_of_the_token() {
-        // Токен приходит со стандартного ввода, и перевод строки в конце
-        // там неизбежен. Заголовок с лишним пробелом брокер отвергнет,
-        // а причину назовёт невнятно.
+        // The token comes from standard input, so a trailing newline is
+        // unavoidable. A broker would reject a header with extra whitespace,
+        // while its reason would be unclear.
         let (mut store, owner) = store_with_owner();
         let key = key();
 
@@ -213,7 +212,7 @@ mod tests {
     #[test]
     fn between_several_owners_nothing_is_guessed() {
         let (mut store, _) = store_with_owner();
-        issue(&store, OwnerId::new_random(), "второй");
+        issue(&store, OwnerId::new_random(), "second");
 
         assert!(matches!(
             add_broker_access(&mut store, &key(), "tinkoff", Environment::Sandbox, TOKEN),
@@ -223,7 +222,7 @@ mod tests {
 
     #[test]
     fn no_error_message_carries_the_token() {
-        // Сообщение об ошибке — это то, что точно попадёт в лог.
+        // An error message is certain to reach the log.
         let mut store = SqliteStore::open_in_memory().unwrap();
         let error = add_broker_access(&mut store, &key(), "tinkoff", Environment::Sandbox, TOKEN)
             .unwrap_err();

@@ -1,39 +1,39 @@
-//! Устойчивость: когда повторять, через сколько и как часто ходить (§12).
+//! Resilience: when to retry, how long to wait, and how often to call (§12).
 //!
-//! Решение о повторе — **чистая функция**. Так оно проверяется без сети
-//! и без сна: тест на политику повторов, который спит, проверяет ещё
-//! и планировщик потоков, а падает загадочно.
+//! The retry decision is a **pure function**. It can then be checked without
+//! a network or sleep: a retry-policy test that sleeps also tests the thread
+//! scheduler and fails mysteriously.
 
 use std::time::{Duration, Instant};
 
 use crate::response::HttpError;
 
-/// Потолок задержки.
+/// Backoff ceiling.
 ///
-/// Без него экспонента на шестой попытке ушла бы за пределы окна
-/// суточной синхронизации, и задание висело бы вместо того, чтобы
-/// честно отчитаться о частичном отказе.
+/// Without it, the exponential delay on the sixth attempt would exceed the
+/// daily synchronisation window, leaving the job hanging instead of honestly
+/// reporting a partial refusal.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Чем закончилась попытка.
+/// Attempt outcome.
 #[derive(Debug)]
 pub enum Outcome {
-    /// Транспорт не довёл запрос.
+    /// Transport did not deliver the request.
     Transport(HttpError),
-    /// Узел ответил кодом.
+    /// Endpoint returned a status code.
     Status(u16),
 }
 
-/// Что делать после попытки.
+/// Action after an attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retry {
-    /// Повторить через указанную задержку.
+    /// Retry after the specified delay.
     After(Duration),
-    /// Не повторять: попытки исчерпаны либо повтор бессмыслен.
+    /// Do not retry: attempts are exhausted or retrying is pointless.
     GiveUp,
 }
 
-/// Политика повторов.
+/// Retry policy.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     attempts: u32,
@@ -46,7 +46,7 @@ impl RetryPolicy {
         Self { attempts, base }
     }
 
-    /// Решение по номеру попытки (с единицы) и её исходу.
+    /// Decide from the attempt number (starting at one) and its outcome.
     #[must_use]
     pub fn decide(&self, attempt: u32, outcome: &Outcome) -> Retry {
         if attempt >= self.attempts || !is_transient(outcome) {
@@ -61,11 +61,11 @@ impl RetryPolicy {
     }
 }
 
-/// Отказ временный, то есть повтор имеет шанс дать другой ответ.
+/// A transient refusal, where a retry may produce a different response.
 ///
-/// 4xx, кроме 429, сюда не входят намеренно: отказ в правах или
-/// неверный запрос повторятся ровно тем же, и попытки будут потрачены
-/// на заведомо известный ответ.
+/// 4xx statuses other than 429 are deliberately excluded: an authorization
+/// refusal or invalid request will be repeated exactly, wasting attempts on a
+/// known response.
 fn is_transient(outcome: &Outcome) -> bool {
     match outcome {
         Outcome::Transport(HttpError::Network | HttpError::Timeout) => true,
@@ -76,11 +76,10 @@ fn is_transient(outcome: &Outcome) -> bool {
     }
 }
 
-/// Ограничение частоты: не чаще одного запроса в заданный интервал.
+/// Rate limit: no more than one request in the specified interval.
 ///
-/// Существует, чтобы первичная загрузка истории не выглядела для MOEX
-/// как поток запросов: получить 429 и уйти в повторы дороже, чем
-/// подождать.
+/// This prevents the initial history load from looking like a request flood
+/// to MOEX: receiving 429 and retrying costs more than waiting.
 pub struct RateLimiter {
     min_interval: Duration,
     last: std::sync::Mutex<Option<Instant>>,
@@ -95,7 +94,7 @@ impl RateLimiter {
         }
     }
 
-    /// Сколько ждать до следующего запроса. Ноль — можно сразу.
+    /// How long to wait before the next request. Zero means proceed now.
     #[must_use]
     pub fn delay_before_next(&self, now: Instant) -> Duration {
         let mut last = self
@@ -149,7 +148,7 @@ mod tests {
                     policy().decide(1, &Outcome::Status(status)),
                     Retry::After(_)
                 ),
-                "код {status} обязан повторяться"
+                "status {status} must be retried"
             );
         }
     }
@@ -159,7 +158,7 @@ mod tests {
         for status in [400, 401, 403, 404, 422] {
             assert!(
                 matches!(policy().decide(1, &Outcome::Status(status)), Retry::GiveUp),
-                "код {status} повторять бессмысленно: ответ будет тот же"
+                "retrying status {status} is pointless: the response will be the same"
             );
         }
     }
@@ -177,17 +176,17 @@ mod tests {
         let policy = policy();
         let first = match policy.decide(1, &Outcome::Status(503)) {
             Retry::After(delay) => delay,
-            Retry::GiveUp => panic!("должен был повториться"),
+            Retry::GiveUp => panic!("it should have been retried"),
         };
         let third = match policy.decide(3, &Outcome::Status(503)) {
             Retry::After(delay) => delay,
-            Retry::GiveUp => panic!("должен был повториться"),
+            Retry::GiveUp => panic!("it should have been retried"),
         };
+        assert!(third > first, "delay must grow: {first:?} → {third:?}");
         assert!(
-            third > first,
-            "задержка обязана расти: {first:?} → {third:?}"
+            third <= MAX_BACKOFF,
+            "delay exceeded the ceiling: {third:?}"
         );
-        assert!(third <= MAX_BACKOFF, "задержка вышла за потолок: {third:?}");
     }
 
     #[test]

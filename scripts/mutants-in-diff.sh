@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Мутанты ТОЛЬКО в изменённых строках — быстрая проверка рабочего цикла.
+# Mutants ONLY in changed lines — a fast development-loop check.
 #
-# Это НЕ заслон. Заслон — scripts/check-mutants.sh, он гоняет весь список
-# критичных модулей целиком, и в CI вызывается именно он. Здесь
-# проверяются мутанты лишь в тех строках, которые тронуты диффом:
-# правка теста в одном модуле может воскресить мутанта в другом,
-# и диффом такое не ловится.
+# This is NOT the guard. The guard is scripts/check-mutants.sh; it runs the full
+# list of critical modules and is the script invoked in CI. This script checks
+# mutants only on lines touched by the diff:
+# changing a test in one module can revive a mutant in another,
+# and a diff-only check will not catch that.
 #
-# Смысл в цене обратной связи. Полный прогон — тысячи мутантов и часы;
-# после правки одного файла осмысленных из них десятки.
+# The point is the cost of feedback. A full run means thousands of mutants and hours;
+# after changing one file, only dozens of them are relevant.
 set -euo pipefail
 
 if ! REPO_ROOT=$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null); then
-  echo "МУТАНТЫ-ДИФФ: не удалось определить корень репозитория" >&2
+  echo "DIFF-MUTANTS: could not determine the repository root" >&2
   exit 1
 fi
 cd "$REPO_ROOT"
@@ -21,55 +21,55 @@ BASE="${BASE:-main}"
 
 for tool in cargo git; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "МУТАНТЫ-ДИФФ: $tool недоступен." >&2
+    echo "DIFF-MUTANTS: $tool is unavailable." >&2
     exit 1
   fi
 done
 if ! cargo mutants --version >/dev/null 2>&1; then
-  echo "МУТАНТЫ-ДИФФ: cargo-mutants недоступен." >&2
+  echo "DIFF-MUTANTS: cargo-mutants is unavailable." >&2
   exit 1
 fi
 
-# Три точки: сравнение с точкой расхождения, а не с текущим состоянием
-# базовой ветки. Иначе чужие коммиты в main приезжают в дифф как свои.
+# Three-dot comparison uses the divergence point, not the current state of the
+# base branch. Otherwise, other people's commits in main appear in the diff as ours.
 if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
-  echo "МУТАНТЫ-ДИФФ: ветка '$BASE' не найдена (задайте BASE=...)." >&2
+  echo "DIFF-MUTANTS: branch '$BASE' was not found (set BASE=...)." >&2
   exit 1
 fi
 
 DIFF_FILE=$(mktemp)
 trap 'rm -f "$DIFF_FILE"' EXIT
 
-# Неподтверждённые правки входят в дифф намеренно: проверять хочется
-# то, что написано сейчас, а не то, что уже закоммичено.
+# Uncommitted changes are intentionally included in the diff: we want to check
+# what is written now, not just what has already been committed.
 #
-# Один дифф от точки расхождения до рабочего дерева, а не склейка
-# `BASE...HEAD` и `HEAD`. Склейка давала два набора заголовков по одному
-# пути, когда файл изменён и в коммитах ветки, и в дереве; cargo-mutants
-# такой дифф применить не может и падает кодом, неотличимым от выживших
-# мутантов (iaam-387k).
+# Use one diff from the divergence point to the working tree, rather than
+# concatenating `BASE...HEAD` and `HEAD`. Concatenation produced two sets of
+# headers for the same path when a file was changed both in branch commits and
+# in the working tree; cargo-mutants cannot apply such a diff and exits with a
+# status indistinguishable from surviving mutants (iaam-387k).
 if ! MERGE_BASE=$(git merge-base "$BASE" HEAD 2>/dev/null); then
-  echo "МУТАНТЫ-ДИФФ: у HEAD и '$BASE' нет общего предка — дифф не построить." >&2
+  echo "DIFF-MUTANTS: HEAD and '$BASE' have no common ancestor — cannot build the diff." >&2
   exit 1
 fi
 if ! git diff "$MERGE_BASE" >"$DIFF_FILE" 2>/dev/null; then
-  echo "МУТАНТЫ-ДИФФ: не удалось построить дифф от $MERGE_BASE." >&2
-  echo "Это сбой построения диффа, а не выжившие мутанты." >&2
+  echo "DIFF-MUTANTS: could not build the diff from $MERGE_BASE." >&2
+  echo "This is a diff construction failure, not surviving mutants." >&2
   exit 1
 fi
 
 if [ ! -s "$DIFF_FILE" ]; then
-  echo "МУТАНТЫ-ДИФФ: относительно $BASE ничего не изменилось — проверять нечего."
+  echo "DIFF-MUTANTS: nothing has changed relative to $BASE — nothing to check."
   exit 0
 fi
 
-echo "Мутанты в строках, изменённых относительно $BASE."
-echo "ВНИМАНИЕ: это не заслон. Полная проверка — make mutants."
+echo "Mutants in lines changed relative to $BASE."
+echo "WARNING: this is not the guard. Full check: make mutants."
 echo ""
 
-# --error только когда дифф трогает iaam-core: типы объявлены там,
-# и в любом другом пакете такой мутант не собирается никогда, а полную
-# сборку ради этого вывода оплачивает (см. scripts/check-mutants.sh).
+# Use --error only when the diff touches iaam-core: the types are declared there,
+# and in any other package such a mutant will never be built, while producing
+# this output incurs the cost of a full build (see scripts/check-mutants.sh).
 error_args=()
 if grep -q '^+++ b/crates/iaam-core/' "$DIFF_FILE"; then
   error_args=(

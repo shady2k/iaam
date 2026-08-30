@@ -1,149 +1,150 @@
-# Обёртка над заслонами качества и командами запуска.
+# Wrapper for quality gates and run commands.
 #
-# Источник правды по заслонам — .github/workflows/ci.yml и таблица в
-# README. Цели ниже повторяют шаги CI команда в команду: обёртка, которая
-# проверяет мягче, даёт зелёный локальный прогон при красном CI, а это
-# хуже отсутствия обёртки. Намеренных расхождений сейчас нет: последнее,
-# у цели `test`, снято в iaam-829 правкой самого CI.
+# The source of truth for the gates is .github/workflows/ci.yml and the table in
+# README. The targets below repeat the CI steps command for command: a wrapper that
+# checks less strictly can produce a green local run while CI is red, which is
+# worse than having no wrapper. There are currently no intentional discrepancies:
+# the last one, in target `test`, was removed in iaam-829 by changing CI itself.
 #
-# Makefile не входит в список файлов политики scripts/check-diff-lint.sh.
-# Значит, ослабление заслона правкой этой обёртки заслон не поймает.
-# Если обёртка приживётся, `Makefile` стоит добавить в тот список — но
-# это правка самого скрипта, то есть изменение политики, которое вносит
-# владелец репозитория (POLICY_CHANGE_APPROVED=1), а не агент.
+# Makefile is not included in the list of policy files in scripts/check-diff-lint.sh.
+# This means that weakening a guard by changing this wrapper will not be caught by
+# the guard. If the wrapper proves useful, `Makefile` should be added to that list —
+# but that requires changing the script itself, which is a policy change that must
+# be made by the repository owner (POLICY_CHANGE_APPROVED=1), not an agent.
 
-# Внутри `nix develop` (в том числе поднятого direnv) префикс не нужен;
-# снаружи цель заходит в окружение сама — иначе соберётся не тем
-# тулчейном и проверит не то.
+# Inside `nix develop` (including one started by direnv), the prefix is unnecessary;
+# outside it, the target enters the environment itself — otherwise the project will
+# be built with the wrong toolchain and check the wrong thing.
 RUN := $(if $(IN_NIX_SHELL),,nix develop -c)
 
-# База сравнения для diff-заслонов. В CI её задаёт целевая ветка PR.
+# Comparison base for diff guards. In CI it is set to the PR target branch.
 BASE ?= origin/main
 
-# Умолчания для команд запуска. У среды умолчания нет: токены у сред
-# разные, и записанная не та среда оборачивается отказом шлюза, по
-# тексту которого о среде не догадаться.
-LABEL  ?= ноутбук
+# Defaults for run commands. There is no default environment: tokens differ between
+# environments, and recording the wrong environment results in a gateway rejection
+# whose message gives no clue that the environment is the problem.
+LABEL  ?= laptop
 BROKER ?= tinkoff
 ENVIRONMENT ?=
 
 .DEFAULT_GOAL := help
 
 .PHONY: help
-help: ## Список целей
+help: ## List targets
 	@grep -hE '^[a-z][a-z0-9_-]*:.*?## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
-# --- Заслоны -----------------------------------------------------------
+# --- Quality gates -----------------------------------------------------
 
 .PHONY: check
-check: fmt lint arch fixtures deps test doc-test ## Всё, что не ходит в сеть и укладывается в минуты
+check: fmt lint arch fixtures deps test doc-test ## Everything that avoids the network and completes within minutes
 
 .PHONY: fmt
-fmt: ## Формат (проверка)
+fmt: ## Format (check)
 	$(RUN) cargo fmt --all -- --check
 
 .PHONY: fmt-fix
-fmt-fix: ## Формат (исправление)
+fmt-fix: ## Format (fix)
 	$(RUN) cargo fmt --all
 
 .PHONY: lint
-lint: ## Линты
+lint: ## Lints
 	$(RUN) cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 .PHONY: arch
-arch: ## Направление зависимостей, f64 и async в ядре
+arch: ## Dependency direction, f64, and async in the core
 	$(RUN) ./scripts/check-architecture.sh
 
 .PHONY: fixtures
-fixtures: ## Замороженный эталон и мёртвые фикстуры
+fixtures: ## Frozen reference data and dead fixtures
 	$(RUN) ./scripts/check-fixtures.sh
 
 .PHONY: deps
-deps: ## Уязвимости, лицензии, источники
+deps: ## Vulnerabilities, licenses, sources
 	$(RUN) cargo deny check
 
-# `--all-features` здесь нет, и в CI его тоже нет (iaam-829): флаг включил
-# бы фичу `sandbox` крейта iaam-broker и превратил прогон в поход в
-# интернет (docs/deployment.md, «Два режима проверки»). Живая проверка
-# вынесена в отдельную цель `sandbox`. Флаг сюда не возвращайте.
+# There is no `--all-features` here, and CI does not use it either (iaam-829):
+# the flag would enable the `sandbox` feature of the iaam-broker crate and turn
+# the run into an internet request (docs/deployment.md, “Two check modes”).
+# The live check has been moved to the separate `sandbox` target. Do not add
+# the flag back here.
 .PHONY: test
-test: ## Тесты, сети не касаются
+test: ## Tests that do not access the network
 	$(RUN) cargo nextest run --workspace
 
 .PHONY: doc-test
-doc-test: ## Doc-тесты (nextest их не выполняет)
+doc-test: ## Doc-tests (nextest does not run them)
 	$(RUN) cargo test --workspace --doc
 
 .PHONY: diff-lint
-diff-lint: ## Новые allow/ignore/todo! и правка файлов политики (BASE=...)
+diff-lint: ## New allow/ignore/todo! directives and changes to policy files (BASE=...)
 	$(RUN) ./scripts/check-diff-lint.sh $(BASE)
 
 .PHONY: coverage
-coverage: ## Отчёт покрытия в lcov.info
+coverage: ## Coverage report in lcov.info
 	$(RUN) cargo llvm-cov --workspace --lcov --output-path lcov.info
 
 .PHONY: diff-coverage
-diff-coverage: coverage ## Порог 90% на добавленных строках (BASE=...)
+diff-coverage: coverage ## 90% threshold for added lines (BASE=...)
 	$(RUN) diff-cover lcov.info --compare-branch=$(BASE) --fail-under=90
 
 .PHONY: mutants
-mutants: ## Мутационное тестирование, порог по каждому модулю (долго)
+mutants: ## Mutation testing with a threshold for each module (slow)
 	$(RUN) ./scripts/check-mutants.sh
 
 .PHONY: mutants-diff
-mutants-diff: ## Мутанты только в изменённых строках (BASE=...). Быстро, но НЕ заслон
+mutants-diff: ## Mutants only in changed lines (BASE=...). Fast, but NOT a gate
 	$(RUN) env BASE=$(BASE) ./scripts/mutants-in-diff.sh
 
-# Ходит в интернет и требует заведённого доступа: IAAM_DATABASE и
-# IAAM_BROKER_KEY_FILE должны быть выставлены, иначе цель падает —
-# режим запрошен явно, и молчаливый пропуск был бы враньём.
+# Accesses the internet and requires configured access: IAAM_DATABASE and
+# IAAM_BROKER_KEY_FILE must be set, otherwise the target fails — the mode was
+# requested explicitly, and silently skipping it would be misleading.
 .PHONY: sandbox
-sandbox: require-database require-broker-key ## Живая проверка шлюза брокера (сеть)
+sandbox: require-database require-broker-key ## Live broker gateway check (network)
 	$(RUN) cargo test -p iaam-broker --features sandbox
 
-# --- Запуск ------------------------------------------------------------
+# --- Running -----------------------------------------------------------
 
-# Путь к базе и путь к ключу умолчаний не имеют намеренно: база и ключ
-# «в известном месте» — худший вид умолчания. Проверяются здесь, потому
-# что сама программа сообщает о незаданной переменной отладочным выводом
-# вида `Error: Invalid { name: "IAAM_DATABASE", ... }` (iaam-p28).
+# The database path and key path intentionally have no defaults: a database and
+# key “in a known location” are the worst kind of default. They are checked here
+# because the program itself reports an unset variable with debug output such as
+# `Error: Invalid { name: "IAAM_DATABASE", ... }` (iaam-p28).
 .PHONY: require-database
 require-database:
 	@test -n "$(IAAM_DATABASE)" || { \
-		echo "IAAM_DATABASE не задана: укажите путь к файлу базы, например" >&2; \
+		echo "IAAM_DATABASE is not set: specify the path to the database file, for example" >&2; \
 		echo "  make $(MAKECMDGOALS) IAAM_DATABASE=/var/lib/iaam/iaam.db" >&2; \
 		exit 1; }
 
 .PHONY: require-broker-key
 require-broker-key:
 	@test -n "$(IAAM_BROKER_KEY_FILE)" || { \
-		echo "IAAM_BROKER_KEY_FILE не задана: укажите файл ключа, например" >&2; \
+		echo "IAAM_BROKER_KEY_FILE is not set: specify the path to the key file, for example" >&2; \
 		echo "  make $(MAKECMDGOALS) IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key" >&2; \
 		exit 1; }
 
 .PHONY: run
-run: require-database ## Поднять сервис (IAAM_DATABASE=...)
+run: require-database ## Start service (IAAM_DATABASE=...)
 	$(RUN) cargo run -p iaam-bootstrap --release
 
-# Дверь восстановления при потерянном токене владельца. В пустой базе
-# заводит владельца, в непустой выпускает токен существующему. Печатает
-# токен один раз — в базе остаётся только хеш.
+# Recovery path for a lost owner token. In an empty database it creates an owner;
+# in a nonempty database it issues a token to the existing owner. It prints the
+# token once — only the hash remains in the database.
 .PHONY: owner-token
-owner-token: require-database ## Токен владельца с консоли (IAAM_DATABASE=..., LABEL=...)
+owner-token: require-database ## Owner token from the console (IAAM_DATABASE=..., LABEL=...)
 	IAAM_ISSUE_OWNER_TOKEN="$(LABEL)" $(RUN) cargo run -p iaam-bootstrap --release
 
 .PHONY: broker-key
-broker-key: require-database require-broker-key ## Завести ключ шифрования доступов
+broker-key: require-database require-broker-key ## Create a key for encrypting credentials
 	@install -d -m 700 "$(dir $(IAAM_BROKER_KEY_FILE))"
 	IAAM_GENERATE_BROKER_KEY=1 $(RUN) cargo run -p iaam-bootstrap --release
 
-# Токен читается со стандартного ввода: список процессов виден всей
-# машине, а история оболочки переживает сессию.
+# The token is read from standard input: the process list is visible across the
+# machine, and shell history outlives the session.
 .PHONY: broker-access
-broker-access: require-database require-broker-key ## Запасной путь к POST /v1/broker-access (BROKER=..., ENVIRONMENT=prod|sandbox)
+broker-access: require-database require-broker-key ## Fallback path to POST /v1/broker-access (BROKER=..., ENVIRONMENT=prod|sandbox)
 	@test -n "$(ENVIRONMENT)" || { \
-		echo "ENVIRONMENT не задана: prod или sandbox — токены у сред разные." >&2; \
+		echo "ENVIRONMENT is not set: prod or sandbox — tokens differ between environments." >&2; \
 		echo "  make broker-access BROKER=$(BROKER) ENVIRONMENT=sandbox" >&2; \
 		exit 1; }
 	IAAM_ADD_BROKER_ACCESS="$(BROKER)" IAAM_BROKER_ENVIRONMENT="$(ENVIRONMENT)" \

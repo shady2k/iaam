@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Независимый эталон XIRR (§15.4).
+"""Independent XIRR reference implementation (§15.4).
 
-Реализация намеренно другая, чем в ядре: бисекция на 50 знаках десятичной
-арифметики (`decimal`), без метода Ньютона и без двоичной плавающей точки.
-Общего кода с продакшеном нет — он на другом языке.
+An intentionally different implementation from the core: bisection using 50-digit
+decimal arithmetic (`decimal`), without Newton's method and without binary floating point.
+No code is shared with production—it is written in another language.
 
-Значения замораживаются в tests/fixtures/xirr_cases.json и после этого
-не пересчитываются ради зелёного теста (§15.7).
+Values are frozen in tests/fixtures/xirr_cases.json and are not
+recalculated afterward just to keep a test green (§15.7).
 """
 
 import datetime
@@ -19,9 +19,9 @@ YEAR = Decimal(365)
 
 
 def sign(value: Decimal) -> int:
-    """Знак числа. Decimal.copy_sign сюда не годится: он возвращает величину
-    со знаком аргумента, то есть сравнение copy_sign(1) сравнивало бы модули
-    и всегда давало бы «знак не менялся»."""
+    """Sign of a number. Decimal.copy_sign is not suitable here: it returns a magnitude
+    with the sign of the argument, meaning that comparison with copy_sign(1) would compare
+    absolute values and would always report "sign unchanged"."""
     if value > 0:
         return 1
     if value < 0:
@@ -30,8 +30,8 @@ def sign(value: Decimal) -> int:
 
 
 def npv(rate: Decimal, flows) -> Decimal:
-    """Приведённая стоимость. Степень с дробным показателем считается
-    через exp(ln), потому что Decimal не умеет возведения в дробную степень."""
+    """Discounted value. A power with a fractional exponent is computed
+    through exp(ln), because Decimal cannot raise to a fractional power."""
     base = Decimal(1) + rate
     total = Decimal(0)
     d0 = flows[0][0]
@@ -42,11 +42,11 @@ def npv(rate: Decimal, flows) -> Decimal:
 
 
 def xirr(flows, low=Decimal("-0.9999"), high=Decimal(100)) -> Decimal:
-    """Бисекция до 40 знаков. Никакого Ньютона — эталон обязан отличаться
-    от проверяемой реализации не только числами, но и методом."""
+    """Bisection to 40 digits. No Newton's method—the reference must differ
+    from the implementation under test not only numerically, but also in its method."""
     f_low = npv(low, flows)
     if sign(f_low) == sign(npv(high, flows)):
-        raise ValueError("знак не меняется на границах диапазона")
+        raise ValueError("sign does not change within the bounds")
     for _ in range(400):
         mid = (low + high) / 2
         f_mid = npv(mid, flows)
@@ -63,6 +63,10 @@ def d(s: str) -> datetime.date:
     return datetime.date.fromisoformat(s)
 
 
+# The case names, comments and the `source` label below stay in Russian on
+# purpose: this script must reproduce tests/fixtures/xirr_cases.json byte for
+# byte, and that file is frozen (§15.7). Translating them changes the frozen
+# fixture, which takes a separate commit with justification and owner approval.
 CASES = [
     {
         "name": "один год, ровно десять процентов",

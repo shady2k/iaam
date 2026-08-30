@@ -1,10 +1,10 @@
-//! Приёмка этапа 1 (§16.3): по одному счёту с ручным вводом система
-//! отвечает, сколько внесено, сколько выведено и какова доходность
-//! до налога.
+//! Stage 1 acceptance (§16.3): for a single account with manual input, the system
+//! reports how much was deposited, how much was withdrawn, and what the return is
+//! before tax.
 //!
-//! Ожидаемая ставка получена независимым эталоном на Python
-//! (`scripts/gen-xirr-fixtures.py`, арифметика `decimal`, 50 знаков),
-//! а не выводом проверяемой программы (§15.5).
+//! The expected rate was obtained from an independent Python reference
+//! (`scripts/gen-xirr-fixtures.py`, `decimal` arithmetic, 50 digits),
+//! rather than from the output of the program under test (§15.5).
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates, TradeDate};
@@ -48,7 +48,7 @@ impl Fixture {
     fn provenance(&self) -> Provenance {
         Provenance::new(
             self.source,
-            RawHash::parse(&"a".repeat(64)).expect("хеш фикстуры"),
+            RawHash::parse(&"a".repeat(64)).expect("fixture hash"),
             ParserVersion("manual/1".into()),
         )
     }
@@ -80,14 +80,14 @@ fn qty(units: i64) -> Quantity {
     Quantity(Dec::new(Decimal::from(units)))
 }
 
-/// Ручной ввод: пополнение, покупка, дивиденд, вывод, оценка.
+/// Manual input: deposit, purchase, dividend, withdrawal, valuation.
 fn journal(fixture: &mut Fixture) -> Vec<Event> {
     let deposit = rub(10_000_000);
     let gross = rub(9_000_000);
-    // Комиссия сделки задаётся ПОЛОЖИТЕЛЬНОЙ величиной: `trade_settlement`
-    // прибавляет её к телу сделки и уже потом меняет знак при покупке
-    // (у продажи — вычитает из выручки). Отрицательная комиссия здесь
-    // уменьшила бы стоимость покупки — проверено: `AmountMismatch`.
+    // The trade fee is specified as a POSITIVE amount: `trade_settlement`
+    // adds it to the trade principal and only then changes the sign for a purchase
+    // (for a sale, it subtracts it from the proceeds). A negative fee here
+    // would reduce the purchase cost — verified: `AmountMismatch`.
     let fee = rub(10_000);
     let dividend = rub(300_000);
     let withdrawal = rub(-1_000_000);
@@ -177,31 +177,31 @@ fn single_account_answers_the_three_questions_of_stage_one() {
         lot_rule: LotRuleVersion(1),
     };
 
-    let projection = project(&events, &ctx).expect("проекция строится");
+    let projection = project(&events, &ctx).expect("projection builds successfully");
     let state = projection.state();
 
-    // Деньги: 100 000 − 90 100 + 3 000 − 10 000 = 2 900 рублей.
+    // Cash: 100 000 − 90 100 + 3 000 − 10 000 = 2 900 rubles.
     assert_eq!(
         state.balances().cash(fixture.account, CurrencyCode::Rub),
         Some(rub(290_000))
     );
-    // Позиция: 100 бумаг, стоимость приобретения 90 100 рублей.
+    // Position: 100 securities, acquisition cost 90 100 rubles.
     assert_eq!(
         state
             .balances()
             .quantity_of(fixture.account, fixture.instrument)
-            .expect("количество"),
+            .expect("quantity"),
         qty(100)
     );
 
-    // Инварианты проверены, а не просто «не упало»: отчёт перечисляет,
-    // что именно проверялось.
+    // The invariants were checked, not merely «it did not crash»: the report lists
+    // exactly what was checked.
     assert!(!projection.invariants().checked().is_empty());
 
     let fx = FxTable::new(FxSource::OwnerSupplied);
-    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
-    // а не подтверждение данных. Пустые реестр и оценка означают
-    // «ничего не подтверждено», что для расчёта нейтрально.
+    // Reconciliation and the perimeter are not involved in this test: it checks the calculation,
+    // not data confirmation. An empty registry and valuation mean
+    // «nothing has been confirmed», which is neutral for the calculation.
     let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
     let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
         iaam_core::perimeter::PerimeterPolicy::default(),
@@ -229,19 +229,19 @@ fn single_account_answers_the_three_questions_of_stage_one() {
         report.withdrawn.value(),
         Some(&Dec::new(Decimal::from(10_000)))
     );
-    // 2 900 денег + 100 бумаг по 1 000 = 102 900.
+    // 2 900 in cash + 100 securities at 1 000 = 102 900.
     assert_eq!(
         report.terminal_value.value(),
         Some(&Dec::new(Decimal::from(102_900)))
     );
 
-    let outcome = report.xirr.value().expect("ставка вычислена");
+    let outcome = report.xirr.value().expect("rate computed");
     let expected = 0.133_270_341_032_f64;
     assert!(
         (outcome.rate().value() - expected).abs() < 1e-7,
-        "ставка {} против эталонной {expected}",
+        "rate {} versus reference {expected}",
         outcome.rate().value()
     );
-    // Дивиденд границу контура не пересекает: он не является вложением.
+    // The dividend does not cross the perimeter boundary: it is not an investment.
     assert_eq!(state.flows().external().len(), 2);
 }

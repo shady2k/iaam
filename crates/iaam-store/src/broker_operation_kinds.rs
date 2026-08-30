@@ -1,19 +1,19 @@
-//! Словарь видов операций канала (§14, эпик iaam-d8b.2.2).
+//! Dictionary of channel operation kinds (§14, iaam-d8b.2.2 epic).
 //!
-//! Соответствие «код источника → вид операции» — это **данные**,
-//! а не код: множество кодов принадлежит брокеру, меняется без нашего
-//! участия и пополняется чаще, чем выходят релизы. Пока оно жило
-//! в `match`, о новом коде система узнавала из отклонённой строки
-//! импорта — то есть тогда, когда владелец уже пытался что-то посчитать.
+//! The “source code → operation kind” mapping is **data**,
+//! not code: the set of codes belongs to the broker, changes without our
+//! involvement, and grows more often than releases are published. While it lived
+//! in `match`, the system learned of a new code from a rejected import row
+//! — that is, when the owner had already tried to calculate something.
 //!
-//! Вид хранится строкой и хранилищем **не толкуется** — по той же
-//! причине, что область прав и среда доступа: разбирает её `iaam-broker`,
-//! которому этот словарь принадлежит по смыслу. Закрытость списка
-//! стережёт `CHECK` схемы, а не код этого модуля.
+//! The kind is stored as a string and is **not interpreted** by storage — for the same
+//! reason as the permissions scope and access environment: it is parsed by `iaam-broker`,
+//! which semantically owns this dictionary. The list's closed nature
+//! is enforced by the schema's `CHECK`, not by this module's code.
 //!
-//! Владельца в ключе нет: словарь описывает брокерское API, а не
-//! владельца. `OPERATION_TYPE_COUPON` означает купон у всех, кто ходит
-//! в T-Invest.
+//! The owner is not part of the key: the dictionary describes the broker API, not
+//! the owner. `OPERATION_TYPE_COUPON` means a coupon for everyone using T-Invest.
+//! in T-Invest.
 
 use std::collections::BTreeMap;
 
@@ -22,16 +22,16 @@ use rusqlite::{TransactionBehavior, params};
 use crate::documents::BrokerCode;
 use crate::{SqliteStore, StoreError, now};
 
-/// Откуда взялась строка словаря.
+/// Origin of the dictionary entry.
 ///
-/// Различать обязательно: обновление словаря из контракта не имеет
-/// права затирать решение владельца, а без происхождения эти две
-/// строки неотличимы.
+/// Distinguishing them is mandatory: updating the dictionary from the contract has no
+/// right to overwrite the owner's decision, and without the origin these two
+/// entries are indistinguishable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KindOrigin {
-    /// Из опубликованного контракта брокера.
+    /// From the broker's published contract.
     Contract,
-    /// Решение владельца.
+    /// The owner's decision.
     Owner,
 }
 
@@ -45,20 +45,20 @@ impl KindOrigin {
     }
 }
 
-/// Строка словаря, предлагаемая к записи.
+/// Dictionary entry proposed for writing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerOperationKind {
-    /// Как вид назвал канал.
+    /// The kind under which the channel was named.
     pub source_kind: String,
-    /// Во что он превращается. Толкует `iaam-broker`.
+    /// What it turns into. Interpreted by `iaam-broker`.
     pub kind: String,
 }
 
-/// Сколько строк словарь принял и сколько уже знал.
+/// How many entries the dictionary accepted and how many it already knew.
 ///
-/// Возвращается, а не пишется в журнал: обновление словаря обязано
-/// уметь сказать, что именно изменилось, иначе «прошло успешно»
-/// неотличимо от «не сделало ничего».
+/// Returned rather than logged: dictionary updates must
+/// be able to say exactly what changed; otherwise “succeeded”
+/// is indistinguishable from “did nothing”.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DictionaryOutcome {
     pub added: usize,
@@ -66,12 +66,12 @@ pub struct DictionaryOutcome {
 }
 
 impl SqliteStore {
-    /// Пополнить словарь канала из контракта.
+    /// Populate the channel dictionary from the contract.
     ///
-    /// Существующие строки **не** трогаются, и решение владельца
-    /// в том числе: обновление добавляет то, чего не было, а не
-    /// переписывает то, что есть. Иначе ночной прогон бесшумно
-    /// отменял бы разбор, заведённый руками.
+    /// Existing entries are **not** touched, and the owner's decision
+    /// also means: the update adds what was missing rather than
+    /// overwriting what exists. Otherwise the nightly run would silently
+    /// cancel a manually configured interpretation.
     pub fn extend_broker_operation_kinds(
         &mut self,
         broker: &BrokerCode,
@@ -109,10 +109,10 @@ impl SqliteStore {
         Ok(outcome)
     }
 
-    /// Записать решение владельца о виде.
+    /// Record the owner's decision about the kind.
     ///
-    /// Оно перекрывает строку из контракта: владелец знает про свой
-    /// портфель то, чего в контракте нет.
+    /// It overrides the contract entry: the owner knows about their
+    /// portfolio what the contract does not.
     pub fn set_broker_operation_kind(
         &mut self,
         broker: &BrokerCode,
@@ -142,10 +142,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Весь словарь канала одним чтением.
+    /// The entire channel dictionary in a single read.
     ///
-    /// Не «вид по коду»: разбор идёт пачкой, и запрос на строку
-    /// превратил бы одну выгрузку в тысячу обращений к базе.
+    /// Not “kind by code”: parsing is batched, and a per-row query
+    /// would turn one export into a thousand database calls.
     pub fn broker_operation_kinds(
         &self,
         broker: &BrokerCode,

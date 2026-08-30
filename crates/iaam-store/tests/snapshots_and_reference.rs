@@ -1,4 +1,4 @@
-//! Снимки, справочники и версии контуров.
+//! Snapshots, reference data, and contour versions.
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -69,12 +69,12 @@ fn purchase(owner: OwnerId, account: AccountId, instrument: InstrumentId) -> Eve
     event
 }
 
-/// Убрать поле из снимка, представленного значением CBOR.
+/// Remove a field from a snapshot represented as a CBOR value.
 ///
-/// Именно CBOR, а не JSON: карты состояния имеют составные ключи, и
-/// `serde_json` их не берёт — попытка пройти снимок через JSON падает
-/// с «key must be a string». Ради этого проект и хранит снимки в CBOR
-/// (см. комментарий к зависимости `ciborium` в `iaam-core/Cargo.toml`).
+/// Specifically CBOR, not JSON: state maps have composite keys, and
+/// `serde_json` cannot handle them—the attempt to pass the snapshot through JSON fails
+/// with “key must be a string”. That is why the project stores snapshots in CBOR
+/// (see the comment for the `ciborium` dependency in `iaam-core/Cargo.toml`).
 fn strip_acquisition_basis(value: &mut ciborium::value::Value) {
     match value {
         ciborium::value::Value::Map(entries) => {
@@ -94,8 +94,8 @@ fn strip_acquisition_basis(value: &mut ciborium::value::Value) {
 
 #[test]
 fn a_snapshot_survives_a_write_and_a_read() {
-    // Состояние содержит карты с составными ключами: JSON их не берёт,
-    // поэтому снимок хранится в CBOR. Тест ловит возврат к JSON.
+    // The state contains maps with composite keys: JSON cannot handle them,
+    // so the snapshot is stored in CBOR. The test catches a regression to JSON.
     let store = SqliteStore::open_in_memory().unwrap();
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -116,7 +116,7 @@ fn a_snapshot_survives_a_write_and_a_read() {
     let loaded = store
         .load_snapshot(owner, contour.id(), contour.version(), LotRuleVersion(1))
         .unwrap()
-        .expect("снимок найден");
+        .expect("snapshot found");
 
     assert_eq!(loaded.fingerprint(), snapshot.fingerprint());
     assert_eq!(
@@ -159,7 +159,7 @@ fn a_projection_snapshot_written_before_acquisition_basis_loads() {
     let loaded = store
         .load_snapshot(owner, contour.id(), contour.version(), LotRuleVersion(1))
         .unwrap()
-        .expect("старый снимок найден");
+        .expect("old snapshot found");
     let entry = loaded
         .state()
         .book()
@@ -167,7 +167,7 @@ fn a_projection_snapshot_written_before_acquisition_basis_loads() {
             account,
             instrument,
         })
-        .expect("лот восстановлен");
+        .expect("lot restored");
     assert_eq!(entry.lots()[0].acquisition_basis, None);
     assert_eq!(
         entry.lots()[0].cost_basis,
@@ -211,8 +211,8 @@ fn saving_a_snapshot_twice_replaces_it() {
 
 #[test]
 fn a_contour_version_cannot_be_edited_in_place() {
-    // Изменение состава контура задним числом молча переписало бы
-    // историческую доходность (§4.10).
+    // Changing the contour composition retroactively would silently rewrite
+    // historical returns (§4.10).
     let mut store = SqliteStore::open_in_memory().unwrap();
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -221,20 +221,20 @@ fn a_contour_version_cannot_be_edited_in_place() {
         .upsert_account(&AccountRecord {
             id: account,
             owner,
-            title: "Брокерский".into(),
+            title: "Brokerage".into(),
             institution: None,
         })
         .unwrap();
     store
-        .insert_contour_version(owner, &contour, "Мой портфель", &[account])
+        .insert_contour_version(owner, &contour, "My portfolio", &[account])
         .unwrap();
 
     let update = store
         .connection()
-        .execute("UPDATE contour_accounts SET account = 'подмена'", []);
+        .execute("UPDATE contour_accounts SET account = 'replacement'", []);
     assert!(
         update.is_err(),
-        "UPDATE состава контура обязан быть отклонён"
+        "UPDATE contour composition must be rejected"
     );
 
     let loaded = store
@@ -255,8 +255,8 @@ fn accounts_round_trip() {
     let record = AccountRecord {
         id: AccountId::new_random(),
         owner,
-        title: "Брокерский".into(),
-        institution: Some("Т-Банк".into()),
+        title: "Brokerage".into(),
+        institution: Some("T-Bank".into()),
     };
     store.upsert_account(&record).unwrap();
     assert_eq!(store.list_accounts(owner).unwrap(), vec![record]);
@@ -268,18 +268,18 @@ fn a_revoked_token_is_not_found() {
     let record = TokenRecord {
         id: Uuid::new_v4(),
         owner: OwnerId::new_random(),
-        label: "агент".into(),
+        label: "agent".into(),
         scope: TokenScope::Agent,
         revoked: false,
     };
-    store.insert_token(&record, "хеш-токена").unwrap();
+    store.insert_token(&record, "token-hash").unwrap();
     assert_eq!(
-        store.find_token("хеш-токена").unwrap(),
+        store.find_token("token-hash").unwrap(),
         Some(record.clone())
     );
 
     store.revoke_token(record.owner, record.id).unwrap();
-    assert_eq!(store.find_token("хеш-токена").unwrap(), None);
+    assert_eq!(store.find_token("token-hash").unwrap(), None);
 }
 
 #[test]
@@ -292,8 +292,8 @@ fn an_agent_token_may_submit_but_not_administer() {
 
 #[test]
 fn a_contour_cannot_include_an_account_of_another_owner() {
-    // Контур из чужих счетов — это доступ к чужим деньгам, а не ошибка
-    // ввода. Отказывает база по внешнему ключу (owner, account) (§14).
+    // A contour containing someone else's accounts is access to someone else's money, not an input error.
+    // The database rejects it via the foreign key (owner, account) (§14).
     let mut store = SqliteStore::open_in_memory().unwrap();
     let owner = OwnerId::new_random();
     let stranger = OwnerId::new_random();
@@ -302,7 +302,7 @@ fn a_contour_cannot_include_an_account_of_another_owner() {
         .upsert_account(&AccountRecord {
             id: foreign_account,
             owner: stranger,
-            title: "Чужой".into(),
+            title: "Someone else's".into(),
             institution: None,
         })
         .unwrap();
@@ -311,12 +311,12 @@ fn a_contour_cannot_include_an_account_of_another_owner() {
     let attempt = store.insert_contour_version(
         owner,
         &ContourDefinition::new(contour, ContourVersion(1), [foreign_account]),
-        "Чужие деньги",
+        "Someone else's money",
         &[foreign_account],
     );
     assert!(
         attempt.is_err(),
-        "чужой счёт в контуре обязан быть отклонён"
+        "a foreign account in the contour must be rejected"
     );
 }
 
@@ -330,7 +330,7 @@ fn a_contour_of_another_owner_is_not_found() {
         .upsert_account(&AccountRecord {
             id: account,
             owner,
-            title: "Свой".into(),
+            title: "Own".into(),
             institution: None,
         })
         .unwrap();
@@ -339,12 +339,12 @@ fn a_contour_of_another_owner_is_not_found() {
         .insert_contour_version(
             owner,
             &ContourDefinition::new(contour, ContourVersion(1), [account]),
-            "Мой",
+            "Mine",
             &[account],
         )
         .unwrap();
 
-    // Знание идентификатора не даёт доступа.
+    // Knowing the identifier does not grant access.
     assert_eq!(
         store
             .load_contour(stranger, contour, ContourVersion(1))
@@ -367,19 +367,19 @@ fn an_account_of_another_owner_is_not_overwritten() {
         .upsert_account(&AccountRecord {
             id,
             owner,
-            title: "Мой счёт".into(),
+            title: "My account".into(),
             institution: None,
         })
         .unwrap();
-    // Тот же идентификатор, другой владелец: строка не должна измениться.
+    // The same identifier, a different owner: the row must not change.
     let attempt = store.upsert_account(&AccountRecord {
         id,
         owner: stranger,
-        title: "Захвачено".into(),
+        title: "Taken over".into(),
         institution: None,
     });
-    assert!(attempt.is_ok(), "конфликт не должен быть ошибкой записи");
-    assert_eq!(store.list_accounts(owner).unwrap()[0].title, "Мой счёт");
+    assert!(attempt.is_ok(), "the conflict must not be a write error");
+    assert_eq!(store.list_accounts(owner).unwrap()[0].title, "My account");
     assert!(store.list_accounts(stranger).unwrap().is_empty());
 }
 
@@ -411,9 +411,9 @@ fn a_snapshot_of_another_owner_is_not_found() {
 
 #[test]
 fn dropping_a_snapshot_actually_removes_it() {
-    // Единственное удаление в хранилище обязано удалять. Метод, молча
-    // возвращающий успех, оставляет протухший кэш и делает следующий
-    // `advance` продвижением снимка, который решили выбросить.
+    // The only deletion in the store must actually delete. A method that silently
+    // returns success leaves a stale cache and makes the next
+    // `advance` advance a snapshot that was meant to be discarded.
     let store = SqliteStore::open_in_memory().unwrap();
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -443,22 +443,22 @@ fn dropping_a_snapshot_actually_removes_it() {
             .load_snapshot(owner, contour.id(), contour.version(), LotRuleVersion(1))
             .unwrap()
             .is_none(),
-        "снимок обязан исчезнуть, а не остаться протухшим кэшем"
+        "the snapshot must disappear, not remain as a stale cache"
     );
 }
 
 #[test]
 fn an_upserted_instrument_reaches_the_table() {
-    // Справочник читается задачей приёмки, а не этой крейтой, поэтому
-    // проверка идёт прямым запросом: без неё запись инструмента можно
-    // заменить на молчаливый успех, и приёмка перестала бы находить
-    // инструмент, который «уже добавили».
+    // The reference is read by the acceptance test, not this crate, so
+    // the check uses a direct query: without it, the instrument write could
+    // be replaced with a silent success, and the acceptance test would stop finding
+    // the instrument that was “already added”.
     let store = SqliteStore::open_in_memory().unwrap();
     let instrument = InstrumentRecord {
         id: InstrumentId::new_random(),
         kind: Some(InstrumentKind::Share),
         symbol: "SBER".into(),
-        title: "Сбербанк, обыкновенные".into(),
+        title: "Sberbank common shares".into(),
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
     };
@@ -471,12 +471,12 @@ fn an_upserted_instrument_reaches_the_table() {
             [instrument.id.inner().to_string()],
             |row| row.get(0),
         )
-        .expect("инструмент найден в таблице");
+        .expect("instrument found in the table");
     assert_eq!(symbol, "SBER");
 
-    // Повторный вызов обновляет, а не задваивает.
+    // A repeated call updates rather than creates a duplicate.
     let renamed = InstrumentRecord {
-        title: "Сбербанк России, ао".into(),
+        title: "Sberbank Russia ordinary shares".into(),
         ..instrument
     };
     store.upsert_instrument(&renamed).unwrap();
@@ -489,14 +489,14 @@ fn an_upserted_instrument_reaches_the_table() {
 
 #[test]
 fn every_use_of_a_token_is_recorded_including_the_rejected_one() {
-    // Журнал использования нужен ровно ради отклонённых попыток (§14).
-    // Метод, возвращающий успех без записи, оставляет их невидимыми.
+    // The usage log exists specifically for rejected attempts (§14).
+    // A method that returns success without recording them leaves them invisible.
     let store = SqliteStore::open_in_memory().unwrap();
     let owner = OwnerId::new_random();
     let record = TokenRecord {
         id: Uuid::new_v4(),
         owner,
-        label: "агент".into(),
+        label: "agent".into(),
         scope: TokenScope::Agent,
         revoked: false,
     };
@@ -522,9 +522,9 @@ fn every_use_of_a_token_is_recorded_including_the_rejected_one() {
 
 #[test]
 fn every_token_scope_survives_a_round_trip_through_its_code() {
-    // Область действия токена хранится строкой. Разбор, потерявший
-    // ветку, молча превратил бы владельца в «неизвестно» — или, хуже,
-    // читателя в агента, если бы ветки перепутались.
+    // The token scope is stored as a string. A parser that drops
+    // a branch would silently turn the owner into “unknown”—or, worse,
+    // the reader into an agent if the branches were swapped.
     for scope in [TokenScope::Owner, TokenScope::Agent, TokenScope::ReadOnly] {
         assert_eq!(TokenScope::parse(scope.code()), Some(scope));
     }

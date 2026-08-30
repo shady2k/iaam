@@ -1,4 +1,4 @@
-//! Доменные права и условия окон оферты.
+//! Domain rights and offer-window terms.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,7 +11,7 @@ use crate::numeric::decimal::Dec;
 
 const OFFER_WINDOW_NAMESPACE: Uuid = Uuid::from_u128(0x6d8f_7dc6_9f8a_4d9b_8e3e_5b3a_8f9d_2c11);
 
-/// Право, которое описывает строка окна в справочном графике.
+/// A right represented by a window row in the reference schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OfferRight {
     HolderPut,
@@ -21,10 +21,11 @@ pub enum OfferRight {
 }
 
 impl OfferRight {
-    /// Перевести доменное значение словаря `offer_kind` в закрытый тип.
+    /// Translate the domain value from the `offer_kind` dictionary into a
+    /// closed type.
     ///
-    /// Неизвестное значение — отказ: `Other` доступен только если словарь
-    /// явно сообщил именно это значение.
+    /// An unknown value is a refusal: `Other` is available only when the
+    /// dictionary explicitly reports that exact value.
     pub fn from_dictionary_meaning(meaning: &str) -> Result<Self, OfferWindowError> {
         match meaning {
             "put_option" => Ok(Self::HolderPut),
@@ -38,7 +39,7 @@ impl OfferRight {
     }
 }
 
-/// Типизированные условия одного окна оферты.
+/// Typed terms for one offer window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferWindowTerms {
     pub window: OfferWindowId,
@@ -50,9 +51,9 @@ pub struct OfferWindowTerms {
 }
 
 impl OfferWindowId {
-    /// Вывести устойчивый идентификатор окна из выпуска и даты исполнения.
+    /// Derive a stable window identifier from the issue and execution date.
     ///
-    /// Свободная формулировка вида источника намеренно не участвует в имени.
+    /// Free-form wording from the source intentionally does not enter the name.
     #[must_use]
     pub fn derive(instrument: InstrumentId, execution_date: Date) -> Self {
         let mut name = Vec::with_capacity(16 + 1 + 10);
@@ -63,16 +64,16 @@ impl OfferWindowId {
     }
 }
 
-/// Ошибка структурного перевода окон графика.
+/// Structural error while translating schedule windows.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum OfferWindowError {
-    #[error("несколько окон оферты имеют дату исполнения {execution_date}")]
+    #[error("multiple offer windows have execution date {execution_date}")]
     AmbiguousWindow { execution_date: Date },
-    #[error("неизвестное доменное значение права оферты: {meaning}")]
+    #[error("unknown domain offer right: {meaning}")]
     UnknownRight { meaning: String },
 }
 
-/// Проверить, что в снимке нет двух неразличимых окон.
+/// Verify that the snapshot has no two indistinguishable windows.
 pub fn validate_unique_windows(windows: &[OfferWindowTerms]) -> Result<(), OfferWindowError> {
     let mut dates = std::collections::BTreeSet::new();
     for window in windows {
@@ -85,44 +86,44 @@ pub fn validate_unique_windows(windows: &[OfferWindowTerms]) -> Result<(), Offer
     Ok(())
 }
 
-/// Вердикт уже выполненной проверки полноты источника.
+/// Verdict from an already completed source-completeness check.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScheduleCompleteness {
     Validated,
     Incomplete {
         reason: String,
     },
-    /// Умолчание намеренно `Unknown`, а не `Validated`: снимок без
-    /// записанного вердикта полноты не является проверенным.
+    /// The default is intentionally `Unknown`, not `Validated`: a snapshot
+    /// without a recorded completeness verdict has not been checked.
     #[default]
     Unknown,
 }
 
-/// Сценарий, который владелец сравнивает в отчёте.
+/// Scenario that the owner compares in the report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OfferChoice {
     HoldToMaturity,
     ExerciseAtOffer { window: OfferWindowId },
 }
 
-/// Причина, по которой явно запрошенный сценарий оферты нельзя принять.
+/// Reason an explicitly requested offer scenario cannot be accepted.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum OfferChoiceError {
-    #[error("окно оферты {window:?} отсутствует в графике")]
+    #[error("offer window {window:?} is absent from the schedule")]
     UnknownWindow { window: OfferWindowId },
-    #[error("условия расчёта окна оферты {window:?} неизвестны")]
+    #[error("settlement terms for offer window {window:?} are unknown")]
     SettlementTermsUnknown { window: OfferWindowId },
-    #[error("право окна оферты {window:?} не принадлежит владельцу")]
+    #[error("the right for offer window {window:?} does not belong to the holder")]
     RightIsNotHolders { window: OfferWindowId },
-    /// Словарь источника классифицировал право как то, которого мы не
-    /// моделируем. Это не то же самое, что право эмитента: сказать
-    /// владельцу «право не ваше» про неизвестную нам конструкцию значит
-    /// назвать отказ чужой причиной.
-    #[error("право окна оферты {window:?} не моделируется")]
+    /// The source dictionary classified the right as something we do not
+    /// model. This is not the same as an issuer right: telling the holder
+    /// “this is not your right” for an unknown construct names the refusal
+    /// with someone else's reason.
+    #[error("offer window {window:?} right is not modelled")]
     RightNotModelled { window: OfferWindowId },
 }
 
-/// Перечислить все сценарии, доступные владельцу на дату среза.
+/// List every scenario available to the owner at the snapshot date.
 #[must_use]
 pub fn available_choices(schedule: &super::BondSchedule, as_of: Date) -> Vec<OfferChoice> {
     let mut choices = vec![OfferChoice::HoldToMaturity];
@@ -142,7 +143,7 @@ pub fn available_choices(schedule: &super::BondSchedule, as_of: Date) -> Vec<Off
     choices
 }
 
-/// Проверить, что сценарий оферты ссылается на известное право и цену.
+/// Validate that an offer scenario refers to a known right and price.
 pub fn validate(
     choice: &OfferChoice,
     schedule: &super::BondSchedule,
@@ -319,8 +320,9 @@ mod tests {
 
     #[test]
     fn an_unmodelled_right_is_refused_by_its_own_reason() {
-        // «Право не ваше» про конструкцию, которую словарь отнёс к прочему,
-        // — отказ с чужой причиной: владелец пошёл бы чинить не то.
+        // “Not your right” for a construct the dictionary classified as other
+        // is a refusal with someone else's reason: the owner would fix the
+        // wrong thing.
         let instrument = crate::ids::InstrumentId::new_random();
         let execution_date = date!(2027 - 01 - 15);
         let window = OfferWindowId::derive(instrument, execution_date);

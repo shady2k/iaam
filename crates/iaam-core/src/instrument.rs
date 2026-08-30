@@ -1,8 +1,8 @@
-//! Справочник инструментов: род, псевдонимы, роли валют (§4.5, §5.4, §7.2).
+//! Instrument catalogue: kind, aliases, and currency roles (§4.5, §5.4, §7.2).
 //!
-//! Здесь только неизменные свойства инструмента. Строка политики
-//! оценки §5.4 зависит ещё и от наличия цены и её возраста на дату,
-//! поэтому выводится функцией в E3.3, а не хранится колонкой.
+//! Only immutable instrument properties belong here. The valuation-policy
+//! sentence in §5.4 also depends on whether a price exists and how old it is
+//! on the relevant date, so E3.3 derives it rather than storing a column.
 
 use serde::{Deserialize, Serialize};
 use time::Date;
@@ -10,26 +10,25 @@ use time::Date;
 use crate::ids::InstrumentId;
 use crate::money::CurrencyCode;
 
-/// Род инструмента. Неизменное свойство: акция не становится облигацией.
+/// Instrument kind. An immutable property: a share does not become a bond.
 ///
-/// Исчерпаемый `enum` без `#[non_exhaustive]` по образцу [`CurrencyCode`]:
-/// добавление рода обязано сломать сборку везде, где его не обработали
-/// (§15.1).
+/// This is an exhaustive `enum`, following [`CurrencyCode`]: adding a kind
+/// must break compilation everywhere it is not handled (§15.1).
 ///
-/// Вариантов `Futures` и `Option` здесь нет намеренно: §11 выводит ПФИ
-/// за периметр вместе с шортами, маржой и РЕПО, и ledger обязательств
-/// не строится. Вариант `Deposit` отсутствует по другой причине: вклад
-/// является счётом, а не инструментом — у него нет ни количества, ни
-/// места хранения (§4.5, и doc-комментарий `AccountId` прямо называет
-/// вклад денежным счётом).
+/// `Futures` and `Option` are intentionally absent: §11 puts derivatives
+/// outside the perimeter together with shorts, margin, and repos, and no
+/// liability ledger is built. `Deposit` is absent for a different reason: a
+/// deposit is an account, not an instrument—it has neither quantity nor a
+/// place of custody (§4.5; the `AccountId` doc comment explicitly calls it a
+/// cash account).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum InstrumentKind {
     Share,
     DepositaryReceipt,
     Bond,
-    /// Биржевой фонд: есть котировка.
+    /// Exchange-traded fund: it has a quote.
     Etf,
-    /// Паевой фонд: расчётная стоимость пая, а не котировка.
+    /// Mutual fund: unit net asset value, not a quote.
     MutualFund,
     Currency,
     Crypto,
@@ -39,8 +38,8 @@ pub enum InstrumentKind {
 }
 
 impl InstrumentKind {
-    /// Все варианты. Существует ради табличных тестов: список,
-    /// собранный руками в тесте, разъедется с `enum` молча.
+    /// All variants. This exists for table-driven tests: a list assembled by
+    /// hand in a test would silently drift from the `enum`.
     pub const ALL: [Self; 10] = [
         Self::Share,
         Self::DepositaryReceipt,
@@ -70,22 +69,22 @@ impl InstrumentKind {
         }
     }
 
-    /// Разбор кода. `None`, а не подстановка умолчания: неизвестный род
-    /// обязан дойти до вызывающего, а не превратиться в акцию (§4.9).
+    /// Parse a code. `None`, rather than a default, ensures an unknown kind
+    /// reaches the caller instead of becoming a share (§4.9).
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.code() == code)
     }
 }
 
-/// Пространство имён внешнего кода инструмента.
+/// Namespace of an external instrument code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AliasNamespace {
     Isin,
     MoexSecid,
     Ticker,
     Figi,
-    /// Внутренний код брокера: у разных брокеров разный для одной бумаги.
+    /// Internal broker code: different brokers use different codes for one security.
     BrokerCode,
 }
 
@@ -117,10 +116,10 @@ impl AliasNamespace {
     }
 }
 
-/// Почему у инструмента есть предшественник (§7.2, §4.7).
+/// Why an instrument has a predecessor (§7.2, §4.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum LineageReason {
-    /// Замещающая облигация.
+    /// Replacement bond.
     Replacement,
     Conversion,
     Merger,
@@ -151,24 +150,24 @@ impl LineageReason {
     }
 }
 
-/// Три роли валюты у одного инструмента (§7.2).
+/// Three currency roles for one instrument (§7.2).
 ///
-/// Структура, а не три позиционных `CurrencyCode`: одинаково
-/// типизированные аргументы подряд переставляются местами незаметно
-/// для компилятора (§15.1). Валюты отчёта здесь нет — она свойство
-/// отчёта и владельца, а не бумаги.
+/// A struct, rather than three positional `CurrencyCode` values: consecutive
+/// arguments of the same type can be swapped without the compiler noticing
+/// (§15.1). The reporting currency does not belong here; it is a property of
+/// the report and owner, not of the security.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrencyRoles {
-    /// Валюта обязательства.
+    /// Liability currency.
     pub denomination: CurrencyCode,
-    /// Валюта расчётов.
+    /// Settlement currency.
     pub settlement: CurrencyCode,
-    /// Валюта котировки.
+    /// Quotation currency.
     pub quote: CurrencyCode,
 }
 
 impl CurrencyRoles {
-    /// Все три роли совпадают — обычный случай рублёвой бумаги.
+    /// All three roles match—the usual case for a rouble-denominated security.
     #[must_use]
     pub const fn uniform(currency: CurrencyCode) -> Self {
         Self {
@@ -179,16 +178,15 @@ impl CurrencyRoles {
     }
 }
 
-/// Интервал действия псевдонима.
+/// Validity interval for an alias.
 ///
-/// Начало включительно, конец исключительно. Полуинтервал выбран,
-/// чтобы смежные интервалы одного кода стыковались без зазора и без
-/// перекрытия: при включительном конце день смены ISIN принадлежал бы
-/// сразу двум записям.
+/// The start is inclusive and the end exclusive. This half-open interval lets
+/// adjacent intervals for one code meet without gaps or overlap: with an
+/// inclusive end, the ISIN-change date would belong to two records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AliasInterval {
     pub valid_from: Date,
-    /// `None` — открытый интервал.
+    /// `None` means an open-ended interval.
     pub valid_to: Option<Date>,
 }
 
@@ -199,7 +197,7 @@ impl AliasInterval {
     }
 }
 
-/// Происхождение инструмента: замещение, конвертация, слияние (§7.2).
+/// Instrument lineage: replacement, conversion, or merger (§7.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lineage {
     pub parent: InstrumentId,

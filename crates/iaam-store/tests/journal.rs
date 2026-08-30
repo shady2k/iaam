@@ -1,4 +1,4 @@
-//! Журнал append-only и идемпотентность.
+//! Append-only journal and idempotency.
 
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
@@ -90,8 +90,8 @@ fn an_event_survives_a_write_and_a_read() {
 
 #[test]
 fn the_journal_is_append_only_at_the_database_level() {
-    // Дисциплина кода не переживает первый же скрипт починки данных,
-    // поэтому запрет живёт в базе (§4.8).
+    // Code discipline does not survive the very first data-repair script,
+    // so the prohibition lives in the database (§4.8).
     let store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let event = ctx.deposit(1, 100_000);
@@ -100,10 +100,10 @@ fn the_journal_is_append_only_at_the_database_level() {
     let update = store
         .connection()
         .execute("UPDATE events SET kind = 'cash_out'", []);
-    assert!(update.is_err(), "UPDATE обязан быть отклонён базой");
+    assert!(update.is_err(), "UPDATE must be rejected by the database");
 
     let delete = store.connection().execute("DELETE FROM events", []);
-    assert!(delete.is_err(), "DELETE обязан быть отклонён базой");
+    assert!(delete.is_err(), "DELETE must be rejected by the database");
 
     assert_eq!(store.load_events(ctx.owner).unwrap().len(), 1);
 }
@@ -148,8 +148,8 @@ fn the_same_source_operation_is_not_recorded_twice() {
 
 #[test]
 fn two_identical_purchases_on_the_same_day_are_both_recorded() {
-    // Естественный ключ «счёт + дата + сумма» слишком слаб: две одинаковые
-    // операции в один день — законная ситуация (§10.6, §15.9).
+    // The natural key “account + date + amount” is too weak: two identical
+    // operations on the same day are a valid situation (§10.6, §15.9).
     let store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     store.append_event(&ctx.deposit(1, 100_000)).unwrap();
@@ -186,10 +186,10 @@ fn migrations_are_idempotent() {
 
 #[test]
 fn the_store_assigns_the_sequence_and_does_not_take_it_from_the_caller() {
-    // Номер внутри дня — свойство журнала, а не пожелание клиента.
-    // Обе операции приходят с номером 1; вторая обязана лечь второй,
-    // иначе порядок внутри дня начнёт определяться случайным
-    // идентификатором вместо объявленной семантики (§4.8).
+    // The within-day number is a property of the journal, not a client request.
+    // Both operations arrive with number 1; the second must be recorded second,
+    // otherwise the order within the day will be determined by a random
+    // identifier instead of the declared semantics (§4.8).
     let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
 
@@ -209,7 +209,7 @@ fn the_store_assigns_the_sequence_and_does_not_take_it_from_the_caller() {
     assert_eq!(
         stored[1].order,
         EffectiveOrder::new(day, 2),
-        "номер обязан быть назначен хранилищем, а не взят из события"
+        "the number must be assigned by the store, not taken from the event"
     );
 }
 #[test]
@@ -242,14 +242,14 @@ fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
             .map_err(|error| error.to_string())
     });
 
-    let first = first.join().expect("первый писатель не должен паниковать");
-    let second = second.join().expect("второй писатель не должен паниковать");
+    let first = first.join().expect("the first writer must not panic");
+    let second = second.join().expect("the second writer must not panic");
     let outcomes = [first, second];
     let successful_writes = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
     let failed_writes = outcomes.iter().filter(|outcome| outcome.is_err()).count();
     assert!(
         (1..=2).contains(&successful_writes),
-        "должен успеть один или оба писателя: {outcomes:?}"
+        "one or both writers must complete in time: {outcomes:?}"
     );
     assert_eq!(successful_writes + failed_writes, 2);
 
@@ -272,7 +272,7 @@ fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
         .unwrap();
     assert!(
         duplicate_sequences.is_empty(),
-        "один порядковый номер выдан дважды: {duplicate_sequences:?}"
+        "one sequence number was issued twice: {duplicate_sequences:?}"
     );
 
     let stored_rows: u32 = verification_store
@@ -287,7 +287,7 @@ fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
         .unwrap();
     assert_eq!(
         stored_rows, successful_writes as u32,
-        "ошибка записи не должна оставлять строку в базе"
+        "a failed write must not leave a row in the database"
     );
 
     let sequences: Vec<u32> = verification_store
@@ -299,6 +299,6 @@ fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
     assert_eq!(
         sequences,
         (1..=successful_writes as u32).collect::<Vec<_>>(),
-        "успешные записи должны занимать последовательность без пропусков"
+        "successful writes must occupy the sequence without gaps"
     );
 }

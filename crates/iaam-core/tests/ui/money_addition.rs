@@ -1,4 +1,4 @@
-//! Деньги нельзя сложить в обход проверки валюты (§15.1).
+//! Money cannot be added while bypassing currency validation (§15.1).
 
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 

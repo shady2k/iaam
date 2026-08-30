@@ -1,12 +1,12 @@
-//! Основания автоматического повышения статуса (§10.3).
+//! Grounds for automatic status promotion (§10.3).
 //!
-//! Восемь оснований спеки плюс девятое — названный владельцем остаток
-//! (§10.4). Участия человека ни одно из первых восьми не требует.
+//! Eight grounds from the spec plus a ninth — the owner-stated balance
+//! (§10.4). None of the first eight requires human involvement.
 //!
-//! **Уровень определяется независимостью канала, а не типом
-//! основания.** Это главное правило модуля: основание задаёт лишь
-//! потолок, а фактический уровень получается понижением потолка до
-//! `internal`, если независимость не доказана.
+//! **The level is determined by channel independence, not by the type
+//! of ground.** This is the module's main rule: the ground only sets
+//! the ceiling, while the actual level is obtained by lowering the ceiling to
+//! `internal` if independence has not been proven.
 
 use std::collections::BTreeSet;
 
@@ -14,11 +14,11 @@ use super::{ConfidenceLevel, Dimension};
 use crate::event::provenance::{ParserVersion, RawHash};
 use crate::ids::SourceId;
 
-/// Канал, которым получены данные.
+/// The channel through which the data was obtained.
 ///
-/// Документ — хеш файла, из которого разобраны данные. У ответа API
-/// документа нет: это поток, а не файл, и `None` здесь означает именно
-/// «файла не было», а не «хеш не посчитали».
+/// A document is the hash of the file from which the data was parsed. An API response
+/// has no document: it is a stream, not a file, and `None` here specifically means
+/// “there was no file”, not “the hash was not computed”.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceChannel {
     pub source: SourceId,
@@ -27,66 +27,66 @@ pub struct SourceChannel {
 }
 
 impl SourceChannel {
-    /// Независим ли этот канал от другого (§10.3).
+    /// Whether this channel is independent of another (§10.3).
     ///
-    /// Критерий спеки: подтверждающие данные не должны проходить через
-    /// **тот же код разбора** и **тот же документ**. Оба условия
-    /// обязательны, поэтому здесь конъюнкция:
+    /// The spec's criterion: confirming data must not pass through
+    /// **the same parsing code** and **the same document**. Both conditions
+    /// are required, so this is a conjunction:
     ///
-    /// - тот же парсер, другой документ — следующий отчёт того же
-    ///   брокера: непрерывность, но не независимость;
-    /// - другой парсер, тот же документ — повторный разбор новой
-    ///   версией: исправленный разбор, но источник тот же.
+    /// - same parser, different document — the next report from the same
+    ///   broker: continuity, but not independence;
+    /// - different parser, same document — reparsing with a new
+    ///   version: corrected parsing, but the source is the same.
     ///
-    /// Идентификатор источника в критерий **не входит**: два источника
-    /// могут делить код разбора, и тогда общая ошибка исказит обе
-    /// стороны, сколько бы разных идентификаторов у них ни было.
+    /// The source identifier is **not part of** the criterion: two sources
+    /// may share parsing code, in which case a common error will corrupt both
+    /// sides, no matter how many different identifiers they have.
     #[must_use]
     pub fn is_independent_of(&self, other: &Self) -> bool {
         self.parser_version != other.parser_version && self.document != other.document
     }
 }
 
-/// Основание повышения статуса.
+/// Ground for status promotion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Ground {
-    /// 1. Начальный остаток следующего отчёта совпал с вычисленным
-    ///    остатком предыдущего периода.
+    /// 1. The opening balance of the next report matched the computed
+    ///    balance of the previous period.
     OpeningMatchesPriorClosing,
-    /// 2. Конечный остаток одного отчёта совпал с начальным следующего.
+    /// 2. The closing balance of one report matched the opening balance of the next.
     ContinuityBetweenStatements,
-    /// 3. API брокера совпал с разобранным отчётом.
+    /// 3. The broker API matched the parsed report.
     BrokerApiAgreesWithStatement,
-    /// 4. Депозитарный отчёт подтвердил количества и место хранения.
+    /// 4. The depository report confirmed the quantities and custody location.
     DepositaryReportConfirms,
-    /// 5. Раздельные контрольные секции одного документа сошлись
-    ///    одновременно.
+    /// 5. Separate control sections of the same document reconciled
+    ///    simultaneously.
     SeparateSectionsAgree,
-    /// 6. Фактическая выплата подтвердила график предшествующего периода.
+    /// 6. The actual payment confirmed the schedule from the preceding period.
     PayoutConfirmsSchedule,
-    /// 7. Количества после корпоративного действия совпали с параметрами
-    ///    выпуска.
+    /// 7. Quantities after the corporate action matched the issue
+    ///    parameters.
     CorporateActionMatchesIssueTerms,
-    /// 8. Справка налогового агента подтвердила агрегаты.
+    /// 8. The tax agent certificate confirmed the aggregates.
     TaxAgentCertificate,
-    /// Названный владельцем остаток (§10.4).
+    /// Owner-stated balance (§10.4).
     ///
-    /// В восемь автоматических оснований не входит: требует участия
-    /// человека. Уровень ограничен `internal` намеренно — владелец мог
-    /// прочитать ту же цифру в том же отчёте, который мы разобрали,
-    /// и независимость здесь не доказана, а §10.3 требует именно
-    /// доказательства, а не типа основания.
+    /// Not one of the eight automatic grounds: it requires human
+    /// involvement. The level is deliberately capped at `internal` — the owner may have
+    /// read the same figure in the same report that we parsed,
+    /// and independence has not been proven here, while §10.3 specifically requires
+    /// proof, not a type of ground.
     OwnerStatedBalance,
 }
 
 impl Ground {
-    /// Потолок уровня, который основание может дать в принципе.
+    /// The maximum level that the ground can provide in principle.
     ///
-    /// Основания 1, 2 и 5 ограничены `internal` **по устройству**: они
-    /// сравнивают данные, прошедшие через один и тот же парсер. Опустить
-    /// это ограничение и положиться на проверку независимости нельзя:
-    /// у оснований 1 и 2 документы разные, и проверка пропустила бы их,
-    /// если бы версия парсера вдруг тоже отличалась.
+    /// Grounds 1, 2, and 5 are capped at `internal` **by design**: they
+    /// compare data that passed through the same parser. This restriction
+    /// cannot be removed in favor of relying on the independence check:
+    /// grounds 1 and 2 use different documents, and the check would let them pass
+    /// if the parser version happened to differ as well.
     #[must_use]
     pub const fn ceiling(self) -> ConfidenceLevel {
         match self {
@@ -102,11 +102,11 @@ impl Ground {
         }
     }
 
-    /// Какие измерения основание вправе повысить.
+    /// Which dimensions the ground may promote.
     ///
-    /// Ограничение существенно: депозитарий не говорит о деньгах,
-    /// справка налогового агента — только об агрегатах, названный
-    /// владельцем остаток — только о снимке (§10.4).
+    /// This restriction matters: a depository says nothing about money,
+    /// a tax agent certificate covers only aggregates, and an owner-stated
+    /// balance covers only a snapshot (§10.4).
     #[must_use]
     pub fn dimensions(self) -> BTreeSet<Dimension> {
         let list: &[Dimension] = match self {
@@ -144,7 +144,7 @@ impl Ground {
         }
     }
 
-    /// Все основания одним списком — для обходов и проверок полноты.
+    /// All grounds in a single list — for iteration and completeness checks.
     #[must_use]
     pub const fn all() -> [Self; 9] {
         [
@@ -161,7 +161,7 @@ impl Ground {
     }
 }
 
-/// Состоявшееся подтверждение.
+/// A successful confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
     ground: Ground,
@@ -171,14 +171,14 @@ pub struct Evidence {
 }
 
 impl Evidence {
-    /// Построение основания из состоявшегося совпадения.
+    /// Constructs a ground from a successful match.
     ///
-    /// Возвращает `None`, когда основание не подтверждает ни одного из
-    /// сошедшихся измерений: основание, ничего не подтверждающее,
-    /// является не пустым основанием, а его отсутствием, и попадание
-    /// такого в список доказательств создавало бы видимость проверки.
+    /// Returns `None` when the ground confirms none of the
+    /// matching dimensions: a ground that confirms nothing
+    /// is not an empty ground but the absence of a ground, and adding
+    /// one to the evidence list would create the appearance of verification.
     ///
-    /// Логика живёт не в `new`: `cargo-mutants` пропускает это имя.
+    /// The logic does not live in `new`: `cargo-mutants` skips this name.
     #[must_use]
     pub fn from_match(
         ground: Ground,
@@ -199,12 +199,12 @@ impl Evidence {
         })
     }
 
-    /// Уровень, который даёт это основание.
+    /// The level granted by this ground.
     ///
-    /// Потолок основания понижается до `internal`, если независимость
-    /// канала не доказана. Обратного хода нет: основание, ограниченное
-    /// `internal` по устройству, ограничено им всегда — проверка канала
-    /// его не повышает.
+    /// The ground's ceiling is lowered to `internal` if channel independence
+    /// has not been proven. There is no reverse path: a ground capped at
+    /// `internal` by design is always capped there — the channel check
+    /// does not promote it.
     #[must_use]
     pub fn level(&self) -> ConfidenceLevel {
         let ceiling = self.ground.ceiling();

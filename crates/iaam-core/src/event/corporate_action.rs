@@ -1,10 +1,10 @@
-//! Корпоративные действия — типизированное семейство (§4.7).
+//! Corporate actions — a typed family (§4.7).
 //!
-//! Один универсальный `corporate_action` с мешком необязательных полей
-//! превратился бы в невалидируемый JSON: инварианта, который отличает
-//! амортизацию от замещения, у такого мешка нет. Здесь у каждого члена
-//! свои поля, и `match` по семейству исчерпывающий — новый член обязан
-//! сломать сборку везде, где его не обработали (§15.1).
+//! A single universal `corporate_action` with a bag of optional fields
+//! would become impossible-to-validate JSON: such a bag has no invariant that
+//! distinguishes amortization from replacement. Here every variant has
+//! its own fields, and the family `match` is exhaustive — a new variant must
+//! break the build everywhere it is not handled (§15.1).
 
 use serde::{Deserialize, Serialize};
 use time::Date;
@@ -13,47 +13,47 @@ use crate::ids::{CustodyId, InstrumentId};
 use crate::money::{Money, PerUnitAmount, Quantity};
 use crate::numeric::decimal::Dec;
 
-/// Корпоративное действие по бумаге.
+/// Corporate action for a security.
 ///
-/// Исчерпаемый `enum` без `#[non_exhaustive]` — по той же причине, что
-/// и [`crate::event::kind::EventKind`]: добавление члена обязано
-/// сломать сборку везде, где разбор не полон (§15.1).
+/// An exhaustive `enum` without `#[non_exhaustive]` — for the same reason as
+/// [`crate::event::kind::EventKind`]: adding a variant must
+/// break the build wherever matching is incomplete (§15.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CorporateAction {
-    /// Амортизация: непогашенный номинал уменьшается, деньги приходят,
-    /// **количество бумаг не меняется** (§6.5).
+    /// Amortization: outstanding face value decreases, cash is received,
+    /// **the number of securities does not change** (§6.5).
     PartialRedemption {
         instrument: InstrumentId,
-        /// Место хранения — факт о выплате, а **не** ключ выборки лотов:
-        /// `LotKey` намеренно не различает депозитарии
-        /// (`projection/lots.rs`), и перенос бумаги между ними партии
-        /// не создаёт.
+        /// Custody location is a fact about the payment, **not** a lot lookup key:
+        /// `LotKey` intentionally does not distinguish between depositories
+        /// (`projection/lots.rs`), and moving a security between them
+        /// does not create a lot.
         custody: CustodyId,
-        /// Количество, которого касается выплата. Проекция его сверяет,
-        /// а не масштабирует по нему номинал: расхождение с позицией —
-        /// брак источника, а не повод пересчитать.
+        /// The quantity covered by the payment. The projection checks it,
+        /// rather than scaling face value by it: a position mismatch —
+        /// bad source data, not a reason to recalculate.
         quantity: Quantity,
         principal_returned_per_unit: PerUnitAmount,
-        /// Денежная компенсация, фактически поступившая владельцу.
-        /// Она может отличаться от возвращённого номинала — на удержанный
-        /// налог, например, — и потому записывается отдельно.
+        /// Cash compensation actually received by the holder.
+        /// It may differ from the face value repaid — because of withheld
+        /// tax, for example — and is therefore recorded separately.
         compensation: Money,
         effective_date: Date,
         record_date: Option<Date>,
         grounds: Option<String>,
-        /// Доля непогашенного номинала, возвращённая этим событием.
+        /// The portion of outstanding face value repaid by this event.
         ///
-        /// Умолчание `Unknown` честное: событие, записанное до появления
-        /// поля, действительно ничего не утверждало.
+        /// Defaulting to `Unknown` is honest: an event recorded before this
+        /// field existed really asserted nothing.
         #[serde(default)]
         basis_allocation: crate::event::allocation::BasisAllocation,
     },
-    /// Окончательное погашение: номинал возвращён целиком и бумага
-    /// выбывает из позиции.
+    /// Final redemption: face value is repaid in full and the security
+    /// is removed from the position.
     ///
-    /// Отдельный член, а не амортизация до нуля: обнулить остаток и
-    /// оставить количество значило бы держать позицию из погашенных
-    /// бумаг, которой не существует.
+    /// A separate variant rather than amortization to zero: zeroing the balance and
+    /// leaving the quantity would mean retaining a position in redeemed
+    /// securities, which does not exist.
     Redemption {
         instrument: InstrumentId,
         custody: CustodyId,
@@ -64,24 +64,24 @@ pub enum CorporateAction {
         record_date: Option<Date>,
         grounds: Option<String>,
     },
-    /// Замещение: бумага предшественника меняется на бумагу преемника.
+    /// Replacement: a predecessor security is exchanged for a successor security.
     ///
-    /// Поля подобраны так, чтобы E5 посчитал перенос налоговой стоимости
-    /// и срока владения, ничего не угадывая (§16.1). Правило переноса
-    /// хранится в самом факте: вывести его позже будет нечем — условия
-    /// замещения живут в решении эмитента, а не в справочнике.
+    /// The fields are chosen so E5 can calculate the carryover of tax basis
+    /// and holding period without guessing (§16.1). The carryover rule
+    /// is stored in the fact itself: it cannot be inferred later — the terms
+    /// of the replacement are set by the issuer's decision, not reference data.
     Conversion {
         predecessor: InstrumentId,
         successor: InstrumentId,
         custody: CustodyId,
-        /// Сколько бумаг преемника приходится на одну бумагу
-        /// предшественника.
+        /// How many successor securities are received for one
+        /// predecessor security.
         ratio: Dec,
         quantity_in: Quantity,
         quantity_out: Quantity,
         fractional: FractionalTreatment,
-        /// Компенсация дробей. Как она влияет на налоговую базу —
-        /// правило E5; часть 1 её только сохраняет.
+        /// Cash in lieu of fractions. Its tax-basis treatment —
+        /// an E5 rule; part 1 only stores the compensation.
         compensation: Option<Money>,
         effective_date: Date,
         record_date: Option<Date>,
@@ -91,8 +91,8 @@ pub enum CorporateAction {
 }
 
 impl CorporateAction {
-    /// Имя члена для диагностики и заслонов. Тот же приём, что
-    /// у [`crate::event::kind::EventKind::discriminant`].
+    /// Variant name for diagnostics and guards. The same approach as
+    /// in [`crate::event::kind::EventKind::discriminant`].
     #[must_use]
     pub const fn discriminant(&self) -> &'static str {
         match self {
@@ -102,8 +102,8 @@ impl CorporateAction {
         }
     }
 
-    /// Дата вступления в силу — идентичность факта, поэтому обязательна
-    /// у каждого члена и достаётся без разбора семейства.
+    /// The effective date is part of the fact's identity — consequently, it is required
+    /// for every variant and available without inspecting the family.
     #[must_use]
     pub const fn effective_date(&self) -> Date {
         match self {
@@ -113,9 +113,9 @@ impl CorporateAction {
         }
     }
 
-    /// Дата фиксации реестра. Необязательна у каждого члена: источник
-    /// её сообщает не всегда, а выдумать её нечем — `None` означает
-    /// «не утверждалось», а не «совпадает с датой вступления в силу».
+    /// The record date. Optional for every variant: the source
+    /// does not always provide it, and it cannot be invented — `None` means
+    /// «not asserted», not «the same as the effective date».
     #[must_use]
     pub const fn record_date(&self) -> Option<Date> {
         match self {
@@ -126,26 +126,26 @@ impl CorporateAction {
     }
 }
 
-/// Что сделали с дробной частью при замещении.
+/// How the fractional part was handled during replacement.
 ///
-/// Отдельный член на «дроби не возникло»: `None` означал бы «неизвестно»,
-/// а это разные вещи (§4.9).
+/// A separate variant for «no fraction resulted»: `None` would mean «unknown»,
+/// and those are different things (§4.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FractionalTreatment {
-    /// Дробь выкуплена деньгами.
+    /// The fraction was paid out in cash.
     CashCompensated,
-    /// Дробь отброшена вниз без компенсации.
+    /// The fraction was rounded down without compensation.
     RoundedDown,
-    /// Дроби не возникло.
+    /// No fraction resulted.
     NotApplicable,
 }
 
-/// Правило переноса налоговой стоимости и срока владения при замещении.
+/// The rule for carrying over tax basis and holding period during replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BasisTransferRule {
-    /// Стоимость и срок владения переходят на преемника целиком.
+    /// Tax basis and holding period carry over to the successor in full.
     CarryOver,
-    /// Замещение приравнено к продаже и покупке: срок начинается заново.
+    /// The replacement is treated as a sale and purchase: the holding period restarts.
     Restart,
 }
 
@@ -240,9 +240,9 @@ mod tests {
 
     #[test]
     fn the_effective_date_of_every_action_is_reachable_without_a_match() {
-        // Дата вступления в силу — идентичность факта, и она есть
-        // у каждого члена: проекция обязана её получать, не разбирая
-        // семейство заново на каждом вызове.
+        // The effective date is part of the fact's identity — consequently, every
+        // variant has one: the projection must obtain it without inspecting
+        // the family anew on every call.
         assert_eq!(
             sample_partial_redemption().effective_date(),
             date!(2026 - 06 - 15)
@@ -252,15 +252,15 @@ mod tests {
     }
 
     #[test]
-    fn дата_фиксации_реестра_остаётся_доступной_для_проверки_права() {
+    fn record_date_remains_available_for_entitlement_check() {
         let action = sample_conversion();
         let record_date = action
             .record_date()
-            .expect("известная дата фиксации должна быть доступна");
+            .expect("a known record date must be available");
 
         assert!(
             record_date < action.effective_date(),
-            "отсечка должна предшествовать дате вступления в силу"
+            "record date must precede the effective date"
         );
     }
 

@@ -1,8 +1,8 @@
-//! Запись рыночных наблюдений и атомарная публикация серий.
+//! Storage for market observations and atomic publication of series.
 //!
-//! Хранилище не знает форматы источников. Оно принимает собственные строковые
-//! строки таблиц; преобразование наблюдений источника выполняется на границе
-//! приложения.
+//! The store is unaware of source formats. It accepts its own string table
+//! rows; source observation conversion is performed at the application boundary.
+//! of the application.
 
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use time::format_description::well_known::{Iso8601, Rfc3339};
@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{SqliteStore, StoreError, now};
 
-/// Единица полноты: источник, набор данных и конкретная серия.
+/// Unit of completeness: source, dataset, and specific series.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesKey {
     pub source_id: String,
@@ -19,8 +19,8 @@ pub struct SeriesKey {
     pub series_key: String,
 }
 
-/// Строка таблицы цен. Все значения источника остаются строками до границы
-/// приложения, чтобы хранилище не зависело от крейты формата источника.
+/// Price table row. All source values remain strings until the application
+/// boundary, so the store does not depend on the source format crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceRow {
     pub instrument_id: String,
@@ -31,15 +31,15 @@ pub struct PriceRow {
     pub observed_at: String,
     pub price: String,
     pub currency: String,
-    /// Код основания котировки. Строкой, как и остальные значения
-    /// источника: хранилище не зависит от крейта формата.
+    /// Quote basis code. Stored as a string, like all other source values,
+    /// so the store does not depend on the source format crate.
     pub quotation_basis: String,
-    /// Признак, по которому основание выведено.
+    /// Indicator specifying how the basis was derived.
     pub basis_evidence: String,
     pub executability: String,
 }
 
-/// Строка наблюдения НКД. Значения строками, как и везде в хранилище.
+/// Accrued coupon income observation row. Values are strings, as everywhere else in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccruedInterestRow {
     pub instrument_id: String,
@@ -47,19 +47,19 @@ pub struct AccruedInterestRow {
     pub session: i64,
     pub trade_date: String,
     pub observed_at: String,
-    /// На одну бумагу.
+    /// Per security.
     pub per_unit: String,
     pub currency: String,
 }
 
-/// Площадка и сессия для выборки строки цены.
+/// Venue and session used to select a price row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceVenue {
     pub board: String,
     pub session: i64,
 }
 
-/// Окно торгового ряда и координата знания для чтения.
+/// Trading-series window and knowledge coordinate for reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketWindow<'a> {
     pub from: &'a str,
@@ -67,7 +67,7 @@ pub struct MarketWindow<'a> {
     pub knowledge_as_of: &'a str,
 }
 
-/// Строка таблицы курсов валют.
+/// Foreign-exchange rates table row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FxRow {
     pub from_code: String,
@@ -79,7 +79,7 @@ pub struct FxRow {
     pub unit_rate: String,
 }
 
-/// Строка таблицы ключевой ставки.
+/// Key interest rate table row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRateRow {
     pub trade_date: String,
@@ -87,7 +87,7 @@ pub struct KeyRateRow {
     pub rate: String,
 }
 
-/// Запуск, удерживающий аренду одной серии.
+/// Run holding a lease on one series.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunHandle {
     pub id: String,
@@ -95,14 +95,14 @@ pub struct RunHandle {
     pub series: SeriesKey,
 }
 
-/// Фактически покрытый диапазон, сообщаемый завершённым запуском.
+/// Actual covered range reported by the completed run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Coverage {
     pub from: Date,
     pub to: Date,
 }
 
-/// Итог запуска синхронизации.
+/// Name used by the application layer to designate the observations API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
     Succeeded,
@@ -110,10 +110,10 @@ pub enum RunOutcome {
     Failed { reason: String },
 }
 
-/// Имя, которым слой приложения обозначает API наблюдений.
+/// Name used by the application layer for the observations API.
 ///
-/// Как и остальные доменные модули `iaam-store`, реализация живёт на
-/// `SqliteStore`: это сохраняет одну транзакцию и одно соединение.
+/// As with the other `iaam-store` domain modules, the implementation lives on
+/// `SqliteStore`: this preserves one transaction and one connection.
 pub type MarketStore = SqliteStore;
 
 type RunRow = (
@@ -127,11 +127,11 @@ type RunRow = (
 );
 
 impl SqliteStore {
-    /// Захватить аренду серии и создать незавершённый запуск.
+    /// Acquire a series lease and create an unfinished run.
     ///
-    /// Просроченные `running`-запуски переводятся в `failed` в той же
-    /// транзакции. Удалять их нельзя: на их строки наблюдений ссылается
-    /// внешний ключ, а история запуска должна сохраниться.
+    /// Expired `running` runs are moved to `failed` in the same
+    /// transaction. They cannot be deleted: an external key references their observation
+    /// rows, and the run history must be preserved.
     pub fn begin_run(
         &mut self,
         series: SeriesKey,
@@ -209,7 +209,7 @@ impl SqliteStore {
         Ok(run)
     }
 
-    /// Записать страницу цен в незавершённый запуск.
+    /// Write a price page to an unfinished run.
     pub fn record_prices(
         &mut self,
         run: &RunHandle,
@@ -257,7 +257,7 @@ impl SqliteStore {
         Ok(observations.len())
     }
 
-    /// Записать страницу наблюдений НКД в незавершённый запуск.
+    /// Write an accrued-interest observation page to an unfinished run.
     pub fn record_accrued_interest(
         &mut self,
         run: &RunHandle,
@@ -300,7 +300,7 @@ impl SqliteStore {
         Ok(observations.len())
     }
 
-    /// Записать страницу курсов валют в незавершённый запуск.
+    /// Write an FX rate page to an unfinished run.
     pub fn record_fx(
         &mut self,
         run: &RunHandle,
@@ -343,7 +343,7 @@ impl SqliteStore {
         Ok(observations.len())
     }
 
-    /// Записать страницу ключевой ставки в незавершённый запуск.
+    /// Write a key rate page to an unfinished run.
     pub fn record_key_rate(
         &mut self,
         run: &RunHandle,
@@ -381,7 +381,7 @@ impl SqliteStore {
         Ok(observations.len())
     }
 
-    /// Завершить запуск и, только при успехе, продвинуть границу полноты.
+    /// Complete the run and, only on success, advance the completeness boundary.
     pub fn finish_run(
         &mut self,
         run: &RunHandle,
@@ -464,7 +464,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Вернуть границу полной публикации серии.
+    /// Return the series' full-publication boundary.
     pub fn complete_through(&self, series: &SeriesKey) -> Result<Option<Date>, StoreError> {
         let value: Option<String> = self
             .conn
@@ -478,7 +478,7 @@ impl SqliteStore {
         value.map_or(Ok(None), |date| parse_date(&date).map(Some))
     }
 
-    /// Вернуть границу, опубликованную не позже момента знания.
+    /// Return the boundary published no later than the knowledge time.
     pub fn complete_through_at_or_before(
         &self,
         series: &SeriesKey,
@@ -502,7 +502,7 @@ impl SqliteStore {
         value.map_or(Ok(None), |date| parse_date(&date).map(Some))
     }
 
-    /// Вернуть последнее опубликованное наблюдение по торговой дате и знанию.
+    /// Return the latest published observation by trading date and knowledge time.
     pub fn prices_at_or_before(
         &self,
         instrument_id: &str,
@@ -552,7 +552,7 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
-    /// Вернуть последнее опубликованное наблюдение НКД по торговой дате и знанию.
+    /// Return the latest published accrued-interest observation by trading date and knowledge time.
     pub fn accrued_interest_at_or_before(
         &self,
         instrument_id: &str,
@@ -596,13 +596,13 @@ impl SqliteStore {
             .optional()
             .map_err(StoreError::from)
     }
-    /// Вернуть все опубликованные наблюдения цены инструмента в диапазоне
-    /// на момент знания, не выбирая площадку заранее.
+    /// Return all published instrument price observations in the range
+    /// as of the knowledge time, without selecting a venue in advance.
     ///
-    /// Площадка и сессия не задаются: какую из них применить — решение
-    /// политики оценки (E3.3), а не запроса. Источник и набор при этом
-    /// остаются параметрами: зашить их значило бы сделать второй источник
-    /// цен невидимым молча.
+    /// Venue and session are not specified: which one to use is a decision
+    /// of valuation policy (E3.3), not of the query. The source and set
+    /// remain parameters: hard-coding them would mean creating a second source
+    /// Silently make prices invisible.
     pub fn prices_for_instrument_between(
         &self,
         source_id: &str,
@@ -654,7 +654,7 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
-    /// Вернуть опубликованные наблюдения цен в диапазоне на момент знания.
+    /// Return published price observations within the range as of the time of knowledge.
     pub fn prices_between(
         &self,
         series: &SeriesKey,
@@ -712,7 +712,7 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
-    /// Вернуть опубликованные наблюдения курса в диапазоне на момент знания.
+    /// Return published exchange-rate observations within the range as of the time of knowledge.
     pub fn fx_between(
         &self,
         series: &SeriesKey,
@@ -763,7 +763,7 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
-    /// Вернуть опубликованные наблюдения ключевой ставки в диапазоне.
+    /// Return published key-rate observations within the range.
     pub fn key_rates_through(
         &self,
         series: &SeriesKey,

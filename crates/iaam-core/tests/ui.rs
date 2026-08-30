@@ -1,14 +1,14 @@
-//! Проверки, которые обязаны **не компилироваться** (§15.1).
+//! Tests that **must not compile** (§15.1).
 //!
-//! Первый слой проверки — типы, делающие ошибку непредставимой. Без
-//! этого теста слой держится на честном слове: закомментированная строка
-//! в обычном тесте не проверяет ничего, потому что её никто не собирает.
+//! The first validation layer consists of types that make the error unrepresentable. Without
+//! this test, the layer relies on trust alone: a commented-out line
+//! in a regular test verifies nothing because it is never compiled.
 //!
-//! Ожидаемый вывод компилятора лежит рядом в `.stderr`. При смене версии
-//! тулчейна тексты диагностик меняются; обновлять их надо командой
-//! `TRYBUILD=overwrite cargo test -p iaam-core --test ui` и **читать
-//! диффы**: изменение вида «ошибки больше нет» означает, что защита
-//! исчезла, а не что тест устарел.
+//! The expected compiler output is in the adjacent `.stderr` file. When the
+//! toolchain version changes, diagnostic text changes; update it with
+//! `TRYBUILD=overwrite cargo test -p iaam-core --test ui` and **read
+//! the diffs**: a change like “the error is gone” means that the safeguard
+//! has disappeared, not that the test is outdated.
 
 #[test]
 fn errors_that_must_not_compile() {

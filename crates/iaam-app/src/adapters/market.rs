@@ -1,8 +1,8 @@
-//! HTTP-адаптер источников рынка.
+//! HTTP adapter for market sources.
 //!
-//! Здесь сосредоточена вся политика исходящих запросов: ограничение частоты,
-//! повторы временных отказов и хеширование тела. Сценарий получает уже
-//! проверенный ответ через порт и не знает ни о `reqwest`, ни о снах.
+//! This contains all outgoing request policy: rate limiting,
+//! retries for transient failures and body hashing. The use case receives an already
+//! validated response through the port and knows nothing about `reqwest` or sleeps.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::error::AppError;
 use crate::ports::{OutboundHttp, OutboundResponse};
 
-/// Реализация рыночного транспорта поверх общего HTTP-клиента.
+/// Market transport implementation using the shared HTTP client.
 pub struct HttpOutbound {
     client: HttpClient,
     retry: RetryPolicy,
@@ -62,7 +62,7 @@ impl OutboundHttp for HttpOutbound {
                         continue;
                     }
                     return Err(AppError::Store(format!(
-                        "рыночный источник вернул HTTP {}",
+                        "market source returned HTTP {}",
                         response.status
                     )));
                 }
@@ -88,7 +88,7 @@ impl OutboundHttp for HttpOutbound {
                         attempt = attempt.saturating_add(1);
                         continue;
                     }
-                    return Err(AppError::Store(format!("рыночный транспорт: {error}")));
+                    return Err(AppError::Store(format!("market transport: {error}")));
                 }
             }
         }

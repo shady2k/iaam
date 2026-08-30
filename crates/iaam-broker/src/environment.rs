@@ -1,31 +1,31 @@
-//! Среда брокера: боевая и песочница (§14).
+//! Broker environment: production and sandbox (§14).
 //!
-//! Т-Инвестиции зовут это контуром, но слово «контур» в этой системе
-//! занято составом контура учёта (§11), и второе значение читалось бы
-//! как первое. Здесь — среда.
+//! T-Invest calls this a contour, but “contour” is already occupied in this
+//! system by the accounting contour (§11), and the second meaning would be
+//! read as the first. Here it is an environment.
 //!
-//! Среды различаются не только адресом. Токены у них **разные**: боевой
-//! токен песочный шлюз встречает `401` «Authentication token is missing
-//! or invalid», а песочный на боевых методах даёт отказ. Поэтому среда —
-//! свойство заведённого доступа, а не параметр отдельного обращения:
-//! среда, выбранная вызывающим по ошибке, — это поход не туда,
-//! замеченный по чужому ответу.
+//! Environments differ by more than address. Their tokens are **different**:
+//! the production token gets `401` “Authentication token is missing or
+//! invalid” from the sandbox gateway, while sandbox rejects production
+//! methods. Therefore environment is a property of configured access, not a
+//! parameter of an individual request: an environment selected in error is a
+//! request sent to the wrong place, detected by the other side's response.
 //!
-//! Адрес шлюза выводится из среды, а не хранится рядом с доступом:
-//! адрес — свойство среды, и запись, приносящая свой собственный,
-//! означала бы, что заведённый доступ умеет увести программу куда угодно.
+//! The gateway address is derived from the environment, not stored beside
+//! access: the address belongs to the environment, and an access record that
+//! supplied its own would let configured access redirect the program anywhere.
 
-/// Среда брокерского канала.
+/// Broker channel environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Environment {
-    /// Боевая: настоящие деньги и настоящая история сделок.
+    /// Production: real money and real trading history.
     Prod,
-    /// Песочница: эмуляция торгов. Брокерского отчёта в ней нет.
+    /// Sandbox: simulated trading. No broker report exists there.
     Sandbox,
 }
 
 impl Environment {
-    /// Код для хранилища. Хранилище среду не толкует — оно хранит.
+    /// Code for storage. Storage does not interpret the environment; it stores it.
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
@@ -34,11 +34,11 @@ impl Environment {
         }
     }
 
-    /// Разбор кода.
+    /// Parse a code.
     ///
-    /// Не `trim` и не приведение регистра: значение пишет система,
-    /// а не человек, и «почти то же самое» здесь означает, что запись
-    /// изменил кто-то другой.
+    /// No `trim` and no case folding: the value is written by the system,
+    /// not a person, and “almost the same” here means another party changed
+    /// the record.
     #[must_use]
     pub fn parse(code: &str) -> Option<Self> {
         match code {
@@ -48,7 +48,7 @@ impl Environment {
         }
     }
 
-    /// Адрес шлюза.
+    /// Gateway address.
     #[must_use]
     pub const fn base_url(self) -> &'static str {
         match self {
@@ -57,12 +57,13 @@ impl Environment {
         }
     }
 
-    /// Бывает ли метод в этой среде.
+    /// Whether a method exists in this environment.
     ///
-    /// Двух методов в песочнице нет вовсе — брокерского отчёта и справки
-    /// о доходах за пределами РФ. Отказ выдаётся здесь, до похода: шлюз
-    /// на такой вызов отвечает пустым ответом, а пустой отчёт неотличим
-    /// от отчёта, в котором ничего не было. Это худший вид ошибки — тихая.
+    /// Two methods are entirely absent in the sandbox: the broker report and
+    /// the income statement for foreign issuers. Refuse here, before making
+    /// the request: the gateway answers such a call with an empty response,
+    /// and an empty report is indistinguishable from a report containing
+    /// nothing. That is the worst kind of error: a silent one.
     #[must_use]
     pub fn serves(self, method: Method) -> bool {
         match self {
@@ -75,11 +76,11 @@ impl Environment {
     }
 }
 
-/// Метод шлюза в той мере, в какой среда о нём знает.
+/// Gateway method to the extent known by the environment.
 ///
-/// Перечисление, а не строка с полным именем метода: строка отвечает
-/// на «что послать», а здесь нужен ответ на «бывает ли такое здесь»,
-/// и опечатка в строке дала бы молчаливое «бывает».
+/// An enum rather than a string containing the full method name: the string
+/// answers “what should be sent?”, while this must answer “does this exist
+/// here?”, and a typo in the string would silently answer “yes”.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Method {
     Accounts,
@@ -102,16 +103,16 @@ mod tests {
 
     #[test]
     fn nothing_else_parses_as_an_environment() {
-        // «Почти то же самое» — это чужая запись, а не наша.
-        for code in ["", "PROD", " prod", "prod ", "песочница", "test"] {
+        // “Almost the same” is another party's record, not ours.
+        for code in ["", "PROD", " prod", "prod ", "sandbox-ish", "test"] {
             assert_eq!(Environment::parse(code), None, "{code}");
         }
     }
 
     #[test]
     fn the_environments_never_share_an_address() {
-        // Один адрес на две среды означал бы боевые сделки
-        // из проверочного прогона.
+        // One address for two environments would mean production trades
+        // from a verification run.
         assert_ne!(
             Environment::Prod.base_url(),
             Environment::Sandbox.base_url()

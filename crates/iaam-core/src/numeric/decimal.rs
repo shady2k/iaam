@@ -1,4 +1,4 @@
-//! Денежный режим (§6.6): суммы, цены, курсы, НКД.
+//! Monetary mode (§6.6): amounts, prices, exchange rates, accrued interest.
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use super::NumericError;
 use super::exact::Exact;
 
-/// Максимальный масштаб, который умеет представить `Exact` без переполнения
-/// при типичных величинах портфеля.
+/// The maximum scale that `Exact` can represent without overflow
+/// for typical portfolio values.
 const MAX_SCALE: u32 = 18;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
@@ -29,16 +29,16 @@ impl Dec {
         Self(Decimal::ZERO)
     }
 
-    /// Наибольший масштаб, переводимый в точный режим без потерь.
+    /// The largest scale that can be converted to exact mode without loss.
     #[must_use]
     pub const fn max_scale() -> u32 {
         MAX_SCALE
     }
-    /// Округление до знака после запятой, половина — от нуля.
+    /// Rounding to a decimal place, halfway cases—away from zero.
     ///
-    /// Отдельный метод, а не `Decimal::round_dp` на месте: правило НКД
-    /// округляет до минорной единицы валюты, и стратегия округления —
-    /// часть версионированного правила, а не вкус вызывающего.
+    /// A separate method rather than an inline `Decimal::round_dp` call: the accrued-interest rule
+    /// rounds to the currency's minor unit, and the rounding strategy—
+    /// is part of the versioned rule, not a caller preference.
     pub fn checked_round_to_scale(self, scale: u32) -> Result<Self, NumericError> {
         if scale > Self::max_scale() {
             return Err(NumericError::ScaleTooLarge {
@@ -90,17 +90,17 @@ impl Dec {
         Self::zero().checked_sub(self)
     }
 
-    /// Сумма списка. Вынесена отдельно по той же причине, что и у `Exact`:
-    /// суммирование компонентов отчёта обязано отказывать явно.
+    /// Sums a list. Kept separate for the same reason as in `Exact`:
+    /// summing report components must fail explicitly.
     pub fn sum(items: &[Self]) -> Result<Self, NumericError> {
         items
             .iter()
             .try_fold(Self::zero(), |acc, x| acc.checked_add(*x))
     }
 
-    /// Сложение с проверкой переполнения. Штатный `+` у `Decimal` паникует
-    /// при выходе за диапазон; тихая паника в расчёте доходности хуже
-    /// типизированного отказа.
+    /// Addition with overflow checking. The standard `+` for `Decimal` panics
+    /// when the range is exceeded; a silent panic in a return calculation is worse
+    /// than a typed failure.
     pub fn checked_add(self, other: Self) -> Result<Self, NumericError> {
         self.0
             .checked_add(other.0)
@@ -108,11 +108,11 @@ impl Dec {
             .ok_or(NumericError::Overflow)
     }
 
-    /// Деление с отказом на нуле. У `Decimal` штатное деление на ноль
-    /// паникует, а `checked_div` возвращает `None` и на нуле, и на
-    /// переполнении — два разных отказа под одним ответом. Ноль
-    /// отделён явно: «делили на ноль» и «результат не представим» —
-    /// разные диагнозы для того, кто читает отказ расчёта.
+    /// Division that fails on zero. Standard division by zero for `Decimal`
+    /// panics, while `checked_div` returns `None` for both zero and
+    /// overflow—two different failures with the same response. Zero
+    /// is handled explicitly: «divided by zero» and «result is not representable»—
+    /// are different diagnoses for whoever reads the calculation failure.
     pub fn checked_div(self, other: Self) -> Result<Self, NumericError> {
         if other.0.is_zero() {
             return Err(NumericError::DivisionByZero);
@@ -123,8 +123,8 @@ impl Dec {
             .ok_or(NumericError::Overflow)
     }
 
-    /// Перевод в точный режим. Возможен без потерь: десятичная дробь
-    /// с масштабом `s` — это рациональное число со знаменателем `10^s`.
+    /// Conversion to exact mode. It is lossless: a decimal fraction
+    /// with scale `s` is a rational number with denominator `10^s`.
     pub fn to_exact(&self) -> Result<Exact, NumericError> {
         let scale = self.0.scale();
         if scale > MAX_SCALE {
@@ -178,17 +178,17 @@ mod tests {
 
     #[test]
     fn sign_predicates_split_the_line_in_three_and_leave_zero_to_neither() {
-        // Ноль не положителен и не отрицателен — обе проверки обязаны
-        // отказать на нём, иначе «есть цена» и «цена ниже нуля»
-        // начинают пересекаться.
+        // Zero is neither positive nor negative—both checks must
+        // reject it, otherwise «has a price» and «price is below zero»
+        // begin to overlap.
         assert!(dec("0.01").is_positive());
         assert!(!dec("0.01").is_negative());
         assert!(dec("-0.01").is_negative());
         assert!(!dec("-0.01").is_positive());
         assert!(!Dec::zero().is_positive());
         assert!(!Dec::zero().is_negative());
-        // Отрицательный ноль остаётся нулём: знак у него есть,
-        // а величины нет.
+        // Negative zero remains zero: it has a sign,
+        // but no magnitude.
         assert!(!dec("-0").is_negative());
     }
 
@@ -234,15 +234,15 @@ mod tests {
 
     #[test]
     fn checked_add_sums_without_binary_rounding() {
-        // Ожидание посчитано вручную, а не снято с вывода (§15.5).
+        // The expected value was calculated manually, not copied from the output (§15.5).
         assert_eq!(dec("0.1").checked_add(dec("0.2")).unwrap(), dec("0.3"));
     }
 
     #[test]
     fn checked_add_is_not_either_operand() {
-        // Отдельно от предыдущего: сумма разных величин обязана отличаться
-        // от каждого слагаемого, иначе «сложение», возвращающее один из
-        // операндов, прошло бы незамеченным.
+        // Separate from the previous check: the sum of distinct values must differ
+        // from each addend, otherwise an «addition» that returns one of
+        // its operands would go unnoticed.
         let sum = dec("2.5").checked_add(dec("7.5")).unwrap();
         assert_ne!(sum, dec("2.5"));
         assert_ne!(sum, dec("7.5"));
@@ -315,8 +315,8 @@ mod tests {
     }
     #[test]
     fn rounding_to_a_scale_matches_the_kopeck_of_the_source() {
-        // Числа взяты из живой сверки с MOEX: линейный расчёт даёт
-        // 0.70571 и 17.99571, источник печатает 0.71 и 18.00.
+        // The numbers come from a live reconciliation with MOEX: the linear calculation gives
+        // 0.70571 and 17.99571, while the source prints 0.71 and 18.00.
         let value = Dec::new(Decimal::from_str_exact("0.70571").unwrap());
         assert_eq!(
             value.checked_round_to_scale(2).unwrap(),
@@ -331,18 +331,18 @@ mod tests {
 
     #[test]
     fn a_scale_beyond_the_limit_is_refused_not_truncated() {
-        // Молчаливое усечение до max_scale дало бы число, о котором
-        // вызывающий думает, что оно точнее, чем есть.
+        // Silently truncating to max_scale would produce a number that
+        // the caller believes is more precise than it actually is.
         let value = Dec::new(Decimal::from_str_exact("1.5").unwrap());
         assert!(value.checked_round_to_scale(Dec::max_scale() + 1).is_err());
     }
 
     #[test]
     fn the_limit_itself_is_allowed_not_refused() {
-        // Граница включительная: max_scale — предельный, а не первый
-        // запрещённый знак. Без этого утверждения мутант `>` -> `>=`
-        // выживает, а с ним валюта с максимальной точностью перестала бы
-        // округляться вовсе — и правило НКД отказывало бы на ровном месте.
+        // The boundary is inclusive: max_scale is the limit, not the first
+        // prohibited digit. Without this assertion, the `>` -> `>=` mutant
+        // survives, and a currency at maximum precision would no longer
+        // be rounded at all—and the accrued-interest rule would fail for no reason.
         let value = Dec::new(Decimal::from_str_exact("1.5").unwrap());
         assert!(value.checked_round_to_scale(Dec::max_scale()).is_ok());
     }

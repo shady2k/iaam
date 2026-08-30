@@ -1,8 +1,8 @@
-//! Доменная обёртка решателя ставки (§6.1).
+//! Domain wrapper around the rate solver (§6.1).
 //!
-//! Здесь живёт то, что решатель знать не должен: границы контура, валюты,
-//! курсы, цены и знаковая конвенция. Сам решатель работает с парами
-//! «смещение в днях, сумма» и о портфеле ничего не знает.
+//! This is where solver-unaware concerns live: contour boundaries, currencies,
+//! rates, prices, and sign convention. The solver itself works with
+//! “day offset, amount” pairs and knows nothing about portfolios.
 
 use std::collections::BTreeMap;
 
@@ -16,20 +16,20 @@ use crate::projection::flows::FlowDirection;
 use crate::projection::state::LedgerState;
 use crate::valuation::convert;
 
-/// Ряд потоков в валюте отчёта.
+/// Flow series in the reporting currency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowSeries {
-    /// Внесено за всю историю, положительная величина.
+    /// Contributed over the entire history, as a positive amount.
     pub contributed: Dec,
-    /// Выведено за всю историю, положительная величина.
+    /// Withdrawn over the entire history, as a positive amount.
     pub withdrawn: Dec,
-    /// Датированные суммы **в знаковой конвенции владельца**: внесение
-    /// отрицательно, изъятие положительно. Это отрицание движения денег
-    /// по контуру: то, что для контура приход, для владельца расход.
+    /// Dated amounts **in the owner’s sign convention**: contributions are
+    /// negative and withdrawals positive. This negates cash movement across
+    /// the contour: an inflow for the contour is an outflow for the owner.
     pub flows: Vec<(Date, Dec)>,
 }
 
-/// Перевод внешних потоков в валюту отчёта.
+/// Convert external flows to the reporting currency.
 pub fn flow_series(
     state: &LedgerState,
     request: &ReturnsRequest,
@@ -58,14 +58,14 @@ pub fn flow_series(
     })
 }
 
-/// Стоимость счёта, разложенная на деньги и бумаги.
+/// Account value split into cash and securities.
 ///
-/// Разложение существенно для покрытия NAV (§10.5): деньги
-/// подтверждаются измерением `cash`, бумаги — измерением `positions`,
-/// и это **разные** утверждения. Одна цифра на счёт заставила бы брать
-/// худшее из двух, и тогда счёт без единой бумаги никогда не стал бы
-/// подтверждённым: измерение `positions`, о котором нечего утверждать,
-/// вечно тянуло бы его вниз.
+/// The split matters for NAV coverage (§10.5): cash
+/// is confirmed by the `cash` measurement, securities by `positions`,
+/// and these are **different** claims. One account-level number would force
+/// the worse of the two, so an account with no securities could never become
+/// confirmed: the empty `positions` measurement, which has nothing to assert,
+/// would drag it down forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountValue {
     pub cash: Dec,
@@ -73,10 +73,10 @@ pub struct AccountValue {
 }
 
 impl Default for AccountValue {
-    /// Нулевые части пишутся руками: `Dec` намеренно не имеет
-    /// умолчания, потому что нулевая заглушка вместо неизвестной
-    /// величины запрещена (§4.9). Здесь ноль осмыслен — накопитель
-    /// начинает с него для счёта, который уже признан существующим.
+    /// Zero parts are written explicitly: `Dec` deliberately has no default,
+    /// because a zero placeholder for an unknown
+    /// value is forbidden (§4.9). Here zero is meaningful: the accumulator
+    /// starts there for an account already known to exist.
     fn default() -> Self {
         Self {
             cash: Dec::zero(),
@@ -86,24 +86,24 @@ impl Default for AccountValue {
 }
 
 impl AccountValue {
-    /// Стоимость счёта целиком.
+    /// Total account value.
     pub fn total(&self) -> Result<Dec, NotComputable> {
         add(self.cash, self.positions)
     }
 }
 
-/// Стоимость контура **по счетам** на дату отчёта: деньги плюс позиции
-/// по кандидату, выбранному политикой оценки.
+/// Contour value **by account** on the report date: cash plus positions
+/// at the price selected by valuation policy.
 ///
-/// Это **ликвидационная** оценка в упрощённом виде (§5.1): комиссий
-/// закрытия и налога к уплате в ней нет, потому что ни того, ни другого
-/// этап 1 не считает. Разрыв с `contractual_hold_value` не вычисляется —
-/// вклады и облигации целиком относятся к E3.
+/// This is a simplified **liquidation** estimate (§5.1): closing fees
+/// and tax are absent because stage 1 calculates neither. The gap to
+/// `contractual_hold_value` is not calculated—
+/// deposits and bonds belong wholly to E3.
 ///
-/// Разбиение по счетам существует потому, что покрытие NAV по уровням
-/// достоверности (§10.5) взвешивается стоимостью счёта: доля,
-/// посчитанная по числу записей, объявила бы счёт с одной сделкой на
-/// миллион равным счёту с сотней сделок на тысячу.
+/// Per-account splitting exists because NAV coverage by confidence level
+/// (§10.5) is weighted by account value: weighting by record count
+/// would make an account with one million-value trade
+/// equal to one with a hundred thousand-value trades.
 pub fn account_values(
     state: &LedgerState,
     request: &ReturnsRequest,
@@ -152,13 +152,13 @@ pub(super) fn terminal_value_from_position_values(
     Ok(total)
 }
 
-/// Стоимость контура на дату отчёта — сумма по счетам.
+/// Contour value on the report date—the sum by account.
 pub fn terminal_value(state: &LedgerState, request: &ReturnsRequest) -> Result<Dec, NotComputable> {
     let positions = super::position_values(state, request);
     terminal_value_from_position_values(state, request, &positions)
 }
 
-/// Ставка по ряду потоков и терминальной стоимости.
+/// Rate from a flow series and terminal value.
 pub fn rate(
     series: &Result<FlowSeries, NotComputable>,
     terminal: &Result<Dec, NotComputable>,
@@ -207,10 +207,10 @@ pub fn rate(
     }
 }
 
-/// Состояние обязано быть спроецировано **по дату отчёта**: фильтрацию
-/// журнала делает оболочка при сборке среза, а не ядро. Событие позже
-/// даты отчёта означает, что срез собран неверно, и молча посчитать
-/// по нему — значит выдать отчёт на дату, которого на эту дату не было.
+/// State must be projected **through the report date**: the shell filters the
+/// journal while building the slice, not the core. An event after the report
+/// date means the slice was assembled incorrectly; silently calculating from it
+/// would produce a report for a date that did not exist on that date.
 fn guard_state_not_newer(state: &LedgerState, as_of: Date) -> Result<(), NotComputable> {
     match state.coverage().last_event() {
         Some(last) if last > as_of => Err(NotComputable::StateNewerThanReport {
@@ -292,7 +292,7 @@ mod tests {
             vec![],
         );
         let state = project(&[opening, valuation], &context)
-            .expect("проекция владельческой оценки")
+            .expect("owner-valuation projection")
             .snapshot()
             .state()
             .clone();
@@ -313,7 +313,7 @@ mod tests {
             accrued_observations: &std::collections::BTreeMap::new(),
         };
 
-        let values = account_values(&state, &request).expect("стоимость позиции");
+        let values = account_values(&state, &request).expect("position value");
 
         assert_eq!(
             values[&account].positions,
@@ -406,7 +406,7 @@ mod tests {
             ),
         ];
         let snapshot = project(&events, &context)
-            .expect("проекция")
+            .expect("projection")
             .into_snapshot();
         let ledger = ReconciliationLedger::default();
         let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
@@ -425,7 +425,7 @@ mod tests {
             market_prices: &[],
         };
 
-        let values = account_values(snapshot.state(), &request).expect("стоимости счетов");
+        let values = account_values(snapshot.state(), &request).expect("account values");
         assert_eq!(
             values.get(&inside),
             Some(&AccountValue {

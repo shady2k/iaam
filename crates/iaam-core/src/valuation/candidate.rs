@@ -1,9 +1,9 @@
-//! Общий кандидат на оценку и порт выборки (E3.3, дизайн раздел 3).
+//! Shared valuation candidate and sampling port (E3.3, design section 3).
 //!
-//! Два канала цены — биржевое наблюдение и утверждение владельца или
-//! документа — приходят сюда одним типом. Исполнимость в кандидате
-//! принадлежит источнику; всё, что вывела политика оценки, живёт в
-//! [`SelectedPrice`] и в кандидат не попадает по построению.
+//! The two price channels — an exchange observation and a statement by the owner or
+//! a document — arrive here as the same type. Executability in the candidate
+//! belongs to the source; everything inferred by the valuation policy lives in
+//! [`SelectedPrice`] and is excluded from the candidate by construction.
 
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
@@ -13,17 +13,17 @@ use crate::money::CurrencyCode;
 use crate::numeric::decimal::Dec;
 
 use super::PriceQuality;
-/// Режим торгов, входящий в идентичность рыночного наблюдения.
+/// Trading mode that is part of the identity of a market observation.
 ///
-/// Номер сессии отделяет основную торговлю от вечерней: одного кода
-/// инструмента и доски недостаточно, чтобы связать цену с наблюдением НКД.
+/// The session number distinguishes regular trading from the evening session: the instrument
+/// code and board alone are insufficient to associate a price with an accrued-interest observation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Venue {
     pub board: String,
     pub session: i64,
 }
 
-/// Колонки рыночной цены MOEX, различаемые политикой оценки.
+/// MOEX market-price columns distinguished by the valuation policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PriceKind {
     Close,
@@ -35,7 +35,7 @@ pub enum PriceKind {
 }
 
 impl PriceKind {
-    /// Каноническое имя колонки в проводном формате.
+    /// Canonical column name in the wire format.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -49,47 +49,47 @@ impl PriceKind {
     }
 }
 
-/// Откуда пришёл кандидат. Не выводится: канал известен в точке сборки.
+/// Where the candidate came from. Not inferred: the channel is known at the point of construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PriceOrigin {
-    /// Наблюдение из рыночного источника.
+    /// An observation from a market source.
     Market { venue: Venue, kind: PriceKind },
-    /// Цена, разобранная из отчёта или другого документа.
+    /// A price parsed from a report or another document.
     ReportParsed { source: SourceId },
-    /// Цена, утверждённая владельцем.
+    /// A price asserted by the owner.
     OwnerAsserted,
 }
 
-/// Исполнимость по утверждению источника.
+/// Executability as asserted by the source.
 ///
-/// `Unknown` обязателен: владелец, вводя цену неликвида, не утверждает
-/// ни того, что по ней можно выйти, ни того, что это цена закрытия.
-/// Без этого варианта ручной канал вынужден лгать.
+/// `Unknown` is required: when entering a price for an illiquid asset, the owner asserts
+/// neither that the position can be exited at that price nor that it is a closing price.
+/// Without this variant, the manual channel would be forced to lie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceExecutability {
-    /// Источник утверждает доступную для выхода цену.
+    /// The source asserts a price at which the position can be exited.
     Executable,
-    /// Источник утверждает цену закрытия предыдущих торгов.
+    /// The source asserts the closing price of the previous trading session.
     IndicativePreviousClose,
-    /// Источник не утверждает исполнимость цены.
+    /// The source makes no assertion about the price's executability.
     Unknown,
 }
 
-/// Единица, в которой источник назвал цену (§10.2).
+/// The unit in which the source quoted the price (§10.2).
 ///
-/// Третья ось наряду с полнотой и исполнимостью (ADR-0002), и, как они,
-/// **атрибут наблюдения от источника**, а не вывод политики: основание
-/// задаётся рынком и режимом торгов, из которого адаптер брал строку.
-/// Вывести его правилом задним числом — то же смешение осей, которое
-/// решение 0002 запрещает.
+/// The third axis alongside completeness and executability (ADR-0002), and, like them,
+/// **an attribute of the source observation**, not an inference by the policy: the basis
+/// is determined by the market and trading mode from which the adapter took the row.
+/// Inferring it later by rule would be the same conflation of axes that
+/// decision 0002 prohibits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum QuotationBasis {
-    /// Деньги за одну бумагу. Валюта числа — валюта наблюдения.
+    /// Money per security. The number's currency is the observation currency.
     MoneyPerUnit,
-    /// Проценты непогашенного номинала. Само число **безразмерно**:
-    /// денежная валюта приходит из валюты номинала, а не отсюда.
+    /// Percentage of the outstanding face value. The number itself is **dimensionless**:
+    /// the monetary currency comes from the face-value currency, not from here.
     PercentOfRemainingFace,
-    /// Источник основания не доказал. Отказ при оценке, а не догадка.
+    /// The source did not establish the basis. Reject during valuation rather than guess.
     #[default]
     Unknown,
 }
@@ -104,9 +104,9 @@ impl QuotationBasis {
         }
     }
 
-    /// Разбор кода из хранилища. `None`, а не `Unknown`: неизвестный код —
-    /// порча строки, и выдать её за недоказанное наблюдение значит
-    /// спрятать порчу.
+    /// Parses a code from storage. `None`, not `Unknown`: an unknown code indicates
+    /// a corrupted row, and passing it off as an unsubstantiated observation would
+    /// hide the corruption.
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         [
@@ -119,84 +119,84 @@ impl QuotationBasis {
     }
 }
 
-/// Способ выбора — почему дата наблюдения не совпала с датой оценки.
+/// Selection method — why the observation date differed from the valuation date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceSelection {
-    /// Наблюдение относится ровно к дате оценки.
+    /// The observation is from exactly the valuation date.
     AsObserved,
-    /// Наблюдение перенесено с более ранней даты.
+    /// The observation was carried forward from an earlier date.
     CarriedForward { observed_on: Date, days: u16 },
-    /// Значение унаследовано от старого правила и не переоценивается.
+    /// The value was inherited from a legacy rule and is not revalued.
     LegacyDerived { quality: PriceQuality },
 }
 
-/// Свежесть — отдельная ось: цена бывает перенесённой и устаревшей.
+/// Freshness is a separate axis: a price can be both carried forward and stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceFreshness {
-    /// Возраст цены не превышает порог свежести.
+    /// The price age does not exceed the freshness threshold.
     Fresh,
-    /// Возраст цены превышает обычный порог, но она ещё выбрана.
+    /// The price age exceeds the normal threshold, but the price is still selected.
     Stale { days: u16 },
 }
 
-/// Почему позиция осталась без цены.
+/// Why the position remained unpriced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UncoveredReason {
-    /// Для инструмента нет ни одного наблюдения.
+    /// There are no observations for the instrument.
     NoObservation,
-    /// Все наблюдения старше предельного возраста.
+    /// All observations exceed the maximum age.
     TooOld,
-    /// Нельзя однозначно определить площадку.
+    /// The venue cannot be determined unambiguously.
     AmbiguousVenue,
-    /// После отбора осталось несколько кандидатов.
+    /// Multiple candidates remained after filtering.
     AmbiguousCandidate,
 }
 
-/// Совместимое с планом имя причины отсутствия покрытия.
+/// Plan-compatible name for the reason coverage is missing.
 pub type Uncovered = UncoveredReason;
 
-/// Общий кандидат на оценку.
+/// Shared valuation candidate.
 ///
-/// Исполнимость принадлежит источнику. Здесь намеренно нет
-/// [`PriceSelection`]: перенос и устаревание являются выводами политики,
-/// а не атрибутами наблюдения.
+/// Executability belongs to the source. There is intentionally no
+/// [`PriceSelection`] here: carry-forward and staleness are policy outputs,
+/// not observation attributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceCandidate {
     pub instrument: InstrumentId,
     pub price: Dec,
     pub currency: CurrencyCode,
-    /// Единица цены. `#[serde(default)]` не нужен: `PriceCandidate`
-    /// не сериализуется, он строится на каждом расчёте.
+    /// Price unit. `#[serde(default)]` is unnecessary: `PriceCandidate`
+    /// is not serialized; it is constructed for every calculation.
     pub basis: QuotationBasis,
-    /// Признак, по которому основание выведено. Хранится рядом, а не
-    /// восстанавливается по основанию: без него запись недоказуема
-    /// при разборе аудита (§10.2).
+    /// Evidence from which the basis was inferred. Stored alongside it rather than
+    /// reconstructed from the basis: without it, the record cannot be substantiated
+    /// when parsing the audit trail (§10.2).
     pub basis_evidence: String,
-    /// Признак противоречит записанному основанию. Эффективное основание
-    /// в таком кандидате уже `Unknown`, но причина отказа должна дойти
-    /// до оценки позиции отдельно от недоказанности.
+    /// The evidence contradicts the recorded basis. The effective basis
+    /// in such a candidate is already `Unknown`, but the rejection reason must reach
+    /// the position valuation separately from the lack of evidence.
     pub basis_evidence_contradicts: bool,
     pub trade_date: Date,
-    /// Момент, когда источник узнал о наблюдении. Для журнальной
-    /// оценки этот момент не записан и остаётся `None`.
+    /// The time when the source learned of the observation. For journal-based
+    /// valuation, this time is not recorded and remains `None`.
     pub observed_at: Option<OffsetDateTime>,
     pub origin: PriceOrigin,
     pub executability: SourceExecutability,
 }
 
-/// Основание решения политики: все версии и пороги, способные
-/// изменить его толкование (§6.6).
+/// Basis for the policy decision: all versions and thresholds capable of
+/// changing its interpretation (§6.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceProvenance {
     pub price_kind: Option<String>,
     pub origin: PriceOrigin,
     pub venue: Option<String>,
-    /// Единица, в которой источник назвал цену. Без неё след аудита
-    /// не объясняет, откуда взялась денежная стоимость позиции.
+    /// The unit in which the source quoted the price. Without it, the audit trail
+    /// does not explain where the position's monetary value came from.
     pub quotation_basis: QuotationBasis,
-    /// Признак, по которому основание выведено.
+    /// Evidence from which the basis was inferred.
     pub basis_evidence: String,
-    /// Момент, когда источник узнал о наблюдении, если журнал его хранит.
+    /// The time when the source learned of the observation, if recorded by the log.
     pub observed_at: Option<OffsetDateTime>,
     pub valuation_policy_version: u32,
     pub source_priority_version: u32,
@@ -204,7 +204,7 @@ pub struct PriceProvenance {
     pub price_max_age: u16,
 }
 
-/// Выбранный кандидат с независимыми выводами политики и основанием.
+/// The selected candidate with independent policy determinations and rationale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedPrice {
     pub candidate: PriceCandidate,
@@ -213,7 +213,7 @@ pub struct SelectedPrice {
     pub provenance: PriceProvenance,
 }
 
-/// Запрос выборки цены на дату оценки и в координате знания.
+/// A request to select a price for a valuation date and knowledge coordinate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PriceQuery {
     pub instrument: InstrumentId,
@@ -221,17 +221,17 @@ pub struct PriceQuery {
     pub knowledge_as_of: OffsetDateTime,
 }
 
-/// Результат разбора старого качества цены.
+/// The result of parsing legacy price quality.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyValuationOutcome {
-    /// Старое событие можно представить как источник цены.
+    /// A legacy event can be represented as a price source.
     Candidate(PriceCandidate),
-    /// Старое событие содержит уже вычисленный результат политики.
+    /// A legacy event contains a precomputed policy result.
     LegacyDerived(PriceQuality),
 }
 
 impl LegacyValuationOutcome {
-    /// Возвращает кандидата, если legacy-качество допускает переоценку.
+    /// Returns the candidate if the legacy quality permits reevaluation.
     #[must_use]
     pub const fn candidate(&self) -> Option<&PriceCandidate> {
         match self {
@@ -240,7 +240,7 @@ impl LegacyValuationOutcome {
         }
     }
 
-    /// Возвращает унаследованное качество, если оно терминально.
+    /// Returns the inherited quality if it is terminal.
     #[must_use]
     pub const fn legacy(&self) -> Option<PriceQuality> {
         match self {
@@ -249,7 +249,7 @@ impl LegacyValuationOutcome {
         }
     }
 
-    /// Извлекает кандидата, если он есть.
+    /// Extracts the candidate, if present.
     #[must_use]
     pub fn into_candidate(self) -> Option<PriceCandidate> {
         match self {
@@ -259,12 +259,12 @@ impl LegacyValuationOutcome {
     }
 }
 
-/// Разбирает старое качество цены на происхождение и исполнимость.
+/// Parses legacy price quality into provenance and executability.
 ///
-/// `Executable`, `PreviousClose` и `OwnerEstimate` снова становятся
-/// кандидатами. `CarriedForward` и `Stale` не становятся кандидатами:
-/// legacy-событие хранит дату, к которой цену отнесли, но не исходную дату
-/// наблюдения, поэтому повторная выборка отмыла бы старый вывод как свежий.
+/// `Executable`, `PreviousClose`, and `OwnerEstimate` become
+/// candidates again. `CarriedForward` and `Stale` do not become candidates:
+/// the legacy event stores the date to which the price was assigned, but not the original
+/// observation date, so re-selection would launder an old determination as fresh.
 #[must_use]
 pub fn candidate_from_legacy_valuation(
     quality: PriceQuality,
@@ -299,8 +299,8 @@ mod tests {
 
     #[test]
     fn an_undecided_quotation_basis_is_unknown_not_money_per_unit() {
-        // Строка, записанная до появления основания, недоказуема.
-        // `MoneyPerUnit` по умолчанию объявил бы её доказанной (§4.9).
+        // A row written before the rationale existed cannot be proven.
+        // `MoneyPerUnit` would declare it proven by default (§4.9).
         assert_eq!(QuotationBasis::default(), QuotationBasis::Unknown);
     }
 
@@ -327,8 +327,8 @@ mod tests {
 
     #[test]
     fn an_unrecognised_code_does_not_fall_back_to_a_basis() {
-        // Неизвестный код из базы — это порча, а не `Unknown`: `Unknown`
-        // означает «источник не доказал», а не «строку не прочитали».
+        // An unknown code from the database is corruption, not `Unknown`: `Unknown`
+        // means «the source did not prove it», not «the row could not be read».
         assert_eq!(QuotationBasis::from_code("percent"), None);
     }
 
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn a_legacy_owner_estimate_becomes_an_owner_asserted_candidate() {
         let outcome = candidate_from_legacy_valuation(PriceQuality::OwnerEstimate, price());
-        let candidate = outcome.candidate().expect("оценка владельца — кандидат");
+        let candidate = outcome.candidate().expect("owner estimate is a candidate");
         assert_eq!(candidate.origin, PriceOrigin::OwnerAsserted);
         assert_eq!(candidate.executability, SourceExecutability::Unknown);
     }
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(
             outcome.legacy(),
             Some(PriceQuality::CarriedForward),
-            "исходная дата наблюдения потеряна: переоценка выдала бы перенос за наблюдение"
+            "original observation date was lost: reevaluation would pass off a carry-forward as an observation"
         );
     }
 

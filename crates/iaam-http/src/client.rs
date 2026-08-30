@@ -1,8 +1,8 @@
-//! Отправка запроса.
+//! Sending requests.
 //!
-//! Клиент на назначение собирается один раз: сборка клиента `reqwest`
-//! поднимает пул соединений и разбирает якорь доверия, и делать это
-//! на каждый запрос значит терять и то, и другое.
+//! A client is built once per destination: building a `reqwest` client
+//! creates a connection pool and parses the trust anchor, so doing this for
+//! every request would discard both.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -13,13 +13,13 @@ use crate::request::{HttpMethod, HttpRequest};
 use crate::response::{HttpError, HttpResponse};
 use crate::trust::{ConfiguredClient, client_for};
 
-/// Предел ожидания ответа.
+/// Response wait limit.
 ///
-/// Задан явно: у `reqwest` таймаута по умолчанию нет, и его отсутствие
-/// превратило бы зависший узел в вечно висящее фоновое задание.
+/// Explicit because `reqwest` has no default timeout; without one, a stalled
+/// endpoint would become a background job that hangs forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Клиент исходящих запросов.
+/// Outgoing request client.
 pub struct HttpClient {
     pool: Mutex<HashMap<Destination, ConfiguredClient>>,
 }
@@ -62,10 +62,11 @@ impl HttpClient {
             .len()
     }
 
-    /// Отправляет запрос и возвращает код с телом.
+    /// Send a request and return its status and body.
     ///
-    /// Код ответа **не классифицируется** здесь: смысл 401 у шлюза
-    /// брокера и у биржи разный, и трактовка принадлежит источнику.
+    /// The response status is **not classified** here: 401 has different
+    /// meaning at a broker gateway and an exchange, and interpretation
+    /// belongs to the source.
     pub async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let client = self.client_for(request.destination())?;
         let mut builder = match request.method() {
@@ -112,31 +113,31 @@ mod tests {
     fn a_client_is_built_once_per_destination() {
         let client = HttpClient::new();
         let first = client.pool_len();
-        let _ = client.client_for(Destination::MoexIss).expect("клиент");
-        let _ = client.client_for(Destination::MoexIss).expect("клиент");
+        let _ = client.client_for(Destination::MoexIss).expect("client");
+        let _ = client.client_for(Destination::MoexIss).expect("client");
         assert_eq!(first, 0);
-        assert_eq!(client.pool_len(), 1, "второй запрос собрал второй клиент");
+        assert_eq!(client.pool_len(), 1, "second request built a second client");
     }
 
     #[test]
     fn distinct_destinations_get_distinct_clients() {
         let client = HttpClient::new();
-        let _ = client.client_for(Destination::MoexIss).expect("клиент");
-        let _ = client.client_for(Destination::TinkoffProd).expect("клиент");
+        let _ = client.client_for(Destination::MoexIss).expect("client");
+        let _ = client.client_for(Destination::TinkoffProd).expect("client");
         assert_eq!(client.pool_len(), 2);
     }
 
     #[test]
     fn the_two_gateway_environments_do_not_share_a_client() {
         let client = HttpClient::new();
-        let _ = client.client_for(Destination::TinkoffProd).expect("клиент");
+        let _ = client.client_for(Destination::TinkoffProd).expect("client");
         let _ = client
             .client_for(Destination::TinkoffSandbox)
-            .expect("клиент");
+            .expect("client");
         assert_eq!(
             client.pool_len(),
             2,
-            "песочница и бой — разные хосты, общий клиент увёл бы запрос не туда"
+            "sandbox and production are different hosts; sharing a client would route the request incorrectly"
         );
     }
 

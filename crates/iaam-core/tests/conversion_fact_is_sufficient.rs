@@ -1,13 +1,13 @@
-//! Достаточность факта замещения (§16.1).
+//! Sufficiency of the substitution event (§16.1).
 //!
-//! Тест стартует **с лотов предшественника и самого события** и получает
-//! лоты преемника. Иначе он доказывал бы достаточность правила, а не
-//! факта: правило можно дописать, а поля уже записанного события — нет.
+//! The test starts **with the predecessor lots and the event itself** and derives
+//! the successor lots. Otherwise, it would prove the sufficiency of the rule, not
+//! the event: the rule can be amended, but the fields of an already-recorded event cannot.
 //!
-//! Это единственная проверка эпика, чей провал означает необратимую
-//! потерю. Если перенос налоговой стоимости и срока владения не выводится
-//! из факта, E5 будет угадывать, и угадывать по данным, которых больше
-//! неоткуда взять.
+//! This is the epic's only check whose failure means irreversible
+//! loss. If the carryover of tax basis and holding period cannot be derived
+//! from the event, E5 will have to guess—and guess using data that can
+//! no longer be obtained from anywhere else.
 
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates, TradeDate};
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
@@ -79,7 +79,7 @@ impl Swap {
         }
     }
 
-    /// Покупка предшественника — единственный источник лотов в тесте.
+    /// The predecessor purchase is the only source of lots in the test.
     fn bought(&self) -> Event {
         self.event(
             ACQUIRED,
@@ -160,11 +160,13 @@ impl Swap {
 fn book_after(swap: &Swap, conversion: &Event) -> LotBook {
     let rules = RuleRegistry::with_defaults();
     let mut book = LotBook::new(LotRuleVersion(1));
-    book.apply(&swap.bought(), &rules).expect("покупка");
-    // Форма факта проверяется тем же заслоном, что и в журнале: тест
-    // не имеет права применить событие, которое журнал бы не принял.
-    conversion.validate_structure().expect("форма замещения");
-    book.apply(conversion, &rules).expect("замещение");
+    book.apply(&swap.bought(), &rules).expect("purchase");
+    // The event structure is checked by the same gate used by the journal: the test
+    // must not apply an event that the journal would reject.
+    conversion
+        .validate_structure()
+        .expect("substitution structure");
+    book.apply(conversion, &rules).expect("substitution");
     book
 }
 
@@ -182,43 +184,43 @@ fn successor_lots_are_derived_from_predecessor_lots_and_the_event_alone() {
         ),
     );
 
-    let successor = book.entry(&swap.successor_key()).expect("лоты преемника");
+    let successor = book.entry(&swap.successor_key()).expect("successor lots");
     assert_eq!(successor.quantity().unwrap(), qty(10));
     assert_eq!(successor.remaining_basis().unwrap(), Some(rub(1_000_000)));
-    // Срок владения переходит целиком: замещение не является
-    // приобретением, и обнулить его значило бы отнять ЛДВ.
+    // The holding period carries over in full: a substitution is not an
+    // acquisition, and resetting it would forfeit the long-term holding deduction.
     assert_eq!(
         successor.lots()[0].acquired,
         Some(TradeDate(ACQUIRED)),
-        "срок владения обнулился"
+        "holding period was reset"
     );
 
-    // Стоимость обязана прийти к преемнику как приобретённая, иначе
-    // тождество «приобретено = осталось + списано» перестанет держаться
-    // и инвариант проекции остановит отчёт (projection/invariants.rs).
+    // The basis must reach the successor as acquired basis; otherwise
+    // the identity «acquired = remaining + written off» will no longer hold,
+    // and the projection invariant will halt the report (projection/invariants.rs).
     assert_eq!(successor.acquired_basis(), Some(rub(1_000_000)));
     assert_eq!(
         successor.lots()[0].acquisition_basis,
         Some(rub(1_000_000)),
-        "историческая стоимость должна перейти к преемнику"
+        "historical basis must carry over to the successor"
     );
     assert_eq!(successor.released_basis(), None);
 
     let predecessor = book
         .entry(&swap.predecessor_key())
-        .expect("запись предшественника");
+        .expect("predecessor entry");
     assert_eq!(predecessor.quantity().unwrap(), qty(0));
     assert_eq!(predecessor.released_basis(), Some(rub(1_000_000)));
 
-    // Тождество сохранения стоимости по обеим записям.
+    // Basis conservation identity across both entries.
     for entry in [predecessor, successor] {
-        let acquired = entry.acquired_basis().expect("стоимость приобретения");
+        let acquired = entry.acquired_basis().expect("acquisition basis");
         let remaining = entry.remaining_basis().unwrap().unwrap_or_else(|| rub(0));
         let released = entry.released_basis().unwrap_or_else(|| rub(0));
         assert_eq!(
             acquired,
             remaining.try_add(released).unwrap(),
-            "замещение потеряло стоимость"
+            "substitution lost basis"
         );
     }
 }
@@ -237,15 +239,15 @@ fn a_restart_rule_starts_the_holding_period_at_the_effective_date() {
         ),
     );
 
-    let successor = book.entry(&swap.successor_key()).expect("лоты преемника");
+    let successor = book.entry(&swap.successor_key()).expect("successor lots");
     assert_eq!(successor.lots()[0].acquired, Some(TradeDate(EFFECTIVE)));
 }
 
 #[test]
 fn a_cash_compensated_fraction_does_not_silently_reduce_the_basis() {
-    // Как компенсация дробей влияет на налоговую базу — правило E5.
-    // Часть 1 её только хранит; вычесть её здесь значило бы решить
-    // за E5 и записать решение в необратимую проекцию.
+    // How compensation for fractional shares affects the tax basis is an E5 rule.
+    // Part 1 only stores it; deducting it here would mean deciding
+    // for E5 and recording that decision in an irreversible projection.
     let swap = Swap::new();
     let book = book_after(
         &swap,
@@ -258,7 +260,7 @@ fn a_cash_compensated_fraction_does_not_silently_reduce_the_basis() {
         ),
     );
 
-    let successor = book.entry(&swap.successor_key()).expect("лоты преемника");
+    let successor = book.entry(&swap.successor_key()).expect("successor lots");
     assert_eq!(successor.remaining_basis().unwrap(), Some(rub(1_000_000)));
     assert_eq!(successor.quantity().unwrap(), qty(15));
 }
@@ -279,7 +281,7 @@ fn the_ratio_of_the_event_decides_the_successor_quantity() {
 
     assert_eq!(
         book.entry(&swap.successor_key())
-            .expect("лоты преемника")
+            .expect("successor lots")
             .quantity()
             .unwrap(),
         qty(15)

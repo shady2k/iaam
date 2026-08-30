@@ -1,9 +1,9 @@
-//! Разнесение налоговой стоимости при амортизации как факт события.
+//! Allocation of tax basis on amortisation as an event fact.
 //!
-//! Доля хранится в самом факте, а не выводится позже: если справочник
-//! исправят, вывести её будет неоткуда. Тот же довод, по которому
-//! `Conversion` хранит `basis_transfer` — условия живут в решении
-//! эмитента, а не в справочнике.
+//! The share is stored in the fact itself, not derived later: if the
+//! reference data is corrected, there would be no way to derive it.
+//! The same argument explains why `Conversion` stores `basis_transfer`:
+//! the terms live in the issuer's decision, not in reference data.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,35 +11,35 @@ use time::OffsetDateTime;
 
 use crate::rules::ReturnedShare;
 
-/// Почему доля разнесения не вычислена.
+/// Why the basis allocation was not computed.
 ///
-/// Проекции достаточно одного «неизвестно», но владельцу нужно знать,
-/// что именно дозагрузить, а аудиту — что именно разошлось.
+/// Projections need only one “unknown”, but the owner needs to know what to
+/// load next, and the audit needs to know what went wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocationGap {
-    /// Событие записано до появления поля либо обогащение не выполнялось.
+    /// The event predates the field or enrichment was not run.
     NotComputed,
-    /// Графика выпуска нет вовсе.
+    /// No issuance schedule exists.
     ScheduleMissing,
-    /// График есть, но не проверен.
+    /// The schedule exists but was not validated.
     ScheduleNotValidated,
-    /// В графике нет возврата на дату события.
+    /// No repayment occurs on the event date.
     NoRepaymentOnDate,
-    /// Сумма события не сошлась с плановой долей.
+    /// The event amount does not match the scheduled share.
     AmountMismatch,
-    /// Валюта возврата не совпала с валютой номинала.
+    /// The repayment currency does not match the principal currency.
     CurrencyMismatch,
-    /// На дату приходится несколько возвратов, которые не удалось
-    /// сопоставить событиям.
+    /// Multiple repayments occur on the date and could not be matched
+    /// to events.
     AmbiguousSameDateRepayments,
-    /// Доли возвратов до даты дают больше 100%.
+    /// Returns through the date exceed 100%.
     InvalidPrefix,
 }
 
 impl AllocationGap {
-    /// Все варианты. Заслон от забытого кода у нового члена семейства:
-    /// тест обходит этот массив, а компилятор ловит несовпадение длины.
+    /// All variants. A guard against forgetting a code for a new family
+    /// member: the test walks this array, while the compiler checks its length.
     pub const ALL: [Self; 8] = [
         Self::NotComputed,
         Self::ScheduleMissing,
@@ -66,21 +66,21 @@ impl AllocationGap {
     }
 }
 
-/// Версия алгоритма вычисления доли.
+/// Allocation-algorithm version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AllocationAlgorithmVersion(pub u16);
 
-/// Отпечаток канонической выборки справочных входов вычисления.
+/// Fingerprint of the canonical reference-input selection used for allocation.
 ///
-/// Покрывает то, от чего зависит доля: номинал с валютой, возвраты,
-/// вошедшие в остаток до события, возвраты на дату события, идентичность
-/// снимка источника и версию правила группировки одинаковых дат.
+/// Covers everything the share depends on: principal and currency, returns
+/// included in the remainder before the event, returns on the event date,
+/// source-snapshot identity, and the rule version for grouping equal dates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AllocationInputsHash(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("отпечаток входов не является 64 шестнадцатеричными знаками")]
+#[error("input fingerprint is not 64 hexadecimal characters")]
 pub struct AllocationInputsHashError;
 
 impl AllocationInputsHash {
@@ -98,10 +98,10 @@ impl AllocationInputsHash {
     }
 }
 
-/// Из каких дополнительных входов приложение вывело долю.
+/// Additional inputs from which the application derived the share.
 ///
-/// Отдельно от `Provenance`: тот отвечает на вопрос «откуда пришёл сырой
-/// факт», а это — «из чего выведено производное поле».
+/// Separate from `Provenance`: that answers “where did the raw fact come from?”,
+/// while this answers “from what was the derived field computed?”.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocationEvidence {
     pub inputs_hash: AllocationInputsHash,
@@ -109,7 +109,7 @@ pub struct AllocationEvidence {
     pub algorithm_version: AllocationAlgorithmVersion,
 }
 
-/// Доля разнесения с доказательством её вычисления.
+/// Basis allocation with evidence of its computation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum BasisAllocation {
@@ -121,9 +121,9 @@ pub enum BasisAllocation {
 }
 
 impl Default for BasisAllocation {
-    /// Умолчание честное: событие, записанное до появления поля,
-    /// действительно ничего не утверждало, и приписать ему долю значило
-    /// бы объявить вычисленным то, чего никто не вычислял.
+    /// Honest default: an event written before the field existed asserted
+    /// nothing, and assigning it a share would claim that someone computed
+    /// what nobody computed.
     fn default() -> Self {
         Self::Unknown(AllocationGap::NotComputed)
     }
@@ -139,7 +139,7 @@ mod tests {
 
     fn known() -> BasisAllocation {
         BasisAllocation::Known {
-            share: ReturnedShare::new(Dec::new(Decimal::new(2, 1))).expect("доля 0.2"),
+            share: ReturnedShare::new(Dec::new(Decimal::new(2, 1))).expect("share 0.2"),
             evidence: AllocationEvidence {
                 inputs_hash: AllocationInputsHash::new("a".repeat(64)).expect("hex"),
                 knowledge_as_of: OffsetDateTime::UNIX_EPOCH,
@@ -158,9 +158,9 @@ mod tests {
 
     #[test]
     fn a_known_allocation_survives_a_json_round_trip() {
-        let text = serde_json::to_string(&known()).expect("запись");
+        let text = serde_json::to_string(&known()).expect("write");
         assert_eq!(
-            serde_json::from_str::<BasisAllocation>(&text).expect("чтение"),
+            serde_json::from_str::<BasisAllocation>(&text).expect("read"),
             known()
         );
     }
@@ -168,9 +168,9 @@ mod tests {
     #[test]
     fn a_known_allocation_survives_a_cbor_round_trip() {
         let mut body = Vec::new();
-        ciborium::into_writer(&known(), &mut body).expect("запись");
+        ciborium::into_writer(&known(), &mut body).expect("write");
         assert_eq!(
-            ciborium::from_reader::<BasisAllocation, _>(body.as_slice()).expect("чтение"),
+            ciborium::from_reader::<BasisAllocation, _>(body.as_slice()).expect("read"),
             known()
         );
     }

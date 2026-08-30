@@ -1,8 +1,8 @@
-//! Доменные стратегии и их версии (§3.2).
+//! Domain strategies and their versions (§3.2).
 //!
-//! Стратегия — **не порт ввода-вывода**: она передаётся в ядро как
-//! неизменяемый вход, поэтому чистота функционального ядра сохраняется.
-//! Реестр закрытый: плагины в рантайме не нужны.
+//! A strategy is **not an I/O port**: it is passed into the core as an
+//! immutable input, preserving the purity of the functional core.
+//! The registry is closed; runtime plugins are unnecessary.
 
 mod accrued_interest;
 pub mod allocation;
@@ -41,15 +41,15 @@ pub use valuation::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LotRuleVersion(pub u32);
 
-/// Реестр версионированных доменных правил.
+/// Registry of versioned domain rules.
 ///
-/// Реестр хранит независимые наборы правил: списание лотов и выбор цены.
+/// The registry stores independent rule sets: lot disposal and price selection.
 pub struct RuleRegistry {
     lot_rules: BTreeMap<LotRuleVersion, Box<dyn LotDisposalRule>>,
     valuation_rules: BTreeMap<ValuationPolicyVersion, Box<dyn ValuationRule>>,
-    /// Отдельная карта, а не расширение `lot_rules`: списание лотов —
-    /// выбор владельца, амортизация — событие выпуска, и общая версия
-    /// связала бы два независимых решения.
+    /// A separate map, not an extension of `lot_rules`: lot disposal is the
+    /// owner's choice, amortisation is an issue event, and a shared version
+    /// would couple two independent decisions.
     amortisation_rules: BTreeMap<AmortisationRuleVersion, Box<dyn AmortisationRule>>,
     quotation_rules: BTreeMap<QuotationRuleVersion, Box<dyn QuotationRule>>,
     cashflow_rules: BTreeMap<CashflowProjectionVersion, Box<dyn CashflowProjection>>,
@@ -57,7 +57,7 @@ pub struct RuleRegistry {
 }
 
 impl RuleRegistry {
-    /// Реестр с правилами по умолчанию.
+    /// Registry with the default rules.
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut lot_rules: BTreeMap<LotRuleVersion, Box<dyn LotDisposalRule>> = BTreeMap::new();
@@ -122,13 +122,13 @@ impl RuleRegistry {
         self.cashflow_rules.get(&version).map(|rule| rule.as_ref())
     }
 
-    /// Наибольшая доступная версия правила построения потока.
+    /// Highest available version of the cashflow construction rule.
     #[must_use]
     pub fn latest_cashflow_version(&self) -> Option<CashflowProjectionVersion> {
         self.cashflow_rules.keys().next_back().copied()
     }
 
-    /// Наибольшая доступная версия правила амортизации.
+    /// Highest available version of the amortisation rule.
     #[must_use]
     pub fn latest_amortisation_version(&self) -> Option<AmortisationRuleVersion> {
         self.amortisation_rules.keys().next_back().copied()
@@ -144,8 +144,7 @@ impl RuleRegistry {
         self.lot_rules.get(&version).map(|rule| rule.as_ref())
     }
 
-    /// Наибольшая доступная версия. Используется, когда вызывающий
-    /// не указал версию явно.
+    /// Highest available version. Used when the caller does not specify one.
     #[must_use]
     pub fn latest_disposal_version(&self) -> Option<LotRuleVersion> {
         self.lot_rules.keys().next_back().copied()
@@ -156,7 +155,7 @@ impl RuleRegistry {
         self.quotation_rules.get(&version).map(|rule| rule.as_ref())
     }
 
-    /// Наибольшая доступная версия правила пересчёта котировки.
+    /// Highest available version of the quotation conversion rule.
     #[must_use]
     pub fn latest_quotation_version(&self) -> Option<QuotationRuleVersion> {
         self.quotation_rules.keys().next_back().copied()
@@ -178,7 +177,7 @@ mod tests {
         let reg = RuleRegistry::with_defaults();
         let rule = reg
             .disposal_rule(LotRuleVersion(1))
-            .expect("FIFO v1 зарегистрирован");
+            .expect("FIFO v1 is registered");
         assert_eq!(rule.id(), lot_disposal::RuleId::new(FifoV1::ID));
     }
 
@@ -187,7 +186,7 @@ mod tests {
         let reg = RuleRegistry::with_defaults();
         assert!(
             reg.disposal_rule(LotRuleVersion(99)).is_none(),
-            "неизвестная версия не должна молча подменяться доступной"
+            "unknown version must not silently fall back to an available one"
         );
     }
 
@@ -199,16 +198,16 @@ mod tests {
 
     #[test]
     fn the_default_registry_is_the_registry_with_defaults() {
-        // `Default` — не отдельный пустой реестр: иначе вызывающий,
-        // положившийся на него, молча остался бы без правил.
+        // `Default` is not a separate empty registry: otherwise a caller
+        // relying on it would silently have no rules.
         let reg = RuleRegistry::default();
         assert_eq!(reg.latest_disposal_version(), Some(LotRuleVersion(1)));
     }
 
     #[test]
     fn the_registry_dispatches_disposal_through_the_rule_it_resolved() {
-        // Проекция обязана ходить через реестр, а не звать FifoV1 напрямую:
-        // здесь проверяется, что через `&dyn` вызов доходит до правила.
+        // The projection must go through the registry, not call FifoV1 directly:
+        // this verifies that the `&dyn` call reaches the rule.
         use crate::dates::TradeDate;
         use crate::ids::InstrumentId;
         use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
@@ -220,8 +219,8 @@ mod tests {
         let reg = RuleRegistry::with_defaults();
         let version = reg
             .latest_disposal_version()
-            .expect("реестр не пуст по умолчанию");
-        let rule = reg.disposal_rule(version).expect("версия разрешается");
+            .expect("registry is not empty by default");
+        let rule = reg.disposal_rule(version).expect("version resolves");
 
         let lots = vec![Lot {
             id: LotId::new_random(),
@@ -238,7 +237,7 @@ mod tests {
                 lots,
                 quantity: Quantity(Dec::new(Decimal::from(4))),
             })
-            .expect("списание выполнимо");
+            .expect("disposal is computable");
 
         assert_eq!(out.rule, lot_disposal::RuleId::new(FifoV1::ID));
         assert_eq!(
@@ -251,7 +250,7 @@ mod tests {
         let reg = RuleRegistry::with_defaults();
         let rule = reg
             .valuation_rule(ValuationPolicyVersion(1))
-            .expect("политика оценки v1 зарегистрирована");
+            .expect("valuation policy v1 is registered");
         assert_eq!(rule.version(), ValuationPolicyVersion(1));
     }
 

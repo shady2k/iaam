@@ -1,7 +1,7 @@
-//! Сырьё источников: документы и строки (§10.1).
+//! Source raw material: documents and rows (§10.1).
 //!
-//! Разбор повторяется, сырьё — никогда: без сохранённого тела документа
-//! исправленный парсер бесполезен для уже загруженного отчёта.
+//! Parsing can be repeated, but raw material cannot: without the stored document body
+//! a corrected parser is useless for an already loaded report.
 
 use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::ids::{OwnerId, SourceId};
@@ -24,11 +24,11 @@ fn upload(owner: OwnerId, seed: &str) -> NewDocument {
         format: ReportFormat::parse("xlsx").unwrap(),
         parser_version: ParserVersion("tinkoff-xlsx/1".to_owned()),
         document_hash: hash(seed),
-        // Настоящий XLSX начинается с сигнатуры ZIP и содержит
-        // произвольные байты: тело не является текстом.
+        // A real XLSX starts with a ZIP signature and contains
+        // arbitrary bytes: the body is not text.
         body: [
             b"PK\x03\x04".as_slice(),
-            "тело отчёта".as_bytes(),
+            "report body".as_bytes(),
             &[0x00, 0xff],
         ]
         .concat(),
@@ -51,11 +51,11 @@ fn a_document_survives_a_write_and_a_read() {
     assert_eq!(read.format, uploaded.format);
     assert_eq!(read.parser_version, uploaded.parser_version);
     assert_eq!(read.document_hash, uploaded.document_hash);
-    // Тело возвращается побайтно: повторный разбор новой версией парсера
-    // не обращается к источнику.
+    // The body is returned byte-for-byte: reparsing with a new parser version
+    // does not access the source.
     assert_eq!(read.body, uploaded.body);
     OffsetDateTime::parse(&read.uploaded_at, &Rfc3339)
-        .expect("момент загрузки разбирается обратно");
+        .expect("the upload moment can be parsed back");
 }
 
 #[test]
@@ -65,8 +65,8 @@ fn the_same_file_uploaded_twice_keeps_the_first_document() {
     let first = upload(owner, "b");
     store.insert_document(&first).unwrap();
 
-    // Тот же файл, другой идентификатор загрузки: повтор отправки, а не
-    // второй документ.
+    // The same file, a different upload identifier: a resend, not
+    // a second document.
     let again = NewDocument {
         id: SourceId::new_random(),
         ..upload(owner, "b")
@@ -84,8 +84,8 @@ fn the_same_file_from_another_owner_is_a_separate_document() {
     let theirs = upload(OwnerId::new_random(), "c");
     store.insert_document(&mine).unwrap();
 
-    // Одинаковый файл у разных владельцев — разные факты о разных
-    // портфелях, а не дубликат.
+    // The same file owned by different owners represents different facts about different
+    // portfolios, not a duplicate.
     assert_eq!(
         store.insert_document(&theirs).unwrap(),
         DocumentStored::Inserted { id: theirs.id }
@@ -101,7 +101,7 @@ fn a_document_of_another_owner_is_not_readable() {
     let stranger = OwnerId::new_random();
     assert!(
         store.load_document(stranger, theirs.id).is_err(),
-        "чужой документ не читается даже по точному идентификатору"
+        "a document owned by someone else cannot be read even with the exact identifier"
     );
 }
 
@@ -114,15 +114,15 @@ fn a_row_keeps_the_locator_that_provenance_needs() {
 
     let rows = vec![
         RawRow {
-            sheet: Some("Сделки".to_owned()),
+            sheet: Some("Trades".to_owned()),
             row: 118,
-            payload: "покупка;10;100,50".to_owned(),
+            payload: "purchase;10;100,50".to_owned(),
             status: RowStatus::Parsed,
         },
         RawRow {
-            sheet: Some("Сделки".to_owned()),
+            sheet: Some("Trades".to_owned()),
             row: 119,
-            payload: "неведомая строка".to_owned(),
+            payload: "unknown row".to_owned(),
             status: RowStatus::Unparsed,
         },
     ];
@@ -138,8 +138,8 @@ fn a_row_without_a_sheet_is_stored_and_its_locator_stays_unique() {
     let document = upload(owner, "f");
     store.insert_document(&document).unwrap();
 
-    // У CSV листа нет. `None` здесь означает «листа не было», а не
-    // «лист не разобрали», и пустой строкой не подменяется.
+    // A CSV has no sheet. `None` here means “there was no sheet,” not
+    // “the sheet was not parsed,” and it is not replaced with an empty string.
     let row = RawRow {
         sheet: None,
         row: 7,
@@ -154,10 +154,10 @@ fn a_row_without_a_sheet_is_stored_and_its_locator_stays_unique() {
         vec![row.clone()]
     );
 
-    // Тот же локатор второй раз — тот же кусок сырья дважды.
+    // The same locator a second time—the same raw-material chunk twice.
     assert!(
         store.insert_rows(owner, document.id, &[row]).is_err(),
-        "локатор без листа обязан оставаться уникальным"
+        "a locator without a sheet must remain unique"
     );
 }
 
@@ -171,12 +171,12 @@ fn rows_are_not_added_to_another_owners_document() {
     let row = RawRow {
         sheet: None,
         row: 1,
-        payload: "подложенная строка".to_owned(),
+        payload: "injected row".to_owned(),
         status: RowStatus::Parsed,
     };
     assert!(
         store.insert_rows(stranger, theirs.id, &[row]).is_err(),
-        "в чужой документ строки не дописываются"
+        "rows are not appended to another document"
     );
 }
 
@@ -193,7 +193,7 @@ fn rows_of_another_owners_document_are_not_readable() {
             &[RawRow {
                 sheet: None,
                 row: 1,
-                payload: "своя строка".to_owned(),
+                payload: "own row".to_owned(),
                 status: RowStatus::Parsed,
             }],
         )
@@ -202,7 +202,7 @@ fn rows_of_another_owners_document_are_not_readable() {
     let stranger = OwnerId::new_random();
     assert!(
         store.rows_of_document(stranger, document.id).is_err(),
-        "строки чужого документа не читаются"
+        "rows from another document are not readable"
     );
 }
 
@@ -216,12 +216,12 @@ fn a_partly_rejected_batch_of_rows_leaves_no_half_document() {
     let good = RawRow {
         sheet: None,
         row: 1,
-        payload: "первая".to_owned(),
+        payload: "first".to_owned(),
         status: RowStatus::Parsed,
     };
     let clash = RawRow {
         row: 1,
-        payload: "вторая с тем же локатором".to_owned(),
+        payload: "second with the same locator".to_owned(),
         ..good.clone()
     };
     assert!(
@@ -232,7 +232,7 @@ fn a_partly_rejected_batch_of_rows_leaves_no_half_document() {
     assert_eq!(
         store.rows_of_document(owner, document.id).unwrap(),
         vec![],
-        "отказ на строке отменяет всю пачку: половина сырья хуже, чем ничего"
+        "rejecting one row cancels the entire batch: half the raw material is worse than none"
     );
 }
 
@@ -249,22 +249,25 @@ fn stored_raw_material_resists_a_direct_repair_script() {
             &[RawRow {
                 sheet: None,
                 row: 1,
-                payload: "строка".to_owned(),
+                payload: "row".to_owned(),
                 status: RowStatus::Parsed,
             }],
         )
         .unwrap();
 
-    // Проверяется прямым SQL, а не через обёртку: заслон обязан держать
-    // и скрипт починки данных.
+    // Checked with direct SQL rather than through the wrapper: the guard must cover
+    // the data-repair script as well.
     let conn = store.connection();
     for sql in [
         "UPDATE source_documents SET body = x'00'",
         "DELETE FROM source_documents",
-        "UPDATE raw_rows SET payload = 'подменено'",
+        "UPDATE raw_rows SET payload = 'replacement'",
         "DELETE FROM raw_rows",
     ] {
-        assert!(conn.execute(sql, []).is_err(), "сырьё неизменяемо: {sql}");
+        assert!(
+            conn.execute(sql, []).is_err(),
+            "raw material is immutable: {sql}"
+        );
     }
 }
 
@@ -307,8 +310,8 @@ fn documents_of_another_owner_never_await_our_reparse() {
 
 #[test]
 fn a_broker_or_format_without_a_name_is_refused() {
-    // Пустой код брокера в базе неотличим от «брокера не знаем», а
-    // неизвестное значение — это `Option`, а не пустая строка (§4.9).
+    // An empty broker code in the database is indistinguishable from “broker unknown”, while
+    // an unknown value is an `Option`, not an empty string (§4.9).
     assert!(BrokerCode::parse("").is_none());
     assert!(BrokerCode::parse("   ").is_none());
     assert!(ReportFormat::parse("").is_none());

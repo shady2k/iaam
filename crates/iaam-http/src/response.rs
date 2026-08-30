@@ -1,12 +1,12 @@
-//! Ответ и отказы транспорта.
+//! Transport response and refusals.
 
 use thiserror::Error;
 
-/// Ответ узла: код и тело как есть.
+/// Endpoint response: status and body as received.
 ///
-/// Тело не разбирается и не перекодируется здесь: ЦБ отвечает
-/// в `windows-1251`, MOEX — в UTF-8, и знание об этом принадлежит
-/// крейте источника, а не транспорту.
+/// The body is not parsed or re-encoded here: CBR responds in
+/// `windows-1251`, MOEX in UTF-8, and that knowledge belongs to the source
+/// crate, not the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
@@ -14,28 +14,28 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
-    /// Тело как строка UTF-8. Источники с иной кодировкой этим методом
-    /// не пользуются — они берут `body` и перекодируют сами.
+    /// Body as a UTF-8 string. Sources with another encoding do not use this
+    /// method; they take `body` and re-encode it themselves.
     #[must_use]
     pub fn text_utf8(&self) -> Option<&str> {
         core::str::from_utf8(&self.body).ok()
     }
 }
 
-/// Отказ транспорта.
+/// Transport refusal.
 ///
-/// Варианты не несут ни тела ответа, ни предъявленного секрета:
-/// классификация ответа по смыслу принадлежит источнику, а отказ
-/// транспорта не должен превращаться в утечку.
+/// Variants carry neither response body nor presented secret: response
+/// classification belongs to the source, and a transport refusal must not
+/// become a data leak.
 #[derive(Debug, Error)]
 pub enum HttpError {
-    #[error("сетевой отказ")]
+    #[error("network refusal")]
     Network,
-    #[error("истекло время ожидания ответа")]
+    #[error("response timed out")]
     Timeout,
-    #[error("клиент не собран: {0}")]
+    #[error("client was not built: {0}")]
     ClientNotBuilt(String),
-    #[error("вшитый корень доверия не разобран: {0}")]
+    #[error("embedded trust root was not parsed: {0}")]
     TrustAnchorNotParsed(String),
 }
 
@@ -47,10 +47,10 @@ mod tests {
     fn text_utf8_returns_the_exact_valid_body() {
         let response = HttpResponse {
             status: 200,
-            body: "ответ".as_bytes().to_vec(),
+            body: "response".as_bytes().to_vec(),
         };
 
-        assert_eq!(response.text_utf8(), Some("ответ"));
+        assert_eq!(response.text_utf8(), Some("response"));
     }
 
     #[test]

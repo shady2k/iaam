@@ -1,4 +1,4 @@
-//! Версионированная политика выбора цены (§4–5 E3.3).
+//! Versioned price selection policy (§4–5 E3.3).
 
 use std::collections::BTreeSet;
 
@@ -8,15 +8,15 @@ use crate::valuation::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Версия политики выбора цены.
+/// Price selection policy version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ValuationPolicyVersion(pub u32);
 
-/// Версия таблицы приоритетов происхождений.
+/// Origin priority table version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourcePriorityVersion(pub u32);
 
-/// Результат выбора: отсутствие цены является свойством выборки.
+/// Selection result: price absence is a property of the selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceSelectionResult {
     selected: Option<SelectedPrice>,
@@ -35,14 +35,14 @@ impl PriceSelectionResult {
     }
 }
 
-/// Доменный порт политики выбора цены.
+/// Domain port for the price selection policy.
 pub trait ValuationRule: Send + Sync {
     fn version(&self) -> ValuationPolicyVersion;
     fn source_priority_version(&self) -> SourcePriorityVersion;
     fn select(&self, query: &PriceQuery, candidates: &[PriceCandidate]) -> PriceSelectionResult;
 }
 
-/// Политика выбора цены версии 1.
+/// Price selection policy version 1.
 #[derive(Debug, Clone, Copy)]
 pub struct ValuationPolicyV1 {
     pub carry_forward_limit: u16,
@@ -232,11 +232,11 @@ impl ValuationRule for ValuationPolicyV1 {
             });
         }
 
-        // Безвременные кандидаты не могут конкурировать по свежести с
-        // известными: сравнивать их момент знания не с чем. Если известный
-        // момент есть, он оставляет только самый свежий; если нет, все
-        // безвременные остаются и несколько таких кандидатов дают явный
-        // отказ как неоднозначные.
+        // Timeless candidates cannot compete on freshness with
+        // known ones: there is no knowledge time to compare them by. If a known
+        // time exists, it leaves only the freshest; if not, all
+        // timeless ones remain, and multiple such candidates result in an explicit
+        // rejection as ambiguous.
         if let Some(latest_observed_at) = matching
             .iter()
             .filter_map(|(_, candidate)| candidate.observed_at)
@@ -335,7 +335,7 @@ mod tests {
             "market_price_2" | "marketprice2" => PriceKind::MarketPrice2,
             "market_price_3" | "marketprice3" => PriceKind::MarketPrice3,
             "admitted_quote" | "admittedquote" => PriceKind::AdmittedQuote,
-            _ => panic!("неизвестный вид цены: {kind}"),
+            _ => panic!("unknown price kind: {kind}"),
         };
         candidate_from_origin(
             instrument,
@@ -416,7 +416,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            out.selected().expect("цена есть").candidate.origin,
+            out.selected().expect("price exists").candidate.origin,
             PriceOrigin::ReportParsed { .. }
         ));
     }
@@ -451,7 +451,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            out.selected().expect("цена есть").candidate.origin,
+            out.selected().expect("price exists").candidate.origin,
             PriceOrigin::Market { .. }
         ));
     }
@@ -476,7 +476,7 @@ mod tests {
         assert!(matches!(
             report_over_owner
                 .selected()
-                .expect("отчёт приоритетнее владельца")
+                .expect("report takes priority over owner")
                 .candidate
                 .origin,
             PriceOrigin::ReportParsed { .. }
@@ -501,7 +501,7 @@ mod tests {
         assert!(matches!(
             market_over_report
                 .selected()
-                .expect("биржа приоритетнее отчёта")
+                .expect("exchange takes priority over report")
                 .candidate
                 .origin,
             PriceOrigin::Market { .. }
@@ -568,7 +568,7 @@ mod tests {
         );
         assert_eq!(
             out.selected()
-                .expect("Close остаётся допустимым видом")
+                .expect("Close remains an allowed kind")
                 .provenance
                 .price_kind
                 .as_deref(),
@@ -688,7 +688,7 @@ mod tests {
         );
         assert_eq!(
             out.selected()
-                .expect("версия до knowledge_as_of")
+                .expect("version before knowledge_as_of")
                 .provenance
                 .observed_at,
             Some(datetime!(2026 - 08 - 10 11:00 UTC))
@@ -702,7 +702,7 @@ mod tests {
             &query,
             &[candidate(query.instrument, date!(2026 - 08 - 10))],
         );
-        let picked = out.selected().expect("цена есть");
+        let picked = out.selected().expect("price exists");
         assert_eq!(picked.selection, PriceSelection::AsObserved);
         assert_eq!(picked.freshness, PriceFreshness::Fresh);
     }
@@ -714,7 +714,7 @@ mod tests {
             &query,
             &[candidate(query.instrument, date!(2026 - 07 - 11))],
         );
-        let picked = out.selected().expect("30 дней ещё в окне");
+        let picked = out.selected().expect("30 days is still within the window");
         assert_eq!(
             picked.selection,
             PriceSelection::CarriedForward {
@@ -776,7 +776,7 @@ mod tests {
             let query = query(date!(2026 - 08 - 10));
             let trade_date = query.as_of - time::Duration::days(age);
             let out = policy().select(&query, &[candidate(query.instrument, trade_date)]);
-            let picked = out.selected().expect("граница должна быть в окне");
+            let picked = out.selected().expect("boundary must be within the window");
             assert_eq!(picked.selection, selection);
             assert_eq!(picked.freshness, freshness);
         }
@@ -802,7 +802,7 @@ mod tests {
         candidate.basis = crate::valuation::QuotationBasis::PercentOfRemainingFace;
         candidate.basis_evidence = "iss:engines/stock/markets/bonds".to_owned();
         let out = policy().select(&query, &[candidate]);
-        let provenance = &out.selected().expect("цена есть").provenance;
+        let provenance = &out.selected().expect("price exists").provenance;
         assert_eq!(provenance.price_kind.as_deref(), Some("legal_close"));
         assert_eq!(provenance.venue.as_deref(), Some("TQBR"));
         assert_eq!(
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(provenance.price_max_age, 30);
     }
     #[test]
-    fn известное_время_отчёта_побеждает_неизвестное_в_любом_порядке() {
+    fn known_report_time_beats_unknown_in_any_order() {
         let query = query(date!(2026 - 08 - 10));
         let known_at = datetime!(2026 - 08 - 10 11:00 UTC);
         let known = candidate_from_origin(
@@ -834,12 +834,12 @@ mod tests {
 
         for candidates in [[known.clone(), unknown.clone()], [unknown, known]] {
             let result = policy().select(&query, &candidates);
-            let selected = result.selected().expect("известное время должно победить");
+            let selected = result.selected().expect("known time must win");
             assert_eq!(selected.provenance.observed_at, Some(known_at));
         }
     }
     #[test]
-    fn рыночное_время_побеждает_журнальное_безвременное_в_любом_порядке() {
+    fn market_time_beats_timeless_journal_time_in_any_order() {
         let query = query(date!(2026 - 08 - 10));
         let mut journal = candidate_from_origin(
             query.instrument,
@@ -860,9 +860,7 @@ mod tests {
 
         for candidates in [[market.clone(), journal.clone()], [journal, market]] {
             let result = policy().select(&query, &candidates);
-            let selected = result
-                .selected()
-                .expect("известное рыночное время должно победить");
+            let selected = result.selected().expect("known market time must win");
             assert!(matches!(
                 selected.candidate.origin,
                 PriceOrigin::Market { .. }
@@ -871,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn журнальные_кандидаты_без_времени_детерминированы_и_не_зависят_от_координаты() {
+    fn timeless_journal_candidates_are_deterministic_and_coordinate_independent() {
         let instrument = instrument();
         let mut first = candidate(instrument, date!(2026 - 08 - 10));
         first.observed_at = None;

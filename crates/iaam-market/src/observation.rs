@@ -1,10 +1,10 @@
-//! Наблюдение рыночных данных (раздел 3 дизайна E3.2).
+//! Market-data observations (design E3.2, section 3).
 //!
-//! Наблюдение **append-only и битемпорально**. Две оси времени:
-//! `trade_date` — к какому дню относится значение, `observed_at` —
-//! когда мы об этом узнали. Вторая назначается системой, а не берётся
-//! из ответа: доверить её часам источника значит сделать ось знания
-//! подделываемой ответом, а вместе с ней и воспроизводимость отчёта.
+//! An observation is **append-only and bitemporal**. It has two time axes:
+//! `trade_date` says which day the value belongs to, and `observed_at` says
+//! when we learned it. The latter is assigned by the system, not taken from
+//! the response: trusting the source's clock would make the knowledge axis
+//! forgeable by the response and would make report reproduction impossible.
 
 use iaam_core::ids::InstrumentId;
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
@@ -13,40 +13,40 @@ use iaam_core::valuation::QuotationBasis;
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
-/// К какому торговому дню относится значение (valid time).
+/// Trade date to which the value belongs (valid time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TradeDate(pub Date);
 
-/// Когда мы узнали значение (knowledge time).
+/// Time at which we learned the value (knowledge time).
 ///
-/// Отдельный тип, а не второй `Date`, намеренно: перепутать оси местами
-/// не должно быть представимо (§15.1). Перестановка «когда цена» и
-/// «когда узнали» не даёт ни ошибки компиляции, ни неверного числа —
-/// она молча ломает воспроизводимость отчёта.
+/// A separate type rather than another `Date` is intentional: swapping the
+/// axes must not be representable (§15.1). Swapping “when was the price?” and
+/// “when did we learn it?” produces neither a compiler error nor a wrong
+/// number—it silently breaks report reproducibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObservedAt(pub OffsetDateTime);
 
-/// Исполнимость цены — **атрибут источника**, а не вывод политики.
+/// Price executability—an **attribute of the source**, not a policy output.
 ///
-/// Вариантов `CarriedForward` и `Stale` здесь нет и быть не может: перенос
-/// цены на нерабочий день и устаревание по порогу выводятся правилом оценки
-/// (E3.3). Записать их наблюдением значит стереть различие между «биржа не
-/// торговала» и «мы подставили вчерашнее» — и лишиться возможности пересчитать
-/// отчёт по изменившемуся правилу.
+/// There are no `CarriedForward` or `Stale` variants here and there cannot be:
+/// carrying a price onto a non-trading day and staleness beyond a threshold
+/// are derived by valuation policy (E3.3). Recording them as observations
+/// would erase the distinction between “the exchange did not trade” and “we
+/// substituted yesterday's value”, making reports impossible to recalculate
+/// under a changed rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Executability {
-    /// Цена, по которой можно выйти: доступный bid.
+    /// Price at which an exit is possible: the available bid.
     Executable,
-    /// Цена закрытия предыдущих торгов — ориентир, не исполнение.
+    /// Previous trading day's closing price—an indication, not an execution.
     IndicativePreviousClose,
 }
 
-/// Какая именно цена наблюдалась.
+/// The exact price that was observed.
 ///
-/// ISS отдаёт шесть кандидатов в одной строке. Ни один не объявлен
-/// главным: выбор между ними — политика оценки, то есть E3.3.
-/// Объявить главного здесь значило бы принять решение чужого
-/// подпроекта молча.
+/// ISS returns six candidates in one row. None is declared primary: choosing
+/// among them is valuation policy, E3.3. Declaring one primary here would
+/// silently accept a decision belonging to another subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PriceKind {
     Close,
@@ -57,13 +57,13 @@ pub enum PriceKind {
     AdmittedQuote,
 }
 
-/// Режим торгов из идентичности рыночного наблюдения.
+/// Trading venue from the identity of a market observation.
 ///
-/// Тип принадлежит core, чтобы кандидаты оценки и рыночные наблюдения
-/// не могли расходиться по представлению площадки.
+/// The type belongs to core so valuation candidates and market observations
+/// cannot diverge in how they represent a venue.
 pub use iaam_core::valuation::Venue;
 
-/// Наблюдение цены инструмента.
+/// Instrument price observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceObservation {
     pub instrument: InstrumentId,
@@ -72,61 +72,61 @@ pub struct PriceObservation {
     pub observed_at: ObservedAt,
     pub kind: PriceKind,
     pub price: Dec,
-    /// Валюта площадки, **не «валюта инструмента»**: ISS отдаёт
-    /// `CURRENCYID` построчно, и она принадлежит наблюдению.
+    /// Venue currency, **not “instrument currency”**: ISS returns
+    /// `CURRENCYID` per row, and it belongs to the observation.
     pub currency: CurrencyCode,
-    /// Единица цены, доказанная при разборе (§10.2).
+    /// Price unit established during parsing (§10.2).
     ///
-    /// `#[serde(default)]` обязателен: наблюдения записаны до появления
-    /// поля, и подставить им `MoneyPerUnit` значит объявить доказанным
-    /// то, чего никто не доказывал.
+    /// `#[serde(default)]` is required: observations were recorded before this
+    /// field existed, and assigning `MoneyPerUnit` would claim proof nobody
+    /// had provided.
     #[serde(default)]
     pub basis: QuotationBasis,
-    /// Признак, из которого основание выведено.
+    /// Evidence from which the basis was derived.
     #[serde(default)]
     pub basis_evidence: String,
     pub executability: Executability,
 }
 
-/// Наблюдение накопленного купонного дохода.
+/// Accrued coupon-interest observation.
 ///
-/// Отдельный тип, а не поле в [`PriceObservation`], по трём причинам.
-/// Во-первых, котировка облигации — процент номинала, а НКД — деньги:
-/// одна структура на две размерности возвращает ошибку смешения единиц.
-/// Во-вторых, исполнимости у НКД нет: это не цена, по которой кто-то
-/// торгует. В-третьих, у акции такое поле было бы вечно пустым.
+/// A separate type rather than a field in [`PriceObservation`] for three
+/// reasons. First, a bond quote is a percentage of principal while accrued
+/// interest is money: one structure for two dimensions invites unit mixing.
+/// Second, accrued interest has no executability; it is not a price at which
+/// anyone trades. Third, the field would always be empty for equities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccruedInterestObservation {
     pub instrument: InstrumentId,
     pub venue: Venue,
     pub trade_date: TradeDate,
     pub observed_at: ObservedAt,
-    /// На ОДНУ бумагу, вместе с валютой из `FACEUNIT`.
+    /// Per ONE security, with the currency from `FACEUNIT`.
     pub per_unit: PerUnitAmount,
 }
 
-/// Наблюдение курса.
+/// Exchange-rate observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FxObservation {
     pub from: CurrencyCode,
     pub to: CurrencyCode,
     pub trade_date: TradeDate,
     pub observed_at: ObservedAt,
-    /// Номинал: ЦБ публикует курс за 1, 10 или 100 единиц.
-    /// Голое число без номинала неинтерпретируемо.
+    /// Nominal: the CBR publishes a rate per 1, 10, or 100 units.
+    /// A bare number without a nominal is not interpretable.
     pub nominal: u32,
-    /// Значение за номинал, как его дал источник.
+    /// Value per nominal, as supplied by the source.
     pub value: Dec,
-    /// Значение за единицу. Хранится **вместе** с `value`: расхождение
-    /// между ними — сигнал порчи разбора, и потерять его нельзя.
+    /// Value per unit. Stored **alongside** `value`: a discrepancy between
+    /// them signals corrupted parsing and must not be lost.
     pub unit_rate: Dec,
 }
 
-/// Наблюдение ключевой ставки.
+/// Key-rate observation.
 ///
-/// Именно наблюдение по рабочему дню, а не интервал: источник отдаёт
-/// дневной ряд и даты вступления в нём нет вовсе (раздел 8.3 спеки).
-/// Интервал выводится на чтении и помечается выведенным.
+/// This is an observation for a business day, not an interval: the source
+/// returns a daily series and contains no effective date (design §8.3).
+/// Intervals are derived on read and marked as derived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyRateObservation {
     pub trade_date: TradeDate,
@@ -146,19 +146,19 @@ mod tests {
     fn the_two_time_axes_are_distinct_types() {
         let traded = TradeDate(date!(2026 - 08 - 03));
         let learned = ObservedAt(datetime!(2026-08-26 09:00:00 UTC));
-        // Тест существует ради компилятора: если оси когда-нибудь станут
-        // одним типом, перестановка аргументов в конструкторе наблюдения
-        // пройдёт молча, а это подмена «когда цена» на «когда узнали».
+        // This test exists for the compiler: if the axes ever become one type,
+        // swapping constructor arguments would compile silently, replacing
+        // “when the price was” with “when we learned it”.
         assert_ne!(traded.0.to_string(), learned.0.date().to_string());
     }
 
     #[test]
     fn executability_has_no_carried_forward_variant() {
-        // Перенос цены на нерабочий день — вывод политики (E3.3),
-        // а не то, что прислал источник (раздел 3.5 спеки). Вариант
-        // в этом перечислении означал бы, что вывод можно записать
-        // наблюдением, и различие «биржа не торговала» против
-        // «мы подставили вчерашнее» потерялось бы навсегда.
+        // Carrying a price to a non-trading day is valuation policy (E3.3),
+        // not something the source sent (design §3.5). A variant here would
+        // make the policy output recordable as an observation, permanently
+        // losing the distinction between “the exchange did not trade” and
+        // “we substituted yesterday's value”.
         let all = [
             Executability::Executable,
             Executability::IndicativePreviousClose,
@@ -185,10 +185,10 @@ mod tests {
 
     #[test]
     fn accrued_interest_is_measured_per_bond_not_per_trade() {
-        // Trade.accrued_interest — сумма ВСЕЙ сделки (event/mod.rs,
-        // trade_settlement складывает её с gross целиком). Наблюдение —
-        // величина на одну бумагу. Тип обязан делать подмену
-        // непредставимой: голый Dec её не остановит.
+        // Trade.accrued_interest is the amount for the ENTIRE trade
+        // (event/mod.rs; trade_settlement adds it to gross in full). An
+        // observation is per security. The type must make this substitution
+        // unrepresentable: a bare Dec would not stop it.
         let observation = AccruedInterestObservation {
             instrument: InstrumentId::new_random(),
             venue: Venue {

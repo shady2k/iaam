@@ -1,7 +1,7 @@
-//! Парсер XLS-отчёта Финама (§10.1, §10.3).
+//! Finam XLS report parser (§10.1, §10.3).
 //!
-//! Формат Финама разбирается отдельными функциями и отдельными признаками
-//! листов. Общими с другими каналами остаются только типы результата.
+//! Finam's format is parsed using dedicated functions and dedicated sheet markers.
+//! Only result types are shared with other channels.
 
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::{ParserVersion, RawHash, RowLocator};
@@ -30,7 +30,7 @@ use crate::verdict::Rejection;
 const PARSER_VERSION: &str = "finam-xls/2";
 const DOCUMENT_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
-/// Парсер выгрузки брокерского отчёта Финама.
+/// Parser for a Finam broker report export.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FinamParser;
 
@@ -186,7 +186,7 @@ fn parse_trades(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
                     currency,
                 }
             } else {
-                return Err(rejection("type", "Купля или Продажа", &side));
+                return Err(rejection("type", "buy or sell", &side));
             };
             Ok(operation(
                 account,
@@ -240,11 +240,7 @@ fn parse_cash_movements(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Loc
                     currency,
                 }
             } else {
-                return Err(rejection(
-                    "type",
-                    "Ввод или Вывод денежных средств",
-                    &kind_text,
-                ));
+                return Err(rejection("type", "deposit or withdrawal", &kind_text));
             };
             Ok(operation(account, kind, date, None, Some(date), None))
         })();
@@ -319,17 +315,18 @@ fn parse_income(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
     for (index, row) in data_rows(sheet).enumerate() {
         let row_number = index as u64 + 2;
         let result = (|| {
+            // The report names the operation type with a word, and that word reaches
+            // the operation: the «Выплаты» sheet accepts only coupon
+            // and dividend, so saying «not stated» here would be
+            // a loss, not honesty.
             let date = date_value(cell(row, date_col), "date")?;
             let currency = currency_value(cell(row, currency_col))?;
             let account = account_value(directory, cell(row, account_col), "account")?;
             let kind = text_value(cell(row, kind_col))?.to_lowercase();
-            // Отчёт называет вид словом, и слово это — единственное
-            // место, где он вообще есть. Потерять его здесь значит
-            // потерять навсегда: событие журнала неизменяемо.
             let income_kind = match kind.as_str() {
                 "купон" => IncomeKind::Coupon,
                 "дивиденд" => IncomeKind::Dividend,
-                other => return Err(rejection("type", "Купон или Дивиденд", other)),
+                other => return Err(rejection("type", "coupon or dividend", other)),
             };
             let instrument = optional_text(cell(row, instrument_col))
                 .map(|_| instrument_value(directory, cell(row, instrument_col), Some(date)))
@@ -549,7 +546,7 @@ fn cell_date(cell: &Cell) -> Option<Date> {
 }
 
 fn date_value(cell: &Cell, field: &'static str) -> Result<Date, Rejection> {
-    cell_date(cell).ok_or_else(|| rejection(field, "дата отчёта", &cell_description(cell)))
+    cell_date(cell).ok_or_else(|| rejection(field, "report date", &cell_description(cell)))
 }
 
 fn parse_date_text(value: &str) -> Result<Date, ()> {
@@ -565,7 +562,7 @@ fn currency_value(cell: &Cell) -> Result<CurrencyCode, Rejection> {
         "EUR" | "€" => Ok(CurrencyCode::Eur),
         "CNY" => Ok(CurrencyCode::Cny),
         "XAU" => Ok(CurrencyCode::Xau),
-        value => Err(rejection("currency", "RUB, USD, EUR, CNY или XAU", value)),
+        value => Err(rejection("currency", "RUB, USD, EUR, CNY or XAU", value)),
     }
 }
 
@@ -576,12 +573,8 @@ fn decimal_value(cell: &Cell, field: &'static str) -> Result<Decimal, Rejection>
             .replace(['\u{a0}', ' '], "")
             .replace(',', ".")
             .parse::<Decimal>()
-            .map_err(|_| rejection(field, "десятичное число", value)),
-        _ => Err(rejection(
-            field,
-            "десятичное число",
-            &cell_description(cell),
-        )),
+            .map_err(|_| rejection(field, "decimal number", value)),
+        _ => Err(rejection(field, "decimal number", &cell_description(cell))),
     }
 }
 
@@ -613,7 +606,7 @@ fn quantity_value(cell: &Cell, field: &'static str) -> Result<Dec, Rejection> {
 fn text_value(cell: &Cell) -> Result<&str, Rejection> {
     cell.text()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| rejection("value", "непустой текст", &cell_description(cell)))
+        .ok_or_else(|| rejection("value", "non-empty text", &cell_description(cell)))
 }
 
 fn optional_text(cell: &Cell) -> Option<&str> {
@@ -653,9 +646,9 @@ fn operation(
     account: iaam_core::ids::AccountId,
     kind: OperationKind,
     trade_date: Date,
-    // Дата расчётов, а не «денежная дата»: именно при расчётах
-    // переходят права (dates.rs:34). None — колонки в отчёте нет,
-    // и подставлять дату сделки нельзя: это утверждение, а не пропуск.
+    // Settlement date, not the “money date”: rights transfer precisely upon settlement
+    // (dates.rs:34). None means the report has no such column,
+    // and the trade date must not be substituted: this is an assertion, not an omission.
     settlement_date: Option<Date>,
     cash_date: Option<Date>,
     source_id: Option<&str>,
@@ -707,7 +700,7 @@ fn rejection(field: &'static str, expected: &str, actual: &str) -> Rejection {
 
 fn cell_description(cell: &Cell) -> String {
     match cell {
-        Cell::Empty => "пусто".to_owned(),
+        Cell::Empty => "empty".to_owned(),
         Cell::Text(value) | Cell::Error(value) => value.clone(),
         Cell::Number(value) => value.inner().to_string(),
         Cell::Date(value) => value.to_string(),
@@ -723,8 +716,8 @@ mod tests {
 
     #[test]
     fn the_settlement_date_becomes_settled_and_not_cash_posted() {
-        // Дата расчётов и дата движения денег — разные факты: расчёты
-        // определяют переход прав и отчётный период, а не движение по счёту.
+        // Settlement date and money movement date are different facts: settlement
+        // determines the transfer of rights and the reporting period, not account activity.
         let operation = operation(
             AccountId::new_random(),
             OperationKind::Deposit {
@@ -743,8 +736,8 @@ mod tests {
 
     #[test]
     fn a_cash_movement_date_becomes_cash_posted_and_not_settled() {
-        // Денежное движение доказывает дату зачисления, но не дату
-        // расчётов по сделке: это разные факты в журнале.
+        // Money movement proves the crediting date, but not the trade's
+        // settlement date: these are different facts in the journal.
         let operation = operation(
             AccountId::new_random(),
             OperationKind::Withdrawal {
@@ -763,8 +756,8 @@ mod tests {
 
     #[test]
     fn a_missing_settlement_column_stays_unknown() {
-        // Отсутствие колонки означает неизвестную дату расчётов; дата сделки
-        // не доказывает, что расчёты произошли в тот же день.
+        // The absence of the column means the settlement date is unknown; the trade date
+        // does not prove that settlement occurred on the same day.
         let operation = operation(
             AccountId::new_random(),
             OperationKind::Deposit {

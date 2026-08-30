@@ -1,44 +1,44 @@
-//! Приближённый режим (§6.6): единственное место в ядре, где разрешена
-//! двоичная плавающая точка.
+//! Approximate mode (§6.6): the only place in the core where
+//! binary floating-point arithmetic is permitted.
 //!
-//! Применяется только там, где требуются степени, корни и итерации:
-//! XIRR, CAGR, дисконтирование. Результаты этого модуля **никогда**
-//! не входят в денежное тождество §6.3 — тождество проверяет суммы,
-//! а не ставки.
+//! Used only where powers, roots, and iterations are required:
+//! XIRR, CAGR, discounting. Results from this module **never**
+//! enter the monetary identity in §6.3—the identity checks amounts,
+//! not rates.
 
 use rust_decimal::prelude::ToPrimitive;
 
 use super::decimal::Dec;
 
-/// Политика численного метода. Каждый решатель обязан её объявить,
-/// и она попадает в результат рядом с числом.
+/// Numerical-method policy. Every solver must declare it,
+/// and it is included in the result alongside the number.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SolverPolicy {
-    /// Допустимая ширина интервала, локализующего корень, — в единицах
-    /// **ставки**. Она же определяет объявленную погрешность результата.
+    /// The allowed width of the root-bracketing interval—in units of the
+    /// **rate**. It also determines the declared error bound of the result.
     ///
-    /// Допуск ровно один, и он в единицах ставки. Допуск по величине
-    /// невязки здесь не нужен и вреден: возле пологого корня невязка
-    /// мала при большой ошибке ставки, а абсолютный допуск по невязке
-    /// ещё и зависел бы от масштаба денег — та же серия, умноженная
-    /// на тысячу, останавливалась бы в другой точке, хотя ставка
-    /// обязана быть масштабно-инвариантной. Корень заключён
-    /// в интервале по построению, поэтому половина ширины — доказанная
-    /// граница, а не оценка.
+    /// There is exactly one tolerance, and it is in rate units. A tolerance on the
+    /// residual magnitude is unnecessary and harmful here: near a flat root, the residual
+    /// is small even when the rate error is large, while an absolute residual tolerance
+    /// would also depend on the scale of the amounts—the same series, multiplied
+    /// by a thousand, would stop at a different point even though the rate
+    /// must be scale-invariant. The root is enclosed
+    /// in the interval by construction, so half the width is a proven
+    /// bound, not an estimate.
     pub rate_tolerance: f64,
-    /// Максимум итераций до отказа.
+    /// Maximum number of iterations before failure.
     pub max_iterations: u32,
-    /// Нижняя граница локализации корня.
+    /// Lower bound of the root-bracketing interval.
     pub bracket_low: f64,
-    /// Верхняя граница локализации корня.
+    /// Upper bound of the root-bracketing interval.
     pub bracket_high: f64,
 }
 
 impl SolverPolicy {
-    /// Политика по умолчанию для расчёта ставок доходности.
+    /// Default policy for calculating rates of return.
     ///
-    /// Локализация от −99,99 % до +10 000 % годовых покрывает любой
-    /// реалистичный результат, включая полную потерю капитала.
+    /// Bracketing from −99.99% to +10,000% annually covers any
+    /// realistic result, including a total loss of capital.
     #[must_use]
     pub const fn returns_default() -> Self {
         Self {
@@ -50,10 +50,10 @@ impl SolverPolicy {
     }
 }
 
-/// Приближённое значение вместе с оценкой погрешности.
+/// An approximate value together with an error estimate.
 ///
-/// Сконструировать без границы погрешности невозможно: значение,
-/// про которое неизвестно, насколько оно точно, бесполезно для отчёта.
+/// It cannot be constructed without an error bound: a value
+/// whose accuracy is unknown is useless for reporting.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ApproxValue {
     value: f64,
@@ -87,8 +87,8 @@ impl ApproxValue {
     }
 }
 
-/// Явный переход из денежного режима в приближённый.
-/// Единственная разрешённая точка такого перехода.
+/// Explicit transition from monetary mode to approximate mode.
+/// The only permitted point for such a transition.
 #[must_use]
 pub fn dec_to_f64(d: &Dec) -> Option<f64> {
     d.inner().to_f64()
@@ -116,18 +116,15 @@ mod tests {
     #[test]
     fn returns_policy_brackets_total_loss_and_extreme_gain() {
         let p = SolverPolicy::returns_default();
-        assert!(
-            p.bracket_low < -0.99,
-            "должна покрывать полную потерю капитала"
-        );
-        assert!(p.bracket_high > 10.0, "должна покрывать экстремальный рост");
+        assert!(p.bracket_low < -0.99, "must cover a total loss of capital");
+        assert!(p.bracket_high > 10.0, "must cover extreme growth");
     }
 
     #[test]
     fn returns_policy_stops_on_tolerance_and_iteration_budget() {
-        // Допуск один и он в единицах ставки: 1e-10 — это одна
-        // десятимиллиардная процентного пункта, то есть заведомо
-        // тоньше любой осмысленной подачи результата.
+        // There is one tolerance, and it is in rate units: 1e-10 is one
+        // ten-billionth of a percentage point, which is certainly
+        // finer than any meaningful presentation precision.
         let p = SolverPolicy::returns_default();
         assert!(p.rate_tolerance > 0.0 && p.rate_tolerance < 1e-6);
         assert_eq!(p.max_iterations, 200);

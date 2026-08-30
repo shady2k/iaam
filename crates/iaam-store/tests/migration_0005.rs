@@ -1,14 +1,14 @@
-//! Перенос данных при миграции 0005.
+//! Data migration for 0005.
 //!
-//! Проверка на непустой базе обязательна: на пустой базе перенос
-//! данных верен тривиально, а ломается он ровно на существующих
-//! строках.
+//! A non-empty database is required for the test: on an empty database, the data
+//! migration is trivially correct, while it breaks precisely on existing
+//! rows.
 
 use rusqlite::Connection;
 
-/// Схема версии 4 в объёме, который затрагивает миграция 0005.
+/// The portion of the version 4 schema affected by migration 0005.
 fn database_at_version_four() -> Connection {
-    let conn = Connection::open_in_memory().expect("база в памяти");
+    let conn = Connection::open_in_memory().expect("in-memory database");
     conn.execute_batch(
         "CREATE TABLE instruments (
              id       TEXT PRIMARY KEY,
@@ -17,17 +17,17 @@ fn database_at_version_four() -> Connection {
              currency TEXT NOT NULL
          ) STRICT;
          INSERT INTO instruments (id, symbol, title, currency)
-         VALUES ('11111111-1111-4111-8111-111111111111', 'SBER', 'Сбербанк', 'RUB');
+         VALUES ('11111111-1111-4111-8111-111111111111', 'SBER', 'Sberbank', 'RUB');
          PRAGMA user_version = 4;",
     )
-    .expect("схема версии 4");
+    .expect("version 4 schema");
     conn
 }
 
 fn apply_migration_0005(conn: &Connection) {
     let sql = include_str!("../migrations/0005_instrument_reference.sql");
     conn.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = 5; COMMIT;"))
-        .expect("миграция 0005");
+        .expect("migration 0005");
 }
 
 #[test]
@@ -42,7 +42,7 @@ fn an_existing_instrument_keeps_its_currency_in_all_three_roles() {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("перенесённый инструмент");
+        .expect("migrated instrument");
 
     assert_eq!(denomination, "RUB");
     assert_eq!(settlement, "RUB");
@@ -60,11 +60,11 @@ fn an_existing_instrument_has_no_kind_guessed_for_it() {
             [],
             |row| row.get(0),
         )
-        .expect("перенесённый инструмент");
+        .expect("migrated instrument");
 
     assert_eq!(
         kind, None,
-        "род не известен и не должен подставляться акцией"
+        "lineage is unknown and must not be substituted with a stock"
     );
 }
 
@@ -78,7 +78,7 @@ fn overlapping_alias_intervals_are_refused_by_the_database() {
          VALUES ('isin', 'RU000A0JX0J2', '11111111-1111-4111-8111-111111111111',
                  '2020-01-01', '2024-01-01', 'manual', '2026-08-25T00:00:00Z');",
     )
-    .expect("первый интервал");
+    .expect("first interval");
 
     let overlapping = conn.execute_batch(
         "INSERT INTO instrument_aliases
@@ -89,7 +89,7 @@ fn overlapping_alias_intervals_are_refused_by_the_database() {
 
     assert!(
         overlapping.is_err(),
-        "пересечение интервалов делает резолвинг неоднозначным"
+        "overlapping intervals make resolution ambiguous"
     );
 }
 
@@ -111,17 +111,17 @@ fn adjacent_alias_intervals_are_allowed() {
 
     assert!(
         adjacent.is_ok(),
-        "смежные интервалы стыкуются без зазора: конец полуинтервала исключителен"
+        "adjacent intervals join without a gap: the half-open interval's end is exclusive"
     );
 }
 
-/// Таблица создаётся под именем `instruments_new` и переименовывается,
-/// поэтому её собственный внешний ключ на `lineage_parent` в момент
-/// создания указывает на `instruments_new`. Полагаться на то, что
-/// `ALTER TABLE ... RENAME TO` перепишет эту самоссылку, нельзя молча:
-/// поведение зависит от `legacy_alter_table`, а сломанный ключ никак
-/// себя не проявит, пока не появится первая замещающая облигация —
-/// то есть спустя месяцы после миграции.
+/// The table is created under the name `instruments_new` and renamed,
+/// so its own foreign key on `lineage_parent` points to `instruments_new` at creation time.
+/// One must not silently rely on `ALTER TABLE ... RENAME TO` rewriting this self-reference:
+/// behavior depends on `legacy_alter_table`, and a broken key cannot be detected
+/// behavior depends on `legacy_alter_table`, and a broken key in no way
+/// will not surface until the first replacement bond appears —
+/// that is, months after the migration.
 #[test]
 fn the_self_reference_survives_the_rename() {
     let conn = database_at_version_four();
@@ -133,10 +133,10 @@ fn the_self_reference_survives_the_rename() {
             [],
             |row| row.get(0),
         )
-        .expect("определение таблицы");
+        .expect("table definition");
 
     assert!(
         !ddl.contains("instruments_new"),
-        "внешний ключ остался на промежуточное имя таблицы: {ddl}"
+        "foreign key still points to the intermediate table name: {ddl}"
     );
 }

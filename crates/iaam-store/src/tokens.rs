@@ -1,8 +1,8 @@
-//! Агентские токены (§14).
+//! Agent tokens (§14).
 //!
-//! Хранится **хеш** токена, а не токен: утечка файла базы не должна
-//! давать доступ к API. Сам хеш считает транспортный слой — хранилище
-//! не знает, чем именно, и потому не может ослабить алгоритм.
+//! The **hash** of the token is stored, not the token itself: a database file leak must not
+//! grant access to the API. The transport layer computes the hash itself—the store
+//! does not know how, and therefore cannot weaken the algorithm.
 
 use iaam_core::ids::OwnerId;
 use rusqlite::{OptionalExtension, params};
@@ -10,17 +10,17 @@ use uuid::Uuid;
 
 use crate::{SqliteStore, StoreError, now};
 
-/// Права токена. Исчерпаемый `enum`, а не строка в базе: добавление
-/// права обязано сломать сборку везде, где его не обработали (§15.1).
+/// Token permissions. An exhaustive `enum`, not a database string: adding a
+/// permission must break the build everywhere it has not been handled (§15.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenScope {
-    /// Полный доступ владельца.
+    /// Full owner access.
     Owner,
-    /// Внешний агент: чтение отчётов и отправка операций в приёмку.
-    /// Прямой записи в журнал у него нет — она результат прохождения
-    /// приёмки, а не отдельное разрешённое действие (§13).
+    /// External agent: report reading and submitting operations for acceptance.
+    /// It has no direct journal write access—that is the result of passing
+    /// acceptance, not a separately permitted action (§13).
     Agent,
-    /// Только чтение отчётов.
+    /// Report reading only.
     ReadOnly,
 }
 
@@ -44,7 +44,7 @@ impl TokenScope {
         }
     }
 
-    /// Может ли токен отправлять операции в приёмку.
+    /// Whether the token can submit operations for acceptance.
     #[must_use]
     pub const fn may_submit(self) -> bool {
         match self {
@@ -53,7 +53,7 @@ impl TokenScope {
         }
     }
 
-    /// Может ли токен управлять другими токенами и справочниками.
+    /// Whether the token can manage other tokens and reference data.
     #[must_use]
     pub const fn may_administer(self) -> bool {
         match self {
@@ -72,25 +72,25 @@ pub struct TokenRecord {
     pub revoked: bool,
 }
 
-/// Выданный токен в том виде, в каком его показывают владельцу.
+/// An issued token in the form in which it is shown to the owner.
 ///
-/// **Ни токена, ни его хеша здесь нет и быть не может.** Хеш — это то,
-/// что достаточно подставить в `WHERE token_hash = ?`, чтобы система
-/// признала запрос своим; список выданных токенов, показывающий хеши,
-/// был бы списком отмычек. То, чего структура не несёт, транспорт
-/// не может отдать наружу ни ответом, ни логом (§14).
+/// **Neither the token nor its hash can be present here.** The hash is what
+/// is sufficient to substitute into `WHERE token_hash = ?` for the system to
+/// recognize the request as its own; a list of issued tokens showing hashes
+/// would be a list of skeleton keys. What the structure does not carry, the transport
+/// cannot expose externally, either in a response or a log (§14).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenSummary {
     pub id: Uuid,
     pub label: String,
     pub scope: TokenScope,
     pub created_at: String,
-    /// Момент отзыва. `None` — токен действует.
+    /// Revocation time. `None` — the token is active.
     pub revoked_at: Option<String>,
 }
 
 impl SqliteStore {
-    /// Регистрация токена по его хешу.
+    /// Register a token by its hash.
     pub fn insert_token(&self, record: &TokenRecord, token_hash: &str) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO api_tokens (id, owner, label, token_hash, scope, created_at, revoked_at)
@@ -107,7 +107,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Поиск действующего токена по хешу. Отозванный не находится.
+    /// Find an active token by its hash. A revoked token is not found.
     pub fn find_token(&self, token_hash: &str) -> Result<Option<TokenRecord>, StoreError> {
         let row: Option<(String, String, String, String)> = self
             .conn
@@ -140,14 +140,14 @@ impl SqliteStore {
         }))
     }
 
-    /// Отзыв токена.
+    /// Revoke a token.
     ///
-    /// Владелец входит в запрос, а не проверяется вызывающим:
-    /// идентификатор токена не является правом на него, и без владельца
-    /// в `WHERE` любой знающий чужой идентификатор отзывал бы чужой
-    /// токен (§14). Ничего не обновилось — `NotFound`: отозванный
-    /// заранее, несуществующий и чужой обязаны быть неотличимы, иначе
-    /// ответ сообщает постороннему, что такая запись есть.
+    /// The owner is part of the query rather than being checked by the caller:
+    /// a token identifier is not authorization to use it, and without the owner
+    /// in `WHERE`, anyone who knows someone else's identifier could revoke that person's
+    /// token (§14). If nothing was updated, `NotFound`: a token revoked
+    /// beforehand, nonexistent, and belonging to someone else must be indistinguishable; otherwise
+    /// the response tells an outsider that such a record exists.
     pub fn revoke_token(&self, owner: OwnerId, id: Uuid) -> Result<(), StoreError> {
         let updated = self.conn.execute(
             "UPDATE api_tokens SET revoked_at = ?3
@@ -156,18 +156,18 @@ impl SqliteStore {
         )?;
         if updated == 0 {
             return Err(StoreError::NotFound {
-                what: "действующий токен",
+                what: "active token",
                 id: id.to_string(),
             });
         }
         Ok(())
     }
 
-    /// Выданные токены владельца, включая отозванные.
+    /// Tokens issued to the owner, including revoked ones.
     ///
-    /// Отозванные показываются по той же причине, что и отозванные
-    /// брокерские доступы: «когда токен перестал пускать» является
-    /// вопросом, на который нужен ответ. Хеша в ответе нет — см.
+    /// Revoked tokens are shown for the same reason as revoked
+    /// broker access: “when a token stopped granting access” is a
+    /// question that needs an answer. The hash is not included in the response—see
     /// `TokenSummary`.
     pub fn list_tokens(&self, owner: OwnerId) -> Result<Vec<TokenSummary>, StoreError> {
         let mut statement = self.conn.prepare(
@@ -203,9 +203,9 @@ impl SqliteStore {
         Ok(tokens)
     }
 
-    /// Журнал использования токена (§14). Пишется на каждый запрос,
-    /// включая отклонённый: попытки с отозванным токеном — то, ради
-    /// чего журнал и нужен.
+    /// Token usage log (§14). Written for every request,
+    /// including rejected ones: attempts using a revoked token are exactly
+    /// what the log is for.
     pub fn record_token_use(
         &self,
         token_hash: &str,

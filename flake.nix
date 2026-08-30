@@ -1,5 +1,5 @@
 {
-  description = "IAAM — учёт инвестиций";
+  description = "IAAM — investment tracking";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -28,15 +28,15 @@
             pkgs.cargo-audit
             pkgs.jq
             pkgs.sqlite
-            # Покрытие по диффу: cargo llvm-cov строит полный отчёт,
-            # но порог на добавленных строках задаёт diff-cover.
+            # Differential coverage: cargo llvm-cov builds the full report,
+            # but diff-cover sets the threshold for added lines.
             pkgs.python3Packages.diff-cover
           ];
-          # rusqlite с feature "bundled" компилирует SQLite из исходников
+          # rusqlite with the "bundled" feature compiles SQLite from source
           shellHook = ''
-            # В stderr, а не в stdout: приветствие в stdout попадает
-            # в любой перенаправленный вывод и портит его. Генератор
-            # фикстур пишет JSON в stdout, и баннер делал его неразбираемым.
+            # Write to stderr, not stdout: a greeting on stdout ends up in
+            # any redirected output and corrupts it. The fixture generator
+            # writes JSON to stdout, and the banner made it impossible to parse.
             echo "iaam dev shell · $(rustc --version)" >&2
           '';
         };

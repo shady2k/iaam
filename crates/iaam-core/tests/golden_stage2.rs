@@ -1,8 +1,8 @@
-//! Golden-приёмка E2: отчётные строки, сверка, периметр и качество данных.
+//! E2 golden acceptance test: report rows, reconciliation, perimeter, and data quality.
 //!
-//! Ожидаемые суммы ниже посчитаны вручную из строк сценария. Этот тест
-//! намеренно остаётся в `iaam-core`: ingest-слой не является зависимостью
-//! core, поэтому граница разбора реального XLSX проверяется в iaam-app.
+//! The expected amounts below were calculated manually from the scenario rows. This test
+//! intentionally remains in `iaam-core`: the ingest layer is not a dependency of
+//! core, so the boundary for parsing an actual XLSX is tested in iaam-app.
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
@@ -55,10 +55,10 @@ struct ImportedRows {
     verdicts: Vec<RowVerdict>,
 }
 
-/// Представляет итог разбора строк до передачи фактов в ядро.
+/// Represents the result of parsing rows before passing facts to the core.
 ///
-/// В production этот boundary принадлежит `iaam-ingest`; здесь он записан
-/// явно, чтобы golden-сценарий не мог потерять rejected/unsupported строки.
+/// In production, this boundary belongs to `iaam-ingest`; here it is written
+/// explicitly so that the golden scenario cannot lose rejected/unsupported rows.
 fn imported_report(owner: OwnerId, account: AccountId, channel: &TestChannel) -> ImportedRows {
     let mut events = Vec::new();
     let mut verdicts = Vec::new();

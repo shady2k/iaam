@@ -6,31 +6,31 @@ use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time};
 
-/// Ошибки HTTP-доступа к Finam Trade API.
+/// HTTP access errors for the Finam Trade API.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FinamError {
-    #[error("сетевой отказ шлюза Finam")]
+    #[error("Finam gateway network refusal")]
     Network,
-    #[error("шлюз Finam ограничил частоту запросов")]
+    #[error("Finam gateway rate-limited the request")]
     RateLimited,
-    #[error("токен Finam недействителен")]
+    #[error("Finam token is invalid")]
     InvalidToken,
-    #[error("неожиданный код HTTP {status}: {body}")]
+    #[error("unexpected HTTP status {status}: {body}")]
     UnexpectedStatus { status: u16, body: String },
-    #[error("ответ Finam с пагинацией оборван: отсутствует токен следующей страницы")]
+    #[error("Finam paginated response is truncated: next-page token is missing")]
     PartialResponse,
-    #[error("успешный ответ Finam не соответствует JSON-схеме")]
+    #[error("successful response does not match the JSON schema")]
     MalformedResponse,
 }
 
-/// HTTP-клиент Finam, возвращающий сырые тела ответов.
+/// Finam HTTP client returning raw response bodies.
 pub struct FinamClient {
     token: BrokerToken,
     http: HttpClient,
 }
 
 impl FinamClient {
-    /// Создаёт клиент; токен остаётся в зануляемой обёртке.
+    /// Create a client; the token remains in a zeroizing wrapper.
     #[must_use]
     pub fn new(token: BrokerToken) -> Self {
         Self {
@@ -39,12 +39,12 @@ impl FinamClient {
         }
     }
 
-    /// Возвращает сырое тело текущего портфеля счёта.
+    /// Return the raw body of the account's current portfolio.
     pub async fn get_portfolio(&self, account_id: &str) -> Result<String, FinamError> {
         self.get(&format!("/v1/accounts/{account_id}"), &[]).await
     }
 
-    /// Возвращает сырое тело страницы транзакций за интервал.
+    /// Return the raw body of a transaction page for an interval.
     pub async fn get_transactions(
         &self,
         account_id: &str,
@@ -119,7 +119,7 @@ fn redact_token(body: &str, token: &str) -> String {
     if token.is_empty() {
         body.to_owned()
     } else {
-        body.replace(token, "<токен скрыт>")
+        body.replace(token, "<token hidden>")
     }
 }
 

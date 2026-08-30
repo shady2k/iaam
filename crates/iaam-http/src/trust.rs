@@ -1,66 +1,65 @@
-//! Якорь доверия задаётся здесь и только здесь (§14).
+//! The trust anchor is defined here and only here (§14).
 //!
-//! Политика доверия объявлена **одной таблицей назначений**, а не
-//! рассыпана по крейтам источников. «Глобально» здесь означает единство
-//! управления, а не слияние якорей: вшитый корень применяется ровно
-//! к тому узлу, ради которого он вшит.
+//! Trust policy is declared in **one destination table**, not scattered
+//! across source crates. “Global” means one place of control, not one merged
+//! set of anchors: an embedded root applies exactly to the endpoint it serves.
 //!
-//! Причина, по которой у Т-Инвестиций якорь свой: корень Минцифры
-//! отсутствует в общедоступных хранилищах, и пиннинг был единственным
-//! способом соединиться. У MOEX (ZeroSSL) и ЦБ (HARICA) сертификаты
-//! публичных центров — вшивать там нечего, а пиннинг публичного
-//! DV-центра ломался бы при смене выпускающего и не покупал бы ничего.
+//! T-Invest has its own anchor because the Ministry of Digital Development
+//! root is absent from public stores, and pinning was the only way to connect.
+//! MOEX (ZeroSSL) and CBR (HARICA) use public CA certificates; there is
+//! nothing to embed, and pinning a public DV CA would break when the issuer
+//! changes without buying us anything.
 //!
-//! Проверка подлинности не отключается ни для одного назначения.
-//! Меняется только то, откуда берётся якорь.
+//! Authentication is disabled for no destination. Only the source of the
+//! anchor changes.
 
 use reqwest::{Certificate, Client};
 
 use crate::destination::Destination;
 use crate::response::HttpError;
 
-/// Корневой сертификат Минцифры.
+/// Ministry of Digital Development root certificate.
 ///
-/// `include_str!`, а не чтение файла при запуске: файл на диске рядом
-/// с программой подменить проще, чем содержимое двоичного файла,
-/// а якорь доверия — ровно то, что подменяют в первую очередь.
+/// `include_str!`, rather than reading a file at startup: a file beside the
+/// program is easier to replace than binary contents, and the trust anchor
+/// is exactly what an attacker would replace first.
 pub const RUSSIAN_TRUSTED_ROOT_CA_PEM: &str = include_str!("../certs/russian-trusted-root-ca.pem");
 
-/// Считает сертификаты в произвольной PEM-связке.
+/// Count certificates in an arbitrary PEM bundle.
 fn certificate_count_in_pem(pem: &str) -> usize {
     pem.matches("BEGIN CERTIFICATE").count()
 }
 
-/// Сколько сертификатов лежит в PEM-связке.
+/// Number of certificates in a PEM bundle.
 #[must_use]
 pub fn certificate_count(pem: &str) -> usize {
     certificate_count_in_pem(pem)
 }
 
-/// Откуда берётся якорь для назначения.
+/// Source of a destination's trust anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Anchors {
-    /// Общедоступные корни. Узел подписан публичным центром.
+    /// Public roots. The endpoint is signed by a public CA.
     WebRoots,
-    /// Ровно один вшитый корень; веб-корни выключены.
+    /// Exactly one embedded root; public roots are disabled.
     Pinned(&'static str),
 }
 
-/// Клиент, собранный с выбранной политикой доверия.
+/// Client built with the selected trust policy.
 #[derive(Clone)]
 pub(crate) struct ConfiguredClient(pub(crate) Client);
 
-/// Якорь доверия назначения.
+/// Trust anchor for a destination.
 ///
-/// `impl` живёт здесь, а не рядом с объявлением `Destination`: база узла
-/// нужна для сборки URL и не имеет отношения к доверию, а якорь нужен
-/// только при сборке клиента. Разные вопросы — разные модули; крейта
-/// та же, так что дополнительный `impl` законен.
+/// The `impl` lives here rather than beside `Destination`: the endpoint base
+/// is needed to build URLs and is unrelated to trust, while the anchor is
+/// needed only when building a client. Different concerns belong in different
+/// modules; they are in the same crate, so this additional `impl` is legal.
 impl Destination {
     #[must_use]
     pub const fn anchors(self) -> Anchors {
         match self {
-            // Обе среды шлюза — один удостоверяющий центр.
+            // Both gateway environments use one certificate authority.
             Self::TinkoffProd | Self::TinkoffSandbox => {
                 Anchors::Pinned(RUSSIAN_TRUSTED_ROOT_CA_PEM)
             }
@@ -68,9 +67,9 @@ impl Destination {
             | Self::MoexIss
             | Self::CbrScripts
             | Self::CbrDailyInfo
-            // Контракт лежит у стороннего хостинга, и вшитый корень
-            // шлюза к нему отношения не имеет: обычные корни — это
-            // ровно то доверие, которое здесь уместно.
+            // The contract is hosted elsewhere, and the gateway's embedded
+            // root does not apply: ordinary roots are the exact trust policy
+            // appropriate here.
             | Self::TinvestContract => Anchors::WebRoots,
         }
     }
@@ -80,7 +79,7 @@ fn client_anchors(destination: Destination) -> Anchors {
     destination.anchors()
 }
 
-/// Собирает клиента под якорь назначения.
+/// Build a client for a destination's trust anchor.
 pub(crate) fn client_for(destination: Destination) -> Result<ConfiguredClient, HttpError> {
     let anchors = client_anchors(destination);
     let builder = Client::builder().tls_backend_rustls();
@@ -89,9 +88,9 @@ pub(crate) fn client_for(destination: Destination) -> Result<ConfiguredClient, H
         Anchors::Pinned(pem) => {
             let root = Certificate::from_pem(pem.as_bytes())
                 .map_err(|error| HttpError::TrustAnchorNotParsed(error.to_string()))?;
-            // Именно `only`, а не `merge`: `merge` добавил бы наш корень
-            // к веб-корням, и клиент продолжил бы доверять всему
-            // публичному интернету ради узла, которому это не нужно.
+            // `only`, not `merge`: `merge` would add our root to public roots,
+            // leaving the client trusting the entire public internet for an
+            // endpoint that does not need it.
             builder.tls_certs_only([root])
         }
     };

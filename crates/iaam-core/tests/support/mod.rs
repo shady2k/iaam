@@ -1,8 +1,8 @@
-//! Сборка событий для интеграционных тестов ядра.
+//! Event construction for core integration tests.
 //!
-//! Живёт отдельным модулем, потому что `test_support` внутри крейта
-//! доступен только модульным тестам: интеграционный тест — внешний
-//! потребитель и обязан собирать событие через публичный интерфейс.
+//! This lives in a separate module because the crate-internal `test_support`
+//! is available only to unit tests: an integration test is an external
+//! consumer and must construct an event through the public interface.
 
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
@@ -12,13 +12,13 @@ use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use time::Date;
 
-/// Канал получения данных в тестах: источник, версия разбора, документ.
+/// Data ingestion channel in tests: source, parser version, document.
 ///
-/// Существует как отдельная сущность, а не как три аргумента, потому
-/// что **источник входит в тождество канала**. Выдать каждому событию
-/// свой случайный `SourceId` значит разложить один документ на столько
-/// каналов, сколько в нём строк, — и ни одно основание, требующее
-/// нескольких секций одного документа, не сработает (§10.3).
+/// This is a separate entity rather than three arguments because
+/// the **source is part of the channel identity**. Giving each event
+/// its own random `SourceId` means splitting one document into as many
+/// channels as it has rows—and no basis requiring
+/// multiple sections of the same document will work (§10.3).
 pub struct TestChannel {
     source: SourceId,
     parser: ParserVersion,
@@ -26,7 +26,7 @@ pub struct TestChannel {
 }
 
 impl TestChannel {
-    /// Один документ, разобранный одним парсером.
+    /// One document parsed by one parser.
     #[must_use]
     pub fn new(parser: &str, document: &str) -> Self {
         Self {
@@ -41,26 +41,26 @@ impl TestChannel {
     }
 }
 
-/// Хеш документа из читаемого имени.
+/// A document hash derived from a human-readable name.
 ///
-/// Имя кодируется шестнадцатерично и дополняется до шестидесяти четырёх
-/// знаков: `RawHash` принимает только корректный SHA-256, а тесту нужны
-/// различимые и узнаваемые в отладке документы, а не настоящие хеши.
+/// The name is hex-encoded and padded to sixty-four
+/// characters: `RawHash` accepts only a valid SHA-256, while tests need
+/// documents that are distinct and recognizable in debug output, not real hashes.
 #[must_use]
 pub fn document_hash(name: &str) -> RawHash {
     let mut hex: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
-    assert!(hex.len() <= 64, "имя документа {name} слишком длинное");
+    assert!(hex.len() <= 64, "document name {name} is too long");
     while hex.len() < 64 {
         hex.push('0');
     }
-    RawHash::parse(&hex).expect("шестнадцатеричный хеш")
+    RawHash::parse(&hex).expect("hexadecimal hash")
 }
 
-/// Куда и когда записывается событие.
+/// Where and when an event is recorded.
 ///
-/// Собрано структурой, а не четырьмя аргументами: у помощника, который
-/// принимает подряд два идентификатора, дату и число, перепутать
-/// аргументы местами легко, а заметить — нет.
+/// Packaged as a struct rather than four arguments: in a helper that
+/// takes two identifiers, a date, and a number in sequence, swapping
+/// arguments is easy, but noticing it is not.
 #[derive(Debug, Clone, Copy)]
 pub struct Posting {
     pub owner: OwnerId,
@@ -69,7 +69,7 @@ pub struct Posting {
     pub sequence: u32,
 }
 
-/// Событие, пришедшее заданным каналом.
+/// An event received through the specified channel.
 #[must_use]
 pub fn event_on(channel: &TestChannel, posting: Posting, kind: EventKind, legs: Vec<Leg>) -> Event {
     Event {

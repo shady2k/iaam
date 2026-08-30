@@ -1,15 +1,15 @@
-//! Хранение снимков графика выплат (§2.2 спеки E3.4).
+//! Storage for payout schedule snapshots (§2.2 of the E3.4 spec).
 //!
-//! Хранилище не знает форматов источников: все значения приходят строками
-//! и уходят строками. Преобразование доменных типов — на границе
-//! приложения, как и у рыночных наблюдений.
+//! The storage does not know source formats: all values arrive as strings
+//! and leave as strings. Domain type conversion happens at the application
+//! boundary, as with market observations.
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::{SqliteStore, StoreError, now};
 
-/// Заголовок снимка.
+/// Snapshot header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleSnapshotRow {
     pub instrument_id: String,
@@ -18,7 +18,7 @@ pub struct ScheduleSnapshotRow {
     pub content_hash: String,
 }
 
-/// Строка купонного периода.
+/// Coupon period row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CouponPeriodRow {
     pub period_start: String,
@@ -32,7 +32,7 @@ pub struct CouponPeriodRow {
     pub source_entry_id: Option<String>,
 }
 
-/// Строка возврата номинала.
+/// Principal repayment row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrincipalRepaymentRow {
     pub repayment_date: String,
@@ -41,7 +41,7 @@ pub struct PrincipalRepaymentRow {
     pub source_entry_id: Option<String>,
 }
 
-/// Строка окна оферты.
+/// Offer window row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfferWindowRow {
     pub execution_date: String,
@@ -53,18 +53,18 @@ pub struct OfferWindowRow {
     pub source_entry_id: Option<String>,
 }
 
-/// Итог записи снимка.
+/// Snapshot write result.
 ///
-/// `written = false` означает, что содержимое совпало с последним снимком
-/// и новой записи не потребовалось. Это не ошибка и молчать об этом нельзя:
-/// «записали» и «уже было то же самое» — разные события для следа запуска.
+/// `written = false` means that the contents matched the latest snapshot
+/// and no new write was needed. This is not an error, and it must not be
+/// silenced: “written” and “the same content was already present” are different events in the run trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotOutcome {
     pub snapshot_id: String,
     pub written: bool,
 }
 
-/// Снимок, прочитанный на координату знания.
+/// A snapshot read at a knowledge coordinate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSnapshot {
     pub snapshot_id: String,
@@ -74,7 +74,7 @@ pub struct StoredSnapshot {
     pub offer_windows: Vec<OfferWindowRow>,
 }
 
-/// Сохранённый вердикт полноты снимка.
+/// Stored snapshot completeness verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleCompletenessRow {
     pub fetch_exhausted: bool,
@@ -82,8 +82,8 @@ pub struct ScheduleCompletenessRow {
     pub incomplete_reason: Option<String>,
 }
 
-/// Строка условий выпуска. Все значения строками, как и везде в
-/// хранилище: форматов источников оно не знает.
+/// Issue terms row. All values are strings, as everywhere in the
+/// storage: it does not know source formats.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueTermsRow {
     pub instrument_id: String,
@@ -101,11 +101,11 @@ pub struct IssueTermsRow {
 }
 
 impl SqliteStore {
-    /// Записать снимок графика целиком.
+    /// Write the complete payout schedule snapshot.
     ///
-    /// Если содержимое совпадает с последним снимком того же ряда, новая
-    /// запись не создаётся: снимок наблюдением не является, если ничего
-    /// не наблюдалось заново.
+    /// If the contents match the latest snapshot for the same series, no new
+    /// write is created: a snapshot is not an observation if nothing was
+    /// observed again.
     pub fn record_schedule_snapshot(
         &mut self,
         header: &ScheduleSnapshotRow,
@@ -211,11 +211,11 @@ impl SqliteStore {
         })
     }
 
-    /// Последний снимок не позже координаты знания, целиком.
+    /// The last complete snapshot no later than the knowledge coordinate.
     ///
-    /// Целиком, а не построчно: строки разных снимков не смешиваются —
-    /// собранный из них график описывал бы выпуск, которого не
-    /// существовало ни в один момент времени.
+    /// As a whole, not row by row: rows from different snapshots must not be mixed—
+    /// the schedule assembled from them would describe an issuance that did not
+    /// exist at any point in time.
     pub fn schedule_at_or_before(
         &self,
         instrument_id: &str,
@@ -301,7 +301,7 @@ impl SqliteStore {
         }))
     }
 
-    /// Прочитать сохранённый вердикт полноты целого снимка.
+    /// Read the saved completeness verdict for the entire snapshot.
     pub fn schedule_completeness(
         &self,
         snapshot_id: &str,
@@ -325,11 +325,11 @@ impl SqliteStore {
         Ok(row)
     }
 
-    /// Записать три утверждения о полноте снимка.
+    /// Record three assertions about snapshot completeness.
     ///
-    /// Три, а не одно: «источник вычитан до конца» и «график доменно
-    /// достаточен» — разные утверждения, и полностью вычитанный источник
-    /// с дырой внутри проходил бы как полный.
+    /// Three, not one: “the source was read to the end” and “the domain schedule
+    /// is sufficient” are different assertions, and a source read completely
+    /// with a gap inside would pass as complete.
     pub fn record_schedule_completeness(
         &mut self,
         snapshot_id: &str,
@@ -366,11 +366,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Записать наблюдение условий выпуска.
+    /// Record an observation of the issuance conditions.
     ///
-    /// `INSERT OR IGNORE`, а не `UPSERT`: наблюдение append-only, и
-    /// повторная запись на тот же `observed_at` — это то же наблюдение,
-    /// а не исправление. Исправление приходит новым `observed_at`.
+    /// `INSERT OR IGNORE`, not `UPSERT`: the observation is append-only, and
+    /// recording the same `observed_at` again is the same observation,
+    /// not a correction. A correction arrives with a new `observed_at`.
     pub fn record_issue_terms(&mut self, row: &IssueTermsRow) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO issue_terms
@@ -397,7 +397,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Последнее наблюдение условий не позже координаты знания.
+    /// The latest observation of the conditions no later than the knowledge coordinate.
     pub fn issue_terms_at_or_before(
         &self,
         instrument_id: &str,

@@ -1,16 +1,16 @@
-//! Сценарии и порты (§3.1, §3.2).
+//! Use cases and ports (§3.1, §3.2).
 //!
-//! Оболочка собирает срез, зовёт ядро и сохраняет результат. Арифметики
-//! над деньгами здесь нет и быть не может: любое число в ответе API
-//! приходит из `iaam-core`.
+//! The shell assembles a snapshot, calls the core and persists the result. There is
+//! no monetary arithmetic here and there never can be: every number in an API response
+//! comes from `iaam-core`.
 
 pub mod adapters;
 pub mod market_candidate;
-/// Типы приёмки, доступные транспорту.
+/// Ingestion types available to the transport layer.
 ///
-/// `iaam-server` не зависит от `iaam-ingest` напрямую — это запрещено
-/// заслоном архитектуры (§3.2). Приложение переэкспортирует ровно то,
-/// что нужно транспорту для преобразования DTO в доменные типы.
+/// `iaam-server` does not depend on `iaam-ingest` directly — this is prohibited
+/// by the architecture boundary (§3.2). The application re-exports exactly what
+/// the transport layer needs to convert DTOs into domain types.
 pub use iaam_ingest as ingest;
 
 pub mod error;
@@ -21,10 +21,10 @@ pub mod scenarios;
 pub mod sync;
 pub mod tokens;
 
-/// Типы SQLite-адаптера, нужные точке сборки и её интеграционным стендам.
+/// SQLite adapter types needed by the composition root and its integration test harnesses.
 ///
-/// Сервер не импортирует их напрямую: доступ к данным маршруты получают
-/// через сценарии приложения.
+/// The server does not import them directly: routes access data
+/// through application use cases.
 pub mod storage {
     pub use iaam_store::SqliteStore;
     pub use iaam_store::documents::BrokerCode;
@@ -42,39 +42,39 @@ use ports::{
     UnavailableBrokerDictionary, UnavailableClassificationRuleStore, UnavailableOutboundHttp,
 };
 
-/// Собранные зависимости. Точка сборки создаёт один экземпляр,
-/// обработчики получают `Arc<AppServices>` (§3.2).
+/// Assembled dependencies. The composition root creates one instance;
+/// handlers receive `Arc<AppServices>` (§3.2).
 pub struct AppServices {
     pub store: Arc<dyn Store>,
     pub directory: Arc<dyn InstrumentDirectory>,
-    /// Хранилище брокерских доступов. Отдельным полем, а не частью
-    /// `store`: за ним стоит ключ шифрования, и его может не быть.
+    /// Broker credential storage. A separate field rather than part of
+    /// `store`: it requires an encryption key and may be unavailable.
     pub broker: Arc<dyn BrokerVault>,
-    /// Управление токенами. Отдельным полем по той же причине, по
-    /// которой это отдельный порт: читать журнал и раздавать права
-    /// на него — разные полномочия (§14).
+    /// Token management. A separate field for the same reason that
+    /// this is a separate port: reading the journal and granting access
+    /// to it are distinct privileges (§14).
     pub tokens: Arc<dyn TokenAdmin>,
     pub clock: Arc<dyn Clock>,
-    /// Создание канала брокера. Секреты остаются внутри адаптера.
+    /// Broker channel creation. Secrets remain inside the adapter.
     pub channels: Arc<dyn BrokerChannelFactory>,
-    /// Исторические правила классификации.
+    /// Historical classification rules.
     pub rules: Arc<dyn ClassificationRuleStore>,
-    /// Исходящий HTTP. Без адаптера ручной запуск отвечает 503.
+    /// Outbound HTTP. Without an adapter, manual execution returns 503.
     pub http: Arc<dyn OutboundHttp>,
-    /// Словарь видов операций канала.
+    /// Dictionary of channel operation types.
     pub broker_dictionary: Arc<dyn BrokerDictionary>,
-    /// Отдельное соединение рынка; блокирующие операции не выполняются
-    /// в async-обработчике напрямую.
+    /// Dedicated market connection; blocking operations are not performed
+    /// directly in the async handler.
     pub market_store: Arc<tokio::sync::Mutex<MarketStore>>,
 }
 
 impl AppServices {
-    /// Сборка с умолчаниями для необязательных портов.
+    /// Construction with defaults for optional ports.
     ///
-    /// Конструктора со всеми семью портами нет намеренно: поля структуры
-    /// публичны, и литерал с именованными полями читается лучше
-    /// позиционного вызова, а перестановку двух портов одного вида
-    /// компилятор на литерале заметит по имени поля (§15.1).
+    /// There is deliberately no constructor taking all seven ports: the struct fields
+    /// are public, and a literal with named fields is clearer than
+    /// a positional call, while if two ports of the same type are swapped
+    /// in a literal, the compiler will identify them by field name (§15.1).
     #[must_use]
     pub fn new(
         store: Arc<dyn Store>,

@@ -26,8 +26,8 @@ expression: report
       "unknown": "1"
     },
     "material_issues": [
-      "история начинается 2025-01-01",
-      "по счёту [uuid] нет независимого подтверждения измерения cash"
+      "history starts on 2025-01-01",
+      "account [uuid] has no independent confirmation of the cash measurement"
     ],
     "nav_coverage": {
       "accepted_independent": "0",

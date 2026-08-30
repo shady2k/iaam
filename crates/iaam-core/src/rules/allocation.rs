@@ -1,9 +1,9 @@
-//! Вычисление доли разнесения как версионированное правило ядра.
+//! Computing basis allocation as a versioned core rule.
 //!
-//! Денежная арифметика живёт в `iaam-core`, потому что именно ядро
-//! обязано вычислять числа в ответах API. Приёмка читает график и
-//! координату знания, затем передаёт готовое значение в чистый
-//! нормализатор `iaam-ingest`.
+//! Monetary arithmetic belongs in `iaam-core` because the core is responsible
+//! for computing the numbers returned by the API. Ingest reads the schedule and
+//! knowledge coordinate, then passes the ready value to the pure
+//! `iaam-ingest` normaliser.
 
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -20,12 +20,12 @@ use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use time::{Date, OffsetDateTime};
 
-/// Доля возврата от остатка **до** события.
+/// Return share from the remainder **before** the event.
 ///
-/// Возвраты одной даты агрегируются: две отдельные амортизации нельзя
-/// применить каждую с долей от остатка на начало дня — 10% и 10% от
-/// убывающей базы дают 19%, а не 20%. Источник различить их не даёт:
-/// `source_entry_id` у MOEX всегда `None`.
+/// Returns on one date are aggregated: two separate amortisations cannot each
+/// use a share of the start-of-day remainder — 10% and 10% of a shrinking base
+/// produce 19%, not 20%. The source cannot distinguish them:
+/// `source_entry_id` is always `None` at MOEX.
 pub fn resolve_basis_allocation(
     returned_per_unit: PerUnitAmount,
     on: Date,
@@ -74,17 +74,16 @@ pub fn resolve_basis_allocation(
         return BasisAllocation::Unknown(AllocationGap::InvalidPrefix);
     }
 
-    // Сравниваются суммы, а не доли: доли графика приходят в процентах
-    // с точностью источника, а возврат — деньги, округлённые до
-    // минимальной единицы валюты. Расхождение хотя бы в одну единицу
-    // означает другой возврат или брак источника — обе причины требуют
-    // отказа, а не догадки.
+    // Compare amounts, not shares: schedule shares arrive as percentages with
+    // source precision, while the return is money rounded to the currency's
+    // minor unit. A discrepancy of even one unit means a different return or
+    // corrupt source data — either requires refusal, not a guess.
     //
-    // Округление — половина от нуля, той же конвенцией, что и правило
-    // НКД: сверяемся с числом, которое напечатал источник, а он
-    // округляет так (см. `rounding_to_a_scale_matches_the_kopeck_of_the_source`).
-    // Половина к чётному, как в `split_basis`, дала бы на середине
-    // ложный `AmountMismatch` на честной выплате.
+    // Rounding is half away from zero, the same convention as the accrued-
+    // interest rule: compare against the number printed by the source, which
+    // rounds this way (see `rounding_to_a_scale_matches_the_kopeck_of_the_source`).
+    // Half to even, as in `split_basis`, would produce a false `AmountMismatch`
+    // at the midpoint of an honest payment.
     let Ok(planned) = initial
         .value()
         .checked_mul(scheduled_on_date)
@@ -127,13 +126,12 @@ pub fn resolve_basis_allocation(
     }
 }
 
-/// Отпечаток канонической выборки входов вычисления.
+/// Digest of the canonical selection of calculation inputs.
 ///
-/// Покрывает ровно то, от чего зависит доля: номинал с валютой, все
-/// возвраты (их даты и доли), дату события, идентичность снимка
-/// источника и версию правила группировки одинаковых дат. Изменение
-/// любого из них обязано менять отпечаток — иначе устаревшее evidence
-/// будет выглядеть свежим.
+/// Covers exactly what the share depends on: principal with currency, all
+/// returns (their dates and shares), the event date, the source snapshot
+/// identity, and the rule version for grouping equal dates. Any change must
+/// change the digest — otherwise stale evidence would look fresh.
 fn allocation_inputs_hash(
     initial: PerUnitAmount,
     returns: &[PrincipalReturn],
@@ -155,13 +153,13 @@ fn allocation_inputs_hash(
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        write!(&mut hex, "{byte:02x}").expect("писатель строки не может завершиться ошибкой");
+        write!(&mut hex, "{byte:02x}").expect("string writer cannot fail");
     }
-    AllocationInputsHash::new(hex).expect("SHA-256 всегда даёт 64 шестнадцатеричных знака")
+    AllocationInputsHash::new(hex).expect("SHA-256 always yields 64 hexadecimal digits")
 }
 
-/// Версия правила: агрегация возвратов одной даты, доля от остатка
-/// до события, сверка суммы с точностью до минимальной единицы валюты.
+/// Rule version: aggregate returns on one date, share from the pre-event
+/// remainder, and compare the amount to the currency minor-unit precision.
 const ALLOCATION_ALGORITHM_V1: AllocationAlgorithmVersion = AllocationAlgorithmVersion(1);
 
 #[cfg(test)]
@@ -175,7 +173,7 @@ mod tests {
     use time::macros::{date, datetime};
 
     fn dec(text: &str) -> Dec {
-        Dec::new(Decimal::from_str_exact(text).expect("десятичное число"))
+        Dec::new(Decimal::from_str_exact(text).expect("decimal number"))
     }
 
     fn per_unit(text: &str, currency: CurrencyCode) -> PerUnitAmount {
@@ -191,7 +189,7 @@ mod tests {
                         day,
                         &time::format_description::well_known::Iso8601::DATE,
                     )
-                    .expect("дата возврата"),
+                    .expect("repayment date"),
                     share_percent: dec(share),
                 })
                 .collect(),
@@ -212,7 +210,7 @@ mod tests {
     fn share_of(allocation: &BasisAllocation) -> Dec {
         match allocation {
             BasisAllocation::Known { share, .. } => share.inner(),
-            BasisAllocation::Unknown(gap) => panic!("ожидалась доля, получена {gap:?}"),
+            BasisAllocation::Unknown(gap) => panic!("expected a share, got {gap:?}"),
         }
     }
 
@@ -229,7 +227,7 @@ mod tests {
         );
         assert_eq!(share_of(&allocation), dec("0.2"));
         let BasisAllocation::Known { evidence, .. } = allocation else {
-            panic!("ожидалось известное вычисление")
+            panic!("expected a known calculation")
         };
         assert_eq!(
             evidence.knowledge_as_of,
@@ -379,18 +377,18 @@ mod tests {
             ..
         } = first
         else {
-            panic!("ожидалось известное вычисление")
+            panic!("expected a known calculation")
         };
         let BasisAllocation::Known {
             evidence: second_evidence,
             ..
         } = second
         else {
-            panic!("ожидалось известное вычисление")
+            panic!("expected a known calculation")
         };
         assert_ne!(
             first_evidence.inputs_hash, second_evidence.inputs_hash,
-            "идентичность снимка входит в отпечаток"
+            "snapshot identity is part of the digest"
         );
     }
 }

@@ -1,9 +1,9 @@
-//! Метаморфные тесты (§15.6).
+//! Metamorphic tests (§15.6).
 //!
-//! Проверяют не значение, а **преобразование**: что должно измениться
-//! и что обязано остаться прежним. Область применимости у каждого своя
-//! и указана явно — метаморфное свойство без оговорки так же опасно,
-//! как обычное (§15.3).
+//! They test not a value but a **transformation**: what should change
+//! and what must remain unchanged. Each has its own scope,
+//! stated explicitly—a metamorphic property without a caveat is just as dangerous
+//! as a regular one (§15.3).
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -53,7 +53,7 @@ impl Ledger {
             legs,
             provenance: Provenance::new(
                 self.source,
-                RawHash::parse(&"5".repeat(64)).expect("хеш"),
+                RawHash::parse(&"5".repeat(64)).expect("hash"),
                 ParserVersion("meta/1".into()),
             ),
             relation: Relation::None,
@@ -147,11 +147,11 @@ fn report(events: &[Event], accounts: &[AccountId], as_of: Date) -> ReturnsRepor
             lot_rule: LotRuleVersion(1),
         },
     )
-    .expect("проекция строится");
+    .expect("projection builds successfully");
     let fx = FxTable::new(FxSource::OwnerSupplied);
-    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
-    // а не подтверждение данных. Пустые реестр и оценка означают
-    // «ничего не подтверждено», что для расчёта нейтрально.
+    // Reconciliation and perimeter are not involved in this test: it tests calculation,
+    // not data confirmation. An empty registry and assessment mean
+    // “nothing is confirmed”, which is neutral for the calculation.
     let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
     let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
         iaam_core::perimeter::PerimeterPolicy::default(),
@@ -178,14 +178,14 @@ fn rate_of(report: &ReturnsReport) -> f64 {
     match &report.xirr {
         Computed::Value(outcome) => outcome.rate().value(),
         Computed::NotComputable { reason } => {
-            panic!("ставка не вычислена: {}", reason.code())
+            panic!("rate not calculated: {}", reason.code())
         }
     }
 }
 
-/// Область: всегда (§4.10). Счёт вне контура на доходность контура
-/// не влияет — именно из-за нарушения этого правила чужие сервисы
-/// показывают доходность, в которую попали чужие деньги.
+/// Scope: always (§4.10). An account outside the perimeter does not affect
+/// perimeter returns—it is precisely because this rule is violated that third-party services
+/// show returns that include someone else's money.
 #[test]
 fn an_account_outside_the_contour_does_not_change_the_rate() {
     let inside = AccountId::new_random();
@@ -198,23 +198,23 @@ fn an_account_outside_the_contour_does_not_change_the_rate() {
     ledger.valuation(inside, date!(2026 - 01 - 01), instrument, 1_000);
     let base = report(&ledger.events, &[inside], date!(2026 - 01 - 01));
 
-    // Тот же журнал плюс бурная деятельность на счёте вне контура.
+    // The same journal plus a flurry of activity in an account outside the perimeter.
     ledger.deposit(outside, date!(2025 - 03 - 01), 50_000_000);
     ledger.withdraw(outside, date!(2025 - 04 - 01), 20_000_000);
     let widened = report(&ledger.events, &[inside], date!(2026 - 01 - 01));
 
     assert!(
         (rate_of(&base) - rate_of(&widened)).abs() < 1e-12,
-        "счёт вне контура изменил ставку"
+        "account outside the perimeter changed the rate"
     );
     assert_eq!(base.contributed, widened.contributed);
     assert_eq!(base.terminal_value, widened.terminal_value);
 }
 
-/// Область: инструменты без корпоративных действий и без правил,
-/// зависящих от количества (минимальная комиссия, лот). На этапе 1
-/// таких правил нет; при их появлении свойство перестанет выполняться,
-/// и его придётся сузить, а не «починить».
+/// Scope: instruments without corporate actions or rules
+/// that depend on quantity (minimum fee, lot size). At stage 1,
+/// there are no such rules; if they are introduced, the property will no longer hold,
+/// and it will need to be narrowed rather than «fixed».
 #[test]
 fn splitting_one_instrument_into_two_identical_halves_keeps_the_aggregates() {
     let account = AccountId::new_random();
@@ -243,10 +243,10 @@ fn splitting_one_instrument_into_two_identical_halves_keeps_the_aggregates() {
     assert!((rate_of(&left) - rate_of(&right)).abs() < 1e-12);
 }
 
-/// Область: **масштабная инвариантность ставки** при отключённых налогах,
-/// порогах и минимальных комиссиях (§15.3). Линейные величины умножаются
-/// на `k`, ставка не меняется. При появлении прогрессивной шкалы
-/// свойство становится неверным.
+/// Scope: **scale invariance of the rate** with taxes,
+/// thresholds, and minimum fees disabled (§15.3). Linear quantities are multiplied
+/// by `k`, while the rate remains unchanged. If a progressive scale is introduced,
+/// the property becomes invalid.
 #[test]
 fn scaling_every_flow_scales_the_amounts_and_leaves_the_rate() {
     let account = AccountId::new_random();
@@ -270,7 +270,7 @@ fn scaling_every_flow_scales_the_amounts_and_leaves_the_rate() {
         9_000_000 * factor,
     );
     scaled.withdraw(account, date!(2025 - 08 - 01), 500_000 * factor);
-    // Цена за единицу не масштабируется: масштабируется количество.
+    // The unit price does not scale: the quantity does.
     scaled.valuation(account, as_of, instrument, 1_000);
 
     let left = report(&plain.events, &[account], as_of);
@@ -278,15 +278,15 @@ fn scaling_every_flow_scales_the_amounts_and_leaves_the_rate() {
 
     assert!(
         (rate_of(&left) - rate_of(&right)).abs() < 1e-9,
-        "ставка изменилась при масштабировании: {} против {}",
+        "rate changed under scaling: {} versus {}",
         rate_of(&left),
         rate_of(&right)
     );
     let scaled_contribution = left
         .contributed
         .value()
-        .expect("внесено")
+        .expect("deposited")
         .checked_mul(Dec::new(Decimal::from(factor)))
-        .expect("умножение");
+        .expect("multiplication");
     assert_eq!(right.contributed.value(), Some(&scaled_contribution));
 }

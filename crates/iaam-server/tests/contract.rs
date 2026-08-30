@@ -1,11 +1,11 @@
-//! Контрактные тесты против порождённой спеки (§17.1).
+//! Contract tests against the generated spec (§17.1).
 //!
-//! `utoipa` порождает спеку из типов и потому устраняет расхождение
-//! **схемы данных**. Поведение — коды ответов, требования аутентификации,
-//! фактическая сериализация — остаётся вне генерации, и проверяется
-//! только вызовом поднятого сервера. Для контракта, которым пользуется
-//! внешний агент, синтаксически верная, но поведенчески неверная спека
-//! означает, что агент будет чиниться по неверной подсказке.
+//! `utoipa` generates the spec from types and therefore eliminates
+//! **data schema** drift. Behaviour — response codes, authentication requirements,
+//! actual serialisation — remains outside generation, and is tested
+//! only by calling a running server. For a contract used by
+//! an external agent, a syntactically valid but behaviourally incorrect spec
+//! means the agent will fix itself based on incorrect guidance.
 
 use std::sync::Arc;
 
@@ -58,8 +58,8 @@ use time::{Date, Duration as TimeDuration, OffsetDateTime};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// Часы с зафиксированной датой: отчёт «на сегодня» иначе
-/// невоспроизводим в тесте.
+/// A clock with a fixed date: otherwise the report «as at today» is
+/// not reproducible in a test.
 struct FixedClock(Date);
 
 impl Clock for FixedClock {
@@ -171,15 +171,15 @@ struct Harness {
 }
 
 fn harness() -> Harness {
-    harness_with(SqliteStore::open_in_memory().expect("база в памяти"))
+    harness_with(SqliteStore::open_in_memory().expect("in-memory database"))
 }
 
-/// Тот же стенд, но на базе файлом: тесты, проверяющие, что запись
-/// действительно легла в таблицу, обязаны иметь второе соединение
-/// к той же базе. Через `open_in_memory` второго соединения не бывает.
+/// The same harness, but with a file-backed database: tests verifying that a record
+/// was actually written to the table must use a second connection
+/// to the same database. There is no second connection with `open_in_memory`.
 fn harness_on_disk() -> (Harness, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("iaam-contract-{}.db", Uuid::new_v4()));
-    let store = SqliteStore::open(&path).expect("база файлом");
+    let store = SqliteStore::open(&path).expect("file-backed database");
     (harness_with(store), path)
 }
 
@@ -188,7 +188,7 @@ fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account:
         date!(2025 - 01 - 01),
         date!(2025 - 01 - 31),
     )
-    .expect("период");
+    .expect("period");
     let source = SourceId::new_random();
     let event = iaam_core::event::Event {
         id: iaam_core::ids::EventId::new_random(),
@@ -208,7 +208,7 @@ fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account:
         legs: Vec::new(),
         provenance: iaam_core::event::provenance::Provenance::new(
             source,
-            iaam_core::event::provenance::RawHash::parse(&"b".repeat(64)).expect("хеш"),
+            iaam_core::event::provenance::RawHash::parse(&"b".repeat(64)).expect("hash"),
             ParserVersion("contract-test".to_owned()),
         ),
         relation: iaam_core::event::Relation::None,
@@ -221,9 +221,9 @@ fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account:
         )),
     };
     SqliteStore::open(path)
-        .expect("второе соединение")
+        .expect("second connection")
         .append_event(&event)
-        .expect("утверждение сверки");
+        .expect("reconciliation assertion");
 }
 
 fn harness_with(store: SqliteStore) -> Harness {
@@ -241,10 +241,10 @@ fn harness_with_factory(
         .upsert_account(&AccountRecord {
             id: account,
             owner,
-            title: "Брокерский".into(),
+            title: "Brokerage".into(),
             institution: None,
         })
-        .expect("счёт");
+        .expect("account");
 
     let owner_token = "owner-secret-token";
     store
@@ -252,13 +252,13 @@ fn harness_with_factory(
             &TokenRecord {
                 id: Uuid::new_v4(),
                 owner,
-                label: "владелец".into(),
+                label: "owner".into(),
                 scope: TokenScope::Owner,
                 revoked: false,
             },
             &hash_token(owner_token),
         )
-        .expect("токен владельца");
+        .expect("owner token");
 
     let agent_token = "agent-secret-token";
     store
@@ -266,13 +266,13 @@ fn harness_with_factory(
             &TokenRecord {
                 id: Uuid::new_v4(),
                 owner,
-                label: "агент".into(),
+                label: "agent".into(),
                 scope: TokenScope::Agent,
                 revoked: false,
             },
             &hash_token(agent_token),
         )
-        .expect("токен агента");
+        .expect("agent token");
 
     let readonly_token = "read-only-token";
     store
@@ -280,18 +280,18 @@ fn harness_with_factory(
             &TokenRecord {
                 id: Uuid::new_v4(),
                 owner,
-                label: "чтение".into(),
+                label: "read".into(),
                 scope: TokenScope::ReadOnly,
                 revoked: false,
             },
             &hash_token(readonly_token),
         )
-        .expect("токен чтения");
+        .expect("read token");
 
-    // Ключ прямо из байтов, а не из файла: файл во временном каталоге
-    // пришлось бы удалять, и тест, упавший до удаления, оставлял бы
-    // за собой ключ. Постоянные байты здесь безопасны — база живёт
-    // ровно столько же, сколько тест.
+    // The key is created directly from bytes, not from a file: a file in a temporary directory
+    // would have to be deleted, and a test that failed before deletion would leave
+    // the key behind. Fixed bytes are safe here — the database lives
+    // exactly as long as the test.
     let adapter = Arc::new(SqliteAdapter::with_broker_key(
         store,
         Some(Key::from_bytes([7; 32])),
@@ -345,11 +345,11 @@ async fn seed_market(harness: &Harness) {
             id: harness.instrument,
             kind: Some(InstrumentKind::Share),
             symbol: "SBER".into(),
-            title: "Сбербанк".into(),
+            title: "Sberbank".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент рынка");
+        .expect("market instrument");
 
     let price_series = SeriesKey {
         source_id: "moex-iss".into(),
@@ -363,7 +363,7 @@ async fn seed_market(harness: &Harness) {
             date!(2026 - 08 - 03),
             lease_expires_at,
         )
-        .expect("запуск цен");
+        .expect("price run");
     store
         .record_prices(
             &price_run,
@@ -397,7 +397,7 @@ async fn seed_market(harness: &Harness) {
                 },
             ],
         )
-        .expect("строки цен");
+        .expect("price rows");
     store
         .finish_run(
             &price_run,
@@ -407,7 +407,7 @@ async fn seed_market(harness: &Harness) {
                 to: date!(2026 - 08 - 03),
             }),
         )
-        .expect("публикация цен");
+        .expect("price publication");
 
     let fx_series = SeriesKey {
         source_id: "cbr".into(),
@@ -421,7 +421,7 @@ async fn seed_market(harness: &Harness) {
             date!(2026 - 08 - 03),
             lease_expires_at,
         )
-        .expect("запуск курсов");
+        .expect("exchange-rate run");
     store
         .record_fx(
             &fx_run,
@@ -436,7 +436,7 @@ async fn seed_market(harness: &Harness) {
                 unit_rate: "80.00".into(),
             }],
         )
-        .expect("строка курса");
+        .expect("exchange-rate row");
     store
         .finish_run(
             &fx_run,
@@ -446,7 +446,7 @@ async fn seed_market(harness: &Harness) {
                 to: date!(2026 - 08 - 03),
             }),
         )
-        .expect("публикация курса");
+        .expect("exchange-rate publication");
 
     let key_rate_series = SeriesKey {
         source_id: "cbr".into(),
@@ -460,7 +460,7 @@ async fn seed_market(harness: &Harness) {
             date!(2026 - 08 - 10),
             lease_expires_at,
         )
-        .expect("запуск ставки");
+        .expect("rate run");
     store
         .record_key_rate(
             &key_rate_run,
@@ -478,7 +478,7 @@ async fn seed_market(harness: &Harness) {
                 },
             ],
         )
-        .expect("строки ставки");
+        .expect("rate rows");
     store
         .finish_run(
             &key_rate_run,
@@ -489,7 +489,7 @@ async fn seed_market(harness: &Harness) {
                 to: date!(2026 - 08 - 10),
             }),
         )
-        .expect("публикация ставки");
+        .expect("rate publication");
 }
 
 async fn seed_bond_market(harness: &Harness) {
@@ -499,11 +499,11 @@ async fn seed_bond_market(harness: &Harness) {
             id: harness.instrument,
             kind: Some(InstrumentKind::Bond),
             symbol: "BOND".into(),
-            title: "Тестовая облигация".into(),
+            title: "Test bond".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент рынка облигации");
+        .expect("bond market instrument");
     store
         .extend_market_source_codes(
             "moex-iss",
@@ -514,7 +514,7 @@ async fn seed_bond_market(harness: &Harness) {
                 meaning: "put_option".into(),
             }],
         )
-        .expect("словарь оферт");
+        .expect("offer dictionary");
 
     let price_run = store
         .begin_run(
@@ -527,7 +527,7 @@ async fn seed_bond_market(harness: &Harness) {
             date!(2026 - 08 - 03),
             OffsetDateTime::now_utc() + TimeDuration::days(1),
         )
-        .expect("запуск цен облигации");
+        .expect("bond price run");
     store
         .record_prices(
             &price_run,
@@ -546,7 +546,7 @@ async fn seed_bond_market(harness: &Harness) {
                 executability: "executable".into(),
             }],
         )
-        .expect("цена облигации");
+        .expect("bond price");
     store
         .finish_run(
             &price_run,
@@ -556,7 +556,7 @@ async fn seed_bond_market(harness: &Harness) {
                 to: date!(2026 - 08 - 03),
             }),
         )
-        .expect("публикация цены облигации");
+        .expect("bond price publication");
     let accrued_run = store
         .begin_run(
             SeriesKey {
@@ -568,7 +568,7 @@ async fn seed_bond_market(harness: &Harness) {
             date!(2026 - 08 - 03),
             OffsetDateTime::now_utc() + TimeDuration::days(1),
         )
-        .expect("запуск НКД");
+        .expect("starting accrued interest");
     store
         .record_accrued_interest(
             &accrued_run,
@@ -583,7 +583,7 @@ async fn seed_bond_market(harness: &Harness) {
                 currency: "RUB".into(),
             }],
         )
-        .expect("НКД облигации");
+        .expect("bond accrued interest");
     store
         .finish_run(
             &accrued_run,
@@ -593,7 +593,7 @@ async fn seed_bond_market(harness: &Harness) {
                 to: date!(2026 - 08 - 03),
             }),
         )
-        .expect("публикация НКД облигации");
+        .expect("bond accrued interest publication");
 
     let snapshot = store
         .record_schedule_snapshot(
@@ -641,10 +641,10 @@ async fn seed_bond_market(harness: &Harness) {
                 },
             ],
         )
-        .expect("снимок графика");
+        .expect("schedule snapshot");
     store
         .record_schedule_completeness(&snapshot.snapshot_id, true, true, None, &[0])
-        .expect("полнота графика");
+        .expect("schedule completeness");
     store
         .record_issue_terms(&IssueTermsRow {
             instrument_id: harness.instrument.inner().to_string(),
@@ -660,7 +660,7 @@ async fn seed_bond_market(harness: &Harness) {
             default_declared: false,
             default_technical: false,
         })
-        .expect("условия выпуска");
+        .expect("issue terms");
 }
 
 async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
@@ -668,13 +668,13 @@ async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
         .clone()
         .oneshot(request)
         .await
-        .expect("обработчик ответил");
+        .expect("handler responded");
     let status = response.status();
     let bytes = response
         .into_body()
         .collect()
         .await
-        .expect("тело ответа")
+        .expect("response body")
         .to_bytes();
     let value = if bytes.is_empty() {
         Value::Null
@@ -689,7 +689,7 @@ fn get(path: &str, token: Option<&str>) -> Request<Body> {
     if let Some(token) = token {
         builder = builder.header("Authorization", format!("Bearer {token}"));
     }
-    builder.body(Body::empty()).expect("запрос")
+    builder.body(Body::empty()).expect("request")
 }
 
 fn delete(path: &str, token: &str) -> Request<Body> {
@@ -698,7 +698,7 @@ fn delete(path: &str, token: &str) -> Request<Body> {
         .method("DELETE")
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::empty())
-        .expect("запрос")
+        .expect("request")
 }
 
 fn post(path: &str, token: &str, body: &Value) -> Request<Body> {
@@ -708,35 +708,35 @@ fn post(path: &str, token: &str, body: &Value) -> Request<Body> {
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/json")
         .body(Body::from(body.to_string()))
-        .expect("запрос")
+        .expect("request")
 }
 
-/// Запрос без токена: присвоение экземпляра зовут тогда, когда токена
-/// ещё нет и взять его неоткуда.
+/// Request without a token: instance claiming is invoked when there is
+/// no token yet and nowhere to obtain one.
 fn post_public(path: &str, body: &Value) -> Request<Body> {
     Request::builder()
         .uri(path)
         .method("POST")
         .header("Content-Type", "application/json")
         .body(Body::from(body.to_string()))
-        .expect("запрос")
+        .expect("request")
 }
 
-/// Стенд без владельца: экземпляр ещё не присвоен.
+/// Harness without an owner: the instance has not yet been claimed.
 ///
-/// Отдельный стенд, а не признак у общего: в общем владелец заведён
-/// с первой строки, и присваивать там нечего. Код присвоения берётся
-/// из той же функции, которой его порождает точка сборки, — иначе тест
-/// проверял бы не тот путь, которым код попадает к человеку.
+/// A separate harness rather than a flag on the shared one: the shared harness has an owner
+/// from the outset, so there is nothing to claim there. The claim code is obtained
+/// from the same function the composition root uses to generate it — otherwise the test
+/// would not exercise the path by which the code reaches the user.
 async fn unclaimed_harness() -> (Router, String) {
-    unclaimed_harness_with(SqliteStore::open_in_memory().expect("база в памяти")).await
+    unclaimed_harness_with(SqliteStore::open_in_memory().expect("in-memory database")).await
 }
 
-/// Тот же стенд на базе файлом: проверка того, что владелец завёлся
-/// **помимо** присвоения, требует второго соединения к той же базе.
+/// The same harness with a file-backed database: verifying that the owner was created
+/// **in addition to** the claim requires a second connection to the same database.
 async fn unclaimed_harness_on_disk() -> (Router, String, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("iaam-claim-{}.db", Uuid::new_v4()));
-    let store = SqliteStore::open(&path).expect("база файлом");
+    let store = SqliteStore::open(&path).expect("file-backed database");
     let (router, code) = unclaimed_harness_with(store).await;
     (router, code, path)
 }
@@ -745,16 +745,16 @@ async fn unclaimed_harness_with(store: SqliteStore) -> (Router, String) {
     let state = claim_state(store);
     let code = iaam_server::claim::arm(&state)
         .await
-        .expect("состояние базы прочитано")
-        .expect("владельца нет — код присвоения обязан быть порождён");
+        .expect("database state read")
+        .expect("there is no owner — a claim code must have been generated");
     let (router, _) = build(state);
     (router, code)
 }
 
-/// Состояние сервера поверх готовой базы.
+/// Server state over a prepared database.
 ///
-/// Общее для стендов присвоения: собирать его в каждом означало бы,
-/// что тесты проверяют разные сборки одного и того же.
+/// Shared by the claim harnesses: constructing it in each would mean
+/// that the tests exercise different builds of the same thing.
 fn claim_state(store: SqliteStore) -> ServerState {
     let adapter = Arc::new(SqliteAdapter::new(store));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
@@ -778,26 +778,26 @@ async fn health_is_public_and_reports_versions() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Версия 4: после ControlAssertion (версия 3) добавлены
-    // CorporateAction и OfferExercise, а Income получил вид дохода
-    // (§4.7); одна версия не может обозначать две схемы (§4.1). Внешний
-    // агент читает эту цифру, чтобы понять, разберёт ли он ответ, —
-    // поэтому она закреплена здесь, а не выводится из кода.
+    // Version 4: CorporateAction and OfferExercise were added after
+    // ControlAssertion (version 3), while Income gained an income type
+    // (§4.7); one version cannot denote two schemas (§4.1). An external
+    // agent reads this number to determine whether it can parse the response, so
+    // it is fixed here rather than derived from the code.
     assert_eq!(body["schema_version"], 4);
-    // Версия 7: номинал ушёл из лота, а отпечаток префикса покрывает
-    // содержимое события, а не только идентичность подачи. Снимок
-    // версии 6 несовместим и вызывает полный пересчёт.
+    // Version 7: the face value was removed from the lot, while the prefix fingerprint covers
+    // the event contents rather than only the submission identity. The version 6
+    // snapshot is incompatible and triggers a full recalculation.
     assert_eq!(body["projection_version"], 7);
 }
 
 #[tokio::test]
 async fn every_documented_path_answers_something_other_than_404() {
-    // Спека, описывающая несуществующий маршрут, — это инструкция
-    // внешнему агенту чинить себя по неверной подсказке.
+    // A spec describing a non-existent route is an instruction
+    // for the external agent to correct itself based on false guidance.
     let harness = harness();
     for (path, item) in harness.api.paths.paths.clone() {
-        // `PathItem` в utoipa 5 хранит операции отдельными полями,
-        // а не картой: перечисляем ровно те методы, которые использует API.
+        // `PathItem` in utoipa 5 stores operations in separate fields
+        // rather than a map: enumerate exactly the methods used by the API.
         let methods = [
             ("GET", item.get.is_some()),
             ("POST", item.post.is_some()),
@@ -815,24 +815,24 @@ async fn every_documented_path_answers_something_other_than_404() {
                 .header("Authorization", format!("Bearer {}", harness.owner_token))
                 .header("Content-Type", "application/json")
                 .body(Body::from("{}"))
-                .expect("запрос");
+                .expect("request");
             let (status, body) = call(&harness.router, request).await;
-            // `404` бывает двух разных родов, и заслон различает их по
-            // телу ответа. Отсутствующий **маршрут** отдаёт пустой `404`
-            // самого axum — это и есть расхождение со спекой, ради
-            // которого тест написан. Отсутствующий **ресурс** отдаёт наш
-            // `ApiError` с машиночитаемым кодом, и это законный ответ:
-            // идентификатор в запросе случайный, и записи с ним нет.
+            // There are two distinct kinds of `404`, and the guard distinguishes them by
+            // the response body. A missing **route** returns an empty `404`
+            // axum itself — this is exactly the discrepancy from the specification that
+            // the test was written for. A missing **resource** returns our
+            // `ApiError` with a machine-readable code, and this is a valid response:
+            // the identifier in the request is random, and there is no record with it.
             if status == StatusCode::NOT_FOUND {
                 assert!(
                     body.get("code").and_then(Value::as_str).is_some(),
-                    "маршрут {path} {verb} описан в спеке, но не существует"
+                    "route {path} {verb} is described in the specification but does not exist"
                 );
             }
             assert_ne!(
                 status,
                 StatusCode::METHOD_NOT_ALLOWED,
-                "метод {verb} для {path} описан в спеке, но не поддерживается"
+                "method {verb} for {path} is described in the specification but is not supported"
             );
         }
     }
@@ -840,7 +840,7 @@ async fn every_documented_path_answers_something_other_than_404() {
 
 #[tokio::test]
 async fn a_request_without_a_token_is_rejected() {
-    // Аутентификация с первого дня (§14).
+    // Authentication from day one (§14).
     let harness = harness();
     let (status, body) = call(&harness.router, get("/v1/accounts", None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -850,7 +850,7 @@ async fn a_request_without_a_token_is_rejected() {
 #[tokio::test]
 async fn an_unknown_token_is_rejected() {
     let harness = harness();
-    let (status, _) = call(&harness.router, get("/v1/accounts", Some("чужой"))).await;
+    let (status, _) = call(&harness.router, get("/v1/accounts", Some("someone else's"))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -858,7 +858,7 @@ async fn an_unknown_token_is_rejected() {
 async fn a_read_only_token_may_not_submit_operations() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "operations": [{
             "account": harness.account.inner(),
             "type": "deposit",
@@ -880,7 +880,7 @@ async fn a_read_only_token_may_not_submit_operations() {
 async fn an_invalid_amount_is_reported_as_422_with_field_expected_actual() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "operations": [{
             "account": harness.account.inner(),
             "type": "deposit",
@@ -894,7 +894,7 @@ async fn an_invalid_amount_is_reported_as_422_with_field_expected_actual() {
         post("/v1/ingest/operations", &harness.owner_token, &body),
     )
     .await;
-    // Вердикт на строку, а не отказ всего документа (§10.1).
+    // A verdict per row, rather than rejection of the entire document (§10.1).
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response[0]["verdict"], "rejected");
     assert_eq!(response[0]["field"], "amount");
@@ -906,7 +906,7 @@ async fn opening_position_assertions_reach_the_event_through_the_api() {
     let (harness, path) = harness_on_disk();
     let claimed = date!(2021 - 05 - 01);
     let body = json!({
-        "source_label": "ручной ввод",
+        "source_label": "manual entry",
         "operations": [{
             "account": harness.account.inner(),
             "type": "opening_position",
@@ -931,16 +931,16 @@ async fn opening_position_assertions_reach_the_event_through_the_api() {
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
 
-    let store = SqliteStore::open(&path).expect("второе соединение");
+    let store = SqliteStore::open(&path).expect("second connection");
     let events = store
         .load_events(harness.owner)
-        .expect("события восстановленной позиции");
+        .expect("events for the restored position");
     let event = events
         .into_iter()
         .find(|event| matches!(&event.kind, EventKind::OpeningPosition { .. }))
-        .expect("восстановленная позиция");
+        .expect("restored position");
     let EventKind::OpeningPosition { assertions, .. } = event.kind else {
-        unreachable!("выше найден только opening_position");
+        unreachable!("only opening_position was found above");
     };
     assert_eq!(assertions.acquisition_date, Some(claimed));
     assert_eq!(assertions.acquisition_date_certainty, DateCertainty::Known);
@@ -953,7 +953,7 @@ async fn opening_position_assertions_reach_the_event_through_the_api() {
 async fn a_carried_forward_price_is_not_accepted_from_the_api() {
     let harness = harness();
     let body = json!({
-        "source_label": "ручной ввод",
+        "source_label": "manual entry",
         "operations": [{
             "account": harness.account.inner(),
             "type": "valuation",
@@ -976,7 +976,7 @@ async fn a_carried_forward_price_is_not_accepted_from_the_api() {
 async fn a_stale_price_is_not_accepted_from_the_api() {
     let harness = harness();
     let body = json!({
-        "source_label": "ручной ввод",
+        "source_label": "manual entry",
         "operations": [{
             "account": harness.account.inner(),
             "type": "valuation",
@@ -997,12 +997,12 @@ async fn a_stale_price_is_not_accepted_from_the_api() {
 
 #[tokio::test]
 async fn the_stage_one_question_is_answered_end_to_end() {
-    // Приёмочный критерий эпика через API: сколько внесено, сколько
-    // выведено, какова доходность до налога.
+    // The epic's acceptance criterion via the API: how much was contributed, how much
+    // was withdrawn, and the pre-tax return.
     let harness = harness();
 
     let contour = json!({
-        "title": "Мой портфель",
+        "title": "My portfolio",
         "accounts": [harness.account.inner()],
     });
     let (status, contour_response) = call(
@@ -1013,11 +1013,11 @@ async fn the_stage_one_question_is_answered_end_to_end() {
     assert_eq!(status, StatusCode::CREATED, "{contour_response}");
     let contour_id = contour_response["contour"]
         .as_str()
-        .expect("контур")
+        .expect("scope")
         .to_owned();
 
     let operations = json!({
-        "source_label": "ручной ввод",
+        "source_label": "manual entry",
         "operations": [
             {
                 "account": harness.account.inner(),
@@ -1070,7 +1070,7 @@ async fn the_stage_one_question_is_answered_end_to_end() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{verdicts}");
-    for verdict in verdicts.as_array().expect("массив вердиктов") {
+    for verdict in verdicts.as_array().expect("array of verdicts") {
         assert_eq!(verdict["verdict"], "provisional", "{verdict}");
     }
 
@@ -1083,11 +1083,11 @@ async fn the_stage_one_question_is_answered_end_to_end() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{report}");
-    // Масштаб сохраняется: рубль имеет две минимальные единицы, и сумма,
-    // переведённая из проведённой в расчётную, остаётся с двумя знаками.
+    // Scale is preserved: the rouble has two minor units, and an amount,
+    // converted from posted to calculated retains two decimal places.
     assert_eq!(report["contributed"]["value"], "100000.00");
     assert_eq!(report["withdrawn"]["value"], "10000.00");
-    // 2 900,00 рубля денег плюс 100 бумаг по 1 000 = 102 900,00.
+    // 2 900,00 roubles in cash plus 100 securities at 1 000 = 102 900,00.
     assert_eq!(report["terminal_value"]["value"], "102900.00");
     assert_eq!(report["history_starts"], "2025-01-01");
     assert_eq!(report["bond_metrics"], json!([]));
@@ -1095,7 +1095,7 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         report["data_quality"]["nav_coverage"]
             .get("bond_metrics")
             .is_none(),
-        "метрики облигаций не должны попадать в data_quality"
+        "bond metrics must not appear in data_quality"
     );
     assert_eq!(report["applied_rules"]["fx_source"], "cbr_official");
     assert_eq!(report["applied_rules"]["day_count"], "act/365");
@@ -1111,25 +1111,25 @@ async fn the_stage_one_question_is_answered_end_to_end() {
     for field in ["contributed", "terminal_value", "xirr_pre_tax"] {
         assert_eq!(
             missing_rate_report[field]["not_computable"], "missing_fx_rate",
-            "отсутствующий курс не должен превращаться в единицу: {field}"
+            "a missing exchange rate must not be treated as 1: {field}"
         );
     }
 
-    // Ставка получена независимым эталоном (scripts/gen-xirr-fixtures.py),
-    // а не выводом проверяемой программы (§15.5).
+    // The rate was obtained using an independent reference (scripts/gen-xirr-fixtures.py),
+    // not from the output of the program under test (§15.5).
     let rate: f64 = report["xirr_pre_tax"]["value"]
         .as_str()
-        .expect("ставка")
+        .expect("rate")
         .parse()
-        .expect("число");
+        .expect("number");
     assert!(
         (rate - 0.133_270_341_032).abs() < 1e-7,
-        "ставка {rate} не совпадает с эталонной"
+        "rate {rate} does not match the reference value"
     );
-    // Данные введены руками и ничем не подтверждены: вся стоимость
-    // портфеля лежит в доле `provisional`. Это не дефект — §10.5
-    // требует считать такие записи в отчётах по умолчанию, — но
-    // владелец обязан видеть, какая именно доля не подтверждена.
+    // The data were entered manually and are uncorroborated: the entire value
+    // of the portfolio is in the `provisional` share. This is not a defect — §10.5
+    // requires such records to be included in reports by default, — but
+    // the owner must see exactly what proportion is unverified.
     assert_eq!(report["data_quality"]["nav_coverage"]["provisional"], "1");
     assert_eq!(
         report["data_quality"]["nav_coverage"]["accepted_independent"],
@@ -1201,7 +1201,7 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
                 "id": harness.instrument.inner(),
                 "kind": "bond",
                 "symbol": "BOND",
-                "title": "Тестовая облигация",
+                "title": "Test bond",
                 "denomination_currency": "RUB",
                 "settlement_currency": "RUB",
                 "quote_currency": "RUB"
@@ -1213,7 +1213,7 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     seed_bond_market(&harness).await;
 
     let contour = json!({
-        "title": "Облигационный портфель",
+        "title": "Bond portfolio",
         "accounts": [harness.account.inner()],
     });
     let (status, contour_response) = call(
@@ -1224,11 +1224,11 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     assert_eq!(status, StatusCode::CREATED, "{contour_response}");
     let contour_id = contour_response["contour"]
         .as_str()
-        .expect("контур")
+        .expect("scope")
         .to_owned();
 
     let operations = json!({
-        "source_label": "ручной ввод",
+        "source_label": "manual entry",
         "operations": [
             {
                 "account": harness.account.inner(),
@@ -1268,7 +1268,7 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     assert!(
         verdicts
             .as_array()
-            .expect("массив вердиктов")
+            .expect("array of verdicts")
             .iter()
             .all(|verdict| verdict["verdict"] == "provisional"),
         "{verdicts}"
@@ -1302,7 +1302,7 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     assert_eq!(attributes[0]["next_posting_date"], "2026-12-02");
     assert_eq!(attributes[0]["next_principal_return_finality"], "final");
 
-    let scenarios = bond["scenarios"].as_array().expect("сценарии");
+    let scenarios = bond["scenarios"].as_array().expect("scenarios");
     assert_eq!(scenarios.len(), 3);
     assert!(
         scenarios
@@ -1342,10 +1342,10 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     assert!(
         !ytm["prospective"]["metrics"]["value"]["zero_reinvestment_note"]
             .as_str()
-            .expect("пояснение")
+            .expect("explanation")
             .is_empty()
     );
-    let lifetime = ytm["lifetime"]["value"].as_array().expect("когорты");
+    let lifetime = ytm["lifetime"]["value"].as_array().expect("cohorts");
     assert_eq!(lifetime.len(), 1);
     assert_eq!(lifetime[0]["quantity"], "10");
     assert_eq!(lifetime[0]["c0"]["value"]["currency"], "RUB");
@@ -1357,14 +1357,14 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     assert!(
         !lifetime[0]["irr_absent_because"]
             .as_str()
-            .expect("причина отсутствия IRR")
+            .expect("reason IRR is unavailable")
             .is_empty()
     );
 
     let refusal = scenarios
         .iter()
         .find(|scenario| scenario["prospective"]["terminal_date"] == "2026-08-26")
-        .expect("отказная offer-ставка");
+        .expect("rejection offer-rate");
     assert_eq!(refusal["prospective"]["irr"]["value"], "");
     assert_eq!(refusal["prospective"]["irr"]["error_bound"], "");
     assert_eq!(
@@ -1374,7 +1374,7 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     assert!(
         !refusal["prospective"]["irr"]["detail"]
             .as_str()
-            .expect("деталь отказа")
+            .expect("rejection detail")
             .is_empty()
     );
     drop(harness);
@@ -1387,7 +1387,7 @@ async fn returns_report_loads_official_fx_from_market_store() {
     seed_market(&harness).await;
 
     let contour = json!({
-        "title": "Долларовый отчёт",
+        "title": "Dollar-denominated report",
         "accounts": [harness.account.inner()],
     });
     let (status, contour_response) = call(
@@ -1398,11 +1398,11 @@ async fn returns_report_loads_official_fx_from_market_store() {
     assert_eq!(status, StatusCode::CREATED, "{contour_response}");
     let contour_id = contour_response["contour"]
         .as_str()
-        .expect("контур")
+        .expect("scope")
         .to_owned();
 
     let operations = json!({
-        "source_label": "рыночный курс",
+        "source_label": "market rate",
         "operations": [{
             "account": harness.account.inner(),
             "type": "deposit",
@@ -1437,7 +1437,7 @@ async fn returns_report_loads_official_fx_from_market_store() {
 async fn repeating_an_idempotent_operation_returns_the_same_event() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "operations": [{
             "account": harness.account.inner(),
             "type": "deposit",
@@ -1470,7 +1470,7 @@ async fn the_openapi_document_declares_bearer_security() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         spec["components"]["securitySchemes"]["bearer"].is_object(),
-        "спека обязана описывать схему аутентификации"
+        "the spec must describe the authentication scheme"
     );
 }
 
@@ -1508,7 +1508,7 @@ async fn the_openapi_document_declares_report_quality_and_liquidation_fields() {
     ] {
         assert!(
             spec["components"]["schemas"][schema].is_object(),
-            "схема {schema} обязана быть в OpenAPI"
+            "schema {schema} must be in OpenAPI"
         );
     }
 }
@@ -1530,12 +1530,12 @@ async fn the_openapi_document_declares_quotation_basis_provenance_fields() {
 
 #[tokio::test]
 async fn the_report_shape_is_frozen_by_a_snapshot() {
-    // Поштучные проверки полей ловят неверное значение, но не ловят
-    // исчезнувшее поле и не ловят появление лишнего. Снапшот ловит
-    // форму целиком (§15.8).
+    // Field-by-field checks catch an incorrect value, but do not catch
+    // a missing field or the appearance of an extra one. A snapshot captures
+    // the whole shape (§15.8).
     let harness = harness();
     let contour = json!({
-        "title": "Снапшот",
+        "title": "Snapshot",
         "accounts": [harness.account.inner()],
     });
     let (_, contour_response) = call(
@@ -1545,11 +1545,11 @@ async fn the_report_shape_is_frozen_by_a_snapshot() {
     .await;
     let contour_id = contour_response["contour"]
         .as_str()
-        .expect("контур")
+        .expect("scope")
         .to_owned();
 
     let operations = json!({
-        "source_label": "снапшот",
+        "source_label": "snapshot",
         "operations": [{
             "account": harness.account.inner(),
             "type": "deposit",
@@ -1575,11 +1575,11 @@ async fn the_report_shape_is_frozen_by_a_snapshot() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Идентификаторы счетов случайны в каждом прогоне, а материальные
-    // проблемы их называют. Заменяются они фильтром, а не редакцией
-    // поля: редакция скрыла бы текст проблемы целиком, и снимок
-    // перестал бы проверять то, ради чего существует, — какие именно
-    // проблемы система сообщает владельцу.
+    // Account IDs are random on each run, while material
+    // issues mention them. They are replaced by a filter, not by redacting
+    // the field: redaction would hide the issue text entirely, and the snapshot
+    // would stop checking the very thing it exists to check — exactly which
+    // issues the system reports to the owner.
     let mut settings = insta::Settings::clone_current();
     settings.add_filter(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
@@ -1593,10 +1593,10 @@ async fn the_report_shape_is_frozen_by_a_snapshot() {
 }
 #[tokio::test]
 async fn an_agent_may_submit_but_may_not_administer() {
-    // Область действия — заслон, а не подсказка. Агент отправляет
-    // операции, но не заводит счета и не меняет состав контура: иначе
-    // внешний агент, которому доверили ввод данных, получает право
-    // переопределить границу контура и тем самым переписать доходность.
+    // Scope is a barrier, not a hint. The agent submits
+    // transactions, but does not create accounts or change the scope's composition: otherwise
+    // an external agent entrusted with data entry gains the right
+    // to redefine the scope boundary and thereby rewrite returns.
     let harness = harness();
 
     let (status, body) = call(
@@ -1604,7 +1604,7 @@ async fn an_agent_may_submit_but_may_not_administer() {
         post(
             "/v1/accounts",
             &harness.agent_token,
-            &json!({ "title": "Чужой счёт" }),
+            &json!({ "title": "Someone else's account" }),
         ),
     )
     .await;
@@ -1616,20 +1616,20 @@ async fn an_agent_may_submit_but_may_not_administer() {
         post(
             "/v1/contours",
             &harness.agent_token,
-            &json!({ "title": "Свой контур", "accounts": [harness.account.inner()] }),
+            &json!({ "title": "Own scope", "accounts": [harness.account.inner()] }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
-    // Но отправлять операции — может.
+    // But it can submit transactions.
     let (status, body) = call(
         &harness.router,
         post(
             "/v1/ingest/operations",
             &harness.agent_token,
             &json!({
-                "source_label": "агент",
+                "source_label": "agent",
                 "operations": [{
                     "account": harness.account.inner(),
                     "type": "deposit",
@@ -1648,15 +1648,15 @@ async fn an_agent_may_submit_but_may_not_administer() {
 
 #[tokio::test]
 async fn a_created_account_appears_in_the_list_and_a_readonly_token_can_read_it() {
-    // Счёт, который завели, обязан читаться обратно: пустой список
-    // выглядит как «счетов нет», а не как «список сломан».
+    // A newly created account must be retrievable: an empty list
+    // looks like «there are no accounts», not «the list is broken».
     let harness = harness();
     let (status, created) = call(
         &harness.router,
         post(
             "/v1/accounts",
             &harness.owner_token,
-            &json!({ "title": "Второй брокерский", "institution": "Банк" }),
+            &json!({ "title": "Second brokerage account", "institution": "Bank" }),
         ),
     )
     .await;
@@ -1670,22 +1670,25 @@ async fn a_created_account_appears_in_the_list_and_a_readonly_token_can_read_it(
     assert_eq!(status, StatusCode::OK);
     let titles: Vec<&str> = list
         .as_array()
-        .expect("список счетов")
+        .expect("account list")
         .iter()
-        .map(|account| account["title"].as_str().expect("название"))
+        .map(|account| account["title"].as_str().expect("title"))
         .collect();
     assert!(
-        titles.contains(&"Второй брокерский"),
-        "заведённый счёт обязан быть в списке: {titles:?}"
+        titles.contains(&"Second brokerage account"),
+        "the created account must be in the list: {titles:?}"
     );
-    assert!(titles.contains(&"Брокерский"), "и прежний тоже: {titles:?}");
+    assert!(
+        titles.contains(&"Brokerage"),
+        "and the existing one too: {titles:?}"
+    );
 }
 
 #[tokio::test]
 async fn each_verdict_names_the_row_it_belongs_to() {
-    // Вердикты приходят по строке на операцию, и агент чинит именно ту,
-    // которую ему назвали. Сбитая нумерация отправляет его править
-    // здоровую строку, а больную оставляет как есть.
+    // Verdicts arrive one row per transaction, and the agent fixes exactly the one
+    // it was told about. Incorrect numbering sends it to fix
+    // a valid row, while leaving the invalid one unchanged.
     let harness = harness();
     let (status, body) = call(
         &harness.router,
@@ -1693,7 +1696,7 @@ async fn each_verdict_names_the_row_it_belongs_to() {
             "/v1/ingest/operations",
             &harness.owner_token,
             &json!({
-                "source_label": "ручной ввод",
+                "source_label": "manual entry",
                 "operations": [
                     {
                         "account": harness.account.inner(),
@@ -1714,7 +1717,7 @@ async fn each_verdict_names_the_row_it_belongs_to() {
                     {
                         "account": harness.account.inner(),
                         "type": "deposit",
-                        "amount": "не число",
+                        "amount": "not a number",
                         "currency": "RUB",
                         "dates": { "cash_posted": "2025-01-03" },
                         "idempotency_key": "row-3",
@@ -1735,50 +1738,50 @@ async fn each_verdict_names_the_row_it_belongs_to() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let rows: Vec<u64> = body
         .as_array()
-        .expect("вердикты")
+        .expect("verdicts")
         .iter()
-        .map(|verdict| verdict["row"].as_u64().expect("номер строки"))
+        .map(|verdict| verdict["row"].as_u64().expect("row number"))
         .collect();
     assert_eq!(
         rows,
         vec![1, 2, 3, 4],
-        "нумерация начинается с единицы подряд"
+        "numbering starts at one and is consecutive"
     );
     assert_eq!(body[0]["verdict"], "provisional");
-    // Вторая строка отклонена приёмкой: величина разобралась, но
-    // отрицательной быть не может.
+    // The second row was rejected during validation: the value was parsed, but
+    // it cannot be negative.
     assert_eq!(body[1]["verdict"], "rejected");
-    // Третья — отклонена ещё на разборе тела запроса. Обе дороги к
-    // вердикту нумеруют строки, и обе обязаны нумеровать одинаково.
+    // The third was rejected while parsing the request body. Both routes to
+    // a verdict number the rows, and both must number them identically.
     assert_eq!(body[2]["verdict"], "rejected");
     assert_eq!(body[3]["verdict"], "provisional");
 }
 
 #[tokio::test]
 async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
-    // Справочник имён строится из счетов владельца. Пустой справочник
-    // отклонил бы весь документ по полю account, и «не завели счёт»
-    // стало бы неотличимо от «сломался справочник».
+    // The name lookup is built from the owner's accounts. An empty lookup
+    // would reject the entire document on the account field, and «no account was set up»
+    // would become indistinguishable from «the lookup failed».
     let harness = harness();
     let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
-        2025-01-01,deposit,Брокерский,,,,,1000.00,,,RUB,csv-1\n\
-        2025-01-02,deposit,Нет такого счёта,,,,,1000.00,,,RUB,csv-2\n\
-        2025-01-03,withdrawal,Брокерский,,,,,500.00,,,RUB,csv-3\n";
+        2025-01-01,deposit,Brokerage,,,,,1000.00,,,RUB,csv-1\n\
+        2025-01-02,deposit,No such account,,,,,1000.00,,,RUB,csv-2\n\
+        2025-01-03,withdrawal,Brokerage,,,,,500.00,,,RUB,csv-3\n";
     let request = Request::builder()
         .uri("/v1/ingest/csv")
         .method("POST")
         .header("Authorization", format!("Bearer {}", harness.owner_token))
         .header("Content-Type", "text/csv")
         .body(Body::from(document))
-        .expect("запрос");
+        .expect("request");
     let (status, body) = call(&harness.router, request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let verdicts = body.as_array().expect("вердикты");
+    let verdicts = body.as_array().expect("verdicts");
     assert_eq!(verdicts.len(), 3);
     let rows: Vec<u64> = verdicts
         .iter()
-        .map(|verdict| verdict["row"].as_u64().expect("номер строки"))
+        .map(|verdict| verdict["row"].as_u64().expect("row number"))
         .collect();
     assert_eq!(rows, vec![1, 2, 3]);
     assert_eq!(verdicts[0]["verdict"], "provisional");
@@ -1788,45 +1791,45 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
 }
 
 #[tokio::test]
-async fn неоднозначное_название_счёта_отвергается_при_разрешении_строки() {
+async fn ambiguous_account_name_is_rejected_when_resolving_row() {
     let (harness, path) = harness_on_disk();
     {
-        let store = SqliteStore::open(&path).expect("второе соединение");
+        let store = SqliteStore::open(&path).expect("second connection");
         store
             .upsert_account(&AccountRecord {
                 id: AccountId::new_random(),
                 owner: harness.owner,
-                title: "Брокерский".into(),
+                title: "Brokerage".into(),
                 institution: None,
             })
-            .expect("дубликат счёта");
+            .expect("duplicate account");
         store
             .upsert_account(&AccountRecord {
                 id: AccountId::new_random(),
                 owner: harness.owner,
-                title: "Однозначный".into(),
+                title: "Unambiguous".into(),
                 institution: None,
             })
-            .expect("однозначный счёт");
+            .expect("unambiguous account");
     }
 
     let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
-        2025-01-01,deposit,Брокерский,,,,,1000.00,,,RUB,duplicate\n\
-        2025-01-02,deposit,Однозначный,,,,,1000.00,,,RUB,unique\n";
+        2025-01-01,deposit,Brokerage,,,,,1000.00,,,RUB,duplicate\n\
+        2025-01-02,deposit,Unambiguous,,,,,1000.00,,,RUB,unique\n";
     let request = Request::builder()
         .uri("/v1/ingest/csv")
         .method("POST")
         .header("Authorization", format!("Bearer {}", harness.owner_token))
         .header("Content-Type", "text/csv")
         .body(Body::from(document))
-        .expect("запрос");
+        .expect("request");
     let (status, body) = call(&harness.router, request).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body[0]["verdict"], "rejected");
     assert_eq!(body[0]["field"], "account");
-    let actual = body[0]["actual"].as_str().expect("причина отказа");
-    assert_eq!(actual, "Брокерский: название счёта неоднозначно: 2 счёта");
+    let actual = body[0]["actual"].as_str().expect("reason for rejection");
+    assert_eq!(actual, "Brokerage: account name is ambiguous: 2 accounts");
     assert_eq!(body[1]["verdict"], "provisional");
 
     drop(harness);
@@ -1835,20 +1838,20 @@ async fn неоднозначное_название_счёта_отвергае
 
 #[tokio::test]
 async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
-    // Молчаливое умолчание «сегодня» вместо непонятой даты выдало бы
-    // отчёт не на ту дату — с виду нормальный, но про другой период.
+    // Silently defaulting to «today» instead of rejecting an unrecognised date would produce
+    // a report for the wrong date — apparently valid, but for a different period.
     let harness = harness();
     let (status, contour) = call(
         &harness.router,
         post(
             "/v1/contours",
             &harness.owner_token,
-            &json!({ "title": "Портфель", "accounts": [harness.account.inner()] }),
+            &json!({ "title": "Portfolio", "accounts": [harness.account.inner()] }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{contour}");
-    let contour_id = contour["contour"].as_str().expect("контур").to_owned();
+    let contour_id = contour["contour"].as_str().expect("contour").to_owned();
 
     let (status, _) = call(
         &harness.router,
@@ -1856,7 +1859,7 @@ async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
             "/v1/ingest/operations",
             &harness.owner_token,
             &json!({
-                "source_label": "ручной ввод",
+                "source_label": "manual entry",
                 "operations": [{
                     "account": harness.account.inner(),
                     "type": "deposit",
@@ -1874,7 +1877,7 @@ async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
     let (status, body) = call(
         &harness.router,
         get(
-            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=вчера"),
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=yesterday"),
             Some(&harness.owner_token),
         ),
     )
@@ -1882,8 +1885,8 @@ async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["field"], "as_of");
 
-    // Дата раньше операции: отчёт на неё обязан отличаться от отчёта
-    // на сегодня, иначе параметр ни на что не влияет.
+    // The date precedes the transaction: its report must differ from the report
+    // for today, otherwise the parameter has no effect.
     let (status, early) = call(
         &harness.router,
         get(
@@ -1904,32 +1907,32 @@ async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{today}");
-    assert_eq!(today["as_of"], "2026-01-01", "умолчание — дата часов");
+    assert_eq!(today["as_of"], "2026-01-01", "default — clock date");
     assert_ne!(
         early["contributed"], today["contributed"],
-        "отчёт до первой операции обязан отличаться от отчёта после неё"
+        "a report before the first transaction must differ from a report after it"
     );
 }
 
 #[tokio::test]
 async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_not() {
-    // Ключ снимка — контур, его версия и версия правила; даты в ключе
-    // нет. Снимок, построенный по срезу на прошлую дату, лёг бы под тем
-    // же ключом и молча подменил бы состояние следующему запросу.
-    // Проверяется прямым запросом к базе: снаружи подмена выглядит
-    // как обычный ответ, просто с неверными числами.
+    // The snapshot key comprises the contour, its version and the rule version; the date is
+    // absent. A snapshot built from a slice at a past date would be stored under the
+    // same key and silently substitute its state into the next request.
+    // This is checked with a direct database query: from the outside, the substitution looks
+    // like an ordinary response, just with incorrect figures.
     let (harness, path) = harness_on_disk();
     let (status, contour) = call(
         &harness.router,
         post(
             "/v1/contours",
             &harness.owner_token,
-            &json!({ "title": "Портфель", "accounts": [harness.account.inner()] }),
+            &json!({ "title": "Portfolio", "accounts": [harness.account.inner()] }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{contour}");
-    let contour_id = contour["contour"].as_str().expect("контур").to_owned();
+    let contour_id = contour["contour"].as_str().expect("contour").to_owned();
 
     let (status, _) = call(
         &harness.router,
@@ -1937,7 +1940,7 @@ async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_
             "/v1/ingest/operations",
             &harness.owner_token,
             &json!({
-                "source_label": "ручной ввод",
+                "source_label": "manual entry",
                 "operations": [{
                     "account": harness.account.inner(),
                     "type": "deposit",
@@ -1953,21 +1956,21 @@ async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_
     assert_eq!(status, StatusCode::OK);
 
     let snapshots = |path: &std::path::Path| -> u32 {
-        let probe = SqliteStore::open(path).expect("второе соединение");
+        let probe = SqliteStore::open(path).expect("second connection");
         probe
             .connection()
             .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
-            .expect("счёт снимков")
+            .expect("snapshot count")
     };
     let usages = |path: &std::path::Path| -> u32 {
-        let probe = SqliteStore::open(path).expect("второе соединение");
+        let probe = SqliteStore::open(path).expect("second connection");
         probe
             .connection()
             .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
-            .expect("счёт обращений")
+            .expect("request count")
     };
 
-    // Отчёт на прошлую дату снимка не оставляет.
+    // A report for a past date does not save a snapshot.
     let (status, _) = call(
         &harness.router,
         get(
@@ -1980,11 +1983,11 @@ async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_
     assert_eq!(
         snapshots(&path),
         0,
-        "снимок по срезу на прошлую дату сохраняться не должен"
+        "an as-of snapshot for a past date must not be saved"
     );
 
-    // Отчёт на сегодня — оставляет, и он читается обратно: повторный
-    // запрос обязан дать те же числа.
+    // A report for today does save a snapshot, and it can be read back: a repeated
+    // request must return the same figures.
     let (status, first) = call(
         &harness.router,
         get(
@@ -1994,7 +1997,7 @@ async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(snapshots(&path), 1, "отчёт на сегодня оставляет снимок");
+    assert_eq!(snapshots(&path), 1, "a report for today saves a snapshot");
 
     let (status, second) = call(
         &harness.router,
@@ -2007,14 +2010,18 @@ async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         first, second,
-        "отчёт, посчитанный со снимка, обязан совпасть с посчитанным без него"
+        "a report calculated from a snapshot must match one calculated without it"
     );
-    assert_eq!(snapshots(&path), 1, "снимок заменяется, а не задваивается");
+    assert_eq!(
+        snapshots(&path),
+        1,
+        "the snapshot is replaced, not duplicated"
+    );
 
-    // Каждое обращение с токеном попадает в журнал (§14).
+    // Every request made with a token is recorded in the access log (§14).
     assert!(
         usages(&path) >= 4,
-        "журнал обращений пуст: попытки с токеном обязаны быть видны"
+        "the access log is empty: attempts made with a token must be visible"
     );
 
     drop(harness);
@@ -2023,27 +2030,27 @@ async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_
 
 #[tokio::test]
 async fn an_event_added_behind_the_snapshot_boundary_forces_a_recompute_not_a_failure() {
-    // Снимок — кэш, и его непригодность не является ошибкой работы.
-    // Событие, пришедшее задним числом до границы снимка, меняет
-    // отпечаток свёрнутого префикса: ядро отказывается продвигать
-    // снимок, а оболочка обязана пересчитать журнал целиком и всё
-    // равно ответить — причём ответить с учётом нового события.
+    // A snapshot is a cache, and an unusable one is not an operational error.
+    // A backdated event before the snapshot boundary changes
+    // the fingerprint of the folded prefix: the core refuses to advance
+    // the snapshot, while the wrapper must recalculate the entire log and still
+    // return a response — one that accounts for the new event.
     let harness = harness();
     let (status, contour) = call(
         &harness.router,
         post(
             "/v1/contours",
             &harness.owner_token,
-            &json!({ "title": "Портфель", "accounts": [harness.account.inner()] }),
+            &json!({ "title": "Portfolio", "accounts": [harness.account.inner()] }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{contour}");
-    let contour_id = contour["contour"].as_str().expect("контур").to_owned();
+    let contour_id = contour["contour"].as_str().expect("contour").to_owned();
 
     let deposit = |key: &str, day: &str, amount: &str| {
         json!({
-            "source_label": "ручной ввод",
+            "source_label": "manual entry",
             "operations": [{
                 "account": harness.account.inner(),
                 "type": "deposit",
@@ -2066,7 +2073,7 @@ async fn an_event_added_behind_the_snapshot_boundary_forces_a_recompute_not_a_fa
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Первый отчёт на сегодня оставляет снимок.
+    // The first report for today saves a snapshot.
     let (status, before) = call(
         &harness.router,
         get(
@@ -2078,7 +2085,7 @@ async fn an_event_added_behind_the_snapshot_boundary_forces_a_recompute_not_a_fa
     assert_eq!(status, StatusCode::OK, "{before}");
     assert_eq!(before["contributed"]["value"], "1000.00");
 
-    // Событие задним числом — раньше уже свёрнутого.
+    // A backdated event — before the data already folded.
     let (status, _) = call(
         &harness.router,
         post(
@@ -2101,20 +2108,20 @@ async fn an_event_added_behind_the_snapshot_boundary_forces_a_recompute_not_a_fa
     assert_eq!(
         status,
         StatusCode::OK,
-        "непригодный снимок — повод пересчитать, а не отказать: {after}"
+        "an unusable snapshot calls for recalculation, not failure: {after}"
     );
     assert_eq!(
         after["contributed"]["value"], "1500.00",
-        "событие задним числом обязано войти в расчёт"
+        "the backdated event must be included in the calculation"
     );
     assert_eq!(
         after["history_starts"], "2025-01-01",
-        "и сдвинуть начало истории"
+        "and shift the start of the history"
     );
 }
 
-/// Токен брокера, который тесты отдают серверу. Значение подобрано
-/// так, чтобы его подстрока не встречалась в ответе случайно.
+/// The broker token that the tests pass to the server. The value was chosen
+/// so that a substring of it does not occur in the response by chance.
 const BROKER_TOKEN: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
 
 fn add_broker_access_body() -> Value {
@@ -2123,9 +2130,9 @@ fn add_broker_access_body() -> Value {
 
 #[tokio::test]
 async fn a_provisioned_broker_access_never_echoes_the_token_back() {
-    // Токен, вернувшийся в ответе, попадёт в лог клиента, в историю
-    // отладочного запроса и в снимок экрана. То, чего сервер не отдал,
-    // туда попасть не может (§14).
+    // A token returned in the response will end up in the client's log, in the history
+    // of the debugging request, and in a screenshot. What the server has not returned
+    // cannot end up there (§14).
     let harness = harness();
 
     let (status, body) = call(
@@ -2142,20 +2149,20 @@ async fn a_provisioned_broker_access_never_echoes_the_token_back() {
     assert_eq!(body["broker"], "tinkoff");
     assert!(
         !body.to_string().contains(BROKER_TOKEN),
-        "токен не возвращается наружу ни одним полем: {body}"
+        "the token is not exposed through any field: {body}"
     );
     assert!(
         body["revoked_at"].is_null(),
-        "заведённый доступ действует: {body}"
+        "the created access works: {body}"
     );
 }
 
 #[tokio::test]
 async fn the_scope_of_a_broker_access_is_read_only_whatever_the_client_sends() {
-    // Область прав задаёт система, а не клиент: торговые права
-    // не запрашиваются ни при каких условиях (§14). Присланное клиентом
-    // поле игнорируется молча — принять его означало бы завести доступ,
-    // которым можно торговать.
+    // The permission scope is set by the system, not the client: trading permissions
+    // are never requested under any circumstances (§14). A field supplied by the client
+    // is silently ignored — accepting it would mean creating access
+    // that can trade.
     let harness = harness();
 
     let (status, body) = call(
@@ -2176,15 +2183,15 @@ async fn the_scope_of_a_broker_access_is_read_only_whatever_the_client_sends() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(
         body["scope"], "read_only",
-        "область прав задаёт система, а не клиент: {body}"
+        "the permission scope is set by the system, not the client: {body}"
     );
 }
 
 #[tokio::test]
 async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() {
-    // Отзыв — это не удаление: запись остаётся историей, но перестаёт
-    // быть действующей. Пропавшая из списка запись отвечала бы «доступа
-    // не было», а не «доступ отозван тогда-то».
+    // Revocation is not deletion: the record remains in the history, but ceases to
+    // be active. A record missing from the list would mean «there was no
+    // access», not «access was revoked at such-and-such time».
     let harness = harness();
 
     let (status, created) = call(
@@ -2197,7 +2204,7 @@ async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() 
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let id = created["id"].as_str().expect("идентификатор").to_owned();
+    let id = created["id"].as_str().expect("identifier").to_owned();
 
     let (status, list) = call(
         &harness.router,
@@ -2205,10 +2212,10 @@ async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{list}");
-    let listed = find_access(&list, &id).expect("заведённый доступ обязан быть в списке");
+    let listed = find_access(&list, &id).expect("the created access must be in the list");
     assert!(
         listed["revoked_at"].is_null(),
-        "только что заведённый доступ действует: {listed}"
+        "the newly created access is active: {listed}"
     );
 
     let (status, body) = call(
@@ -2224,18 +2231,18 @@ async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{list}");
-    let listed = find_access(&list, &id).expect("отозванный доступ остаётся историей");
+    let listed = find_access(&list, &id).expect("the revoked access remains in the history");
     assert!(
         !listed["revoked_at"].is_null(),
-        "отозванный доступ перестаёт быть действующим: {listed}"
+        "the revoked access is no longer active: {listed}"
     );
 }
 
 #[tokio::test]
 async fn both_environments_of_one_broker_are_provisioned_side_by_side() {
-    // Токены у сред разные: боевой песочница не принимает, песочный
-    // не принимает бой. Значит оба доступа обязаны уживаться, иначе
-    // живая проверка и боевой канал исключают друг друга.
+    // The environments use different tokens: the sandbox does not accept the production one, and
+    // production does not accept the sandbox one. Therefore both accesses must coexist, otherwise
+    // live validation and the production channel would be mutually exclusive.
     let harness = harness();
 
     let (status, sandbox) = call(
@@ -2255,7 +2262,7 @@ async fn both_environments_of_one_broker_are_provisioned_side_by_side() {
         post(
             "/v1/broker-access",
             &harness.owner_token,
-            &json!({ "broker": "tinkoff", "environment": "prod", "token": "t.другой-токен-боевой" }),
+            &json!({ "broker": "tinkoff", "environment": "prod", "token": "t.another-production-token" }),
         ),
     )
     .await;
@@ -2271,7 +2278,7 @@ async fn both_environments_of_one_broker_are_provisioned_side_by_side() {
     assert_eq!(status, StatusCode::OK, "{list}");
     let environments: Vec<&str> = list
         .as_array()
-        .expect("список доступов")
+        .expect("access list")
         .iter()
         .filter_map(|access| access["environment"].as_str())
         .collect();
@@ -2281,10 +2288,10 @@ async fn both_environments_of_one_broker_are_provisioned_side_by_side() {
 
 #[tokio::test]
 async fn a_second_access_in_the_same_environment_is_refused_understandably() {
-    // Два действующих доступа в одной среде означают, что неизвестно,
-    // каким из них система ходит. Отказ обязан называть причину:
-    // «внутренняя ошибка» отправила бы владельца искать поломку
-    // там, где её нет, — на самом деле нужно сначала отозвать старый.
+    // Two active access credentials in the same environment mean it is unclear,
+    // which one the system uses. The rejection must state the reason:
+    // ‘internal error’ would send the owner looking for a fault
+    // where there is none — in fact, the old credential must be revoked first.
     let harness = harness();
 
     let (status, first) = call(
@@ -2313,9 +2320,9 @@ async fn a_second_access_in_the_same_environment_is_refused_understandably() {
 
 #[tokio::test]
 async fn an_access_without_a_named_environment_is_refused() {
-    // Умолчание здесь означало бы песочный токен, молча записанный
-    // боевым: шлюз ответит отказом на первом же обращении, а по тексту
-    // отказа о среде не догадаться — проверено на живом шлюзе.
+    // A default here would mean silently recording a sandbox token
+    // as production: the gateway would reject the very first request, and the
+    // rejection text would not reveal the environment — verified against the live gateway.
     let harness = harness();
 
     let (status, body) = call(
@@ -2331,7 +2338,7 @@ async fn an_access_without_a_named_environment_is_refused() {
     assert_eq!(
         status,
         StatusCode::UNPROCESSABLE_ENTITY,
-        "среда без умолчания: {body}"
+        "environment must not default: {body}"
     );
 }
 
@@ -2344,7 +2351,7 @@ async fn an_unknown_environment_is_refused() {
         post(
             "/v1/broker-access",
             &harness.owner_token,
-            &json!({ "broker": "tinkoff", "environment": "стенд", "token": BROKER_TOKEN }),
+            &json!({ "broker": "tinkoff", "environment": "staging", "token": BROKER_TOKEN }),
         ),
     )
     .await;
@@ -2354,8 +2361,8 @@ async fn an_unknown_environment_is_refused() {
 
 #[tokio::test]
 async fn a_read_only_token_may_not_touch_broker_access_at_all() {
-    // Заведение чужого токена, чтение списка и отзыв — управление
-    // доступом, а не чтение портфеля. Токен чтения не управляет ничем.
+    // Creating someone else's token, reading the list, and revoking it are access
+    // management, not portfolio reading. A read token manages nothing.
     let harness = harness();
 
     let (status, body) = call(
@@ -2388,7 +2395,7 @@ async fn a_read_only_token_may_not_touch_broker_access_at_all() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
-/// Запись списка по идентификатору.
+/// List entry by identifier.
 fn find_access(list: &Value, id: &str) -> Option<Value> {
     list.as_array()?
         .iter()
@@ -2396,53 +2403,53 @@ fn find_access(list: &Value, id: &str) -> Option<Value> {
         .cloned()
 }
 
-// --- Присвоение экземпляра и управление токенами (§14) ---
+// --- Instance claiming and token management (§14) ---
 
 #[tokio::test]
 async fn the_printed_code_claims_the_instance_and_the_token_it_gives_works() {
-    // Присвоение — не регистрация: код печатается один раз при старте,
-    // и прочитать его может только тот, кто запустил программу. Доступ
-    // к консоли и есть доказательство права на экземпляр.
+    // Claiming is not registration: the code is printed once at startup,
+    // and only the person who started the program can read it. Access
+    // to the console itself proves the right to the instance.
     let (router, code) = unclaimed_harness().await;
 
     let (status, body) = call(
         &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "ноутбук" })),
+        post_public("/v1/claim", &json!({ "code": code, "label": "laptop" })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(body["label"], "ноутбук");
+    assert_eq!(body["label"], "laptop");
     assert_eq!(body["scope"], "owner");
-    let token = body["token"].as_str().expect("токен владельца").to_owned();
-    assert!(!token.is_empty(), "присвоение обязано выдать токен: {body}");
+    let token = body["token"].as_str().expect("owner token").to_owned();
+    assert!(!token.is_empty(), "claiming must issue a token: {body}");
 
-    // Выданный токен — настоящий: им проходит защищённый запрос.
+    // The issued token is genuine: a protected request succeeds with it.
     let (status, accounts) = call(&router, get("/v1/accounts", Some(&token))).await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "токен присвоения обязан пускать: {accounts}"
+        "claim token must grant access: {accounts}"
     );
 }
 
 #[tokio::test]
 async fn the_same_claim_code_never_works_twice() {
-    // Код одноразовый, и это свойство самого кода: он стирается из
-    // памяти в момент использования. Второй обмен — это либо повтор
-    // запроса, либо чужая рука; различить их нечем, и оба получают
-    // тот же отказ, что и неверный код.
+    // The code is single-use, and this is a property of the code itself: it is erased from
+    // memory when used. A second exchange is either a repeated
+    // request or someone else acting; they cannot be distinguished, and both receive
+    // the same rejection as an invalid code.
     let (router, code) = unclaimed_harness().await;
 
     let (status, body) = call(
         &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "ноутбук" })),
+        post_public("/v1/claim", &json!({ "code": code, "label": "laptop" })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
     let (status, body) = call(
         &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "ещё раз" })),
+        post_public("/v1/claim", &json!({ "code": code, "label": "again" })),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -2451,15 +2458,15 @@ async fn the_same_claim_code_never_works_twice() {
 
 #[tokio::test]
 async fn a_wrong_claim_code_is_refused_and_does_not_burn_the_right_one() {
-    // Неверный код не стирает верный: иначе любой посторонний одним
-    // запросом с мусором закрывал бы присвоение навсегда.
+    // An invalid code does not erase the valid one: otherwise any outsider could
+    // permanently disable claiming with a single garbage request.
     let (router, code) = unclaimed_harness().await;
 
     let (status, body) = call(
         &router,
         post_public(
             "/v1/claim",
-            &json!({ "code": "не тот код", "label": "чужой" }),
+            &json!({ "code": "wrong code", "label": "outsider" }),
         ),
     )
     .await;
@@ -2468,43 +2475,43 @@ async fn a_wrong_claim_code_is_refused_and_does_not_burn_the_right_one() {
 
     let (status, body) = call(
         &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "ноутбук" })),
+        post_public("/v1/claim", &json!({ "code": code, "label": "laptop" })),
     )
     .await;
     assert_eq!(
         status,
         StatusCode::CREATED,
-        "верный код обязан пережить чужую попытку: {body}"
+        "the valid code must survive someone else's attempt: {body}"
     );
 }
 
 #[tokio::test]
 async fn claiming_is_closed_once_an_owner_exists_even_with_a_valid_code() {
-    // Владелец мог завестись помимо присвоения — командой консоли уже
-    // после старта, — и напечатанный тогда код устарел. Принять его
-    // значило бы завести второго владельца: пустой портфель в чужой
-    // базе, а у первого пропавшие деньги.
+    // The owner may have been created without claiming — via a console command
+    // after startup — making the code printed earlier stale. Accepting it
+    // would create a second owner: an empty portfolio in someone else's
+    // database, while the first owner's money appears to be gone.
     let (router, code, path) = unclaimed_harness_on_disk().await;
 
     {
-        let store = SqliteStore::open(&path).expect("второе соединение");
+        let store = SqliteStore::open(&path).expect("second connection");
         store
             .insert_token(
                 &TokenRecord {
                     id: Uuid::new_v4(),
                     owner: OwnerId::new_random(),
-                    label: "заведён с консоли".into(),
+                    label: "created from the console".into(),
                     scope: TokenScope::Owner,
                     revoked: false,
                 },
                 &hash_token("issued-from-the-console"),
             )
-            .expect("токен владельца");
+            .expect("owner token");
     }
 
     let (status, body) = call(
         &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "опоздавший" })),
+        post_public("/v1/claim", &json!({ "code": code, "label": "latecomer" })),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -2513,39 +2520,36 @@ async fn claiming_is_closed_once_an_owner_exists_even_with_a_valid_code() {
 
 #[tokio::test]
 async fn an_instance_with_an_owner_generates_no_claim_code_at_all() {
-    // Секрет, который никому не нужен, всё равно остаётся секретом,
-    // лежащим в памяти. Владелец есть — код не порождается вовсе,
-    // и присвоение отвечает отказом на любой предъявленный код.
-    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    // A secret that nobody needs still remains a secret,
+    // held in memory. An owner exists — so no code is generated at all,
+    // and claiming rejects every code presented.
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
     store
         .insert_token(
             &TokenRecord {
                 id: Uuid::new_v4(),
                 owner: OwnerId::new_random(),
-                label: "владелец".into(),
+                label: "owner".into(),
                 scope: TokenScope::Owner,
                 revoked: false,
             },
             &hash_token("owner-secret-token"),
         )
-        .expect("токен владельца");
+        .expect("owner token");
     let state = claim_state(store);
 
     assert!(
         iaam_server::claim::arm(&state)
             .await
-            .expect("состояние базы прочитано")
+            .expect("database state read")
             .is_none(),
-        "владелец есть — код присвоения порождаться не должен"
+        "there is an owner — no claim code should be generated"
     );
 
     let (router, _) = build(state);
     let (status, body) = call(
         &router,
-        post_public(
-            "/v1/claim",
-            &json!({ "code": "любой", "label": "посторонний" }),
-        ),
+        post_public("/v1/claim", &json!({ "code": "any", "label": "outsider" })),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -2554,9 +2558,9 @@ async fn an_instance_with_an_owner_generates_no_claim_code_at_all() {
 
 #[tokio::test]
 async fn an_owner_token_is_never_issued_through_the_api() {
-    // Владелец заводится присвоением экземпляра или консолью. Маршрут,
-    // выпускающий полный доступ, превращал бы один украденный токен
-    // в неотличимые копии, и отзыв исходного ничего бы не менял.
+    // An owner is created by claiming the instance or via the console. A route,
+    // issuing full access, would turn one stolen token
+    // into indistinguishable copies, and revoking the original would change nothing.
     let harness = harness();
 
     let (status, body) = call(
@@ -2564,7 +2568,7 @@ async fn an_owner_token_is_never_issued_through_the_api() {
         post(
             "/v1/tokens",
             &harness.owner_token,
-            &json!({ "label": "второй владелец", "scope": "owner" }),
+            &json!({ "label": "second owner", "scope": "owner" }),
         ),
     )
     .await;
@@ -2576,9 +2580,9 @@ async fn an_owner_token_is_never_issued_through_the_api() {
 
 #[tokio::test]
 async fn an_agent_token_may_not_manage_tokens_at_all() {
-    // Агент отправляет операции, но не раздаёт права на портфель:
-    // иначе украденный агентский токен выписывал бы себе замену
-    // быстрее, чем владелец успевал бы его отозвать.
+    // An agent submits operations, but does not grant access to the portfolio:
+    // otherwise a stolen agent token could issue itself a replacement
+    // faster than the owner could revoke it.
     let harness = harness();
 
     let (status, body) = call(
@@ -2586,7 +2590,7 @@ async fn an_agent_token_may_not_manage_tokens_at_all() {
         post(
             "/v1/tokens",
             &harness.agent_token,
-            &json!({ "label": "ещё агент", "scope": "agent" }),
+            &json!({ "label": "another agent", "scope": "agent" }),
         ),
     )
     .await;
@@ -2613,11 +2617,11 @@ async fn an_agent_token_may_not_manage_tokens_at_all() {
 
 #[tokio::test]
 async fn the_token_list_carries_neither_tokens_nor_their_hashes() {
-    // Хеш — это то, что достаточно подставить в запрос поиска, чтобы
-    // система признала предъявителя своим. Список выданных токенов,
-    // показывающий хеши, был бы списком отмычек. Проверка подстрокой
-    // по всему телу, а не по полям: поле, добавленное завтра, глазами
-    // не проверяется.
+    // The hash is all that needs to be supplied in a lookup request for
+    // the system to recognise the bearer as authorised. A list of issued tokens
+    // exposing hashes would be a list of skeleton keys. Check for the substring
+    // throughout the entire body, not by field: a field added tomorrow will not
+    // be checked by eye.
     let harness = harness();
 
     let (status, created) = call(
@@ -2625,12 +2629,12 @@ async fn the_token_list_carries_neither_tokens_nor_their_hashes() {
         post(
             "/v1/tokens",
             &harness.owner_token,
-            &json!({ "label": "домашний агент", "scope": "agent" }),
+            &json!({ "label": "home agent", "scope": "agent" }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let issued = created["token"].as_str().expect("токен").to_owned();
+    let issued = created["token"].as_str().expect("token").to_owned();
 
     let (status, list) = call(
         &harness.router,
@@ -2641,26 +2645,26 @@ async fn the_token_list_carries_neither_tokens_nor_their_hashes() {
     let body = list.to_string();
 
     assert!(
-        body.contains("домашний агент"),
-        "выданный токен обязан быть в списке: {body}"
+        body.contains("home agent"),
+        "the issued token must be listed: {body}"
     );
     for secret in [&issued, &harness.owner_token, &harness.agent_token] {
         assert!(
             !body.contains(secret.as_str()),
-            "токен утёк в список выданных токенов: {body}"
+            "token leaked into the list of issued tokens: {body}"
         );
         assert!(
             !body.contains(&hash_token(secret)),
-            "хеш токена утёк в список выданных токенов: {body}"
+            "token hash leaked into the list of issued tokens: {body}"
         );
     }
 }
 
 #[tokio::test]
 async fn a_revoked_token_stops_being_accepted_and_stays_in_the_history() {
-    // Отзыв — это не удаление: запись остаётся историей, но перестаёт
-    // пускать. Пропавшая из списка запись отвечала бы «токена не было»,
-    // а не «токен отозван тогда-то».
+    // Revocation is not deletion: the record remains as history, but no longer
+    // grants access. A record missing from the list would answer «no such token»,
+    // rather than «the token was revoked at such-and-such time».
     let harness = harness();
 
     let (status, created) = call(
@@ -2668,19 +2672,19 @@ async fn a_revoked_token_stops_being_accepted_and_stays_in_the_history() {
         post(
             "/v1/tokens",
             &harness.owner_token,
-            &json!({ "label": "телефон", "scope": "read_only" }),
+            &json!({ "label": "phone", "scope": "read_only" }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let id = created["id"].as_str().expect("идентификатор").to_owned();
-    let token = created["token"].as_str().expect("токен").to_owned();
+    let id = created["id"].as_str().expect("identifier").to_owned();
+    let token = created["token"].as_str().expect("token").to_owned();
 
     let (status, accounts) = call(&harness.router, get("/v1/accounts", Some(&token))).await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "выпущенный токен пускает: {accounts}"
+        "the issued token grants access: {accounts}"
     );
 
     let (status, body) = call(
@@ -2694,7 +2698,7 @@ async fn a_revoked_token_stops_being_accepted_and_stays_in_the_history() {
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "отозванный токен не пускает: {body}"
+        "the revoked token does not grant access: {body}"
     );
 
     let (status, list) = call(
@@ -2703,37 +2707,37 @@ async fn a_revoked_token_stops_being_accepted_and_stays_in_the_history() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{list}");
-    let listed = find_access(&list, &id).expect("отозванный токен остаётся историей");
+    let listed = find_access(&list, &id).expect("the revoked token remains in the history");
     assert!(
         !listed["revoked_at"].is_null(),
-        "отозванный токен перестаёт быть действующим: {listed}"
+        "the revoked token ceases to be active: {listed}"
     );
 }
 
 #[tokio::test]
 async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
-    // Идентификатор токена не является правом на него: без владельца
-    // в запросе отзыва любой знающий чужой идентификатор отзывал бы
-    // чужой токен. Ответ одинаков с «нет такого» намеренно — разные
-    // сообщили бы постороннему, что запись существует (§14).
+    // A token identifier does not confer authority over it: without owner authentication
+    // on the revocation request, anyone knowing someone else's identifier could revoke
+    // their token. The response deliberately matches «not found» — different responses
+    // would tell an outsider that the record exists (§14).
     let (harness, path) = harness_on_disk();
 
-    // Токен второго владельца заводится вторым соединением к той же
-    // базе: через API его не завести — владелец в системе один, и это
-    // ровно то состояние, в котором чужой токен вообще может появиться.
+    // The second owner's token is created through a second connection to the same
+    // database: it cannot be created via the API — the system has only one owner, and this is
+    // exactly the state in which another owner's token can appear at all.
     let stranger_token = "stranger-secret-token";
     let stranger = TokenRecord {
         id: Uuid::new_v4(),
         owner: OwnerId::new_random(),
-        label: "чужой".into(),
+        label: "someone else's".into(),
         scope: TokenScope::Agent,
         revoked: false,
     };
     {
-        let store = SqliteStore::open(&path).expect("второе соединение");
+        let store = SqliteStore::open(&path).expect("second connection");
         store
             .insert_token(&stranger, &hash_token(stranger_token))
-            .expect("чужой токен");
+            .expect("another user's token");
     }
 
     let (status, body) = call(
@@ -2744,8 +2748,8 @@ async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["code"], "not_found");
 
-    // Отсутствующий токен отвечает ровно тем же: отличить одно
-    // от другого по ответу нельзя.
+    // A non-existent token returns exactly the same response: one cannot
+    // be distinguished from the other by the response.
     let (missing, body) = call(
         &harness.router,
         delete(
@@ -2756,13 +2760,13 @@ async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
     .await;
     assert_eq!(missing, status, "{body}");
 
-    // И чужой токен остался действующим: отказ обязан быть отказом,
-    // а не «не сказали, но сделали».
+    // And the other user's token remained valid: a refusal must be a refusal,
+    // not ‘we did not say so, but did it anyway’.
     let (status, accounts) = call(&harness.router, get("/v1/accounts", Some(stranger_token))).await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "чужой токен не отозван чужими руками: {accounts}"
+        "another user's token was not revoked by an unauthorised user: {accounts}"
     );
 }
 
@@ -2781,7 +2785,7 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["version"], 1);
     assert!(!created.to_string().contains(BROKER_TOKEN), "{created}");
-    let id = created["id"].as_str().expect("идентификатор").to_owned();
+    let id = created["id"].as_str().expect("identifier").to_owned();
 
     let (status, history) = call(
         &harness.router,
@@ -2789,7 +2793,7 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{history}");
-    assert_eq!(history.as_array().expect("история").len(), 1);
+    assert_eq!(history.as_array().expect("history").len(), 1);
     assert_eq!(history[0]["matcher"], r#"{"kind":"income"}"#);
     assert!(!history.to_string().contains(BROKER_TOKEN), "{history}");
 
@@ -2859,7 +2863,7 @@ async fn reconciliation_returns_nonempty_status_content() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    let statuses = response.as_array().expect("статусы сверки");
+    let statuses = response.as_array().expect("reconciliation statuses");
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
     assert_eq!(statuses[0]["from"], "2025-01-01");
@@ -2889,7 +2893,7 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    let statuses = response.as_array().expect("статусы сверки");
+    let statuses = response.as_array().expect("reconciliation statuses");
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
     assert_eq!(statuses[0]["dimensions"][0]["dimension"], "cash");
@@ -2911,7 +2915,7 @@ async fn broker_sync_numbers_recorded_verdicts_from_one() {
     });
     let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory { channel });
     let harness = harness_with_factory(
-        SqliteStore::open_in_memory().expect("база в памяти"),
+        SqliteStore::open_in_memory().expect("in-memory database"),
         Some(factory),
     );
     let body = json!({
@@ -2925,7 +2929,7 @@ async fn broker_sync_numbers_recorded_verdicts_from_one() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    assert_eq!(response["recorded"].as_array().expect("вердикты").len(), 1);
+    assert_eq!(response["recorded"].as_array().expect("verdicts").len(), 1);
     assert_eq!(response["recorded"][0]["verdict"], "provisional");
     assert_eq!(response["recorded"][0]["row"], 1);
 }
@@ -2941,7 +2945,7 @@ async fn broker_sync_returns_the_scenario_outcome() {
     });
     let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory { channel });
     let harness = harness_with_factory(
-        SqliteStore::open_in_memory().expect("база в памяти"),
+        SqliteStore::open_in_memory().expect("in-memory database"),
         Some(factory),
     );
     let body = json!({
@@ -2991,7 +2995,7 @@ async fn broker_sync_reports_unconfigured_access_as_503_and_rejects_read_only() 
 async fn ingest_verdicts_return_their_populated_fields() {
     let harness = harness();
     let body = json!({
-        "source_label": "контракт",
+        "source_label": "contract",
         "operations": [{
             "account": harness.account.inner(),
             "type": "deposit",
@@ -3011,7 +3015,7 @@ async fn ingest_verdicts_return_their_populated_fields() {
     let provisional_event = first[0]["event_id"].as_str().expect("provisional event_id");
     assert!(
         Uuid::parse_str(provisional_event).is_ok(),
-        "event_id обязан быть UUID: {provisional_event}"
+        "event_id must be a UUID: {provisional_event}"
     );
 
     let (status, second) = call(
@@ -3024,11 +3028,11 @@ async fn ingest_verdicts_return_their_populated_fields() {
     assert_eq!(second[0]["event_id"], provisional_event);
     assert!(
         second[0]["event_id"].as_str().is_some(),
-        "duplicate обязан назвать существующее событие"
+        "duplicate must identify the existing event"
     );
 
     let rejected_body = json!({
-        "source_label": "контракт",
+        "source_label": "contract",
         "operations": [{
             "account": harness.account.inner(),
             "type": "deposit",
@@ -3049,7 +3053,7 @@ async fn ingest_verdicts_return_their_populated_fields() {
     assert_eq!(status, StatusCode::OK, "{rejected}");
     assert_eq!(rejected[0]["verdict"], "rejected");
     assert_eq!(rejected[0]["field"], "amount");
-    assert_eq!(rejected[0]["expected"], "положительная величина");
+    assert_eq!(rejected[0]["expected"], "positive value");
     assert_eq!(rejected[0]["actual"], "-5.00");
 }
 
@@ -3067,15 +3071,15 @@ async fn a_document_verdict_return_contains_its_detail() {
         .body(Body::from(
             include_bytes!("../../../tests/fixtures/reports/tinkoff-synthetic.xlsx").as_slice(),
         ))
-        .expect("запрос");
+        .expect("request");
     let (status, response) = call(&harness.router, request).await;
     assert_eq!(status, StatusCode::OK, "{response}");
 
-    let rows = response["rows"].as_array().expect("строки документа");
+    let rows = response["rows"].as_array().expect("document rows");
     let unsupported = rows
         .iter()
         .find(|row| row["verdict"] == "unsupported")
-        .expect("отчёт обязан вернуть строку вне периметра");
+        .expect("the report must return a row outside the scope");
     assert_eq!(unsupported["detail"], "repo");
 }
 
@@ -3105,7 +3109,7 @@ fn verdict_dto_json_contains_every_variant_field() {
                 event,
                 account,
                 dimension: Dimension::Cash,
-                detail: "остаток не сошёлся".into(),
+                detail: "balance did not reconcile".into(),
             },
             json!({
                 "row": 7,
@@ -3113,7 +3117,7 @@ fn verdict_dto_json_contains_every_variant_field() {
                 "event_id": event.inner(),
                 "account_id": account.inner(),
                 "dimension": "cash",
-                "detail": "остаток не сошёлся",
+                "detail": "balance did not reconcile",
             }),
         ),
         (
@@ -3138,12 +3142,12 @@ fn verdict_dto_json_contains_every_variant_field() {
         ),
         (
             Verdict::NeedsClassification {
-                question: "перевод внутренний?".into(),
+                question: "internal transfer?".into(),
             },
             json!({
                 "row": 7,
                 "verdict": "needs_classification",
-                "detail": "перевод внутренний?",
+                "detail": "internal transfer?",
             }),
         ),
         (
@@ -3160,7 +3164,7 @@ fn verdict_dto_json_contains_every_variant_field() {
             Verdict::Rejected {
                 rejection: Rejection {
                     field: "amount".into(),
-                    expected: "положительная величина".into(),
+                    expected: "a positive value".into(),
                     actual: "-5.00".into(),
                 },
             },
@@ -3168,16 +3172,16 @@ fn verdict_dto_json_contains_every_variant_field() {
                 "row": 7,
                 "verdict": "rejected",
                 "field": "amount",
-                "expected": "положительная величина",
+                "expected": "a positive value",
                 "actual": "-5.00",
             }),
         ),
     ];
 
     for (domain, expected) in cases {
-        let actual = serde_json::to_value(VerdictDto::from_domain(7, &domain))
-            .expect("вердикт сериализуется");
-        assert_eq!(actual, expected, "содержимое вердикта {domain:?}");
+        let actual =
+            serde_json::to_value(VerdictDto::from_domain(7, &domain)).expect("verdict serialises");
+        assert_eq!(actual, expected, "verdict content for {domain:?}");
     }
 }
 
@@ -3188,11 +3192,11 @@ fn seed_directory(store: &SqliteStore) -> InstrumentId {
             id: instrument,
             kind: Some(InstrumentKind::Share),
             symbol: "SBER".into(),
-            title: "Сбербанк".into(),
+            title: "Sberbank".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент");
+        .expect("instrument");
     store
         .record_alias(&AliasRecord {
             namespace: AliasNamespace::Isin,
@@ -3204,12 +3208,12 @@ fn seed_directory(store: &SqliteStore) -> InstrumentId {
             },
             source: SourceId::new_random(),
         })
-        .expect("псевдоним");
+        .expect("alias");
     instrument
 }
 
 fn seeded_harness() -> Harness {
-    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
     let instrument = seed_directory(&store);
     let mut harness = harness_with(store);
     harness.instrument = instrument;
@@ -3234,7 +3238,7 @@ async fn listing_instruments_returns_the_global_directory() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         body.as_array()
-            .expect("список")
+            .expect("list")
             .iter()
             .any(|item| item["id"] == instrument.inner().to_string())
     );
@@ -3289,7 +3293,7 @@ async fn resolving_a_code_outside_its_interval_names_the_known_range() {
     assert_eq!(
         status,
         StatusCode::UNPROCESSABLE_ENTITY,
-        "известный код вне интервала — не то же самое, что неизвестный код"
+        "a known code outside the interval is not the same as an unknown code"
     );
     assert_eq!(body["field"], "on");
     assert!(
@@ -3336,7 +3340,7 @@ async fn the_instrument_dto_does_not_leak_the_alias_source() {
     assert_eq!(status, StatusCode::OK);
     assert!(
         !body.to_string().contains("source"),
-        "SourceId указывает на документ владельца: наружу он не идёт (§14)"
+        "SourceId points to the owner's document: it is not exposed externally (§14)"
     );
 }
 
@@ -3348,7 +3352,7 @@ async fn an_agent_token_may_not_write_to_the_directory() {
         post(
             "/v1/instruments",
             &agent_token,
-            &json!({"symbol": "HACK", "title": "Подменыш", "kind": "share"}),
+            &json!({"symbol": "HACK", "title": "Impostor", "kind": "share"}),
         ),
     )
     .await;
@@ -3356,7 +3360,7 @@ async fn an_agent_token_may_not_write_to_the_directory() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "справочник глобален: чужая запись портит данные всех владельцев"
+        "the reference catalogue is global: another owner's entry corrupts every owner's data"
     );
 }
 
@@ -3373,7 +3377,7 @@ async fn an_owner_can_record_an_instrument_in_directory() {
                 "id": instrument,
                 "kind": "share",
                 "symbol": "GAZP",
-                "title": "Газпром",
+                "title": "Gazprom",
                 "denomination_currency": "RUB",
                 "settlement_currency": "RUB",
                 "quote_currency": "RUB",
@@ -3395,7 +3399,7 @@ async fn an_owner_can_record_an_instrument_in_directory() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(stored["title"], "Газпром");
+    assert_eq!(stored["title"], "Gazprom");
     assert_eq!(stored["quote_currency"], "RUB");
 }
 
@@ -3415,7 +3419,7 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
     for token in [&harness.owner_token, &harness.agent_token] {
         let (status, prices) = call(&harness.router, get(&prices_path, Some(token))).await;
         assert_eq!(status, StatusCode::OK);
-        let prices = prices.as_array().expect("массив цен");
+        let prices = prices.as_array().expect("price array");
         assert_eq!(prices.len(), 2);
         for price in prices {
             for field in [
@@ -3428,16 +3432,19 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
                 "recorded_quotation_basis",
                 "quotation_basis_status",
             ] {
-                assert!(price.get(field).is_some(), "у цены нет {field}: {price}");
+                assert!(
+                    price.get(field).is_some(),
+                    "price is missing {field}: {price}"
+                );
             }
             assert_eq!(price["source"], "moex-iss");
             assert_eq!(price["complete_through"], "2026-08-03");
-            // Доказательство основания котировки — это то, чем цена
-            // отличается от догадки (§10.2). Потерянное по дороге,
-            // оно не оставляет следа: ответ выглядит так же.
+            // Proof of the quotation's basis is what distinguishes a price
+            // from a guess (§10.2). If lost in transit,
+            // it leaves no trace: the response looks the same.
             assert_eq!(
                 price["basis_evidence"], "test:contract",
-                "основание цены не доехало: {price}"
+                "price basis was lost in transit: {price}"
             );
             assert_eq!(price["quotation_basis"], "unknown");
             assert_eq!(price["recorded_quotation_basis"], "money_per_unit");
@@ -3446,7 +3453,7 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
 
         let (status, fx) = call(&harness.router, get(fx_path, Some(token))).await;
         assert_eq!(status, StatusCode::OK);
-        let fx = fx.as_array().expect("массив курсов");
+        let fx = fx.as_array().expect("array of exchange rates");
         assert_eq!(fx.len(), 1);
         for field in [
             "value",
@@ -3456,14 +3463,18 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
             "quality",
             "complete_through",
         ] {
-            assert!(fx[0].get(field).is_some(), "у курса нет {field}: {}", fx[0]);
+            assert!(
+                fx[0].get(field).is_some(),
+                "exchange rate has no {field}: {}",
+                fx[0]
+            );
         }
         assert_eq!(fx[0]["source"], "cbr");
         assert_eq!(fx[0]["quality"], "official");
 
         let (status, key_rates) = call(&harness.router, get(key_rate_path, Some(token))).await;
         assert_eq!(status, StatusCode::OK);
-        let key_rates = key_rates.as_array().expect("массив интервалов ставки");
+        let key_rates = key_rates.as_array().expect("array of key-rate intervals");
         assert_eq!(key_rates.len(), 2);
         assert_eq!(key_rates[0]["observed_at"], "2026-08-20T00:00:00Z");
         assert_eq!(key_rates[0]["quality"], "observed");
@@ -3474,17 +3485,17 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
 
     for path in [prices_path.as_str(), fx_path, key_rate_path] {
         let (status, _) = call(&harness.router, get(path, None)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "маршрут открыт: {path}");
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "route is open: {path}");
     }
 }
 
-// --- Журнальные факты: корпоративные действия и оферта -----------------
+// --- Journal facts: corporate actions and an offer -----------------
 
 #[tokio::test]
 async fn an_amortisation_is_recorded_through_the_journal_route() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "corporate_action",
@@ -3513,7 +3524,7 @@ async fn an_amortisation_is_recorded_through_the_journal_route() {
 async fn an_offer_settlement_is_recorded_through_the_journal_route() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "offer_exercise",
@@ -3538,13 +3549,13 @@ async fn an_offer_settlement_is_recorded_through_the_journal_route() {
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
 }
 
-/// Один непонятый факт не отменяет соседний (§10.1) — и номер строки
-/// в ответе называет именно тот факт, который отклонён.
+/// One unrecognised fact does not invalidate an adjacent one (§10.1) — and the line number
+/// in the response identifies the exact fact that was rejected.
 #[tokio::test]
 async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [
             {
                 "account": harness.account.inner(),
@@ -3553,7 +3564,7 @@ async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
                     "type": "partial_redemption",
                     "instrument": harness.instrument.inner(),
                     "custody": harness.custody.inner(),
-                    "quantity": "не число",
+                    "quantity": "not a number",
                     "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
                     "compensation": { "amount": "1000.00", "currency": "RUB" },
                     "effective_date": "2026-05-20"
@@ -3587,13 +3598,13 @@ async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
     assert_eq!(response[1]["verdict"], "provisional", "{response}");
 }
 
-/// Нулевая выплата — не «амортизация на ноль», а брак источника. Отказ
-/// обязан случиться до записи: журнал append-only.
+/// A zero payment is not «amortisation to zero», but bad source data. Rejection
+/// must occur before writing: the journal is append-only.
 #[tokio::test]
 async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "corporate_action",
@@ -3621,7 +3632,7 @@ async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
 async fn the_ingest_route_ignores_a_client_supplied_allocation() {
     let (harness, path) = harness_on_disk();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "corporate_action",
@@ -3645,10 +3656,10 @@ async fn the_ingest_route_ignores_a_client_supplied_allocation() {
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
 
-    let store = SqliteStore::open(&path).expect("второе соединение");
+    let store = SqliteStore::open(&path).expect("second connection");
     let allocation = store
         .load_events_through(harness.owner, Date::MAX)
-        .expect("события амортизации")
+        .expect("amortisation events")
         .into_iter()
         .find_map(|event| match event.kind {
             EventKind::CorporateAction {
@@ -3660,7 +3671,7 @@ async fn the_ingest_route_ignores_a_client_supplied_allocation() {
             } => Some(basis_allocation),
             _ => None,
         })
-        .expect("амортизация");
+        .expect("amortisation");
     assert!(
         matches!(
             &allocation,
@@ -3668,14 +3679,14 @@ async fn the_ingest_route_ignores_a_client_supplied_allocation() {
                 iaam_core::event::allocation::AllocationGap::ScheduleMissing
             )
         ),
-        "доля должна быть выведена приложением без графика: {allocation:?}"
+        "the share must be inferred by the application without a schedule: {allocation:?}"
     );
     assert!(
         !matches!(
             &allocation,
             iaam_core::event::allocation::BasisAllocation::Known { .. }
         ),
-        "клиентская доля не должна попасть в событие: {allocation:?}"
+        "the client-supplied share must not enter the event: {allocation:?}"
     );
 
     drop(harness);
@@ -3686,7 +3697,7 @@ async fn the_ingest_route_ignores_a_client_supplied_allocation() {
 async fn an_unknown_allocation_is_named_to_the_owner() {
     let harness = harness();
     let contour = json!({
-        "title": "Портфель с амортизацией",
+        "title": "Portfolio with amortisation",
         "accounts": [harness.account.inner()],
     });
     let (status, contour_response) = call(
@@ -3697,11 +3708,11 @@ async fn an_unknown_allocation_is_named_to_the_owner() {
     assert_eq!(status, StatusCode::CREATED, "{contour_response}");
     let contour_id = contour_response["contour"]
         .as_str()
-        .expect("контур")
+        .expect("scope")
         .to_owned();
 
     let operations = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "operations": [{
             "account": harness.account.inner(),
             "type": "buy",
@@ -3722,7 +3733,7 @@ async fn an_unknown_allocation_is_named_to_the_owner() {
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
 
     let journal = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "corporate_action",
@@ -3756,17 +3767,17 @@ async fn an_unknown_allocation_is_named_to_the_owner() {
     assert_eq!(status, StatusCode::OK, "{report}");
     assert_eq!(report["data_quality"]["status"], "incomplete", "{report}");
     let expected = format!(
-        "доля разнесения амортизации инструмента {} на счёте {} не выведена: дозагрузите проверенный график выпуска",
+        "the amortisation allocation share for instrument {} in account {} could not be derived: load a verified issue schedule",
         harness.instrument.inner(),
         harness.account.inner()
     );
     assert!(
         report["data_quality"]["material_issues"]
             .as_array()
-            .expect("материальные проблемы")
+            .expect("material issues")
             .iter()
             .any(|issue| issue.as_str() == Some(expected.as_str())),
-        "владелец не увидел разрыв: {report}"
+        "the owner did not see the gap: {report}"
     );
 }
 
@@ -3774,7 +3785,7 @@ async fn an_unknown_allocation_is_named_to_the_owner() {
 async fn a_read_only_token_may_not_submit_journal_events() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "offer_exercise",
@@ -3795,14 +3806,14 @@ async fn a_read_only_token_may_not_submit_journal_events() {
     assert_eq!(response["code"], "forbidden");
 }
 
-/// Круг через JSON по каждому оставшемуся члену: разбор, что не прошёл
-/// ни одного факта, отличается от разобранного только тем, что ошибку
-/// в нём никто не увидит.
+/// A JSON round trip for every remaining member: a parsing path not exercised
+/// by any fact differs from an exercised one only in that nobody will see
+/// an error in it.
 #[tokio::test]
 async fn a_redemption_is_recorded_through_the_journal_route() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "corporate_action",
@@ -3814,7 +3825,7 @@ async fn a_redemption_is_recorded_through_the_journal_route() {
                 "principal_returned_per_unit": { "amount": "1000", "currency": "RUB" },
                 "compensation": { "amount": "10000.00", "currency": "RUB" },
                 "effective_date": "2026-06-01",
-                "grounds": "решение эмитента"
+                "grounds": "issuer decision"
             }
         }]
     });
@@ -3832,7 +3843,7 @@ async fn a_conversion_is_recorded_through_the_journal_route() {
     let harness = harness();
     let successor = Uuid::new_v4();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "corporate_action",
@@ -3859,13 +3870,13 @@ async fn a_conversion_is_recorded_through_the_journal_route() {
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
 }
 
-/// Выкупленная деньгами дробь добавляет денежную ногу — и валюта
-/// компенсации приезжает вместе с суммой, а не отдельным полем.
+/// A fraction bought out for cash adds a cash leg — and the currency
+/// of the compensation comes with the amount, rather than in a separate field.
 #[tokio::test]
 async fn a_cash_compensated_fraction_travels_with_its_currency() {
     let harness = harness();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [{
             "account": harness.account.inner(),
             "type": "corporate_action",
@@ -3899,7 +3910,7 @@ async fn an_offer_application_and_its_withdrawal_are_recorded() {
     let harness = harness();
     let submission = Uuid::new_v4();
     let body = json!({
-        "source_label": "тест",
+        "source_label": "test",
         "events": [
             {
                 "account": harness.account.inner(),
@@ -3935,9 +3946,9 @@ async fn an_offer_application_and_its_withdrawal_are_recorded() {
     assert_eq!(response[1]["verdict"], "provisional", "{response}");
 }
 
-/// Синхронизация рынка пишет в журнал наблюдений, поэтому read-only
-/// токену она закрыта. Проверка на месте, но без теста её снятие
-/// неотличимо от рабочего кода: ответ на владельческий токен тот же.
+/// Market synchronisation writes to the observation journal, so it is closed
+/// to a read-only token. The check is in place, but without a test its removal
+/// is indistinguishable from working code: the response for an owner token is the same.
 #[tokio::test]
 async fn a_read_only_token_may_not_sync_the_market() {
     let harness = harness();
@@ -3955,10 +3966,10 @@ async fn a_read_only_token_may_not_sync_the_market() {
     assert_eq!(response["code"], "forbidden");
 }
 
-/// Заведённый доступ без словаря отклонил бы первую же выгрузку целиком,
-/// и владелец пошёл бы разбираться с брокером вместо настройки. Словарь
-/// заселяется тем же действием, и сети для этого не нужно: контракт
-/// перечисляет коды, но не сообщает, во что они превращаются у нас.
+/// Provisioned access without a dictionary would reject the very first export outright,
+/// and the owner would investigate the broker rather than the configuration. The dictionary
+/// is populated by the same operation, with no network access required: the contract
+/// lists the codes but does not say what they map to internally.
 #[tokio::test]
 async fn provisioning_an_access_fills_the_channel_dictionary() {
     let (harness, path) = harness_on_disk();
@@ -3974,36 +3985,36 @@ async fn provisioning_an_access_fills_the_channel_dictionary() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    let store = SqliteStore::open(&path).expect("второе соединение");
-    let broker = BrokerCode::parse("tinkoff").expect("код брокера");
-    let dictionary = store.broker_operation_kinds(&broker).expect("словарь");
+    let store = SqliteStore::open(&path).expect("second connection");
+    let broker = BrokerCode::parse("tinkoff").expect("broker code");
+    let dictionary = store.broker_operation_kinds(&broker).expect("dictionary");
     assert_eq!(
         dictionary.get("OPERATION_TYPE_COUPON").map(String::as_str),
         Some("coupon"),
-        "словарь не заселён"
+        "dictionary was not seeded"
     );
-    // Синоним теряется незаметнее прочего: он не ломает ни один
-    // очевидный случай, а половина выгрузки перестаёт разбираться.
+    // A missing synonym is easier to overlook than anything else: it breaks no
+    // obvious case, yet half the export can no longer be parsed.
     assert_eq!(
         dictionary.get("OPERATION_TYPE_DIV_EXT").map(String::as_str),
         Some("dividend"),
-        "синоним потерян при заселении"
+        "synonym was lost during seeding"
     );
     assert!(
         dictionary.len() >= 35,
-        "заселено меньше, чем знал прежний разбор: {}",
+        "fewer entries were seeded than the old parser recognised: {}",
         dictionary.len()
     );
 }
 
-/// Прогоняет проблемы через ту же конверсию, по которой текст доходит
-/// до владельца.
+/// Runs issues through the same conversion used to deliver the text
+/// to the owner.
 ///
-/// Пустой журнал здесь — не упрощение, а способ изолировать текст: сам
-/// отчёт не должен добавить ни одной своей проблемы, иначе тест
-/// закреплял бы чужие строки вместе со своими. Публичного пути к
-/// формированию отдельной строки нет, и делать его ради теста нельзя:
-/// владелец получает строки только целым отчётом.
+/// The empty journal here serves — not as a simplification, but as a way to isolate the text: the
+/// report itself must not add any issues of its own, otherwise the test
+/// would lock down unrelated strings along with its own. There is no public route to
+/// produce an individual string, and one must not be added solely for the test:
+/// the owner receives strings only as a complete report.
 fn issue_texts(issues: Vec<MaterialIssue>) -> Vec<String> {
     let events: Vec<iaam_core::event::Event> = Vec::new();
     let contour = ContourDefinition::new(
@@ -4017,10 +4028,10 @@ fn issue_texts(issues: Vec<MaterialIssue>) -> Vec<String> {
         rules: &rules,
         lot_rule: LotRuleVersion(1),
     };
-    let projection = project(&events, &context).expect("проекция пустого журнала");
-    let perimeter = assess(&events, PerimeterPolicy::default()).expect("периметр");
-    let ledger =
-        ReconciliationLedger::build_with(&events, &perimeter.exceptions()).expect("реестр сверки");
+    let projection = project(&events, &context).expect("projection of the empty journal");
+    let perimeter = assess(&events, PerimeterPolicy::default()).expect("perimeter");
+    let ledger = ReconciliationLedger::build_with(&events, &perimeter.exceptions())
+        .expect("reconciliation ledger");
     let fx = FxTable::new(FxSource::OwnerSupplied);
     let mut report = returns_report(
         projection.state(),
@@ -4040,7 +4051,7 @@ fn issue_texts(issues: Vec<MaterialIssue>) -> Vec<String> {
     );
     assert!(
         report.data_quality.material_issues.is_empty(),
-        "пустой журнал дал собственные проблемы: {:?}",
+        "empty journal produced issues of its own: {:?}",
         report.data_quality.material_issues
     );
     report.data_quality.material_issues = issues;
@@ -4050,15 +4061,15 @@ fn issue_texts(issues: Vec<MaterialIssue>) -> Vec<String> {
         .material_issues
 }
 
-/// Кода у этой проблемы в ответе нет: владелец видит только строку.
-/// Незакреплённая строка молча меняется вместе с `fn issue`, и владелец
-/// получает другое сообщение без единого красного теста.
+/// There is no code for this issue in the response: the owner sees only the string.
+/// An unpinned string changes silently along with `fn issue`, and the owner
+/// receives a different message without a single test failing.
 ///
-/// Проверяются все четыре величины сразу: вид выплаты — потому что
-/// «не пришёл купон» и «не пришёл возврат номинала» требуют разных
-/// действий; счёт — потому что одна бумага на двух счетах иначе даёт
-/// две неразличимые строки; инструмент и дата — потому что без них
-/// искать в журнале нечего.
+/// All four values are checked together: payment type — because
+/// «coupon not received» and «principal repayment not received» require different
+/// actions; account — because otherwise the same security in two accounts produces
+/// two indistinguishable strings; instrument and date — because without them
+/// there is nothing to search for in the journal.
 #[test]
 fn an_unreceived_scheduled_posting_names_kind_instrument_account_and_date() {
     let account = AccountId::new_random();
@@ -4081,7 +4092,7 @@ fn an_unreceived_scheduled_posting_names_kind_instrument_account_and_date() {
     assert_eq!(
         texts[0],
         format!(
-            "выплата coupon инструмента {} на счёте {} за 2026-03-31 не подтверждена",
+            "payment coupon for instrument {} in account {} for 2026-03-31 has not been confirmed",
             instrument.inner(),
             account.inner()
         )
@@ -4089,15 +4100,15 @@ fn an_unreceived_scheduled_posting_names_kind_instrument_account_and_date() {
     assert_eq!(
         texts[1],
         format!(
-            "выплата principal_return инструмента {} на счёте {} за 2026-03-31 не подтверждена",
+            "payment principal_return for instrument {} in account {} for 2026-03-31 has not been confirmed",
             instrument.inner(),
             account.inner()
         )
     );
 }
 
-/// Причина, дата и вид обязаны быть в тексте: без них владелец не знает,
-/// какую выплату искать и чем чинить.
+/// The reason, date and type must be included in the text: without them the owner does not know,
+/// which payment to look for or how to fix it.
 #[test]
 fn an_unverifiable_scheduled_posting_names_kind_instrument_account_date_and_reason() {
     let account = AccountId::new_random();
@@ -4113,18 +4124,18 @@ fn an_unverifiable_scheduled_posting_names_kind_instrument_account_date_and_reas
     assert_eq!(
         texts[0],
         format!(
-            "сверку выплаты coupon инструмента {} на счёте {} за 2026-03-15 провести нечем: acquisition_date_unknown",
+            "payment coupon for instrument {} in account {} for 2026-03-15 cannot be reconciled: acquisition_date_unknown",
             instrument.inner(),
             account.inner()
         )
     );
 }
 
-/// Шесть причин чинятся по-разному, а одна из них относится ко всему
-/// графику и тоже должна иметь отдельный текст.
-/// Совпади хотя бы две строки — владелец не отличил бы «уточни даты
-/// расчётов» от «догрузи дату фиксации», «журнал начинается позже» или
-/// «догрузи доверенный график».
+/// The six reasons require different fixes, and one of them concerns the whole
+/// schedule and must also have distinct text.
+/// If even two strings were identical — the owner could not distinguish «clarify the
+/// calculation dates» from «load the record date», «the journal starts later» or
+/// «load the trusted schedule».
 #[test]
 fn the_seven_unverifiable_scheduled_posting_reasons_are_distinguishable() {
     let account = AccountId::new_random();
@@ -4152,5 +4163,9 @@ fn the_seven_unverifiable_scheduled_posting_reasons_are_distinguishable() {
     );
 
     let distinct: std::collections::BTreeSet<&String> = texts.iter().collect();
-    assert_eq!(distinct.len(), 7, "причины неразличимы в тексте: {texts:?}");
+    assert_eq!(
+        distinct.len(),
+        7,
+        "reasons are indistinguishable in the text: {texts:?}"
+    );
 }

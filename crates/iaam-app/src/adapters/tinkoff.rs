@@ -1,8 +1,8 @@
-//! Порт `BrokerChannel` поверх разобранного канала T-Invest.
+//! A `BrokerChannel` port over the parsed T-Invest channel.
 //!
-//! Разбор ответа остаётся в `iaam-broker`; этот слой только запрашивает
-//! тело, сохраняет отвергнутые строки в карантине и связывает устойчивые
-//! типы портов.
+//! Response parsing stays in `iaam-broker`; this layer only requests
+//! the body, quarantines rejected rows, and binds stable
+//! port types.
 
 use async_trait::async_trait;
 use iaam_broker::operation_kind::OperationKindDictionary;
@@ -24,20 +24,20 @@ use crate::ports::{BrokerChannel, BrokerError, ParsedOperations, Quarantined};
 
 const BROKER: &str = "tinkoff";
 
-/// Реализация канала брокера для T-Invest.
+/// Broker channel implementation for T-Invest.
 pub struct TinkoffChannel {
     client: TinkoffClient,
     source: SourceId,
-    /// Словарь видов операций этого канала. Приезжает из хранилища
-    /// готовым: разбор в `iaam-broker` про хранилище не знает, и
-    /// связывает их этот адаптер — тем же приёмом, что уже сделан
-    /// для SQLite.
+    /// Dictionary of operation kinds for this channel. It arrives from storage
+    /// ready to use: parsing in `iaam-broker` knows nothing about storage, and
+    /// this adapter binds them — using the same approach already used
+    /// for SQLite.
     dictionary: OperationKindDictionary,
 }
 
 impl TinkoffChannel {
-    /// Создаёт канал с уже настроенным HTTP-клиентом, источником данных
-    /// и словарём видов операций.
+    /// Creates a channel with a preconfigured HTTP client, data source
+    /// and operation kind dictionary.
     #[must_use]
     pub fn new(
         client: TinkoffClient,
@@ -99,12 +99,12 @@ fn adapt_operations(
     operations: Vec<ChannelOperation>,
     dictionary: &OperationKindDictionary,
 ) -> Result<ParsedOperations, BrokerError> {
-    // Пустой словарь — это ненастроенный канал, а не непонятный брокер.
-    // Без этой проверки владелец получил бы отказ про каждый код
-    // по отдельности и пошёл бы разбираться с брокером вместо настройки.
+    // An empty dictionary means an unconfigured channel, not an unknown broker.
+    // Without this check, the owner would receive a rejection for every code
+    // separately and investigate the broker instead of the configuration.
     if dictionary.is_empty() && !operations.is_empty() {
         return Err(unparsable(
-            "словарь видов операций канала пуст: разбирать выгрузку нечем",
+            "the channel's operation kind dictionary is empty: there is nothing to parse the export with",
         ));
     }
     let mut accepted = Vec::new();
@@ -132,23 +132,23 @@ fn operation_to_submitted(
     kind: ChannelOperationKind,
 ) -> Result<SubmittedOperation, BrokerError> {
     if let Some(rejection) = operation.rejection.as_ref() {
-        return Err(unparsable(format!("строка отклонена: {rejection}")));
+        return Err(unparsable(format!("row rejected: {rejection}")));
     }
     let kind = match kind {
         ChannelOperationKind::Buy => trade_kind(account, &operation, true)?,
         ChannelOperationKind::Sell => trade_kind(account, &operation, false)?,
-        // Схлопывать купон и дивиденд в один приход нельзя: журнал
-        // хранит вид, и потерять его здесь значит потерять навсегда —
-        // событие неизменяемо.
+        // A coupon and a dividend must not be collapsed into a single receipt: the journal
+        // stores the kind, and losing it here means losing it forever —
+        // the event is immutable.
         kind @ (ChannelOperationKind::Dividend | ChannelOperationKind::Coupon) => {
             let (gross_minor, currency) = required_money(operation.payment, "payment")?;
             let income_kind = match kind {
                 ChannelOperationKind::Coupon => IncomeKind::Coupon,
                 ChannelOperationKind::Dividend => IncomeKind::Dividend,
-                // Внешний образец уже сузил варианты. Ветвь недостижима
-                // и обязана быть шумной, а не подставлять дивиденд.
+                // The outer pattern has already narrowed the possibilities. This branch is unreachable
+                // and must fail loudly, rather than substitute a dividend.
                 other => {
-                    return Err(unparsable(format!("вид дохода разъехался: {other:?}")));
+                    return Err(unparsable(format!("income kind mismatch: {other:?}")));
                 }
             };
             OperationKind::Income {
@@ -181,29 +181,29 @@ fn operation_to_submitted(
             }
         }
         ChannelOperationKind::Transfer => {
-            return Err(unparsable("перевод не содержит счёт получателя"));
+            return Err(unparsable("transfer does not contain a recipient account"));
         }
-        // Амортизация и погашение — корпоративные действия, а не
-        // операции владельца: у них своя форма и свой вход
-        // (POST /v1/ingest/journal-events). Отказ здесь называет
-        // НЕДОСТАЮЩЕЕ, а не «непонятный вид»: канал сообщает сумму
-        // выплаты, но не возвращённый номинал на единицу и не место
-        // хранения, а без них факт не построить, и подстановка
-        // догадки записала бы в append-only журнал то, чего не было.
+        // Amortisation and redemption are corporate actions, not
+        // owner operations: they have their own representation and endpoint
+        // (POST /v1/ingest/journal-events). The rejection here identifies
+        // WHAT IS MISSING, rather than «unknown kind»: the channel reports the
+        // payment amount, but not the returned face value per unit or the custody
+        // location; without them the fact cannot be constructed, and substituting
+        // a guess would record something that never happened in the append-only journal.
         ChannelOperationKind::BondAmortisation => {
             return Err(unparsable(
-                "амортизация облигации: канал не сообщает возвращённый номинал на единицу \
-                 и место хранения — факт вводится через журнальный вход",
+                "bond amortisation: the channel does not report the returned face value per unit \
+                 or custody location — the fact is entered via the journal endpoint",
             ));
         }
         ChannelOperationKind::BondRedemption => {
             return Err(unparsable(
-                "погашение облигации: канал не сообщает возвращённый номинал на единицу \
-                 и место хранения — факт вводится через журнальный вход",
+                "bond redemption: the channel does not report the returned face value per unit \
+                 or custody location — the fact is entered via the journal endpoint",
             ));
         }
         ChannelOperationKind::Other(kind) => {
-            return Err(unparsable(format!("неподдержанный вид операции: {kind}")));
+            return Err(unparsable(format!("unsupported operation kind: {kind}")));
         }
     };
 
@@ -227,7 +227,7 @@ fn trade_kind(
     let (gross_minor, currency) = required_money(operation.payment, "payment")?;
     let quantity = operation
         .quantity
-        .ok_or_else(|| unparsable("торговая операция не содержит quantity"))?;
+        .ok_or_else(|| unparsable("trading operation does not contain quantity"))?;
     let instrument = required_instrument(operation)?;
     let fee_minor = operation
         .commission
@@ -261,7 +261,7 @@ fn required_money(
     money: Option<ChannelMoney>,
     field: &'static str,
 ) -> Result<(i64, CurrencyCode), BrokerError> {
-    let money = money.ok_or_else(|| unparsable(format!("операция не содержит {field}")))?;
+    let money = money.ok_or_else(|| unparsable(format!("operation does not contain {field}")))?;
     Ok((money_amount(money, field)?, money.currency))
 }
 
@@ -269,14 +269,14 @@ fn money_amount(money: ChannelMoney, field: &'static str) -> Result<i64, BrokerE
     money
         .magnitude()
         .map(|amount| amount.raw())
-        .ok_or_else(|| unparsable(format!("поле {field} не имеет положительного модуля")))
+        .ok_or_else(|| unparsable(format!("field {field} does not have a positive magnitude")))
 }
 
 fn required_instrument(operation: &ChannelOperation) -> Result<InstrumentId, BrokerError> {
     let value = operation
         .instrument_uid
         .as_deref()
-        .ok_or_else(|| unparsable("торговая операция не содержит instrumentUid"))?;
+        .ok_or_else(|| unparsable("trading operation does not contain instrumentUid"))?;
     parse_instrument(value)
 }
 
@@ -291,7 +291,7 @@ fn optional_instrument(operation: &ChannelOperation) -> Result<Option<Instrument
 fn parse_instrument(value: &str) -> Result<InstrumentId, BrokerError> {
     Uuid::parse_str(value)
         .map(InstrumentId)
-        .map_err(|_| unparsable(format!("instrumentUid не является UUID: {value}")))
+        .map_err(|_| unparsable(format!("instrumentUid is not a UUID: {value}")))
 }
 
 fn rfc3339_midnight(date: time::Date) -> String {
@@ -361,10 +361,10 @@ mod tests {
         )
     }
 
-    /// Амортизация и погашение — корпоративные действия, и канал
-    /// данных для них не даёт. Отказ обязан называть НЕДОСТАЮЩЕЕ:
-    /// «неподдержанный вид» отправил бы владельца искать поддержку
-    /// вида, которая есть, вместо данных, которых нет.
+    /// Amortisation and redemption are corporate actions, and the channel
+    /// does not provide the data they require. The rejection must identify WHAT IS MISSING:
+    /// «unsupported kind» would send the owner looking for support
+    /// for a kind that is supported, rather than for the data that is missing.
     #[test]
     fn a_bond_repayment_is_refused_by_naming_what_the_channel_does_not_report() {
         use iaam_broker::operation_kind::ChannelOperationKind;
@@ -376,11 +376,11 @@ mod tests {
         ] {
             let operation = ChannelOperation {
                 date: None,
-                broker_account_id: "счёт".to_owned(),
+                broker_account_id: "account".to_owned(),
                 operation_id: "1".to_owned(),
                 parent_operation_id: None,
                 cursor: "c".to_owned(),
-                source_kind: "не важно: вид передаётся отдельно".to_owned(),
+                source_kind: "irrelevant: the kind is passed separately".to_owned(),
                 state: "OPERATION_STATE_EXECUTED".to_owned(),
                 instrument_uid: None,
                 figi: None,
@@ -389,28 +389,28 @@ mod tests {
                 price: None,
                 commission: None,
                 deduplication_key: "k".to_owned(),
-                parser_version: iaam_core::event::provenance::ParserVersion("тест".to_owned()),
+                parser_version: iaam_core::event::provenance::ParserVersion("test".to_owned()),
                 raw: serde_json::Value::Null,
                 rejection: None,
             };
             let account = AccountId(Uuid::from_u128(1));
             let error = operation_to_submitted(account, operation, kind.clone())
-                .expect_err("корпоративное действие каналом не строится");
+                .expect_err("a corporate action cannot be constructed through the channel");
             let text = error.to_string();
             assert!(
-                text.contains("номинал на единицу"),
-                "отказ не называет недостающее: {text}"
+                text.contains("returned face value per unit"),
+                "error does not identify what is missing: {text}"
             );
             assert!(
-                text.contains("журнальный вход"),
-                "отказ не называет, куда факт вводится: {text}"
+                text.contains("journal endpoint"),
+                "error does not identify where the fact is entered: {text}"
             );
         }
     }
 
-    /// Словарь канала в тестах заводится явно: классификация — данные,
-    /// и тест, полагающийся на вшитый список, проверял бы список,
-    /// которого больше нет.
+    /// The channel dictionary is defined explicitly in tests: classification is data,
+    /// and a test relying on a hard-coded list would be testing a list
+    /// that no longer exists.
     fn dictionary() -> OperationKindDictionary {
         let (dictionary, unreadable) = OperationKindDictionary::build([
             ("OPERATION_TYPE_BUY", "buy"),
@@ -427,14 +427,15 @@ mod tests {
     }
 
     fn income_kind_of(operation_type: &str) -> Option<IncomeKind> {
-        let operations = parse_operations(&income_operation(operation_type)).expect("разбор");
+        let operations = parse_operations(&income_operation(operation_type)).expect("parsing");
         let account = AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888));
-        let operation = operations.into_iter().next().expect("одна операция");
+        let operation = operations.into_iter().next().expect("one operation");
         let kind = dictionary().kind_of(&operation.source_kind);
-        let submitted = operation_to_submitted(account, operation, kind).expect("операция принята");
+        let submitted =
+            operation_to_submitted(account, operation, kind).expect("operation accepted");
         match submitted.kind {
             OperationKind::Income { kind, .. } => kind,
-            other => panic!("ожидался приход дохода, получено {other:?}"),
+            other => panic!("expected an income receipt, got {other:?}"),
         }
     }
 
@@ -448,8 +449,8 @@ mod tests {
 
     #[test]
     fn a_dividend_does_not_become_a_coupon() {
-        // Схлопывание двух видов в один приход теряло вид навсегда:
-        // событие журнала неизменяемо.
+        // Collapsing two kinds into a single receipt lost the kind forever:
+        // the journal event is immutable.
         assert_eq!(
             income_kind_of("OPERATION_TYPE_DIVIDEND"),
             Some(IncomeKind::Dividend)
@@ -462,12 +463,12 @@ mod tests {
 
     #[test]
     fn an_unknown_operation_kind_is_still_refused() {
-        // Молчаливое превращение неизвестного вида в приход денег
-        // хуже отказа: отказ виден, выдумка — нет.
+        // Silently turning an unknown kind into a cash receipt
+        // is worse than rejection: rejection is visible, fabrication is not.
         let operations =
-            parse_operations(&income_operation("OPERATION_TYPE_SOMETHING_NEW")).expect("разбор");
+            parse_operations(&income_operation("OPERATION_TYPE_SOMETHING_NEW")).expect("parsing");
         let account = AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888));
-        let operation = operations.into_iter().next().expect("одна операция");
+        let operation = operations.into_iter().next().expect("one operation");
         let kind = dictionary().kind_of(&operation.source_kind);
         assert!(operation_to_submitted(account, operation, kind).is_err());
     }
@@ -539,7 +540,7 @@ mod tests {
             .quarantined
             .iter()
             .find(|row| row.raw["id"] == "7aa1cf04-71c7-4b62-81c7-7f27ec4cfb8d")
-            .ok_or("отказанная комиссия исчезла из карантина")?;
+            .ok_or("rejected commission disappeared from quarantine")?;
         assert!(rejected.reason.contains("NonRepresentableFraction"));
         assert_eq!(rejected.raw["payment"]["nano"], -135065000);
         Ok(())

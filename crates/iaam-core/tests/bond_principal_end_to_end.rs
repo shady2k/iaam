@@ -1,8 +1,8 @@
-//! Сквозная проверка: номинал доезжает до расчёта обычным путём.
+//! End-to-end check: face value reaches the calculation through the normal path.
 //!
-//! Тест намеренно не подменяет CBOR-поля состояния. Прежние хелперы
-//! подставляли номинал мимо рабочего пути, и потому вся линия E3.4
-//! годами проверялась на данных, которых рабочий код никогда не увидит.
+//! The test deliberately does not override the state's CBOR fields. Previous helpers
+//! injected face value outside the production path, so the entire E3.4 pipeline
+//! was tested for years against data that production code would never see.
 
 use std::collections::BTreeMap;
 
@@ -43,7 +43,7 @@ const CUSTODY: CustodyId = CustodyId(Uuid::from_u128(4));
 const SOURCE: SourceId = SourceId(Uuid::from_u128(5));
 
 fn dec(text: &str) -> Dec {
-    Dec::new(Decimal::from_str_exact(text).expect("десятичная константа"))
+    Dec::new(Decimal::from_str_exact(text).expect("decimal constant"))
 }
 
 fn rub(minor: i64) -> Money {
@@ -66,7 +66,7 @@ fn event(day: time::Date, sequence: u32, kind: EventKind, legs: Vec<Leg>) -> Eve
         legs,
         provenance: Provenance::new(
             SOURCE,
-            RawHash::parse(&"b".repeat(64)).expect("шестнадцатеричный хеш"),
+            RawHash::parse(&"b".repeat(64)).expect("hexadecimal hash"),
             ParserVersion("test/bond-principal-e2e/1".to_owned()),
         ),
         relation: Relation::None,
@@ -137,9 +137,9 @@ fn cash_in(day: time::Date, sequence: u32, amount: i64) -> Event {
 
 fn known_allocation(share: &str) -> BasisAllocation {
     BasisAllocation::Known {
-        share: ReturnedShare::new(dec(share)).expect("доля в пределах единицы"),
+        share: ReturnedShare::new(dec(share)).expect("fraction within one"),
         evidence: AllocationEvidence {
-            inputs_hash: AllocationInputsHash::new("c".repeat(64)).expect("хеш входов"),
+            inputs_hash: AllocationInputsHash::new("c".repeat(64)).expect("inputs hash"),
             knowledge_as_of: OffsetDateTime::UNIX_EPOCH,
             algorithm_version: AllocationAlgorithmVersion(1),
         },
@@ -215,7 +215,7 @@ fn market_price(day: time::Date) -> PriceCandidate {
         basis: QuotationBasis::MoneyPerUnit,
         basis_evidence: "test:bond-principal-e2e".to_owned(),
         basis_evidence_contradicts: false,
-        trade_date: day.previous_day().expect("дата до отчёта"),
+        trade_date: day.previous_day().expect("date before the report"),
         observed_at: None,
         origin: PriceOrigin::Market {
             venue: Venue {
@@ -238,7 +238,7 @@ fn a_bond_from_journal_and_catalog_has_computable_metrics_without_state_override
         cash_in(date!(2026 - 01 - 02), 1, 2_000_000),
         buy(date!(2026 - 01 - 03), 2, 1_000_000),
     ];
-    let projection = project(&events, &context(&contour, &rules)).expect("проекция журнала");
+    let projection = project(&events, &context(&contour, &rules)).expect("journal projection");
     let entry = projection
         .state()
         .book()
@@ -246,7 +246,7 @@ fn a_bond_from_journal_and_catalog_has_computable_metrics_without_state_override
             account: ACCOUNT,
             instrument: INSTRUMENT,
         })
-        .expect("партия из обычной покупки");
+        .expect("lot from an ordinary purchase");
     assert_eq!(projection.state().book().iter().count(), 1);
 
     assert_eq!(entry.unpriced(), Quantity(dec("0")));
@@ -300,8 +300,8 @@ fn a_return_after_thirty_percent_prior_amortisation_releases_one_seventh_of_rema
         ),
         sell(date!(2026 - 05 - 01), 3, 700_000),
         buy(date!(2026 - 06 - 01), 4, 700_000),
-        // Возврат 10% первоначального номинала после погашения 30%:
-        // приложение передало долю 10/70 = 1/7 в самом событии.
+        // Repayment of 10% of the original face value after a 30% repayment:
+        // the application passed the 10/70 = 1/7 fraction in the event itself.
         partial_redemption(
             day,
             5,
@@ -311,8 +311,8 @@ fn a_return_after_thirty_percent_prior_amortisation_releases_one_seventh_of_rema
             known_allocation("0.1428571428571428571428571429"),
         ),
     ];
-    let before_current =
-        project(&events[..4], &context(&contour, &rules)).expect("состояние до текущего возврата");
+    let before_current = project(&events[..4], &context(&contour, &rules))
+        .expect("state before the current repayment");
     let before_entry = before_current
         .state()
         .book()
@@ -320,11 +320,11 @@ fn a_return_after_thirty_percent_prior_amortisation_releases_one_seventh_of_rema
             account: ACCOUNT,
             instrument: INSTRUMENT,
         })
-        .expect("новая партия до текущего возврата");
+        .expect("new lot before the current repayment");
     assert_eq!(before_entry.lots().len(), 1);
     assert_eq!(before_entry.lots()[0].cost_basis, rub(700_000));
 
-    let projection = project(&events, &context(&contour, &rules)).expect("проекция амортизации");
+    let projection = project(&events, &context(&contour, &rules)).expect("amortization projection");
     let key = iaam_core::projection::lots::LotKey {
         account: ACCOUNT,
         instrument: INSTRUMENT,
@@ -333,17 +333,17 @@ fn a_return_after_thirty_percent_prior_amortisation_releases_one_seventh_of_rema
         .state()
         .book()
         .entry(&key)
-        .expect("новая партия после покупки");
+        .expect("new lot after the purchase");
 
-    // `released_basis` накопительный: 1 000 000 от ранней покупки и её
-    // продажи плюс 100 000 от текущего возврата. Эффект 1/7 проверяется
-    // на самой новой партии: 700 000 / 7 = 100 000.
+    // `released_basis` is cumulative: 1 000 000 from the earlier purchase and its
+    // sale, plus 100 000 from the current repayment. The 1/7 effect is verified
+    // on the newest lot itself: 700 000 / 7 = 100 000.
     assert_eq!(entry.released_basis(), Some(rub(1_100_000)));
     assert_eq!(entry.lots().len(), 1);
     assert_eq!(
         entry.lots()[0].cost_basis,
         rub(600_000),
-        "новая партия: 700 000 − 700 000 / 7, а не расчёт от номинала 1 000 000"
+        "new lot: 700 000 − 700 000 / 7, not a calculation based on face value 1 000 000"
     );
     assert_eq!(entry.gap(), None);
 }
@@ -366,7 +366,7 @@ fn an_amortisation_without_schedule_is_applied_as_unknown_not_zero() {
         ),
     ];
     let projection =
-        project(&events, &context(&contour, &rules)).expect("деньги нельзя отвергнуть");
+        project(&events, &context(&contour, &rules)).expect("cash must not be rejected");
     let key = iaam_core::projection::lots::LotKey {
         account: ACCOUNT,
         instrument: INSTRUMENT,
@@ -375,7 +375,7 @@ fn an_amortisation_without_schedule_is_applied_as_unknown_not_zero() {
         .state()
         .book()
         .entry(&key)
-        .expect("партия после покупки");
+        .expect("lot after the purchase");
 
     assert_eq!(entry.gap(), Some(BasisGap::AmortisationAllocationUnknown));
     assert_eq!(entry.released_basis(), None);

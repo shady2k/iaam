@@ -1,4 +1,4 @@
-//! Envelope события журнала (§4.1).
+//! Journal event envelope (§4.1).
 
 pub mod allocation;
 pub mod corporate_action;
@@ -23,86 +23,86 @@ use legs::LegExpectation;
 use offer::OfferExerciseAction;
 use provenance::Provenance;
 
-/// Уверенность в записанном факте (§4.9).
+/// Confidence in the recorded fact (§4.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confidence {
-    /// Факт подтверждён источником.
+    /// The fact is confirmed by the source.
     Known,
-    /// Значение восстановлено или оценено.
+    /// The value was reconstructed or estimated.
     Estimated,
-    /// Значение неизвестно и не должно подставляться нулём.
+    /// The value is unknown and must not be replaced with zero.
     Unknown,
 }
 
-/// Связь с другим событием (§4.8).
+/// Link to another event (§4.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Relation {
-    /// Самостоятельное событие.
+    /// Standalone event.
     None,
-    /// Сторнирование указанного события.
+    /// Reversal of the specified event.
     Reversal { target: EventId },
-    /// Замена указанного события. Всегда идёт после сторнирования.
+    /// Replacement of the specified event. Always follows a reversal.
     Replacement { target: EventId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EventValidationError {
-    #[error("для {kind} ожидалось: {expected}; найдено ног: {found}")]
+    #[error("for {kind} expected: {expected}; legs found: {found}")]
     LegCount {
         kind: &'static str,
         expected: &'static str,
         found: usize,
     },
-    #[error("для {kind} знак денежной ноги неверен: {amount} в {currency:?}")]
+    #[error("for {kind} monetary leg has the wrong sign: {amount} in {currency:?}")]
     WrongSign {
         kind: &'static str,
         amount: i64,
         currency: CurrencyCode,
     },
-    #[error("сумма ног ({legs}) не совпадает с суммой события ({declared}) для {kind}")]
+    #[error("leg total ({legs}) does not match event amount ({declared}) for {kind}")]
     AmountMismatch {
         kind: &'static str,
         legs: i64,
         declared: i64,
     },
-    #[error("нога отнесена не к тому счёту: ожидался {expected:?}")]
+    #[error("leg assigned to the wrong account: expected {expected:?}")]
     WrongAccount { expected: AccountId },
-    #[error("две стороны перевода не сходятся: остаток {residual}")]
+    #[error("transfer sides do not balance: residual {residual}")]
     TransferResidual { residual: i64 },
     #[error(
-        "счёт {account:?} указан и источником, и получателем перевода; \
-         перемещение денег внутри одного счёта не меняет ни один остаток \
-         и потому не является фактом движения"
+        "account {account:?} is both transfer source and recipient; \
+         moving money within one account changes no balance \
+         and therefore is not a movement fact"
     )]
     TransferToSelf { account: AccountId },
     #[error(
-        "для {kind} нога не соответствует событию по полю {field}: \
-         событие говорит одно, нога другое"
+        "for {kind} leg does not match the event in field {field}: \
+         the event says one thing, the leg another"
     )]
     LegDoesNotMatchEvent {
         kind: &'static str,
         field: &'static str,
     },
-    #[error("для {kind} величина {field} должна быть положительной, получено {value}")]
+    #[error("for {kind} value {field} must be positive, got {value}")]
     NonPositive {
         kind: &'static str,
         field: &'static str,
         value: String,
     },
-    #[error("для {event} лишняя нога: ожидалось ног {expected}, найдено {found}")]
+    #[error("extra leg for {event}: expected {expected} legs, found {found}")]
     UnexpectedLeg {
         event: &'static str,
         expected: usize,
         found: usize,
     },
-    #[error("для {event} не хватает ноги {kind:?}: ожидалось ног {expected}, найдено {found}")]
+    #[error("missing {kind:?} leg for {event}: expected {expected} legs, found {found}")]
     MissingLeg {
         event: &'static str,
         kind: LegKind,
         expected: usize,
         found: usize,
     },
-    #[error("для {event} нога {kind:?} не совпала с ожиданием по полю {field}")]
+    #[error("for {event} leg {kind:?} did not match the expected field {field}")]
     LegMismatch {
         event: &'static str,
         kind: LegKind,
@@ -121,7 +121,7 @@ enum Sign {
     Any,
 }
 
-/// Факт журнала. Неизменяем после записи.
+/// Journal fact. Immutable once recorded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: EventId,
@@ -135,28 +135,28 @@ pub struct Event {
     pub provenance: Provenance,
     pub relation: Relation,
     pub confidence: Confidence,
-    /// Ключ идемпотентности от клиента (§10.6).
+    /// Client idempotency key (§10.6).
     pub idempotency_key: Option<String>,
 }
 
-/// Текущая версия схемы события.
+/// Current event schema version.
 ///
-/// Версия 2 отличалась от версии 1 добавленным вариантом
-/// [`EventKind::Valuation`]; версия 3 отличается от версии 2
-/// добавленным вариантом [`EventKind::ControlAssertion`]; версия 4 —
-/// вариантами [`EventKind::CorporateAction`] и
-/// [`EventKind::OfferExercise`], а также видом дохода в
-/// [`EventKind::Income`] (§4.7). Уже записанные факты прежних версий
-/// читаются без изменений — новых вариантов в них просто не
-/// встречается, а `Income` без вида читается как «вид не утверждался»,
-/// — но программа, знающая только версию 3, не разберёт корпоративное
-/// действие и потому не должна притворяться, что разобрала. Оставить
-/// прежний номер значило бы, что одна версия обозначает две
-/// несовместимые схемы (§4.1).
+/// Version 2 differed from version 1 by the added variant
+/// [`EventKind::Valuation`]; version 3 differs from version 2
+/// by the added variant [`EventKind::ControlAssertion`]; version 4 —
+/// by variants [`EventKind::CorporateAction`] and
+/// [`EventKind::OfferExercise`], and by the income kind in
+/// [`EventKind::Income`] (§4.7). Previously recorded facts from older versions
+/// are read unchanged — the new variants simply do not
+/// occur in them, and `Income` without a kind is read as «kind was not asserted»,
+/// — but software that knows only version 3 cannot parse a corporate
+/// action and therefore must not pretend that it did. Keeping
+/// the old number would mean that one version denotes two
+/// incompatible schemas (§4.1).
 pub const SCHEMA_VERSION: u32 = 4;
 
 impl Event {
-    /// Сумма денежного эффекта всех ног в указанной валюте.
+    /// Total monetary effect of all legs in the specified currency.
     pub fn cash_effect(&self, currency: CurrencyCode) -> Result<Money, MoneyError> {
         let amounts: Vec<Money> = self
             .legs
@@ -179,16 +179,16 @@ impl Event {
         self.legs_of_kind(LegKind::SecurityQuantity)
     }
 
-    /// Структурная проверка события (§15.2).
+    /// Structural event validation (§15.2).
     ///
-    /// **Не является бухгалтерским балансом.** Ноги события не образуют
-    /// двойную запись: контрсчетов капитала, дохода и расхода у них нет.
-    /// Поэтому единого правила «сумма ног равна нулю» не существует —
-    /// комиссия, записанная одной фактической ногой, никогда не даст ноль,
-    /// и это корректно. У каждого типа события своя форма, она и проверяется.
+    /// **This is not an accounting balance.** Event legs do not form
+    /// double-entry records: they have no equity, income, or expense counteraccounts.
+    /// Therefore no universal «leg total equals zero» rule exists —
+    /// a fee recorded as one actual leg will never produce zero,
+    /// and that is correct. Each event type has its own shape, which is validated.
     ///
-    /// Тело — только диспетчер по типу события: форма каждого типа проверяется
-    /// отдельной функцией, иначе одна ветка молча заимствовала бы условия другой.
+    /// The body only dispatches by event type: each type's shape is validated
+    /// by a separate function, or one branch could silently borrow another's conditions.
     pub fn validate_structure(&self) -> Result<(), EventValidationError> {
         let name = self.kind.discriminant();
         match &self.kind {
@@ -241,7 +241,7 @@ impl Event {
         sign: Sign,
     ) -> Result<(), EventValidationError> {
         let legs = self.cash_legs();
-        let money = single_leg_money(name, &legs, "ровно одна денежная нога")?;
+        let money = single_leg_money(name, &legs, "exactly one monetary leg")?;
         let raw = money.amount().raw();
         let ok = match sign {
             Sign::Positive => raw > 0,
@@ -258,15 +258,15 @@ impl Event {
         require_equal(name, money, declared)
     }
 
-    /// Комиссия записывается **одной** фактической ногой: контрсчёта расхода
-    /// в модели нет, поэтому сумма ног в ноль не сходится, и это корректно.
+    /// A fee is recorded with **one** actual leg: the model has no expense
+    /// counteraccount, so the legs do not sum to zero, and that is correct.
     fn validate_fee(
         &self,
         name: &'static str,
         declared: Money,
     ) -> Result<(), EventValidationError> {
         let fee_legs = self.legs_of_kind(LegKind::Fee);
-        let money = single_leg_money(name, &fee_legs, "ровно одна нога комиссии")?;
+        let money = single_leg_money(name, &fee_legs, "exactly one fee leg")?;
         if money.amount().raw() >= 0 {
             return Err(EventValidationError::WrongSign {
                 kind: name,
@@ -277,7 +277,7 @@ impl Event {
         require_equal(name, money, declared)
     }
 
-    /// Перевод: две встречные денежные ноги на объявленных счетах.
+    /// Transfer: two opposing monetary legs on the declared accounts.
     fn validate_transfer(
         &self,
         name: &'static str,
@@ -285,11 +285,11 @@ impl Event {
         to: AccountId,
         declared: Money,
     ) -> Result<(), EventValidationError> {
-        // Проверяется ДО разбора ног. Иначе причина отказа зависела бы от их
-        // числа: при двух ногах оба `find` вернули бы одну и ту же, остаток
-        // удвоился бы и отказ пришёл бы как `TransferResidual` — по случайной
-        // причине; а две нулевые ноги дали бы нулевой остаток и событие
-        // прошло бы проверку.
+        // Checked BEFORE parsing the legs. Otherwise the rejection reason would depend on their
+        // count: with two legs both `find` calls would return the same one, the residual
+        // would double and the rejection would be `TransferResidual` — for an accidental
+        // reason; while two zero legs would produce zero residual and the event
+        // would pass validation.
         if from == to {
             return Err(EventValidationError::TransferToSelf { account: from });
         }
@@ -297,7 +297,7 @@ impl Event {
         if legs.len() != 2 {
             return Err(EventValidationError::LegCount {
                 kind: name,
-                expected: "ровно две денежные ноги",
+                expected: "exactly two monetary legs",
                 found: legs.len(),
             });
         }
@@ -320,16 +320,16 @@ impl Event {
         require_equal(name, in_money, declared)
     }
 
-    /// Сделка: ровно одна денежная и ровно одна бумажная нога, денежная
-    /// нога равна расчётной сумме со знаком направления, **а бумажная
-    /// нога говорит ровно то же, что тип события**.
+    /// Trade: exactly one monetary and exactly one security leg, the monetary
+    /// leg equals the settlement amount with the direction sign, **and the security
+    /// leg says exactly the same thing as the event type**.
     ///
-    /// Последнее — не педантизм. Без этой сверки событие «куплено сто
-    /// бумаг X», чья нога зачисляет одну бумагу Y на чужой счёт, проходит
-    /// проверку и попадает в append-only журнал навсегда. Инвариант
-    /// проекции остановит отчёт, но исправить записанный факт можно будет
-    /// только сторнированием: входной заслон обязан не пропускать
-    /// противоречие, а не сохранять его (§4.3, §4.8).
+    /// The latter is not pedantry. Without this check an event saying «bought one hundred
+    /// units of security X», whose leg credits one unit of security Y to another account, passes
+    /// validation and enters the append-only journal forever. The projection
+    /// invariant will stop the report, but the recorded fact can only be fixed
+    /// by reversal: the input gate must reject
+    /// the contradiction, not preserve it (§4.3, §4.8).
     fn validate_trade(
         &self,
         name: &'static str,
@@ -347,7 +347,7 @@ impl Event {
         require_positive_quantity(name, "quantity", quantity)?;
 
         let cash = self.cash_legs();
-        let cash_money = single_leg_money(name, &cash, "ровно одна денежная нога")?;
+        let cash_money = single_leg_money(name, &cash, "exactly one monetary leg")?;
         require_own_account(name, cash[0].account, self.account)?;
         let expected = trade_settlement(side, gross, fee, accrued_interest)?;
         require_equal(name, cash_money, expected)?;
@@ -356,7 +356,7 @@ impl Event {
         if security.len() != 1 {
             return Err(EventValidationError::LegCount {
                 kind: name,
-                expected: "ровно одна бумажная нога",
+                expected: "exactly one security leg",
                 found: security.len(),
             });
         }
@@ -364,8 +364,8 @@ impl Event {
         require_own_account(name, leg.account, self.account)?;
         require_same_instrument(name, leg.instrument, instrument)?;
 
-        // Покупка увеличивает позицию, продажа уменьшает. Шорты вне
-        // периметра (§11), поэтому знак задан направлением однозначно.
+        // A purchase increases the position, a sale decreases it. Shorts are out of
+        // scope (§11), so the direction determines the sign unambiguously.
         let expected_quantity = match side {
             TradeSide::Buy => quantity,
             TradeSide::Sell => Quantity(quantity.0.checked_neg()?),
@@ -379,25 +379,25 @@ impl Event {
         }
     }
 
-    /// Форма корпоративного действия (§4.7).
+    /// Corporate action shape (§4.7).
     ///
-    /// Ноги перечисляются **ровно**: посторонняя нога отклоняется так же,
-    /// как недостающая, — событие с движением, которого оно не называет,
-    /// не является тем событием, которым назвалось.
+    /// Legs are enumerated **exactly**: an extraneous leg is rejected just like
+    /// a missing one, — an event with movement it does not name
+    /// is not the event it claims to be.
     fn validate_corporate_action(
         &self,
         name: &'static str,
         action: &CorporateAction,
     ) -> Result<(), EventValidationError> {
         match action {
-            // Амортизация выплачивает деньги, но количество бумаг
-            // не меняет (§6.5). Отсюда **одна** нога `Principal` и ни
-            // одной бумажной: «количество не уменьшается» становится
-            // инвариантом формы, а не обещанием.
+            // Amortization pays cash, but the number of securities
+            // does not change (§6.5). Hence **one** `Principal` leg and no
+            // security leg: «quantity does not decrease» becomes
+            // a shape invariant, not a promise.
             //
-            // Пары «Cash + Principal» здесь нет намеренно: `Principal`
-            // уже входит в `cash_effect()` (`leg.rs`), и пара дала бы
-            // двойной денежный эффект.
+            // There is intentionally no «Cash + Principal» pair here: `Principal`
+            // is already included in `cash_effect()` (`leg.rs`), and the pair would produce
+            // a double monetary effect.
             CorporateAction::PartialRedemption {
                 instrument,
                 quantity,
@@ -407,9 +407,9 @@ impl Event {
             } => {
                 require_positive(name, "compensation", compensation.amount().raw())?;
                 require_positive_quantity(name, "quantity", *quantity)?;
-                // Возврат номинала проверяется здесь, а не в правиле
-                // разнесения: правило считает по безразмерной доле и
-                // сырое денежное утверждение события больше не видит.
+                // Principal repayment is checked here, not in the allocation
+                // rule: that rule uses a dimensionless fraction and
+                // no longer sees the event's raw monetary assertion.
                 require_positive_per_unit(
                     name,
                     "principal_returned_per_unit",
@@ -420,9 +420,9 @@ impl Event {
                     &[principal_leg(self.account, *instrument, *compensation)],
                 )
             }
-            // Погашение возвращает номинал целиком, и бумага выбывает.
-            // Обнулить остаток и оставить количество — позиция
-            // из погашенных бумаг, которой не существует.
+            // Redemption repays the principal in full, and the security leaves the position.
+            // Zeroing the balance while retaining the quantity would create a position
+            // in redeemed securities, which does not exist.
             CorporateAction::Redemption {
                 instrument,
                 custody,
@@ -478,7 +478,7 @@ impl Event {
         }
     }
 
-    /// Форма факта оферты (§3.5).
+    /// Offer fact shape (§3.5).
     fn validate_offer_exercise(
         &self,
         name: &'static str,
@@ -486,14 +486,14 @@ impl Event {
     ) -> Result<(), EventValidationError> {
         require_positive_quantity(name, "quantity", action.quantity())?;
         match action {
-            // Подача и отзыв ног не имеют: ни денег, ни бумаг они
-            // не двигают — как контрольное утверждение. Отсутствие ног —
-            // тоже форма, и проверяется она наравне с остальными.
+            // Submission and withdrawal have no legs: they move neither money nor
+            // securities — like a control assertion. Having no legs is
+            // also a shape, and it is validated like the others.
             OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {
                 self.expect_legs(name, &[])
             }
-            // Выкуп: деньги и отрицательное количество. Ноги `Principal`
-            // нет — бумага выбывает, а не возвращает номинал.
+            // Buyout: cash and a negative quantity. There is no `Principal`
+            // leg — the security leaves the position rather than repaying principal.
             OfferExerciseAction::Settled {
                 submission: _,
                 instrument,
@@ -522,9 +522,9 @@ impl Event {
         }
     }
 
-    /// Восстановленная позиция описывает только бумагу: денег в этом
-    /// событии не двигалось, иначе восстановление остатка выглядело бы
-    /// как реальная покупка (§10.7).
+    /// A reconstructed position describes only the security: no money moved in this
+    /// event, otherwise reconstructing the balance would look
+    /// like an actual purchase (§10.7).
     fn validate_opening_position(
         &self,
         name: &'static str,
@@ -536,7 +536,7 @@ impl Event {
         if !cash.is_empty() {
             return Err(EventValidationError::LegCount {
                 kind: name,
-                expected: "ни одной денежной ноги",
+                expected: "no monetary legs",
                 found: cash.len(),
             });
         }
@@ -544,7 +544,7 @@ impl Event {
         if security.len() != 1 {
             return Err(EventValidationError::LegCount {
                 kind: name,
-                expected: "ровно одна бумажная нога",
+                expected: "exactly one security leg",
                 found: security.len(),
             });
         }
@@ -560,17 +560,17 @@ impl Event {
         }
     }
 
-    /// Оценка не двигает ни денег, ни бумаг: это утверждение о цене.
-    /// Нога здесь означала бы, что кто-то записал переоценку как факт
-    /// движения, — а нереализованный результат движением не является.
+    /// A valuation moves neither money nor securities: it is a price assertion.
+    /// A leg here would mean that someone recorded revaluation as a movement
+    /// fact, — but an unrealized result is not a movement.
     fn validate_valuation(
         &self,
         name: &'static str,
         price: crate::numeric::decimal::Dec,
     ) -> Result<(), EventValidationError> {
-        // Нулевая и отрицательная цена дают отрицательную стоимость
-        // позиции и внешне правдоподобную доходность. Бумага может
-        // обесцениться до нуля — но это факт делистинга (E3), а не цена.
+        // A zero or negative price produces a negative position value
+        // and superficially plausible returns. A security may
+        // become worthless — but that is a delisting fact (E3), not a price.
         if !price.is_positive() {
             return Err(EventValidationError::NonPositive {
                 kind: name,
@@ -583,19 +583,19 @@ impl Event {
         } else {
             Err(EventValidationError::LegCount {
                 kind: name,
-                expected: "ни одной ноги",
+                expected: "no legs",
                 found: self.legs.len(),
             })
         }
     }
 
-    /// Контрольное утверждение: ног нет, интервал корректен, величины,
-    /// которые обязаны быть модулями, — неотрицательны.
+    /// Control assertion: no legs, a valid interval, and values
+    /// that must be magnitudes, — nonnegative.
     ///
-    /// Отрицательный денежный остаток пропускается намеренно: это
-    /// законное состояние (§11). Отрицательное количество бумаг — нет:
-    /// шорты вне периметра, и минус здесь означает либо шорт, либо
-    /// перепутанный знак при разборе.
+    /// A negative cash balance is intentionally allowed: it is
+    /// a valid state (§11). A negative security quantity is not:
+    /// shorts are out of scope, and a minus here means either a short or
+    /// a reversed sign during parsing.
     fn validate_control_assertion(
         &self,
         name: &'static str,
@@ -634,19 +634,19 @@ impl Event {
         } else {
             Err(EventValidationError::LegCount {
                 kind: name,
-                expected: "ни одной ноги",
+                expected: "no legs",
                 found: self.legs.len(),
             })
         }
     }
 }
 
-/// Расчётная сумма сделки со знаком денежной ноги (§7.2).
+/// Trade settlement amount with the cash-leg sign (§7.2).
 ///
-/// Тело плюс НКД, затем комиссия: при покупке она увеличивает списание,
-/// при продаже уменьшает приход. Знак задаётся направлением сделки —
-/// покупка списывает деньги, продажа зачисляет.
-/// Ожидание ноги непогашенного номинала.
+/// Principal plus accrued interest, then the fee: on purchase it increases the debit,
+/// on sale it reduces the credit. The sign is set by trade direction —
+/// a purchase debits cash, a sale credits it.
+/// Expected outstanding principal leg.
 fn principal_leg(account: AccountId, instrument: InstrumentId, money: Money) -> LegExpectation {
     LegExpectation {
         kind: LegKind::Principal,
@@ -658,7 +658,7 @@ fn principal_leg(account: AccountId, instrument: InstrumentId, money: Money) -> 
     }
 }
 
-/// Ожидание бумажной ноги со знаком.
+/// Expected signed security leg.
 fn security_leg(
     account: AccountId,
     custody: CustodyId,
@@ -675,7 +675,7 @@ fn security_leg(
     }
 }
 
-/// Ожидание денежной ноги.
+/// Expected monetary leg.
 fn cash_leg(account: AccountId, money: Money) -> LegExpectation {
     LegExpectation {
         kind: LegKind::Cash,
@@ -687,13 +687,13 @@ fn cash_leg(account: AccountId, money: Money) -> LegExpectation {
     }
 }
 
-/// Коэффициент замещения сверяется с парой количеств.
+/// The replacement ratio is checked against the pair of quantities.
 ///
-/// Без сверки коэффициент — необязательная подпись под числами, а E5
-/// именно по нему будет переносить налоговую стоимость. Дробная часть
-/// учитывается по тому, что с ней сделали: при выкупе или отбрасывании
-/// дроби количество преемника округлено вниз, и требовать точного
-/// равенства значило бы отвергать корректные замещения.
+/// Without this check the ratio is an optional label on the numbers, while E5
+/// will use it to transfer tax basis. The fractional part
+/// is handled according to what was done with it: when the fraction is bought out or discarded,
+/// the successor quantity is rounded down, and requiring exact
+/// equality would reject valid replacements.
 fn require_conversion_ratio(
     name: &'static str,
     ratio: Dec,
@@ -718,7 +718,7 @@ fn require_conversion_ratio(
     }
 }
 
-/// Компенсация дробей есть тогда и только тогда, когда дробь выкупили.
+/// Fractional compensation exists if and only if the fraction was bought out.
 fn require_fraction_compensation(
     name: &'static str,
     fractional: FractionalTreatment,
@@ -726,7 +726,7 @@ fn require_fraction_compensation(
 ) -> Result<(), EventValidationError> {
     let expected = match fractional {
         FractionalTreatment::CashCompensated => true,
-        // Дробь отброшена или её не возникло — платить не за что.
+        // The fraction was discarded or never arose — there is nothing to pay for.
         FractionalTreatment::RoundedDown | FractionalTreatment::NotApplicable => false,
     };
     if compensation.is_some() == expected {
@@ -767,13 +767,13 @@ fn trade_settlement(
 fn leg_money(name: &'static str, leg: &Leg) -> Result<Money, EventValidationError> {
     leg.money.ok_or(EventValidationError::LegCount {
         kind: name,
-        expected: "нога с указанной суммой",
+        expected: "leg with the specified amount",
         found: 0,
     })
 }
 
-/// Объявленные условия сделки. Отдельная структура, потому что порог
-/// `too-many-arguments-threshold = 6` действует, а подавлять линт нельзя.
+/// Declared trade terms. A separate structure because the
+/// `too-many-arguments-threshold = 6` applies, and the lint cannot be suppressed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TradeDeclaration {
     instrument: InstrumentId,
@@ -831,8 +831,8 @@ fn require_positive_quantity(
     }
 }
 
-/// Нога обязана лежать на счёте события: иначе одно событие двигало бы
-/// бумаги на чужом счёте, а лоты считались бы по своему.
+/// A leg must belong to the event account: otherwise one event would move
+/// securities in another account, while lots would be calculated in its own.
 fn require_own_account(
     name: &'static str,
     leg: AccountId,
@@ -896,8 +896,8 @@ fn require_equal(
     Ok(())
 }
 
-/// Конструкторы событий для тестов. Доступны и другим модулям крейты,
-/// поэтому вынесены из приватного `mod tests`.
+/// Event constructors for tests. Also available to other crate modules,
+/// so they are kept outside the private `mod tests`.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::provenance::{ParserVersion, Provenance, RawHash};
@@ -907,11 +907,11 @@ pub(crate) mod test_support {
     use crate::money::PostedMinor;
     use time::macros::date;
 
-    /// Событие произвольного типа для тестов модулей ядра.
+    /// Event of any type for core module tests.
     ///
-    /// Существует, чтобы тесты проекций не переписывали конверт события
-    /// в каждом модуле: переписанный вручную конверт незаметно расходится
-    /// с настоящим, и тест начинает проверять фикстуру, а не код.
+    /// Exists so projection tests do not rewrite the event envelope
+    /// in every module: a manually rewritten envelope can silently diverge
+    /// from the real one, and the test starts testing the fixture rather than the code.
     pub(crate) fn event_with(
         account: AccountId,
         day: time::Date,
@@ -946,9 +946,9 @@ pub(crate) mod test_support {
 
     pub(crate) fn sample_event_with(sequence: u32, relation: Relation) -> Event {
         let account = AccountId::new_random();
-        // Сумма записывается одним числом в минимальных единицах:
-        // группировка вида `10_000_00` не компилируется
-        // (clippy::inconsistent_digit_grouping входит в `all`, а `all = deny`).
+        // The amount is written as one number in minimal units:
+        // grouping like `10_000_00` does not compile
+        // (`clippy::inconsistent_digit_grouping` is included in `all`, and `all = deny`).
         let amount = Money::new(PostedMinor::new(1_000_000), CurrencyCode::Rub);
         Event {
             id: EventId::new_random(),
@@ -981,9 +981,9 @@ mod tests {
     use crate::money::{PostedMinor, Quantity};
     use time::macros::date;
 
-    // Суммы записываются в минимальных единицах одним числом: группировка
-    // вида `50_000_00` не компилируется (clippy::inconsistent_digit_grouping
-    // входит в `all`, а `all = deny`).
+    // Amounts are written in minimal units as one number: grouping
+    // like `50_000_00` does not compile (`clippy::inconsistent_digit_grouping`
+    // is included in `all`, and `all = deny`).
     fn rub(minor: i64) -> Money {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
     }
@@ -1019,7 +1019,7 @@ mod tests {
         ))
     }
 
-    // --- форма новых фактов (§4.7, §3.5) ---
+    // --- shape of new facts (§4.7, §3.5) ---
 
     struct Bond {
         account: AccountId,
@@ -1128,8 +1128,8 @@ mod tests {
             "0",
             vec![Leg::principal(bond.account, bond.instrument, rub(100_000))],
         );
-        // Поле названо явно: отказ по compensation или quantity прошёл
-        // бы этот тест, ничего не доказав про возврат номинала.
+        // The field is named explicitly: rejection on compensation or quantity would pass
+        // this test without proving anything about principal repayment.
         assert!(matches!(
             event.validate_structure().unwrap_err(),
             EventValidationError::NonPositive { field, .. } if field == "principal_returned_per_unit"
@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn amortisation_with_a_security_quantity_leg_is_rejected() {
-        // §6.5: амортизация выплачивает деньги, но количество не меняет.
+        // §6.5: amortization pays cash, but does not change the quantity.
         let bond = Bond::new();
         assert!(
             bond.amortisation(vec![
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn amortisation_with_a_cash_leg_is_rejected() {
-        // `Principal` уже денежная нога: пара дала бы двойной эффект.
+        // `Principal` is already a monetary leg: a pair would produce a double effect.
         let bond = Bond::new();
         assert!(
             bond.amortisation(vec![
@@ -1220,8 +1220,8 @@ mod tests {
 
     #[test]
     fn final_redemption_without_a_security_leg_is_rejected() {
-        // Обнулить номинал и оставить количество — позиция
-        // из погашенных бумаг, которой не существует.
+        // Zeroing the principal while retaining the quantity would create a position
+        // in redeemed securities, which does not exist.
         let bond = Bond::new();
         assert!(
             bond.redemption(vec![Leg::principal(
@@ -1236,8 +1236,8 @@ mod tests {
 
     #[test]
     fn final_redemption_with_a_positive_security_leg_is_rejected() {
-        // Знак — не описка: положительное количество означает приход
-        // бумаги, то есть противоположное движение.
+        // The sign is not a typo: a positive quantity means a security
+        // inflow, that is, the opposite movement.
         let bond = Bond::new();
         assert!(
             bond.redemption(vec![
@@ -1249,8 +1249,8 @@ mod tests {
         );
     }
 
-    /// Стороны замещения. Отдельная структура: порог
-    /// `too-many-arguments-threshold = 6` действует и в тестах.
+    /// Replacement sides. A separate structure: the
+    /// `too-many-arguments-threshold = 6` also applies in tests.
     #[derive(Debug, Clone, Copy)]
     struct Swap {
         account: AccountId,
@@ -1324,8 +1324,8 @@ mod tests {
 
     #[test]
     fn a_conversion_whose_ratio_contradicts_the_quantities_is_rejected() {
-        // Коэффициент — не подпись под числами: E5 переносит по нему
-        // налоговую стоимость.
+        // The ratio is not a label on the numbers: E5 uses it to transfer
+        // tax basis.
         let swap = Swap::new();
         assert_eq!(
             conversion(
@@ -1369,7 +1369,7 @@ mod tests {
 
     #[test]
     fn a_cash_leg_without_a_bought_out_fraction_is_rejected() {
-        // Деньги в замещении бывают только компенсацией дроби.
+        // Cash in a replacement can only be fractional compensation.
         let swap = Swap::new();
         assert!(
             conversion(
@@ -1484,7 +1484,7 @@ mod tests {
 
     #[test]
     fn a_settled_offer_has_no_principal_leg() {
-        // Бумага выбывает, а не возвращает номинал.
+        // The security leaves the position rather than repaying principal.
         let bond = Bond::new();
         assert!(
             bond.offer_settled(vec![
@@ -1501,23 +1501,23 @@ mod tests {
         Leg::security(account, CustodyId::new_random(), instrument, quantity)
     }
 
-    // --- Общие тестовые конструкторы ---
+    // --- Common test constructors ---
 
     #[test]
     fn sample_event_passes_structural_validation() {
-        // Конструктор из `test_support` используется другими модулями крейты
-        // как «обычное событие». Событие, не проходящее структурную проверку,
-        // в этой роли негодно: тесты исправлений опирались бы на факт,
-        // который журнал не принял бы.
+        // The constructor from `test_support` is used by other crate modules
+        // as a «normal event». An event that fails structural validation
+        // is unsuitable for this role: correction tests would rely on a fact
+        // that the journal would not accept.
         assert!(test_support::sample_event(0).validate_structure().is_ok());
     }
 
-    // --- Комиссия ---
+    // --- Fee ---
 
     #[test]
     fn fee_with_a_single_negative_leg_is_valid() {
-        // Комиссия — одна фактическая нога. Сумма ног в ноль не сходится,
-        // и это корректно: контрсчёта расхода в модели нет.
+        // A fee is one actual leg. The legs do not sum to zero,
+        // and that is correct: the model has no expense counteraccount.
         let acc = AccountId::new_random();
         let ev = event(
             EventKind::Fee {
@@ -1549,8 +1549,8 @@ mod tests {
 
     #[test]
     fn zero_fee_is_rejected() {
-        // Комиссия ноль — не факт о деньгах, а пропущенное поле источника.
-        // Граница строгая: `>= 0` отвергает, `> 0` пропустил бы.
+        // A zero fee is not a cash fact, but a missing source field.
+        // The boundary is strict: `>= 0` rejects, `> 0` would allow it.
         let acc = AccountId::new_random();
         let ev = event(
             EventKind::Fee {
@@ -1611,7 +1611,7 @@ mod tests {
         ));
     }
 
-    // --- Внешние деньги ---
+    // --- External cash ---
 
     #[test]
     fn cash_in_must_be_positive_and_match_the_declared_amount() {
@@ -1652,7 +1652,7 @@ mod tests {
 
     #[test]
     fn zero_cash_in_is_rejected() {
-        // Ноль — не приход. Граница строгая: `> 0`, а не `>= 0`.
+        // Zero is not an inflow. The boundary is strict: `> 0`, not `>= 0`.
         let acc = AccountId::new_random();
         let ev = event(
             EventKind::CashIn { amount: rub(0) },
@@ -1728,8 +1728,8 @@ mod tests {
 
     #[test]
     fn opening_cash_accepts_either_sign() {
-        // Восстановленный остаток может быть и отрицательным (маржинальный
-        // долг), и нулевым: это факт о состоянии, а не о движении.
+        // A reconstructed balance may be negative (margin
+        // debt) or zero: this is a state fact, not a movement.
         let acc = AccountId::new_random();
         for amount in [rub(5_000_000), rub(-5_000_000), rub(0)] {
             let ev = event(
@@ -1739,7 +1739,7 @@ mod tests {
             );
             assert!(
                 ev.validate_structure().is_ok(),
-                "остаток {} должен приниматься",
+                "balance {} should be accepted",
                 amount.amount().raw()
             );
         }
@@ -1790,7 +1790,7 @@ mod tests {
         ));
     }
 
-    // --- Перевод ---
+    // --- Transfer ---
 
     #[test]
     fn transfer_requires_two_matching_sides() {
@@ -1812,8 +1812,8 @@ mod tests {
         );
         assert!(ok.validate_structure().is_ok());
 
-        // 100 000,00 ушло, 99 000,00 пришло: остаток −1 000,00, то есть
-        // −100 000 минимальных единиц.
+        // 100 000,00 left, 99 000,00 arrived: residual −1 000,00, that is
+        // −100 000 minimal units.
         let lopsided = event(
             kind,
             vec![
@@ -1899,9 +1899,9 @@ mod tests {
 
     #[test]
     fn transfer_to_the_same_account_is_not_a_movement() {
-        // Один счёт по обе стороны — не движение денег: ни один остаток
-        // не меняется. Отказ приходит по существу, а не потому, что
-        // остаток ног случайно не сошёлся.
+        // The same account on both sides is not a cash movement: no balance
+        // changes. The rejection gives the actual reason, not that
+        // the leg residual happened not to balance.
         let acc = AccountId::new_random();
         let ev = event(
             EventKind::CashTransfer {
@@ -1924,9 +1924,9 @@ mod tests {
 
     #[test]
     fn a_transfer_to_self_of_nothing_is_rejected_too() {
-        // Вырожденный случай: две нулевые ноги на одном счёте дают нулевой
-        // остаток, и проверка сходимости пропустила бы событие. Отказ должен
-        // приходить от проверки счетов, а не от арифметики ног.
+        // Degenerate case: two zero legs on one account produce zero
+        // residual, so the balance check would allow the event. Rejection must
+        // come from the account check, not leg arithmetic.
         let acc = AccountId::new_random();
         let ev = event(
             EventKind::CashTransfer {
@@ -1946,8 +1946,8 @@ mod tests {
 
     #[test]
     fn the_self_transfer_check_runs_before_the_legs_are_read() {
-        // Ног нет вовсе — отказ всё равно называет настоящую причину,
-        // а не «ожидалось ровно две денежные ноги».
+        // There are no legs at all — the rejection still names the real reason,
+        // not «exactly two monetary legs expected».
         let acc = AccountId::new_random();
         let ev = event(
             EventKind::CashTransfer {
@@ -1994,9 +1994,9 @@ mod tests {
 
     #[test]
     fn a_principal_leg_does_not_disturb_the_transfer_check() {
-        // `LegKind::Principal` попадает в `cash_effect`, но проверка перевода
-        // смотрит только на ноги вида `Cash`: амортизация номинала не должна
-        // выглядеть как третья сторона перевода.
+        // `LegKind::Principal` is included in `cash_effect`, but transfer validation
+        // considers only `Cash` legs: principal amortization must not
+        // look like a third transfer party.
         let from = AccountId::new_random();
         let to = AccountId::new_random();
         let ev = event(
@@ -2016,10 +2016,10 @@ mod tests {
         assert!(ev.validate_structure().is_ok());
     }
 
-    // --- Сделка ---
+    // --- Trade ---
 
-    /// Именно этот класс ошибок пропускало прежнее «освобождение
-    /// событий с бумажной ногой» от проверки.
+    /// This is exactly the error class the former «exemption
+    /// for events with a security leg» allowed through.
     #[test]
     fn buy_with_the_wrong_cash_sign_is_rejected() {
         let acc = AccountId::new_random();
@@ -2032,7 +2032,7 @@ mod tests {
             fee: Some(rub(3_500)),
             accrued_interest: None,
         };
-        // Покупка обязана списывать деньги: −50 035,00.
+        // A purchase must debit cash: −50 035,00.
         let wrong = event(
             kind.clone(),
             vec![
@@ -2059,7 +2059,7 @@ mod tests {
 
     #[test]
     fn buy_settlement_includes_accrued_interest() {
-        // НКД платится продавцу сверх тела: 50 000 + 1 200 + 35 = 51 235.
+        // Accrued interest is paid to the seller on top of principal: 50 000 + 1 200 + 35 = 51 235.
         let acc = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let ev = event(
@@ -2082,7 +2082,7 @@ mod tests {
 
     #[test]
     fn sell_settlement_subtracts_the_fee() {
-        // Продажа: 50 000 + НКД 1 200 − комиссия 35 = 51 165 приходит.
+        // Sale: 50 000 + accrued interest 1 200 − fee 35 = 51 165 received.
         let acc = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let ev = event(
@@ -2105,8 +2105,8 @@ mod tests {
 
     #[test]
     fn a_trade_without_a_fee_settles_at_body_plus_accrued_interest() {
-        // Комиссии нет — расчётная сумма не должна ни прибавлять,
-        // ни вычитать её значение по умолчанию.
+        // There is no fee — the settlement amount must neither add
+        // nor subtract its default value.
         let acc = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let buy = event(
@@ -2146,8 +2146,8 @@ mod tests {
 
     #[test]
     fn the_fee_moves_the_settlement_in_opposite_directions() {
-        // Одна и та же комиссия увеличивает списание при покупке
-        // и уменьшает приход при продаже: 50 035 против 49 965.
+        // The same fee increases the debit on purchase
+        // and reduces the credit on sale: 50 035 versus 49 965.
         let acc = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let buy_at_sell_amount = event(
@@ -2261,7 +2261,7 @@ mod tests {
         ));
     }
 
-    // --- Восстановленная позиция ---
+    // --- Reconstructed position ---
 
     #[test]
     fn opening_position_is_a_single_security_leg_without_cash() {
@@ -2282,8 +2282,8 @@ mod tests {
 
     #[test]
     fn opening_position_with_a_cash_leg_is_rejected() {
-        // Восстановление остатка не двигает деньги: иначе оно попало бы
-        // в денежный поток как реальная покупка.
+        // Reconstructing a balance does not move cash: otherwise it would enter
+        // cash flow as an actual purchase.
         let acc = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let ev = event(
@@ -2335,7 +2335,7 @@ mod tests {
         ));
     }
 
-    // --- Общие правила формы ---
+    // --- General shape rules ---
 
     #[test]
     fn a_leg_of_another_currency_is_not_silently_compared() {
@@ -2358,8 +2358,8 @@ mod tests {
 
     #[test]
     fn a_cash_leg_without_an_amount_is_rejected() {
-        // Нога вида `Cash` обязана нести сумму: `None` здесь — не ноль,
-        // а отсутствующий факт (§4.9).
+        // A `Cash` leg must carry an amount: `None` here is not zero,
+        // but a missing fact (§4.9).
         let acc = AccountId::new_random();
         let ev = event(
             EventKind::CashIn {
@@ -2378,7 +2378,7 @@ mod tests {
         assert!(matches!(
             ev.validate_structure(),
             Err(EventValidationError::LegCount {
-                expected: "нога с указанной суммой",
+                expected: "leg with the specified amount",
                 ..
             })
         ));
@@ -2411,18 +2411,18 @@ mod tests {
         assert!(matches!(
             ev.validate_structure(),
             Err(EventValidationError::LegCount {
-                expected: "нога с указанной суммой",
+                expected: "leg with the specified amount",
                 ..
             })
         ));
     }
 
-    // --- Денежный эффект события ---
+    // --- Event monetary effect ---
 
     #[test]
     fn cash_effect_sums_every_money_bearing_leg() {
-        // Покупка на 50 000 с комиссией 35 уменьшает остаток на 50 035:
-        // бумажная нога денег не двигает, комиссия — двигает.
+        // A purchase for 50 000 with a fee of 35 reduces the balance by 50 035:
+        // the security leg does not move cash, the fee does.
         let acc = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let ev = event(
@@ -2446,8 +2446,8 @@ mod tests {
 
     #[test]
     fn cash_effect_counts_only_the_requested_currency() {
-        // Ноги в разных валютах не складываются и не отбрасывают друг друга:
-        // запрошенная валюта выбирается, остальные игнорируются.
+        // Legs in different currencies are neither added nor offset:
+        // the requested currency is selected, the others are ignored.
         let acc = AccountId::new_random();
         let ev = event(
             EventKind::OpeningCash {
@@ -2488,7 +2488,7 @@ mod tests {
 
     #[test]
     fn unknown_confidence_is_representable_without_a_placeholder() {
-        // Неизвестная уверенность — отдельное значение, а не ноль (§4.9).
+        // Unknown confidence is a distinct value, not zero (§4.9).
         let acc = AccountId::new_random();
         let mut ev = event(
             EventKind::CashIn {
@@ -2501,7 +2501,7 @@ mod tests {
         assert_eq!(ev.confidence, Confidence::Unknown);
         assert_ne!(Confidence::Unknown, Confidence::Estimated);
         assert_ne!(Confidence::Unknown, Confidence::Known);
-        // Форма события от уверенности не зависит.
+        // Event shape does not depend on confidence.
         assert!(ev.validate_structure().is_ok());
     }
 
@@ -2516,15 +2516,15 @@ mod tests {
             acc,
         );
         assert_eq!(ev.schema_version, SCHEMA_VERSION);
-        // Литерал закреплён намеренно: подъём версии схемы обязан быть
-        // осознанным решением, а не побочным следствием правки. Каждое
-        // изменение этой строки требует ответа на вопрос, читаются ли
-        // уже записанные факты прежних версий (§4.1).
+        // The literal is fixed intentionally: raising the schema version must be
+        // a conscious decision, not a side effect of an edit. Every
+        // change to this line requires answering whether previously recorded
+        // facts from older versions remain readable (§4.1).
         //
-        // 1 → 2: добавлен `EventKind::Valuation`.
-        // 2 → 3: добавлен `EventKind::ControlAssertion` (§10.3).
-        // 3 → 4: добавлены `EventKind::CorporateAction` и
-        //        `EventKind::OfferExercise`, а `Income` получил вид (§4.7).
+        // 1 → 2: added `EventKind::Valuation`.
+        // 2 → 3: added `EventKind::ControlAssertion` (§10.3).
+        // 3 → 4: added `EventKind::CorporateAction` and
+        //        `EventKind::OfferExercise`, and `Income` gained a kind (§4.7).
         assert_eq!(SCHEMA_VERSION, 4);
     }
 
@@ -2545,11 +2545,11 @@ mod tests {
         assert!(event.validate_structure().is_ok());
     }
 
-    // --- Сверка ноги с событием и знаки величин ---
+    // --- Matching legs to events and value signs ---
     //
-    // Каждый отказ проверяется отдельно: без этого мутационный заслон
-    // показывает, что проверку можно заменить на `Ok(())` и ни один
-    // тест не заметит (проверено — так и было).
+    // Every rejection is tested separately: without this the mutation gate
+    // shows that validation can be replaced with `Ok(())` and no
+    // test notices (verified — that was indeed the case).
 
     fn buy_with(acc: AccountId, instrument: InstrumentId, quantity: Quantity, leg: Leg) -> Event {
         event(
@@ -2587,9 +2587,9 @@ mod tests {
 
     #[test]
     fn a_trade_of_negative_quantity_is_rejected() {
-        // Отрицательное количество в покупке — это шорт, а шорты вне
-        // периметра (§11): их денежный эффект сохраняется отдельным
-        // типом события, а не отрицательной сделкой.
+        // A negative purchase quantity is a short, and shorts are out of
+        // scope (§11): their monetary effect is preserved as a separate
+        // event type, not a negative trade.
         let acc = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let ev = buy_with(
@@ -2711,7 +2711,7 @@ mod tests {
 
     #[test]
     fn a_purchase_whose_leg_reduces_the_position_is_rejected() {
-        // Знак задан направлением сделки: покупка увеличивает позицию.
+        // The sign is determined by trade direction: a purchase increases the position.
         let acc = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let ev = buy_with(
@@ -2820,9 +2820,9 @@ mod tests {
 
     #[test]
     fn a_valuation_at_zero_or_below_is_rejected() {
-        // Нулевая цена даёт нулевую стоимость позиции и правдоподобную
-        // доходность. Обесценившаяся бумага — это факт делистинга (E3),
-        // а не цена.
+        // A zero price gives a zero position value and plausible
+        // returns. A worthless security is a delisting fact (E3),
+        // not a price.
         let acc = AccountId::new_random();
         for price in [
             crate::numeric::decimal::Dec::zero(),
@@ -2857,9 +2857,9 @@ mod tests {
 
     #[test]
     fn a_control_assertion_carries_no_legs() {
-        // Утверждение о полноте интервала не двигает денег. Нога у него
-        // означала бы, что контрольная секция отчёта попала в остаток
-        // вторым экземпляром и удвоила его.
+        // An assertion about interval completeness does not move cash. A leg on it
+        // would mean the report's control section entered the balance
+        // a second time and doubled it.
         use crate::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 
         let account = AccountId::new_random();
@@ -2891,10 +2891,10 @@ mod tests {
 
     #[test]
     fn a_control_assertion_with_an_inverted_period_is_rejected() {
-        // Конструктор такой интервал не создаёт, но событие приходит
-        // и из JSON, где конструктор не вызывался. Валидация формы —
-        // второй рубеж, и он обязан ловить состояние, а не полагаться
-        // на то, что первый рубеж отработал.
+        // The constructor does not create such an interval, but the event also comes
+        // from JSON, where the constructor was not called. Shape validation is
+        // the second line of defense, and it must catch the state rather than rely
+        // on the first line having worked.
         use crate::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 
         assert!(AssertionPeriod::between(date!(2026 - 03 - 31), date!(2026 - 03 - 01)).is_none());
@@ -2929,10 +2929,10 @@ mod tests {
 
     #[test]
     fn negative_totals_are_rejected_but_a_negative_cash_balance_is_not() {
-        // Отрицательный остаток — законное состояние (§11): технический
-        // овердрафт и тайминги расчётов. Отрицательная сумма комиссий
-        // законным состоянием не является: это ошибка разбора знака,
-        // и принять её значит внести её в журнал навсегда.
+        // A negative balance is a valid state (§11): technical
+        // overdrafts and settlement timing. A negative fee total
+        // is not a valid state: it is a sign-parsing error,
+        // and accepting it means recording it in the journal forever.
         use crate::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 
         let account = AccountId::new_random();
@@ -2972,9 +2972,9 @@ mod tests {
 
     #[test]
     fn a_negative_position_quantity_is_outside_the_perimeter() {
-        // Шорты вне периметра (§11). Отрицательное количество в контрольной
-        // секции означает либо шорт, либо перепутанный знак — принимать
-        // нельзя ни то, ни другое.
+        // Shorts are out of scope (§11). A negative quantity in the control
+        // section means either a short or a reversed sign — neither
+        // can be accepted.
         use crate::numeric::decimal::Dec;
         use crate::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
         use rust_decimal::Decimal;

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Запрет ослабления проверок в диффе (§15.7).
-# Агент, столкнувшись с падающим линтом, склонен добавить allow вместо исправления.
+# Guard against weakening checks in the diff (§15.7).
+# When faced with a failing lint, an agent may add an allow instead of fixing the issue.
 set -euo pipefail
 
-# Корень ищется от каталога самого скрипта, а не от cwd вызывающего: запуск
-# из не-git каталога иначе даёт пустую строку и `cd ""`, то есть заслон
-# проверяет не тот каталог. Не определили корень — это отказ заслона.
+# Determine the root from the script directory, not the caller's cwd: otherwise,
+# running from a non-git directory yields an empty string and `cd ""`, causing the
+# guard to check the wrong directory. If the root cannot be determined, refuse to proceed.
 if ! REPO_ROOT=$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null); then
-  echo "DIFF-LINT: не удалось определить корень репозитория от $(dirname -- "${BASH_SOURCE[0]}")" >&2
+  echo "DIFF-LINT: could not determine the repository root from $(dirname -- "${BASH_SOURCE[0]}")" >&2
   exit 1
 fi
 cd "$REPO_ROOT"
@@ -15,88 +15,88 @@ cd "$REPO_ROOT"
 BASE="${1:-}"
 
 if [ -z "$BASE" ]; then
-  echo "ОШИБКА: база для сравнения не передана." >&2
-  echo "Заслон, который молча пропускает себя при отсутствии базы, бесполезен:" >&2
-  echo "именно в этом состоянии через него и пройдёт ослабление проверки." >&2
+  echo "ERROR: comparison base was not provided." >&2
+  echo "A guard that silently skips itself when the base is absent is useless:" >&2
+  echo "that is exactly the state in which weakened checks would pass through it." >&2
   exit 1
 fi
 
-# База может быть коммитом (обычный случай) или деревом: CI при первом push
-# в ветку подставляет хеш пустого дерева. Формы диффа для них РАЗНЫЕ.
-# `git diff <tree>...HEAD` — фатальная ошибка «is a tree, not a commit»,
-# и с `|| true` на пайплайне она читалась бы как «нарушений нет».
-# Поэтому база разбирается явно, а `git diff` вызывается без маскировки кода.
+# The base may be a commit (the usual case) or a tree: on the first push to a
+# branch, CI supplies the hash of the empty tree. The diff forms are DIFFERENT.
+# `git diff <tree>...HEAD` fails with the fatal error “is a tree, not a commit”,
+# and with `|| true` on the pipeline it would be interpreted as “no violations”.
+# Therefore, resolve the base explicitly and invoke `git diff` without masking its status.
 if BASE_RESOLVED=$(git rev-parse --verify --quiet "${BASE}^{commit}"); then
   DIFF_RANGE=("${BASE_RESOLVED}...HEAD")
 elif BASE_RESOLVED=$(git rev-parse --verify --quiet "${BASE}^{tree}"); then
   DIFF_RANGE=("$BASE_RESOLVED" "HEAD")
 else
-  echo "ОШИБКА: база $BASE недоступна (ни коммит, ни дерево). Заслон не может отработать." >&2
+  echo "ERROR: base $BASE is unavailable (neither a commit nor a tree). The guard cannot run." >&2
   exit 1
 fi
 
-# Пустой диапазон — законная ситуация (например, коммит без .rs-файлов),
-# но она не должна маскировать отсутствие базы, проверенное выше.
+# An empty range is valid (for example, a commit without .rs files),
+# but it must not mask the absence of a base, which was checked above.
 
-# Только добавленные строки в .rs файлах.
-# `git diff` вызывается отдельно и его код возврата проверяется: `|| true`,
-# привязанный ко всему пайплайну, спрятал бы падение самого git.
+# Only added lines in .rs files.
+# `git diff` is invoked separately and its exit status is checked: `|| true`
+# attached to the entire pipeline would hide a failure in git itself.
 if ! diff_out=$(git diff "${DIFF_RANGE[@]}" -- '*.rs'); then
-  echo "ОШИБКА: git diff ${DIFF_RANGE[*]} не выполнился — заслон не может быть проверен." >&2
+  echo "ERROR: git diff ${DIFF_RANGE[*]} did not run — guard cannot be checked." >&2
   exit 1
 fi
-# awk вместо `grep '^+' | grep -v '^+++'`: одна команда, всегда код 0,
-# нечего маскировать. Заголовки файлов (+++) отбрасываются.
+# Use awk instead of `grep '^+' | grep -v '^+++'`: one command, always status 0,
+# with nothing to mask. File headers (+++) are discarded.
 added=$(printf '%s\n' "$diff_out" | awk '/^\+\+\+/ { next } /^\+/ { print }')
 
 fail=0
 check() {
   local pattern="$1" msg="$2"
   local hits
-  # Herestring, а не пайп: под pipefail пайп с `|| true` на конце скрывает
-  # падение источника. grep без -q — досрочного закрытия пайпа нет.
+  # Use a here-string, not a pipeline: under pipefail, a pipeline ending in
+  # `|| true` hides a source failure. grep without -q does not close the pipe early.
   hits=$(grep -E -- "$pattern" <<<"$added" || true)
   if [ -n "$hits" ]; then
-    echo "ЗАПРЕЩЕНО: $msg" >&2
+    echo "FORBIDDEN: $msg" >&2
     echo "$hits" >&2
     echo "" >&2
     fail=1
   fi
 }
 
-check '#!?\[allow\(' 'новый allow(...) — исправьте причину, а не подавляйте линт'
-check '#!?\[expect\(' 'новый expect(...) — то же самое другими словами'
-check 'cfg_attr\(.*allow\(' 'подавление линта через cfg_attr'
-check '#\[ignore\]' 'новый #[ignore] — отключённый тест не считается тестом'
-check '\btodo!\(|\bunimplemented!\(' 'todo!/unimplemented! в коде'
-check '#\[cfg\(ignore\)\]' 'отключение кода через cfg(ignore)'
+check '#!?\[allow\(' 'new allow(...) — fix the cause instead of suppressing the lint'
+check '#!?\[expect\(' 'new expect(...) — the same thing in different words'
+check 'cfg_attr\(.*allow\(' 'lint suppression through cfg_attr'
+check '#\[ignore\]' 'new #[ignore] — a disabled test does not count as a test'
+check '\btodo!\(|\bunimplemented!\(' 'todo!/unimplemented! in code'
+check '#\[cfg\(ignore\)\]' 'disabling code through cfg(ignore)'
 
-# --- Изменения самих заслонов и их конфигурации ---
-# Ослабить проверку можно не только в коде: достаточно снять -D warnings,
-# исключить модуль из мутационного тестирования или поправить сам скрипт.
-# Пути заданы каталогами: pathspec каталога покрывает всё под ним и не
-# зависит от режима globbing. Манифесты крейт сюда не входят намеренно —
-# потерю `[lints] workspace = true` ловит scripts/check-architecture.sh.
+# --- Changes to the guards themselves and their configuration ---
+# Checks can be weakened outside the code as well: it is enough to remove -D warnings,
+# exclude a module from mutation testing, or change this script itself.
+# Paths are specified as directories: a directory pathspec covers everything beneath it
+# and does not depend on globbing mode. Crate manifests are intentionally omitted here —
+# the loss of `[lints] workspace = true` is caught by scripts/check-architecture.sh.
 if ! policy_files=$(git diff --name-only "${DIFF_RANGE[@]}" -- \
   '.github/workflows' 'scripts' 'deny.toml' 'clippy.toml' \
   '.cargo/mutants.toml' 'Cargo.toml' 'tests/fixtures' \
   'flake.nix' 'flake.lock' 'rustfmt.toml'); then
-  echo "ОШИБКА: git diff --name-only не выполнился — заслон не может быть проверен." >&2
+  echo "ERROR: git diff --name-only did not run — guard cannot be checked." >&2
   exit 1
 fi
 if [ -n "$policy_files" ]; then
-  echo "ВНИМАНИЕ: изменены файлы политики качества:" >&2
+  echo "WARNING: quality-policy files changed:" >&2
   echo "$policy_files" >&2
-  echo "Такие изменения допустимы только с обоснованием в описании бида." >&2
-  echo "Пометьте PR меткой 'policy-change', иначе заслон не пропустит." >&2
+  echo "Such changes are allowed only with justification in the bead description." >&2
+  echo "Label the PR with 'policy-change'; otherwise, the guard will reject it." >&2
   if [ "${POLICY_CHANGE_APPROVED:-0}" != "1" ]; then
     fail=1
   fi
 fi
 
 if [ "$fail" -ne 0 ]; then
-  echo "Если ослабление действительно необходимо — обоснуйте его в описании бида" >&2
-  echo "и добавьте исключение в этот скрипт отдельным коммитом." >&2
+  echo "If the weakening is actually necessary, justify it in the bead description" >&2
+  echo "and add an exclusion to this script in a separate commit." >&2
   exit 1
 fi
-echo "Diff-lint пройден."
+echo "Diff-lint passed."

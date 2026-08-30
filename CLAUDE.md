@@ -74,4 +74,22 @@ _Add a brief overview of your project architecture_
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+### Language
+
+**Everything you write is in English: code and documents alike.**
+Identifiers, test names, doc comments, inline comments, `#[error(...)]`
+texts, API response messages, and any new document — specs, plans, ADRs,
+guides.
+
+One exception: **values that come from a source.** Strings compared
+against an external source's response stay as they are — `"Оферта"` in
+`iaam-market` is a MOEX ISS value, not our text, and translating it
+breaks parsing. Same for broker report sheet and column names.
+
+Existing Russian documents under `docs/`, `README.md` and `.internal/`
+are left alone; they are not retranslated. Anything **new** goes in
+English, including new sections of those files.
+
+Take domain terms from `docs/glossary-ru-en.md`. If a term is missing,
+add it before using it: a synonym invented on the spot breaks grep worse
+than an awkward but shared one.

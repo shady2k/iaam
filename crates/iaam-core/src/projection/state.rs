@@ -1,10 +1,10 @@
-//! Состояние проекции и его отпечаток.
+//! Projection state and its fingerprint.
 //!
-//! Отпечаток нужен не для целостности хранилища, а для того, чтобы
-//! `advance` мог отказаться продвигать снимок, который кто-то собрал
-//! или изменил мимо ядра (§3.1). Считается по упорядоченным структурам:
-//! порядок обхода `BTreeMap` детерминирован, поэтому один и тот же
-//! журнал всегда даёт один и тот же отпечаток.
+//! The fingerprint is needed not for storage integrity, but so that
+//! `advance` can refuse to advance a snapshot that someone assembled
+//! or modified outside the core (§3.1). It is computed over ordered structures:
+//! `BTreeMap` traversal order is deterministic, so the same
+//! journal always produces the same fingerprint.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -22,7 +22,7 @@ use crate::event::{Confidence, Event};
 use crate::ids::AccountId;
 use crate::valuation::PriceBoard;
 
-/// Отпечаток состояния: SHA-256 по упорядоченному обходу.
+/// State fingerprint: SHA-256 over an ordered traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StateHash([u8; 32]);
 
@@ -42,25 +42,25 @@ impl fmt::Display for StateHash {
     }
 }
 
-/// Что видел журнал: границы истории и доля непроверенного (§10.7).
+/// What the journal has seen: history boundaries and the unverified share (§10.7).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coverage {
     events_applied: u64,
-    /// Начало покрытия по каждому счёту.
+    /// Coverage start for each account.
     ///
-    /// Глобальная граница отвечает на вопрос отчёта «с какого дня
-    /// вообще есть данные» (§10.7), но для сверки выплат она врёт:
-    /// счёт, заведённый восстановленным остатком позже, унаследовал бы
-    /// чужое покрытие и получил бы обвинение вместо недоказуемости.
+    /// The global boundary answers the report question, «from what date
+    /// is any data available at all» (§10.7), but it is misleading for payout reconciliation:
+    /// an account created later with a restored balance would inherit
+    /// another account's coverage and be reported as a mismatch rather than unprovable.
     first_event_by_account: BTreeMap<AccountId, Date>,
     first_event: Option<Date>,
     last_event: Option<Date>,
-    /// Счета, история которых начата восстановленным остатком,
-    /// а не наблюдаемой операцией.
+    /// Accounts whose history starts with a restored balance,
+    /// rather than an observed transaction.
     restored_accounts: BTreeSet<AccountId>,
-    /// События, чьё значение записано как оценка, а не как известный факт
-    /// (§4.9). Это **не** уровень сверки: сверка появляется в E2 и живёт
-    /// отдельным утверждением о счёте и интервале, а не полем события.
+    /// Events whose value is recorded as an estimate rather than a known fact
+    /// (§4.9). This is **not** a reconciliation level: reconciliation appears in E2 and exists
+    /// as a separate assertion about an account and interval, not as an event field.
     estimated_events: u64,
 }
 
@@ -70,14 +70,14 @@ impl Coverage {
         self.events_applied
     }
 
-    /// Дата первого учтённого события. Отчёт обязан её показывать:
-    /// «XIRR посчитан с 01.03.2024, ранее данных нет» (§10.7).
+    /// Date of the first recorded event. The report must show it:
+    /// «XIRR calculated from 01.03.2024; no earlier data is available» (§10.7).
     #[must_use]
     pub const fn first_event(&self) -> Option<Date> {
         self.first_event
     }
 
-    /// Начало покрытия конкретного счёта.
+    /// Coverage start for a specific account.
     #[must_use]
     pub fn first_event_for(&self, account: AccountId) -> Option<Date> {
         self.first_event_by_account.get(&account).copied()
@@ -128,7 +128,7 @@ impl Coverage {
     }
 }
 
-/// Полное состояние проекции.
+/// Complete projection state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LedgerState {
     balances: Balances,
@@ -167,7 +167,7 @@ impl LedgerState {
         &self.flows
     }
 
-    /// Датированные факты дохода: с ними сверяется график выплат.
+    /// Dated income facts used to reconcile the payout schedule.
     #[must_use]
     pub const fn income(&self) -> &IncomeLedger {
         &self.income
@@ -199,31 +199,31 @@ impl LedgerState {
         self.coverage.observe(event);
     }
 
-    /// Отпечаток состояния.
+    /// State fingerprint.
     ///
-    /// Считается по **канонической сериализации всего состояния**, а не по
-    /// перечислению полей вручную. Ручное перечисление проверено ревью
-    /// и оказалось неполным: в него не попали реализованный результат,
-    /// стоимость приобретений и списаний, версия правила списания
-    /// и границы истории. Отпечаток, покрывающий часть состояния, обещает
-    /// больше, чем даёт: снимок с изменённым непокрытым полем прошёл бы
-    /// проверку. Сериализация покрывает всё, что состояние содержит,
-    /// по построению.
+    /// Computed from the **canonical serialization of the entire state**, not by
+    /// enumerating fields manually. The manual enumeration was reviewed
+    /// and found to be incomplete: it omitted realised results,
+    /// acquisition and disposal costs, the disposal rule version,
+    /// and history boundaries. A fingerprint covering only part of the state promises
+    /// more than it provides: a snapshot with a modified uncovered field would pass
+    /// validation. Serialization covers everything contained in the state
+    /// by construction.
     ///
-    /// CBOR, а не JSON, по той же причине, что и в хранилище: карты
-    /// состояния имеют составные ключи, которые JSON не представляет.
-    /// Обход `BTreeMap` детерминирован, `Decimal` сериализуется точно,
-    /// двоичной плавающей точки в состоянии нет — поэтому один и тот же
-    /// журнал всегда даёт один и тот же отпечаток.
+    /// CBOR rather than JSON, for the same reason as in storage: state maps
+    /// have compound keys, which JSON cannot represent.
+    /// `BTreeMap` traversal is deterministic, `Decimal` is serialized exactly,
+    /// and the state contains no binary floating-point values, so the same
+    /// journal always produces the same fingerprint.
     #[must_use]
     pub fn fingerprint(&self) -> StateHash {
         let mut body = Vec::new();
-        // Отказ сериализации здесь невозможен: пишем в вектор в памяти,
-        // а состояние состоит из типов, у которых `Serialize` выведен.
-        // Тем не менее отпечаток не подменяется заглушкой: одинаковый
-        // отпечаток у разных состояний хуже, чем паника.
+        // Serialization cannot fail here: we write to an in-memory vector,
+        // and the state consists of types with derived `Serialize`.
+        // Nevertheless, the fingerprint is not replaced with a placeholder: the same
+        // fingerprint for different states is worse than a panic.
         ciborium::into_writer(self, &mut body)
-            .unwrap_or_else(|error| panic!("состояние не сериализуется: {error}"));
+            .unwrap_or_else(|error| panic!("state cannot be serialized: {error}"));
         let mut hasher = Sha256::new();
         hasher.update(b"iaam/ledger-state/v2");
         hasher.update(body);
@@ -231,23 +231,23 @@ impl LedgerState {
     }
 }
 
-/// Отпечаток префикса журнала, свёрнутого в снимок.
+/// Fingerprint of the journal prefix folded into the snapshot.
 ///
-/// Отвечает на вопрос, на который отпечаток состояния не отвечает:
-/// «те ли это события». Событие, добавленное задним числом **до** границы
-/// снимка, не меняет ни границу, ни состояние снимка — и без этой
-/// проверки просто исчезло бы из расчёта.
+/// Answers the question that the state fingerprint does not:
+/// «are these the same events». An event backdated **before** the snapshot
+/// boundary changes neither the boundary nor the snapshot state, and without this
+/// check would simply disappear from the calculation.
 ///
-/// В отпечаток входит каноническое CBOR-тело каждого события, а не только
-/// его идентичность. `provenance.raw_hash()` для этой роли не годится:
-/// это отпечаток сырого поданного факта, который не меняется, когда
-/// приложение выводит производное поле. При этом `raw_hash` обязан
-/// оставаться прежним для дедупликации: повтор того же брокерского факта
-/// должен остаться дубликатом.
+/// The fingerprint includes the canonical CBOR body of each event, not just
+/// its identity. `provenance.raw_hash()` is not suitable for this purpose:
+/// it is the fingerprint of the raw submitted fact, which does not change when
+/// the application derives a field. At the same time, `raw_hash` must
+/// remain unchanged for deduplication: resubmitting the same brokerage fact
+/// must remain a duplicate.
 ///
-/// Отпечаток чувствителен к любому будущему полю [`Event`]. Добавление
-/// поля обесценит все снимки и вызовет полный пересчёт. Это осознанная
-/// цена: молча посчитать по устаревшему снимку хуже, чем пересчитать.
+/// The fingerprint is sensitive to any future [`Event`] field. Adding
+/// a field will invalidate all snapshots and trigger a full recalculation. This is a deliberate
+/// tradeoff: silently calculating from a stale snapshot is worse than recalculating.
 #[must_use]
 pub fn prefix_digest(events: &[&Event]) -> StateHash {
     let mut hasher = Sha256::new();
@@ -258,15 +258,16 @@ pub fn prefix_digest(events: &[&Event]) -> StateHash {
             .to_be_bytes(),
     );
     for event in events {
-        // Идентичность подаётся отдельно, хотя тело её и содержит:
-        // так покрытие ключевых полей не зависит от того, что однажды
-        // сделают с их сериализацией.
+        // The identity is fed separately even though the body contains it:
+        // this ensures that coverage of key fields does not depend on what may eventually
+        // be done to their serialization.
         hasher.update(event.id.inner().as_bytes());
         feed_date(&mut hasher, event.order.date());
         hasher.update(event.order.sequence().to_be_bytes());
         let mut body = Vec::new();
-        ciborium::into_writer(event, &mut body)
-            .expect("событие сериализуемо: обратное — дефект типа, а не данных");
+        ciborium::into_writer(event, &mut body).expect(
+            "event must be serializable: otherwise this is a type defect, not a data error",
+        );
         hasher.update(&body);
     }
     StateHash(hasher.finalize().into())
@@ -317,9 +318,9 @@ mod tests {
     fn known_allocation() -> BasisAllocation {
         BasisAllocation::Known {
             share: ReturnedShare::new(Dec::new(Decimal::new(1, 1)))
-                .expect("доля в пределах инварианта"),
+                .expect("share is within invariant"),
             evidence: AllocationEvidence {
-                inputs_hash: AllocationInputsHash::new("a".repeat(64)).expect("хеш входов"),
+                inputs_hash: AllocationInputsHash::new("a".repeat(64)).expect("inputs hash"),
                 knowledge_as_of: OffsetDateTime::UNIX_EPOCH,
                 algorithm_version: AllocationAlgorithmVersion(1),
             },
@@ -356,7 +357,7 @@ mod tests {
         event.owner = OwnerId(Uuid::from_u128(5));
         event.provenance = Provenance::new(
             SourceId(Uuid::from_u128(6)),
-            RawHash::parse(&"d".repeat(64)).expect("хеш сырого факта"),
+            RawHash::parse(&"d".repeat(64)).expect("raw fact hash"),
             ParserVersion("test/1".into()),
         );
         event
@@ -369,7 +370,7 @@ mod tests {
         assert_ne!(
             prefix_digest(&[&unknown]),
             prefix_digest(&[&known]),
-            "отпечаток обязан покрывать содержимое события"
+            "fingerprint must cover event contents"
         );
     }
 
@@ -380,15 +381,15 @@ mod tests {
         assert_eq!(
             unknown.provenance.raw_hash(),
             known.provenance.raw_hash(),
-            "повтор того же брокерского факта обязан оставаться дубликатом"
+            "resubmitting the same brokerage fact must remain a duplicate"
         );
     }
 
     #[test]
     fn a_state_hash_prints_as_lowercase_hex_of_every_byte() {
-        // Отпечаток печатается в логах и в ответах API. Пустая строка
-        // вместо него неотличима от «отпечатка нет», а обрезанная —
-        // от совпадения с другим состоянием.
+        // The fingerprint is printed in logs and API responses. An empty string
+        // in its place is indistinguishable from «no fingerprint», and a truncated one is
+        // indistinguishable from a match with another state.
         let mut bytes = [0_u8; 32];
         bytes[0] = 0x0a;
         bytes[31] = 0xff;
@@ -400,8 +401,8 @@ mod tests {
 
     #[test]
     fn coverage_counts_events_and_keeps_the_outer_bounds_of_history() {
-        // Границы истории — это min и max, а не первое и последнее
-        // применённое: события приходят в произвольном порядке.
+        // History boundaries are min and max, not the first and last
+        // events applied: events arrive in arbitrary order.
         let account = AccountId::new_random();
         let mut coverage = Coverage::default();
         assert_eq!(coverage.events_applied(), 0);
@@ -419,10 +420,10 @@ mod tests {
 
     #[test]
     fn each_account_carries_its_own_history_horizon() {
-        // Глобальный горизонт объявлял бы историю счёта B покрытой
-        // с 2020 года только потому, что счёт A существует с 2020-го.
-        // Выплаты счёта B за 2021–2025 получали бы обвинение вместо
-        // честного «журнал начинается позже графика».
+        // A global horizon would declare account B's history covered
+        // since 2020 solely because account A has existed since 2020.
+        // Account B's payouts for 2021–2025 would be reported as mismatches instead of
+        // honestly stating «the journal starts later than the schedule».
         let a = AccountId::new_random();
         let b = AccountId::new_random();
         let mut coverage = Coverage::default();
@@ -431,15 +432,15 @@ mod tests {
 
         assert_eq!(coverage.first_event_for(a), Some(date!(2020 - 01 - 15)));
         assert_eq!(coverage.first_event_for(b), Some(date!(2026 - 01 - 01)));
-        // Глобальная граница остаётся: её показывает отчёт о покрытии (§10.7).
+        // The global boundary remains: it is shown by the coverage report (§10.7).
         assert_eq!(coverage.first_event(), Some(date!(2020 - 01 - 15)));
     }
 
     #[test]
     fn coverage_counts_estimated_values_but_not_known_ones() {
-        // `Confidence` описывает уверенность в значении (§4.9). Известное
-        // значение оценкой не является, и наоборот — иначе доля
-        // непроверенного в отчёте перестаёт что-либо означать.
+        // `Confidence` describes confidence in the value (§4.9). A known
+        // value is not an estimate, and vice versa; otherwise the
+        // unverified share in the report ceases to mean anything.
         let account = AccountId::new_random();
         let mut coverage = Coverage::default();
         coverage.observe(&cash_in(account, date!(2025 - 02 - 02), 1));
@@ -459,9 +460,9 @@ mod tests {
 
     #[test]
     fn only_a_restored_opening_marks_the_account_as_restored() {
-        // Счёт, история которого начата восстановленным остатком, честно
-        // помечается в блоке качества: наблюдения операций до этой даты
-        // нет, и доходность за ранний период посчитать нельзя (§10.7).
+        // An account whose history starts with a restored balance is correctly
+        // marked in the quality section: there are no observed transactions before this date,
+        // and returns for the earlier period cannot be calculated (§10.7).
         let observed = AccountId::new_random();
         let restored = AccountId::new_random();
         let mut coverage = Coverage::default();
@@ -484,9 +485,9 @@ mod tests {
 
     #[test]
     fn observing_through_the_state_reaches_its_coverage() {
-        // Состояние — единственная дверь к покрытию снаружи: если
-        // `observe` перестанет доводить событие до `Coverage`, отчёт
-        // о полноте данных станет пустым, а расчёт — нет.
+        // State is the only external gateway to coverage: if
+        // `observe` stops propagating the event to `Coverage`, the
+        // data-completeness report will be empty while the calculation is not.
         let account = AccountId::new_random();
         let mut state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
         assert_eq!(state.coverage().events_applied(), 0);
@@ -497,9 +498,9 @@ mod tests {
 
     #[test]
     fn the_prefix_digest_notices_a_different_date_at_the_same_position() {
-        // Дата входит в отпечаток префикса: событие, перенесённое на
-        // другой день внутри свёрнутого периода, обязано менять его,
-        // иначе `advance` продвинет устаревшее состояние.
+        // The date is included in the prefix fingerprint: an event moved to
+        // another day within the folded period must change it,
+        // otherwise `advance` will advance a stale state.
         let account = AccountId::new_random();
         let first = cash_in(account, date!(2025 - 05 - 05), 1);
         let mut moved = first.clone();

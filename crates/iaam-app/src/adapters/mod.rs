@@ -1,4 +1,4 @@
-//! Адаптеры портов.
+//! Port adapters.
 
 pub mod market;
 pub mod sqlite;

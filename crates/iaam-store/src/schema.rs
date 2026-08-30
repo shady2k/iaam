@@ -1,14 +1,14 @@
-//! Миграции.
+//! Migrations.
 //!
-//! Миграции нумерованы и применяются по одной в транзакции. Файл схемы
-//! встроен в двоичный файл: база, открытая версией программы, обязана
-//! соответствовать этой версии, а не тому, что лежит рядом на диске.
+//! Migrations are numbered and applied one at a time in a transaction. The schema file
+//! is embedded in the binary: a database opened by this program version must match this version, not whatever is on disk beside it.
+//! correspond to this version, rather than what is nearby on disk.
 
 use rusqlite::Connection;
 
 use crate::StoreError;
 
-/// Версия схемы, которую понимает эта сборка.
+/// Schema version understood by this build.
 pub const SCHEMA_VERSION: u32 = 11;
 
 const MIGRATIONS: [(u32, &str); 11] = [
@@ -37,10 +37,10 @@ const MIGRATIONS: [(u32, &str); 11] = [
     (11, include_str!("../migrations/0011_accrued_interest.sql")),
 ];
 
-/// Применение недостающих миграций.
+/// Apply missing migrations.
 ///
-/// База новее программы — отказ, а не попытка работать: неизвестная
-/// колонка молча читается как отсутствующая, и это худший вид ошибки.
+/// The database is newer than the program—reject it rather than attempt to operate: an unknown
+/// column is silently read as absent, which is the worst kind of error.
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
     let current: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > SCHEMA_VERSION {

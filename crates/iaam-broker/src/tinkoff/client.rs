@@ -6,96 +6,96 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-/// Ошибки HTTP-шлюза Т-Инвестиций.
+/// T-Invest HTTP gateway errors.
 ///
-/// Варианты не содержат токен: даже случайный `Debug` или `Display` ошибки
-/// не должен превращать отказ удалённого узла в утечку доступа.
+/// Variants contain no token: even an accidental `Debug` or `Display` of the
+/// error must not turn a remote refusal into an access leak.
 #[derive(Debug, Error)]
 pub enum TinkoffError {
-    /// Соединение не установлено или тело ответа не дочитано.
-    #[error("сетевой отказ шлюза Т-Инвестиций")]
+    /// Connection was not established or the response body was not read fully.
+    #[error("T-Invest gateway network refusal")]
     Network,
-    /// Шлюз временно ограничил частоту запросов.
-    #[error("шлюз Т-Инвестиций ограничил частоту запросов")]
+    /// The gateway temporarily rate-limited the request.
+    #[error("T-Invest gateway rate-limited the request")]
     RateLimited,
-    /// Шлюз отверг предъявленный токен.
-    #[error("токен Т-Инвестиций недействителен")]
+    /// The gateway rejected the presented token.
+    #[error("T-Invest token is invalid")]
     InvalidToken,
-    /// В выбранной среде такого метода нет.
-    #[error("метод {method:?} недоступен в среде {environment:?}")]
+    /// The selected environment does not provide this method.
+    #[error("method {method:?} is unavailable in environment {environment:?}")]
     MethodUnavailable {
-        /// Метод, который нельзя вызвать в этой среде.
+        /// Method unavailable in this environment.
         method: Method,
-        /// Выбранная среда шлюза.
+        /// Selected gateway environment.
         environment: Environment,
     },
-    /// Шлюз ответил кодом, который клиент не умеет принять.
-    #[error("неожиданный код HTTP {status}: {body}")]
+    /// The gateway returned a code the client cannot accept.
+    #[error("unexpected HTTP status {status}: {body}")]
     UnexpectedStatus {
-        /// Код HTTP.
+        /// HTTP status code.
         status: u16,
-        /// Тело ответа после удаления предъявленного токена.
+        /// Response body after removing the presented token.
         body: String,
     },
-    /// Ответ с пагинацией не позволяет продолжить выгрузку.
-    #[error("ответ с пагинацией оборван: шлюз сообщил следующий элемент без курсора")]
+    /// A paginated response cannot be fetched further.
+    #[error("paginated response is truncated: gateway reported a next item without a cursor")]
     PartialResponse,
-    /// Успешный ответ не соответствует минимальной схеме метода.
-    #[error("ответ шлюза Т-Инвестиций не разобран")]
+    /// A successful response does not match the method's minimum schema.
+    #[error("T-Invest gateway response could not be parsed")]
     MalformedResponse,
-    /// Запрос не удалось превратить в JSON до отправки.
-    #[error("не удалось сериализовать запрос к шлюзу Т-Инвестиций")]
+    /// The request could not be serialized to JSON before sending.
+    #[error("could not serialize request to the T-Invest gateway")]
     RequestSerialization,
-    /// Транспорт не довёл запрос: сеть, время ожидания или сборка клиента.
+    /// The transport did not deliver the request: network, timeout, or client construction.
     ///
-    /// Токена не несёт: `HttpError` его не содержит по построению.
+    /// Contains no token: `HttpError` is designed not to contain one.
     #[error(transparent)]
     Transport(#[from] iaam_http::HttpError),
 }
 
-/// Запрос страницы операций с курсорной пагинацией.
+/// Request an operations page with cursor pagination.
 ///
-/// Даты и значения перечислений остаются строками: этот слой отвечает за
-/// транспорт, а смысл полей и разбор операций принадлежат следующему слою.
+/// Dates and enum values remain strings: this layer handles transport, while
+/// field meanings and operation parsing belong to the next layer.
 #[derive(Debug, Clone, Serialize)]
 pub struct GetOperationsByCursorRequest {
-    /// Идентификатор счёта.
+    /// Account identifier.
     #[serde(rename = "accountId")]
     pub account_id: String,
-    /// FIGI или UID инструмента.
+    /// FIGI or UID of the instrument.
     #[serde(rename = "instrumentId", skip_serializing_if = "Option::is_none")]
     pub instrument_id: Option<String>,
-    /// Начало периода по UTC в формате RFC 3339.
+    /// Period start in UTC, formatted as RFC 3339.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    /// Окончание периода по UTC в формате RFC 3339.
+    /// Period end in UTC, formatted as RFC 3339.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
-    /// Курсор начала страницы.
+    /// Cursor at the start of the page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-    /// Ограничение размера страницы.
+    /// Page-size limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<i32>,
-    /// Фильтр по типам операций.
+    /// Filter by operation kinds.
     #[serde(rename = "operationTypes", skip_serializing_if = "Vec::is_empty")]
     pub operation_types: Vec<String>,
-    /// Фильтр по состоянию операции.
+    /// Filter by operation state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
-    /// Не возвращать комиссии.
+    /// Do not return commissions.
     #[serde(rename = "withoutCommissions")]
     pub without_commissions: bool,
-    /// Не возвращать сделки.
+    /// Do not return trades.
     #[serde(rename = "withoutTrades")]
     pub without_trades: bool,
-    /// Не возвращать overnight-операции.
+    /// Do not return overnight operations.
     #[serde(rename = "withoutOvernights")]
     pub without_overnights: bool,
 }
 
 impl GetOperationsByCursorRequest {
-    /// Создаёт запрос первой страницы счёта с настройками шлюза по умолчанию.
+    /// Create the first account page request with gateway defaults.
     #[must_use]
     pub fn new(account_id: impl Into<String>) -> Self {
         Self {
@@ -114,7 +114,7 @@ impl GetOperationsByCursorRequest {
     }
 }
 
-/// HTTP-клиент методов T-Invest REST API.
+/// HTTP client for T-Invest REST API methods.
 pub struct TinkoffClient {
     environment: Environment,
     token: BrokerToken,
@@ -122,7 +122,7 @@ pub struct TinkoffClient {
 }
 
 impl TinkoffClient {
-    /// Создаёт клиент с тем же закреплённым корнем доверия, что и probe.
+    /// Create a client with the same pinned trust root as the probe.
     pub fn new(environment: Environment, token: BrokerToken) -> Result<Self, TinkoffError> {
         Ok(Self {
             environment,
@@ -131,13 +131,13 @@ impl TinkoffClient {
         })
     }
 
-    /// Возвращает сырое тело ответа `UsersService/GetAccounts`.
+    /// Return the raw response body from `UsersService/GetAccounts`.
     pub async fn get_accounts(&self) -> Result<String, TinkoffError> {
         self.post(Method::Accounts, "UsersService/GetAccounts", json!({}))
             .await
     }
 
-    /// Возвращает сырое тело ответа `OperationsService/GetPortfolio`.
+    /// Return the raw response body from `OperationsService/GetPortfolio`.
     pub async fn get_portfolio(&self, account_id: &str) -> Result<String, TinkoffError> {
         self.post(
             Method::Portfolio,
@@ -147,7 +147,7 @@ impl TinkoffClient {
         .await
     }
 
-    /// Возвращает сырое тело страницы `OperationsService/GetOperationsByCursor`.
+    /// Return the raw page body from `OperationsService/GetOperationsByCursor`.
     pub async fn get_operations_by_cursor(
         &self,
         request: &GetOperationsByCursorRequest,
@@ -165,9 +165,9 @@ impl TinkoffClient {
 
     async fn post(&self, method: Method, path: &str, body: Value) -> Result<String, TinkoffError> {
         ensure_method_available(self.environment, method)?;
-        // База среды берётся у `Environment`, а не у `Destination`:
-        // песочница и бой — это разные адреса одного назначения,
-        // и якорь доверия у них общий.
+        // The environment supplies the base through `Environment`, not
+        // `Destination`: sandbox and production are different addresses for
+        // one destination, and share a trust anchor.
         let request = HttpRequest::post(
             destination_for(self.environment),
             path,
@@ -183,12 +183,13 @@ impl TinkoffClient {
     }
 }
 
-/// Среда выбирает назначение, а не приписку к URL.
+/// The environment selects the destination, not a URL suffix.
 ///
-/// У песочницы и боя **разные хосты** (`sandbox-invest-public-api.tbank.ru`
-/// против `invest-public-api.tbank.ru`), поэтому подставить одну вместо
-/// другой обрезкой базы нельзя — запрос ушёл не туда и получил бы
-/// правдоподобный ответ из другой среды.
+/// Sandbox and production have **different hosts**
+/// (`sandbox-invest-public-api.tbank.ru` versus
+/// `invest-public-api.tbank.ru`), so substituting one by trimming the base is
+/// impossible—the request would go to the wrong place and receive a plausible
+/// response from another environment.
 const fn destination_for(environment: Environment) -> Destination {
     match environment {
         Environment::Prod => Destination::TinkoffProd,
@@ -250,7 +251,7 @@ fn redact_token(body: &str, token: &str) -> String {
     if token.is_empty() {
         body.to_owned()
     } else {
-        body.replace(token, "<токен скрыт>")
+        body.replace(token, "<token hidden>")
     }
 }
 
@@ -303,7 +304,7 @@ mod tests {
             Err(TinkoffError::InvalidToken)
         ));
         let error = classify_response(500, r#"{"data":{"quantity":70001}}"#)
-            .expect_err("вложенное значение не является кодом отказа");
+            .expect_err("nested value is not a refusal code");
         assert!(matches!(
             error,
             TinkoffError::UnexpectedStatus { status: 500, .. }
@@ -314,7 +315,7 @@ mod tests {
     fn preserves_unexpected_status_body_without_treating_success_as_error() {
         assert!(classify_response(200, r#"{"ok":true}"#).is_ok());
         let error = classify_response(500, r#"{"message":"gateway failed"}"#)
-            .expect_err("неожиданный код должен быть отказом");
+            .expect_err("unexpected code must be a refusal");
         assert!(matches!(
             error,
             TinkoffError::UnexpectedStatus { status: 500, body }
@@ -325,7 +326,7 @@ mod tests {
     #[test]
     fn refuses_methods_absent_from_the_selected_environment() {
         let error = ensure_method_available(Environment::Sandbox, Method::BrokerReport)
-            .expect_err("отчёт отсутствует в песочнице");
+            .expect_err("report is absent in the sandbox");
         assert!(matches!(error, TinkoffError::MethodUnavailable { .. }));
         assert!(ensure_method_available(Environment::Sandbox, Method::Portfolio).is_ok());
     }
@@ -369,7 +370,7 @@ mod tests {
         let token = "secret-token-42";
         let error =
             classify_response_with_token(500, &format!(r#"{{"message":"{token}"}}"#), token)
-                .expect_err("код ответа должен быть отказом");
+                .expect_err("response code must be a refusal");
         assert!(!error.to_string().contains(token));
     }
 }

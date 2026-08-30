@@ -1,4 +1,4 @@
-//! Архивный бандл: экспорт, импорт, повреждение.
+//! Archived bundle: export, import, corruption.
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -47,8 +47,8 @@ fn populated() -> (SqliteStore, OwnerId, AccountId, ContourId) {
         .upsert_account(&AccountRecord {
             id: account,
             owner,
-            title: "Брокерский".into(),
-            institution: Some("Т-Банк".into()),
+            title: "Brokerage".into(),
+            institution: Some("T-Bank".into()),
         })
         .unwrap();
     let contour = ContourId::new_random();
@@ -56,7 +56,7 @@ fn populated() -> (SqliteStore, OwnerId, AccountId, ContourId) {
         .insert_contour_version(
             owner,
             &ContourDefinition::new(contour, ContourVersion(1), [account]),
-            "Мой портфель",
+            "My portfolio",
             &[account],
         )
         .unwrap();
@@ -71,8 +71,8 @@ fn populated() -> (SqliteStore, OwnerId, AccountId, ContourId) {
 
 #[test]
 fn a_bundle_restores_a_complete_working_state() {
-    // Экспорт одних событий не является бэкапом: из него получатся
-    // другие проекции, потому что состав контуров останется снаружи.
+    // Exporting events alone is not a backup: it produces
+    // different projections because the set of scopes remains external.
     let (source, owner, account, contour) = populated();
     let bundle = source.export_bundle(owner).unwrap();
     assert_eq!(bundle.events.len(), 2);
@@ -120,7 +120,7 @@ fn importing_the_same_bundle_twice_changes_nothing() {
 
 #[test]
 fn a_tampered_bundle_is_refused() {
-    // Повреждённый архив хуже отсутствующего: он выглядит как целый.
+    // A corrupted archive is worse than a missing one: it looks intact.
     let (source, owner, _, _) = populated();
     let mut bundle = source.export_bundle(owner).unwrap();
     bundle.events.truncate(1);
@@ -130,9 +130,9 @@ fn a_tampered_bundle_is_refused() {
 
 #[test]
 fn a_changed_amount_breaks_the_checksum() {
-    // Первая редакция суммы хешировала только идентификаторы событий:
-    // подменённая денежная величина проходила проверку, и архив
-    // с неверными суммами выглядел целым.
+    // The first version of the checksum hashed only event identifiers:
+    // a substituted monetary value passed verification, and an archive
+    // with incorrect amounts looked intact.
     let (source, owner, account, _) = populated();
     let mut bundle = source.export_bundle(owner).unwrap();
     bundle.events[0] = Event {
@@ -148,7 +148,7 @@ fn a_changed_amount_breaks_the_checksum() {
     let mut restored = SqliteStore::open_in_memory().unwrap();
     assert!(
         restored.import_bundle(&bundle).is_err(),
-        "подменённая сумма обязана ломать контрольную сумму"
+        "the substituted amount must invalidate the checksum"
     );
 }
 
@@ -163,7 +163,7 @@ fn a_bundle_carrying_a_foreign_event_is_refused() {
     bundle.checksum = bundle.compute_checksum();
     let mut restored = SqliteStore::open_in_memory().unwrap();
     assert!(restored.import_bundle(&bundle).is_err());
-    // Ничего не записалось: импорт идёт одной транзакцией.
+    // Nothing was written: the import runs in a single transaction.
     assert!(restored.load_events(owner).unwrap().is_empty());
     assert!(restored.list_accounts(owner).unwrap().is_empty());
     let _ = account;
@@ -191,7 +191,7 @@ fn a_bundle_of_a_newer_format_is_refused() {
 
 #[test]
 fn a_bundle_survives_json() {
-    // Бандл — переносимый архив: он обязан пережить текстовый формат.
+    // A bundle is a portable archive: it must survive a text format.
     let (source, owner, _, _) = populated();
     let bundle = source.export_bundle(owner).unwrap();
     let json = serde_json::to_string(&bundle).unwrap();
@@ -201,11 +201,11 @@ fn a_bundle_survives_json() {
 
 #[test]
 fn versions_of_a_contour_are_exported_as_separate_sections_with_all_their_accounts() {
-    // Состав контура выгружается построчно: одна строка на счёт. Сборка
-    // строк в секции обязана различать И контур, И версию — иначе счета
-    // разных версий сливаются в одну, и восстановленный контур получает
-    // состав, которого у него никогда не было. Цифры отчёта после такого
-    // восстановления выглядят нормально и являются неверными.
+    // The scope composition is exported one line at a time: one line per account. Rebuilding
+    // the section must distinguish BOTH the scope AND the version — otherwise accounts
+    // from different versions are merged into one, and the restored scope gets a composition
+    // it never had. The report figures look normal after such a restoration and are incorrect.
+    // recoveries look normal but are incorrect.
     let (mut store, owner, first_account, contour) = populated();
 
     let second_account = AccountId::new_random();
@@ -213,28 +213,28 @@ fn versions_of_a_contour_are_exported_as_separate_sections_with_all_their_accoun
         .upsert_account(&AccountRecord {
             id: second_account,
             owner,
-            title: "Второй брокерский".into(),
+            title: "Second brokerage".into(),
             institution: None,
         })
         .unwrap();
 
-    // Версия 2 того же контура: счёт добавлен.
+    // Version 2 of the same scope: the account was added.
     store
         .insert_contour_version(
             owner,
             &ContourDefinition::new(contour, ContourVersion(2), [first_account, second_account]),
-            "Мой портфель",
+            "My portfolio",
             &[first_account, second_account],
         )
         .unwrap();
 
-    // И отдельный контур из одного счёта.
+    // And a separate scope consisting of one account.
     let other = ContourId::new_random();
     store
         .insert_contour_version(
             owner,
             &ContourDefinition::new(other, ContourVersion(1), [second_account]),
-            "Только второй",
+            "Only the second",
             &[second_account],
         )
         .unwrap();
@@ -243,7 +243,7 @@ fn versions_of_a_contour_are_exported_as_separate_sections_with_all_their_accoun
     assert_eq!(
         bundle.contours.len(),
         3,
-        "две версии первого контура и одна второго — три секции, а не меньше"
+        "two versions of the first scope and one of the second — three sections, not fewer"
     );
 
     let section = |id: ContourId, version: u32| {
@@ -251,7 +251,7 @@ fn versions_of_a_contour_are_exported_as_separate_sections_with_all_their_accoun
             .contours
             .iter()
             .find(|section| section.contour == id.0 && section.version == version)
-            .unwrap_or_else(|| panic!("секция {id:?} версии {version} не найдена"))
+            .unwrap_or_else(|| panic!("section {id:?} of version {version} not found"))
     };
     assert_eq!(section(contour, 1).accounts, vec![first_account.inner()]);
     assert_eq!(section(contour, 2).accounts.len(), 2);
@@ -262,7 +262,7 @@ fn versions_of_a_contour_are_exported_as_separate_sections_with_all_their_accoun
     );
     assert_eq!(section(other, 1).accounts, vec![second_account.inner()]);
 
-    // И всё это переживает круг через архив.
+    // And all of this survives a round trip through the archive.
     let mut restored = SqliteStore::open_in_memory().unwrap();
     restored.import_bundle(&bundle).unwrap();
     let back = restored.export_bundle(owner).unwrap();
@@ -270,22 +270,22 @@ fn versions_of_a_contour_are_exported_as_separate_sections_with_all_their_accoun
     let version_two = restored
         .load_contour(owner, contour, ContourVersion(2))
         .unwrap()
-        .expect("версия 2 восстановлена");
+        .expect("version 2 restored");
     assert!(version_two.contains(first_account));
     assert!(version_two.contains(second_account));
 
     let version_one = restored
         .load_contour(owner, contour, ContourVersion(1))
         .unwrap()
-        .expect("версия 1 восстановлена");
+        .expect("version 1 restored");
     assert!(version_one.contains(first_account));
     assert!(
         !version_one.contains(second_account),
-        "счёт версии 2 не должен протечь в версию 1"
+        "the account from version 2 must not leak into version 1"
     );
 }
 
-// --- новые факты E3.4 ---
+// --- new E3.4 facts ---
 
 fn bond_event(
     owner: OwnerId,
@@ -315,17 +315,17 @@ fn bond_event(
     }
 }
 
-/// По одному событию каждого нового вида. Тест обязан ломаться, когда
-/// в семейство добавят члена: архив, потерявший факт, выглядит целым.
+/// One event of each new kind. The test must fail when
+/// a member is added to the family: an archive that has lost a fact looks intact.
 fn every_new_fact(owner: OwnerId, account: AccountId) -> Vec<Event> {
     let instrument = InstrumentId::new_random();
     let successor = InstrumentId::new_random();
     let custody = CustodyId::new_random();
     let submission = OfferSubmissionId::new_random();
     let money = |minor| Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
-    // `rust_decimal` в зависимостях этого крейта нет, а добавлять его
-    // ради теста — правка Cargo.toml, то есть файла политики. Число
-    // приходит через тот же serde, которым его читает и хранилище.
+    // `rust_decimal` is not a dependency of this crate, and adding it
+    // just for the test would modify Cargo.toml, which is the policy file. The number
+    // arrives through the same serde that the storage reads it with.
     let dec = |text: &str| serde_json::from_str::<Dec>(text).unwrap();
     let qty = |text: &str| Quantity(dec(text));
     let per_unit = |text: &str| PerUnitAmount::new(dec(text), CurrencyCode::Rub);
@@ -344,7 +344,7 @@ fn every_new_fact(owner: OwnerId, account: AccountId) -> Vec<Event> {
                     compensation: money(200_000),
                     effective_date: date!(2026 - 06 - 15),
                     record_date: Some(date!(2026 - 06 - 13)),
-                    grounds: Some("решение эмитента №4".to_owned()),
+                    grounds: Some("issuer decision no. 4".to_owned()),
                     basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
                 },
             },
@@ -458,8 +458,8 @@ fn every_new_fact(owner: OwnerId, account: AccountId) -> Vec<Event> {
 
 #[test]
 fn a_bundle_round_trip_keeps_the_new_facts() {
-    // Архив, потерявший поле нового факта, выглядит целым — и обнаружится
-    // только при восстановлении, когда исходной базы уже нет.
+    // An archive that has lost a new fact looks intact—and will be detected
+    // only during restoration, when the original database is no longer available.
     let (source, owner, account, _) = populated();
     let facts = every_new_fact(owner, account);
     for event in &facts {
@@ -478,7 +478,7 @@ fn a_bundle_round_trip_keeps_the_new_facts() {
     for event in &facts {
         assert!(
             stored.iter().any(|kept| kept == event),
-            "факт {} не пережил круг через архив",
+            "fact {} did not survive a round trip through the archive",
             event.kind.discriminant()
         );
     }

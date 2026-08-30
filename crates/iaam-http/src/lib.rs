@@ -1,12 +1,11 @@
-//! Исходящий HTTP: транспорт, доверие, устойчивость.
+//! Outgoing HTTP: transport, trust, resilience.
 //!
-//! Единственная крейта в дереве, объявляющая HTTP-клиент. Крейты
-//! источников (`iaam-broker`, `iaam-market`) описывают запрос и разбирают
-//! ответ; ни та, ни другая операция сети не касается, и потому обе
-//! проверяются на замороженных образцах.
+//! The only crate in the tree that declares the HTTP client. Source crates
+//! (`iaam-broker`, `iaam-market`) describe requests and parse responses; neither
+//! operation touches the network, so both are checked against frozen samples.
 //!
-//! Правило проверяется заслоном: `scripts/check-architecture.sh`
-//! запрещает `reqwest` во всех крейтах, кроме этой.
+//! The rule is enforced by a guard: `scripts/check-architecture.sh` forbids
+//! `reqwest` in every crate except this one.
 
 pub mod client;
 pub mod destination;

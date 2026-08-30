@@ -1,8 +1,8 @@
-//! Маршруты.
+//! Routes.
 //!
-//! Обработчик делает три вещи: разбирает DTO, зовёт сценарий, сериализует
-//! результат. Ни одной арифметической операции над деньгами здесь нет —
-//! это проверяется заслоном архитектуры (§3.1, §13).
+//! The handler does three things: parses the DTO, calls the use case, and serialises
+//! the result. There are no arithmetic operations on money here —
+//! this is enforced by the architecture guard (§3.1, §13).
 
 use std::sync::Arc;
 
@@ -60,11 +60,11 @@ use crate::dto::{
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
 
-/// Список глобального справочника инструментов.
+/// List of instruments in the global reference catalogue.
 #[utoipa::path(
     get,
     path = "/v1/instruments",
-    responses((status = 200, description = "Инструменты справочника", body = [InstrumentDto])),
+    responses((status = 200, description = "Reference catalogue instruments", body = [InstrumentDto])),
     security(("bearer" = []))
 )]
 pub async fn list_instruments(
@@ -75,14 +75,14 @@ pub async fn list_instruments(
     Ok(Json(instruments.into_iter().map(instrument_dto).collect()))
 }
 
-/// Один инструмент глобального справочника.
+/// One instrument from the global reference catalogue.
 #[utoipa::path(
     get,
     path = "/v1/instruments/{id}",
-    params(("id" = Uuid, Path, description = "Идентификатор инструмента")),
+    params(("id" = Uuid, Path, description = "Instrument identifier")),
     responses(
-        (status = 200, description = "Инструмент справочника", body = InstrumentDto),
-        (status = 404, description = "Инструмент неизвестен", body = ApiError)
+        (status = 200, description = "Reference catalogue instrument", body = InstrumentDto),
+        (status = 404, description = "Instrument unknown", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -97,21 +97,21 @@ pub async fn get_instrument(
         .instrument(InstrumentId(id))
         .await?
         .ok_or_else(|| iaam_app::error::AppError::NotFound {
-            what: "инструмент",
+            what: "instrument",
             id: id.to_string(),
         })?;
     Ok(Json(instrument_dto(instrument)))
 }
 
-/// Разрешение внешнего кода инструмента на дату документа.
+/// Resolve an external instrument code as at the document date.
 #[utoipa::path(
     post,
     path = "/v1/instruments/resolve",
     request_body = ResolveInstrumentRequest,
     responses(
-        (status = 200, description = "Инструмент по коду на дату", body = ResolvedInstrumentDto),
-        (status = 404, description = "Код неизвестен", body = ApiError),
-        (status = 422, description = "Код известен, но не на эту дату, либо пространство имён неверно", body = ApiError)
+        (status = 200, description = "Instrument by code as at date", body = ResolvedInstrumentDto),
+        (status = 404, description = "Code unknown", body = ApiError),
+        (status = 422, description = "Code known, but not on this date, or namespace invalid", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -130,18 +130,18 @@ pub async fn resolve_instrument(
     }))
 }
 
-/// Запись инструмента в глобальный справочник.
+/// Add an instrument to the global reference catalogue.
 ///
-/// Право проверяется до разбора тела: агентский токен должен получить 403
-/// даже для тела, которое само по себе некорректно (§7, §14).
+/// Permission is checked before parsing the body: an agent token must receive 403
+/// even for a body that is itself invalid (§7, §14).
 #[utoipa::path(
     post,
     path = "/v1/instruments",
     request_body = CreateInstrumentRequest,
     responses(
-        (status = 201, description = "Инструмент записан", body = InstrumentDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 422, description = "Некорректные данные инструмента", body = ApiError)
+        (status = 201, description = "Instrument recorded", body = InstrumentDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "Invalid instrument data", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -152,7 +152,7 @@ pub async fn create_instrument(
 ) -> Result<(StatusCode, Json<InstrumentDto>), ApiFailure> {
     require_admin(&principal)?;
     let request: CreateInstrumentRequest = serde_json::from_slice(&body)
-        .map_err(|error| invalid_field("body", "JSON-объект инструмента", error.to_string()))?;
+        .map_err(|error| invalid_field("body", "instrument JSON object", error.to_string()))?;
     let id = InstrumentId(request.id.unwrap_or_else(Uuid::new_v4));
     let kind = request
         .kind
@@ -162,7 +162,7 @@ pub async fn create_instrument(
                 invalid_field(
                     "kind",
                     "share, depositary_receipt, bond, etf, mutual_fund, currency, crypto, \
-                     real_estate, private_share или loan",
+                     real_estate, private_share or loan",
                     kind.to_owned(),
                 )
             })
@@ -191,22 +191,22 @@ pub async fn create_instrument(
         .instrument(id)
         .await?
         .ok_or_else(|| iaam_app::error::AppError::NotFound {
-            what: "записанный инструмент",
+            what: "recorded instrument",
             id: id.inner().to_string(),
         })?;
     Ok((StatusCode::CREATED, Json(instrument_dto(instrument))))
 }
 
-/// Загрузка отчёта с построчными исходами.
+/// Upload a report with per-row outcomes.
 #[utoipa::path(
     post,
     path = "/v1/documents",
     params(DocumentParams),
-    request_body(content = String, description = "Двоичная книга XLSX/XLS"),
+    request_body(content = String, description = "Binary XLSX/XLS workbook"),
     responses(
-        (status = 200, description = "Исход по каждой строке", body = DocumentDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 422, description = "Документ не опознан или некорректен", body = ApiError)
+        (status = 200, description = "Outcome for each row", body = DocumentDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "Document unrecognised or invalid", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -228,19 +228,19 @@ pub async fn upload_document(
     Ok(Json(document_dto(result)))
 }
 
-/// Повторный разбор исходника с проверкой его идентичности.
+/// Re-parse the source while verifying that it is identical.
 #[utoipa::path(
     post,
     path = "/v1/documents/{id}/reparse",
     params(
-        ("id" = String, Path, description = "SHA-256 исходного документа"),
+        ("id" = String, Path, description = "SHA-256 of the source document"),
         DocumentParams
     ),
-    request_body(content = String, description = "Двоичная книга XLSX/XLS"),
+    request_body(content = String, description = "Binary XLSX/XLS workbook"),
     responses(
-        (status = 200, description = "Исход по каждой строке", body = DocumentDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 422, description = "Хеш или документ некорректны", body = ApiError)
+        (status = 200, description = "Outcome for each row", body = DocumentDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "Hash or document invalid", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -264,14 +264,14 @@ pub async fn reparse_document(
     Ok(Json(document_dto(result)))
 }
 
-/// Статусы сверки с основаниями и исходами утверждений.
+/// Reconciliation statuses with grounds and assertion outcomes.
 #[utoipa::path(
     get,
     path = "/v1/reconciliation",
     params(ReconciliationParams),
     responses(
-        (status = 200, description = "Статусы сверки", body = Vec<ReconciliationStatusDto>),
-        (status = 422, description = "Диапазон дат некорректен", body = ApiError)
+        (status = 200, description = "Reconciliation statuses", body = Vec<ReconciliationStatusDto>),
+        (status = 422, description = "Invalid date range", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -295,15 +295,15 @@ pub async fn reconciliation(
     ))
 }
 
-/// Запись названного владельцем остатка.
+/// Record a balance declared by the owner.
 #[utoipa::path(
     post,
     path = "/v1/reconciliation/balance",
     request_body = OwnerBalanceRequest,
     responses(
-        (status = 200, description = "Обновлённые статусы", body = Vec<ReconciliationStatusDto>),
-        (status = 403, description = "Только владелец", body = ApiError),
-        (status = 422, description = "Баланс некорректен", body = ApiError)
+        (status = 200, description = "Updated statuses", body = Vec<ReconciliationStatusDto>),
+        (status = 403, description = "Owner only", body = ApiError),
+        (status = 422, description = "Invalid balance", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -316,7 +316,7 @@ pub async fn reconciliation_balance(
     let period = AssertionPeriod::between(request.from, request.to).ok_or_else(|| {
         invalid_field(
             "period",
-            "from не позже to",
+            "from no later than to",
             format!("{}..{}", request.from, request.to),
         )
     })?;
@@ -324,19 +324,16 @@ pub async fn reconciliation_balance(
         "opening" => BalancePoint::Opening,
         "closing" => BalancePoint::Closing,
         actual => {
-            return Err(invalid_field(
-                "at",
-                "opening или closing",
-                actual.to_owned(),
-            ));
+            return Err(invalid_field("at", "opening or closing", actual.to_owned()));
         }
     };
     let cash = request
         .cash
         .map(|cash| {
-            let amount = cash.amount.parse::<Decimal>().map_err(|_| {
-                invalid_field("cash.amount", "десятичная строка", cash.amount.clone())
-            })?;
+            let amount = cash
+                .amount
+                .parse::<Decimal>()
+                .map_err(|_| invalid_field("cash.amount", "decimal string", cash.amount.clone()))?;
             let amount = iaam_app::ingest::operation::to_minor_units(
                 amount,
                 cash.currency.to_domain(),
@@ -351,7 +348,7 @@ pub async fn reconciliation_balance(
         let quantity = position.quantity.parse::<Decimal>().map_err(|_| {
             invalid_field(
                 "positions.quantity",
-                "десятичная строка",
+                "decimal string",
                 position.quantity.clone(),
             )
         })?;
@@ -363,7 +360,7 @@ pub async fn reconciliation_balance(
     }
     let raw_hash = request.source_hash.unwrap_or_else(|| "0".repeat(64));
     let raw_hash = iaam_core::event::provenance::RawHash::parse(&raw_hash)
-        .ok_or_else(|| invalid_field("source_hash", "64 hex-символа", raw_hash))?;
+        .ok_or_else(|| invalid_field("source_hash", "64 hex-characters", raw_hash))?;
     let _ = record_owner_balance(
         &state.services,
         &principal,
@@ -390,13 +387,13 @@ pub async fn reconciliation_balance(
     ))
 }
 
-/// Действующие и выведенные из обращения правила классификации.
+/// Active and retired classification rules.
 #[utoipa::path(
     get,
     path = "/v1/classification-rules",
     responses(
-        (status = 200, description = "История правил классификации", body = Vec<ClassificationRuleDto>),
-        (status = 403, description = "Только владелец", body = ApiError)
+        (status = 200, description = "Classification rule history", body = Vec<ClassificationRuleDto>),
+        (status = 403, description = "Owner only", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -419,9 +416,9 @@ pub async fn list_classification_rules(
     path = "/v1/classification-rules",
     request_body = ClassificationRuleRequest,
     responses(
-        (status = 201, description = "Правило добавлено", body = ClassificationRuleDto),
-        (status = 403, description = "Только владелец", body = ApiError),
-        (status = 422, description = "Правило некорректно", body = ApiError)
+        (status = 201, description = "Rule added", body = ClassificationRuleDto),
+        (status = 403, description = "Owner only", body = ApiError),
+        (status = 422, description = "Invalid rule", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -448,11 +445,11 @@ pub async fn create_classification_rule(
 #[utoipa::path(
     delete,
     path = "/v1/classification-rules/{id}",
-    params(("id" = Uuid, Path, description = "Идентификатор правила")),
+    params(("id" = Uuid, Path, description = "Rule identifier")),
     responses(
-        (status = 204, description = "Правило выведено из обращения"),
-        (status = 403, description = "Только владелец", body = ApiError),
-        (status = 404, description = "Правило не найдено", body = ApiError)
+        (status = 204, description = "Rule retired"),
+        (status = 403, description = "Owner only", body = ApiError),
+        (status = 404, description = "Rule not found", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -466,16 +463,16 @@ pub async fn delete_classification_rule(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Синхронизация одного брокерского канала за интервал.
+/// Synchronise one broker channel over an interval.
 #[utoipa::path(
     post,
     path = "/v1/brokers/{broker}/sync",
-    params(("broker" = String, Path, description = "Код брокера")),
+    params(("broker" = String, Path, description = "Broker code")),
     request_body = BrokerSyncRequest,
     responses(
-        (status = 200, description = "Результат синхронизации", body = SyncOutcomeDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 503, description = "Канал или доступ брокера не настроены", body = ApiError)
+        (status = 200, description = "Synchronisation result", body = SyncOutcomeDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 503, description = "Broker channel or access is not configured", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -505,16 +502,16 @@ pub async fn sync_broker(
     Ok(Json(SyncOutcomeDto::from_domain(outcome)))
 }
 
-/// Ручной запуск синхронизации одной рыночной серии.
+/// Manually synchronise one market series.
 #[utoipa::path(
     post,
     path = "/v1/market/sync",
     request_body = MarketSyncRequest,
     responses(
-        (status = 200, description = "Результат синхронизации рынка", body = MarketSyncOutcomeDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 422, description = "Некорректный диапазон", body = ApiError),
-        (status = 503, description = "Рыночный транспорт не настроен", body = ApiError)
+        (status = 200, description = "Market synchronisation result", body = MarketSyncOutcomeDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "Invalid range", body = ApiError),
+        (status = 503, description = "Market transport is not configured", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -534,7 +531,7 @@ pub async fn sync_market(
     Ok(Json(MarketSyncOutcomeDto::from_domain(outcome)))
 }
 
-/// Параметры ряда цен.
+/// Price series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct MarketPricesParams {
     pub instrument: Uuid,
@@ -548,7 +545,7 @@ pub struct MarketPricesParams {
     pub knowledge_as_of: Option<String>,
 }
 
-/// Параметры ряда курсов.
+/// Exchange-rate series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct MarketFxParams {
     pub from: CurrencyDto,
@@ -561,7 +558,7 @@ pub struct MarketFxParams {
     pub knowledge_as_of: Option<String>,
 }
 
-/// Параметры ряда ключевой ставки.
+/// Key-rate series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct MarketKeyRateParams {
     #[param(value_type = String, format = Date)]
@@ -572,14 +569,14 @@ pub struct MarketKeyRateParams {
     pub knowledge_as_of: Option<String>,
 }
 
-/// Ряд цен с provenance каждой строки.
+/// Price series with provenance for each row.
 #[utoipa::path(
     get,
     path = "/v1/market/prices",
     params(MarketPricesParams),
     responses(
-        (status = 200, description = "Цены с provenance", body = Vec<MarketPriceDto>),
-        (status = 422, description = "Некорректный диапазон", body = ApiError)
+        (status = 200, description = "Prices with provenance", body = Vec<MarketPriceDto>),
+        (status = 422, description = "Invalid range", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -606,14 +603,14 @@ pub async fn list_market_prices(
     Ok(Json(views.into_iter().map(market_price_dto).collect()))
 }
 
-/// Ряд официальных курсов с provenance каждой строки.
+/// Official exchange-rate series with provenance for each row.
 #[utoipa::path(
     get,
     path = "/v1/market/fx",
     params(MarketFxParams),
     responses(
-        (status = 200, description = "Курсы с provenance", body = Vec<MarketFxDto>),
-        (status = 422, description = "Некорректный диапазон", body = ApiError)
+        (status = 200, description = "Exchange rates with provenance", body = Vec<MarketFxDto>),
+        (status = 422, description = "Invalid range", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -639,14 +636,14 @@ pub async fn list_market_fx(
     Ok(Json(views.into_iter().map(market_fx_dto).collect()))
 }
 
-/// Интервалы официальной ключевой ставки с provenance границ.
+/// Official key-rate intervals with boundary provenance.
 #[utoipa::path(
     get,
     path = "/v1/market/key-rate",
     params(MarketKeyRateParams),
     responses(
-        (status = 200, description = "Интервалы ставки с provenance", body = Vec<MarketKeyRateDto>),
-        (status = 422, description = "Некорректный диапазон", body = ApiError)
+        (status = 200, description = "Key-rate intervals with provenance", body = Vec<MarketKeyRateDto>),
+        (status = 422, description = "Invalid range", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -715,16 +712,16 @@ fn market_source(source: MarketSourceDto) -> MarketSource {
         MarketSourceDto::CbrKeyRate => MarketSource::CbrKeyRate,
     }
 }
-/// Ротация доступа без возврата переданного секрета.
+/// Rotate access without returning the submitted secret.
 #[utoipa::path(
     put,
     path = "/v1/brokers/{broker}/access",
-    params(("broker" = String, Path, description = "Код брокера")),
+    params(("broker" = String, Path, description = "Broker code")),
     request_body = BrokerAccessUpdateRequest,
     responses(
-        (status = 200, description = "Доступ обновлён", body = BrokerAccessDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 503, description = "Шифрование доступа не настроено", body = ApiError)
+        (status = 200, description = "Access updated", body = BrokerAccessDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 503, description = "Access encryption is not configured", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -748,11 +745,11 @@ pub async fn update_broker_access(
     Ok(Json(BrokerAccessDto::from_domain(access)))
 }
 
-/// Состояние сервиса.
+/// Service status.
 #[utoipa::path(
     get,
     path = "/v1/health",
-    responses((status = 200, description = "Сервис отвечает", body = HealthDto))
+    responses((status = 200, description = "Service is responding", body = HealthDto))
 )]
 pub async fn health() -> Json<HealthDto> {
     Json(HealthDto {
@@ -762,11 +759,11 @@ pub async fn health() -> Json<HealthDto> {
     })
 }
 
-/// Список счетов.
+/// Account list.
 #[utoipa::path(
     get,
     path = "/v1/accounts",
-    responses((status = 200, description = "Счета владельца", body = Vec<AccountDto>)),
+    responses((status = 200, description = "Owner's accounts", body = Vec<AccountDto>)),
     security(("bearer" = []))
 )]
 pub async fn list_accounts(
@@ -786,14 +783,14 @@ pub async fn list_accounts(
     ))
 }
 
-/// Создание счёта.
+/// Create an account.
 #[utoipa::path(
     post,
     path = "/v1/accounts",
     request_body = CreateAccountRequest,
     responses(
-        (status = 201, description = "Счёт создан", body = AccountDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError)
+        (status = 201, description = "Account created", body = AccountDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -823,19 +820,19 @@ pub async fn create_account(
     ))
 }
 
-/// Заведение брокерского доступа.
+/// Creating broker access.
 ///
-/// Токен приходит от владельца и наружу не возвращается: в ответе —
-/// только идентификатор записи, по которому доступ отзывают (§14).
+/// The token is supplied by the owner and is not returned to the caller: the response contains —
+/// only the record identifier used to revoke access (§14).
 #[utoipa::path(
     post,
     path = "/v1/broker-access",
     request_body = AddBrokerAccessRequest,
     responses(
-        (status = 201, description = "Доступ заведён", body = BrokerAccessDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 422, description = "Код брокера или токен пусты", body = ApiError),
-        (status = 503, description = "Шифрование доступа не настроено", body = ApiError)
+        (status = 201, description = "Access created", body = BrokerAccessDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "Broker code or token is empty", body = ApiError),
+        (status = 503, description = "Broker access encryption is not configured", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -845,9 +842,9 @@ pub async fn add_broker_access(
     Json(request): Json<AddBrokerAccessRequest>,
 ) -> Result<(StatusCode, Json<BrokerAccessDto>), ApiFailure> {
     require_admin(&principal)?;
-    // Токен заворачивается в зануляемую память сразу при разборе тела
-    // и дальше не копируется: открытым он живёт до шифрования в адаптере
-    // и зануляется при уничтожении.
+    // The token is wrapped in zeroising memory as soon as the body is parsed
+    // and is never copied thereafter: it remains in plaintext until encrypted in the adapter
+    // and is zeroised when dropped.
     let token = Zeroizing::new(request.token);
     let created = state
         .services
@@ -865,18 +862,18 @@ pub async fn add_broker_access(
     ))
 }
 
-/// Список брокерских доступов.
+/// List of broker access entries.
 ///
-/// Отозванные тоже показываются: «когда система перестала ходить
-/// к брокеру» является вопросом, на который нужен ответ. Действующий
-/// от отозванного отличается полем `revoked_at`.
+/// Revoked entries are also shown: «when the system stopped contacting
+/// the broker» is a question that needs answering. An active entry
+/// differs from a revoked one by the `revoked_at` field.
 #[utoipa::path(
     get,
     path = "/v1/broker-access",
     responses(
-        (status = 200, description = "Доступы владельца", body = Vec<BrokerAccessDto>),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 503, description = "Шифрование доступа не настроено", body = ApiError)
+        (status = 200, description = "Owner's broker access entries", body = Vec<BrokerAccessDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 503, description = "Broker access encryption is not configured", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -894,15 +891,15 @@ pub async fn list_broker_access(
     ))
 }
 
-/// Отзыв брокерского доступа.
+/// Revoking broker access.
 #[utoipa::path(
     delete,
     path = "/v1/broker-access/{id}",
-    params(("id" = Uuid, Path, description = "Идентификатор заведённого доступа")),
+    params(("id" = Uuid, Path, description = "Identifier of the created access entry")),
     responses(
-        (status = 204, description = "Доступ отозван"),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 503, description = "Шифрование доступа не настроено", body = ApiError)
+        (status = 204, description = "Access revoked"),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 503, description = "Broker access encryption is not configured", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -920,48 +917,48 @@ pub async fn revoke_broker_access(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Присвоение экземпляра.
+/// Claiming the instance.
 ///
-/// **Единственный маршрут без аутентификации, кроме `/v1/health`.**
-/// Иначе и быть не может: токена у присваивающего ещё нет, и позвать
-/// защищённый маршрут ему нечем. Вместо токена его пускает одноразовый
-/// код, напечатанный при старте в консоль, — то есть доказательством
-/// служит доступ к машине, а не знание чего-либо пересылаемого.
+/// **The only unauthenticated route apart from `/v1/health`.**
+/// It cannot be otherwise: the claimant does not yet have a token, and has no way
+/// to call a protected route. Instead of a token, access is granted by a one-time
+/// code printed to the console at startup — that is, proof is provided by
+/// access to the machine, rather than knowledge of anything transmitted.
 ///
-/// Открытой регистрации здесь не будет никогда: второй пришедший завёл
-/// бы себе пустой портфель в чужой базе. Владелец уже есть — присвоение
-/// закрыто навсегда.
+/// There will never be open registration here: the second claimant would create
+/// an empty portfolio for themselves in someone else's database. An owner already exists — claiming
+/// is closed forever.
 #[utoipa::path(
     post,
     path = "/v1/claim",
     request_body = ClaimRequest,
     responses(
-        (status = 201, description = "Экземпляр присвоен", body = IssuedTokenDto),
-        (status = 403, description = "Код неверен, просрочен или уже использован", body = ApiError),
-        (status = 409, description = "Владелец уже есть: присвоение закрыто", body = ApiError)
+        (status = 201, description = "Instance claimed", body = IssuedTokenDto),
+        (status = 403, description = "Code is invalid, expired, or already used", body = ApiError),
+        (status = 409, description = "An owner already exists: claiming is closed", body = ApiError)
     )
 )]
 pub async fn claim(
     State(state): State<ServerState>,
     Json(request): Json<ClaimRequest>,
 ) -> Result<(StatusCode, Json<IssuedTokenDto>), ApiFailure> {
-    // Код проверяется до состояния базы: одноразовость — свойство
-    // самого кода, а не следствие того, что владелец завёлся. Проверка
-    // и стирание идут одной операцией под одним замком — разделив их,
-    // два одновременных запроса с верным кодом получили бы по токену
-    // владельца каждый.
+    // The code is checked before consulting the database state: being single-use is a property
+    // of the code itself, not a consequence of the owner being created. Checking
+    // and erasure happen in one operation under the same lock — if separated,
+    // two concurrent requests with the correct code would each receive an
+    // owner token.
     if !state.accept_claim(&request.code) {
-        // Неверный, просроченный и уже использованный код дают
-        // **одинаковый** ответ: разные сообщили бы, что код угадан
-        // наполовину (§14).
+        // Invalid, expired, and already used codes produce
+        // the **same** response: different responses would reveal that the guess was
+        // partly correct (§14).
         return Err(claim_refused());
     }
 
-    // Код был верен, но владелец успел появиться — например, его завели
-    // с консоли уже после старта, и напечатанный код устарел. Присвоение
-    // закрыто навсегда: второй владелец в однопользовательской системе
-    // означает пустой портфель в чужой базе. Код при этом уже истрачен,
-    // и это не потеря — присваивать всё равно нечего.
+    // The code was correct, but an owner was created in the meantime — for example, through
+    // the console after startup, making the printed code stale. Claiming
+    // permanently closed: a second owner in a single-user system
+    // means an empty portfolio in someone else's database. The code has already been consumed,
+    // and this is no loss — there is nothing to claim anyway.
     match state.services.tokens.sole_owner().await? {
         SoleOwner::None => {}
         SoleOwner::Single(_) | SoleOwner::Several => {
@@ -969,14 +966,14 @@ pub async fn claim(
                 StatusCode::CONFLICT,
                 ApiError::simple(
                     "already_claimed",
-                    "экземпляр уже присвоен: потерянный токен восстанавливается с консоли",
+                    "instance already claimed: a lost token can be recovered from the console",
                 ),
             ));
         }
     }
 
-    // Владелец заводится здесь и только здесь через API: дальше он
-    // существует, и второго присвоения не будет.
+    // The owner is created here and only here via the API: from then on they
+    // exist, and there will be no second claim.
     let issued = state
         .services
         .tokens
@@ -988,33 +985,33 @@ pub async fn claim(
     ))
 }
 
-/// Отказ в присвоении.
+/// Claim rejected.
 ///
-/// Один текст на три разные причины намеренно: сообщение, различающее
-/// «код не тот» и «код просрочен», подтверждает угадавшему, что он
-/// угадал (§14).
+/// A single message is deliberately used for three different reasons: a message that distinguishes
+/// «wrong code» from «expired code» confirms to a guesser that they
+/// guessed correctly (§14).
 fn claim_refused() -> ApiFailure {
     ApiFailure::new(
         StatusCode::FORBIDDEN,
         ApiError::simple(
             "claim_refused",
-            "код присвоения не принят: неверен, просрочен или уже использован",
+            "claim code rejected: incorrect, expired or already used",
         ),
     )
 }
 
-/// Выпуск токена.
+/// Token issuance.
 ///
-/// Токен показывается **один раз**: в базе остаётся только его хеш,
-/// и повторить показ неоткуда (§14).
+/// The token is shown **once only**: only its hash remains in the database,
+/// so it cannot be shown again (§14).
 #[utoipa::path(
     post,
     path = "/v1/tokens",
     request_body = CreateTokenRequest,
     responses(
-        (status = 201, description = "Токен выпущен и показан один раз", body = IssuedTokenDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 422, description = "Область owner через API не выпускается", body = ApiError)
+        (status = 201, description = "Token issued and shown once only", body = IssuedTokenDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 422, description = "The owner scope cannot be issued via the API", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1025,20 +1022,20 @@ pub async fn create_token(
 ) -> Result<(StatusCode, Json<IssuedTokenDto>), ApiFailure> {
     require_admin(&principal)?;
     let scope = match request.scope {
-        // Полный доступ через API не выпускается: владелец заводится
-        // присвоением экземпляра или консолью. Иначе украденный токен
-        // владельца немедленно размножался бы в неотличимые копии,
-        // и отзыв исходного ничего бы не менял.
+        // Full-access tokens cannot be issued via the API: the owner is created
+        // by claiming the instance or using the console. Otherwise, a stolen owner token
+        // could immediately be replicated into indistinguishable copies,
+        // and revoking the original would change nothing.
         TokenScopeDto::Owner => {
             return Err(ApiFailure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ApiError {
                     code: "invalid_request".into(),
-                    message: "токен владельца через API не выпускается: владелец заводится \
-                              присвоением экземпляра или командой консоли"
+                    message: "an owner token cannot be issued via the API: the owner is created \
+                              by claiming the instance or with a console command"
                         .into(),
                     field: Some("scope".into()),
-                    expected: Some("agent или read_only".into()),
+                    expected: Some("agent or read_only".into()),
                     actual: Some("owner".into()),
                     correlation_id: None,
                 },
@@ -1058,18 +1055,18 @@ pub async fn create_token(
     ))
 }
 
-/// Список выданных токенов.
+/// List of issued tokens.
 ///
-/// Ни токенов, ни их хешей в ответе нет и быть не может: хеш — это то,
-/// что достаточно подставить в запрос поиска, чтобы система признала
-/// предъявителя своим. Отозванные показываются: «когда токен перестал
-/// пускать» является вопросом, на который нужен ответ.
+/// Neither tokens nor their hashes are, or can be, included in the response: the hash is all
+/// that needs to be supplied in a lookup request for the system to accept
+/// the bearer as authenticated. Revoked tokens are shown: «when the token stopped
+/// granting access» is a question that needs an answer.
 #[utoipa::path(
     get,
     path = "/v1/tokens",
     responses(
-        (status = 200, description = "Токены владельца", body = Vec<TokenDto>),
-        (status = 403, description = "Недостаточно прав", body = ApiError)
+        (status = 200, description = "Owner's tokens", body = Vec<TokenDto>),
+        (status = 403, description = "Insufficient privileges", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1084,18 +1081,18 @@ pub async fn list_tokens(
     ))
 }
 
-/// Отзыв токена.
+/// Token revocation.
 ///
-/// Отсутствующий и чужой токен дают одинаковый `404` намеренно: разные
-/// ответы сообщили бы постороннему, что такая запись есть (§14).
+/// A missing token and one belonging to another owner deliberately return the same `404`: different
+/// responses would reveal to an outsider that such a record exists (§14).
 #[utoipa::path(
     delete,
     path = "/v1/tokens/{id}",
-    params(("id" = Uuid, Path, description = "Идентификатор выданного токена")),
+    params(("id" = Uuid, Path, description = "Identifier of the issued token")),
     responses(
-        (status = 204, description = "Токен отозван"),
-        (status = 403, description = "Недостаточно прав", body = ApiError),
-        (status = 404, description = "Токена нет или он чужой", body = ApiError)
+        (status = 204, description = "Token revoked"),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Token does not exist or belongs to someone else", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1113,14 +1110,14 @@ pub async fn revoke_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Новая версия состава контура.
+/// New contour composition version.
 #[utoipa::path(
     post,
     path = "/v1/contours",
     request_body = CreateContourVersionRequest,
     responses(
-        (status = 201, description = "Версия создана", body = ContourVersionDto),
-        (status = 403, description = "Недостаточно прав", body = ApiError)
+        (status = 201, description = "Version created", body = ContourVersionDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1135,10 +1132,10 @@ pub async fn create_contour_version(
             StatusCode::UNPROCESSABLE_ENTITY,
             ApiError {
                 code: "invalid_request".into(),
-                message: "контур без счетов не имеет границы".into(),
+                message: "a contour with no accounts has no boundary".into(),
                 field: Some("accounts".into()),
-                expected: Some("хотя бы один счёт".into()),
-                actual: Some("пустой список".into()),
+                expected: Some("at least one account".into()),
+                actual: Some("empty list".into()),
                 correlation_id: None,
             },
         ));
@@ -1169,14 +1166,14 @@ pub async fn create_contour_version(
     ))
 }
 
-/// Приёмка операций.
+/// Operation ingestion.
 #[utoipa::path(
     post,
     path = "/v1/ingest/operations",
     request_body = SubmitOperationsRequest,
     responses(
-        (status = 200, description = "Вердикт по каждой операции", body = Vec<VerdictDto>),
-        (status = 403, description = "Недостаточно прав", body = ApiError)
+        (status = 200, description = "Verdict for each operation", body = Vec<VerdictDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1190,8 +1187,8 @@ pub async fn ingest_operations(
     }
     let source = SourceId::new_random();
 
-    // Разбор DTO даёт вердикт на строку: одна непонятая операция
-    // не отменяет остальные (§10.1).
+    // Parsing the DTO yields a verdict for each row: one unrecognised operation
+    // does not invalidate the others (§10.1).
     let mut verdicts: Vec<VerdictDto> = Vec::with_capacity(request.operations.len());
     let mut accepted: Vec<(usize, SubmittedOperation)> = Vec::new();
     for (index, operation) in request.operations.iter().enumerate() {
@@ -1216,14 +1213,14 @@ pub async fn ingest_operations(
     Ok(Json(verdicts))
 }
 
-/// Приёмка журнальных фактов: корпоративных действий и оферты.
+/// Journal fact ingestion: corporate actions and offers.
 #[utoipa::path(
     post,
     path = "/v1/ingest/journal-events",
     request_body = SubmitJournalEventsRequest,
     responses(
-        (status = 200, description = "Вердикт по каждому факту", body = Vec<VerdictDto>),
-        (status = 403, description = "Недостаточно прав", body = ApiError)
+        (status = 200, description = "Verdict for each fact", body = Vec<VerdictDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1237,9 +1234,9 @@ pub async fn ingest_journal_events(
     }
     let source = SourceId::new_random();
 
-    // Разбор DTO даёт вердикт на элемент: один непонятый факт
-    // не отменяет остальные (§10.1). Порядок ответа — порядок пачки,
-    // поэтому номер строки едет вместе с кандидатом.
+    // Parsing the DTO yields a verdict for each element: one unrecognised fact
+    // does not invalidate the others (§10.1). Response order — batch order,
+    // so the line number accompanies the candidate.
     let mut verdicts: Vec<VerdictDto> = Vec::with_capacity(request.events.len());
     let mut accepted: Vec<(usize, SubmittedJournalEvent)> = Vec::new();
     for (index, event) in request.events.iter().enumerate() {
@@ -1262,14 +1259,14 @@ pub async fn ingest_journal_events(
     Ok(Json(verdicts))
 }
 
-/// Приёмка CSV.
+/// CSV ingestion.
 #[utoipa::path(
     post,
     path = "/v1/ingest/csv",
-    request_body(content = String, description = "Документ CSV", content_type = "text/csv"),
+    request_body(content = String, description = "CSV document", content_type = "text/csv"),
     responses(
-        (status = 200, description = "Вердикт по каждой строке", body = Vec<VerdictDto>),
-        (status = 403, description = "Недостаточно прав", body = ApiError)
+        (status = 200, description = "Verdict for each row", body = Vec<VerdictDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1313,31 +1310,31 @@ pub async fn ingest_csv(
     Ok(Json(verdicts))
 }
 
-/// Параметры отчёта о доходности.
+/// Returns report parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct ReturnsParams {
-    /// Идентификатор контура.
+    /// Scope identifier.
     pub contour: Uuid,
-    /// Версия состава контура. По умолчанию — последняя.
+    /// Scope composition version. By default — the latest.
     #[serde(default)]
     pub contour_version: Option<u32>,
-    /// Дата отчёта в формате ГГГГ-ММ-ДД. По умолчанию — сегодня.
+    /// Report date in YYYY-MM-DD format. By default — today.
     #[serde(default)]
     #[param(value_type = Option<String>, format = Date, example = "2026-01-01")]
     pub as_of: Option<String>,
-    /// Валюта отчёта.
+    /// Report currency.
     pub currency: CurrencyDto,
 }
 
-/// Отчёт о доходности **до налога**.
+/// Returns report **before tax**.
 #[utoipa::path(
     get,
     path = "/v1/reports/returns",
     params(ReturnsParams),
     responses(
-        (status = 200, description = "Отчёт", body = ReturnsReportDto),
-        (status = 404, description = "Контур не найден", body = ApiError),
-        (status = 500, description = "Нарушен инвариант", body = ApiError)
+        (status = 200, description = "Report", body = ReturnsReportDto),
+        (status = 404, description = "Scope not found", body = ApiError),
+        (status = 500, description = "Invariant violated", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1351,8 +1348,8 @@ pub async fn returns_report(
         contour_version: params.contour_version.map(ContourVersion),
         as_of: parse_as_of(params.as_of.as_deref())?,
         report_currency: params.currency.to_domain(),
-        // Официальные курсы читаются сценарием из MarketStore: сервер
-        // не знает ни адаптера, ни формата источника.
+        // The use case reads official exchange rates from MarketStore: the server
+        // knows neither the adapter nor the source format.
         fx: FxTable::new(FxSource::CbrOfficial),
         lot_rule: LotRuleVersion(1),
     };
@@ -1360,18 +1357,18 @@ pub async fn returns_report(
     Ok(Json(ReturnsReportDto::from_domain(&report)))
 }
 
-/// Курсы, переданные вместе с запросом отчёта.
+/// Exchange rates supplied with the report request.
 ///
-/// Это явный переход для владельческого источника: ответ помечен
-/// `owner_supplied` и не смешивается с официальным маршрутом выше.
+/// This is an explicit path for an owner-supplied source: the response is marked
+/// `owner_supplied` and is not mixed with the official route above.
 #[utoipa::path(
     post,
     path = "/v1/reports/returns",
     params(ReturnsParams),
     request_body = Vec<FxRateDto>,
     responses(
-        (status = 200, description = "Отчёт с указанными курсами", body = ReturnsReportDto),
-        (status = 422, description = "Некорректный курс", body = ApiError)
+        (status = 200, description = "Report using the specified exchange rates", body = ReturnsReportDto),
+        (status = 422, description = "Invalid exchange rate", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1388,9 +1385,9 @@ pub async fn returns_report_with_rates(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ApiError {
                     code: "invalid_request".into(),
-                    message: "курс должен быть десятичным числом".into(),
+                    message: "exchange rate must be a decimal number".into(),
                     field: Some("rate".into()),
-                    expected: Some("десятичное число в виде строки".into()),
+                    expected: Some("decimal number represented as a string".into()),
                     actual: Some(rate.rate.clone()),
                     correlation_id: None,
                 },
@@ -1551,12 +1548,12 @@ fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure
         value,
         time::macros::format_description!("[year]-[month]-[day]"),
     )
-    .map_err(|_| invalid_field(field, "ГГГГ-ММ-ДД", value.to_owned()))
+    .map_err(|_| invalid_field(field, "YYYY-MM-DD", value.to_owned()))
 }
 
 fn parse_currency(field: &'static str, value: &str) -> Result<CurrencyCode, ApiFailure> {
     CurrencyCode::from_code(value)
-        .ok_or_else(|| invalid_field(field, "RUB, USD, EUR, CNY или XAU", value.to_owned()))
+        .ok_or_else(|| invalid_field(field, "RUB, USD, EUR, CNY or XAU", value.to_owned()))
 }
 
 fn invalid_field(field: impl Into<String>, expected: &str, actual: String) -> ApiFailure {
@@ -1565,7 +1562,7 @@ fn invalid_field(field: impl Into<String>, expected: &str, actual: String) -> Ap
         StatusCode::UNPROCESSABLE_ENTITY,
         ApiError {
             code: "invalid_request".into(),
-            message: format!("некорректное поле {field}"),
+            message: format!("invalid field {field}"),
             field: Some(field),
             expected: Some(expected.into()),
             actual: Some(actual),
@@ -1578,9 +1575,9 @@ fn invalid_rejection(rejection: Rejection) -> ApiFailure {
 }
 
 ///
-/// Отдельная функция с явным отказом `422`: `serde` для `time::Date`
-/// не принимает строку «ГГГГ-ММ-ДД» без указания формата, и молчаливое
-/// умолчание «сегодня» вместо непонятой даты выдало бы отчёт не на ту дату.
+/// Separate function with an explicit `422` rejection: `serde` for `time::Date`
+/// does not accept a «YYYY-MM-DD» string without a specified format, and silently
+/// defaulting to «today» for an unrecognised date would produce a report for the wrong date.
 fn parse_as_of(value: Option<&str>) -> Result<Option<Date>, ApiFailure> {
     let Some(raw) = value else {
         return Ok(None);
@@ -1595,9 +1592,9 @@ fn parse_as_of(value: Option<&str>) -> Result<Option<Date>, ApiFailure> {
             StatusCode::UNPROCESSABLE_ENTITY,
             ApiError {
                 code: "invalid_request".into(),
-                message: "дата отчёта должна быть в формате ГГГГ-ММ-ДД".into(),
+                message: "report date must be in YYYY-MM-DD format".into(),
                 field: Some("as_of".into()),
-                expected: Some("ГГГГ-ММ-ДД".into()),
+                expected: Some("YYYY-MM-DD".into()),
                 actual: Some(raw.to_owned()),
                 correlation_id: None,
             },
@@ -1613,11 +1610,11 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
     }
 }
 
-/// Справочник имён для разбора CSV.
+/// Name lookup for CSV parsing.
 ///
-/// Счета и принадлежащие владельцу места хранения разрешаются по имени.
-/// Инструменты заранее загружаются со всеми интервалами действия внешних
-/// кодов, чтобы каждая строка документа разрешалась на свою дату.
+/// Accounts and custody locations belonging to the owner are resolved by name.
+/// Instruments are preloaded with all validity intervals for external
+/// codes, so each document row can be resolved as at its own date.
 async fn build_directory(
     services: &Arc<AppServices>,
     principal: &Principal,
@@ -1645,8 +1642,8 @@ async fn build_directory(
             .or_default()
             .push(place.id);
     }
-    // Псевдонимы кладутся все: разбор документа иначе ходил бы в базу
-    // на каждую строку, а строк в отчёте тысячи.
+    // All aliases are inserted: otherwise document parsing would query the database
+    // for each row, and there are thousands of rows in the report.
     for alias in aliases {
         directory.instruments.entry(alias.value).or_default().push((
             alias.namespace,

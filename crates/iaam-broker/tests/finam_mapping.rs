@@ -1,6 +1,6 @@
-//! Все образцы здесь синтетические и построены по официальной документации
-//! Finam REST API; живого токена и снимков шлюза у проекта нет. Тесты
-//! проверяют разбор зафиксированной схемы, а не неизменность живого сервиса.
+//! All samples here are synthetic and built from the official Finam REST API
+//! documentation; the project has no live token or gateway snapshots. Tests
+//! parse a fixed schema rather than asserting that a live service is unchanged.
 
 use std::error::Error;
 
@@ -19,8 +19,8 @@ fn parses_synthetic_transactions_and_keeps_rejected_rows() -> Result<(), Box<dyn
         .iter()
         .find(|operation| operation.operation_id == "FINAM-TRADE-001")
         .ok_or("synthetic fixture does not contain the buy")?;
-    // Разбор доносит слово источника, приведённое к верхнему регистру:
-    // это свойство канала, а не словаря. Классифицирует словарь.
+    // Parsing preserves the source word in upper case: that is a channel
+    // property, not dictionary knowledge. The dictionary classifies it.
     assert_eq!(buy.source_kind, "BUY");
     assert_eq!(buy.quantity_as_decimal(), Some("1".to_owned()));
     assert_eq!(

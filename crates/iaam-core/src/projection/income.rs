@@ -1,12 +1,12 @@
-//! Датированные факты дохода (§7.2).
+//! Dated income facts (§7.2).
 //!
-//! Четвёртый независимый читатель журнала. Он намеренно не берёт ничего
-//! у лотов: `received_to_date` отвечает на другой вопрос — сколько
-//! получено пожизненно, — и делится по лотам пропорционально, а при
-//! замещении бумаги переносится на новую. Сверка спрашивает иное:
-//! пришла ли конкретная запланированная выплата и когда. Поэтому факт
-//! живёт отдельно от агрегатов лота, а гранулярность — ряд на пару
-//! (счёт, инструмент).
+//! The fourth independent journal reader. It deliberately takes nothing
+//! from lots: `received_to_date` answers a different question — how much
+//! has been received over the lifetime — and is distributed proportionally across lots, while on
+//! security replacement it is carried over to the new one. Reconciliation asks something else:
+//! did a specific scheduled payment arrive, and when? Therefore the fact
+//! lives separately from lot aggregates, with one row per
+//! (account, instrument) pair.
 
 use std::collections::BTreeMap;
 
@@ -23,11 +23,11 @@ use crate::money::Money;
 use crate::projection::lots::LotKey;
 use crate::rules::PostingKind;
 
-/// Факт дохода с датой и видом.
+/// An income fact with a date and kind.
 ///
-/// Хранится `EventId`, а не событие целиком: проекции достаточно ссылки
-/// на журнал плюс тех величин, по которым идёт сопоставление. Копия
-/// журнала внутри снимка удваивала бы источник истины.
+/// Stores the `EventId`, not the entire event: the projection only needs a reference
+/// to the journal plus the values used for matching. A copy
+/// of the journal inside the snapshot would duplicate the source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceivedPosting {
     pub event: EventId,
@@ -36,16 +36,16 @@ pub struct ReceivedPosting {
     pub kind: PostingKind,
 }
 
-/// Почему сверка по паре (счёт, инструмент) недоказуема.
+/// Why reconciliation for an (account, instrument) pair cannot be proven.
 ///
-/// Это не дефект данных, а честный отказ утверждать: молчаливое
-/// «выплата не получена» по неполному входу обвиняет брокера в том,
-/// чего журнал не говорит (§4.9).
+/// This is not a data defect, but an honest refusal to assert: silently saying
+/// “the payment was not received” from incomplete input accuses the broker of something
+/// the journal does not say (§4.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IncomeGap {
-    /// Есть выплата, вид которой не установлен: на график её не положить.
+    /// There is a payment whose kind is unknown: it cannot be placed on the schedule.
     IncomeKindUnknown,
-    /// Есть выплата без даты зачисления и без даты выплаты.
+    /// There is a payment with neither a posting date nor a payment date.
     PaymentDateUnknown,
 }
 
@@ -55,7 +55,7 @@ pub enum IncomeError {
     Money(#[from] crate::money::MoneyError),
 }
 
-/// Датированные факты дохода по парам (счёт, инструмент).
+/// Dated income facts by (account, instrument) pair.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomeLedger {
     entries: BTreeMap<LotKey, Entry>,
@@ -68,11 +68,11 @@ struct Entry {
 }
 
 impl IncomeLedger {
-    /// Факты по паре в порядке чтения журнала.
+    /// Facts for the pair in journal read order.
     ///
-    /// Пустой срез у пары, которой в карте нет, и у пары без выплат —
-    /// одно и то же: «подтверждать нечем». Различает их не срез,
-    /// а [`IncomeLedger::gap`].
+    /// An empty slice for a pair absent from the map and for a pair with no payments
+    /// means the same thing: “there is nothing to confirm with.” They are distinguished not by the slice,
+    /// but by [`IncomeLedger::gap`].
     #[must_use]
     pub fn postings(&self, key: &LotKey) -> &[ReceivedPosting] {
         self.entries
@@ -90,13 +90,13 @@ impl IncomeLedger {
         self.entries.is_empty()
     }
 
-    /// Дата получения денег.
+    /// The date the money was received.
     ///
-    /// `cash_posted`, иначе `paid`. Цепочка [`crate::dates::EventDates::effective_date`]
-    /// здесь не годится: она начинается с `settled` и падает до `trade`,
-    /// а это не даты получения денег — подстановка молча сдвинула бы
-    /// факт на другой день (§4.9), и одностороннее окно сопоставления
-    /// приняло бы или отвергло его по чужой дате.
+    /// `cash_posted`, otherwise `paid`. The [`crate::dates::EventDates::effective_date`]
+    /// chain is unsuitable here: it starts with `settled` and falls back to `trade`,
+    /// but those are not dates when money was received — substituting one would silently move
+    /// the fact to another day (§4.9), and the one-sided matching window
+    /// would accept or reject it based on an unrelated date.
     fn payment_date(event: &Event) -> Option<Date> {
         event
             .dates
@@ -109,9 +109,9 @@ impl IncomeLedger {
         self.entries.entry(key).or_default().postings.push(posting);
     }
 
-    /// Пометить пару недоказуемой. Первая причина побеждает: она
-    /// возникла раньше в журнале, и перезапись более поздней сделала бы
-    /// диагноз функцией порядка чтения, а не содержимого журнала.
+    /// Mark a pair as unverifiable. The first reason wins: it
+    /// occurred earlier in the journal, and overwriting it with a later one would make
+    /// the diagnosis a function of read order rather than journal contents.
     fn mark(&mut self, key: LotKey, gap: IncomeGap) {
         let entry = self.entries.entry(key).or_default();
         if entry.gap.is_none() {
@@ -119,15 +119,15 @@ impl IncomeLedger {
         }
     }
 
-    /// Все три источника запланированных выплат теперь здесь: купон
-    /// приходит `Income`, возврат номинала — `CorporateAction`,
-    /// расчёт по оферте — `OfferExercise`.
+    /// All three sources of scheduled payments are now handled here: a coupon
+    /// arrives as `Income`, principal repayment as `CorporateAction`,
+    /// and offer settlement as `OfferExercise`.
     ///
-    /// Разбор исчерпывающий намеренно, и `_ =>` тут запрещён: новый
-    /// член [`EventKind`] обязан сломать сборку и заставить автора
-    /// ответить, выплата это или нет. Молчаливый `_` ответил бы за него
-    /// «нет» — и пропавший факт вышел бы не ошибкой сборки, а ложной
-    /// тревогой сверки у владельца.
+    /// The match is intentionally exhaustive, and `_ =>` is forbidden here: a new
+    /// [`EventKind`] variant must break the build and force the author
+    /// to decide whether it is a payment. A silent `_` would answer
+    /// “no” for them — and the missing fact would surface not as a build error, but as a false
+    /// reconciliation alarm for the owner.
     pub fn apply(&mut self, event: &Event) -> Result<(), IncomeError> {
         match &event.kind {
             EventKind::Income {
@@ -142,13 +142,13 @@ impl IncomeLedger {
                 self.apply_income(event, key, *gross, *kind);
                 Ok(())
             }
-            // Без инструмента сверять не с чем: график выплат
-            // принадлежит бумаге.
+            // Without an instrument, there is nothing to reconcile against: the payment schedule
+            // belongs to the security.
             EventKind::Income {
                 instrument: None, ..
             } => Ok(()),
-            // Ни одно из этих событий запланированной выплатой
-            // по облигации не является.
+            // None of these events is a scheduled payment
+            // on a bond.
             EventKind::Trade { .. }
             | EventKind::CashIn { .. }
             | EventKind::CashOut { .. }
@@ -166,17 +166,17 @@ impl IncomeLedger {
         }
     }
 
-    /// Возврат номинала приносит деньги двумя способами: амортизацией
-    /// (позиция остаётся) и погашением (позиция уходит). Замещение денег
-    /// не приносит и факта не создаёт.
+    /// Principal repayment brings money in two ways: amortisation
+    /// (the position remains) and redemption (the position goes away). Security replacement
+    /// brings no money and creates no fact.
     ///
-    /// Записывается `compensation` — фактически поступившие деньги, а не
-    /// объявленный возвращённый номинал: они расходятся на удержанный
-    /// налог, а сверка отвечает на вопрос «пришли ли деньги».
+    /// `compensation` is recorded — the money actually received, not
+    /// the declared principal repaid: they differ by the withheld
+    /// tax, and reconciliation answers the question “did the money arrive?”
     ///
-    /// Дату даёт [`IncomeLedger::payment_date`], а не `effective_date`
-    /// действия: последняя говорит, когда эмитент принял решение, а не
-    /// когда деньги легли на счёт владельца.
+    /// The date comes from [`IncomeLedger::payment_date`], not the action's `effective_date`:
+    /// the latter says when the issuer made the decision, not
+    /// when the money reached the owner's account.
     fn apply_corporate_action(&mut self, event: &Event, action: &CorporateAction) {
         let (instrument, compensation) = match action {
             CorporateAction::PartialRedemption {
@@ -189,8 +189,8 @@ impl IncomeLedger {
                 compensation,
                 ..
             } => (*instrument, *compensation),
-            // Замещение меняет бумагу на бумагу: подтверждать им нечего,
-            // и пары в карте оно не заводит.
+            // Replacement exchanges one security for another: there is nothing to confirm with it,
+            // and it does not create pairs in the map.
             CorporateAction::Conversion { .. } => return,
         };
         let key = LotKey {
@@ -212,31 +212,31 @@ impl IncomeLedger {
         );
     }
 
-    /// Расчёт по оферте — третий и последний способ, которым
-    /// запланированная выплата приходит деньгами (§3.3). Заявка и её
-    /// отзыв денег не двигают: бумага остаётся у владельца, пока выкуп
-    /// не состоялся, и их состояние ведёт `super::offers::OfferBook`.
+    /// Offer settlement is the third and final way in which
+    /// a scheduled payment arrives as cash (§3.3). The request and its
+    /// withdrawal do not move money: the security remains with the owner until the buyback
+    /// occurs, and their state is tracked by `super::offers::OfferBook`.
     ///
-    /// Сумма считается тем же порядком, что и выручка в книге лотов
-    /// (`lots.rs:746`) и денежная нога самого события
-    /// (`event/mod.rs:732`): иначе один и тот же выкуп значил бы в трёх
-    /// местах три разные суммы. Ни комиссия, ни НКД не подставляются
-    /// нулём (§4.9) — отсутствующего слагаемого в сумме просто нет,
-    /// а объявленное складывается через `try_add`/`try_sub`, чтобы
-    /// переполнение и чужая валюта доехали до вызывающего ошибкой,
-    /// а не молчанием.
+    /// The amount is calculated in the same order as the proceeds in the lot book
+    /// (`lots.rs:746`) and the event's own cash leg
+    /// (`event/mod.rs:732`): otherwise the same buyback would have three
+    /// different amounts in three places. Neither the fee nor accrued interest is replaced
+    /// with zero (§4.9) — a missing term is simply absent from the sum,
+    /// while declared values are combined via `try_add`/`try_sub` so that
+    /// overflow and a mismatched currency reach the caller as errors,
+    /// rather than being silenced.
     ///
-    /// Единственный из трёх разборов, который может не сойтись: у купона
-    /// и возврата номинала сумма берётся из события как есть, считать
-    /// там нечего.
+    /// The only one of the three handlers that may fail to add up: for a coupon
+    /// and principal repayment, the amount is taken from the event as is, with nothing
+    /// to calculate there.
     fn apply_offer_exercise(
         &mut self,
         event: &Event,
         action: &OfferExerciseAction,
     ) -> Result<(), IncomeError> {
-        // Разбор членов, а не отсев одним образцом: `let ... else`
-        // принял бы за «денег не было» и будущий член семейства,
-        // о котором компилятор промолчал бы.
+        // Match variants instead of filtering with a single pattern: `let ... else`
+        // would also treat a future member of the family as “there was no money,”
+        // without a warning from the compiler.
         match action {
             OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => Ok(()),
             OfferExerciseAction::Settled {
@@ -298,8 +298,8 @@ impl IncomeLedger {
                     },
                 );
             }
-            // Дивиденд и процент по вкладу в графике облигации
-            // не значатся: подтверждать ими нечего.
+            // Dividends and deposit interest do not appear in the bond schedule:
+            // there is nothing to confirm with them.
             Some(IncomeKind::Dividend | IncomeKind::DepositInterest) => {}
             None => self.mark(key, IncomeGap::IncomeKindUnknown),
         }
@@ -328,9 +328,9 @@ mod tests {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
     }
 
-    /// Событие дохода в конверте `test_support`: он уже проставляет
-    /// `cash_posted` тем же днём, что и порядок, — то есть ровно ту дату,
-    /// по которой сверка и обязана искать факт.
+    /// An income event in the `test_support` envelope: it already sets
+    /// `cash_posted` to the same day as the ordering date — exactly the date
+    /// by which reconciliation must look up the fact.
     fn income(
         account: AccountId,
         instrument: Option<InstrumentId>,
@@ -362,10 +362,10 @@ mod tests {
         )
     }
 
-    /// Купон без единой даты получения денег. `validate_structure` для
-    /// `Income` (`event/mod.rs:197`) требует лишь одну положительную
-    /// денежную ногу и дат не требует вовсе, поэтому такое событие
-    /// приходит из настоящего импорта, а не только из теста.
+    /// A coupon without any date when the money was received. `validate_structure` for
+    /// `Income` (`event/mod.rs:197`) requires only one positive
+    /// cash leg and does not require dates at all, so such an event
+    /// can come from a real import, not only from a test.
     fn coupon_without_payment_date(
         account: AccountId,
         instrument: InstrumentId,
@@ -407,7 +407,7 @@ mod tests {
 
         ledger
             .apply(&coupon(account, instrument, date!(2026 - 03 - 18), 500))
-            .expect("купон с датой зачисления принимается");
+            .expect("coupon with a posting date is accepted");
 
         let key = LotKey {
             account,
@@ -423,10 +423,10 @@ mod tests {
 
     #[test]
     fn a_coupon_falls_back_to_the_paid_date_but_never_to_settled_or_trade() {
-        // Цепочка `EventDates::effective_date` начинается с `settled`
-        // и падает до `trade` — это не даты получения денег. Взять их
-        // значило бы молча сдвинуть факт на другой день (§4.9),
-        // а окно сопоставления в правиле — односторонее.
+        // The `EventDates::effective_date` chain starts with `settled`
+        // and falls back to `trade` — those are not dates when money was received. Using them
+        // would silently move the fact to another day (§4.9),
+        // while the matching window in the rule is one-sided.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
@@ -438,7 +438,7 @@ mod tests {
             paid: Some(PaidDate(date!(2026 - 03 - 20))),
             ..EventDates::empty()
         };
-        ledger.apply(&event).expect("купон принимается");
+        ledger.apply(&event).expect("coupon is accepted");
 
         let key = LotKey {
             account,
@@ -449,8 +449,8 @@ mod tests {
 
     #[test]
     fn a_cash_posted_date_wins_over_the_paid_date() {
-        // Деньги на счёте — факт получения; «дата выплаты» эмитентом
-        // говорит лишь о том, когда он заплатил.
+        // Money in the account is the fact of receipt; the issuer's “payment date”
+        // only says when the issuer paid.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
@@ -461,7 +461,7 @@ mod tests {
             paid: Some(PaidDate(date!(2026 - 03 - 16))),
             ..EventDates::empty()
         };
-        ledger.apply(&event).expect("купон принимается");
+        ledger.apply(&event).expect("coupon is accepted");
 
         let key = LotKey {
             account,
@@ -478,7 +478,7 @@ mod tests {
 
         ledger
             .apply(&coupon_without_payment_date(account, instrument, 500))
-            .expect("событие принимается, но датированным фактом не становится");
+            .expect("event is accepted but does not become a dated fact");
 
         let key = LotKey {
             account,
@@ -501,7 +501,7 @@ mod tests {
                 date!(2026 - 03 - 18),
                 500,
             ))
-            .expect("событие принимается");
+            .expect("event is accepted");
 
         let key = LotKey {
             account,
@@ -513,16 +513,16 @@ mod tests {
 
     #[test]
     fn the_first_reason_a_pair_is_unverifiable_survives_a_later_one() {
-        // Диагноз не должен зависеть от того, сколько событий прочитано
-        // после первого: перезапись более поздней причиной сделала бы
-        // ответ функцией длины журнала, а не его содержимого.
+        // The diagnosis must not depend on how many events were read
+        // after the first one: overwriting it with a later reason would make
+        // the answer a function of journal length rather than journal contents.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
 
         ledger
             .apply(&coupon_without_payment_date(account, instrument, 500))
-            .expect("принимается");
+            .expect("accepted");
         ledger
             .apply(&income_of_unknown_kind(
                 account,
@@ -530,7 +530,7 @@ mod tests {
                 date!(2026 - 03 - 19),
                 700,
             ))
-            .expect("принимается");
+            .expect("accepted");
 
         let key = LotKey {
             account,
@@ -547,7 +547,7 @@ mod tests {
 
         ledger
             .apply(&dividend(account, instrument, date!(2026 - 03 - 18), 500))
-            .expect("дивиденд принимается");
+            .expect("dividend is accepted");
 
         let key = LotKey {
             account,
@@ -571,7 +571,7 @@ mod tests {
                 Some(IncomeKind::DepositInterest),
                 500,
             ))
-            .expect("процент по вкладу принимается");
+            .expect("deposit interest is accepted");
 
         let key = LotKey {
             account,
@@ -592,26 +592,26 @@ mod tests {
                 date!(2026 - 03 - 18),
                 500,
             ))
-            .expect("принимается");
+            .expect("accepted");
 
         assert!(ledger.is_empty());
     }
 
     #[test]
     fn two_coupons_on_one_pair_are_two_facts_in_journal_order() {
-        // Сверка сопоставляет план с фактами один к одному, поэтому
-        // два купона обязаны остаться двумя фактами: их слияние в сумму
-        // и есть та потеря, ради которой заведён этот читатель.
+        // Reconciliation matches the plan to facts one-to-one, so
+        // two coupons must remain two facts: merging them into one amount
+        // is exactly the loss this reader exists to prevent.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
 
         ledger
             .apply(&coupon(account, instrument, date!(2026 - 03 - 18), 500))
-            .expect("принимается");
+            .expect("accepted");
         ledger
             .apply(&coupon(account, instrument, date!(2026 - 09 - 18), 500))
-            .expect("принимается");
+            .expect("accepted");
 
         let key = LotKey {
             account,
@@ -626,8 +626,8 @@ mod tests {
 
     #[test]
     fn a_pair_the_journal_never_mentioned_has_neither_facts_nor_a_gap() {
-        // «Выплат не было» и «инструмента не видели» — разные ответы;
-        // пустой срез без записи в карте отличает их для сверки.
+        // “There were no payments” and “the instrument was never seen” are different answers;
+        // an empty slice with no entry in the map distinguishes them for reconciliation.
         let ledger = IncomeLedger::default();
         let key = LotKey {
             account: AccountId::new_random(),
@@ -649,10 +649,10 @@ mod tests {
         )
     }
 
-    /// Амортизация в конверте `test_support`: `cash_posted` проставлен тем же
-    /// днём, что и порядок. `effective_date` намеренно отличается от него —
-    /// это дата решения эмитента, а не день, когда деньги легли на счёт,
-    /// и факт обязан датироваться вторым, а не первым.
+    /// Amortisation in the `test_support` envelope: `cash_posted` is set to the same
+    /// day as the ordering date. `effective_date` intentionally differs from it —
+    /// it is the date of the issuer's decision, not the day the money reached the account,
+    /// and the fact must be dated by the latter, not the former.
     fn partial_redemption(
         account: AccountId,
         instrument: InstrumentId,
@@ -691,8 +691,8 @@ mod tests {
         )
     }
 
-    /// Амортизация без единой даты получения денег: конверт `test_support`
-    /// ставит `cash_posted`, поэтому даты снимаются явно.
+    /// Amortisation without any date when the money was received: the `test_support` envelope
+    /// sets `cash_posted`, so the dates are explicitly removed.
     fn partial_redemption_without_payment_date(
         account: AccountId,
         instrument: InstrumentId,
@@ -752,9 +752,9 @@ mod tests {
 
     #[test]
     fn an_amortisation_payment_is_a_dated_principal_return() {
-        // Амортизация приходит `CorporateAction`, а не `Income`. Искать её
-        // среди купонных фактов значило бы поднимать ложную тревогу на
-        // каждой амортизируемой облигации.
+        // Amortisation arrives as `CorporateAction`, not `Income`. Looking for it
+        // among coupon facts would raise a false alarm for
+        // every amortising bond.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
@@ -766,7 +766,7 @@ mod tests {
                 date!(2026 - 06 - 18),
                 300,
             ))
-            .expect("амортизация принимается");
+            .expect("amortisation is accepted");
 
         let key = LotKey {
             account,
@@ -782,10 +782,10 @@ mod tests {
 
     #[test]
     fn the_recorded_amount_is_the_money_received_not_the_principal_declared() {
-        // `compensation` может быть меньше возвращённого номинала — на
-        // удержанный налог, например (`event/corporate_action.rs:37-40`).
-        // Сверка отвечает на вопрос «пришли ли деньги», поэтому берёт
-        // деньги, а не объявленный номинал.
+        // `compensation` may be less than the principal repaid — by
+        // the withheld tax, for example (`event/corporate_action.rs:37-40`).
+        // Reconciliation answers the question “did the money arrive?”, so it uses
+        // the money, not the declared principal.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
@@ -798,7 +798,7 @@ mod tests {
                 /* principal_per_unit */ 400,
                 /* compensation */ 348,
             ))
-            .expect("принимается");
+            .expect("accepted");
 
         let key = LotKey {
             account,
@@ -820,7 +820,7 @@ mod tests {
                 date!(2026 - 09 - 20),
                 1000,
             ))
-            .expect("погашение принимается");
+            .expect("redemption is accepted");
 
         let key = LotKey {
             account,
@@ -835,14 +835,14 @@ mod tests {
 
     #[test]
     fn a_conversion_brings_no_money_and_therefore_no_fact() {
-        // Замещение меняет бумагу на бумагу: подтверждать им нечего,
-        // и отсутствие факта здесь не пробел, а верный ответ.
+        // Replacement exchanges one security for another: there is nothing to confirm with it,
+        // and the absence of a fact here is not a gap, but the correct answer.
         let account = AccountId::new_random();
         let mut ledger = IncomeLedger::default();
 
         ledger
             .apply(&conversion(account, date!(2026 - 06 - 18)))
-            .expect("замещение принимается");
+            .expect("replacement is accepted");
 
         assert!(ledger.is_empty());
     }
@@ -857,7 +857,7 @@ mod tests {
             .apply(&partial_redemption_without_payment_date(
                 account, instrument, 300,
             ))
-            .expect("принимается");
+            .expect("accepted");
 
         let key = LotKey {
             account,
@@ -867,11 +867,11 @@ mod tests {
         assert_eq!(ledger.gap(&key), Some(IncomeGap::PaymentDateUnknown));
     }
 
-    /// Выкуп по оферте в конверте `test_support`. Ноги намеренно пусты:
-    /// [`IncomeLedger`] читает у события вид, даты и величины действия,
-    /// а форму ног проверяет `Event::validate_structure`
-    /// (`event/mod.rs:472`) — собрать их здесь значило бы повторить
-    /// в фикстуре ровно ту арифметику, которую тест и проверяет.
+    /// An offer buyback in the `test_support` envelope. The legs are intentionally empty:
+    /// [`IncomeLedger`] reads the event's kind, dates, and action values,
+    /// while the leg structure is checked by `Event::validate_structure`
+    /// (`event/mod.rs:472`) — building them here would mean repeating
+    /// in the fixture exactly the arithmetic that the test checks.
     fn offer_settled(
         account: AccountId,
         instrument: InstrumentId,
@@ -933,8 +933,8 @@ mod tests {
 
     #[test]
     fn an_offer_settlement_is_a_dated_fact() {
-        // Выкуп по оферте — третий способ, которым запланированная
-        // выплата приходит деньгами: в графике он значится
+        // An offer buyback is the third way in which a scheduled
+        // payment arrives as cash: it appears in the schedule
         // `PostingKind::OfferSettlement` (`rules/cashflow.rs:303`).
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
@@ -949,7 +949,7 @@ mod tests {
                 Some(rub(30)),
                 Some(rub(25)),
             ))
-            .expect("выкуп принимается");
+            .expect("buyback is accepted");
 
         let key = LotKey {
             account,
@@ -966,8 +966,8 @@ mod tests {
 
     #[test]
     fn an_unstated_fee_and_interest_are_absent_from_the_sum_rather_than_zero() {
-        // Отсутствующая величина не подставляется нулём (§4.9): в сумме
-        // её просто нет, и расчёт равен объявленному `gross`.
+        // A missing value is not replaced with zero (§4.9): it is simply
+        // absent from the sum, and the result equals the declared `gross`.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
@@ -981,7 +981,7 @@ mod tests {
                 None,
                 None,
             ))
-            .expect("выкуп без комиссии и НКД принимается");
+            .expect("buyback without a fee or accrued interest is accepted");
 
         let key = LotKey {
             account,
@@ -992,9 +992,9 @@ mod tests {
 
     #[test]
     fn a_zero_fee_in_another_currency_is_an_error_while_an_absent_one_is_not() {
-        // Ноль — такая же величина, как любая другая, и валюту он несёт:
-        // подставить его вместо отсутствующей комиссии значило бы
-        // подменить отказ считать молчаливым согласием.
+        // Zero is a value like any other, and it carries a currency:
+        // substituting it for a missing fee would mean
+        // replacing a refusal to calculate with tacit agreement.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
@@ -1008,7 +1008,7 @@ mod tests {
                 Some(Money::new(PostedMinor::new(0), CurrencyCode::Usd)),
                 None,
             ))
-            .expect_err("комиссия в чужой валюте не складывается с рублями");
+            .expect_err("a fee in a different currency cannot be added to rubles");
 
         assert!(matches!(
             error,
@@ -1039,7 +1039,7 @@ mod tests {
                 None,
                 Some(rub(1)),
             ))
-            .expect_err("переполнение обязано дойти до вызывающего");
+            .expect_err("overflow must reach the caller");
 
         assert!(matches!(error, IncomeError::Money(MoneyError::Overflow)));
         assert!(
@@ -1054,15 +1054,15 @@ mod tests {
 
     #[test]
     fn a_submitted_offer_moves_no_money_and_creates_no_fact() {
-        // Заявка денег не двигает: бумага остаётся у владельца, пока
-        // выкуп не состоялся. Её состояние ведёт `OfferBook`.
+        // A request does not move money: the security remains with the owner until
+        // the buyback occurs. Its state is tracked by `OfferBook`.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut ledger = IncomeLedger::default();
 
         ledger
             .apply(&offer_submitted(account, instrument, date!(2026 - 07 - 01)))
-            .expect("заявка принимается");
+            .expect("request is accepted");
 
         assert!(ledger.is_empty());
     }
@@ -1074,7 +1074,7 @@ mod tests {
 
         ledger
             .apply(&offer_cancelled(account, date!(2026 - 07 - 05)))
-            .expect("отзыв принимается");
+            .expect("withdrawal is accepted");
 
         assert!(ledger.is_empty());
     }
@@ -1094,7 +1094,7 @@ mod tests {
             None,
         );
         event.dates = EventDates::empty();
-        ledger.apply(&event).expect("принимается");
+        ledger.apply(&event).expect("accepted");
 
         let key = LotKey {
             account,

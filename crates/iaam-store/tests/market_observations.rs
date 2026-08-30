@@ -1,4 +1,4 @@
-//! Инварианты публикации и воспроизводимого чтения рыночных рядов.
+//! Invariants for publishing and reproducibly reading market time series.
 
 use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
@@ -12,18 +12,18 @@ use time::macros::{date, datetime};
 use time::{Duration, OffsetDateTime};
 
 fn store_with_instrument() -> (SqliteStore, InstrumentId) {
-    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
     let instrument = InstrumentId::new_random();
     store
         .upsert_instrument(&InstrumentRecord {
             id: instrument,
             kind: Some(InstrumentKind::Share),
             symbol: "SBER".to_owned(),
-            title: "Сбербанк".to_owned(),
+            title: "Sberbank".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент заведён");
+        .expect("instrument created");
     (store, instrument)
 }
 
@@ -97,12 +97,12 @@ fn key_rate(observed_at: &str, rate: &str) -> KeyRateRow {
     }
 }
 
-/// Аренда, заведомо действующая на момент прогона.
+/// A lease that is guaranteed to be valid at the time of the run.
 ///
-/// Абсолютный момент здесь был бы бомбой замедленного действия:
-/// `begin_run` отказывает при `lease_expires_at <= now_utc()`, и записанная
-/// дата однажды наступает — весь файл падает с `LeaseExpired` без единой
-/// правки кода. Так уже случилось (iaam-816).
+/// An absolute point in time here would be a ticking time bomb:
+/// `begin_run` refuses when `lease_expires_at <= now_utc()`, and the recorded
+/// date eventually arrives—the entire file fails with `LeaseExpired` without a single
+/// code change. This has already happened (iaam-816).
 fn lease() -> OffsetDateTime {
     OffsetDateTime::now_utc() + Duration::hours(1)
 }
@@ -117,7 +117,7 @@ fn record_fx_reports_exact_number_of_rows_inserted() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("запуск курсов");
+        .expect("rates run started");
     let rows = [
         fx("2026-08-03T09:00:00Z", "80"),
         fx("2026-08-03T10:00:00Z", "81"),
@@ -125,7 +125,7 @@ fn record_fx_reports_exact_number_of_rows_inserted() {
 
     let inserted = store
         .record_fx(&run, "raw-fx", &rows)
-        .expect("курсы записаны");
+        .expect("rates recorded");
 
     assert_eq!(inserted, 2);
 }
@@ -140,7 +140,7 @@ fn record_key_rate_reports_exact_number_of_rows_inserted() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("запуск ключевой ставки");
+        .expect("key rate run started");
     let rows = [
         key_rate("2026-08-03T09:00:00Z", "18"),
         key_rate("2026-08-03T10:00:00Z", "17.5"),
@@ -148,7 +148,7 @@ fn record_key_rate_reports_exact_number_of_rows_inserted() {
 
     let inserted = store
         .record_key_rate(&run, "raw-key-rate", &rows)
-        .expect("ключевая ставка записана");
+        .expect("key rate recorded");
 
     assert_eq!(inserted, 2);
 }
@@ -163,7 +163,7 @@ fn a_foreign_lease_token_is_refused_for_a_fresh_run() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("свежая аренда");
+        .expect("fresh lease");
     let mut foreign = run.clone();
     foreign.lease_token = "foreign-token".to_owned();
 
@@ -178,7 +178,7 @@ fn a_foreign_lease_token_is_refused_for_a_fresh_run() {
             },
             None,
         )
-        .expect("исходная аренда осталась действующей");
+        .expect("original lease remained active");
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn a_dataset_mismatch_is_refused_even_when_the_other_run_identity_fields_match()
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("запуск курсов");
+        .expect("rates run started");
     let mut wrong_dataset = run.clone();
     wrong_dataset.series.dataset = "other-dataset".to_owned();
 
@@ -210,7 +210,7 @@ fn a_dataset_mismatch_is_refused_even_when_the_other_run_identity_fields_match()
             },
             None,
         )
-        .expect("исходный запуск остался незавершённым");
+        .expect("original run remained unfinished");
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn a_series_key_mismatch_is_refused_even_when_the_other_run_identity_fields_matc
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("запуск курсов");
+        .expect("rates run started");
     let mut wrong_series = run.clone();
     wrong_series.series.series_key = "EUR/RUB".to_owned();
 
@@ -242,7 +242,7 @@ fn a_series_key_mismatch_is_refused_even_when_the_other_run_identity_fields_matc
             },
             None,
         )
-        .expect("исходный запуск остался незавершённым");
+        .expect("original run remained unfinished");
 }
 
 #[test]
@@ -255,14 +255,14 @@ fn an_expired_lease_is_refused_by_recording() {
             date!(2026 - 08 - 03),
             OffsetDateTime::now_utc() + Duration::hours(1),
         )
-        .expect("активная аренда");
+        .expect("active lease");
     store
         .connection()
         .execute(
             "UPDATE sync_runs SET lease_expires_at = '2026-08-01T00:00:00Z' WHERE id = ?1",
             [&run.id],
         )
-        .expect("тестовая просрочка");
+        .expect("test overdue");
 
     let result = store.record_fx(&run, "raw-expired", &[fx("2026-08-03T09:00:00Z", "80")]);
 
@@ -279,14 +279,14 @@ fn a_missing_lease_is_refused_by_recording() {
             date!(2026 - 08 - 03),
             OffsetDateTime::now_utc() + Duration::hours(1),
         )
-        .expect("активная аренда");
+        .expect("active rental");
     store
         .connection()
         .execute(
             "UPDATE sync_runs SET lease_expires_at = NULL WHERE id = ?1",
             [&run.id],
         )
-        .expect("тестовая аренда удалена");
+        .expect("test rental deleted");
 
     let result = store.record_fx(&run, "raw-missing-lease", &[]);
 
@@ -303,14 +303,14 @@ fn a_corrected_price_lands_beside_the_old_one_not_over_it() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("первый запуск");
+        .expect("first run");
     store
         .record_prices(
             &first,
             "raw-first",
             &[price(instrument, "2026-08-03T09:00:00Z", "100")],
         )
-        .expect("первая цена");
+        .expect("first price");
     store
         .finish_run(
             &first,
@@ -320,7 +320,7 @@ fn a_corrected_price_lands_beside_the_old_one_not_over_it() {
                 to: date!(2026 - 08 - 03),
             }),
         )
-        .expect("первый запуск опубликован");
+        .expect("first run published");
 
     let correction = store
         .begin_run(
@@ -329,17 +329,17 @@ fn a_corrected_price_lands_beside_the_old_one_not_over_it() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("исправляющий запуск");
+        .expect("corrective run");
     store
         .record_prices(
             &correction,
             "raw-correction",
             &[price(instrument, "2026-08-03T10:00:00Z", "101")],
         )
-        .expect("исправленная цена");
+        .expect("corrected price");
     store
         .finish_run(&correction, RunOutcome::Succeeded, None)
-        .expect("исправляющий запуск опубликован");
+        .expect("corrective run published");
 
     let venue = PriceVenue {
         board: "TQBR".to_owned(),
@@ -352,8 +352,8 @@ fn a_corrected_price_lands_beside_the_old_one_not_over_it() {
             "2026-08-03",
             "2026-08-03T09:30:00Z",
         )
-        .expect("чтение до исправления")
-        .expect("старая цена существует");
+        .expect("read before correction")
+        .expect("old price exists");
     let after_correction = store
         .prices_at_or_before(
             &instrument.inner().to_string(),
@@ -361,8 +361,8 @@ fn a_corrected_price_lands_beside_the_old_one_not_over_it() {
             "2026-08-03",
             "2026-08-03T11:00:00Z",
         )
-        .expect("чтение после исправления")
-        .expect("новая цена существует");
+        .expect("read after correction")
+        .expect("new price exists");
 
     assert_eq!(before_correction.price, "100");
     assert_eq!(after_correction.price, "101");
@@ -371,8 +371,8 @@ fn a_corrected_price_lands_beside_the_old_one_not_over_it() {
         .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
             row.get(0)
         })
-        .expect("число строк");
-    assert_eq!(rows, 2, "исправление добавлено рядом со старым наблюдением");
+        .expect("row count");
+    assert_eq!(rows, 2, "correction added alongside the old observation");
 }
 
 #[test]
@@ -385,7 +385,7 @@ fn a_partial_run_does_not_advance_the_completeness_boundary() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("полный запуск");
+        .expect("full run");
     store
         .finish_run(
             &complete,
@@ -395,7 +395,7 @@ fn a_partial_run_does_not_advance_the_completeness_boundary() {
                 to: date!(2026 - 08 - 03),
             }),
         )
-        .expect("полный запуск опубликован");
+        .expect("full run published");
 
     let partial = store
         .begin_run(
@@ -404,24 +404,24 @@ fn a_partial_run_does_not_advance_the_completeness_boundary() {
             date!(2026 - 08 - 10),
             lease(),
         )
-        .expect("частичный запуск");
+        .expect("partial run");
     store
         .finish_run(
             &partial,
             RunOutcome::Partial {
-                reason: "страница 8 из 10 недоступна".to_owned(),
+                reason: "page 8 of 10 is unavailable".to_owned(),
             },
             Some(Coverage {
                 from: date!(2026 - 08 - 04),
                 to: date!(2026 - 08 - 08),
             }),
         )
-        .expect("частичный запуск зафиксирован");
+        .expect("partial run recorded");
 
     assert_eq!(
         store
             .complete_through(&series("SBER:TQBR:1"))
-            .expect("граница полноты"),
+            .expect("completeness boundary"),
         Some(date!(2026 - 08 - 03))
     );
 }
@@ -436,16 +436,16 @@ fn a_failed_series_does_not_hold_back_other_series() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("неудачная серия");
+        .expect("failed series");
     store
         .finish_run(
             &failed,
             RunOutcome::Failed {
-                reason: "MOEX недоступен".to_owned(),
+                reason: "MOEX unavailable".to_owned(),
             },
             None,
         )
-        .expect("неудача записана");
+        .expect("failure recorded");
 
     let other = store
         .begin_run(
@@ -454,7 +454,7 @@ fn a_failed_series_does_not_hold_back_other_series() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("другая серия не заблокирована");
+        .expect("other series not blocked");
     store
         .finish_run(
             &other,
@@ -464,18 +464,18 @@ fn a_failed_series_does_not_hold_back_other_series() {
                 to: date!(2026 - 08 - 03),
             }),
         )
-        .expect("другая серия опубликована");
+        .expect("other series published");
 
     assert_eq!(
         store
             .complete_through(&series("SBER:TQBR:1"))
-            .expect("граница первой серии"),
+            .expect("first series boundary"),
         None
     );
     assert_eq!(
         store
             .complete_through(&series("GAZP:TQBR:1"))
-            .expect("граница второй серии"),
+            .expect("second series boundary"),
         Some(date!(2026 - 08 - 03))
     );
 }
@@ -490,14 +490,14 @@ fn rows_of_an_unfinished_run_are_invisible_to_reads() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("запуск");
+        .expect("start");
     store
         .record_prices(
             &run,
             "raw",
             &[price(instrument, "2026-08-03T09:00:00Z", "100")],
         )
-        .expect("незавершённая строка");
+        .expect("unfinished row");
 
     let found = store
         .prices_at_or_before(
@@ -509,14 +509,14 @@ fn rows_of_an_unfinished_run_are_invisible_to_reads() {
             "2026-08-03",
             "2026-08-03T12:00:00Z",
         )
-        .expect("чтение");
-    assert!(found.is_none(), "running не публикуется чтением");
+        .expect("read");
+    assert!(found.is_none(), "running is not published on read");
 }
 
 #[test]
 fn accrued_interest_is_invisible_before_its_knowledge_coordinate() {
-    // Наблюдение, записанное позже координаты, обязано быть невидимым:
-    // иначе отчёт «на вчера» пересчитается от завтрашнего знания.
+    // An observation recorded after the coordinate must be invisible:
+    // otherwise the “as of yesterday” report will be recalculated from tomorrow’s knowledge.
     let (mut store, instrument) = store_with_instrument();
     let run = store
         .begin_run(
@@ -582,7 +582,7 @@ fn a_second_run_on_the_same_series_is_refused_while_the_lease_holds() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("первая аренда");
+        .expect("first lease");
     let refused = store.begin_run(
         series("SBER:TQBR:1"),
         date!(2026 - 08 - 03),
@@ -603,17 +603,17 @@ fn a_read_at_an_earlier_knowledge_time_returns_the_earlier_value() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("первый запуск");
+        .expect("first run");
     store
         .record_prices(
             &first,
             "raw-1",
             &[price(instrument, "2026-08-03T09:00:00Z", "100")],
         )
-        .expect("первое наблюдение");
+        .expect("first observation");
     store
         .finish_run(&first, RunOutcome::Succeeded, None)
-        .expect("первое наблюдение опубликовано");
+        .expect("first observation published");
 
     let second = store
         .begin_run(
@@ -622,17 +622,17 @@ fn a_read_at_an_earlier_knowledge_time_returns_the_earlier_value() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("второй запуск");
+        .expect("second run");
     store
         .record_prices(
             &second,
             "raw-2",
             &[price(instrument, "2026-08-03T10:00:00Z", "101")],
         )
-        .expect("исправленное наблюдение");
+        .expect("corrected observation");
     store
         .finish_run(&second, RunOutcome::Succeeded, None)
-        .expect("второе наблюдение опубликовано");
+        .expect("second observation published");
 
     let value = store
         .prices_at_or_before(
@@ -644,8 +644,8 @@ fn a_read_at_an_earlier_knowledge_time_returns_the_earlier_value() {
             "2026-08-03",
             "2026-08-03T09:30:00Z",
         )
-        .expect("чтение на ранний момент")
-        .expect("ранняя цена");
+        .expect("reading at the early moment")
+        .expect("early price");
     assert_eq!(value.price, "100");
 
     let later = store
@@ -658,8 +658,8 @@ fn a_read_at_an_earlier_knowledge_time_returns_the_earlier_value() {
             "2026-08-03",
             "2026-08-03T11:00:00Z",
         )
-        .expect("чтение на поздний момент")
-        .expect("поздняя цена");
+        .expect("reading at the late moment")
+        .expect("late price");
     assert_eq!(later.price, "101");
 }
 
@@ -681,14 +681,14 @@ fn an_expired_lease_is_replaced_and_old_token_cannot_finish() {
             date!(2026 - 08 - 03),
             OffsetDateTime::now_utc() + Duration::hours(1),
         )
-        .expect("активная аренда");
+        .expect("active lease");
     store
         .connection()
         .execute(
             "UPDATE sync_runs SET lease_expires_at = '2026-08-01T00:00:00Z' WHERE id = ?1",
             [&old.id],
         )
-        .expect("тестовая просрочка");
+        .expect("test expiration");
     let replacement = store
         .begin_run(
             series("SBER:TQBR:1"),
@@ -696,18 +696,18 @@ fn an_expired_lease_is_replaced_and_old_token_cannot_finish() {
             date!(2026 - 08 - 03),
             OffsetDateTime::now_utc() + Duration::hours(1),
         )
-        .expect("просроченная аренда освобождена");
+        .expect("expired lease released");
     assert!(matches!(
         store.finish_run(&old, RunOutcome::Succeeded, None),
         Err(StoreError::RunNotFound)
     ));
     store
         .finish_run(&replacement, RunOutcome::Succeeded, None)
-        .expect("новый запуск завершён");
+        .expect("new run completed");
 }
 
 #[test]
-fn цена_выбирает_последнюю_торговую_дату_а_затем_знание() {
+fn price_uses_latest_trade_date_then_knowledge() {
     let (mut store, instrument) = store_with_instrument();
     let old_day = store
         .begin_run(
@@ -716,7 +716,7 @@ fn цена_выбирает_последнюю_торговую_дату_а_з�
             date!(2026 - 08 - 20),
             lease(),
         )
-        .expect("запуск старого торгового дня");
+        .expect("starting the old trading day");
     store
         .record_prices(
             &old_day,
@@ -735,10 +735,10 @@ fn цена_выбирает_последнюю_торговую_дату_а_з�
                 executability: "executable".to_owned(),
             }],
         )
-        .expect("старая цена");
+        .expect("old price");
     store
         .finish_run(&old_day, RunOutcome::Succeeded, None)
-        .expect("старый день опубликован");
+        .expect("old day published");
 
     let recent_day = store
         .begin_run(
@@ -747,7 +747,7 @@ fn цена_выбирает_последнюю_торговую_дату_а_з�
             date!(2026 - 08 - 26),
             lease(),
         )
-        .expect("запуск свежего торгового дня");
+        .expect("starting a fresh trading day");
     store
         .record_prices(
             &recent_day,
@@ -766,10 +766,10 @@ fn цена_выбирает_последнюю_торговую_дату_а_з�
                 executability: "executable".to_owned(),
             }],
         )
-        .expect("свежая цена");
+        .expect("fresh price");
     store
         .finish_run(&recent_day, RunOutcome::Succeeded, None)
-        .expect("свежий день опубликован");
+        .expect("fresh day published");
 
     let value = store
         .prices_at_or_before(
@@ -781,14 +781,14 @@ fn цена_выбирает_последнюю_торговую_дату_а_з�
             "2026-08-26",
             "2026-08-29T00:00:00Z",
         )
-        .expect("чтение цены")
-        .expect("цена найдена");
+        .expect("reading price")
+        .expect("price found");
     assert_eq!(value.trade_date, "2026-08-26");
     assert_eq!(value.price, "101");
 }
 
 #[test]
-fn нкд_выбирает_последнюю_торговую_дату_а_затем_знание() {
+fn accrued_interest_uses_latest_trade_date_then_knowledge() {
     let (mut store, instrument) = store_with_instrument();
     let old_day = store
         .begin_run(
@@ -797,7 +797,7 @@ fn нкд_выбирает_последнюю_торговую_дату_а_за�
             date!(2026 - 08 - 20),
             lease(),
         )
-        .expect("запуск старого торгового дня");
+        .expect("starting the old trading day");
     store
         .record_accrued_interest(
             &old_day,
@@ -812,10 +812,10 @@ fn нкд_выбирает_последнюю_торговую_дату_а_за�
                 currency: "RUB".to_owned(),
             }],
         )
-        .expect("старый НКД");
+        .expect("old accrued interest");
     store
         .finish_run(&old_day, RunOutcome::Succeeded, None)
-        .expect("старый НКД опубликован");
+        .expect("old accrued interest published");
 
     let recent_day = store
         .begin_run(
@@ -824,7 +824,7 @@ fn нкд_выбирает_последнюю_торговую_дату_а_за�
             date!(2026 - 08 - 26),
             lease(),
         )
-        .expect("запуск свежего торгового дня");
+        .expect("start a fresh trading day");
     store
         .record_accrued_interest(
             &recent_day,
@@ -839,10 +839,10 @@ fn нкд_выбирает_последнюю_торговую_дату_а_за�
                 currency: "RUB".to_owned(),
             }],
         )
-        .expect("свежий НКД");
+        .expect("fresh accrued interest");
     store
         .finish_run(&recent_day, RunOutcome::Succeeded, None)
-        .expect("свежий НКД опубликован");
+        .expect("fresh accrued interest published");
 
     let value = store
         .accrued_interest_at_or_before(
@@ -854,14 +854,14 @@ fn нкд_выбирает_последнюю_торговую_дату_а_за�
             "2026-08-26",
             "2026-08-29T00:00:00Z",
         )
-        .expect("чтение НКД")
-        .expect("НКД найден");
+        .expect("read accrued interest")
+        .expect("accrued interest found");
     assert_eq!(value.trade_date, "2026-08-26");
     assert_eq!(value.per_unit, "16.00");
 }
 
 #[test]
-fn уточнение_внутри_торговой_даты_побеждает_для_цены_и_нкд() {
+fn same_day_observation_wins_for_price_and_accrued_interest() {
     let (mut store, instrument) = store_with_instrument();
     let first_price = store
         .begin_run(
@@ -870,7 +870,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
             date!(2026 - 08 - 26),
             lease(),
         )
-        .expect("первый запуск цены");
+        .expect("first price run");
     store
         .record_prices(
             &first_price,
@@ -889,7 +889,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
                 executability: "executable".to_owned(),
             }],
         )
-        .expect("первая цена");
+        .expect("first price");
     store
         .finish_run(&first_price, RunOutcome::Succeeded, None)
         .unwrap();
@@ -901,7 +901,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
             date!(2026 - 08 - 26),
             lease(),
         )
-        .expect("второй запуск цены");
+        .expect("second price run");
     store
         .record_prices(
             &second_price,
@@ -920,7 +920,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
                 executability: "executable".to_owned(),
             }],
         )
-        .expect("уточнение цены");
+        .expect("price refinement");
     store
         .finish_run(&second_price, RunOutcome::Succeeded, None)
         .unwrap();
@@ -932,7 +932,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
             date!(2026 - 08 - 26),
             lease(),
         )
-        .expect("первый запуск НКД");
+        .expect("first accrued interest run");
     store
         .record_accrued_interest(
             &first_interest,
@@ -947,7 +947,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
                 currency: "RUB".to_owned(),
             }],
         )
-        .expect("первый НКД");
+        .expect("first accrued interest");
     store
         .finish_run(&first_interest, RunOutcome::Succeeded, None)
         .unwrap();
@@ -959,7 +959,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
             date!(2026 - 08 - 26),
             lease(),
         )
-        .expect("второй запуск НКД");
+        .expect("second accrued interest run");
     store
         .record_accrued_interest(
             &second_interest,
@@ -974,7 +974,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
                 currency: "RUB".to_owned(),
             }],
         )
-        .expect("уточнение НКД");
+        .expect("accrued interest refinement");
     store
         .finish_run(&second_interest, RunOutcome::Succeeded, None)
         .unwrap();
@@ -1010,7 +1010,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
 }
 
 #[test]
-fn наблюдение_после_координаты_знания_не_видно() {
+fn observation_after_knowledge_coordinate_is_hidden() {
     let (mut store, instrument) = store_with_instrument();
     let run = store
         .begin_run(
@@ -1019,7 +1019,7 @@ fn наблюдение_после_координаты_знания_не_вид
             date!(2026 - 08 - 26),
             lease(),
         )
-        .expect("запуск");
+        .expect("start");
     store
         .record_prices(
             &run,
@@ -1038,7 +1038,7 @@ fn наблюдение_после_координаты_знания_не_вид
                 executability: "executable".to_owned(),
             }],
         )
-        .expect("будущая цена");
+        .expect("future price");
     store.finish_run(&run, RunOutcome::Succeeded, None).unwrap();
 
     assert!(
@@ -1054,14 +1054,14 @@ fn наблюдение_после_координаты_знания_не_вид
             )
             .unwrap()
             .is_none(),
-        "знание из будущего не публикуется"
+        "knowledge from the future is not published"
     );
 }
 
 #[test]
 fn the_quotation_basis_survives_a_round_trip_through_every_read_path() {
-    // Основание, потерянное на одном из путей чтения, обнаружится
-    // не отказом, а заниженной в номинал/100 раз стоимостью позиции.
+    // A basis lost on one of the read paths is detected
+    // not by rejection, but by the position value being understated by a factor of par/100.
     let (mut store, instrument) = store_with_instrument();
     let series = series_with_dataset("moex", "SBER");
     let run = store
@@ -1071,7 +1071,7 @@ fn the_quotation_basis_survives_a_round_trip_through_every_read_path() {
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("запуск цен");
+        .expect("start prices");
     let row = bond_price(
         instrument,
         "2026-08-03T19:00:00Z",
@@ -1117,7 +1117,7 @@ fn the_quotation_basis_survives_a_round_trip_through_every_read_path() {
 }
 
 #[test]
-fn граница_полноты_доступна_на_момент_знания_и_не_раньше() {
+fn completeness_boundary_is_available_at_knowledge_time_and_not_earlier() {
     let (mut store, _) = store_with_instrument();
     let series = series("SBER:TQBR:1");
     let run = store
@@ -1127,7 +1127,7 @@ fn граница_полноты_доступна_на_момент_знания
             date!(2026 - 08 - 03),
             lease(),
         )
-        .expect("запуск");
+        .expect("start");
     store
         .finish_run(
             &run,
@@ -1137,7 +1137,7 @@ fn граница_полноты_доступна_на_момент_знания
                 to: date!(2026 - 08 - 03),
             }),
         )
-        .expect("граница опубликована");
+        .expect("boundary published");
     store
         .connection()
         .execute(
@@ -1148,24 +1148,24 @@ fn граница_полноты_доступна_на_момент_знания
                AND series_key = 'SBER:TQBR:1'",
             [],
         )
-        .expect("момент знания зафиксирован");
+        .expect("knowledge moment recorded");
 
     assert_eq!(
         store
             .complete_through_at_or_before(&series, "2026-08-04T12:00:00Z")
-            .expect("чтение на границе"),
+            .expect("read at boundary"),
         Some(date!(2026 - 08 - 03))
     );
     assert_eq!(
         store
             .complete_through_at_or_before(&series, "2026-08-04T11:59:59Z")
-            .expect("чтение до границы"),
+            .expect("read before boundary"),
         None
     );
 }
 
 #[test]
-fn курсы_возвращаются_ровно_в_заданном_окне_и_на_момент_знания() {
+fn fx_rates_are_returned_only_within_window_and_at_knowledge_time() {
     let (mut store, _) = store_with_instrument();
     let series = series_with_dataset("fx", "USD/RUB");
     let run = store
@@ -1175,7 +1175,7 @@ fn курсы_возвращаются_ровно_в_заданном_окне_�
             date!(2026 - 08 - 04),
             lease(),
         )
-        .expect("запуск курсов");
+        .expect("rates started");
     let rows = [
         FxRow {
             from_code: "USD".to_owned(),
@@ -1207,10 +1207,10 @@ fn курсы_возвращаются_ровно_в_заданном_окне_�
     ];
     store
         .record_fx(&run, "raw-fx", &rows)
-        .expect("курсы записаны");
+        .expect("rates recorded");
     store
         .finish_run(&run, RunOutcome::Succeeded, None)
-        .expect("курсы опубликованы");
+        .expect("rates published");
 
     let found = store
         .fx_between(
@@ -1223,13 +1223,13 @@ fn курсы_возвращаются_ровно_в_заданном_окне_�
                 knowledge_as_of: "2026-08-04T12:00:00Z",
             },
         )
-        .expect("чтение курсов");
+        .expect("read rates");
 
     assert_eq!(found, rows[..2].to_vec());
 }
 
 #[test]
-fn ключевые_ставки_возвращаются_ровно_до_границы_торговой_даты_и_знания() {
+fn key_rates_are_returned_only_through_trade_and_knowledge_boundaries() {
     let (mut store, _) = store_with_instrument();
     let series = series_with_dataset("key-rate", "CBR");
     let run = store
@@ -1239,7 +1239,7 @@ fn ключевые_ставки_возвращаются_ровно_до_гра
             date!(2026 - 08 - 04),
             lease(),
         )
-        .expect("запуск ключевой ставки");
+        .expect("key rate started");
     let rows = [
         KeyRateRow {
             trade_date: "2026-08-01".to_owned(),
@@ -1259,14 +1259,14 @@ fn ключевые_ставки_возвращаются_ровно_до_гра
     ];
     store
         .record_key_rate(&run, "raw-key-rate", &rows)
-        .expect("ставки записаны");
+        .expect("rates recorded");
     store
         .finish_run(&run, RunOutcome::Succeeded, None)
-        .expect("ставки опубликованы");
+        .expect("rates published");
 
     let found = store
         .key_rates_through(&series, "2026-08-03", "2026-08-04T12:00:00Z")
-        .expect("чтение ключевых ставок");
+        .expect("read key rates");
 
     assert_eq!(found, rows[..2].to_vec());
 }

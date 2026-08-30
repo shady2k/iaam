@@ -1,8 +1,8 @@
-//! Независимые эталоны метрик без реинвестирования (§15.4).
+//! Independent reference values for metrics without reinvestment (§15.4).
 //!
-//! График переводится из замороженного ответа MOEX в минимальные доменные
-//! типы прямо в тесте. Ожидаемые суммы ниже вычислены вручную из строк
-//! fixtures, а не вызовом проверяемых функций.
+//! The schedule is converted from a frozen MOEX response into minimal domain
+//! types directly in the test. The expected amounts below were calculated manually from rows in
+//! fixtures, not by calling the functions under test.
 
 use iaam_core::bond::offer::{OfferChoice, OfferRight, ScheduleCompleteness};
 use iaam_core::bond::{AccrualPeriod, BondSchedule, DefaultFlags, PrincipalReturn};
@@ -32,7 +32,7 @@ const OFFERS: &str =
     include_str!("../../../tests/fixtures/market/moex-iss-bondization-offers.json");
 
 fn dec(text: &str) -> Dec {
-    Dec::new(text.parse::<Decimal>().expect("десятичный эталон"))
+    Dec::new(text.parse::<Decimal>().expect("decimal reference value"))
 }
 
 fn calc(text: &str) -> CalcMoney {
@@ -40,17 +40,17 @@ fn calc(text: &str) -> CalcMoney {
 }
 
 fn date_of(text: &str) -> Date {
-    Date::parse(text, format_description!("[year]-[month]-[day]")).expect("дата fixture")
+    Date::parse(text, format_description!("[year]-[month]-[day]")).expect("fixture date")
 }
 
 fn block<'a>(root: &'a Value, name: &str) -> (Vec<&'a str>, &'a [Value]) {
-    let block = root.get(name).expect("секция fixture");
+    let block = root.get(name).expect("fixture section");
     let columns = block
         .get("columns")
         .and_then(Value::as_array)
         .expect("columns fixture")
         .iter()
-        .map(|value| value.as_str().expect("имя колонки fixture"))
+        .map(|value| value.as_str().expect("fixture column name"))
         .collect();
     let rows = block
         .get("data")
@@ -63,12 +63,12 @@ fn field<'a>(columns: &[&str], row: &'a Value, name: &str) -> &'a Value {
     let index = columns
         .iter()
         .position(|column| *column == name)
-        .expect("колонка fixture");
-    row.get(index).expect("ячейка fixture")
+        .expect("fixture column");
+    row.get(index).expect("fixture cell")
 }
 
 fn required_date(columns: &[&str], row: &Value, name: &str) -> Date {
-    date_of(field(columns, row, name).as_str().expect("дата строкой"))
+    date_of(field(columns, row, name).as_str().expect("date as string"))
 }
 
 fn optional_dec(columns: &[&str], row: &Value, name: &str) -> Option<Dec> {
@@ -105,7 +105,7 @@ fn schedule_from_fixture(raw: &str, instrument: InstrumentId) -> BondSchedule {
         .map(|row| PrincipalReturn {
             repayment_date: required_date(&amort_columns, row, "amortdate"),
             share_percent: optional_dec(&amort_columns, row, "valueprc")
-                .expect("доля возврата fixture"),
+                .expect("fixture redemption fraction"),
         })
         .collect();
 
@@ -116,11 +116,11 @@ fn schedule_from_fixture(raw: &str, instrument: InstrumentId) -> BondSchedule {
             let execution_date = required_date(&offer_columns, row, "offerdate");
             let source_kind = field(&offer_columns, row, "offertype")
                 .as_str()
-                .expect("вид оферты fixture");
+                .expect("fixture offer type");
             let right = match source_kind {
                 "Оферта" => OfferRight::HolderPut,
                 "Оферта (состоялось)" => OfferRight::HolderPutSettled,
-                other => panic!("неожиданный вид оферты fixture: {other}"),
+                other => panic!("unexpected fixture offer type: {other}"),
             };
             iaam_core::bond::offer::OfferWindowTerms {
                 window: iaam_core::bond::offer::OfferWindowId::derive(instrument, execution_date),
@@ -162,7 +162,7 @@ fn project(
             as_of,
             report_currency: CurrencyCode::Rub,
         })
-        .expect("график проецируется")
+        .expect("schedule can be projected")
 }
 
 fn assert_rate(outcome: &RateOutcome, expected: f64, label: &str) {
@@ -170,7 +170,7 @@ fn assert_rate(outcome: &RateOutcome, expected: f64, label: &str) {
     let delta = (approx.value() - expected).abs();
     assert!(
         delta <= approx.error_bound() + 1e-12,
-        "{label}: {} против независимого эталона {expected}, ошибка {delta}, граница {}",
+        "{label}: {} versus independent reference value {expected}, error {delta}, bound {}",
         approx.value(),
         approx.error_bound()
     );
@@ -184,9 +184,9 @@ fn fixed_coupon_fixture_matches_independent_schedule_ytm_and_cagr() {
     let choice = OfferChoice::HoldToMaturity;
     let plan = project(FIXED_COUPON, instrument, as_of, &choice);
 
-    // Единственная будущая дата 2041-05-15: купон 35.40 ₽ и возврат 1,000 ₽;
-    // C0 = 1,000 ₽. Поэтому W_T = 1,035.40 ₽, surplus = 35.40 ₽,
-    // HPR = 1,035.40 / 1,000 - 1 = 0.0354, T = 182 дня.
+    // The only future date is 2041-05-15: a coupon of 35.40 ₽ and redemption of 1,000 ₽;
+    // C0 = 1,000 ₽. Therefore W_T = 1,035.40 ₽, surplus = 35.40 ₽,
+    // HPR = 1,035.40 / 1,000 - 1 = 0.0354, T = 182 days.
     assert_eq!(
         plan.postings,
         vec![
@@ -205,28 +205,22 @@ fn fixed_coupon_fixture_matches_independent_schedule_ytm_and_cagr() {
     assert_eq!(plan.terminal_date, terminal);
 
     let metric = prospective_metric(as_of, &plan, Computed::Value(calc("1000")), &choice);
-    let metrics = metric
-        .metrics
-        .value()
-        .expect("метрики фиксированного купона");
+    let metrics = metric.metrics.value().expect("fixed-coupon metrics");
     assert_eq!(metrics.terminal_wealth, calc("1035.4"));
     assert_eq!(metrics.surplus, calc("35.4"));
     assert_eq!(metrics.hpr, Computed::Value(dec("0.0354")));
     assert_eq!(metric.irr_label, IrrLabel::YieldToMaturity);
 
-    // Независимо: (1,035.40 / 1,000)^(365 / 182) - 1.
-    // При одном терминальном дне эта же арифметика задаёт YTM через NPV.
+    // Independently: (1,035.40 / 1,000)^(365 / 182) - 1.
+    // With a single terminal day, the same arithmetic defines YTM via NPV.
     let expected_rate = 0.072_258_093_861_151_67_f64;
     assert_rate(
-        metric.irr.value().expect("YTM фиксированного купона"),
+        metric.irr.value().expect("fixed-coupon YTM"),
         expected_rate,
         "YTM fixed",
     );
     assert_rate(
-        metrics
-            .cagr_0r
-            .value()
-            .expect("CAGR_0R фиксированного купона"),
+        metrics.cagr_0r.value().expect("fixed-coupon CAGR_0R"),
         expected_rate,
         "CAGR fixed",
     );
@@ -240,12 +234,12 @@ fn amortised_fixture_matches_independent_schedule_ytm_and_cagr() {
     let choice = OfferChoice::HoldToMaturity;
     let plan = project(AMORTISED, instrument, as_of, &choice);
 
-    // Будущие купоны: 34.41 ₽ (09.08.2034), 25.80 ₽ (07.02.2035),
-    // 17.20 ₽ (08.08.2035), 8.60 ₽ (06.02.2036). Возвраты номинала:
-    // по 250 ₽ на 09.08.2034, 07.02.2035, 08.08.2035 и 06.02.2036.
+    // Future coupons: 34.41 ₽ (09.08.2034), 25.80 ₽ (07.02.2035),
+    // 17.20 ₽ (08.08.2035), 8.60 ₽ (06.02.2036). Principal repayments:
+    // 250 ₽ each on 09.08.2034, 07.02.2035, 08.08.2035, and 06.02.2036.
     // C0 = 1,000 ₽; W_T = 34.41 + 25.80 + 17.20 + 8.60 + 4*250
     // = 1,086.01 ₽; surplus = 86.01 ₽; HPR = 1,086.01/1,000 - 1
-    // = 0.08601; T = 548 дней.
+    // = 0.08601; T = 548 days.
     assert_eq!(
         plan.postings,
         vec![
@@ -294,31 +288,25 @@ fn amortised_fixture_matches_independent_schedule_ytm_and_cagr() {
     assert_eq!(plan.terminal_date, terminal);
 
     let metric = prospective_metric(as_of, &plan, Computed::Value(calc("1000")), &choice);
-    let metrics = metric
-        .metrics
-        .value()
-        .expect("метрики амортизируемого выпуска");
+    let metrics = metric.metrics.value().expect("amortizing issue metrics");
     assert_eq!(metrics.terminal_wealth, calc("1086.01"));
     assert_eq!(metrics.surplus, calc("86.01"));
     assert_eq!(metrics.hpr, Computed::Value(dec("0.08601")));
     assert_eq!(metric.irr_label, IrrLabel::YieldToMaturity);
 
-    // Независимо: CAGR_0R = (1,086.01/1,000)^(365/548) - 1.
-    // Независимый YTM — корень NPV = 0 для потоков:
-    // -1,000 в день 0; 284.41 в день 2; 275.80 в день 184;
-    // 267.20 в день 366; 258.60 в день 548.
+    // Independently: CAGR_0R = (1,086.01/1,000)^(365/548) - 1.
+    // Independent YTM is the root of NPV = 0 for the cash flows:
+    // -1,000 on day 0; 284.41 on day 2; 275.80 on day 184;
+    // 267.20 on day 366; 258.60 on day 548.
     let expected_cagr = 0.056_494_935_308_105_676_f64;
     let expected_ytm = 0.122_174_516_159_886_06_f64;
     assert_rate(
-        metric.irr.value().expect("YTM амортизируемого выпуска"),
+        metric.irr.value().expect("amortizing issue YTM"),
         expected_ytm,
         "YTM amortised",
     );
     assert_rate(
-        metrics
-            .cagr_0r
-            .value()
-            .expect("CAGR_0R амортизируемого выпуска"),
+        metrics.cagr_0r.value().expect("amortizing issue CAGR_0R"),
         expected_cagr,
         "CAGR amortised",
     );
@@ -337,7 +325,7 @@ fn floater_fixture_has_reproducible_coupon_undetermined_refusal() {
             as_of: date!(2020 - 05 - 12),
             report_currency: CurrencyCode::Rub,
         })
-        .expect_err("неопределённый будущий купон должен отказать");
+        .expect_err("an unknown future coupon should cause an error");
     assert_eq!(
         error,
         CashflowError::CouponUndetermined {
@@ -345,13 +333,13 @@ fn floater_fixture_has_reproducible_coupon_undetermined_refusal() {
         }
     );
 
-    // На границе returns этот отказ становится not_computable с той же
-    // причиной, а не нулевым купоном и не правдоподобным YTM.
+    // At the returns boundary, this failure becomes not_computable with the same
+    // reason, rather than a zero coupon or a plausible YTM.
     let reason = match error {
         CashflowError::CouponUndetermined { .. } => {
             NotComputable::CouponUndetermined { instrument }
         }
-        other => panic!("неожиданная причина отказа: {other}"),
+        other => panic!("unexpected failure reason: {other}"),
     };
     let metric = prospective_metric(
         date!(2020 - 05 - 12),
@@ -364,11 +352,11 @@ fn floater_fixture_has_reproducible_coupon_undetermined_refusal() {
         &choice,
     );
     assert_eq!(
-        metric.metrics.reason().expect("причина отказа").code(),
+        metric.metrics.reason().expect("failure reason").code(),
         "coupon_undetermined"
     );
     assert_eq!(
-        metric.irr.reason().expect("причина отказа").code(),
+        metric.irr.reason().expect("failure reason").code(),
         "coupon_undetermined"
     );
 }
@@ -391,15 +379,15 @@ fn offers_fixture_lists_only_future_priced_holder_windows() {
 
     for choice in choices {
         let scenario_as_of = match &choice {
-            // Все купоны до погашения уже прошли, поэтому неизвестные
-            // купоны после горизонта не участвуют в сценарии удержания.
+            // All coupons before maturity have already passed, so unknown
+            // coupons after the horizon do not affect the holding scenario.
             OfferChoice::HoldToMaturity => date!(2032 - 02 - 17),
             OfferChoice::ExerciseAtOffer { window } => {
                 schedule
                     .offer_windows
                     .iter()
                     .find(|terms| terms.window == *window)
-                    .expect("окно оферты")
+                    .expect("offer window")
                     .execution_date
                     - Duration::days(1)
             }
@@ -414,7 +402,7 @@ fn offers_fixture_lists_only_future_priced_holder_windows() {
                     .offer_windows
                     .iter()
                     .find(|terms| terms.window == window)
-                    .expect("окно оферты");
+                    .expect("offer window");
                 assert_eq!(terms.right, OfferRight::HolderPut);
                 assert!(terms.price_percent.is_some());
                 assert_eq!(plan.terminal_date, terms.execution_date);

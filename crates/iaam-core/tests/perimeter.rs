@@ -1,4 +1,4 @@
-//! Периметр: шорты, маржа, РЕПО вне периметра (§11).
+//! Scope: shorts, margin, and repos are excluded (§11).
 
 use iaam_core::event::Event;
 use iaam_core::event::kind::{EventKind, FeeOrigin};
@@ -55,8 +55,8 @@ fn margin_interest(account: AccountId, day: time::Date, minor: i64) -> Event {
 
 #[test]
 fn a_deficit_closed_within_the_window_is_temporary() {
-    // Минус из-за тайминга расчётов — нормальная работа, а не событие
-    // вне периметра. Расчёты по счёту продолжаются.
+    // A negative balance caused by settlement timing is normal operation, not an
+    // out-of-scope event. Account processing continues.
     let account = AccountId::new_random();
     let events = vec![
         cash(account, date!(2026 - 03 - 10), -50_000),
@@ -66,7 +66,7 @@ fn a_deficit_closed_within_the_window_is_temporary() {
     let span = assessment
         .spans()
         .first()
-        .expect("минус обязан быть замечен");
+        .expect("negative balance must be detected");
     assert_eq!(
         span.classification,
         NegativeCashClassification::TemporarySettlementDeficit
@@ -77,8 +77,8 @@ fn a_deficit_closed_within_the_window_is_temporary() {
 
 #[test]
 fn margin_interest_makes_it_an_unsupported_liability() {
-    // Признак кредита есть — экономику финансирования система не
-    // достраивает и отчёты за период не выдаёт (§11).
+    // A credit indicator is present — the system does not reconstruct the
+    // economics of financing or issue reports for the period (§11).
     let account = AccountId::new_random();
     let events = vec![
         cash(account, date!(2026 - 03 - 10), -50_000),
@@ -90,8 +90,8 @@ fn margin_interest_makes_it_an_unsupported_liability() {
     assert_eq!(
         span.classification,
         NegativeCashClassification::UnsupportedMarginLiability,
-        "быстро закрывшийся минус с процентами по марже остаётся \
-         маржинальным обязательством: признак кредита сильнее срока"
+        "a quickly cleared negative balance with margin interest remains a \
+         margin liability: the credit indicator outweighs its duration"
     );
     assert!(assessment.financing_present(account));
     assert!(assessment.blocks_period_reports(account));
@@ -113,8 +113,8 @@ fn an_unexplained_deficit_outside_the_window_is_unclassified() {
 
 #[test]
 fn other_accounts_keep_computing() {
-    // Ключевое требование §11: отказ считать один счёт не отменяет
-    // остальные. Иначе одна непонятая строка гасит весь портфель.
+    // The key requirement of §11: refusing to process one account does not cancel
+    // the others. Otherwise, one unrecognized row disables the entire portfolio.
     let broken = AccountId::new_random();
     let healthy = AccountId::new_random();
     let events = vec![
@@ -126,16 +126,16 @@ fn other_accounts_keep_computing() {
     assert!(assessment.blocks_period_reports(broken));
     assert!(
         !assessment.blocks_period_reports(healthy),
-        "здоровый счёт продолжает считаться"
+        "the healthy account continues to be processed"
     );
     assert!(!assessment.financing_present(healthy));
 }
 
 #[test]
 fn the_settlement_window_comes_from_the_policy() {
-    // Порог обязан быть параметром: «допустимый срок» без торгового
-    // календаря не вычисляется, и цифра, зависящая от порога, обязана
-    // нести порог рядом с собой.
+    // The threshold must be a parameter: «acceptable duration» cannot be determined without a trading
+    // calendar, and any figure that depends on the threshold must
+    // carry the threshold alongside it.
     let account = AccountId::new_random();
     let events = vec![
         cash(account, date!(2026 - 03 - 10), -50_000),
@@ -167,15 +167,15 @@ fn the_settlement_window_comes_from_the_policy() {
     assert_eq!(
         wide.policy().settlement_window_days,
         30,
-        "порог возвращается вместе с оценкой"
+        "the threshold is returned with the assessment"
     );
 }
 
 #[test]
 fn financing_produces_a_reconciliation_exception_for_cash_only() {
-    // Исключение объясняет расхождение по деньгам. Количества бумаг
-    // маржинальным финансированием не объясняются, и накрывать их
-    // исключением значило бы прятать настоящее расхождение.
+    // The exception explains the cash discrepancy. Security quantities
+    // are not explained by margin financing, and covering them
+    // with the exception would hide a real discrepancy.
     let account = AccountId::new_random();
     let events = vec![
         cash(account, date!(2026 - 03 - 10), -50_000),
@@ -192,8 +192,8 @@ fn financing_produces_a_reconciliation_exception_for_cash_only() {
 
 #[test]
 fn a_positive_only_journal_has_no_spans() {
-    // Отсутствие минуса — это отсутствие промежутков, а не пустая
-    // оценка «на всякий случай».
+    // No negative balance means no intervals, not an empty
+    // assessment «just in case».
     let account = AccountId::new_random();
     let events = vec![cash(account, date!(2026 - 03 - 10), 70_000)];
     let assessment = assess(&events, PerimeterPolicy::default()).unwrap();

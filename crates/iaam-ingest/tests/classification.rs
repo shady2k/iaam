@@ -1,4 +1,4 @@
-//! Правила классификации и пересчёт истории (§10.4).
+//! Classification rules and history recalculation (§10.4).
 
 use std::collections::BTreeMap;
 
@@ -56,8 +56,8 @@ fn transfer_to(name: &str, account: AccountId) -> ClassificationSubject {
 
 #[test]
 fn a_transfer_to_an_own_account_needs_no_rule() {
-    // Правило нужно там, где данных не хватает. Спрашивать о том, что
-    // уже известно, — значит требовать от владельца работы впустую.
+    // The rule is needed where data is missing. Asking about what is
+    // already known means making the owner do pointless work.
     let mine = AccountId::new_random();
     let other = AccountId::new_random();
     let subject = ClassificationSubject {
@@ -118,8 +118,8 @@ fn the_owners_answer_becomes_a_rule_and_the_question_stops() {
 
 #[test]
 fn the_newest_matching_rule_wins() {
-    // Правка правила заводит новую версию: старшая — последнее решение
-    // владельца, а не одно из двух равноправных.
+    // Editing a rule creates a new version: the higher number represents the
+    // owner's latest decision, not one of two equally valid alternatives.
     let mine = AccountId::new_random();
     let subject = transfer_to("40817810099910004312", mine);
     let old = rule(
@@ -140,7 +140,7 @@ fn the_newest_matching_rule_wins() {
         basis,
     } = classify(&subject, &[old, new.clone()])
     else {
-        panic!("правило подошло, вопроса быть не должно");
+        panic!("the rule matched; there should be no question");
     };
     assert_eq!(classification, Classification::ExternalFlow);
     assert_eq!(
@@ -154,8 +154,8 @@ fn the_newest_matching_rule_wins() {
 
 #[test]
 fn a_matcher_that_asks_for_nothing_matches_nothing() {
-    // Правило «на всё» заводится только по ошибке, и молча
-    // переклассифицировать им весь портфель нельзя.
+    // An "all-purpose" rule is created only by mistake, and silently
+    // reclassifying the entire portfolio with it is not allowed.
     let mine = AccountId::new_random();
     let subject = transfer_to("40817810099910004312", mine);
     let catch_all = rule(1, matcher(None, None, None), Classification::ExternalFlow);
@@ -168,9 +168,9 @@ fn a_matcher_that_asks_for_nothing_matches_nothing() {
 
 #[test]
 fn the_description_matcher_ignores_letter_case() {
-    // Назначение платежа брокеры пишут как придётся; правило,
-    // чувствительное к регистру, перестало бы работать на следующем
-    // отчёте того же брокера.
+    // Brokers write payment descriptions however they please; a case-sensitive
+    // rule would stop working in the next report from the same broker.
+    //
     let mine = AccountId::new_random();
     let subject = ClassificationSubject {
         account: mine,
@@ -190,7 +190,7 @@ fn the_description_matcher_ignores_letter_case() {
     let ClassificationResult::Resolved { classification, .. } =
         classify(&subject, &[by_description])
     else {
-        panic!("правило по описанию обязано подойти");
+        panic!("the description rule must match");
     };
     assert_eq!(
         classification,
@@ -202,8 +202,8 @@ fn the_description_matcher_ignores_letter_case() {
 
 #[test]
 fn every_matcher_condition_must_hold() {
-    // Условия матчера соединяются «и»: правило, подошедшее по одному
-    // полю из двух, классифицировало бы чужие операции.
+    // Matcher conditions are joined with "and": a rule matching on one
+    // of two fields would classify unrelated operations.
     let mine = AccountId::new_random();
     let subject = transfer_to("40817810099910004312", mine);
     let too_specific = rule(
@@ -220,14 +220,14 @@ fn every_matcher_condition_must_hold() {
 
 #[test]
 fn a_rule_explains_itself_in_words() {
-    // Правило видимо: формулировку показывают владельцу, и она обязана
-    // однозначно объяснять прошлую классификацию.
+    // The rule is visible: its wording is shown to the owner, and it must
+    // unambiguously explain the previous classification.
     let explained = rule(
         3,
         matcher(
             Some("40817810099910004312"),
-            Some("комиссия"),
-            Some("Прочее"),
+            Some("commission"),
+            Some("Other"),
         ),
         Classification::Fee {
             origin: FeeOrigin::Brokerage,
@@ -236,8 +236,8 @@ fn a_rule_explains_itself_in_words() {
     let text = explained.describe();
 
     assert!(text.contains("40817810099910004312"), "{text}");
-    assert!(text.contains("комиссия"), "{text}");
-    assert!(text.contains("Прочее"), "{text}");
+    assert!(text.contains("commission"), "{text}");
+    assert!(text.contains("Other"), "{text}");
     assert!(!text.is_empty());
 }
 
@@ -279,7 +279,7 @@ fn an_inflow_without_a_counterparty_asks_income_or_return() {
     );
 }
 
-// --- пересчёт истории ---
+// --- history recalculation ---
 
 struct Journal {
     owner: OwnerId,
@@ -365,7 +365,7 @@ fn subjects(
 
 #[test]
 fn amending_a_rule_produces_a_reversal_and_a_replacement() {
-    // Пересчёт истории — это новые факты, а не правка старых (§4.8).
+    // Recalculating history adds new facts; it does not modify old ones (§4.8).
     let journal = Journal::start();
     let recipient = AccountId::new_random();
     let moved = journal.transfer(recipient);
@@ -408,7 +408,7 @@ fn an_event_the_rule_does_not_touch_stays_out_of_the_plan() {
     let journal = Journal::start();
     let recipient = AccountId::new_random();
     let moved = journal.transfer(recipient);
-    // Правило подтверждает ровно то, что уже записано.
+    // The rule confirms exactly what has already been recorded.
     let same = rule(
         1,
         matcher(Some("40817810099910004312"), None, None),
@@ -448,8 +448,8 @@ fn recomputing_twice_produces_nothing_the_second_time() {
     .unwrap();
     assert_eq!(plan.len(), 1);
 
-    // План применён: сторно и замена дописаны в журнал, исходное
-    // событие перестало быть действующим.
+    // Plan applied: the reversal and replacement were appended to the journal; the original
+    // event is no longer active.
     let amount = Money::new(PostedMinor::new(50_000), CurrencyCode::Rub);
     let reversal = Event {
         relation: Relation::Reversal { target: moved.id },
@@ -486,13 +486,13 @@ fn recomputing_twice_produces_nothing_the_second_time() {
     assert_eq!(
         again,
         vec![],
-        "повторный пересчёт тем же правилом не создаёт исправлений"
+        "recalculating with the same rule does not create corrections"
     );
 }
 
 #[test]
 fn an_event_that_carries_no_classification_is_never_recomputed() {
-    // У сделки классификации нет: она факт, а не решение владельца.
+    // A trade has no classification: it is a fact, not an owner's decision.
     let journal = Journal::start();
     let bought = journal.purchase();
 
@@ -515,8 +515,8 @@ fn an_event_that_carries_no_classification_is_never_recomputed() {
 
 #[test]
 fn an_ambiguous_subject_is_left_alone_by_the_recompute() {
-    // Догадка запрещена и здесь: не покрытое правилом событие остаётся
-    // как есть, а не переклассифицируется наугад.
+    // Guessing is forbidden here as well: an event not covered by a rule remains
+    // unchanged; it is not arbitrarily reclassified.
     let journal = Journal::start();
     let moved = journal.transfer(AccountId::new_random());
 
@@ -533,7 +533,7 @@ fn an_ambiguous_subject_is_left_alone_by_the_recompute() {
     assert_eq!(plan, vec![]);
 }
 
-// --- корпоративные действия не являются решениями владельца ---
+// --- corporate actions are not owner's decisions ---
 
 fn amortisation_event(journal: &Journal) -> Event {
     let instrument = InstrumentId::new_random();
@@ -561,9 +561,9 @@ fn amortisation_event(journal: &Journal) -> Event {
 
 #[test]
 fn amortisation_is_not_classified_as_income() {
-    // Ошибка правдоподобна и молчалива: амортизация — возврат
-    // собственного капитала (§6.5), и отнесение её к доходу завысило бы
-    // доход на всю сумму возвращённого номинала.
+    // The error is plausible and silent: amortization is a return
+    // of own capital (§6.5), and classifying it as income would overstate
+    // income by the full amount of the returned principal.
     let journal = Journal::start();
     assert_ne!(
         classification_of(&amortisation_event(&journal)),
@@ -573,8 +573,8 @@ fn amortisation_is_not_classified_as_income() {
 
 #[test]
 fn a_corporate_action_carries_no_classification_at_all() {
-    // Не «другая классификация», а её отсутствие: факт эмитента
-    // пересчёту правилами владельца не подлежит.
+    // Not “a different classification,” but its absence: the issuer's fact
+    // is not subject to recalculation by the owner's rules.
     let journal = Journal::start();
     assert_eq!(classification_of(&amortisation_event(&journal)), None);
 }

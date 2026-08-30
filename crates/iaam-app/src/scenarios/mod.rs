@@ -1,7 +1,7 @@
-//! Сценарии: собрать срез, позвать ядро, сохранить результат.
+//! Scenarios: collect a snapshot, call the core, save the result.
 //!
-//! Арифметики над деньгами здесь нет ни одной строки. Любое число,
-//! попадающее в ответ API, приходит из `iaam-core` (§3.1, §13).
+//! There is not a single line of money arithmetic here. Every number
+//! appearing in the API response comes from `iaam-core` (§3.1, §13).
 
 pub mod ingest;
 pub mod market_reference;

@@ -1,7 +1,7 @@
-//! Точный режим (§6.6): рациональная арифметика без потери точности.
+//! Exact mode (§6.6): rational arithmetic with no loss of precision.
 //!
-//! Используется там, где невязка обязана быть строго нулевой: тождество
-//! результата (§6.3), разнесение налоговой стоимости, сверка.
+//! Used where the residual must be exactly zero: identity
+//! of the result (§6.3), tax-basis allocation, reconciliation.
 
 use core::cmp::Ordering;
 
@@ -9,7 +9,7 @@ use ethnum::I256;
 
 use super::NumericError;
 
-/// Рациональное число: всегда в несократимом виде, знаменатель всегда положителен.
+/// A rational number: always in lowest terms, with a positive denominator.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Exact {
     num: i128,
@@ -17,23 +17,23 @@ pub struct Exact {
 }
 
 impl Exact {
-    /// Конструктор. Тело вынесено в [`Exact::from_ratio`]: `cargo-mutants`
-    /// 27.1.0 не порождает мутантов для функций с именем `new`, поэтому
-    /// нормализация, оставленная здесь, не проверялась бы мутационным
-    /// заслоном вовсе — «выживших нет» означало бы «не проверялось».
+    /// Constructor. The body is moved to [`Exact::from_ratio`]: `cargo-mutants`
+    /// 27.1.0 does not generate mutants for functions named `new`, so
+    /// normalization left here would not be covered by the mutation
+    /// gate at all — “no survivors” would mean “not tested”.
     pub fn new(num: i128, den: i128) -> Result<Self, NumericError> {
         Self::from_ratio(num, den)
     }
 
-    /// Приведение дроби к каноническому виду: знаменатель положителен,
-    /// дробь несократима.
+    /// Reduces the fraction to canonical form: the denominator is positive,
+    /// and the fraction is in lowest terms.
     fn from_ratio(num: i128, den: i128) -> Result<Self, NumericError> {
         if den == 0 {
             return Err(NumericError::ZeroDenominator);
         }
-        // checked_neg, а не унарный минус: `i128::MIN` не имеет положительного
-        // представления, и `-i128::MIN` паникует в debug и заворачивается
-        // в release. Тихое заворачивание в финансовой арифметике недопустимо.
+        // checked_neg rather than unary minus: `i128::MIN` has no positive
+        // representation, and `-i128::MIN` panics in debug and wraps
+        // in release. Silent wrapping is unacceptable in financial arithmetic.
         let (num, den) = if den.is_negative() {
             (
                 num.checked_neg().ok_or(NumericError::Overflow)?,
@@ -42,7 +42,7 @@ impl Exact {
         } else {
             (num, den)
         };
-        // g != 0: den != 0, поэтому НОД положителен
+        // g != 0: den != 0, so the GCD is positive
         let g = gcd(num.unsigned_abs(), den.unsigned_abs()) as i128;
         Ok(Self {
             num: num / g,
@@ -70,8 +70,8 @@ impl Exact {
         self.den
     }
 
-    /// Сложение. Паникует при переполнении `i128` — это ошибка предметной
-    /// области (суммы такого порядка невозможны), а не штатный путь.
+    /// Addition. Panics on `i128` overflow — this is a domain
+    /// error (amounts of this magnitude are impossible), not a normal path.
     #[must_use]
     pub fn add(&self, other: &Self) -> Self {
         let num = self
@@ -83,12 +83,12 @@ impl Exact {
                     .checked_mul(self.den)
                     .and_then(|b| a.checked_add(b))
             })
-            .expect("переполнение i128 в точной арифметике");
+            .expect("i128 overflow in exact arithmetic");
         let den = self
             .den
             .checked_mul(other.den)
-            .expect("переполнение i128 в знаменателе");
-        Self::new(num, den).expect("знаменатель не может стать нулём")
+            .expect("i128 overflow in denominator");
+        Self::new(num, den).expect("denominator cannot become zero")
     }
 
     pub fn neg(&self) -> Result<Self, NumericError> {
@@ -107,12 +107,12 @@ impl Exact {
         let num = self
             .num
             .checked_mul(other.num)
-            .expect("переполнение i128 в умножении");
+            .expect("i128 overflow in multiplication");
         let den = self
             .den
             .checked_mul(other.den)
-            .expect("переполнение i128 в умножении");
-        Self::new(num, den).expect("знаменатель не может стать нулём")
+            .expect("i128 overflow in multiplication");
+        Self::new(num, den).expect("denominator cannot become zero")
     }
 
     pub fn div(&self, other: &Self) -> Result<Self, NumericError> {
@@ -130,8 +130,8 @@ impl Exact {
         Self::new(num, den)
     }
 
-    /// Сумма списка. Вынесена отдельно, потому что проверка тождества (§6.3)
-    /// суммирует компоненты и обязана давать строгий ноль.
+    /// Sums a list. Kept separate because the identity check (§6.3)
+    /// sums the components and must produce an exact zero.
     #[must_use]
     pub fn sum(items: &[Self]) -> Self {
         items.iter().fold(Self::zero(), |acc, x| acc.add(x))
@@ -146,17 +146,17 @@ impl PartialOrd for Exact {
 
 impl Ord for Exact {
     fn cmp(&self, other: &Self) -> Ordering {
-        // a/b <=> c/d при b,d > 0 эквивалентно a*d <=> c*b.
-        // Произведение считается в 256 битах, поэтому переполнения нет
-        // и сравнение остаётся точным при любых допустимых величинах.
+        // a/b <=> c/d for b,d > 0 is equivalent to a*d <=> c*b.
+        // The products are computed using 256-bit arithmetic, so there is no overflow
+        // and the comparison remains exact for all valid values.
         let lhs = I256::from(self.num) * I256::from(other.den);
         let rhs = I256::from(other.num) * I256::from(self.den);
         lhs.cmp(&rhs)
     }
 }
 
-/// Наибольший общий делитель. Вызывается только со знаменателем `den != 0`,
-/// поэтому результат всегда положителен и деление на него безопасно.
+/// Greatest common divisor. Called only with denominator `den != 0`,
+/// so the result is always positive and division by it is safe.
 const fn gcd(mut a: u128, mut b: u128) -> u128 {
     while b != 0 {
         let t = b;
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn decimal_tenths_sum_exactly() {
-        // 0.1 + 0.2 == 0.3 — то, чего не даёт двоичная плавающая точка
+        // 0.1 + 0.2 == 0.3 — unlike binary floating-point arithmetic
         let a = Exact::new(1, 10).unwrap();
         let b = Exact::new(2, 10).unwrap();
         assert_eq!(a.add(&b), Exact::new(3, 10).unwrap());
@@ -202,8 +202,8 @@ mod tests {
 
     #[test]
     fn reduction_needs_the_full_euclidean_loop() {
-        // НОД(1_071, 462) = 21 достигается только за несколько шагов алгоритма:
-        // однократное деление на первый остаток дало бы другую дробь.
+        // GCD(1_071, 462) = 21 takes several steps of the algorithm:
+        // dividing only once by the first remainder would yield a different fraction.
         let e = Exact::new(1_071, 462).unwrap();
         assert_eq!(e.numerator(), 51);
         assert_eq!(e.denominator(), 22);
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn ordering_is_not_a_difference_of_terms() {
-        // 5/2 < 3/1, хотя 5−1 > 3−2: сравнение обязано быть произведением.
+        // 5/2 < 3/1, even though 5−1 > 3−2: the comparison must use cross-products.
         let a = Exact::new(5, 2).unwrap();
         let b = Exact::from_int(3);
         assert_eq!(a.cmp(&b), Ordering::Less);
@@ -382,8 +382,8 @@ mod tests {
 
     #[test]
     fn ordering_survives_operands_that_would_overflow_i128() {
-        // Перекрёстные произведения здесь не помещаются в i128 —
-        // сравнение обязано считаться шире.
+        // The cross-products here do not fit in i128 —
+        // the comparison must be computed at a wider width.
         let big = Exact::new(i128::MAX, 2).unwrap();
         let bigger = Exact::new(i128::MAX, 1).unwrap();
         assert_eq!(big.cmp(&bigger), Ordering::Less);

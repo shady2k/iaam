@@ -1,9 +1,9 @@
-//! Инварианты как исполняемый код (§15.2).
+//! Invariants as executable code (§15.2).
 //!
-//! Нарушение инварианта — **не** то же самое, что неполные данные.
-//! Неполнота даёт нормальный результат плюс блок качества данных;
-//! нарушение инварианта отменяет отчёт целиком: возвращать число
-//! с предупреждением после доказанного нарушения тождества нельзя.
+//! An invariant violation is **not** the same as incomplete data.
+//! Incompleteness produces a normal result plus a data-quality block;
+//! an invariant violation invalidates the entire report: returning a number
+//! with a warning after a proven identity violation is not allowed.
 
 use std::collections::BTreeSet;
 
@@ -17,31 +17,31 @@ use crate::ids::EventId;
 use crate::money::{Money, Quantity};
 use crate::numeric::NumericError;
 
-/// Проверенный инвариант. Отчёт показывает, что именно было проверено:
-/// «инварианты выполнены» без перечисления неотличимо от «не проверялось».
+/// A verified invariant. The report shows exactly what was checked:
+/// “invariants satisfied” without a list is indistinguishable from “not checked”.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckedInvariant {
-    /// Структура каждого события соответствует его типу.
+    /// The structure of each event matches its type.
     EventStructure { events: usize },
-    /// Сумма лотов равна позиции по каждому инструменту.
+    /// The total lot quantity equals the position for each instrument.
     LotsMatchPositions { pairs: usize },
-    /// Приобретено = осталось + списано, в минимальных единицах, точно.
+    /// Acquired = remaining + released, exactly, in minor units.
     BasisConserved { pairs: usize },
-    /// Ни один внешний поток не имеет нулевой суммы.
+    /// No external flow has a zero amount.
     FlowsNonZero { flows: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum InvariantViolation {
-    #[error("событие {event:?} не проходит структурную проверку: {source}")]
+    #[error("event {event:?} fails structural validation: {source}")]
     EventStructure {
         event: EventId,
         #[source]
         source: EventValidationError,
     },
     #[error(
-        "сумма лотов по {key:?} равна {lots}, позиция по ногам событий — {position}; \
-         две независимые дороги к одному количеству разошлись"
+        "the total lot quantity for {key:?} is {lots}, while the position from event legs is {position}; \
+         two independent paths to the same quantity diverged"
     )]
     LotsDoNotMatchPosition {
         key: LotKey,
@@ -49,8 +49,8 @@ pub enum InvariantViolation {
         position: String,
     },
     #[error(
-        "стоимость по {key:?} не сохраняется: приобретено {acquired}, \
-         осталось {remaining}, списано {released}"
+        "value is not conserved for {key:?}: acquired {acquired}, \
+         remaining {remaining}, released {released}"
     )]
     BasisNotConserved {
         key: LotKey,
@@ -58,15 +58,15 @@ pub enum InvariantViolation {
         remaining: i64,
         released: i64,
     },
-    #[error("внешний поток события {event:?} имеет нулевую сумму")]
+    #[error("external flow for event {event:?} has a zero amount")]
     ZeroExternalFlow { event: EventId },
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
 
 impl InvariantViolation {
-    /// Машиночитаемый код. Нарушение инварианта попадает в лог
-    /// с идентификатором корреляции, а наружу уходит `not_computable` (§15.2).
+    /// Machine-readable code. An invariant violation is logged
+    /// with a correlation identifier, while `not_computable` is returned externally (§15.2).
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -79,7 +79,7 @@ impl InvariantViolation {
     }
 }
 
-/// Отчёт о проверенных инвариантах.
+/// Report on verified invariants.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvariantReport {
     checked: Vec<CheckedInvariant>,
@@ -92,11 +92,11 @@ impl InvariantReport {
     }
 }
 
-/// Проверка всех инвариантов состояния.
+/// Validation of all state invariants.
 ///
-/// Ядро не доверяет входу: события уже проверялись при записи, но
-/// проекция строится и по данным, пришедшим из хранилища, а хранилище
-/// могли наполнить в обход приёмки.
+/// The core does not trust its input: events were already validated when written, but
+/// the projection is also built from data retrieved from storage, and the storage
+/// could have been populated by bypassing ingestion.
 pub fn check(
     state: &LedgerState,
     events: &[&Event],
@@ -208,8 +208,8 @@ mod tests {
         Quantity(Dec::new(Decimal::from(units)))
     }
 
-    /// Отчёт обязан перечислять, ЧТО проверено, и с какими количествами:
-    /// «инварианты выполнены» без чисел неотличимо от «не проверялось».
+    /// The report must list WHAT was checked and with what quantities:
+    /// “invariants satisfied” without numbers is indistinguishable from “not checked”.
     #[test]
     fn the_report_names_what_was_checked_and_how_much() {
         let account = AccountId::new_random();
@@ -266,10 +266,10 @@ mod tests {
 
     #[test]
     fn basis_is_conserved_across_a_partial_sale_and_not_merely_when_nothing_is_sold() {
-        // Тождество «приобретено = осталось + списано» проверяется там,
-        // где обе части ненулевые. Пока ничего не продано, списанная
-        // стоимость равна нулю, и сумма неотличима от разности:
-        // испорченный знак прошёл бы незамеченным.
+        // The identity “acquired = remaining + released” is checked where
+        // both parts are nonzero. Until anything has been sold, the released
+        // value is zero, and addition is indistinguishable from subtraction:
+        // an incorrect sign would go unnoticed.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -327,8 +327,8 @@ mod tests {
         ];
 
         let projection = project(&events, &ctx).unwrap();
-        // Обе части ненулевые и различны: приобретено 1 000 000,
-        // списано 400 000, осталось 600 000. Числа посчитаны вручную.
+        // Both parts are nonzero and differ: acquired 1 000 000,
+        // released 400 000, remaining 600 000. The numbers were calculated manually.
         let entry = projection
             .snapshot
             .state()
@@ -376,23 +376,23 @@ mod tests {
 
     #[test]
     fn lots_disagreeing_with_positions_abort_the_projection() {
-        // §15.2: нарушенный инвариант отменяет отчёт целиком, а не
-        // помечает его предупреждением. Две независимые дороги к одному
-        // количеству — позиция по ногам события и сумма лотов по типу
-        // события и правилу списания — обязаны сходиться; расхождение
-        // означает, что одна из них врёт, и какая именно, неизвестно.
+        // §15.2: a violated invariant invalidates the entire report rather than
+        // marking it with a warning. Two independent paths to the same
+        // quantity—the position from event legs and the total lot quantity based on
+        // the event type and disposal rule—must agree; a mismatch
+        // means that one of them is wrong, and it is unknown which one.
         //
-        // Расхождение строится вручную, потому что через журнал его
-        // больше не получить: структурная проверка сверяет ногу с
-        // событием и не пропускает противоречие в журнал вовсе. Это
-        // правильно и делает инвариант вторым рубежом, а не первым, —
-        // но второй рубеж, который никто не проверял, рубежом не является.
+        // The mismatch is constructed manually because it can no longer be produced
+        // through the journal: structural validation compares the leg with
+        // the event and does not allow the contradiction into the journal at all. This
+        // is correct and makes the invariant a second line of defense, not the first—
+        // but a second line of defense that nobody checks is not a line of defense.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
         let mut state = LedgerState::new(LotBook::new(LotRuleVersion(1)));
 
-        // Настоящая покупка: она ложится и в остатки, и в книгу лотов.
+        // A real purchase: it is recorded in both the balances and the lot book.
         let rules = RuleRegistry::with_defaults();
         let purchase = event_with(
             account,
@@ -413,12 +413,12 @@ mod tests {
         );
         {
             let (balances, book, _) = state.parts_mut();
-            balances.apply(&purchase).expect("остатки");
-            book.apply(&purchase, &rules).expect("лоты");
+            balances.apply(&purchase).expect("balances");
+            book.apply(&purchase, &rules).expect("lots");
         }
 
-        // А теперь бумага «появилась» на счёте мимо книги лотов — ровно
-        // то, что даёт задвоенная нога или потерянная запись о продаже.
+        // Now the security has “appeared” in the account outside the lot book—exactly
+        // what a duplicated leg or a missing sale record would cause.
         let phantom = event_with(
             account,
             date!(2025 - 04 - 02),
@@ -428,28 +428,28 @@ mod tests {
         );
         {
             let (balances, _, _) = state.parts_mut();
-            balances.apply(&phantom).expect("нога применяется");
+            balances.apply(&phantom).expect("leg applies");
         }
 
         let verdict = check(&state, &[]);
-        let violation = verdict.expect_err("расхождение обязано отменить проекцию");
+        let violation = verdict.expect_err("mismatch must invalidate the projection");
         assert!(matches!(
             violation,
             InvariantViolation::LotsDoNotMatchPosition { .. }
         ));
         assert_eq!(violation.code(), "lots_do_not_match_position");
 
-        // И наверх это уходит именно как нарушение инварианта, а не как
-        // неполнота данных: первое отменяет отчёт, второе помечает
-        // величину невычислимой.
+        // This is propagated upward specifically as an invariant violation, not as
+        // incomplete data: the former invalidates the report, while the latter marks
+        // the value as not computable.
         assert!(crate::projection::ProjectionError::from(violation).is_invariant_violation());
     }
 
     #[test]
     fn a_position_without_a_single_lot_is_caught() {
-        // Этот случай отдельный: обход только по книге лотов физически
-        // не видит позицию, для которой записи в книге нет вовсе. Тест
-        // служит регрессионным заслоном для обхода по объединению ключей.
+        // This is a separate case: traversing only the lot book physically
+        // cannot see a position for which there is no book entry at all. The test
+        // serves as a regression guard for traversal over the union of keys.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
@@ -467,12 +467,13 @@ mod tests {
         );
         {
             let (balances, _, _) = state.parts_mut();
-            balances.apply(&phantom).expect("нога применяется");
+            balances.apply(&phantom).expect("leg applies");
         }
 
         assert!(state.book().entry(&key).is_none());
         let verdict = check(&state, &[]);
-        let violation = verdict.expect_err("позиция без лота обязана отменить проекцию");
+        let violation =
+            verdict.expect_err("a position without a lot must invalidate the projection");
         assert!(matches!(
             violation,
             InvariantViolation::LotsDoNotMatchPosition { .. }

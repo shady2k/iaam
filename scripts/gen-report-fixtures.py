@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Генератор синтетических книг отчётов брокеров.
+"""Generator for synthetic broker report books.
 
-Книга Т-Инвестиций повторяет устройство выгрузки: шапка с периодом,
-операционные листы и контрольные секции. Все значения вымышлены, а
-фикстура собирается детерминированно, чтобы её можно было пересобрать.
+The T-Investments workbook reproduces the export structure: a header with a period,
+operational sheets and control sections. All values are invented, and
+the fixture is assembled deterministically, so that it can be rebuilt.
 
     python3 scripts/gen-report-fixtures.py
 """
@@ -388,7 +388,7 @@ def write_minimal_workbook():
         ]:
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             book.writestr(info, text)
-    print(f"записано: {MINIMAL_OUT}")
+    print(f"written: {MINIMAL_OUT}")
 
 
 def write_finam_workbook():
@@ -408,7 +408,7 @@ def write_finam_workbook():
         for name, text in entries:
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             book.writestr(info, text)
-    print(f"записано: {FINAM_OUT}")
+    print(f"written: {FINAM_OUT}")
 
 
 def main():
@@ -428,7 +428,7 @@ def main():
         for name, text in entries:
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             book.writestr(info, text)
-    print(f"записано: {OUT}")
+    print(f"written: {OUT}")
     write_finam_workbook()
     write_minimal_workbook()
 

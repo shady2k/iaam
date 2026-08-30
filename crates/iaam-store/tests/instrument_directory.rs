@@ -1,4 +1,4 @@
-//! Резолвинг инструмента по внешнему коду на дату (E3.1).
+//! Resolving an instrument by external code on a given date (E3.1).
 
 use iaam_core::ids::{CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
@@ -8,18 +8,18 @@ use iaam_store::{ResolveError, SqliteStore, StoreError};
 use time::macros::date;
 
 fn store_with_one_bond() -> (SqliteStore, InstrumentId) {
-    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
     let instrument = InstrumentId::new_random();
     store
         .upsert_instrument(&InstrumentRecord {
             id: instrument,
             kind: Some(InstrumentKind::Bond),
             symbol: "RU000A0JX0J2".to_owned(),
-            title: "ОФЗ 26207".to_owned(),
+            title: "OFZ 26207".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент заведён");
+        .expect("instrument created");
     (store, instrument)
 }
 
@@ -51,11 +51,11 @@ fn a_code_resolves_on_the_first_day_of_its_interval() {
             date!(2020 - 01 - 01),
             None,
         ))
-        .expect("псевдоним записан");
+        .expect("alias recorded");
 
     let found = store
         .resolve_instrument(AliasNamespace::Isin, "RU000A0JX0J2", date!(2020 - 01 - 01))
-        .expect("резолвинг");
+        .expect("resolution");
 
     assert_eq!(found, instrument);
 }
@@ -70,7 +70,7 @@ fn a_code_does_not_resolve_on_the_day_its_interval_ends() {
             date!(2020 - 01 - 01),
             Some(date!(2024 - 01 - 01)),
         ))
-        .expect("псевдоним записан");
+        .expect("alias recorded");
 
     let refused =
         store.resolve_instrument(AliasNamespace::Isin, "RU000A0JX0J2", date!(2024 - 01 - 01));
@@ -88,7 +88,7 @@ fn an_absent_code_is_told_apart_from_a_code_outside_its_interval() {
             date!(2020 - 01 - 01),
             Some(date!(2024 - 01 - 01)),
         ))
-        .expect("псевдоним записан");
+        .expect("alias recorded");
 
     let absent =
         store.resolve_instrument(AliasNamespace::Isin, "RU000A0ZZZZ9", date!(2021 - 06 - 01));
@@ -97,7 +97,7 @@ fn an_absent_code_is_told_apart_from_a_code_outside_its_interval() {
 
     assert!(
         matches!(absent, Err(ResolveError::Unknown { .. })),
-        "новая бумага и испорченная дата — разные ответы разбирающемуся"
+        "a new security and a corrupted date must produce different answers for an informed reader"
     );
     assert!(matches!(out_of_range, Err(ResolveError::NotOnDate { .. })));
 }
@@ -112,7 +112,7 @@ fn a_renamed_code_resolves_from_both_sides_of_the_change() {
             date!(2020 - 01 - 01),
             None,
         ))
-        .expect("исходный псевдоним");
+        .expect("original alias");
 
     store
         .rename_alias(&AliasRename {
@@ -123,14 +123,14 @@ fn a_renamed_code_resolves_from_both_sides_of_the_change() {
             instrument,
             source: SourceId::new_random(),
         })
-        .expect("смена кода");
+        .expect("code change");
 
     let before = store
         .resolve_instrument(AliasNamespace::Isin, "RU000AOLD001", date!(2023 - 06 - 01))
-        .expect("документ до смены");
+        .expect("document before the change");
     let after = store
         .resolve_instrument(AliasNamespace::Isin, "RU000ANEW002", date!(2024 - 06 - 01))
-        .expect("документ после смены");
+        .expect("document after the change");
 
     assert_eq!(before, instrument);
     assert_eq!(after, instrument);
@@ -146,7 +146,7 @@ fn the_new_code_does_not_resolve_before_the_change() {
             date!(2020 - 01 - 01),
             None,
         ))
-        .expect("исходный псевдоним");
+        .expect("original alias");
     store
         .rename_alias(&AliasRename {
             namespace: AliasNamespace::Isin,
@@ -156,14 +156,14 @@ fn the_new_code_does_not_resolve_before_the_change() {
             instrument,
             source: SourceId::new_random(),
         })
-        .expect("смена кода");
+        .expect("code change");
 
     let anachronism =
         store.resolve_instrument(AliasNamespace::Isin, "RU000ANEW002", date!(2023 - 06 - 01));
 
     assert!(
         matches!(anachronism, Err(ResolveError::NotOnDate { .. })),
-        "новый код в документе, датированном до смены, — признак порчи данных"
+        "a new code in a document dated before the change indicates corrupted data"
     );
 }
 
@@ -185,8 +185,8 @@ fn renaming_a_missing_code_is_rejected_without_creating_the_new_code() {
         Err(StoreError::AliasNotFoundForInstrument { .. })
     ));
     assert!(
-        store.list_aliases().expect("список алиасов").is_empty(),
-        "ошибка переименования не должна заводить новый код"
+        store.list_aliases().expect("alias list").is_empty(),
+        "a rename error must not register a new code"
     );
 }
 
@@ -199,11 +199,11 @@ fn renaming_with_a_foreign_instrument_is_rejected_without_closing_the_old_code()
             id: foreign,
             kind: Some(InstrumentKind::Bond),
             symbol: "RU000FOREIGN".to_owned(),
-            title: "Чужой выпуск".to_owned(),
+            title: "Foreign issue".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("чужой инструмент заведён");
+        .expect("foreign instrument created");
     store
         .record_alias(&alias(
             instrument,
@@ -211,7 +211,7 @@ fn renaming_with_a_foreign_instrument_is_rejected_without_closing_the_old_code()
             date!(2020 - 01 - 01),
             None,
         ))
-        .expect("исходный псевдоним");
+        .expect("original alias");
 
     let refused = store.rename_alias(&AliasRename {
         namespace: AliasNamespace::Isin,
@@ -226,7 +226,7 @@ fn renaming_with_a_foreign_instrument_is_rejected_without_closing_the_old_code()
         refused,
         Err(StoreError::AliasNotFoundForInstrument { .. })
     ));
-    let aliases = store.list_aliases().expect("список алиасов");
+    let aliases = store.list_aliases().expect("alias list");
     assert_eq!(aliases.len(), 1);
     assert_eq!(aliases[0].instrument, instrument);
     assert_eq!(aliases[0].value, "RU000AOLD001");
@@ -235,7 +235,7 @@ fn renaming_with_a_foreign_instrument_is_rejected_without_closing_the_old_code()
 
 #[test]
 fn a_custody_place_of_another_owner_is_not_overwritten() {
-    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
     let place = CustodyId::new_random();
     let mine = OwnerId::new_random();
     let theirs = OwnerId::new_random();
@@ -244,28 +244,28 @@ fn a_custody_place_of_another_owner_is_not_overwritten() {
         .upsert_custody_place(&CustodyRecord {
             id: place,
             owner: mine,
-            title: "Депозитарий А".to_owned(),
+            title: "Custody A".to_owned(),
             institution: None,
         })
-        .expect("моё место хранения");
+        .expect("my custody place");
 
     store
         .upsert_custody_place(&CustodyRecord {
             id: place,
             owner: theirs,
-            title: "Захвачено".to_owned(),
+            title: "Captured".to_owned(),
             institution: None,
         })
-        .expect("запрос чужого владельца выполняется, но ничего не меняет");
+        .expect("foreign owner's request succeeds but changes nothing");
 
-    let places = store.list_custody_places(mine).expect("список");
-    assert_eq!(places[0].title, "Депозитарий А");
+    let places = store.list_custody_places(mine).expect("list");
+    assert_eq!(places[0].title, "Custody A");
 }
 
 #[test]
 fn a_code_never_resolves_to_two_instruments() {
-    // При непересекающихся интервалах резолвинг на явных датах,
-    // включая обе границы и стык, даёт не более одного кандидата.
+    // For non-overlapping intervals, resolving on explicit dates,
+    // including both boundaries and the junction, yields at most one candidate.
     let (store, instrument) = store_with_one_bond();
     store
         .record_alias(&alias(
@@ -274,7 +274,7 @@ fn a_code_never_resolves_to_two_instruments() {
             date!(2020 - 01 - 01),
             Some(date!(2024 - 01 - 01)),
         ))
-        .expect("первый интервал");
+        .expect("first interval");
     store
         .record_alias(&alias(
             instrument,
@@ -282,7 +282,7 @@ fn a_code_never_resolves_to_two_instruments() {
             date!(2024 - 01 - 01),
             None,
         ))
-        .expect("смежный интервал");
+        .expect("adjacent interval");
 
     for on in [
         date!(2019 - 12 - 31),
@@ -302,39 +302,39 @@ fn a_code_never_resolves_to_two_instruments() {
 
 #[test]
 fn instrument_returns_the_stored_record_and_none_for_an_unknown_id() {
-    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
     let expected = InstrumentRecord {
         id: InstrumentId::new_random(),
         kind: Some(InstrumentKind::Bond),
         symbol: "RU000ATEST01".to_owned(),
-        title: "Тестовый выпуск".to_owned(),
+        title: "Test issue".to_owned(),
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
     };
     store
         .upsert_instrument(&expected)
-        .expect("инструмент заведён");
+        .expect("instrument created");
 
     assert_eq!(
-        store.instrument(expected.id).expect("чтение инструмента"),
+        store.instrument(expected.id).expect("read instrument"),
         Some(expected.clone())
     );
     assert_eq!(
         store
             .instrument(InstrumentId::new_random())
-            .expect("чтение неизвестного инструмента"),
+            .expect("read unknown instrument"),
         None
     );
 }
 
 #[test]
 fn list_instruments_returns_all_stored_records_in_symbol_order() {
-    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
     let later = InstrumentRecord {
         id: InstrumentId::new_random(),
         kind: Some(InstrumentKind::Bond),
         symbol: "ZZZ".to_owned(),
-        title: "Поздний выпуск".to_owned(),
+        title: "Later issue".to_owned(),
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
     };
@@ -342,19 +342,19 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
         id: InstrumentId::new_random(),
         kind: Some(InstrumentKind::Bond),
         symbol: "AAA".to_owned(),
-        title: "Ранний выпуск".to_owned(),
+        title: "Earlier issue".to_owned(),
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
     };
     store
         .upsert_instrument(&later)
-        .expect("первый инструмент заведён");
+        .expect("first instrument created");
     store
         .upsert_instrument(&earlier)
-        .expect("второй инструмент заведён");
+        .expect("second instrument created");
 
     assert_eq!(
-        store.list_instruments().expect("список инструментов"),
+        store.list_instruments().expect("instrument list"),
         vec![earlier, later]
     );
 }

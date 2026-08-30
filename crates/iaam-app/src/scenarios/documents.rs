@@ -1,7 +1,7 @@
-//! Загрузка и повторный разбор отчётов.
+//! Uploading and re-parsing reports.
 //!
-//! Отчётный парсер остаётся в `iaam-ingest`; этот сценарий только выбирает
-//! его, записывает разобранные операции и возвращает исход по каждой строке.
+//! The report parser remains in `iaam-ingest`; this scenario only selects
+//! it, records the parsed transactions and returns the outcome for each row.
 
 use iaam_core::dates::{EffectiveOrder, EventDates};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
@@ -19,14 +19,14 @@ use sha2::{Digest, Sha256};
 use crate::AppServices;
 use crate::error::AppError;
 use crate::ports::Principal;
-/// Один исход загрузки с номером строки исходного листа.
+/// A single upload outcome with the row number from the source sheet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentRowVerdict {
     pub row: u64,
     pub verdict: Verdict,
 }
 
-/// Результат разбора документа.
+/// Document parsing result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UploadedDocument {
     pub document_hash: String,
@@ -38,7 +38,7 @@ pub struct UploadedDocument {
     pub rows: Vec<DocumentRowVerdict>,
 }
 
-/// Разбирает и записывает отчёт, не отменяя документ из-за одной плохой строки.
+/// Parses and records a report without rejecting the document because of one bad row.
 pub async fn upload_report(
     services: &AppServices,
     principal: &Principal,
@@ -49,14 +49,14 @@ pub async fn upload_report(
     if !principal.scope.may_submit() {
         return Err(AppError::Invalid {
             field: "scope".into(),
-            expected: "право отправки операций".into(),
+            expected: "permission to submit transactions".into(),
             actual: principal.scope.code().to_owned(),
         });
     }
 
     let workbook = Workbook::open(bytes).map_err(|error| AppError::Invalid {
         field: "document".into(),
-        expected: "поддерживаемая книга отчёта".into(),
+        expected: "supported report workbook".into(),
         actual: error.to_string(),
     })?;
     let parser = detect_parser(&workbook)?;
@@ -67,8 +67,8 @@ pub async fn upload_report(
     if account.is_none() && !report.sections.claims().is_empty() {
         return Err(AppError::Invalid {
             field: "account".into(),
-            expected: "идентификатор счёта для контрольных секций".into(),
-            actual: "не указан".into(),
+            expected: "account identifier for control sections".into(),
+            actual: "not specified".into(),
         });
     }
     let source = SourceId::new_random();
@@ -118,7 +118,7 @@ pub async fn upload_report(
         rows,
     })
 }
-/// Повторно разбирает переданный исходник и требует совпадения его хеша.
+/// Re-parses the provided source and requires its hash to match.
 pub async fn reparse_report(
     services: &AppServices,
     principal: &Principal,
@@ -131,7 +131,7 @@ pub async fn reparse_report(
     if actual != document_hash.to_ascii_lowercase() {
         return Err(AppError::Invalid {
             field: "document".into(),
-            expected: "исходник с указанным SHA-256".into(),
+            expected: "source with the specified SHA-256".into(),
             actual,
         });
     }
@@ -139,8 +139,8 @@ pub async fn reparse_report(
 }
 
 fn detect_parser(workbook: &Workbook) -> Result<&'static dyn ReportParser, AppError> {
-    // Список фиксирован и исчерпываем: добавление брокера требует явного
-    // изменения точки выбора, а не молчаливого fallback-парсера.
+    // The list is fixed and exhaustive: adding a broker requires an explicit
+    // change to the selection point, not a silent fallback parser.
     static TINKOFF: TinkoffParser = TinkoffParser;
     static FINAM: FinamParser = FinamParser;
     let mut found: Option<&'static dyn ReportParser> = None;
@@ -151,16 +151,16 @@ fn detect_parser(workbook: &Workbook) -> Result<&'static dyn ReportParser, AppEr
         if let Some(first) = found {
             return Err(AppError::Invalid {
                 field: "document".into(),
-                expected: "книга, однозначно опознанная одним парсером".into(),
-                actual: format!("{} и {}", first.broker().code(), parser.broker().code()),
+                expected: "workbook unambiguously identified by a single parser".into(),
+                actual: format!("{} and {}", first.broker().code(), parser.broker().code()),
             });
         }
         found = Some(parser);
     }
     found.ok_or_else(|| AppError::Invalid {
         field: "document".into(),
-        expected: "поддерживаемый отчёт Т-Инвестиций или Финама".into(),
-        actual: "книга не опознана".into(),
+        expected: "supported T-Investments or Finam report".into(),
+        actual: "workbook not recognised".into(),
     })
 }
 
@@ -217,8 +217,8 @@ async fn submit_rows(
             "report:{document_hash}:row:{}",
             located.locator.row
         ));
-        // Форма, запись и вердикт — общий низ приёмки: своя копия здесь
-        // разошлась бы с операциями молча (`scenarios/ingest.rs`).
+        // Shape, persistence and verdict are the shared ingestion foundation: a local copy here
+        // would silently diverge from operations (`scenarios/ingest.rs`).
         let verdict =
             crate::scenarios::ingest::record_candidate(services, normalized.event, "operation")
                 .await?;
@@ -230,11 +230,11 @@ async fn submit_rows(
     Ok(rows)
 }
 
-/// Откуда взялись утверждения: владелец, счёт и происхождение разбора.
+/// Where the assertions came from: owner, account and parsing provenance.
 ///
-/// Отдельный тип, а не пять параметров подряд: аргументы одного смысла,
-/// перечисленные в строку, рано или поздно меняются местами — и счёт
-/// уезжает в чужого владельца молча, потому что оба поля одного типа.
+/// A dedicated type rather than five consecutive parameters: arguments with the same meaning,
+/// listed in sequence, are eventually swapped — and the account
+/// silently ends up under the wrong owner because both fields have the same type.
 struct AssertionOrigin {
     owner: OwnerId,
     account: AccountId,
@@ -257,8 +257,8 @@ async fn append_control_assertions(
     let Some(period) = report.period else {
         return Err(AppError::Invalid {
             field: "period".into(),
-            expected: "период отчёта".into(),
-            actual: "не указан".into(),
+            expected: "reporting period".into(),
+            actual: "not specified".into(),
         });
     };
     let Some(raw_hash) = RawHash::parse(document_hash) else {

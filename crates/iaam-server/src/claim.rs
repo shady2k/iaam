@@ -1,18 +1,18 @@
-//! Присвоение экземпляра (§14).
+//! Instance claiming (§14).
 //!
-//! Система однопользовательская, и открытой регистрации здесь не будет
-//! никогда: второй пришедший завёл бы себе пустой портфель в чужой базе.
-//! Поэтому существует не регистрация, а **однократное присвоение**:
-//! пока владельца нет, программа при старте печатает одноразовый код,
-//! а тот, кто его прочитал, обменивает его на токен владельца.
-//! Прочитать печать в поток ошибок может только запустивший программу —
-//! доступ к консоли и есть доказательство права на экземпляр.
+//! The system is single-user, and open registration will never be available
+//! here: a second user could create an empty portfolio in someone else's database.
+//! Therefore, instead of registration, there is a **one-time claim**:
+//! while there is no owner, the program prints a one-time code at startup,
+//! which whoever reads it exchanges for an owner token.
+//! Only the person who started the program can read what it prints to standard error —
+//! access to the console is itself proof of entitlement to the instance.
 //!
-//! Код живёт **в памяти процесса и только там**. В базу он не попадает:
-//! утечка файла базы не должна отдавать экземпляр — иначе украденный
-//! файл превращался бы в право завести в нём владельца. По той же
-//! причине хранится хеш кода, а не сам код: снимок памяти процесса —
-//! менее вероятная, но не невозможная утечка.
+//! The code lives **in process memory and nowhere else**. It is not stored in the database:
+//! leaking the database file must not surrender the instance — otherwise a stolen
+//! file would confer the right to create an owner in it. For the same
+//! reason, the code's hash is stored rather than the code itself: a process memory dump is
+//! a less likely, but not impossible, leak.
 
 use std::time::{Duration, Instant};
 
@@ -23,40 +23,40 @@ use iaam_app::tokens::secret_hex;
 use crate::ServerState;
 use crate::auth::hash_token;
 
-/// Сколько живёт код присвоения.
+/// How long the claim code remains valid.
 ///
-/// Пятнадцать минут — это «успеть скопировать из соседнего окна», а не
-/// «завтра разберусь». Код, живущий до конца работы процесса, на
-/// долгоживущем сервере становится постоянным вторым входом.
+/// Fifteen minutes means ‘enough time to copy it from the adjacent window’, not
+/// ‘I'll deal with it tomorrow’. A code valid until the process exits becomes
+/// a permanent secondary entry point on a long-running server.
 pub const CLAIM_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
-/// Сколько байт случайности в коде.
+/// Number of random bytes in the code.
 ///
-/// Шестнадцать байт (128 бит): маршрут присвоения открыт без
-/// аутентификации, и перебор по нему обязан быть невозможен, а не
-/// затруднён.
+/// Sixteen bytes (128 bits): the claim route is open without
+/// authentication, so brute-forcing it must be impossible, not merely
+/// difficult.
 const CLAIM_BYTES: usize = 16;
 
-/// Выпущенный код присвоения.
+/// An issued claim code.
 ///
-/// Хранится хеш, а не код: по той же причине, по которой в базе лежит
-/// хеш токена. Сравнение при проверке — тоже по хешам: сравнение самих
-/// кодов даёт атакующему подсказку по времени о длине совпавшего
-/// префикса, а хеши расходятся с первого байта.
+/// The hash is stored rather than the code, for the same reason that the database stores
+/// the token hash. Verification also compares hashes: comparing the codes themselves
+/// gives an attacker a timing clue about the length of the matching
+/// prefix, whereas hashes differ from the first byte.
 ///
-/// Момент выпуска — `Instant`, а не время суток: срок жизни не должен
-/// зависеть от перевода системных часов.
+/// The issue time is an `Instant`, not the time of day: the lifetime must not
+/// depend on system clock adjustments.
 pub struct ClaimCode {
     hash: String,
     issued_at: Instant,
 }
 
 impl ClaimCode {
-    /// Породить код. Возвращает сам код — его печатает вызывающий — и
-    /// то, что остаётся в памяти сервера.
+    /// Generate a code. Returns the code itself — for the caller to print — and
+    /// the state retained in server memory.
     ///
-    /// Сам код не сохраняется нигде: показать его второй раз неоткуда,
-    /// и это не неудобство, а свойство.
+    /// The code itself is not stored anywhere: there is nowhere to retrieve it for a second display,
+    /// and that is a property, not an inconvenience.
     pub fn issue() -> Result<(String, Self), AppError> {
         let code = secret_hex(CLAIM_BYTES)?;
         let stored = Self {
@@ -66,30 +66,30 @@ impl ClaimCode {
         Ok((code, stored))
     }
 
-    /// Годится ли предъявленный код.
+    /// Whether the submitted code is valid.
     ///
-    /// Неверный и просроченный не различаются вызывающим намеренно:
-    /// разные ответы сообщили бы, что код угадан наполовину.
+    /// Invalid and expired codes are deliberately indistinguishable to the caller:
+    /// different responses would reveal that the code had been partly guessed.
     #[must_use]
     pub fn accepts(&self, code: &str) -> bool {
         self.issued_at.elapsed() < CLAIM_LIFETIME && self.hash == hash_token(code)
     }
 }
 
-/// Взвести присвоение, если владельца в базе ещё нет.
+/// Arm claiming if the database does not yet have an owner.
 ///
-/// Возвращает код для печати; `None` — владелец есть, и код не
-/// порождается **вовсе**: секрет, который никому не нужен, всё равно
-/// остаётся секретом, лежащим в памяти.
+/// Returns the code to print; `None` means an owner exists and no code is
+/// generated **at all**: a secret that nobody needs still remains
+/// a secret held in memory.
 ///
-/// Живёт в транспорте, а не в точке сборки, по двум причинам. Код —
-/// это состояние маршрута `/v1/claim`, и держать его условие в другой
-/// крейте значило бы, что собранный иначе сервер молча остаётся
-/// без присвоения. И печатать код обязана программа, а не библиотека:
-/// поэтому сюда вынесено решение, а печать оставлена вызывающему.
+/// This lives in the transport layer rather than the composition root for two reasons. The code is
+/// state belonging to the `/v1/claim` route, and keeping its condition in another
+/// crate would mean that a differently assembled server could silently remain
+/// unclaimable. And the program, not the library, must print the code:
+/// therefore the decision is made here, while printing is left to the caller.
 ///
-/// Владельцев несколько — код тоже не порождается: присваивать нечего,
-/// а разбираться с раздвоившимся владельцем нужно через консоль.
+/// If there are multiple owners, no code is generated either: there is nothing to claim,
+/// and a split owner must be dealt with via the console.
 pub async fn arm(state: &ServerState) -> Result<Option<String>, AppError> {
     match state.services.tokens.sole_owner().await? {
         SoleOwner::None => {}
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn a_code_is_accepted_once_issued_and_nothing_else_is() {
-        let (code, stored) = ClaimCode::issue().expect("код порождён");
+        let (code, stored) = ClaimCode::issue().expect("code generated");
         assert!(stored.accepts(&code));
         assert!(!stored.accepts(&format!("{code}0")));
         assert!(!stored.accepts(""));
@@ -114,18 +114,18 @@ mod tests {
 
     #[test]
     fn the_code_itself_is_not_kept_in_memory() {
-        // Хранится хеш: снимок памяти процесса не должен отдавать код.
-        let (code, stored) = ClaimCode::issue().expect("код порождён");
+        // A hash is stored: a process memory snapshot must not reveal the code.
+        let (code, stored) = ClaimCode::issue().expect("code generated");
         assert_ne!(stored.hash, code);
         assert_eq!(stored.hash, hash_token(&code));
     }
 
     #[test]
     fn two_codes_never_coincide() {
-        // Совпадение означало бы, что источник случайности не случаен,
-        // а код присвоения — единственная преграда перед экземпляром.
-        let (first, _) = ClaimCode::issue().expect("код порождён");
-        let (second, _) = ClaimCode::issue().expect("код порождён");
+        // A match would mean that the source of randomness is not random,
+        // and the claim code is the only barrier guarding the instance.
+        let (first, _) = ClaimCode::issue().expect("code generated");
+        let (second, _) = ClaimCode::issue().expect("code generated");
         assert_ne!(first, second);
         assert_eq!(first.len(), CLAIM_BYTES * 2);
     }

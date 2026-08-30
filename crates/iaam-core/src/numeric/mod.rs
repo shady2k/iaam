@@ -1,13 +1,13 @@
-//! Три числовых режима (§6.6 спецификации).
+//! Three numerical modes (§6.6 of the specification).
 //!
-//! | Режим | Где | Тип |
+//! | Mode | Where | Type |
 //! |---|---|---|
-//! | Точный | тождество результата, разнесение basis, сверка | [`exact::Exact`] |
-//! | Денежный | суммы, цены, курсы, НКД | [`decimal::Dec`] |
-//! | Приближённый | XIRR, CAGR, DCF — степени, корни, итерации | [`approx`] |
+//! | Exact | result identity, basis allocation, reconciliation | [`exact::Exact`] |
+//! | Monetary | amounts, prices, exchange rates, accrued interest | [`decimal::Dec`] |
+//! | Approximate | XIRR, CAGR, DCF—powers, roots, iterations | [`approx`] |
 //!
-//! Приближённые величины **никогда** не входят в денежное тождество:
-//! тождество проверяет суммы, а не ставки.
+//! Approximate values **never** enter the monetary identity:
+//! the identity checks amounts, not rates.
 
 pub mod approx;
 pub mod decimal;
@@ -18,12 +18,12 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum NumericError {
-    #[error("знаменатель равен нулю")]
+    #[error("denominator is zero")]
     ZeroDenominator,
-    #[error("деление на ноль")]
+    #[error("division by zero")]
     DivisionByZero,
-    #[error("переполнение при точном вычислении")]
+    #[error("overflow during exact computation")]
     Overflow,
-    #[error("масштаб {scale} превышает поддерживаемый максимум {max}")]
+    #[error("scale {scale} exceeds the supported maximum {max}")]
     ScaleTooLarge { scale: u32, max: u32 },
 }

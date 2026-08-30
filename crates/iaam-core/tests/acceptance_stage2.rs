@@ -1,8 +1,8 @@
-//! Приёмка этапа 2 (§16.3): «цифрам можно верить — вот на сколько именно».
+//! Stage 2 acceptance (§16.3): «the numbers can be trusted — and by exactly this much».
 //!
-//! Один сценарий из конца в конец. Ожидаемые остатки и статусы посчитаны
-//! вручную из сумм операций и правил §10.3, а не сняты с вывода
-//! программы (§15.5).
+//! A single end-to-end scenario. Expected balances and statuses are calculated
+//! manually from transaction amounts and the rules in §10.3, rather than taken from the output
+//! of the program (§15.5).
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
@@ -36,10 +36,10 @@ fn april() -> AssertionPeriod {
     AssertionPeriod::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30)).unwrap()
 }
 
-/// Сцена: владелец, счёт и операции марта.
+/// Setup: the owner, account, and March transactions.
 ///
-/// Внесено 500 000, куплено на 300 000 с комиссией 150, получен купон
-/// 4 000. Остаток на конец марта считается вручную:
+/// Deposited 500 000, purchased for 300 000 with a fee of 150, received a coupon of
+/// 4 000. The end-of-March balance is calculated manually:
 /// 500 000 − 300 000 − 150 + 4 000 = 203 850.
 const MARCH_CLOSING: i64 = 203_850;
 const MARCH_DEBIT: i64 = 504_000;
@@ -116,7 +116,7 @@ fn scene(channel: &TestChannel) -> Scene {
     }
 }
 
-/// Контрольные секции документа за март.
+/// Control sections of the March document.
 fn march_sections(
     scene: &Scene,
     channel: &TestChannel,
@@ -171,9 +171,9 @@ fn march_sections(
 }
 
 fn status_of(events: &[Event], account: AccountId, dimension: Dimension) -> DimensionStatus {
-    let perimeter = assess(events, PerimeterPolicy::default()).expect("периметр");
+    let perimeter = assess(events, PerimeterPolicy::default()).expect("perimeter");
     ReconciliationLedger::build_with(events, &perimeter.exceptions())
-        .expect("реестр")
+        .expect("registry")
         .status_for(account, date!(2026 - 03 - 15), dimension)
 }
 
@@ -182,17 +182,17 @@ fn the_stage_two_question_is_answered_step_by_step() {
     let report_channel = TestChannel::new("tinkoff-xlsx/1", "march");
     let scene = scene(&report_channel);
 
-    // Шаг 1. Только операции, никаких утверждений: подтверждать нечем.
+    // Step 1. Transactions only, no assertions: there is nothing to confirm against.
     let mut events = scene.operations.clone();
     assert_eq!(
         status_of(&events, scene.account, Dimension::Cash),
         DimensionStatus::Provisional,
-        "без контрольных секций подтверждать нечем"
+        "without control sections there is nothing to confirm"
     );
 
-    // Шаг 2. Пришёл отчёт за март: пять контрольных секций сошлись
-    // одновременно — основание 5. Один документ и один парсер, поэтому
-    // не выше internal.
+    // Step 2. The March statement arrived: all five control sections reconciled
+    // at the same time — basis 5. There is only one document and one parser, so
+    // no higher than internal.
     events.extend(march_sections(
         &scene,
         &report_channel,
@@ -207,17 +207,17 @@ fn the_stage_two_question_is_answered_step_by_step() {
     assert_eq!(
         status_of(&events, scene.account, Dimension::Income),
         DimensionStatus::AcceptedInternal,
-        "сумма купонов сошлась — измерение доходов тоже подтверждено"
+        "the coupon total matched — the income measurement is also confirmed"
     );
     assert_eq!(
         status_of(&events, scene.account, Dimension::TaxBasis),
         DimensionStatus::Provisional,
-        "об удержанном налоге отчёт ничего не сказал"
+        "the report said nothing about tax withheld"
     );
 
-    // Шаг 3. Апрельский отчёт того же брокера начинается с мартовского
-    // остатка. Это непрерывность, а не независимость: статус остаётся
-    // internal, сколько бы отчётов подряд ни сошлось.
+    // Step 3. The April report from the same broker begins with the March
+    // balance. This is continuity, not independence: the status remains
+    // internal, no matter how many consecutive reports match.
     let april_channel = TestChannel::new("tinkoff-xlsx/1", "april");
     events.push(event_on(
         &april_channel,
@@ -240,11 +240,11 @@ fn the_stage_two_question_is_answered_step_by_step() {
     assert_eq!(
         status_of(&events, scene.account, Dimension::Cash),
         DimensionStatus::AcceptedInternal,
-        "следующий отчёт того же парсера независимости не даёт"
+        "the next report from the same parser provides no independence"
     );
 
-    // Шаг 4. Те же данные пришли вторым каналом — другой код разбора
-    // и другой документ. Только теперь появляется independent.
+    // Step 4. The same data arrived through a second channel — different parsing code
+    // and a different document. Only now does the status become independent.
     let api_channel = TestChannel::new("tinkoff-api/1", "apimarch");
     events.extend(march_sections(
         &scene,
@@ -258,14 +258,14 @@ fn the_stage_two_question_is_answered_step_by_step() {
         DimensionStatus::AcceptedIndependent
     );
 
-    // Шаг 5. Отчёт в блоке качества данных сообщает, какой доле
-    // стоимости можно верить.
+    // Step 5. The report's data-quality section states what share
+    // of the value can be trusted.
     //
-    // Срез для отчёта — события **по дату отчёта**: так его собирает
-    // оболочка (`load_events_through`), и ядро отказывается считать
-    // по срезу, содержащему более поздние события, — иначе получился бы
-    // отчёт на дату, которой на эту дату не было. Апрельское утверждение
-    // из среза выпадает; независимость марту даёт второй канал, а не оно.
+    // The report slice contains events **through the report date**: this is how
+    // the wrapper (`load_events_through`) assembles it, and the core refuses to calculate
+    // from a slice containing later events — otherwise it would produce
+    // an as-of report with information that did not exist as of that date. The April assertion
+    // drops out of the slice; March gets its independence from the second channel, not from it.
     let events: Vec<Event> = events
         .into_iter()
         .filter(|event| {
@@ -282,10 +282,10 @@ fn the_stage_two_question_is_answered_step_by_step() {
         rules: &rules,
         lot_rule: LotRuleVersion(1),
     };
-    let projection = project(&events, &ctx).expect("проекция");
-    let perimeter = assess(&events, PerimeterPolicy::default()).expect("периметр");
+    let projection = project(&events, &ctx).expect("projection");
+    let perimeter = assess(&events, PerimeterPolicy::default()).expect("scope assessment");
     let ledger =
-        ReconciliationLedger::build_with(&events, &perimeter.exceptions()).expect("реестр");
+        ReconciliationLedger::build_with(&events, &perimeter.exceptions()).expect("ledger");
     let fx = FxTable::new(FxSource::OwnerSupplied);
     let report = returns_report(
         projection.state(),
@@ -306,15 +306,15 @@ fn the_stage_two_question_is_answered_step_by_step() {
     assert_eq!(
         report.data_quality.nav_coverage.accepted_independent,
         Dec::one(),
-        "вся стоимость подтверждена двумя независимыми каналами"
+        "the entire value has been confirmed through two independent channels"
     );
     assert_eq!(report.data_quality.status, DataQualityStatus::Clean);
 }
 
 #[test]
 fn a_wrong_figure_in_one_document_is_reported_as_a_discrepancy() {
-    // Испорченная цифра обязана дать расхождение и попасть в долю
-    // discrepant, а не раствориться в «пока не подтверждено».
+    // A corrupted figure must produce a discrepancy and be included in the
+    // discrepant share, rather than disappearing into «not yet confirmed».
     let report_channel = TestChannel::new("tinkoff-xlsx/1", "march");
     let scene = scene(&report_channel);
     let mut events = scene.operations.clone();
@@ -329,7 +329,7 @@ fn a_wrong_figure_in_one_document_is_reported_as_a_discrepancy() {
     assert_eq!(
         status_of(&events, scene.account, Dimension::Cash),
         DimensionStatus::Discrepant,
-        "расхождение в одну копейку остаётся расхождением"
+        "a one-kopek discrepancy remains a discrepancy"
     );
 
     let rules = RuleRegistry::with_defaults();
@@ -338,10 +338,10 @@ fn a_wrong_figure_in_one_document_is_reported_as_a_discrepancy() {
         rules: &rules,
         lot_rule: LotRuleVersion(1),
     };
-    let projection = project(&events, &ctx).expect("проекция");
-    let perimeter = assess(&events, PerimeterPolicy::default()).expect("периметр");
+    let projection = project(&events, &ctx).expect("projection");
+    let perimeter = assess(&events, PerimeterPolicy::default()).expect("scope assessment");
     let ledger =
-        ReconciliationLedger::build_with(&events, &perimeter.exceptions()).expect("реестр");
+        ReconciliationLedger::build_with(&events, &perimeter.exceptions()).expect("ledger");
     let fx = FxTable::new(FxSource::OwnerSupplied);
     let report = returns_report(
         projection.state(),
@@ -361,7 +361,7 @@ fn a_wrong_figure_in_one_document_is_reported_as_a_discrepancy() {
     );
     assert!(
         report.data_quality.nav_coverage.discrepant.is_positive(),
-        "доля расхождения обязана быть строго положительной"
+        "the discrepant share must be strictly positive"
     );
     assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
 }

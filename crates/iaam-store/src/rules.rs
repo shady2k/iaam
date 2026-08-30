@@ -1,39 +1,39 @@
-//! Правила классификации владельца (§10.4).
+//! Owner classification rules (§10.4).
 //!
-//! Правило не удаляется, а выводится из обращения датой: по нему уже
-//! классифицирована история, и объяснять её после удаления будет нечем.
-//! Правка заводит новую строку, ссылающуюся на прежнюю, — прежняя
-//! остаётся ровно такой, какой была в момент, когда по ней считали.
+//! A rule is not deleted; it is retired as of a date: the history has already
+//! been classified by it, and after deletion there would be no way to explain it.
+//! An edit creates a new row referring to the previous one; the previous row
+//! remains exactly as it was when it was used for classification.
 //!
-//! `matcher` и `outcome` — JSON доменных типов классификатора.
-//! Хранилище не знает их устройства: оно хранит. Но разбираемость как
-//! JSON проверяет при записи — правило, которое классификатор не сможет
-//! прочитать, не должно ложиться в базу молча.
+//! `matcher` and `outcome` are JSON values of the classifier's domain types.
+//! The store does not know their structure: it stores them. But it validates
+//! that they can be parsed as JSON on write—a rule the classifier cannot
+//! read must not be silently written to the database.
 
 use iaam_core::ids::{ClassificationRuleId, OwnerId};
 use rusqlite::{Connection, TransactionBehavior, params};
 
 use crate::{SqliteStore, StoreError, now};
 
-/// Сохранённое правило.
+/// A stored rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRule {
     pub id: ClassificationRuleId,
     pub owner: OwnerId,
-    /// Номер решения владельца по порядку. Сквозной внутри владельца:
-    /// пересчёт истории по нему узнаёт, каким решением он вызван.
+    /// The owner's decision number in sequence. Sequential within the owner:
+    /// history replay uses it to determine which decision triggered it.
     pub version: u32,
     pub matcher: String,
     pub outcome: String,
     pub created_at: String,
-    /// Момент вывода из обращения. `None` — правило действует.
+    /// The time the rule was retired. `None` means the rule is active.
     pub retired_at: Option<String>,
-    /// Правило, которое это заменило.
+    /// The rule that replaced this one.
     pub replaces: Option<ClassificationRuleId>,
 }
 
 impl SqliteStore {
-    /// Заведение нового правила.
+    /// Create a new rule.
     pub fn insert_rule(
         &mut self,
         owner: OwnerId,
@@ -48,11 +48,11 @@ impl SqliteStore {
         Ok(stored)
     }
 
-    /// Правка правила: прежнее выводится из обращения, новое заводится.
+    /// Edit a rule: retire the previous one and create a new one.
     ///
-    /// Обе записи идут одной транзакцией: между ними нет момента, когда
-    /// действуют оба правила или не действует ни одного, — а классификация,
-    /// попавшая в такой момент, была бы необъяснима.
+    /// Both records are written in one transaction: there is no point at which
+    /// both rules are active or neither is active—and a classification
+    /// occurring at such a point would be inexplicable.
     pub fn amend_rule(
         &mut self,
         owner: OwnerId,
@@ -69,10 +69,10 @@ impl SqliteStore {
         Ok(stored)
     }
 
-    /// Вывод правила из обращения.
+    /// Retire a rule.
     ///
-    /// Уже выведенное правило вывести нельзя: дата вывода не
-    /// переписывается задним числом.
+    /// A withdrawn rule cannot be withdrawn again: the withdrawal date is not
+    /// rewritten retroactively.
     pub fn retire_rule(
         &mut self,
         owner: OwnerId,
@@ -86,7 +86,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Действующие правила владельца в порядке решений.
+    /// The owner's active rules in decision order.
     pub fn list_active_rules(&self, owner: OwnerId) -> Result<Vec<StoredRule>, StoreError> {
         self.query_rules(
             "SELECT id, version, matcher, outcome, created_at, retired_at, replaces
@@ -97,7 +97,7 @@ impl SqliteStore {
         )
     }
 
-    /// Все правила владельца, включая выведенные из обращения.
+    /// All of the owner's rules, including withdrawn ones.
     pub fn rule_history(&self, owner: OwnerId) -> Result<Vec<StoredRule>, StoreError> {
         self.query_rules(
             "SELECT id, version, matcher, outcome, created_at, retired_at, replaces
@@ -143,11 +143,11 @@ impl SqliteStore {
     }
 }
 
-/// Вставка правила со следующим номером решения.
+/// Insert a rule with the next decision number.
 ///
-/// Номер назначается в той же транзакции, что и вставка: раздельно это
-/// та же гонка, что в журнале, — два одновременных запроса получают один
-/// номер, и порядок правил перестаёт быть порядком.
+/// The number is assigned in the same transaction as the insertion: doing this
+/// separately creates the same race as in the journal—two concurrent requests receive one
+/// number, and the rule order ceases to be the decision order.
 fn write_rule(
     conn: &Connection,
     owner: OwnerId,
@@ -189,11 +189,11 @@ fn write_rule(
     Ok(stored)
 }
 
-/// Вывод из обращения с проверкой владельца.
+/// Withdraw a rule after checking its owner.
 ///
-/// Отсутствие, чужое владение и уже выведенное правило дают одну
-/// ошибку: разные ответы сообщили бы постороннему, что такое правило
-/// существует.
+/// A missing rule, a rule owned by someone else, and an already withdrawn rule produce one
+/// error: different responses would tell an outsider that such a rule
+/// exists.
 fn retire(conn: &Connection, owner: OwnerId, id: ClassificationRuleId) -> Result<(), StoreError> {
     let updated = conn.execute(
         "UPDATE classification_rules SET retired_at = ?3
@@ -202,7 +202,7 @@ fn retire(conn: &Connection, owner: OwnerId, id: ClassificationRuleId) -> Result
     )?;
     if updated == 0 {
         return Err(StoreError::NotFound {
-            what: "действующее правило классификации",
+            what: "active classification rule",
             id: id.inner().to_string(),
         });
     }
@@ -217,7 +217,7 @@ fn check_json(value: &str, field: &'static str) -> Result<(), StoreError> {
 
 fn parse_uuid(value: &str) -> Result<uuid::Uuid, StoreError> {
     uuid::Uuid::parse_str(value).map_err(|_| StoreError::NotFound {
-        what: "правило классификации",
+        what: "classification rule",
         id: value.to_owned(),
     })
 }

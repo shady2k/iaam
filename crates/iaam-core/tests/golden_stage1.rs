@@ -1,10 +1,10 @@
-//! Золотые сценарии этапа 1 (§15.9).
+//! Stage 1 golden scenarios (§15.9).
 //!
-//! Из обязательного набора спеки здесь те сценарии, которые этап 1
-//! обязан отработать. Остальные — амортизация, ЛДВ, замещающие
-//! облигации, налог прошлого периода — относятся к E3 и E5 и появятся
-//! там вместе с механикой, которую проверяют. Пропуск не тихий:
-//! каждый отсутствующий сценарий назван в конце файла.
+//! Of the spec's mandatory set, this file contains the scenarios that Stage 1
+//! must handle. The rest—amortization, the long-term holding exemption, replacement
+//! bonds, and prior-period tax—belong to E3 and E5 and will appear
+//! there along with the mechanics they test. The omission is not silent:
+//! every missing scenario is listed at the end of the file.
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -61,7 +61,7 @@ impl World {
             legs,
             provenance: Provenance::new(
                 self.source,
-                RawHash::parse(&"9".repeat(64)).expect("хеш"),
+                RawHash::parse(&"9".repeat(64)).expect("hash"),
                 ParserVersion("golden/1".into()),
             ),
             relation: Relation::None,
@@ -189,11 +189,11 @@ fn report_of(world: &World, events: &[Event], both_accounts: bool, as_of: Date) 
         rules: &rules,
         lot_rule: LotRuleVersion(1),
     };
-    let projection = project(events, &ctx).expect("проекция строится");
+    let projection = project(events, &ctx).expect("projection succeeds");
     let fx = FxTable::new(FxSource::OwnerSupplied);
-    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
-    // а не подтверждение данных. Пустые реестр и оценка означают
-    // «ничего не подтверждено», что для расчёта нейтрально.
+    // Reconciliation and scope are not involved in this test: it checks the calculation,
+    // not data confirmation. An empty registry and valuation mean
+    // «nothing is confirmed», which is neutral for the calculation.
     let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
     let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
         iaam_core::perimeter::PerimeterPolicy::default(),
@@ -225,7 +225,7 @@ struct ReportPair {
     projection: Box<iaam_core::projection::Projection>,
 }
 
-/// §15.9: перевод между счетами внутри контура — XIRR не меняется.
+/// §15.9: a transfer between accounts within the scope does not change XIRR.
 #[test]
 fn a_transfer_inside_the_contour_does_not_change_the_rate() {
     let mut world = World::new();
@@ -239,11 +239,11 @@ fn a_transfer_inside_the_contour_does_not_change_the_rate() {
     let without = report_of(&world, &base, true, date!(2026 - 01 - 01));
     let with = report_of(&world, &with_transfer, true, date!(2026 - 01 - 01));
 
-    let left = without.report.xirr.value().expect("ставка без перевода");
-    let right = with.report.xirr.value().expect("ставка с переводом");
+    let left = without.report.xirr.value().expect("rate without transfer");
+    let right = with.report.xirr.value().expect("rate with transfer");
     assert!(
         (left.rate().value() - right.rate().value()).abs() < 1e-12,
-        "перевод внутри контура изменил ставку: {} против {}",
+        "transfer within the scope changed the rate: {} versus {}",
         left.rate().value(),
         right.rate().value()
     );
@@ -251,17 +251,17 @@ fn a_transfer_inside_the_contour_does_not_change_the_rate() {
     assert_eq!(with.report.contributed.value(), Some(&dec(100_000)));
 }
 
-/// §15.9: продажа части позиции — списание стоимости и перенос
-/// нереализованного результата в реализованный.
+/// §15.9: partial sale of a position—cost basis write-off and reclassification
+/// of unrealized P&L as realized P&L.
 #[test]
 fn a_partial_sale_releases_basis_and_realizes_result() {
     let mut world = World::new();
     let events = vec![
         world.deposit(date!(2025 - 01 - 01), 10_000_000),
-        // 100 бумаг за 9 000 рублей: по 90 рублей за бумагу.
+        // 100 securities for 9 000 rubles: 90 rubles per security.
         world.buy(date!(2025 - 02 - 01), 100, 900_000),
-        // 40 бумаг проданы за 4 000 рублей: списанная стоимость
-        // 9 000 × 40 / 100 = 3 600, реализовано 4 000 − 3 600 = 400.
+        // 40 securities sold for 4 000 rubles: cost basis written off
+        // 9 000 × 40 / 100 = 3 600, realized gain 4 000 − 3 600 = 400.
         world.sell(date!(2025 - 09 - 01), 40, 400_000),
         world.valuation(date!(2026 - 01 - 01), 100),
     ];
@@ -275,18 +275,18 @@ fn a_partial_sale_releases_basis_and_realizes_result() {
         .state()
         .book()
         .entry(&key)
-        .expect("книга лотов");
+        .expect("lot book");
 
     assert_eq!(entry.quantity().unwrap(), qty(60));
     assert_eq!(entry.released_basis(), Some(rub(360_000)));
     assert_eq!(entry.realized(), Some(rub(40_000)));
     assert_eq!(entry.remaining_basis().unwrap(), Some(rub(540_000)));
-    // Деньги: 100 000 − 9 000 + 4 000 = 95 000; бумаги: 60 × 100 = 6 000.
+    // Cash: 100 000 − 9 000 + 4 000 = 95 000; securities: 60 × 100 = 6 000.
     assert_eq!(pair.report.terminal_value.value(), Some(&dec(101_000)));
 }
 
-/// §15.9: отрицательный денежный остаток — обязательство в стоимости,
-/// а не исчезнувшая величина.
+/// §15.9: a negative cash balance is a liability in the valuation,
+/// not a value that disappears.
 #[test]
 fn negative_cash_lowers_the_terminal_value_and_is_reported() {
     let mut world = World::new();
@@ -304,7 +304,7 @@ fn negative_cash_lowers_the_terminal_value_and_is_reported() {
             .cash(world.account, CurrencyCode::Rub),
         Some(rub(-200_000))
     );
-    // −2 000 рублей денег плюс 100 бумаг по 100 = 8 000.
+    // −2 000 rubles in cash plus 100 securities at 100 = 8 000.
     assert_eq!(pair.report.terminal_value.value(), Some(&dec(8_000)));
     assert!(
         pair.report
@@ -312,12 +312,12 @@ fn negative_cash_lowers_the_terminal_value_and_is_reported() {
             .material_issues
             .iter()
             .any(|issue| matches!(issue, MaterialIssue::NegativeCash { .. })),
-        "отрицательный остаток обязан попасть в блок качества данных"
+        "a negative balance must appear in the data quality section"
     );
 }
 
-/// §15.9: частичная история без налоговой стоимости — `not_computable`
-/// вместо выдуманной цифры.
+/// §15.9: partial history without a tax basis—`not_computable`
+/// instead of a fabricated number.
 #[test]
 fn a_restored_position_without_basis_makes_the_realized_result_not_computable() {
     let mut world = World::new();
@@ -337,16 +337,16 @@ fn a_restored_position_without_basis_makes_the_realized_result_not_computable() 
         .state()
         .book()
         .entry(&key)
-        .expect("книга лотов");
+        .expect("lot book");
 
     assert_eq!(entry.unpriced(), qty(30));
     assert_eq!(
         entry.realized(),
         None,
-        "прибыль от продажи бумаги неизвестной стоимости не вычисляется"
+        "gain on the sale of a security with unknown basis cannot be computed"
     );
-    // Стоимость позиции при этом известна: 30 бумаг по 150 = 4 500,
-    // плюс 10 000 + 3 000 денег.
+    // The position value is still known: 30 securities at 150 = 4 500,
+    // plus 10 000 + 3 000 in cash.
     assert_eq!(pair.report.terminal_value.value(), Some(&dec(17_500)));
     assert!(
         pair.report
@@ -357,7 +357,7 @@ fn a_restored_position_without_basis_makes_the_realized_result_not_computable() 
     );
 }
 
-/// §15.9: две одинаковые сделки в один день — обе учтены.
+/// §15.9: two identical trades on the same day—both are included.
 #[test]
 fn two_identical_purchases_on_the_same_day_are_both_projected() {
     let mut world = World::new();
@@ -373,12 +373,12 @@ fn two_identical_purchases_on_the_same_day_are_both_projected() {
         account: world.account,
         instrument: world.instrument,
     };
-    let entry = pair.projection.state().book().entry(&key).expect("книга");
-    assert_eq!(entry.lots().len(), 2, "две сделки — две партии");
+    let entry = pair.projection.state().book().entry(&key).expect("book");
+    assert_eq!(entry.lots().len(), 2, "two trades—two lots");
     assert_eq!(entry.quantity().unwrap(), qty(20));
 }
 
-/// §15.9: цена без оценки — отчёт отказывается называть стоимость.
+/// §15.9: a price without a valuation—the report refuses to state a value.
 #[test]
 fn a_position_without_a_price_makes_the_terminal_value_not_computable() {
     let mut world = World::new();
@@ -394,20 +394,20 @@ fn a_position_without_a_price_makes_the_terminal_value_not_computable() {
     assert_eq!(
         pair.report.xirr.reason().map(|r| r.code()),
         Some("missing_price"),
-        "ставка без стоимости не определена и не подменяется нулём"
+        "the rate is undefined without a value and is not replaced by zero"
     );
 }
 
-// Сценарии §15.9, НЕ реализованные на этапе 1, и их адрес:
-//   облигация с амортизацией ............................ E3
-//   вклад с капитализацией и досрочным расторжением ..... E3
-//   лот, доживший до ЛДВ ................................ E5
-//   перевод бумаг между брокерами ....................... E3
-//   доудержанный в январе налог за прошлый год .......... E5
-//   возврат излишне удержанного налога .................. E5
-//   дивиденд в валюте с разложением FX .................. E4
-//   замещающая облигация ................................ E3
-//   оферта без предъявления ............................. E3
-//   сплит с дробным остатком ............................ E3
-//   делистинг ........................................... E3
-//   компенсирующая ошибка парсера ....................... E2
+// §15.9 scenarios NOT implemented in Stage 1, and their target stage:
+//   amortizing bond ............................ E3
+//   compounding deposit with early termination ..... E3
+//   lot held through long-term holding exemption eligibility ................................ E5
+//   transfer of securities between brokers ....................... E3
+//   prior-year tax additionally withheld in January .......... E5
+//   refund of overwithheld tax .................. E5
+//   foreign-currency dividend with FX decomposition .................. E4
+//   replacement bond ................................ E3
+//   offer not exercised ............................. E3
+//   split with a fractional remainder ............................ E3
+//   delisting ........................................... E3
+//   offsetting parser error ....................... E2

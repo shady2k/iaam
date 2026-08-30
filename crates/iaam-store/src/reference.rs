@@ -1,4 +1,4 @@
-//! Справочники: счета, инструменты, версии контуров.
+//! Reference data: accounts, instruments, and environment versions.
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
@@ -23,8 +23,8 @@ pub struct AccountRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentRecord {
     pub id: InstrumentId,
-    /// `None` — род не установлен. Такой инструмент оценивается как
-    /// неполный, а не как акция по умолчанию (§4.9, §5.4).
+    /// `None` — the parent is not set. Such an instrument is treated as
+    /// incomplete, rather than as a stock by default (§4.9, §5.4).
     pub kind: Option<InstrumentKind>,
     pub symbol: String,
     pub title: String,
@@ -49,45 +49,45 @@ pub struct AliasRecord {
     pub source: SourceId,
 }
 
-/// Смена внешнего кода инструмента.
+/// Changing an instrument's external code.
 ///
-/// Структура, а не шесть позиционных аргументов. Дело не только в пороге
-/// clippy: `from` и `to` — два соседних `&str`, которые компилятор
-/// переставленными местами не увидит, а результатом станет псевдоним,
-/// заведённый задом наперёд (§15.1).
+/// A struct, rather than six positional arguments. It is not just about the
+/// clippy threshold: `from` and `to` are two adjacent `&str` values that the compiler
+/// cannot detect as swapped, resulting in an alias
+/// registered backwards (§15.1).
 #[derive(Debug, Clone)]
 pub struct AliasRename {
     pub namespace: AliasNamespace,
-    /// Код, действующий до смены.
+    /// The code in effect before the change.
     pub from: String,
-    /// Код, действующий с даты смены.
+    /// The code in effect from the change date.
     pub to: String,
-    /// Дата смены: старый интервал закрывается ею, новый ею же открывается.
+    /// Change date: the old interval is closed by it, and the new one is opened by it.
     pub on: Date,
     pub instrument: InstrumentId,
     pub source: SourceId,
 }
 
-/// Дата в хранилище — ISO-8601, как и везде в схеме.
+/// Dates in storage use ISO-8601, as everywhere else in the schema.
 fn date_to_text(value: Date) -> String {
     value
         .format(&Iso8601::DATE)
-        .expect("дата форматируется в ISO-8601")
+        .expect("date is formatted as ISO-8601")
 }
 
 fn text_to_date(value: &str) -> Result<Date, StoreError> {
     Date::parse(value, &Iso8601::DATE).map_err(|_| StoreError::NotFound {
-        what: "дата псевдонима",
+        what: "alias date",
         id: value.to_owned(),
     })
 }
 
 impl SqliteStore {
-    /// Создание или обновление счёта.
+    /// Creating or updating an account.
     ///
-    /// Условие `WHERE accounts.owner = excluded.owner` обязательно:
-    /// без него запрос с чужим (или угаданным) идентификатором
-    /// переписывал бы название счёта другого владельца (§14).
+    /// The `WHERE accounts.owner = excluded.owner` condition is mandatory:
+    /// without it, a request with another owner's (or a guessed) identifier
+    /// would overwrite another owner's account name (§14).
     pub fn upsert_account(&self, account: &AccountRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO accounts (id, owner, title, institution, created_at)
@@ -163,12 +163,12 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Создание или обновление места хранения.
+    /// Creating or updating a custody place.
     ///
-    /// Условие `WHERE custody_places.owner = excluded.owner`
-    /// обязательно по той же причине, что и у счетов: без него запрос
-    /// с чужим идентификатором переписал бы место хранения другого
-    /// владельца (§14).
+    /// The `WHERE custody_places.owner = excluded.owner` condition
+    /// required for the same reason as accounts: without it, a request
+    /// with someone else's identifier would overwrite another
+    /// owner's storage location (§14).
     pub fn upsert_custody_place(&self, place: &CustodyRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO custody_places (id, owner, title, institution, created_at)
@@ -231,11 +231,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Смена внешнего кода: закрыть старый интервал, открыть новый.
+    /// Change the external code: close the old interval, open a new one.
     ///
-    /// Одна транзакция обязательна: между двумя операциями старый код
-    /// уже закрыт, а новый ещё не заведён, и параллельный резолвинг
-    /// документа получил бы `Unknown` вместо инструмента.
+    /// A single transaction is required: between the two operations, the old code
+    /// is already closed, while the new one has not yet been created, and concurrent
+    /// document resolution would get `Unknown` instead of the instrument.
     pub fn rename_alias(&mut self, rename: &AliasRename) -> Result<(), StoreError> {
         let AliasRename {
             namespace,
@@ -277,7 +277,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Инструмент по внешнему коду на дату.
+    /// Instrument by external code on a given date.
     pub fn resolve_instrument(
         &self,
         namespace: AliasNamespace,
@@ -336,7 +336,7 @@ impl SqliteStore {
                 let known_to = known
                     .last()
                     .and_then(|(_, _, to)| *to)
-                    .map_or_else(|| "открыт".to_owned(), date_to_text);
+                    .map_or_else(|| "open".to_owned(), date_to_text);
                 Err(ResolveError::NotOnDate {
                     namespace: namespace.code(),
                     value: value.to_owned(),
@@ -443,7 +443,7 @@ impl SqliteStore {
             let (namespace, value, instrument, valid_from, valid_to, source) = row?;
             let namespace =
                 AliasNamespace::from_code(&namespace).ok_or_else(|| StoreError::NotFound {
-                    what: "пространство псевдонима",
+                    what: "namespace",
                     id: namespace,
                 })?;
             let instrument = InstrumentId(parse_uuid(&instrument, "instrument")?);
@@ -464,10 +464,10 @@ impl SqliteStore {
         Ok(aliases)
     }
 
-    /// Новая версия состава контура.
+    /// New version of the circuit composition.
     ///
-    /// Версия неизменяема: изменение состава — новая строка, а не UPDATE.
-    /// Это обеспечено триггером в схеме, а не только этим методом.
+    /// The version is immutable: changing the composition creates a new row rather than an UPDATE.
+    /// This is enforced by a trigger in the schema, not only by this method.
     pub fn insert_contour_version(
         &mut self,
         owner: OwnerId,
@@ -488,9 +488,9 @@ impl SqliteStore {
             ],
         )?;
         for account in accounts {
-            // Внешний ключ на (owner, account) отклонит чужой счёт:
-            // контур из чужих счетов — это доступ к чужим деньгам,
-            // а не ошибка ввода.
+            // The foreign key on (owner, account) will reject someone else's account:
+            // a circuit made up of someone else's accounts is access to someone else's money,
+            // not an input error.
             transaction.execute(
                 "INSERT INTO contour_accounts (owner, contour, version, account)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -506,10 +506,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Состав контура на версии **для указанного владельца**.
+    /// Circuit composition at a version **for the specified owner**.
     ///
-    /// Владелец входит в запрос, а не проверяется после: идентификатор
-    /// контура — это UUID, а UUID не является правом доступа (§14).
+    /// The owner is part of the query rather than checked afterward: a circuit
+    /// identifier is a UUID, and a UUID is not an access right (§14).
     pub fn load_contour(
         &self,
         owner: OwnerId,
@@ -534,8 +534,8 @@ impl SqliteStore {
         Ok(Some(ContourDefinition::new(contour, version, accounts)))
     }
 
-    /// Наибольшая версия контура. Отчёт без явно указанной версии
-    /// считается по последней — и пишет её в применённые правила.
+    /// Highest circuit version. Report without an explicitly specified version
+    /// is calculated from the last one—and writes it to the applied rules.
     pub fn latest_contour_version(
         &self,
         owner: OwnerId,
@@ -576,7 +576,7 @@ fn decode_instrument(
     let kind = kind
         .map(|value| {
             InstrumentKind::from_code(&value).ok_or_else(|| StoreError::NotFound {
-                what: "род инструмента",
+                what: "instrument type",
                 id: value,
             })
         })
@@ -584,16 +584,16 @@ fn decode_instrument(
     let currencies = CurrencyRoles {
         denomination: CurrencyCode::from_code(&denomination).ok_or_else(|| {
             StoreError::NotFound {
-                what: "валюта инструмента",
+                what: "instrument currency",
                 id: denomination,
             }
         })?,
         settlement: CurrencyCode::from_code(&settlement).ok_or_else(|| StoreError::NotFound {
-            what: "валюта инструмента",
+            what: "instrument currency",
             id: settlement,
         })?,
         quote: CurrencyCode::from_code(&quote).ok_or_else(|| StoreError::NotFound {
-            what: "валюта инструмента",
+            what: "instrument currency",
             id: quote,
         })?,
     };
@@ -602,13 +602,13 @@ fn decode_instrument(
         (Some(parent), Some(reason)) => Some(Lineage {
             parent: InstrumentId(parse_uuid(&parent, "lineage_parent")?),
             reason: LineageReason::from_code(&reason).ok_or_else(|| StoreError::NotFound {
-                what: "причина происхождения инструмента",
+                what: "instrument origin reason",
                 id: reason,
             })?,
         }),
         (parent, reason) => {
             return Err(StoreError::NotFound {
-                what: "полное происхождение инструмента",
+                what: "full instrument origin",
                 id: format!("{parent:?}/{reason:?}"),
             });
         }

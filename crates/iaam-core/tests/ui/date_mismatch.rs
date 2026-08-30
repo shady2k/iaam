@@ -1,4 +1,4 @@
-//! Шесть семантических дат — шесть разных типов (§4.2).
+//! Six semantic dates—six distinct types (§4.2).
 
 use iaam_core::dates::{SettledDate, TradeDate};
 use time::macros::date;

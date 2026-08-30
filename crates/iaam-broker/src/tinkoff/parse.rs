@@ -1,8 +1,8 @@
 use iaam_core::event::provenance::ParserVersion;
 
-// Реэкспорт, чтобы `tinkoff::ChannelOperationKind` и
-// `finam::ChannelOperationKind` продолжали означать один и тот же тип:
-// имя у каналов привычное, а тип за ним теперь общий.
+// Re-export so `tinkoff::ChannelOperationKind` and
+// `finam::ChannelOperationKind` continue to mean the same type:
+// channel names remain familiar while the type behind them is shared.
 pub use crate::operation_kind::ChannelOperationKind;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
@@ -13,115 +13,115 @@ use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
-/// Версия разбора ответов T-Invest, независимая от XLSX-парсера.
+/// T-Invest response parser version, independent of the XLSX parser.
 pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/1";
 
-/// Ошибка разбора ответа канала T-Invest.
+/// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseError {
-    /// Тело не соответствует JSON-схеме ответа.
-    #[error("ответ T-Invest не разобран как JSON: {0}")]
+    /// The body does not match the response JSON schema.
+    #[error("T-Invest response is not valid JSON: {0}")]
     Json(String),
-    /// В ответе отсутствует обязательное поле.
-    #[error("в ответе T-Invest отсутствует поле {field}")]
+    /// A required field is absent from the response.
+    #[error("T-Invest response is missing field {field}")]
     MissingField { field: &'static str },
-    /// Поле содержит значение, которого транспорт не принимает.
-    #[error("поле {field} ответа T-Invest содержит недопустимое значение {value}")]
+    /// The field contains a value rejected by transport.
+    #[error("response field {field} contains invalid value {value}")]
     InvalidField { field: &'static str, value: String },
-    /// Дата операции не является RFC 3339 timestamp.
-    #[error("поле {field} не является timestamp RFC 3339")]
+    /// The operation date is not an RFC 3339 timestamp.
+    #[error("field {field} is not an RFC 3339 timestamp")]
     InvalidTimestamp { field: &'static str },
-    /// Внешний идентификатор нельзя связать с типизированным ID ядра.
-    #[error("поле {field} не является UUID: {value}")]
+    /// An external identifier cannot be connected to a typed core ID.
+    #[error("field {field} is not a UUID: {value}")]
     InvalidIdentifier { field: &'static str, value: String },
-    /// Валюта не входит в исчерпывающий список ядра.
-    #[error("неизвестная валюта T-Invest: {value}")]
+    /// The currency is absent from the core's exhaustive list.
+    #[error("unknown T-Invest currency: {value}")]
     UnsupportedCurrency { value: String },
-    /// Дробная часть не представима минимальной единицей валюты.
-    #[error("поле {field} нельзя представить минимальной единицей валюты {currency:?}")]
+    /// The fractional part cannot be represented in currency minor units.
+    #[error("field {field} cannot be represented in currency minor units {currency:?}")]
     NonRepresentableFraction {
         field: &'static str,
         currency: CurrencyCode,
     },
-    /// Число вышло за диапазон точного типа ядра.
-    #[error("переполнение точного числа в поле {field}")]
+    /// The number exceeds the exact core type's range.
+    #[error("exact number overflow in field {field}")]
     NumericOverflow { field: &'static str },
-    /// В ответе есть следующая страница, но нет курсора для неё.
-    #[error("ответ с операциями оборван: отсутствует курсор следующей страницы")]
+    /// The response has another page but no cursor for it.
+    #[error("operations response is truncated: next-page cursor is missing")]
     PartialResponse,
 }
 
-/// Деньги операции в точной минимальной единице валюты.
+/// Operation money in exact currency minor units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelMoney {
-    /// Сумма в минимальных единицах, со знаком шлюза.
+    /// Amount in minor units, including the gateway's sign.
     pub amount: PostedMinor,
-    /// Валюта суммы.
+    /// Currency of the amount.
     pub currency: CurrencyCode,
 }
 impl ChannelMoney {
-    /// Возвращает сумму без знака шлюза для доменных операций.
+    /// Return the unsigned amount for domain operations.
     ///
-    /// `OperationKind` хранит положительную величину, а знак движения
-    /// кодирует сам вариант операции. Значение `i64::MIN` не имеет
-    /// представимого модуля и потому явно отказывается.
+    /// `OperationKind` stores a positive magnitude, while the operation
+    /// variant itself encodes movement direction. `i64::MIN` has no
+    /// representable magnitude, so it is explicitly refused.
     #[must_use]
     pub fn magnitude(self) -> Option<PostedMinor> {
         self.amount.raw().checked_abs().map(PostedMinor::new)
     }
 }
 
-/// Операция, полученная из REST-канала T-Invest.
+/// Operation received from the T-Invest REST channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelOperation {
-    /// Дата поручения из timestamp шлюза.
+    /// Order date from the gateway timestamp.
     pub date: Option<Date>,
-    /// Счёт, который назвал шлюз.
+    /// Account named by the gateway.
     pub broker_account_id: String,
-    /// Идентификатор операции источника.
+    /// Source operation identifier.
     pub operation_id: String,
-    /// Идентификатор родительской операции.
+    /// Parent operation identifier.
     pub parent_operation_id: Option<String>,
-    /// Курсор, которым шлюз обозначил строку.
+    /// Cursor with which the gateway labelled the row.
     pub cursor: String,
-    /// Как вид операции назвал сам канал: `OPERATION_TYPE_COUPON`
-    /// и подобное. Множество открыто и принадлежит брокеру, поэтому
-    /// строка, а не перечисление: во что она превращается, решает
-    /// словарь канала (`OperationKindDictionary`), а он живёт в данных.
+    /// Operation kind named by the channel, such as `OPERATION_TYPE_COUPON`.
+    /// The set is open and belongs to the broker, so this is a string rather
+    /// than an enum: the channel dictionary (`OperationKindDictionary`), which
+    /// lives in data, decides what it becomes.
     pub source_kind: String,
-    /// Исходное состояние поручения.
+    /// Original order state.
     pub state: String,
-    /// UID инструмента, если операция его содержит.
+    /// Instrument UID, if the operation contains one.
     pub instrument_uid: Option<String>,
-    /// FIGI, если операция его содержит.
+    /// FIGI, if the operation contains one.
     pub figi: Option<String>,
-    /// Количество инструмента.
+    /// Instrument quantity.
     pub quantity: Option<Quantity>,
-    /// Денежный эффект операции.
+    /// Monetary effect of the operation.
     pub payment: Option<ChannelMoney>,
-    /// Цена одной единицы.
+    /// Price of one unit.
     pub price: Option<ChannelMoney>,
-    /// Комиссия операции.
+    /// Operation commission.
     pub commission: Option<ChannelMoney>,
-    /// Стабильный ключ первой ступени дедупликации.
+    /// Stable key for the first deduplication stage.
     pub deduplication_key: String,
-    /// Версия именно этого кода разбора.
+    /// Version of this exact parser code.
     pub parser_version: ParserVersion,
-    /// Исходный JSON-объект строки, сохраняемый и при отказе.
+    /// Original row JSON object, retained even on refusal.
     pub raw: Value,
-    /// Причина, по которой эта строка не стала принятой операцией.
+    /// Why this row did not become an accepted operation.
     pub rejection: Option<ParseError>,
 }
 
 impl ChannelOperation {
-    /// Отдаёт количество как десятичный текст для транспортных тестов и логов.
+    /// Return quantity as decimal text for transport tests and logs.
     #[must_use]
     pub fn quantity_as_decimal(&self) -> Option<String> {
         self.quantity.map(|quantity| quantity.0.inner().to_string())
     }
 }
 
-/// Разбирает полный ответ `GetOperationsByCursor` без сетевых обращений.
+/// Parse a complete `GetOperationsByCursor` response without network access.
 pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError> {
     let response: RawOperationsResponse = parse_json(body)?;
     let has_next = response
@@ -144,7 +144,7 @@ pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError>
         .collect())
 }
 
-/// Разбирает денежный остаток и позиции портфеля в контрольные утверждения.
+/// Parse portfolio cash and positions into control claims.
 pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
     let response: RawPortfolioResponse = parse_json(body)?;
     let mut claims = Vec::new();
@@ -383,7 +383,7 @@ fn parse_quantity(value: &RawQuotation, field: &'static str) -> Result<Quantity,
     let text = decimal_text(value, field)?;
     serde_json::from_value(Value::String(text)).map_err(|_| ParseError::InvalidField {
         field,
-        value: "десятичное количество".to_owned(),
+        value: "decimal quantity".to_owned(),
     })
 }
 fn parse_integer_quantity(value: &str, field: &'static str) -> Result<Quantity, ParseError> {

@@ -1,29 +1,28 @@
-//! Живая проверка канала на песочнице Т-Инвестиций.
+//! Live channel check against the T-Invest sandbox.
 //!
-//! **Второй режим проверки.** Обычный `cargo test` сети не касается
-//! вовсе: он проверяет разбор на замороженных образцах и потому
-//! повторяем, быстр и не зависит от чужой доступности. Этот файл
-//! собирается только под фичей `sandbox` и отвечает на другой вопрос —
-//! не «правильно ли мы разбираем», а «не изменился ли мир под нами»:
-//! жив ли шлюз, годен ли вшитый корень доверия, принимает ли брокер
-//! заведённый доступ.
+//! **A second verification mode.** Ordinary `cargo test` never touches the
+//! network: it parses frozen samples, so it is repeatable, fast, and
+//! independent of someone else's availability. This file is compiled only
+//! with the `sandbox` feature and answers a different question—not “do we
+//! parse correctly?” but “has the world changed beneath us?”: is the gateway
+//! alive, is the embedded trust root valid, and does the broker accept the
+//! configured access?
 //!
 //! ```text
 //! nix develop -c cargo test -p iaam-broker --features sandbox
 //! ```
 //!
-//! Метод берётся **обычный**, а не из `SandboxService`. Т-Инвестиции
-//! предлагают два способа: вызывать обычные методы по адресу песочницы
-//! (рекомендуемый) либо пользоваться методами песочницы. Смешение
-//! способов — обычный метод по боевому адресу или метод песочницы
-//! по адресу песочницы — шлюз встречает `40003`, то есть жалобой
-//! на токен, и разбирающийся думает на токен, а не на маршрут.
+//! The method is **ordinary**, not from `SandboxService`. T-Invest offers two
+//! approaches: call ordinary methods at the sandbox address (recommended), or
+//! use sandbox methods. Mixing approaches—an ordinary method at the production
+//! address or a sandbox method at the sandbox address—elicits `40003`, a token
+//! complaint, so the investigator blames the token rather than the route.
 //!
-//! Требует заведённого доступа: `IAAM_DATABASE` и `IAAM_BROKER_KEY_FILE`
-//! указывают на базу и ключ, а сам доступ заводится командой
-//! `IAAM_ADD_BROKER_ACCESS=tinkoff`. Отсутствие любого из них —
-//! **отказ**, а не пропуск: режим запрошен явно, и молча ничего не
-//! проверить значит соврать зелёным прогоном.
+//! Requires configured access: `IAAM_DATABASE` and `IAAM_BROKER_KEY_FILE` point
+//! to the database and key, while the access itself is configured with
+//! `IAAM_ADD_BROKER_ACCESS=tinkoff`. Missing any of them is a **refusal**, not
+//! a skip: the mode was requested explicitly, and silently checking nothing
+//! would lie with a green run.
 #![cfg(feature = "sandbox")]
 
 use std::path::PathBuf;
@@ -38,49 +37,48 @@ use iaam_store::documents::BrokerCode;
 
 fn required(variable: &str) -> PathBuf {
     PathBuf::from(std::env::var(variable).unwrap_or_else(|_| {
-        panic!("режим песочницы запрошен, но {variable} не задана: проверять нечем")
+        panic!("sandbox mode requested, but {variable} is not set; nothing to check")
     }))
 }
 
-/// Успешен ли код ответа.
+/// Whether the response status is successful.
 ///
-/// Свободная функция, а не метод трейта `is_*` на `u16`: клиппи требует,
-/// чтобы `is_*` брал `self` по ссылке, а брать по ссылке двухбайтовое
-/// число незачем. `reqwest::StatusCode::is_success` больше недоступен —
-/// транспорт отдаёт код числом.
+/// A free function rather than an `is_*` trait method on `u16`: clippy requires
+/// `is_*` to take `self` by reference, but borrowing a two-byte number is
+/// unnecessary. `reqwest::StatusCode::is_success` is no longer available—the
+/// transport returns a number.
 const fn status_is_success(status: u16) -> bool {
     status >= 200 && status <= 299
 }
 
 #[tokio::test]
 async fn the_sandbox_accepts_the_provisioned_access() {
-    // Проверяется вся цепочка разом: ключ из файла, шифротекст из базы,
-    // расшифровка, вшитый корень доверия и заголовок авторизации.
-    // Каждое звено по отдельности проверено обычными тестами; здесь
-    // важно, что они сходятся на настоящем шлюзе.
-    let store = SqliteStore::open(&required("IAAM_DATABASE")).expect("база открыта");
-    let key = Key::from_file(&required("IAAM_BROKER_KEY_FILE")).expect("ключ прочитан");
-    let SoleOwner::Single(owner) = store.sole_token_owner().expect("владелец прочитан")
-    else {
-        panic!("в базе нет единственного владельца: сначала выпустите токен владельца");
+    // Check the whole chain at once: key from file, ciphertext from database,
+    // decryption, embedded trust root, and authorisation header. Each link is
+    // covered separately by ordinary tests; this proves they meet at the real
+    // gateway.
+    let store = SqliteStore::open(&required("IAAM_DATABASE")).expect("database opened");
+    let key = Key::from_file(&required("IAAM_BROKER_KEY_FILE")).expect("key read");
+    let SoleOwner::Single(owner) = store.sole_token_owner().expect("owner read") else {
+        panic!("database has no sole owner; issue an owner token first");
     };
-    let broker = BrokerCode::parse("tinkoff").expect("код брокера");
-    // Среда называется явно: боевым доступом в песочницу не ходят,
-    // и «какой найдётся» здесь означало бы поход не туда.
+    let broker = BrokerCode::parse("tinkoff").expect("broker code");
+    // Select the environment explicitly: production access must not be used
+    // against the sandbox, and “whatever is found” would mean the wrong route.
     let access = store
         .find_broker_access(owner, &broker, Environment::Sandbox.code())
-        .expect("доступ прочитан")
-        .expect("песочный доступ к tinkoff не заведён: POST /v1/broker-access");
+        .expect("access read")
+        .expect("Tinkoff sandbox access is not configured: POST /v1/broker-access");
 
     assert_eq!(
         BrokerScope::parse(&access.scope),
         Some(BrokerScope::ReadOnly),
-        "доступ заведён не на чтение — к брокеру с ним не ходят"
+        "access is not read-only; do not use it with the broker"
     );
 
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))
-        .expect("доступ расшифрован");
+        .expect("access decrypted");
 
     let request = HttpRequest::post(
         Destination::TinkoffSandbox,
@@ -91,16 +89,16 @@ async fn the_sandbox_accepts_the_provisioned_access() {
     let response = HttpClient::new()
         .send(&request)
         .await
-        .expect("шлюз ответил");
+        .expect("gateway responded");
 
-    // Тело ответа входит в сообщение намеренно: «HTTP 500» без него
-    // не отличает сломанный шлюз от негодного токена, а разбираться
-    // с этим приходится по одному этому сообщению. Секрета в теле нет:
-    // токен туда не возвращается.
+    // Include the response body deliberately: “HTTP 500” alone cannot
+    // distinguish a broken gateway from an invalid token, and this one message
+    // is all the investigation gets. The body contains no secret: the token is
+    // not returned there.
     let status = response.status;
     let body = String::from_utf8(response.body).unwrap_or_default();
     assert!(
         status_is_success(status),
-        "песочница отклонила заведённый доступ: HTTP {status}: {body}"
+        "sandbox rejected configured access: HTTP {status}: {body}"
     );
 }

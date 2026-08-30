@@ -1,8 +1,8 @@
-//! Подсистема планирования синхронизации рыночных рядов.
+//! Market series synchronisation scheduling subsystem.
 //!
-//! Здесь нет универсального движка заданий: зарегистрирован только один
-//! вид работы — синхронизация рынка. Сама политика запуска чистая и потому
-//! проверяется без сна, сети и фоновых потоков.
+//! There is no general-purpose job engine here: only one type of work is
+//! registered — market synchronisation. The run policy itself is pure and therefore
+//! is tested without sleeping, network access or background threads.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,17 +16,17 @@ use crate::AppServices;
 use crate::error::AppError;
 use crate::sync::{MarketSource, MarketSyncRequest, MarketSyncResult, sync_market};
 
-/// Окно, в котором источник может исправить уже опубликованные итоги.
+/// Window during which the source may correct already published results.
 pub const CORRECTION_WINDOW_DAYS: i64 = 21;
-/// Запас перед первым событием: он покрывает выходные и праздники.
+/// Buffer before the first event: it covers weekends and public holidays.
 pub const INITIAL_PADDING_DAYS: i64 = 7;
-/// Время, после которого дневные итоги рынка считаются опубликованными.
+/// Time after which the market's daily results are considered published.
 #[must_use]
 pub fn default_close_time() -> Time {
     Time::from_hms(19, 0, 0).expect("valid close time")
 }
 
-/// Настройки ежедневной синхронизации одной серии.
+/// Daily synchronisation settings for one series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketSchedule {
     close_time: Time,
@@ -58,16 +58,16 @@ impl MarketSchedule {
         }
     }
 
-    /// Чистое решение «пора ли запускать» без сна и побочных эффектов.
+    /// Pure «is it time to run?» decision without sleeping or side effects.
     #[must_use]
     pub fn should_run(self, now: OffsetDateTime, state: &ScheduleState) -> bool {
         state.active && now.time() >= self.close_time && state.last_run != Some(now.date())
     }
 
-    /// Диапазон для автоматического запуска.
+    /// Range for an automatic run.
     ///
-    /// Первый запуск начинается от первого события, а последующие — от
-    /// скользящей границы исправлений. `None` означает закрытую позицию.
+    /// The first run starts from the first event, and subsequent runs — from
+    /// the rolling correction boundary. `None` means a closed position.
     #[must_use]
     pub fn window(
         self,
@@ -85,7 +85,7 @@ impl MarketSchedule {
         Some((from.min(today), today))
     }
 
-    /// Диапазон ручного запуска: ручной вызов не ждёт закрытия торгов.
+    /// Range for a manual run: a manual invocation does not wait for trading to close.
     #[must_use]
     pub fn manual_window(
         self,
@@ -97,7 +97,7 @@ impl MarketSchedule {
     }
 }
 
-/// Состояние одной зарегистрированной серии.
+/// State of one registered series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduleState {
     active: bool,
@@ -144,7 +144,7 @@ impl ScheduleState {
     }
 }
 
-/// Первая дата события инструмента, либо первая дата журнала для общих рядов.
+/// Instrument's first event date, or the first journal date for general series.
 #[must_use]
 pub fn first_event_date(events: &[Event], instrument: Option<InstrumentId>) -> Option<Date> {
     events
@@ -168,7 +168,7 @@ pub fn first_event_date(events: &[Event], instrument: Option<InstrumentId>) -> O
         .min()
 }
 
-/// Одна рыночная серия и её ежедневная синхронизация.
+/// One market series and its daily synchronisation.
 pub struct MarketSyncJob {
     services: Arc<AppServices>,
     source: MarketSource,
@@ -231,7 +231,7 @@ impl MarketSyncJob {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Выполнить серию, если ежедневное окно уже открылось.
+    /// Run the series if the daily window has already opened.
     pub async fn run_if_due(
         &self,
         now: OffsetDateTime,
@@ -263,7 +263,7 @@ impl MarketSyncJob {
         result.map(Some)
     }
 
-    /// Ручной запуск серии независимо от времени суток.
+    /// Run the series manually regardless of the time of day.
     pub async fn run_now(&self, now: OffsetDateTime) -> Result<Option<MarketSyncResult>, AppError> {
         let window = {
             let state = self
@@ -300,7 +300,7 @@ impl MarketSyncJob {
     }
 }
 
-/// Планировщик только рыночных серий. Другие виды заданий сюда не добавляются.
+/// Scheduler for market series only. No other job types are added here.
 pub struct MarketScheduler {
     services: Arc<AppServices>,
     jobs: Arc<Mutex<Vec<Arc<MarketSyncJob>>>>,
@@ -396,8 +396,8 @@ impl MarketScheduler {
         results
     }
 
-    /// Запустить минутный опрос. Решение о фактическом запуске остаётся
-    /// чистым `MarketSchedule::should_run`, поэтому тестам не нужен sleep.
+    /// Start minute-by-minute polling. The decision whether to actually run remains
+    /// in the pure `MarketSchedule::should_run`, so tests do not need sleep.
     #[must_use]
     pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -497,9 +497,9 @@ mod tests {
 
     #[test]
     fn amortisation_does_not_change_the_position_count() {
-        // §6.5: амортизация выплачивает деньги, но количество бумаг
-        // не уменьшает. Отрицательная дельта закрыла бы синхронизацию
-        // цены живой бумаги.
+        // §6.5: amortisation pays out cash, but the quantity of securities
+        // does not decrease. A negative delta would stop synchronising
+        // the price of an active security.
         let instrument = InstrumentId::new_random();
         let events = vec![bought(instrument, 10), amortised(instrument)];
         assert!(active_instruments(&events).unwrap().contains(&instrument));
@@ -532,8 +532,8 @@ mod tests {
 
     #[test]
     fn a_conversion_moves_the_count_from_predecessor_to_successor() {
-        // Замещение двигает количество по двум бумагам сразу: свести его
-        // к одной значило бы оставить предшественника вечно активным.
+        // Substitution changes the quantities of two securities at once: reducing it
+        // to one would leave the predecessor permanently active.
         let predecessor = InstrumentId::new_random();
         let successor = InstrumentId::new_random();
         let converted = event_of(

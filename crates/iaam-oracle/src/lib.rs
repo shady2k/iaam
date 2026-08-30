@@ -1,7 +1,7 @@
-//! Независимые эталонные реализации для тестов (§15.4).
+//! Independent reference implementations for tests (§15.4).
 //!
-//! Крейта существует, чтобы проверка «два способа дают одно и то же»
-//! не вырождалась в тавтологию. Она **не является** зависимостью
-//! ни одной продакшн-крейты.
+//! This crate exists so the check that “two methods produce the same result”
+//! does not collapse into a tautology. It is **not** a dependency
+//! of any production crate.
 
 pub mod lots_reference;

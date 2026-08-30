@@ -1,7 +1,7 @@
-//! Синхронизация одного брокерского канала с журналом фактов.
+//! Synchronisation of a single broker channel with the fact journal.
 //!
-//! Сценарий не считает остатки: он принимает операции и контрольные
-//! утверждения, а сверка остаётся чистой функцией `iaam-core`.
+//! The scenario does not calculate balances: it accepts operations and control
+//! assertions, while reconciliation remains a pure `iaam-core` function.
 
 use crate::AppServices;
 use crate::error::AppError;
@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use time::Date;
 use time::OffsetDateTime;
 
-/// Результат синхронизации одного канала за один интервал.
+/// Result of synchronising one channel for one interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
     pub recorded: Vec<Verdict>,
@@ -38,13 +38,13 @@ pub struct SyncOutcome {
     pub assertions: usize,
 }
 
-/// Получает операции и портфель брокера и записывает новые факты.
+/// Retrieves the broker's operations and portfolio and records new facts.
 ///
-/// Сопоставление с уже записанным журналом выполняется до вызова store:
-/// слой хранилища знает только источник вместе с `source_operation_id`, а
-/// сверка двух независимых каналов обязана видеть одинаковую операцию и при
-/// разных источниках. Вероятный дубликат не удаляется: это лишь подсказка
-/// уровня §10.6, поэтому в журнал он попадает как новый факт.
+/// Matching against the existing journal is performed before calling the store:
+/// the storage layer knows only the source together with `source_operation_id`, while
+/// reconciliation of two independent channels must recognise the same operation even
+/// from different sources. A probable duplicate is not removed: it is only a hint
+/// at the §10.6 level, so it enters the journal as a new fact.
 pub async fn sync_broker(
     services: &AppServices,
     principal: &Principal,
@@ -56,7 +56,7 @@ pub async fn sync_broker(
     if !principal.scope.may_submit() {
         return Err(AppError::Invalid {
             field: "scope".to_owned(),
-            expected: "право синхронизации брокера".to_owned(),
+            expected: "permission to synchronise the broker".to_owned(),
             actual: principal.scope.code().to_owned(),
         });
     }
@@ -110,9 +110,9 @@ pub async fn sync_broker(
         recorded.push(verdict);
     }
 
-    // Отказанная строка доказывает, что ответ не является полной выгрузкой.
-    // Операции выше всё равно сохраняются, но контрольный остаток нельзя
-    // записать рядом с неполным интервалом.
+    // A rejected row proves that the response is not a complete export.
+    // The operations above are still saved, but the control balance cannot be
+    // recorded alongside an incomplete interval.
     if !parsed.quarantined.is_empty() {
         return Ok(SyncOutcome {
             recorded,
@@ -165,7 +165,7 @@ pub async fn sync_broker(
 }
 
 fn broker_error(error: crate::ports::BrokerError) -> AppError {
-    AppError::Store(format!("синхронизация брокера: {error}"))
+    AppError::Store(format!("broker synchronisation: {error}"))
 }
 
 fn with_channel_provenance(mut event: Event, channel: &SourceChannel) -> Event {
@@ -213,8 +213,8 @@ fn verdict_from_recorded(recorded: &[Recorded], duplicates: &mut usize) -> Verdi
         None => Verdict::Rejected {
             rejection: iaam_ingest::Rejection {
                 field: "storage".to_owned(),
-                expected: "результат записи события".to_owned(),
-                actual: "хранилище не вернуло результата".to_owned(),
+                expected: "event recording result".to_owned(),
+                actual: "storage returned no result".to_owned(),
             },
         },
     }
@@ -233,11 +233,11 @@ fn event_id_from_verdict(verdict: &Verdict) -> Option<EventId> {
     }
 }
 
-/// Чьё утверждение и за какой интервал.
+/// Whose assertion and for which interval.
 ///
-/// Отдельный тип, а не четыре параметра подряд: владелец и счёт —
-/// разные вещи одного вида, а две даты интервала переставляются местами
-/// незаметно, и сверка после этого никогда ни с чем не сходится.
+/// A separate type rather than four consecutive parameters: the owner and account are
+/// different things of the same kind, while the two interval dates can be swapped
+/// unnoticed, after which reconciliation will never match anything.
 struct AssertionTarget {
     owner: OwnerId,
     account: AccountId,
@@ -267,7 +267,7 @@ fn assertion_event(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let raw_hash = RawHash::parse(&hex)
-        .unwrap_or_else(|| unreachable!("шестнадцатеричный SHA-256 — всегда годный RawHash"));
+        .unwrap_or_else(|| unreachable!("hexadecimal SHA-256 is always a valid RawHash"));
     Event {
         id: EventId::new_random(),
         schema_version: SCHEMA_VERSION,
@@ -290,7 +290,7 @@ fn assertion_event(
         idempotency_key: Some(identity),
     }
 }
-/// Конкретный источник и серия ручного запуска.
+/// A specific source and manual run series.
 #[derive(Debug, Clone)]
 pub enum MarketSource {
     Moex {
@@ -308,8 +308,8 @@ pub enum MarketSource {
     CbrKeyRate,
 }
 
-/// Узкий запрос ручной синхронизации. Планировщик намеренно отсутствует:
-/// расписание появится в следующей части эпика.
+/// A narrow manual synchronisation request. The scheduler is deliberately absent:
+/// scheduling will be added in the next part of the epic.
 #[derive(Debug, Clone)]
 pub struct MarketSyncRequest {
     pub source: MarketSource,
@@ -317,7 +317,7 @@ pub struct MarketSyncRequest {
     pub to: Date,
 }
 
-/// Наблюдаемое состояние запуска.
+/// Observable run state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketSyncResult {
     pub outcome: RunOutcome,
@@ -336,11 +336,11 @@ impl MarketSyncResult {
     }
 }
 
-/// Синхронизировать одну серию, не публикуя незавершённые строки.
+/// Synchronise one series without publishing incomplete rows.
 ///
-/// Сценарий — единственная граница между `iaam-market` и `iaam-store`:
-/// сначала разбираются доменные наблюдения источника, затем здесь они
-/// превращаются в строковые строки таблиц.
+/// The scenario is the only boundary between `iaam-market` and `iaam-store`:
+/// first the source's domain observations are parsed, then here they
+/// are converted into textual table rows.
 pub async fn sync_market(
     store: &mut MarketStore,
     transport: &dyn crate::ports::OutboundHttp,
@@ -349,7 +349,7 @@ pub async fn sync_market(
     if request.to < request.from {
         return Err(AppError::Invalid {
             field: "to".to_owned(),
-            expected: "дата не раньше from".to_owned(),
+            expected: "date no earlier than from".to_owned(),
             actual: request.to.to_string(),
         });
     }
@@ -374,7 +374,7 @@ pub async fn sync_market(
         return partial(
             store,
             &handle,
-            format!("источник вернул HTTP {}", response.status),
+            format!("source returned HTTP {}", response.status),
         );
     }
 
@@ -424,10 +424,10 @@ pub async fn sync_market(
     })
 }
 
-/// Синхронизировать рынок через собранные зависимости приложения.
+/// Synchronise the market through the application's assembled dependencies.
 ///
-/// Сервер вызывает этот фасад, а не получает доступ к адаптеру хранилища:
-/// оркестрация источника и записи остаётся в `iaam-app`.
+/// The server calls this façade rather than accessing the storage adapter:
+/// source and recording orchestration remains in `iaam-app`.
 pub async fn sync_market_with_services(
     services: &AppServices,
     request: MarketSyncRequest,
@@ -483,7 +483,7 @@ fn parse_response(
             ..
         } => {
             let body = core::str::from_utf8(body)
-                .map_err(|error| AppError::Store(format!("ответ MOEX не UTF-8: {error}")))?;
+                .map_err(|error| AppError::Store(format!("MOEX response is not UTF-8: {error}")))?;
             let prices = iaam_market::moex::parse::parse_history(
                 body,
                 *instrument,
@@ -491,8 +491,8 @@ fn parse_response(
                 iaam_market::moex::parse::MarketSegment { engine, market },
             )
             .map_err(|error| AppError::Store(error.to_string()))?;
-            // Тот же ответ, та же координата знания: НКД лежит в той же
-            // строке, что и цена, и второго обращения не требует.
+            // The same response, the same knowledge coordinate: accrued interest is in the same
+            // row as the price and requires no second request.
             let accrued =
                 iaam_market::moex::parse::parse_accrued_interest(body, *instrument, observed_at)
                     .map_err(|error| AppError::Store(error.to_string()))?;
@@ -511,8 +511,9 @@ fn parse_response(
                 .map_err(|error| AppError::Store(error.to_string()))
         }
         MarketSource::CbrKeyRate => {
-            let body = core::str::from_utf8(body)
-                .map_err(|error| AppError::Store(format!("ответ ЦБ не UTF-8: {error}")))?;
+            let body = core::str::from_utf8(body).map_err(|error| {
+                AppError::Store(format!("Central Bank response is not UTF-8: {error}"))
+            })?;
             iaam_market::cbr::key_rate::parse_key_rate(body, observed_at)
                 .map(ParsedObservations::KeyRates)
                 .map_err(|error| AppError::Store(error.to_string()))
@@ -681,9 +682,9 @@ mod market_tests {
 
     #[test]
     fn one_bond_response_yields_both_prices_and_accrued_interest() {
-        // ACCINT приходит в той же строке, что и CLOSE. Второй запрос
-        // за ним был бы лишним обращением к источнику и второй
-        // координатой знания на одну и ту же строку.
+        // ACCINT arrives in the same row as CLOSE. A second request
+        // for it would be an unnecessary call to the source and a second
+        // knowledge coordinate for the same row.
         let body = std::fs::read("../../tests/fixtures/market/moex-iss-history-ofz.json").unwrap();
         let parsed = parse_response(
             &MarketSource::Moex {
@@ -698,7 +699,7 @@ mod market_tests {
         )
         .unwrap();
         let ParsedObservations::Prices { prices, accrued } = parsed else {
-            panic!("облигационный ответ обязан дать оба вида наблюдений");
+            panic!("bond response must yield both types of observation");
         };
         assert!(!prices.is_empty());
         assert!(!accrued.is_empty());
@@ -722,18 +723,18 @@ mod market_tests {
 
     #[tokio::test]
     async fn a_fixture_transport_publishes_market_rows_without_network() {
-        let mut store = MarketStore::open_in_memory().expect("хранилище");
+        let mut store = MarketStore::open_in_memory().expect("storage");
         let instrument = InstrumentId::new_random();
         store
             .upsert_instrument(&InstrumentRecord {
                 id: instrument,
                 kind: Some(InstrumentKind::Share),
                 symbol: "SBER".to_owned(),
-                title: "Сбербанк".to_owned(),
+                title: "Sberbank".to_owned(),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
             })
-            .expect("инструмент");
+            .expect("instrument");
         let body = include_bytes!("../../../../tests/fixtures/market/moex-iss-history-sber.json");
         let transport = FixtureTransport {
             body: body.to_vec(),
@@ -755,7 +756,7 @@ mod market_tests {
             },
         )
         .await
-        .expect("синхронизация");
+        .expect("synchronisation");
 
         let first_observed_at: String = store
             .connection()
@@ -765,14 +766,14 @@ mod market_tests {
                 [],
                 |row| row.get(0),
             )
-            .expect("момент первого наблюдения");
+            .expect("time of first observation");
 
         let first_count: i64 = store
             .connection()
             .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
                 row.get(0)
             })
-            .expect("число первых наблюдений");
+            .expect("number of first observations");
 
         let repeated = sync_market(
             &mut store,
@@ -790,7 +791,7 @@ mod market_tests {
             },
         )
         .await
-        .expect("повторная синхронизация");
+        .expect("repeat synchronisation");
 
         let second_observed_at: String = store
             .connection()
@@ -800,13 +801,13 @@ mod market_tests {
                 [],
                 |row| row.get(0),
             )
-            .expect("момент повторного наблюдения");
+            .expect("time of repeat observation");
         let second_count: i64 = store
             .connection()
             .query_row("SELECT COUNT(*) FROM price_observations", [], |row| {
                 row.get(0)
             })
-            .expect("число повторных наблюдений");
+            .expect("number of repeat observations");
         assert!(second_observed_at > first_observed_at);
         assert_eq!(
             second_count,
@@ -825,14 +826,14 @@ mod market_tests {
                     dataset: "prices".to_owned(),
                     series_key: format!("{}:TQBR", instrument.inner()),
                 })
-                .expect("граница"),
+                .expect("boundary"),
             Some(date!(2026 - 08 - 21))
         );
     }
 
     #[tokio::test]
     async fn a_source_failure_is_partial_and_keeps_the_previous_boundary() {
-        let mut store = MarketStore::open_in_memory().expect("хранилище");
+        let mut store = MarketStore::open_in_memory().expect("store");
         let transport = FixtureTransport {
             body: Vec::new(),
             status: 503,
@@ -847,7 +848,7 @@ mod market_tests {
             },
         )
         .await
-        .expect("частичный запуск");
+        .expect("partial run");
 
         assert_eq!(result.status(), "partial");
         assert!(result.covered.is_none());
@@ -858,7 +859,7 @@ mod market_tests {
                     dataset: "key_rate".to_owned(),
                     series_key: "key_rate".to_owned(),
                 })
-                .expect("граница"),
+                .expect("boundary"),
             None
         );
     }

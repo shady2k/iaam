@@ -1,14 +1,14 @@
-//! Приёмка (§10).
+//! Ingestion (§10).
 //!
-//! Единый вход: и ручной ввод, и CSV, и внешний агент попадают сюда.
-//! Разбор построчный — документ целиком не отклоняется из-за одной
-//! непонятой строки (§10.1), и каждая строка получает вердикт (§10.4).
+//! Unified entry point: manual input, CSV, and external agents all come here.
+//! Parsing is line-by-line—the document as a whole is not rejected because of one
+//! unrecognized line (§10.1), and every line receives a verdict (§10.4).
 //!
-//! **Знаки и ноги строит приёмка, а не клиент.** Клиент присылает
-//! положительную величину и вид операции; превращение её в ноги события
-//! с правильными знаками — работа этого крейта. Иначе знаковая
-//! конвенция становится частью публичного контракта, и её обязан
-//! знать внешний агент, которому арифметика запрещена (§13).
+//! **Ingestion builds signs and legs, not the client.** The client sends
+//! a positive amount and the operation kind; converting them into event legs
+//! with the correct signs is this crate's job. Otherwise, the sign convention
+//! becomes part of the public contract, and the external agent must
+//! know it, even though arithmetic is forbidden to it (§13).
 
 pub mod classification;
 pub mod csv_source;

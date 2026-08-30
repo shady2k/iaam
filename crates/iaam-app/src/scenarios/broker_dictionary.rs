@@ -1,9 +1,9 @@
-//! Сверка словаря видов операций с опубликованным контрактом (§14).
+//! Reconciliation of the operation type dictionary against the published contract (§14).
 //!
-//! Отвечает на один вопрос: какие коды брокер объявил, а словарь о них
-//! не знает. Классифицировать их сверка не может и не пытается —
-//! контракт перечисляет коды, но не сообщает, во что они превращаются
-//! у нас. Смысл нового кода утверждает владелец.
+//! Answers one question: which codes the broker has declared but the dictionary
+//! does not know. The reconciliation cannot and does not attempt to classify them —
+//! the contract lists the codes but does not say what they map to
+//! in our system. The meaning of a new code is approved by the owner.
 
 use iaam_broker::tinkoff::contract::{operation_types_request, parse_operation_types};
 use iaam_store::documents::BrokerCode;
@@ -12,26 +12,26 @@ use crate::AppServices;
 use crate::error::AppError;
 use crate::ports::{BrokerDictionary, OutboundHttp};
 
-/// Итог сверки.
+/// Reconciliation result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictionaryGap {
-    /// Сколько кодов объявляет контракт.
+    /// Number of codes declared by the contract.
     pub declared: usize,
-    /// Сколько из них словарь уже знает.
+    /// Number of them already known to the dictionary.
     pub known: usize,
-    /// Коды, которых в словаре нет, поимённо.
+    /// Codes missing from the dictionary, by name.
     ///
-    /// Именно поимённо, а не числом: «появилось три кода» не позволяет
-    /// ни принять решение, ни даже понять, те ли это три, что были
-    /// в прошлый раз.
+    /// Specifically by name, rather than as a count: «three codes have appeared» does not allow
+    /// either a decision to be made, or even determining whether these are the same three as
+    /// last time.
     pub missing: Vec<String>,
 }
 
-/// Сверить словарь канала с контрактом.
+/// Reconcile the channel dictionary with the contract.
 ///
-/// Недоступность контракта — отказ, а не пустой список расхождений:
-/// «сверили, всё на месте» и «сверить не удалось» обязаны различаться,
-/// иначе первый же сбой сети выглядит как благополучие.
+/// Contract unavailability is a failure, not an empty list of discrepancies:
+/// «checked, everything is present» and «could not check» must remain distinct,
+/// otherwise the very first network failure looks as if all is well.
 pub async fn compare_with_contract(
     http: &dyn OutboundHttp,
     dictionary: &dyn BrokerDictionary,
@@ -41,18 +41,18 @@ pub async fn compare_with_contract(
     if !(200..=299).contains(&response.status) {
         return Err(AppError::Invalid {
             field: "contract".to_owned(),
-            expected: "успешный ответ за контрактом".to_owned(),
+            expected: "a successful response when fetching the contract".to_owned(),
             actual: response.status.to_string(),
         });
     }
     let body = String::from_utf8(response.body).map_err(|_| AppError::Invalid {
         field: "contract".to_owned(),
-        expected: "текст контракта".to_owned(),
-        actual: "не UTF-8".to_owned(),
+        expected: "contract text".to_owned(),
+        actual: "not UTF-8".to_owned(),
     })?;
     let declared = parse_operation_types(&body).map_err(|error| AppError::Invalid {
         field: "contract".to_owned(),
-        expected: "перечень OperationType".to_owned(),
+        expected: "an OperationType list".to_owned(),
         actual: error.to_string(),
     })?;
 
@@ -73,11 +73,11 @@ pub async fn compare_with_contract(
     })
 }
 
-/// Сверить словарь через собранные зависимости приложения.
+/// Reconcile the dictionary using the application's assembled dependencies.
 ///
-/// Сервер зовёт этот фасад, а сценарий выше берёт порты по отдельности:
-/// сверке нужны два из десяти, и требовать сборку целиком значило бы
-/// требовать в тесте настроенный журнал ради чтения справочника.
+/// The server calls this façade, while the scenario above takes the ports separately:
+/// reconciliation needs two out of ten, and requiring the entire set to be assembled would mean
+/// requiring a configured journal in a test merely to read the reference data.
 pub async fn compare_with_contract_using_services(
     services: &AppServices,
     broker: &BrokerCode,
@@ -119,7 +119,7 @@ enum OperationType {
         async fn send(&self, _request: HttpRequest) -> Result<OutboundResponse, AppError> {
             Ok(OutboundResponse {
                 status: self.status,
-                raw_hash: "контракт".to_owned(),
+                raw_hash: "contract".to_owned(),
                 body: self.body.clone(),
             })
         }
@@ -157,7 +157,7 @@ enum OperationType {
     }
 
     fn tinkoff() -> BrokerCode {
-        BrokerCode::parse("tinkoff").expect("код брокера")
+        BrokerCode::parse("tinkoff").expect("broker code")
     }
 
     #[tokio::test]
@@ -165,13 +165,13 @@ enum OperationType {
         let (http, known) = parts(CONTRACT, 200, &[("OPERATION_TYPE_INPUT", "deposit")]);
         let gap = compare_with_contract(http.as_ref(), known.as_ref(), &tinkoff())
             .await
-            .expect("сверка прошла");
+            .expect("reconciliation succeeded");
         assert_eq!(gap.declared, 3);
         assert_eq!(gap.known, 1);
         assert_eq!(
             gap.missing,
             ["OPERATION_TYPE_BOND_REPAYMENT", "OPERATION_TYPE_COUPON"],
-            "расхождение обязано называть коды, а не их число"
+            "the discrepancy must name the codes, not their count"
         );
     }
 
@@ -188,14 +188,14 @@ enum OperationType {
         );
         let gap = compare_with_contract(http.as_ref(), known.as_ref(), &tinkoff())
             .await
-            .expect("сверка прошла");
+            .expect("reconciliation succeeded");
         assert!(gap.missing.is_empty(), "{:?}", gap.missing);
         assert_eq!(gap.known, gap.declared);
     }
 
-    /// «Сверили, всё на месте» и «сверить не удалось» обязаны
-    /// различаться: иначе первый же сбой сети выглядит как благополучие,
-    /// и словарь тихо отстаёт от контракта.
+    /// «Checked, everything is present» and «could not check» must
+    /// remain distinct: otherwise the very first network failure looks as if all is well,
+    /// and the dictionary quietly falls behind the contract.
     #[tokio::test]
     async fn an_unavailable_contract_is_a_refusal_not_an_empty_gap() {
         let (http, known) = parts("", 503, &[]);
@@ -206,11 +206,11 @@ enum OperationType {
         );
     }
 
-    /// Ответ пришёл, но перечня в нём нет — тоже отказ: страница
-    /// «репозиторий переехал» отдаётся кодом 200.
+    /// A response arrived, but it contains no list — also a failure: the page
+    /// «repository has moved» is returned with code 200.
     #[tokio::test]
     async fn a_body_without_the_enum_is_a_refusal() {
-        let (http, known) = parts("переехали, смотрите в другом месте", 200, &[]);
+        let (http, known) = parts("moved; look elsewhere", 200, &[]);
         assert!(
             compare_with_contract(http.as_ref(), known.as_ref(), &tinkoff())
                 .await

@@ -1,12 +1,12 @@
-//! Транспортные представления (§3.2).
+//! Transport representations (§3.2).
 //!
-//! DTO живут здесь и никогда не переезжают в общий крейт: общий крейт
-//! типов быстро превращается в свалку, и формально независимое ядро
-//! оказывается зависимым от слоя, который знает обо всём.
+//! DTOs live here and never move into the common crate: a common crate
+//! of types quickly becomes a dumping ground, and the formally independent core
+//! ends up depending on the layer that knows about everything.
 //!
-//! **Суммы передаются десятичными строками**, а не числами с плавающей
-//! точкой: JSON-число `0.1` в двоичной плавающей точке не равно одной
-//! десятой, и денежная сумма, прошедшая через него, перестаёт быть фактом.
+//! **Amounts are sent as decimal strings**, not floating-point
+//! numbers: the JSON number `0.1` in binary floating point is not equal to one
+//! tenth, and a monetary amount passed through it ceases to be a fact.
 
 use std::fmt;
 
@@ -42,14 +42,14 @@ use time::{Date, OffsetDateTime};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-// Собственный формат дат: штатная сериализация `time::Date` не является
-// строкой «ГГГГ-ММ-ДД», и без этой строки API принимал бы даты
-// в непредсказуемом виде. Проверено исполнением: без неё разбор тела
-// падает с «invalid type: string "2025-01-01", expected a `Date`».
+// Custom date format: the standard serialisation of `time::Date` is not
+// a «YYYY-MM-DD» string, and without this line the API would accept dates
+// in an unpredictable format. Verified by execution: without it, body parsing
+// fails with «invalid type: string "2025-01-01", expected a `Date`».
 time::serde::format_description!(iso_date, Date, "[year]-[month]-[day]");
 
-/// Код валюты в транспорте. Отдельный тип, потому что `CurrencyCode`
-/// ядра не знает про OpenAPI и знать не должен.
+/// Transport currency code. A separate type because the core's `CurrencyCode`
+/// knows nothing about OpenAPI and should not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum CurrencyDto {
@@ -84,14 +84,14 @@ impl CurrencyDto {
     }
 }
 
-/// Качество цены в транспорте.
+/// Transport price quality.
 ///
-/// Уже вычисленные нами величины — перенос на нерабочий день и
-/// устаревание по порогу — представимым вводом не являются: это выводы
-/// политики оценки, а не то, что утверждает источник. Записать их фактом
-/// значит стереть различие между наблюдением и нашим выводом
+/// Values we have already computed — carry-forward to a non-working day and
+/// threshold-based staleness — are not representable inputs: they are conclusions
+/// of valuation policy, not what the source asserts. Recording them as facts
+/// would erase the distinction between an observation and our conclusion
 /// (docs/decisions/0002-polnota-ocenki-i-ispolnimost-ceny-dve-osi.md).
-/// Доменный PriceQuality шире: он обязан читать старый журнал.
+/// Domain PriceQuality is broader: it must be able to read the old journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceQualityDto {
@@ -111,11 +111,11 @@ impl PriceQualityDto {
     }
 }
 
-/// Вид дохода в транспорте.
+/// Transport income type.
 ///
-/// Варианта «прочее» нет — как и в ядре: мешок, по которому нельзя
-/// принять решение, не отличается от незнания, а незнание выражается
-/// отсутствием поля.
+/// There is no «other» variant, just as in the core: a bucket that cannot
+/// support a decision is indistinguishable from ignorance, and ignorance is
+/// represented by the field's absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IncomeKindDto {
@@ -135,7 +135,7 @@ impl IncomeKindDto {
     }
 }
 
-/// Происхождение комиссии в транспорте.
+/// Transport fee provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FeeOriginDto {
@@ -159,7 +159,7 @@ impl FeeOriginDto {
     }
 }
 
-/// Даты операции.
+/// Operation dates.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 pub struct OperationDatesDto {
     #[serde(
@@ -192,7 +192,7 @@ pub struct OperationDatesDto {
     pub paid: Option<Date>,
 }
 
-/// Уверенность владельца в количестве восстановленной позиции.
+/// Owner's confidence in the quantity of the reconstructed position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CertaintyDto {
@@ -210,7 +210,7 @@ impl CertaintyDto {
     }
 }
 
-/// Уверенность владельца в дате приобретения.
+/// Owner's confidence in the acquisition date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DateCertaintyDto {
@@ -230,7 +230,7 @@ impl DateCertaintyDto {
     }
 }
 
-/// Уверенность в документированности налоговой стоимости.
+/// Confidence that the tax basis is documented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BasisCertaintyDto {
@@ -250,7 +250,7 @@ impl BasisCertaintyDto {
     }
 }
 
-/// Троичное утверждение владельца.
+/// Owner's ternary assertion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TristateDto {
@@ -270,7 +270,7 @@ impl TristateDto {
     }
 }
 
-/// Известность факта, утверждаемого владельцем.
+/// Whether a fact asserted by the owner is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum KnowledgeDto {
@@ -288,11 +288,11 @@ impl KnowledgeDto {
     }
 }
 
-/// Утверждения владельца о восстановленном начале (§10.7).
+/// Owner's assertions about the reconstructed opening (§10.7).
 ///
-/// Отсутствующее поле `assertions` означает, что владелец ничего не
-/// утверждал; значения по умолчанию сохраняют это незнание, а не
-/// выводят уверенность из заполненности других полей.
+/// An absent `assertions` field means that the owner did not
+/// assert anything; default values preserve this lack of knowledge rather than
+/// infer confidence from whether other fields are populated.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct OpeningAssertionsDto {
     #[serde(default)]
@@ -341,7 +341,7 @@ impl OpeningAssertionsDto {
     }
 }
 
-/// Вид операции. Величины **положительные**: знак задаёт вид, а не клиент.
+/// Operation type. Values are **positive**: the type determines the sign, not the client.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationKindDto {
@@ -385,9 +385,9 @@ pub enum OperationKindDto {
         instrument: Option<Uuid>,
         amount: String,
         currency: CurrencyDto,
-        /// Вид дохода. Отсутствие поля означает «не утверждалось»:
-        /// без него API продолжил бы терять вид у журнала, который
-        /// его уже умеет хранить.
+        /// Type of income. An absent field means «not asserted»:
+        /// without it, the API would continue to lose the type from a journal that
+        /// already knows how to store it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<IncomeKindDto>,
     },
@@ -418,7 +418,7 @@ pub enum OperationKindDto {
     },
 }
 
-/// Операция целиком.
+/// Complete operation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OperationDto {
     pub account: Uuid,
@@ -435,7 +435,7 @@ pub struct OperationDto {
 fn decimal(value: &str, field: &str) -> Result<Decimal, Rejection> {
     value.parse::<Decimal>().map_err(|_| Rejection {
         field: field.to_owned(),
-        expected: "десятичное число в виде строки".into(),
+        expected: "a decimal number represented as a string".into(),
         actual: value.to_owned(),
     })
 }
@@ -456,10 +456,10 @@ fn optional_minor(
 }
 
 impl OperationDto {
-    /// Преобразование в доменную операцию.
+    /// Conversion to a domain operation.
     ///
-    /// Единственное место, где транспорт встречается с доменом. Отказ
-    /// возвращается с полем, ожидаемым и полученным — это тело ответа
+    /// The only place where transport meets the domain. A rejection
+    /// is returned with the field, the expected value and the received value — this is the response body
     /// `422` (§13).
     pub fn to_domain(&self) -> Result<SubmittedOperation, Rejection> {
         let kind = self.kind_to_domain()?;
@@ -595,18 +595,18 @@ impl OperationDto {
     }
 }
 
-/// Запрос приёмки.
+/// Intake request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitOperationsRequest {
-    /// Метка источника: ручной ввод, конкретный агент, конкретный файл.
+    /// Source label: manual input, a specific agent, a specific file.
     pub source_label: String,
     pub operations: Vec<OperationDto>,
 }
 
-/// Вердикт по одной операции.
+/// Verdict for a single operation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VerdictDto {
-    /// Номер операции во входной пачке, с единицы.
+    /// One-based operation number in the input batch.
     pub row: usize,
     pub verdict: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -619,11 +619,11 @@ pub struct VerdictDto {
     pub actual: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// Счёт, о котором идёт речь. Заполняется у вердиктов сверки:
-    /// расхождение без счёта — это задание «поищите где-нибудь».
+    /// The account concerned. Populated for reconciliation verdicts:
+    /// a discrepancy without an account is an instruction to «look somewhere».
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<Uuid>,
-    /// Измерение, по которому не сошлось или нечего сверять (§10.3).
+    /// The dimension for which values do not match or there is nothing to reconcile (§10.3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimension: Option<String>,
 }
@@ -690,7 +690,7 @@ impl VerdictDto {
     }
 }
 
-/// Величина, которую система могла отказаться вычислить.
+/// A value that the system may have declined to calculate.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ComputedDto {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -721,111 +721,116 @@ impl ComputedDto {
 fn describe(reason: &NotComputable) -> String {
     match reason {
         NotComputable::MissingPrice { instrument } => {
-            format!("нет цены инструмента {}", instrument.inner())
+            format!("no price for instrument {}", instrument.inner())
         }
         NotComputable::MissingFxRate { from, to, date } => {
-            format!("нет курса {}→{} на {date}", from.code(), to.code())
+            format!("no exchange rate {}→{} on {date}", from.code(), to.code())
         }
         NotComputable::QuotationBasisUnknown { instrument } => {
             format!(
-                "неизвестно основание котировки инструмента {}",
+                "unknown quotation basis for instrument {}",
                 instrument.inner()
             )
         }
         NotComputable::QuotationBasisContradictsEvidence { instrument } => {
             format!(
-                "основание котировки противоречит доказательству инструмента {}",
+                "quotation basis contradicts the evidence for instrument {}",
                 instrument.inner()
             )
         }
         NotComputable::RemainingFaceUnknown { instrument } => {
             format!(
-                "неизвестен остаточный номинал инструмента {}",
+                "remaining face value is unknown for instrument {}",
                 instrument.inner()
             )
         }
         NotComputable::SolverRefused { refusal } => refusal.to_string(),
-        NotComputable::NoExternalFlows => "нет потоков, пересекающих границу контура".into(),
+        NotComputable::NoExternalFlows => "no flows crossing the perimeter boundary".into(),
         NotComputable::StateNewerThanReport { last_event, as_of } => {
-            format!("срез содержит события до {last_event}, отчёт на {as_of}")
+            format!("snapshot contains events only up to {last_event}, report is as of {as_of}")
         }
-        NotComputable::Numeric { code } => format!("арифметический отказ: {code}"),
+        NotComputable::Numeric { code } => format!("arithmetic failure: {code}"),
         NotComputable::UnsupportedFinancing { account } => format!(
-            "на счёте {} присутствует финансирование вне периметра",
+            "the account contains funding from outside the perimeter: {}",
             account.inner()
         ),
         NotComputable::ScheduleMissing { instrument } => {
-            format!("нет графика выпуска инструмента {}", instrument.inner())
+            format!("no issue schedule for instrument {}", instrument.inner())
         }
         NotComputable::AccruedObservationMissing { instrument } => {
-            format!("нет наблюдения НКД инструмента {}", instrument.inner())
+            format!(
+                "no accrued interest observation for instrument {}",
+                instrument.inner()
+            )
         }
         NotComputable::CouponUndetermined { instrument } => {
             format!(
-                "не определена сумма купона инструмента {}",
+                "coupon amount is undefined for instrument {}",
                 instrument.inner()
             )
         }
         NotComputable::OutsideScheduleCoverage { instrument } => {
             format!(
-                "дата отчёта вне покрытия графика инструмента {}",
+                "report date is outside the schedule coverage for instrument {}",
                 instrument.inner()
             )
         }
         NotComputable::OverlappingScheduleCoverage { instrument } => {
             format!(
-                "дата отчёта покрыта несколькими периодами графика инструмента {}",
+                "report date is covered by multiple schedule periods for instrument {}",
                 instrument.inner()
             )
         }
-        NotComputable::ExitNotExecutable => "нет исполнимого выхода для реализации НКД".to_owned(),
-        NotComputable::PrincipalUnknown => "неизвестен номинал для пересчёта котировки".into(),
+        NotComputable::ExitNotExecutable => {
+            "no executable exit for realising accrued interest".to_owned()
+        }
+        NotComputable::PrincipalUnknown => {
+            "face value for converting the quotation is unknown".into()
+        }
         NotComputable::NonPositiveDuration {
             coordinate,
             terminal_date,
         } => {
-            format!("дата окончания {terminal_date} не позже координаты {coordinate}")
+            format!("terminal date {terminal_date} is not later than coordinate {coordinate}")
         }
-        NotComputable::NonPositiveInitialCapital => "начальная стоимость не положительна".into(),
-        NotComputable::NegativeTerminalWealth => "терминальное благосостояние отрицательно".into(),
-        NotComputable::AcquisitionBasisUnknown => {
-            "историческая стоимость приобретения неизвестна".into()
-        }
+        NotComputable::NonPositiveInitialCapital => "initial value is not positive".into(),
+        NotComputable::NegativeTerminalWealth => "terminal wealth is negative".into(),
+        NotComputable::AcquisitionBasisUnknown => "historical acquisition cost is unknown".into(),
         NotComputable::AccruedInterestAtAcquisitionUnknown => {
-            "НКД, уплаченный при приобретении, неизвестен".into()
+            "accrued interest paid on acquisition is unknown".into()
         }
-        NotComputable::HistoricalReceiptsUnknown => "история полученных выплат неизвестна".into(),
+        NotComputable::HistoricalReceiptsUnknown => "historical receipts are unknown".into(),
         NotComputable::CohortGap { gap } => gap.to_string(),
         NotComputable::CurrencyMismatch { expected, actual } => {
             format!(
-                "валюты не совпадают: {} и {}",
+                "currencies do not match: {} and {}",
                 expected.code(),
                 actual.code()
             )
         }
-        NotComputable::ExpenseUnknown => "расход неизвестен".into(),
+        NotComputable::ExpenseUnknown => "expense is unknown".into(),
     }
 }
 
-/// Печать приближённой величины.
+/// Printing an approximate value.
 ///
-/// Печатать `f64` как есть нельзя: последние знаки двоичной плавающей
-/// точки — шум, а не результат, и они меняются между платформами.
-/// Восемь знаков — на четыре порядка точнее допуска решателя (1e-9
-/// по невязке NPV) и ровно настолько, насколько ставка вообще имеет
-/// смысл: 0,00000001 — это одна миллионная процента годовых.
+/// `f64` cannot be printed as-is: the final digits of binary floating
+/// point are noise, not the result, and vary between platforms.
+/// Eight decimal places are four orders of magnitude more precise than the solver tolerance (1e-9
+/// on the NPV residual) and exactly as precise as a rate can meaningfully be:
+/// 0,00000001 is one millionth of a percentage point per annum.
 fn format_rate(value: f64) -> String {
     let scaled = (value * 1e8).round();
-    // −0 и 0 — одно и то же число, но печатаются по-разному.
+    // −0 and 0 are the same number, but are printed differently.
     let normalized = if scaled == 0.0 { 0.0 } else { scaled / 1e8 };
     format!("{normalized:.8}")
 }
 
-/// Ставка доходности вместе с политикой решателя.
+/// A rate of return together with the solver policy.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RateDto {
-    /// Ставка в долях единицы. Приближённая величина: в денежные
-    /// тождества не входит (§6.6).
+    /// The rate as a decimal fraction. An approximate value: it does not enter
+    /// into monetary identities (§6.6).
     pub value: String,
     pub error_bound: String,
     pub iterations: u32,
@@ -836,10 +841,10 @@ pub struct RateDto {
     pub detail: Option<String>,
 }
 
-/// Расчётная денежная величина вместе с валютой.
+/// A calculated monetary value together with its currency.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CalcMoneyDto {
-    /// Десятичное расчётное значение строкой.
+    /// The calculated decimal value as a string.
     pub value: String,
     pub currency: CurrencyDto,
 }
@@ -853,7 +858,7 @@ impl CalcMoneyDto {
     }
 }
 
-/// Расчётная денежная величина, которая может быть невычислимой.
+/// A calculated monetary value that may not be computable.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ComputedCalcMoneyDto {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -881,7 +886,7 @@ impl ComputedCalcMoneyDto {
     }
 }
 
-/// Один ожидаемый платёж в нулевом реинвестиционном сценарии.
+/// One expected payment in the zero-reinvestment scenario.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExpectedPostingDto {
     #[serde(with = "iso_date")]
@@ -901,7 +906,7 @@ impl ExpectedPostingDto {
     }
 }
 
-/// Вид ожидаемого платежа.
+/// Expected payment type.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PostingKindDto {
@@ -920,8 +925,8 @@ impl PostingKindDto {
     }
 }
 
-const ZERO_REINVESTMENT_NOTE: &str = "Полученные купоны и возвраты номинала считаются сохранёнными до конца срока и не приносящими дохода; если их тратить или реинвестировать, единой цифры терминального капитала не существует — остаются график выплат и IRR.";
-/// Пять величин §7.1 для одного сценария.
+const ZERO_REINVESTMENT_NOTE: &str = "Coupons received and principal repayments are assumed to be held until the end of the term without earning a return; if they are spent or reinvested, there is no single terminal capital figure — only the payment schedule and IRR remain.";
+/// Five quantities from §7.1 for a single scenario.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ZeroReinvestmentMetricsDto {
     pub postings: Vec<ExpectedPostingDto>,
@@ -929,14 +934,14 @@ pub struct ZeroReinvestmentMetricsDto {
     pub surplus: CalcMoneyDto,
     pub hpr: ComputedDto,
     pub cagr_0r: RateDto,
-    /// Полученные купоны и возвраты номинала считаются сохранёнными до конца
-    /// срока и не приносящими дохода; если их тратить или реинвестировать,
-    /// единой цифры терминального капитала не существует — остаются график
-    /// выплат и IRR.
+    /// Coupons received and principal repayments are assumed to be held until the end
+    /// of the term without earning a return; if they are spent or reinvested,
+    /// there is no single terminal capital figure — only the payment schedule
+    /// and IRR remain.
     pub zero_reinvestment_assumed: bool,
-    /// Пояснение допущения, показываемое рядом с рассчитанными величинами.
+    /// Explanation of the assumption shown alongside the calculated quantities.
     pub zero_reinvestment_note: String,
-    /// Ряд до налога; налоговая политика появится в E5.
+    /// Pre-tax series; tax policy will be added in E5.
     pub pre_tax: bool,
 }
 
@@ -959,7 +964,7 @@ impl ZeroReinvestmentMetricsDto {
     }
 }
 
-/// Метрики сценария, которые могут быть невычислимы целиком.
+/// Scenario metrics that may not be fully computable.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ComputedZeroReinvestmentMetricsDto {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -987,7 +992,7 @@ impl ComputedZeroReinvestmentMetricsDto {
     }
 }
 
-/// Сценарий удержания до погашения или предъявления к оферте.
+/// Scenario of holding to maturity or tendering under a put offer.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OfferChoiceDto {
@@ -1004,7 +1009,7 @@ impl OfferChoiceDto {
     }
 }
 
-/// Ярлык ставки на проспективной координате.
+/// Rate label on the prospective coordinate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IrrLabelDto {
@@ -1021,7 +1026,7 @@ impl IrrLabelDto {
     }
 }
 
-/// Проспективная метрика от даты отчёта.
+/// Prospective metric from the reporting date.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProspectiveMetricDto {
     #[serde(with = "iso_date")]
@@ -1049,7 +1054,7 @@ impl ProspectiveMetricDto {
     }
 }
 
-/// Пожизненная метрика одной когорты.
+/// Lifetime metric for a single cohort.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LifetimeCohortMetricDto {
     #[serde(with = "iso_date")]
@@ -1061,8 +1066,8 @@ pub struct LifetimeCohortMetricDto {
     pub terminal_date: Date,
     pub c0: ComputedCalcMoneyDto,
     pub metrics: ComputedZeroReinvestmentMetricsDto,
-    /// Исторический IRR отсутствует, потому что прошлые выплаты агрегированы
-    /// без дат.
+    /// Historical IRR is unavailable because past payments are aggregated
+    /// without dates.
     pub irr_absent_because: String,
 }
 
@@ -1079,7 +1084,7 @@ impl LifetimeCohortMetricDto {
     }
 }
 
-/// Метрики одной облигационной позиции по одному сценарию.
+/// Metrics for a single bond position under a single scenario.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BondScenarioResultDto {
     pub choice: OfferChoiceDto,
@@ -1097,7 +1102,7 @@ impl BondScenarioResultDto {
     }
 }
 
-/// Пожизненные метрики могут целиком отказаться из-за пробела в истории.
+/// Lifetime metrics may be entirely unavailable because of a gap in the history.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ComputedLifetimeCohortMetricsDto {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1130,7 +1135,7 @@ impl ComputedLifetimeCohortMetricsDto {
     }
 }
 
-/// Метрики всех сценариев одной облигационной позиции.
+/// Metrics for all scenarios of a single bond position.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BondPositionMetricsDto {
     pub account: Uuid,
@@ -1178,7 +1183,7 @@ fn rate_dto(
     }
 }
 
-/// Выбранная цена позиции с выводами политики и provenance.
+/// Selected position price with policy conclusions and provenance.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SelectedPriceDto {
     pub instrument: Uuid,
@@ -1195,7 +1200,7 @@ pub struct SelectedPriceDto {
     pub provenance: PriceProvenanceDto,
 }
 
-/// Способ, которым политика выбрала наблюдение.
+/// Method by which the policy selected the observation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PriceSelectionDto {
@@ -1211,7 +1216,7 @@ pub enum PriceSelectionDto {
     },
 }
 
-/// Свежесть выбранного наблюдения относительно порога политики.
+/// Freshness of the selected observation relative to the policy threshold.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PriceFreshnessDto {
@@ -1219,7 +1224,7 @@ pub enum PriceFreshnessDto {
     Stale { days: u16 },
 }
 
-/// Происхождение выбранного наблюдения.
+/// Origin of the selected observation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PriceOriginDto {
@@ -1228,14 +1233,14 @@ pub enum PriceOriginDto {
     OwnerAsserted,
 }
 
-/// Единица, в которой источник назвал цену.
+/// Unit in which the source quoted the price.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotationBasisDto {
     MoneyPerUnit,
     PercentOfRemainingFace,
-    /// Источник основания не доказал: цена этой строки в деньги
-    /// не пересчитывается.
+    /// The source did not establish the basis: this row's price is not
+    /// converted into money.
     #[default]
     Unknown,
 }
@@ -1251,7 +1256,7 @@ impl QuotationBasisDto {
     }
 }
 
-/// Статус доказанности записанного основания цены.
+/// Status indicating whether the recorded price basis has been established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotationBasisStatusDto {
@@ -1277,7 +1282,7 @@ impl QuotationBasisStatusDto {
     }
 }
 
-/// Основание выбора: вид источника, площадка, версии и оба порога.
+/// Selection basis: source type, venue, versions and both thresholds.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PriceProvenanceDto {
     pub price_kind: Option<String>,
@@ -1295,7 +1300,7 @@ pub struct PriceProvenanceDto {
     pub price_max_age: u16,
 }
 
-/// Позиция, оценённая выбранным наблюдением.
+/// Position valued using the selected observation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EvaluatedPositionDto {
     pub account: Uuid,
@@ -1305,7 +1310,7 @@ pub struct EvaluatedPositionDto {
     pub price: SelectedPriceDto,
 }
 
-/// Позиция без выбранной цены и причина отказа.
+/// Position without a selected price and the reason for rejection.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UncoveredPositionDto {
     pub account: Uuid,
@@ -1314,7 +1319,7 @@ pub struct UncoveredPositionDto {
     pub reason: String,
 }
 
-/// Позиция, оставшаяся на старом вычисленном качестве.
+/// Position that retained its previous computed quality.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LegacyDerivedPositionDto {
     pub account: Uuid,
@@ -1323,7 +1328,7 @@ pub struct LegacyDerivedPositionDto {
     pub quality: String,
 }
 
-/// Покрытие ценами без выдуманного процента стоимости.
+/// Price coverage without a fabricated percentage of value.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PositionCoverageDto {
     pub evaluated_positions: u32,
@@ -1333,7 +1338,7 @@ pub struct PositionCoverageDto {
     pub legacy_derived: Vec<LegacyDerivedPositionDto>,
 }
 
-/// Доли исполнимости от стоимости оценённых позиций.
+/// Executability proportions by value of valued positions.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExecutabilitySharesDto {
     pub evaluated_positions_value: String,
@@ -1342,7 +1347,7 @@ pub struct ExecutabilitySharesDto {
     pub unknown: String,
 }
 
-/// Денежная величина с явным квалификатором знания.
+/// Monetary amount with an explicit knowledge qualifier.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AmountQualificationDto {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1350,7 +1355,7 @@ pub struct AmountQualificationDto {
     pub qualification: String,
 }
 
-/// Оценка до издержек выхода и до налога.
+/// Estimate before exit costs and tax.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LiquidationEstimateDto {
     pub value_before_exit_costs_and_tax: ComputedDto,
@@ -1359,7 +1364,7 @@ pub struct LiquidationEstimateDto {
     pub tax: AmountQualificationDto,
     pub accrued_interest_payable_on_termination: ComputedDto,
 }
-/// Атрибуты облигационной позиции (§5.1).
+/// Bond position attributes (§5.1).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BondPositionAttributesDto {
     pub account: Uuid,
@@ -1377,7 +1382,7 @@ pub struct BondPositionAttributesDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_principal_return_finality: Option<String>,
 }
-/// Доли стоимости портфеля по уровням достоверности (§10.5).
+/// Shares of portfolio value by confidence level (§10.5).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NavCoverageDto {
     pub accepted_independent: String,
@@ -1386,7 +1391,7 @@ pub struct NavCoverageDto {
     pub discrepant: String,
 }
 
-/// Блок качества данных (§10.5).
+/// Data quality block (§10.5).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DataQualityDto {
     pub status: String,
@@ -1628,7 +1633,7 @@ fn format_timestamp(value: Option<OffsetDateTime>) -> Option<String> {
     value.map(|value| {
         value
             .format(&time::format_description::well_known::Rfc3339)
-            .expect("временная метка provenance должна форматироваться")
+            .expect("provenance timestamp should be formattable")
     })
 }
 
@@ -1661,39 +1666,39 @@ fn posting_kind(value: iaam_core::rules::PostingKind) -> &'static str {
 fn issue(value: &MaterialIssue) -> String {
     match value {
         MaterialIssue::RestoredWithoutBasis { account } => format!(
-            "счёт {} восстановлен без документированной стоимости",
+            "account {} was reconstructed without a documented value",
             account.inner()
         ),
         MaterialIssue::AmortisationAllocationUnknown {
             account,
             instrument,
         } => format!(
-            "доля разнесения амортизации инструмента {} на счёте {} не выведена: дозагрузите проверенный график выпуска",
+            "the amortisation allocation share for instrument {} in account {} could not be derived: load a verified issue schedule",
             instrument.inner(),
             account.inner()
         ),
         MaterialIssue::NegativeCash { account, currency } => format!(
-            "отрицательный остаток на счёте {} в {}",
+            "negative balance in account {} in {}",
             account.inner(),
             currency.code()
         ),
-        MaterialIssue::HistoryStartsAt { date } => format!("история начинается {date}"),
+        MaterialIssue::HistoryStartsAt { date } => format!("history starts on {date}"),
         MaterialIssue::NoIndependentSource { account, dimension } => format!(
-            "по счёту {} нет независимого подтверждения измерения {}",
+            "account {} has no independent confirmation of the {} measurement",
             account.inner(),
             dimension.code()
         ),
         MaterialIssue::Discrepancy { account, dimension } => format!(
-            "сверка счёта {} по измерению {} не сходится",
+            "account {} reconciliation for measurement {} does not balance",
             account.inner(),
             dimension.code()
         ),
         MaterialIssue::UnsupportedFinancing { account } => format!(
-            "на счёте {} присутствует финансирование вне периметра",
+            "account {} contains funding outside the perimeter",
             account.inner()
         ),
         MaterialIssue::OfferWindowUnresolved { submission } => format!(
-            "заявка оферты {} ссылается на неизвестное окно",
+            "offer request {} refers to an unknown window",
             submission.inner()
         ),
         MaterialIssue::ScheduledPostingNotReceived {
@@ -1702,7 +1707,7 @@ fn issue(value: &MaterialIssue) -> String {
             date,
             kind,
         } => format!(
-            "выплата {} инструмента {} на счёте {} за {} не подтверждена",
+            "payment {} for instrument {} in account {} for {} has not been confirmed",
             posting_kind(*kind),
             instrument.inner(),
             account.inner(),
@@ -1715,7 +1720,7 @@ fn issue(value: &MaterialIssue) -> String {
             kind,
             reason,
         } => format!(
-            "сверку выплаты {} инструмента {} на счёте {} за {} провести нечем: {}",
+            "payment {} for instrument {} in account {} for {} cannot be reconciled: {}",
             posting_kind(*kind),
             instrument.inner(),
             account.inner(),
@@ -1731,7 +1736,7 @@ fn issue(value: &MaterialIssue) -> String {
             first_date,
             last_date,
         } => format!(
-            "сверку {count} выплат вида {} инструмента {} на счёте {} за период с {first_date} по {last_date} провести нечем: {}",
+            "the {count} payments of type {} for instrument {} in account {} from {first_date} to {last_date} cannot be reconciled: {}",
             posting_kind(*kind),
             instrument.inner(),
             account.inner(),
@@ -1746,7 +1751,7 @@ fn issue(value: &MaterialIssue) -> String {
             quantity,
             date,
         } => format!(
-            "НКД инструмента {} расходится: расчёт {} {} против наблюдения {} {} для количества {} на {}",
+            "accrued coupon interest for instrument {} differs: calculated {} {} versus observed {} {} for quantity {} on {}",
             instrument.inner(),
             computed.inner(),
             computed_currency.code(),
@@ -1758,7 +1763,7 @@ fn issue(value: &MaterialIssue) -> String {
     }
 }
 
-/// Отчёт о доходности.
+/// Return report.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReturnsReportDto {
     #[serde(with = "iso_date")]
@@ -1775,21 +1780,21 @@ pub struct ReturnsReportDto {
     pub contributed: ComputedDto,
     pub withdrawn: ComputedDto,
     pub terminal_value: ComputedDto,
-    /// Оценка до гипотетических издержек выхода и до налога.
+    /// Valuation before hypothetical exit costs and before tax.
     pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto,
-    /// Атрибуты облигационных позиций (§5.1).
+    /// Bond position attributes (§5.1).
     pub bond_attributes: Vec<BondPositionAttributesDto>,
-    /// Метрики облигационных позиций по каждому доступному сценарию (§7.1).
+    /// Bond position metrics under each available scenario (§7.1).
     pub bond_metrics: Vec<BondPositionMetricsDto>,
-    /// **Доходность до налога.** Имя поля содержит оговорку намеренно:
-    /// налоги появляются в E5, и до тех пор называть эту величину
-    /// «доходностью» без уточнения нельзя (§16.3).
+    /// **Pre-tax return.** The field name deliberately includes the qualification:
+    /// taxes are introduced in E5, and until then this value cannot be called
+    /// «return» without qualification (§16.3).
     pub xirr_pre_tax: RateDto,
     pub applied_rules: AppliedRulesDto,
     pub data_quality: DataQualityDto,
 }
 
-/// Применённые правила (§3.2, §6.1).
+/// Applied rules (§3.2, §6.1).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppliedRulesDto {
     pub contour: Uuid,
@@ -1798,13 +1803,13 @@ pub struct AppliedRulesDto {
     pub lot_rule: Option<String>,
     pub fx_source: String,
     pub day_count: String,
-    /// Допустимая ширина интервала по ставке — она же определяет
-    /// объявленную погрешность результата.
+    /// Permissible width of the rate interval — it also determines
+    /// the declared error margin of the result.
     pub solver_rate_tolerance: String,
     pub solver_max_iterations: u32,
-    /// Окно расчётов, по которому классифицирован отрицательный
-    /// остаток (§11). Цифра, зависящая от порога, обязана нести порог
-    /// рядом с собой: иначе воспроизвести классификацию невозможно.
+    /// The calculation window used to classify a balance as negative
+    /// (§11). A threshold-dependent number must include that threshold
+    /// alongside it: otherwise the classification cannot be reproduced.
     pub perimeter_settlement_window_days: u16,
 }
 
@@ -1876,7 +1881,7 @@ impl ReturnsReportDto {
     }
 }
 
-/// Счёт.
+/// Account.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccountDto {
     pub id: Uuid,
@@ -1885,7 +1890,7 @@ pub struct AccountDto {
     pub institution: Option<String>,
 }
 
-/// Создание счёта.
+/// Account creation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAccountRequest {
     pub title: String,
@@ -1893,27 +1898,27 @@ pub struct CreateAccountRequest {
     pub institution: Option<String>,
 }
 
-/// Приём брокерского токена.
+/// Broker token submission.
 ///
-/// **`Debug` написан вручную.** Производный напечатал бы токен целиком,
-/// а `{:?}` над непонятым запросом — обычный способ разобраться, почему
-/// он не разобрался. Из лога токен уже не убрать (§14).
+/// **`Debug` is implemented manually.** A derived implementation would print the token in full,
+/// and `{:?}` on a request that failed to parse is a common way to find out why
+/// it failed to parse. Once the token is in the log, it cannot be removed (§14).
 ///
-/// Области прав здесь нет намеренно: она задаётся системой, а не
-/// клиентом (§14). Лишние поля тела молча игнорируются, поэтому
-/// присланная клиентом «область» ни на что не влияет.
+/// There is intentionally no permission scope here: it is set by the system, not
+/// the client (§14). Extra body fields are silently ignored, so
+/// any «scope» sent by the client has no effect.
 #[derive(Deserialize, ToSchema)]
 pub struct AddBrokerAccessRequest {
-    /// Код брокера, например `tinkoff`.
+    /// Broker code, for example `tinkoff`.
     pub broker: String,
-    /// Среда брокера. Поле обязательное и умолчания не имеет: токены
-    /// у сред разные, и молча записанная не та среда оборачивается
-    /// отказом шлюза при первом обращении — по тексту которого о среде
-    /// не догадаться.
+    /// Broker environment. The field is required and has no default: tokens
+    /// differ between environments, and silently recording the wrong environment causes
+    /// the gateway to reject the first request — with no indication in the message
+    /// that the environment is the cause.
     pub environment: BrokerEnvironmentDto,
-    /// Токен брокера. Секрет: принимается, но никогда не возвращается,
-    /// поэтому в схеме помечен как `password` и `writeOnly`.
-    #[schema(format = Password, write_only, example = "<секрет>")]
+    /// Broker token. A secret: accepted but never returned,
+    /// so it is marked as `password` and `writeOnly` in the schema.
+    #[schema(format = Password, write_only, example = "<secret>")]
     pub token: String,
 }
 
@@ -1923,13 +1928,13 @@ impl fmt::Debug for AddBrokerAccessRequest {
             .debug_struct("AddBrokerAccessRequest")
             .field("broker", &self.broker)
             .field("environment", &self.environment)
-            .field("token", &"<скрыт>")
+            .field("token", &"<hidden>")
             .finish()
     }
 }
 
-/// Среда брокера в транспорте. Отдельный тип, потому что
-/// `BrokerEnvironment` порта не знает про OpenAPI и знать не должна.
+/// Broker environment in the transport layer. A separate type because
+/// the port's `BrokerEnvironment` knows nothing about OpenAPI and should not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerEnvironmentDto {
@@ -1947,24 +1952,24 @@ impl BrokerEnvironmentDto {
     }
 }
 
-/// Заведённый доступ к брокеру.
+/// Configured broker access.
 ///
-/// `Debug` производный: секрета в этом типе нет — ни токена, ни
-/// шифротекста сюда не попадает, потому что их нет и в порте.
+/// `Debug` is derived: there is no secret in this type — neither the token nor
+/// the ciphertext reaches it, because neither exists in the port.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BrokerAccessDto {
     pub id: Uuid,
     pub broker: String,
-    /// Среда: `prod` или `sandbox`. Строкой, а не перечислением:
-    /// запись пришла из базы, и незнакомое значение обязано доехать
-    /// до владельца как есть, а не превратиться в отказ на чтении.
+    /// Environment: `prod` or `sandbox`. A string rather than an enum:
+    /// the record came from the database, and an unfamiliar value must reach
+    /// the owner as-is rather than be turned into a read failure.
     pub environment: String,
-    /// Область прав. Всегда `read_only`: торговые права не
-    /// запрашиваются ни при каких условиях (§14).
+    /// Permission scope. Always `read_only`: trading permissions are not
+    /// are not requested under any circumstances (§14).
     pub scope: String,
     pub created_at: String,
-    /// Момент отзыва. `null` — доступ действует. Поле не опускается
-    /// при отсутствии значения: пропавшее поле неотличимо от «не знаем».
+    /// Revocation time. `null` — access is active. The field is not omitted
+    /// when there is no value: an omitted field is indistinguishable from «unknown».
     pub revoked_at: Option<String>,
 }
 
@@ -1982,39 +1987,39 @@ impl BrokerAccessDto {
     }
 }
 
-/// Присвоение экземпляра.
+/// Claiming an instance.
 ///
-/// Код прочитан с консоли при старте сервера — см. `claim`. Метка
-/// описывает, чем именно владелец будет ходить: «ноутбук», «телефон».
+/// The code is read from the console at server start-up — see `claim`. The label
+/// describes what the owner will use for access: «laptop», «phone».
 #[derive(Clone, Deserialize, ToSchema)]
 pub struct ClaimRequest {
-    /// Одноразовый код присвоения. Секрет: принимается, но никогда
-    /// не возвращается, поэтому в схеме помечен как `password`.
-    #[schema(format = Password, write_only, example = "<код с консоли>")]
+    /// One-time claim code. A secret: accepted but never
+    /// returned, so it is marked as `password` in the schema.
+    #[schema(format = Password, write_only, example = "<code from console>")]
     pub code: String,
-    /// Метка выпускаемого токена.
+    /// Label for the token being issued.
     pub label: String,
 }
 
-/// `Debug` вручную: код присвоения — это право завести владельца,
-/// и производный вывод отправил бы его в первый же лог.
+/// Custom `Debug`: the claim code grants the right to create an owner,
+/// and derived output would write it to the very first log.
 impl fmt::Debug for ClaimRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ClaimRequest")
-            .field("code", &"<скрыт>")
+            .field("code", &"<redacted>")
             .field("label", &self.label)
             .finish()
     }
 }
 
-/// Область прав в транспорте. Отдельный тип, потому что `Scope`
-/// приложения не знает про OpenAPI и знать не должен.
+/// Permission scope in the transport layer. A separate type because the application's `Scope`
+/// knows nothing about OpenAPI and should not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenScopeDto {
-    /// Полный доступ владельца. В запросе на выпуск **не принимается**:
-    /// владелец заводится присвоением экземпляра или консолью.
+    /// Full owner access. It is **not accepted** in an issuance request:
+    /// the owner is created by claiming the instance or via the console.
     Owner,
     Agent,
     ReadOnly,
@@ -2031,40 +2036,40 @@ impl TokenScopeDto {
     }
 }
 
-/// Запрос на выпуск токена.
+/// Token issuance request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateTokenRequest {
-    /// Чем этот токен будет ходить: «домашний агент», «телефон».
-    /// Метка — единственное, по чему потом узнают, какой токен отзывать.
+    /// What this token will be used by: «home agent», «phone».
+    /// The label is the only means of later identifying which token to revoke.
     pub label: String,
     pub scope: TokenScopeDto,
 }
 
-/// Только что выпущенный токен.
+/// Newly issued token.
 ///
-/// Один тип и на присвоение экземпляра, и на выпуск токена агенту:
-/// в обоих случаях наружу уходит секрет, показываемый **один раз**,
-/// и второй такой тип означал бы второе место, где о нём можно забыть.
+/// One type for both claiming an instance and issuing a token to an agent:
+/// in both cases, a secret is returned, shown **once**,
+/// and a second such type would be another place where that could be forgotten.
 #[derive(Clone, Serialize, ToSchema)]
 pub struct IssuedTokenDto {
-    /// Идентификатор записи — по нему токен отзывают.
+    /// Record identifier — used to revoke the token.
     pub id: Uuid,
-    /// Сам токен. Показывается **один раз**: в базе остаётся только
-    /// хеш, и повторить показ неоткуда.
-    #[schema(format = Password, example = "<секрет>")]
+    /// The token itself. Shown **once**: only
+    /// its hash remains in the database, so it cannot be displayed again.
+    #[schema(format = Password, example = "<secret>")]
     pub token: String,
     pub label: String,
     pub scope: TokenScopeDto,
 }
 
-/// `Debug` вручную: производный вывел бы токен в первый же лог,
-/// а лог переживает и процесс, и сам токен.
+/// Custom `Debug`: derived output would write the token to the very first log,
+/// and the log outlives both the process and the token itself.
 impl fmt::Debug for IssuedTokenDto {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("IssuedTokenDto")
             .field("id", &self.id)
-            .field("token", &"<скрыт>")
+            .field("token", &"<redacted>")
             .field("label", &self.label)
             .field("scope", &self.scope)
             .finish()
@@ -2083,18 +2088,18 @@ impl IssuedTokenDto {
     }
 }
 
-/// Выданный токен в списке.
+/// Issued token in a list.
 ///
-/// `Debug` производный: секрета в этом типе нет — ни токена, ни хеша
-/// сюда не попадает, потому что их нет и в порте.
+/// Derived `Debug`: this type contains no secret — neither the token nor its hash
+/// gets here, because neither is present in the port.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TokenDto {
     pub id: Uuid,
     pub label: String,
     pub scope: TokenScopeDto,
     pub created_at: String,
-    /// Момент отзыва. `null` — токен действует. Поле не опускается
-    /// при отсутствии значения: пропавшее поле неотличимо от «не знаем».
+    /// Revocation time. `null` — the token is active. The field is not omitted
+    /// when there is no value: an omitted field is indistinguishable from «unknown».
     pub revoked_at: Option<String>,
 }
 
@@ -2111,17 +2116,17 @@ impl TokenDto {
     }
 }
 
-/// Новая версия состава контура.
+/// New version of the perimeter composition.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateContourVersionRequest {
-    /// Идентификатор контура. Отсутствует — заводится новый.
+    /// Perimeter identifier. Absent — a new one is created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contour: Option<Uuid>,
     pub title: String,
     pub accounts: Vec<Uuid>,
 }
 
-/// Ответ о версии контура.
+/// Perimeter version response.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ContourVersionDto {
     pub contour: Uuid,
@@ -2129,7 +2134,7 @@ pub struct ContourVersionDto {
     pub accounts: Vec<Uuid>,
 }
 
-/// Курс валюты на дату, названный владельцем (§6.1).
+/// Exchange rate for a date specified by the owner (§6.1).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FxRateDto {
     pub from: CurrencyDto,
@@ -2140,7 +2145,7 @@ pub struct FxRateDto {
     pub rate: String,
 }
 
-/// Наблюдение цены с полным происхождением.
+/// Price observation with full provenance.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MarketPriceDto {
     pub instrument: Uuid,
@@ -2151,7 +2156,7 @@ pub struct MarketPriceDto {
     pub currency: String,
     #[serde(default)]
     pub quotation_basis: QuotationBasisDto,
-    /// Основание ровно в том виде, в каком его записал источник.
+    /// Basis exactly as recorded by the source.
     pub recorded_quotation_basis: String,
     pub quotation_basis_status: QuotationBasisStatusDto,
     #[serde(default)]
@@ -2167,7 +2172,7 @@ pub struct MarketPriceDto {
     pub complete_through: Option<Date>,
 }
 
-/// Наблюдение курса с полным происхождением.
+/// Exchange-rate observation with full provenance.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MarketFxDto {
     pub from: CurrencyDto,
@@ -2186,7 +2191,7 @@ pub struct MarketFxDto {
     pub complete_through: Option<Date>,
 }
 
-/// Интервал ключевой ставки, выведенный из дневных наблюдений.
+/// Key rate interval derived from daily observations.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MarketKeyRateDto {
     pub value: String,
@@ -2205,7 +2210,7 @@ pub struct MarketKeyRateDto {
     pub complete_through: Option<Date>,
 }
 
-/// Состояние сервиса.
+/// Service status.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthDto {
     pub status: String,
@@ -2226,9 +2231,9 @@ mod tests {
         }
     }
 
-    /// Имя члена в JSON — часть контракта: по нему внешний агент
-    /// выбирает разбор. `match` исчерпывающий, поэтому новый член
-    /// обязан сломать сборку, а не тихо появиться безымянным (§15.1).
+    /// The variant name in JSON is part of the contract: the external agent
+    /// uses it to choose how to parse the value. The `match` is exhaustive, so a new variant
+    /// must break the build rather than silently appear unnamed (§15.1).
     fn corporate_action_tag(action: &CorporateActionDto) -> &'static str {
         match action {
             CorporateActionDto::PartialRedemption { .. } => "partial_redemption",
@@ -2285,14 +2290,16 @@ mod tests {
             },
         ];
         for member in &members {
-            let json = serde_json::to_value(member).expect("член представим в JSON");
+            let json = serde_json::to_value(member).expect("variant is representable in JSON");
             assert_eq!(json["type"], corporate_action_tag(member));
-            // Разбор обратно обязан пройти: имя, которое сериализуется,
-            // но не разбирается, — это контракт только на бумаге.
+            // Parsing it back must succeed: a name that is serialised
+            // but cannot be parsed is only a contract on paper.
             let parsed: CorporateActionDto =
-                serde_json::from_value(json).expect("член разбирается обратно");
+                serde_json::from_value(json).expect("variant can be parsed back");
             assert_eq!(corporate_action_tag(&parsed), corporate_action_tag(member));
-            member.to_domain().expect("член доезжает до домена");
+            member
+                .to_domain()
+                .expect("variant reaches the domain layer");
         }
     }
 
@@ -2320,23 +2327,25 @@ mod tests {
             },
         ];
         for member in &members {
-            let json = serde_json::to_value(member).expect("член представим в JSON");
+            let json = serde_json::to_value(member).expect("variant is representable in JSON");
             assert_eq!(json["type"], offer_tag(member));
             let parsed: OfferExerciseDto =
-                serde_json::from_value(json).expect("член разбирается обратно");
+                serde_json::from_value(json).expect("variant can be parsed back");
             assert_eq!(offer_tag(&parsed), offer_tag(member));
-            member.to_domain().expect("член доезжает до домена");
+            member
+                .to_domain()
+                .expect("variant reaches the domain layer");
         }
     }
 
-    /// Квалификатор исполнимости переводится в строку API, и строка
-    /// эта — контракт: по ней внешний агент решает, можно ли цене
-    /// верить. Пустая строка вместо `indicative_previous_close`
-    /// выглядит как ответ, а не как отказ.
+    /// The executability qualifier is mapped to an API string, and that string
+    /// is part of the contract: the external agent uses it to decide whether the price
+    /// can be trusted. An empty string instead of `indicative_previous_close`
+    /// looks like a response rather than a refusal.
     ///
-    /// Ожидаемое имя задаётся здесь ОТДЕЛЬНЫМ исчерпывающим `match`,
-    /// а не берётся из проверяемой функции: тест, зовущий её же,
-    /// согласится с любым её ответом. Новый член ломает сборку теста.
+    /// The expected name is specified here by a SEPARATE exhaustive `match`,
+    /// rather than taken from the function under test: a test that calls the same function
+    /// will accept any answer it gives. A new variant breaks the test build.
     #[test]
     fn every_executability_names_itself_in_the_api() {
         fn expected(value: SourceExecutability) -> &'static str {
@@ -2355,16 +2364,16 @@ mod tests {
         }
     }
 
-    /// Причина, по которой позиция осталась без цены, — это то, что
-    /// владелец увидит вместо суммы. Подменить её пустой строкой
-    /// значит показать «цены нет» без объяснения, почему.
+    /// The reason a position remains unpriced is what
+    /// its owner will see instead of an amount. Replacing it with an empty string
+    /// means showing «no price» without explaining why.
     ///
-    /// Ожидаемое имя задаётся отдельным исчерпывающим `match`
-    /// со строковыми литералами, а не через проверяемую функцию
-    /// или метод домена. Поэтому тест ловит неверный код и обязан
-    /// сломать сборку при добавлении нового варианта причины.
-    /// Дополнительные проверки требуют непустых и различных кодов:
-    /// одинаковый код скрывает конкретную причину непокрытия.
+    /// The expected name is specified by a separate exhaustive `match`
+    /// using string literals, rather than through the function under test
+    /// or a domain method. The test therefore catches an incorrect code and must
+    /// break the build when a new reason variant is added.
+    /// Additional checks require codes to be non-empty and distinct:
+    /// using the same code conceals the specific reason for the lack of coverage.
     #[test]
     fn every_uncovered_reason_names_itself_in_the_api() {
         use iaam_core::returns::{NotComputable, UncoveredReason};
@@ -2489,7 +2498,7 @@ mod tests {
         let codes: Vec<_> = values.iter().map(uncovered_reason).collect();
         assert!(
             codes.iter().all(|code| !code.is_empty()),
-            "код причины не должен быть пустым"
+            "reason code must not be empty"
         );
         let duplicate = codes
             .iter()
@@ -2499,17 +2508,17 @@ mod tests {
         assert_eq!(
             unique_codes.len(),
             codes.len(),
-            "код причины повторяется: {}",
-            duplicate.unwrap_or("<неизвестен>")
+            "duplicate reason code: {}",
+            duplicate.unwrap_or("<unknown>")
         );
     }
 
-    /// Время наблюдения уходит в отчёт строкой, а неизвестное время
-    /// отсутствует в ответе вместо подстановки пустой строки.
+    /// The observation time is included in the report as a string, while an unknown time
+    /// is omitted from the response rather than replaced with an empty string.
     #[test]
     fn a_timestamp_travels_as_rfc_3339_in_utc() {
         let value =
-            OffsetDateTime::from_unix_timestamp(1_787_000_000).expect("метка времени представима");
+            OffsetDateTime::from_unix_timestamp(1_787_000_000).expect("timestamp is representable");
         assert_eq!(
             format_timestamp(Some(value)),
             Some("2026-08-17T20:53:20Z".to_owned())
@@ -2517,9 +2526,9 @@ mod tests {
         assert_eq!(format_timestamp(None), None);
     }
 
-    /// Сумма без валюты не бывает: если бы валюта была необязательной,
-    /// пропущенное поле пришлось бы чем-то заменять — и заменялось бы
-    /// оно рублём, потому что так удобнее.
+    /// An amount cannot exist without a currency: if the currency were optional,
+    /// a missing field would have to be replaced with something — and it would be
+    /// replaced with the rouble, because that is more convenient.
     #[test]
     fn an_amount_without_a_currency_is_not_representable() {
         let raw = serde_json::json!({ "amount": "100.00" });
@@ -2543,8 +2552,8 @@ mod tests {
 
     #[test]
     fn the_api_does_not_drop_the_income_kind() {
-        // Журнал вид уже хранит: потерять его в транспорте значит
-        // оставить внешнего агента без того, что система знает.
+        // The journal already stores the kind: losing it in transport means
+        // withholding from the external agent information the system has.
         assert!(matches!(
             income_operation(Some(IncomeKindDto::Coupon))
                 .to_domain()
@@ -2569,7 +2578,7 @@ mod tests {
 
     #[test]
     fn an_income_without_a_kind_stays_without_one() {
-        // Отсутствие поля означает «не утверждалось», а не «дивиденд».
+        // The absence of the field means «not asserted», not «dividend».
         assert!(matches!(
             income_operation(None).to_domain().unwrap().kind,
             OperationKind::Income { kind: None, .. }
@@ -2593,13 +2602,16 @@ mod tests {
 
     #[test]
     fn every_verdict_reaches_the_wire_with_the_field_that_explains_it() {
-        // Вердикт — это ответ внешнему агенту. Потерянное поле оставляет
-        // его с кодом «rejected» и без указания, что именно чинить:
-        // такой ответ хуже отсутствующего, потому что выглядит полным.
+        // The verdict is the response to the external agent. A missing field leaves
+        // it with the code «rejected» and no indication of exactly what to fix:
+        // such a response is worse than no response, because it looks complete.
         let event = EventId::new_random();
         let provisional = VerdictDto::from_domain(1, &Verdict::Provisional { event });
         assert_eq!(provisional.verdict, "provisional");
-        assert_eq!(provisional.row, 1, "номер строки идёт в ответ как есть");
+        assert_eq!(
+            provisional.row, 1,
+            "line number is included in the response unchanged"
+        );
         assert_eq!(provisional.event_id, Some(event.inner()));
 
         let duplicate = VerdictDto::from_domain(2, &Verdict::Duplicate { existing: event });
@@ -2608,20 +2620,23 @@ mod tests {
         let needs = VerdictDto::from_domain(
             3,
             &Verdict::NeedsClassification {
-                question: "что это за операция?".into(),
+                question: "what kind of transaction is this?".into(),
             },
         );
-        assert_eq!(needs.detail.as_deref(), Some("что это за операция?"));
+        assert_eq!(
+            needs.detail.as_deref(),
+            Some("what kind of transaction is this?")
+        );
 
         let unsupported = VerdictDto::from_domain(
             4,
             &Verdict::Unsupported {
-                reason: "производные вне периметра".into(),
+                reason: "derivatives outside the perimeter".into(),
             },
         );
         assert_eq!(
             unsupported.detail.as_deref(),
-            Some("производные вне периметра")
+            Some("derivatives outside the perimeter")
         );
 
         let rejected = VerdictDto::from_domain(
@@ -2629,7 +2644,7 @@ mod tests {
             &Verdict::Rejected {
                 rejection: Rejection {
                     field: "amount".into(),
-                    expected: "положительная величина".into(),
+                    expected: "positive value".into(),
                     actual: "-1".into(),
                 },
             },
@@ -2637,17 +2652,17 @@ mod tests {
         assert_eq!(rejected.field.as_deref(), Some("amount"));
         assert_eq!(
             rejected.expected.as_deref(),
-            Some("положительная величина"),
-            "без ожидаемого значения отказ не объясняет, что чинить"
+            Some("positive value"),
+            "without an expected value, the refusal does not explain what to fix"
         );
         assert_eq!(rejected.actual.as_deref(), Some("-1"));
     }
 
     #[test]
     fn the_debug_of_a_broker_request_never_carries_the_token() {
-        // `{:?}` над непонятым запросом — обычный способ разобраться,
-        // почему он не разобрался, и производный `Debug` отправил бы
-        // туда сам токен. Из лога его уже не убрать (§14).
+        // Using `{:?}` on a request that failed to parse is a common way to investigate,
+        // why it failed, and a derived `Debug` would send
+        // the token itself there. It cannot then be removed from the log (§14).
         const TOKEN: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
         let request = AddBrokerAccessRequest {
             broker: "tinkoff".into(),
@@ -2658,39 +2673,39 @@ mod tests {
         let printed = format!("{request:?}");
         assert!(
             !printed.contains(TOKEN),
-            "токен утёк в отладочный вывод: {printed}"
+            "token leaked into debug output: {printed}"
         );
         assert!(
             printed.contains("tinkoff"),
-            "код брокера секретом не является и обязан оставаться видимым: {printed}"
+            "the broker code is not secret and must remain visible: {printed}"
         );
         assert!(
             printed.contains("Sandbox"),
-            "среда секретом не является и обязана оставаться видимой: {printed}"
+            "the environment is not secret and must remain visible: {printed}"
         );
     }
 
     #[test]
     fn an_issued_token_never_reaches_the_debug_output() {
-        // Ответ с токеном показывается один раз — и ровно один раз он
-        // существует открытым. Производный `Debug` отправил бы его
-        // в первый же лог, а лог переживает и процесс, и сам токен.
+        // The response containing the token is shown once — and that is the only time it
+        // exists in the clear. A derived `Debug` would send it
+        // to the very first log, and the log outlives both the process and the token itself.
         const ISSUED: &str = "0123456789abcdef0123456789abcdef";
         let response = IssuedTokenDto {
             id: Uuid::new_v4(),
             token: ISSUED.into(),
-            label: "домашний агент".into(),
+            label: "home agent".into(),
             scope: TokenScopeDto::Agent,
         };
 
         let printed = format!("{response:?}");
         assert!(
             !printed.contains(ISSUED),
-            "токен утёк в отладочный вывод: {printed}"
+            "token leaked into debug output: {printed}"
         );
         assert!(
-            printed.contains("домашний агент"),
-            "метка секретом не является и обязана оставаться видимой: {printed}"
+            printed.contains("home agent"),
+            "the label is not secret and must remain visible: {printed}"
         );
     }
 
@@ -2708,7 +2723,7 @@ mod tests {
         assert!(
             dto.detail
                 .as_deref()
-                .is_some_and(|detail| detail.contains("наблюдения НКД"))
+                .is_some_and(|detail| detail.contains("accrued interest observation"))
         );
     }
     #[test]
@@ -2725,7 +2740,7 @@ mod tests {
         assert!(
             dto.detail
                 .as_deref()
-                .is_some_and(|detail| detail.contains("несколькими периодами"))
+                .is_some_and(|detail| detail.contains("multiple schedule periods"))
         );
     }
     #[test]
@@ -2747,8 +2762,8 @@ mod tests {
 
     #[test]
     fn grouped_unverifiable_postings_name_count_and_date_range() {
-        // Количество и границы периода заменяют повторяющиеся адресные
-        // строки: владелец понимает масштаб проблемы и знает, что догружать.
+        // The count and period boundaries replace repetitive itemised lines:
+        // the owner understands the scale of the problem and knows what to backfill.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let text = issue(&MaterialIssue::ScheduledPostingsUnverifiable {
@@ -2764,7 +2779,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "сверку 5 выплат вида coupon инструмента {} на счёте {} за период с 2026-01-15 по 2026-05-15 провести нечем: payment_date_unknown",
+                "the 5 payments of type coupon for instrument {} in account {} from 2026-01-15 to 2026-05-15 cannot be reconciled: payment_date_unknown",
                 instrument.inner(),
                 account.inner()
             )
@@ -2780,16 +2795,16 @@ mod tests {
             time::macros::date!(2027 - 01 - 01),
         );
         let Computed::Value(metrics) = computed else {
-            panic!("простые метрики должны вычисляться");
+            panic!("simple metrics should be computable");
         };
         let json = serde_json::to_value(ZeroReinvestmentMetricsDto::from_domain(&metrics))
-            .expect("метрики представимы в JSON");
+            .expect("metrics should be representable as JSON");
         let note = json["zero_reinvestment_note"]
             .as_str()
-            .expect("допущение должно быть строкой в теле");
+            .expect("the assumption should be a string in the body");
         assert!(!note.is_empty());
-        assert!(note.contains("купоны"));
-        assert!(note.contains("реинвестировать"));
+        assert!(note.contains("Coupons"));
+        assert!(note.contains("reinvested"));
     }
 
     #[test]
@@ -2819,26 +2834,26 @@ mod tests {
 
     #[test]
     fn a_claim_code_never_reaches_the_debug_output() {
-        // Код присвоения — это право завести владельца в пустой базе.
+        // The assignment code grants the right to create an owner in an empty database.
         const CODE: &str = "0123456789abcdef0123456789abcdef";
         let request = ClaimRequest {
             code: CODE.into(),
-            label: "ноутбук".into(),
+            label: "laptop".into(),
         };
 
         let printed = format!("{request:?}");
         assert!(
             !printed.contains(CODE),
-            "код присвоения утёк в отладочный вывод: {printed}"
+            "assignment code leaked into debug output: {printed}"
         );
-        assert!(printed.contains("ноутбук"), "{printed}");
+        assert!(printed.contains("laptop"), "{printed}");
     }
 
     #[test]
     fn a_refusal_to_compute_says_what_exactly_was_missing() {
-        // `not_computable` даёт код, `detail` — конкретику: какой
-        // инструмент, какая пара валют, какая дата. Пустое пояснение
-        // превращает «не посчитали» в «неизвестно почему».
+        // `not_computable` provides the code, `detail` provides the specifics: which
+        // instrument, which currency pair, which date. An empty explanation
+        // turns «not computed» into «reason unknown».
         let instrument = InstrumentId::new_random();
         let missing_price = ComputedDto::from_dec(&Computed::NotComputable {
             reason: NotComputable::MissingPrice { instrument },
@@ -2848,10 +2863,10 @@ mod tests {
             missing_price.not_computable.as_deref(),
             Some("missing_price")
         );
-        let detail = missing_price.detail.expect("пояснение");
+        let detail = missing_price.detail.expect("explanation");
         assert!(
             detail.contains(&instrument.inner().to_string()),
-            "пояснение обязано называть инструмент: {detail}"
+            "the explanation must identify the instrument: {detail}"
         );
 
         let no_flows = ComputedDto::from_dec(&Computed::NotComputable {
@@ -2859,7 +2874,7 @@ mod tests {
         });
         assert_eq!(
             no_flows.detail.as_deref(),
-            Some("нет потоков, пересекающих границу контура")
+            Some("no flows crossing the perimeter boundary")
         );
 
         let refused = ComputedDto::from_dec(&Computed::NotComputable {
@@ -2867,11 +2882,11 @@ mod tests {
                 refusal: SolverRefusal::NoSignChange,
             },
         });
-        let detail = refused.detail.expect("пояснение");
+        let detail = refused.detail.expect("explanation");
         assert!(!detail.is_empty());
         assert_ne!(
-            detail, "нет потоков, пересекающих границу контура",
-            "разные причины обязаны объясняться по-разному"
+            detail, "no flows crossing the perimeter boundary",
+            "different reasons must be explained differently"
         );
     }
 
@@ -2900,14 +2915,14 @@ mod tests {
             Some("iss:engines/stock/markets/bonds")
         );
     }
-    /// Отображение доменного статуса в DTO — место, где `Proven`
-    /// и `Contradicts` можно переставить местами, не сломав ни сборку,
-    /// ни один существующий тест: наружу оба уходят строкой, и до сих
-    /// пор через `from_domain` проходил только `NotProven`. Перепутанная
-    /// пара назвала бы противоречивую запись доказанной — то есть ровно
-    /// то, что витрина обязана различать.
+    /// Mapping a domain status to the DTO is where `Proven`
+    /// and `Contradicts` can be swapped without breaking either the build,
+    /// or any existing test: both are exposed as strings, and so far
+    /// only `NotProven` has passed through `from_domain`. A swapped
+    /// a pair would deem a contradictory record proven — exactly
+    /// what the view must distinguish.
     #[test]
-    fn отображение_доменного_статуса_в_dto_не_путает_ветви() {
+    fn domain_status_to_dto_does_not_confuse_branches() {
         use iaam_app::scenarios::market_reference::QuotationBasisStatus;
 
         assert_eq!(
@@ -2925,7 +2940,7 @@ mod tests {
     }
 
     #[test]
-    fn каждый_статус_основания_называет_себя_в_api() {
+    fn each_basis_status_names_itself_in_api() {
         use std::collections::HashSet;
 
         let values = [
@@ -2938,9 +2953,9 @@ mod tests {
             .iter()
             .map(|value| {
                 serde_json::to_value(value)
-                    .expect("статус представим в JSON")
+                    .expect("status can be represented as JSON")
                     .as_str()
-                    .expect("код статуса — строка")
+                    .expect("status code is a string")
                     .to_owned()
             })
             .collect();
@@ -2956,21 +2971,19 @@ mod tests {
         assert_eq!(
             unique_codes.len(),
             codes.len(),
-            "код статуса повторяется: {}",
-            duplicate
-                .map(|code| code.as_str())
-                .unwrap_or("<неизвестен>")
+            "duplicate status code: {}",
+            duplicate.map(|code| code.as_str()).unwrap_or("<unknown>")
         );
     }
 }
-/// Параметры загрузки отчёта. Тело маршрута — двоичные байты книги.
+/// Report upload parameters. The route body is the workbook's binary bytes.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct DocumentParams {
     #[serde(default)]
     pub account: Option<Uuid>,
 }
 
-/// Ответ загрузки отчёта.
+/// Report upload response.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DocumentDto {
     pub document_hash: String,
@@ -2987,7 +3000,7 @@ pub struct DocumentDto {
     pub rows: Vec<VerdictDto>,
 }
 
-/// Параметры диапазона сверки.
+/// Reconciliation range parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct ReconciliationParams {
     pub account: Uuid,
@@ -2995,14 +3008,14 @@ pub struct ReconciliationParams {
     pub to: String,
 }
 
-/// Статус одного измерения.
+/// Status of one measurement.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DimensionStatusDto {
     pub dimension: String,
     pub status: String,
 }
 
-/// Основание повышения статуса.
+/// Reason for raising the status.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EvidenceDto {
     pub ground: String,
@@ -3012,14 +3025,14 @@ pub struct EvidenceDto {
     pub confirmed_parser: String,
 }
 
-/// Исход одного контрольного утверждения.
+/// Outcome of one control assertion.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimOutcomeDto {
     pub claim: String,
     pub outcome: String,
 }
 
-/// Статус сверки счёта за интервал.
+/// Account reconciliation status for an interval.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ReconciliationStatusDto {
     pub account: Uuid,
@@ -3034,14 +3047,14 @@ pub struct ReconciliationStatusDto {
     pub outcomes: Vec<ClaimOutcomeDto>,
 }
 
-/// Денежный остаток, названный владельцем.
+/// Cash balance stated by the owner.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct OwnerCashDto {
     pub currency: CurrencyDto,
     pub amount: String,
 }
 
-/// Позиция, названная владельцем.
+/// Position stated by the owner.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct OwnerPositionDto {
     pub instrument: Uuid,
@@ -3049,7 +3062,7 @@ pub struct OwnerPositionDto {
     pub quantity: String,
 }
 
-/// Ответ владельца на запрос контрольного остатка.
+/// Owner's response to a control balance request.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct OwnerBalanceRequest {
     pub account: Uuid,
@@ -3068,7 +3081,7 @@ pub struct OwnerBalanceRequest {
     pub source_hash: Option<String>,
 }
 
-/// Правило классификации.
+/// Classification rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClassificationRuleDto {
     pub id: Uuid,
@@ -3095,7 +3108,7 @@ impl ClassificationRuleDto {
     }
 }
 
-/// Запрос создания или изменения правила.
+/// Request to create or update a rule.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ClassificationRuleRequest {
     pub matcher: String,
@@ -3104,7 +3117,7 @@ pub struct ClassificationRuleRequest {
     pub replaces: Option<Uuid>,
 }
 
-/// Идентификатор правила в DELETE.
+/// Rule identifier in DELETE.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct ClassificationRuleParams {
     pub id: Uuid,
@@ -3121,7 +3134,7 @@ pub struct BrokerSyncRequest {
     pub to: Date,
 }
 
-/// Результат синхронизации брокерского канала.
+/// Broker channel synchronisation result.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SyncOutcomeDto {
     pub recorded: Vec<VerdictDto>,
@@ -3144,23 +3157,23 @@ impl SyncOutcomeDto {
         }
     }
 }
-/// Замена секрета доступа: секрет никогда не является частью ответа.
+/// Access secret replacement: the secret is never part of the response.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct BrokerAccessUpdateRequest {
     pub environment: BrokerEnvironmentDto,
     pub token: String,
 }
 
-/// Инструмент справочника.
+/// Instrument catalogue entry.
 ///
-/// Поля `source` псевдонима здесь нет намеренно: справочник глобален
-/// и читается всеми, а `SourceId` указывает на документ конкретного
-/// владельца (§14).
+/// The alias's `source` field is deliberately absent here: the catalogue is global
+/// and readable by everyone, while `SourceId` points to a particular owner's
+/// document (§14).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct InstrumentDto {
     pub id: String,
-    /// `null` — род не установлен; такой инструмент оценивается
-    /// как неполный (§4.9, §5.4).
+    /// `null` — no kind is set; such an instrument is assessed
+    /// as incomplete (§4.9, §5.4).
     pub kind: Option<String>,
     pub symbol: String,
     pub title: String,
@@ -3169,11 +3182,11 @@ pub struct InstrumentDto {
     pub quote_currency: String,
 }
 
-/// Данные для записи инструмента администратором или синхронизацией.
+/// Data for recording an instrument by an administrator or synchronisation.
 ///
-/// Идентификатор можно не передавать: тогда его назначает сервер. Поля
-/// валюты обязательны, потому что отсутствие валюты нельзя отличить от
-/// неизвестного значения в сохранённом справочнике.
+/// The identifier may be omitted: the server then assigns it. The currency
+/// fields are required because a missing currency cannot be distinguished from
+/// an unknown value in the stored catalogue.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateInstrumentRequest {
     #[serde(default)]
@@ -3190,8 +3203,8 @@ pub struct CreateInstrumentRequest {
 pub struct ResolveInstrumentRequest {
     pub namespace: String,
     pub value: String,
-    /// Дата документа. Обязательна: ISIN меняется, и «текущего»
-    /// ответа не существует (§4.7).
+    /// Document date. Required: ISIN changes, and there is no «current»
+    /// answer (§4.7).
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub on: Date,
@@ -3201,7 +3214,7 @@ pub struct ResolveInstrumentRequest {
 pub struct ResolvedInstrumentDto {
     pub instrument: String,
 }
-/// Параметры ручной синхронизации рынка.
+/// Manual market synchronisation parameters.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum MarketSourceDto {
@@ -3228,25 +3241,25 @@ pub struct MarketSyncRequest {
 }
 
 // ---------------------------------------------------------------------
-// Журнальные факты: корпоративные действия и оферта (§4.7, §3.5).
+// Journal facts: corporate actions and offers (§4.7, §3.5).
 //
-// Отдельный вход, а не новые члены `OperationKindDto`. Причина
-// механическая: у корпоративного действия дата фиксации реестра — часть
-// факта, а операционная модель дат её выразить не умеет вовсе
-// (`OperationDates` жёстко проставляет `entitlement: None`).
+// A separate input, rather than new members of `OperationKindDto`. The reason
+// is mechanical: a corporate action's record date is part of the
+// fact, while the operation date model cannot express it at all
+// (`OperationDates` hard-codes `entitlement: None`).
 //
-// Приёма произвольного `EventKind` здесь нет: вход принимает ровно те
-// семьи, которые перечислены ниже.
+// No arbitrary `EventKind` is accepted here: the input accepts exactly the
+// families listed below.
 // ---------------------------------------------------------------------
 
-/// Сумма с валютой в транспорте.
+/// Amount with currency in the transport layer.
 ///
-/// Вложенным объектом, а не парой полей рядом: у замещения компенсация
-/// необязательна, и плоская пара потребовала бы необязательной валюты —
-/// то есть состояния «валюта без суммы», которого не бывает.
+/// A nested object rather than a pair of adjacent fields: compensation for a replacement
+/// is optional, and a flat pair would require an optional currency —
+/// that is, a «currency without an amount» state, which cannot occur.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AmountDto {
-    /// Десятичное число строкой: двоичная плавающая точка теряет копейки.
+    /// Decimal number as a string: binary floating-point loses pennies.
     #[schema(example = "1000.00")]
     pub amount: String,
     pub currency: CurrencyDto,
@@ -3260,8 +3273,8 @@ impl AmountDto {
         ))
     }
 
-    /// Величина на одну бумагу: не деньги счёта, а номинал, поэтому
-    /// минорными единицами не меряется и округлению не подлежит.
+    /// Value per security: this is not account money but face value, so it
+    /// is not measured in minor units and must not be rounded.
     fn to_per_unit(&self, field: &str) -> Result<PerUnitAmount, Rejection> {
         Ok(PerUnitAmount::new(
             Dec::new(decimal(&self.amount, field)?),
@@ -3270,7 +3283,7 @@ impl AmountDto {
     }
 }
 
-/// Что сделали с дробной частью при замещении.
+/// How the fractional part was handled during replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FractionalTreatmentDto {
@@ -3290,7 +3303,7 @@ impl FractionalTreatmentDto {
     }
 }
 
-/// Правило переноса налоговой стоимости при замещении.
+/// Rule for carrying over tax cost during replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BasisTransferRuleDto {
@@ -3308,13 +3321,13 @@ impl BasisTransferRuleDto {
     }
 }
 
-/// Корпоративное действие в транспорте. Величины **положительные**:
-/// знак выбытия ставит приёмка, а не клиент.
+/// Corporate action in the transport layer. Amounts are **positive**:
+/// the ingestion layer applies the disposal sign, not the client.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CorporateActionDto {
-    /// Амортизация: номинал уменьшается, деньги приходят, количество
-    /// бумаг не меняется.
+    /// Amortisation: face value decreases, cash is received, and the number
+    /// of securities does not change.
     PartialRedemption {
         instrument: Uuid,
         custody: Uuid,
@@ -3334,8 +3347,8 @@ pub enum CorporateActionDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grounds: Option<String>,
     },
-    /// Окончательное погашение: номинал возвращён целиком, бумага
-    /// выбывает.
+    /// Final redemption: face value is repaid in full and the security
+    /// is disposed of.
     Redemption {
         instrument: Uuid,
         custody: Uuid,
@@ -3355,13 +3368,13 @@ pub enum CorporateActionDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grounds: Option<String>,
     },
-    /// Замещение: бумага предшественника меняется на бумагу преемника.
+    /// Replacement: a predecessor security is exchanged for a successor security.
     Conversion {
         predecessor: Uuid,
         successor: Uuid,
         custody: Uuid,
-        /// Сколько бумаг преемника приходится на одну бумагу
-        /// предшественника.
+        /// How many successor securities correspond to one
+        /// predecessor security.
         ratio: String,
         quantity_in: String,
         quantity_out: String,
@@ -3462,23 +3475,23 @@ impl CorporateActionDto {
     }
 }
 
-/// Факт оферты в транспорте.
+/// Offer fact in the transport layer.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OfferExerciseDto {
-    /// Поданная заявка: ни денег, ни бумаг она не двигает.
+    /// Submitted application: it moves neither cash nor securities.
     Submitted {
         submission: Uuid,
-        /// Идентификатор окна выводится из `(instrument, execution_date)`.
-        /// Произвольный UUID приведёт к неразрешённой заявке; старые факты
-        /// не валидируются повторно, поскольку журнал append-only.
+        /// The window identifier is derived from `(instrument, execution_date)`.
+        /// An arbitrary UUID will result in an unresolved application; old facts
+        /// are not revalidated because the journal is append-only.
         window: Uuid,
         instrument: Uuid,
         quantity: String,
     },
-    /// Отзыв заявки целиком или частично.
+    /// Withdrawal of an application in full or in part.
     Cancelled { submission: Uuid, quantity: String },
-    /// Совершённый выкуп: бумага выбывает за деньги.
+    /// Completed buyback: the security is disposed of for cash.
     Settled {
         submission: Uuid,
         instrument: Uuid,
@@ -3540,19 +3553,19 @@ impl OfferExerciseDto {
     }
 }
 
-/// Журнальный факт: корпоративное действие или оферта.
+/// Journal fact: a corporate action or an offer.
 ///
-/// Две семьи под одной крышей — это общий канал приёмки, а не общая
-/// природа: корпоративное действие решает эмитент, оферту предъявляет
-/// владелец (`iaam-core/src/event/offer.rs`).
+/// Two families under one roof — a shared ingestion channel, not a shared
+/// nature: a corporate action is decided by the issuer, while an offer is submitted by
+/// the owner (`iaam-core/src/event/offer.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JournalFactDto {
-    /// Даты внутри самого факта: дата вступления в силу — часть его
-    /// идентичности, а не свойство подачи.
+    /// Dates within the fact itself: the effective date is part of its
+    /// identity, not a property of submission.
     CorporateAction { action: CorporateActionDto },
-    /// У оферты собственной даты нет, поэтому день присылает клиент:
-    /// выдумать его приёмке нечем.
+    /// An offer has no date of its own, so the client supplies the day:
+    /// the ingestion layer has no basis for inventing it.
     OfferExercise {
         action: OfferExerciseDto,
         #[serde(with = "iso_date")]
@@ -3561,13 +3574,13 @@ pub enum JournalFactDto {
     },
 }
 
-/// Один журнальный факт в пачке.
+/// One journal fact in a batch.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JournalEventDto {
     pub account: Uuid,
-    /// Плоско, как у операции: клиент одного API не должен помнить,
-    /// что у одного входа вид факта лежит в корне, а у соседнего —
-    /// во вложенном объекте.
+    /// Flat, as with an operation: the client of a single API should not have to remember,
+    /// that one input has the fact kind at the root, while the neighbouring one has it —
+    /// inside a nested object.
     #[serde(flatten)]
     pub fact: JournalFactDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3577,9 +3590,9 @@ pub struct JournalEventDto {
 }
 
 impl JournalEventDto {
-    /// Единственное место, где транспорт журнального факта встречается
-    /// с доменом. Отказ возвращается с полем, ожидаемым и полученным —
-    /// это тело ответа `422` (§13).
+    /// The only place where the journal fact transport meets
+    /// the domain. A rejection is returned with the field, expected value, and received value —
+    /// this is the `422` response body (§13).
     pub fn to_domain(&self) -> Result<SubmittedJournalEvent, Rejection> {
         let fact = match &self.fact {
             JournalFactDto::CorporateAction { action } => {
@@ -3599,10 +3612,10 @@ impl JournalEventDto {
     }
 }
 
-/// Запрос приёмки журнальных фактов.
+/// Request to ingest journal facts.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitJournalEventsRequest {
-    /// Метка источника: ручной ввод, конкретный агент, конкретный файл.
+    /// Source label: manual entry, a specific agent, a specific file.
     pub source_label: String,
     pub events: Vec<JournalEventDto>,
 }

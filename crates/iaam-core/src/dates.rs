@@ -1,16 +1,16 @@
-//! Шесть семантических дат (§4.2).
+//! Six semantic dates (§4.2).
 //!
-//! Одной даты недостаточно: сделка 30 декабря с расчётами 3 января
-//! попадает в другой налоговый год; дивиденд имеет дату отсечки и дату
-//! выплаты; налог имеет дату удержания и период, к которому относится.
+//! One date is not enough: a trade on 30 December settling on 3 January
+//! falls in a different tax year; a dividend has an entitlement date and a
+//! payment date; a tax has a withholding date and the period it belongs to.
 
 use serde::{Deserialize, Serialize};
 use time::Date;
 
-/// Макрос объявления типизированной даты.
+/// Macro for declaring a typed date.
 ///
-/// Каждая дата — отдельный тип, поэтому передать одну вместо другой
-/// невозможно. Это первый слой проверки (§15.1).
+/// Each date is a separate type, so one cannot be passed in place of another.
+/// This is the first layer of validation (§15.1).
 macro_rules! typed_date {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -27,32 +27,32 @@ macro_rules! typed_date {
 }
 
 typed_date!(
-    /// Дата заключения сделки.
+    /// Date on which the trade was concluded.
     TradeDate
 );
 typed_date!(
-    /// Дата расчётов и перехода прав.
+    /// Settlement date and date on which rights transfer.
     SettledDate
 );
 typed_date!(
-    /// Дата движения денег по счёту.
+    /// Date when money moves on the account.
     CashPostedDate
 );
 typed_date!(
-    /// Дата, определяющая право на выплату (отсечка).
+    /// Date determining entitlement to a payment (the record date).
     EntitlementDate
 );
 typed_date!(
-    /// Дата фактической выплаты.
+    /// Date of the actual payment.
     PaidDate
 );
 
-/// Налоговый период — календарный год, к которому относится событие.
+/// Tax period—the calendar year to which the event belongs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaxPeriod(pub i32);
 
-/// Набор дат события. Заполнены не все — это нормально (§4.9),
-/// но схема обязана их допускать без переинтерпретации.
+/// Set of event dates. Not all are populated—that is normal (§4.9),
+/// but the schema must allow that without reinterpretation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventDates {
     pub trade: Option<TradeDate>,
@@ -60,8 +60,8 @@ pub struct EventDates {
     pub cash_posted: Option<CashPostedDate>,
     pub entitlement: Option<EntitlementDate>,
     pub paid: Option<PaidDate>,
-    /// Явно заданный налоговый период. Если `None` — выводится
-    /// правилом [`EventDates::tax_period`].
+    /// Explicitly supplied tax period. If `None`, it is derived by
+    /// [`EventDates::tax_period`].
     pub tax_period_override: Option<TaxPeriod>,
 }
 
@@ -95,10 +95,10 @@ impl EventDates {
         }
     }
 
-    /// Дата, по которой событие попадает в отчётный период.
+    /// Date by which the event enters the reporting period.
     ///
-    /// Приоритет: расчёты → движение денег → выплата → сделка.
-    /// Расчёты важнее сделки, потому что права переходят при расчётах.
+    /// Priority: settlement → cash movement → payment → trade.
+    /// Settlement takes precedence over trade because rights transfer at settlement.
     #[must_use]
     pub fn effective_date(&self) -> Option<Date> {
         self.settled
@@ -108,10 +108,10 @@ impl EventDates {
             .or_else(|| self.trade.map(|d| d.0))
     }
 
-    /// Налоговый период события.
+    /// Event tax period.
     ///
-    /// Сделка 30 декабря с расчётами 3 января относится к следующему году —
-    /// именно поэтому одной даты недостаточно.
+    /// A trade on 30 December settling on 3 January belongs to the next year—
+    /// this is why one date is not enough.
     #[must_use]
     pub fn tax_period(&self) -> Option<TaxPeriod> {
         self.tax_period_override
@@ -119,11 +119,11 @@ impl EventDates {
     }
 }
 
-/// Детерминированный порядок событий.
+/// Deterministic event order.
 ///
-/// При одинаковой дате порядок задаёт `sequence`, а не порядок импорта —
-/// иначе проекция зависела бы от того, в каком порядке загрузили файлы,
-/// и инвариант детерминизма (§15.3) не выполнялся бы.
+/// When dates are equal, `sequence`, not import order, determines the order—
+/// otherwise the projection would depend on the order in which files were
+/// loaded and the determinism invariant (§15.3) would fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EffectiveOrder {
     date: Date,
@@ -131,10 +131,10 @@ pub struct EffectiveOrder {
 }
 
 impl EffectiveOrder {
-    /// Тривиальная упаковка полей: логики, которую стоило бы вынести
-    /// в отдельную функцию ради мутационного заслона, здесь нет
-    /// (ср. [`crate::money::PostedMinor::new`]). Смысл типа задаёт не эта
-    /// функция, а порядок объявления полей, который и проверяется тестами.
+    /// Trivial field packing: there is no logic here worth extracting into a
+    /// separate function for the mutation guard (see
+    /// [`crate::money::PostedMinor::new`]). The type's meaning comes from the
+    /// field declaration order, which the tests check.
     #[must_use]
     pub const fn new(date: Date, sequence: u32) -> Self {
         Self { date, sequence }
@@ -180,8 +180,9 @@ mod tests {
 
     #[test]
     fn payout_date_defines_the_period_not_the_record_date() {
-        // Отсечка 29.12 даёт право на выплату, но период определяет
-        // фактическая выплата 12.01 — это разные годы (§4.2).
+        // An entitlement date of 29 December grants the right to payment, but
+        // the actual payment on 12 January determines the period; these are
+        // different years (§4.2).
         let dates = EventDates {
             entitlement: Some(EntitlementDate(date!(2025 - 12 - 29))),
             paid: Some(PaidDate(date!(2026 - 01 - 12))),
@@ -193,7 +194,7 @@ mod tests {
 
     #[test]
     fn event_without_dates_has_no_period() {
-        // Неизвестное — None, а не подставной год (§4.9).
+        // Unknown means `None`, not a placeholder year (§4.9).
         assert_eq!(EventDates::empty().effective_date(), None);
         assert_eq!(EventDates::empty().tax_period(), None);
     }

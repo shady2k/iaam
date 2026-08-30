@@ -1,7 +1,7 @@
-//! Величина на единицу и проведённая сумма не смешиваются (§3.4).
+//! A per-unit value and a posted amount are not mixed (§3.4).
 //!
-//! Номинал на бумагу — договорная расчётная величина; сложить её
-//! с суммой, проведённой по счёту, значит выдать одно за другое.
+//! Face value per security is a contractual calculated value; adding it
+//! to an amount posted to an account means conflating the two.
 
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor};
 use iaam_core::numeric::decimal::Dec;

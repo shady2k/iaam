@@ -1,9 +1,9 @@
-//! Денежные остатки и позиции (§3.1).
+//! Cash balances and positions (§3.1).
 //!
-//! Считаются **по ногам события**, единообразно для всех типов. Лоты
-//! (`super::lots`) считаются по типу события и правилу списания. Две
-//! независимые дороги к одному количеству — то, что делает инвариант
-//! «сумма лотов равна позиции» проверкой, а не тавтологией (§15.4).
+//! Calculated **by event legs**, uniformly for all types. Lots
+//! (`super::lots`) are calculated by event type and disposal rule. Two
+//! independent paths to the same quantity are what make the invariant
+//! “the sum of lots equals the position” a check rather than a tautology (§15.4).
 
 use std::collections::BTreeMap;
 
@@ -15,9 +15,9 @@ use crate::ids::{AccountId, CustodyId, EventId, InstrumentId};
 use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use crate::numeric::NumericError;
 
-/// Позиция определяется тройкой: счёт, место хранения, инструмент.
-/// Перевод бумаг между депозитариями внутри одного брокера — реальная
-/// операция, поэтому custody входит в ключ (§4.5).
+/// A position is defined by a triple: account, custody location, instrument.
+/// A transfer of securities between depositories within the same broker is a real
+/// operation, so custody is part of the key (§4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PositionKey {
     pub account: AccountId,
@@ -27,18 +27,18 @@ pub struct PositionKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BalanceError {
-    #[error("переполнение денежного остатка на счёте {account:?} в {currency:?}")]
+    #[error("cash balance overflow for account {account:?} in {currency:?}")]
     CashOverflow {
         account: AccountId,
         currency: CurrencyCode,
     },
-    #[error("нога события {event:?} несёт количество без инструмента")]
+    #[error("event leg {event:?} carries a quantity without an instrument")]
     QuantityWithoutInstrument { event: EventId },
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
 
-/// Остатки денег и бумаг.
+/// Cash and securities balances.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Balances {
     cash: BTreeMap<(AccountId, CurrencyCode), PostedMinor>,
@@ -51,8 +51,8 @@ impl Balances {
         Self::default()
     }
 
-    /// Применение одного события. Тело вынесено из цикла проекции,
-    /// чтобы порядок обхода ног был виден и проверяем.
+    /// Applies a single event. The body is extracted from the projection loop
+    /// so that the leg traversal order is visible and verifiable.
     pub fn apply(&mut self, event: &Event) -> Result<(), BalanceError> {
         for leg in &event.legs {
             if let Some(money) = leg.cash_effect() {
@@ -83,8 +83,8 @@ impl Balances {
         Ok(())
     }
 
-    /// Остаток счёта в валюте. `None` означает «движений не было»,
-    /// а не «ноль»: разница видна в отчёте о полноте данных (§10.7).
+    /// Account balance in the currency. `None` means “there were no movements”,
+    /// not “zero”: the distinction is visible in the data completeness report (§10.7).
     #[must_use]
     pub fn cash(&self, account: AccountId, currency: CurrencyCode) -> Option<Money> {
         self.cash
@@ -107,8 +107,8 @@ impl Balances {
         self.positions.iter().map(|(key, qty)| (key, *qty))
     }
 
-    /// Суммарное количество инструмента на счёте по всем местам хранения.
-    /// Именно это сравнивается с суммой лотов: лоты не различают custody.
+    /// Total instrument quantity in the account across all custody locations.
+    /// This is what is compared with the sum of lots: lots do not distinguish custody.
     pub fn quantity_of(
         &self,
         account: AccountId,
@@ -121,9 +121,9 @@ impl Balances {
             .map(Quantity)
     }
 
-    /// Счета с отрицательным денежным остатком (§15.9).
-    /// На этапе 1 это не ошибка: маржинальный минус — обязательство,
-    /// которое обязано попасть в NAV, а не исчезнуть.
+    /// Accounts with a negative cash balance (§15.9).
+    /// At stage 1 this is not an error: a negative margin balance is a liability
+    /// that must be included in NAV rather than disappear.
     pub fn negative_cash(&self) -> impl Iterator<Item = (AccountId, Money)> {
         self.iter_cash()
             .filter(|(_, money)| money.amount().raw() < 0)
@@ -178,8 +178,8 @@ mod tests {
 
     #[test]
     fn an_account_without_movements_is_not_a_zero_balance() {
-        // Разница между «движений не было» и «остаток ноль» видна
-        // в отчёте о полноте данных (§10.7), поэтому она в типе.
+        // The distinction between “there were no movements” and “the balance is zero” is visible
+        // in the data completeness report (§10.7), so it is represented in the type.
         let balances = Balances::new();
         assert_eq!(
             balances.cash(AccountId::new_random(), CurrencyCode::Rub),
@@ -198,8 +198,8 @@ mod tests {
 
     #[test]
     fn quantity_sums_across_custodies_of_the_same_account() {
-        // Лоты не различают место хранения, поэтому сравнивать с ними
-        // надо сумму по всем custody, а не отдельную строку позиции.
+        // Lots do not distinguish custody locations, so they must be compared
+        // with the sum across all custody, not with an individual position row.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut balances = Balances::new();
@@ -222,8 +222,8 @@ mod tests {
 
     #[test]
     fn quantity_of_sums_neither_a_foreign_account_nor_a_foreign_instrument() {
-        // Обе половины условия отбора обязаны действовать: с одной
-        // из них сумма молча вбирала бы чужую позицию.
+        // Both halves of the selection condition must apply: without either
+        // of them, the sum would silently include an unrelated position.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let other_account = AccountId::new_random();
@@ -292,7 +292,7 @@ mod tests {
             balances.position(&key),
             Some(Quantity(crate::numeric::decimal::Dec::new(7.into())))
         );
-        // Другое место хранения — другая позиция, а не та же.
+        // A different custody location is a different position, not the same one.
         assert_eq!(
             balances.position(&PositionKey {
                 custody: Some(CustodyId::new_random()),
@@ -305,8 +305,8 @@ mod tests {
 
     #[test]
     fn a_zero_balance_is_not_a_negative_one() {
-        // Граница: ноль обязательством не является, и в блок качества
-        // данных попадать не должен.
+        // Boundary: zero is not a liability and must not be included
+        // in the data quality block.
         let account = AccountId::new_random();
         let mut balances = Balances::new();
         balances.apply(&cash_event(account, rub(5_000))).unwrap();

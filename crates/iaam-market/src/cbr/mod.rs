@@ -1,10 +1,10 @@
-//! ЦБ РФ: курсы валют и ключевая ставка.
+//! CBR: exchange rates and key rate.
 //!
-//! Два разных интерфейса у одного источника, и это не прихоть:
-//! курсы отдаются простыми XML-скриптами, а история ключевой ставки —
-//! только SOAP-сервисом. Документированной альтернативы без SOAP
-//! и без разбора HTML нет; разбор HTML для источника истины неприемлем,
-//! потому что страница меняется без контракта и без версии.
+//! One source exposes two different interfaces, and that is not a whim:
+//! rates come from simple XML scripts, while key-rate history is available
+//! only through SOAP. There is no documented alternative without SOAP and
+//! without parsing HTML; HTML parsing is unacceptable for a source of truth
+//! because the page changes without a contract or version.
 
 pub mod fx;
 pub mod key_rate;
@@ -12,17 +12,17 @@ pub mod key_rate;
 use iaam_http::{Destination, HttpRequest};
 use time::Date;
 
-/// Курсы всех валют на дату.
+/// Rates for all currencies on a date.
 #[must_use]
 pub fn daily_request(on: Date) -> HttpRequest {
     HttpRequest::get(Destination::CbrScripts, "/scripts/XML_daily.asp")
         .with_query("date_req", &dotted(on))
 }
 
-/// Курс одной валюты за период.
+/// Rate for one currency over a period.
 ///
-/// `cbr_currency_id` — внутренний код ЦБ вида `R01235` (доллар США),
-/// а не код ISO: сервис принимает только его.
+/// `cbr_currency_id` is the CBR's internal code, such as `R01235` (US dollar),
+/// not an ISO code: the service accepts only the former.
 #[must_use]
 pub fn dynamic_request(from: Date, till: Date, cbr_currency_id: &str) -> HttpRequest {
     HttpRequest::get(Destination::CbrScripts, "/scripts/XML_dynamic.asp")
@@ -31,7 +31,7 @@ pub fn dynamic_request(from: Date, till: Date, cbr_currency_id: &str) -> HttpReq
         .with_query("VAL_NM_RQ", cbr_currency_id)
 }
 
-/// Дата в формате источника: `DD/MM/YYYY` в запросе.
+/// Date in the source format: `DD/MM/YYYY` in the request.
 fn dotted(date: Date) -> String {
     format!(
         "{:02}/{:02}/{}",

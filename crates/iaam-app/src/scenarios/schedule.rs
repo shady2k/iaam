@@ -1,22 +1,22 @@
-//! Синхронизация графика выплат облигации (§2.10 спеки E3.4).
+//! Bond payment schedule synchronisation (§2.10 of the E3.4 spec).
 //!
-//! Три отличия от `sync_market`, и каждое существует ради конкретной
-//! ловушки:
+//! There are three differences from `sync_market`, each addressing a specific
+//! pitfall:
 //!
-//! 1. **Пагинация.** `sync_market` берёт одну страницу со смещением ноль.
-//!    Здесь смещение растёт, пока хоть один блок отдаёт строки: источник
-//!    молча режет страницу до сотни, и первый запрос у длинного выпуска
-//!    возвращает замкнутый график, короче настоящего на десять лет.
-//! 2. **Перевод кодов словарём.** Коды вида возврата номинала, вида права
-//!    по оферте и валюты переводятся чтением словаря. Неизвестный код —
-//!    отказ с названным кодом, а не пропуск строки: пропущенная строка
-//!    укорачивает график молча.
-//! 3. **Структурная проверка.** Полнота — три независимых утверждения,
-//!    и «источник вычитан до конца» полнотой не является.
+//! 1. **Pagination.** `sync_market` fetches one page at offset zero.
+//!    Here the offset increases while at least one block returns rows: the source
+//!    silently limits a page to one hundred rows, and the first request for a long issue
+//!    returns a closed schedule ten years shorter than the real one.
+//! 2. **Dictionary-based code translation.** Nominal repayment type, offer right type
+//!    and currency codes are translated by reading the dictionary. An unknown code —
+//!    causes failure naming the code, rather than skipping the row: a skipped row
+//!    silently shortens the schedule.
+//! 3. **Structural validation.** Completeness comprises three independent assertions,
+//!    and «the source was read to the end» does not constitute completeness.
 //!
-//! Нарушение инварианта запись снимка **не отменяет**: снимок — то, что
-//! источник действительно прислал, и стереть его значит потерять
-//! свидетельство. Отменяется пригодность графика к расчёту.
+//! An invariant violation does **not** cancel writing the snapshot: the snapshot is what
+//! the source actually sent, and deleting it would mean losing
+//! evidence. What is invalidated is the schedule's suitability for calculation.
 
 use iaam_core::ids::InstrumentId;
 use iaam_market::moex::bondization::parse_bondization_page;
@@ -38,30 +38,30 @@ use time::format_description::well_known::Rfc3339;
 use crate::error::AppError;
 use crate::ports::OutboundHttp;
 
-/// Идентификатор источника графика.
+/// Schedule source identifier.
 pub const SOURCE_ID: &str = "moex-iss";
 
-/// Потолок числа страниц.
+/// Maximum number of pages.
 ///
-/// Предохранитель, а не ожидание: у выпуска с ежемесячным купоном на
-/// тридцать лет страниц четыре. Выход по счётчику — отказ с причиной,
-/// а не тихий возврат: тихий возврат был бы тем же усечением, только
-/// нашими руками.
+/// A safeguard, not an expectation: an issue with monthly coupons over
+/// thirty years has four pages. Exiting on the counter causes failure with a reason,
+/// rather than a silent return: a silent return would be the same truncation, only
+/// done by us.
 const MAX_PAGES: u32 = 100;
 
-/// Что синхронизируем.
+/// What to synchronise.
 #[derive(Debug, Clone)]
 pub struct ScheduleSyncRequest {
     pub instrument: InstrumentId,
     pub secid: String,
 }
 
-/// Наблюдаемое состояние запуска.
+/// Observable run state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleSyncResult {
     pub snapshot_id: String,
-    /// Записан ли новый снимок. `false` означает, что содержимое совпало
-    /// с прошлым, и это не ошибка, а событие следа запуска.
+    /// Whether a new snapshot was written. `false` means the content matched
+    /// the previous snapshot, and this is not an error but an event in the run trace.
     pub written: bool,
     pub pages_seen: Vec<u32>,
     pub completeness: Completeness,
@@ -75,7 +75,7 @@ fn invalid(field: &str, expected: &str, actual: &str) -> AppError {
     }
 }
 
-/// Синхронизировать график выплат одного выпуска.
+/// Synchronise the payment schedule of one issue.
 pub async fn sync_schedule(
     store: &mut MarketStore,
     transport: &dyn OutboundHttp,
@@ -99,15 +99,15 @@ pub async fn sync_schedule(
         if !(200..300).contains(&response.status) {
             return Err(invalid(
                 "status",
-                "успешный ответ источника",
+                "successful source response",
                 &response.status.to_string(),
             ));
         }
         pages_seen.push(start);
         let page = parse_bondization_page(&response.body, observed_at)
-            .map_err(|error| invalid("body", "разбираемый график", &error.to_string()))?;
-        // Конец выборки — пустая страница ПО ВСЕМ блокам сразу.
-        // Смещение общее, и амортизации кончаются раньше купонов.
+            .map_err(|error| invalid("body", "parseable schedule", &error.to_string()))?;
+        // The result set ends only when a page is empty in ALL blocks at once.
+        // The offset is shared, and amortisations end before coupons.
         if page.total_rows == 0 {
             break;
         }
@@ -118,7 +118,7 @@ pub async fn sync_schedule(
         if page_index + 1 == MAX_PAGES {
             return Err(invalid(
                 "pages",
-                "график короче потолка страниц",
+                "schedule shorter than the page limit",
                 &MAX_PAGES.to_string(),
             ));
         }
@@ -126,22 +126,28 @@ pub async fn sync_schedule(
 
     let repayment_kinds = store
         .market_source_codes(SOURCE_ID, "principal_repayment_kind")
-        .map_err(|error| invalid("dictionary", "словарь видов возврата", &error.to_string()))?;
+        .map_err(|error| {
+            invalid(
+                "dictionary",
+                "repayment type dictionary",
+                &error.to_string(),
+            )
+        })?;
     let offer_kinds = store
         .market_source_codes(SOURCE_ID, "offer_kind")
-        .map_err(|error| invalid("dictionary", "словарь видов оферты", &error.to_string()))?;
+        .map_err(|error| invalid("dictionary", "offer type dictionary", &error.to_string()))?;
     let currencies = store
         .market_source_codes(SOURCE_ID, "currency")
-        .map_err(|error| invalid("dictionary", "словарь валют", &error.to_string()))?;
+        .map_err(|error| invalid("dictionary", "currency dictionary", &error.to_string()))?;
 
-    // Неизвестный код — отказ, названный поимённо. Пропуск строки
-    // укоротил бы график молча, а «Other» означал бы принятое решение
-    // не разбирать — такого решения не принимали.
+    // An unknown code causes failure that names it explicitly. Skipping the row
+    // would silently shorten the schedule, while «Other» would indicate a deliberate decision
+    // not to parse it — no such decision was made.
     for repayment in &principal_repayments {
         if !repayment_kinds.contains_key(&repayment.source_kind) {
             return Err(invalid(
                 "principal_repayment_kind",
-                "код, известный словарю источника",
+                "code known to the source dictionary",
                 &repayment.source_kind,
             ));
         }
@@ -150,7 +156,7 @@ pub async fn sync_schedule(
         if !offer_kinds.contains_key(&window.source_kind) {
             return Err(invalid(
                 "offer_kind",
-                "код, известный словарю источника",
+                "code known to the source dictionary",
                 &window.source_kind,
             ));
         }
@@ -161,7 +167,7 @@ pub async fn sync_schedule(
         {
             return Err(invalid(
                 "currency",
-                "код валюты, известный словарю источника",
+                "currency code known to the source dictionary",
                 (*currency).code(),
             ));
         }
@@ -187,14 +193,14 @@ pub async fn sync_schedule(
     };
     let outcome = store
         .record_schedule_snapshot(&header, &coupon_rows, &repayment_rows, &window_rows)
-        .map_err(|error| invalid("snapshot", "записываемый снимок", &error.to_string()))?;
+        .map_err(|error| invalid("snapshot", "snapshot to be written", &error.to_string()))?;
 
     let (validated, reason) = match &completeness {
         Completeness::Validated => (true, None),
         Completeness::Incomplete { reason } => (false, Some(reason.clone())),
-        // Выпуск вне области применимости профиля: инварианты не
-        // применимы, и объявлять их выполненными нельзя.
-        Completeness::Unknown => (false, Some("выпуск вне профиля источника".to_owned())),
+        // The issue is outside the profile's scope: the invariants do not
+        // apply, so they cannot be declared satisfied.
+        Completeness::Unknown => (false, Some("issue outside the source profile".to_owned())),
     };
     store
         .record_schedule_completeness(
@@ -204,7 +210,13 @@ pub async fn sync_schedule(
             reason.as_deref(),
             &pages_seen,
         )
-        .map_err(|error| invalid("completeness", "записываемая полнота", &error.to_string()))?;
+        .map_err(|error| {
+            invalid(
+                "completeness",
+                "completeness to be recorded",
+                &error.to_string(),
+            )
+        })?;
 
     Ok(ScheduleSyncResult {
         snapshot_id: outcome.snapshot_id,
@@ -214,12 +226,12 @@ pub async fn sync_schedule(
     })
 }
 
-/// Синхронизировать условия выпуска.
+/// Synchronise issue terms.
 ///
-/// Отдельный сценарий, а не шаг синхронизации графика: у условий свой
-/// эндпойнт, своя ось действия (`effective_from`) и своя append-only
-/// таблица. Слить их значило бы записывать новое наблюдение условий
-/// каждый раз, когда поменялся график, и наоборот.
+/// A separate scenario rather than a schedule synchronisation step: issue terms have their own
+/// endpoint, effective axis (`effective_from`) and append-only
+/// table. Combining them would mean recording a new observation of the issue terms
+/// every time the schedule changed, and vice versa.
 pub async fn sync_issue_terms(
     store: &mut MarketStore,
     transport: &dyn OutboundHttp,
@@ -231,24 +243,24 @@ pub async fn sync_issue_terms(
     if !(200..300).contains(&response.status) {
         return Err(invalid(
             "status",
-            "успешный ответ источника",
+            "successful source response",
             &response.status.to_string(),
         ));
     }
     let terms = parse_description(&response.body, instrument, observed_at)
-        .map_err(|error| invalid("body", "разбираемое описание", &error.to_string()))?;
+        .map_err(|error| invalid("body", "description to be parsed", &error.to_string()))?;
 
-    // Код валюты хранится как его дал источник, но словарь обязан его
-    // знать: неизвестный код, дошедший до базы, станет второй валютой
-    // рядом с рублём, и позиции разъедутся молча.
+    // The currency code is stored as supplied by the source, but the dictionary must
+    // know it: an unknown code reaching the database would become a second currency
+    // alongside the rouble, and the positions would silently diverge.
     if let Knowledge::Known(code) = &terms.face_currency_code {
         let currencies = store
             .market_source_codes(SOURCE_ID, "currency")
-            .map_err(|error| invalid("dictionary", "словарь валют", &error.to_string()))?;
+            .map_err(|error| invalid("dictionary", "currency dictionary", &error.to_string()))?;
         if !currencies.contains_key(code) {
             return Err(invalid(
                 "currency",
-                "код валюты, известный словарю источника",
+                "currency code known to the source dictionary",
                 code,
             ));
         }
@@ -262,8 +274,8 @@ pub async fn sync_issue_terms(
                 .0
                 .format(&Rfc3339)
                 .map_err(|error| invalid("observed_at", "RFC 3339", &error.to_string()))?,
-            // Неизвестное доходит до базы NULL. Значение по умолчанию
-            // здесь — правдоподобно неверный НКД.
+            // Unknown reaches the database as NULL. A default value
+            // here would be plausible but incorrect accrued coupon interest.
             effective_from: terms.effective_from.known().map(ToString::to_string),
             maturity_date: terms.maturity_date.known().map(ToString::to_string),
             initial_face_value: terms
@@ -280,7 +292,13 @@ pub async fn sync_issue_terms(
             default_declared: terms.default_flags.declared,
             default_technical: terms.default_flags.technical,
         })
-        .map_err(|error| invalid("issue_terms", "записываемые условия", &error.to_string()))?;
+        .map_err(|error| {
+            invalid(
+                "issue_terms",
+                "issue terms to be recorded",
+                &error.to_string(),
+            )
+        })?;
     Ok(())
 }
 
@@ -337,12 +355,12 @@ fn window_row(window: &OfferWindow) -> OfferWindowRow {
     }
 }
 
-/// Хэш содержимого снимка.
+/// Snapshot content hash.
 ///
-/// Считается по строкам таблиц, а не по телу ответа: тело меняется от
-/// полей, которые в домен не входят (текущий номинал в каждой строке,
-/// рублёвый эквивалент, число дней до погашения), и хэш по нему объявлял
-/// бы изменившимся неизменившийся график каждый день.
+/// Calculated from table rows, not the response body: the body changes because of
+/// fields outside the domain (current face value in each row,
+/// rouble equivalent, number of days to maturity), and hashing it would mark
+/// an unchanged schedule as changed every day.
 fn content_hash(
     coupons: &[CouponPeriodRow],
     repayments: &[PrincipalRepaymentRow],

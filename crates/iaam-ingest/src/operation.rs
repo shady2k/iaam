@@ -1,4 +1,4 @@
-//! Нормализованная операция и её превращение в событие журнала.
+//! Normalized operation and its conversion into a journal event.
 
 use iaam_core::dates::{
     CashPostedDate, EffectiveOrder, EventDates, PaidDate, SettledDate, TradeDate,
@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::verdict::Rejection;
 
-/// Версия разбора. Пишется в provenance: без неё нельзя отличить ошибку
-/// источника от ошибки разбора, исправленной позже (§4.1).
+/// Parsing version. Written to provenance: without it, an error in the source cannot be distinguished
+/// from a parsing error corrected later (§4.1).
 pub const PARSER_VERSION: &str = "ingest/manual/1";
 
-/// Даты операции. Все необязательны, кроме той, что делает операцию
-/// датированной: событие без единой даты не попадает ни в один период.
+/// Operation dates. All are optional except the one that makes the operation dated: an event without a single date does not belong to any period.
+/// Date-based: an event without a single date does not fall into any period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OperationDates {
     pub trade: Option<time::Date>,
@@ -42,8 +42,8 @@ impl OperationDates {
     }
 }
 
-/// Что произошло. Величины **положительные**: знак определяет вид
-/// операции, а не клиент.
+/// What happened. Amounts are **positive**: the sign determines the operation type,
+/// not the client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OperationKind {
     Deposit {
@@ -81,9 +81,9 @@ pub enum OperationKind {
         instrument: Option<InstrumentId>,
         gross_minor: i64,
         currency: CurrencyCode,
-        /// Вид дохода, если источник его назвал. `None` — «не
-        /// утверждалось»: подставить дивиденд там, где источник промолчал,
-        /// значит записать в журнал выдумку (§4.9).
+        /// The income type, if named by the source. `None` means “not
+        /// stated”: substituting a dividend where the source is silent
+        /// means recording an invention in the journal (§4.9).
         kind: Option<IncomeKind>,
     },
     Fee {
@@ -101,13 +101,13 @@ pub enum OperationKind {
         quantity: Dec,
         cost_basis_minor: Option<i64>,
         currency: CurrencyCode,
-        /// Что владелец знает о восстановленной позиции (§10.7).
+        /// What the owner knows about the restored position (§10.7).
         ///
-        /// Отсутствие — «ничего не сказано»: приёмка подставляет
-        /// умолчание, в котором всё неизвестно, и **не выводит**
-        /// уверенность из наличия других полей. Присланная стоимость
-        /// не делает налоговую базу документированной: документ
-        /// подтверждает человек, а не факт заполнения поля.
+        /// Absence means “nothing stated”: acceptance supplies
+        /// a default in which everything is unknown, and **does not infer**
+        /// confidence from the presence of other fields. A submitted value
+        /// does not make the tax basis documented: a person confirms the document,
+        /// not the fact that the field is filled in.
         #[serde(default)]
         assertions: Option<OpeningAssertions>,
     },
@@ -119,40 +119,40 @@ pub enum OperationKind {
     },
 }
 
-/// Операция, пришедшая через API или из файла.
+/// An operation received through an API or from a file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmittedOperation {
     pub account: AccountId,
     pub kind: OperationKind,
     pub dates: OperationDates,
-    /// Ключ идемпотентности клиента (§10.6).
+    /// Client idempotency key (§10.6).
     pub idempotency_key: Option<String>,
-    /// Идентификатор операции в источнике, если он есть.
+    /// Operation identifier in the source, if present.
     pub source_operation_id: Option<String>,
 }
 
-/// Готовое к записи событие плюс отпечаток сырой записи.
+/// An event ready to be written plus a fingerprint of the raw record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Normalized {
     pub event: Event,
 }
 
-/// Контекст нормализации: кто владелец и из какого источника пришло.
+/// Normalization context: who owns it and which source it came from.
 ///
-/// Порядкового номера здесь нет намеренно: его назначает хранилище
-/// в той же транзакции, что и вставку. Приёмка ставит номер `1`
-/// как заведомо временный — хранилище его перезапишет (§4.8).
+/// There is intentionally no sequence number here: storage assigns it
+/// in the same transaction as the insert. Ingestion uses number `1`
+/// as deliberately temporary—storage will overwrite it (§4.8).
 #[derive(Debug, Clone, Copy)]
 pub struct NormalizationContext {
     pub owner: OwnerId,
     pub source: SourceId,
 }
 
-/// Превращение операции в событие журнала.
+/// Converting an operation into a journal event.
 ///
-/// Возвращает отказ, а не паникует и не подставляет умолчания: строка
-/// с непонятой операцией получает вердикт, а документ продолжает
-/// разбираться (§10.1).
+/// Returns a rejection rather than panicking or supplying defaults: a row
+/// with an unrecognized operation receives a verdict, and document processing continues
+/// (§10.1).
 pub fn normalize(
     operation: &SubmittedOperation,
     context: NormalizationContext,
@@ -160,14 +160,14 @@ pub fn normalize(
     let dates = operation.dates.to_event_dates();
     let day = dates.effective_date().ok_or_else(|| Rejection {
         field: "dates".into(),
-        expected: "хотя бы одна дата: trade, settled, cash_posted или paid".into(),
-        actual: "ни одной".into(),
+        expected: "at least one date: trade, settled, cash_posted, or paid".into(),
+        actual: "none".into(),
     })?;
 
     let (kind, legs) = build(operation, &operation.kind)?;
-    // Отпечаток тот же самый, что у дедупликации, и считается там же:
-    // второй экземпляр этой функции разошёлся бы с первым молча, а по
-    // отпечаткам уже дедуплицировано (§10.6).
+    // The fingerprint is the same as for deduplication, and is calculated there as well:
+    // a second copy of this function would silently diverge from the first, while
+    // fingerprints have already been deduplicated (§10.6).
     let raw_hash = crate::dedup::fingerprint(operation);
 
     Ok(Normalized {
@@ -178,7 +178,7 @@ pub fn normalize(
             account: operation.account,
             kind,
             dates,
-            // Временный номер: окончательный ставит хранилище.
+            // Temporary number: storage assigns the final one.
             order: EffectiveOrder::new(day, 1),
             legs,
             provenance: {
@@ -193,22 +193,22 @@ pub fn normalize(
                 }
             },
             relation: Relation::None,
-            // `Confidence` описывает **значение**, а не сверку (§4.9):
-            // владелец, вводящий пополнение вручную, знает его сумму.
-            // Отсутствие независимого подтверждения — это утверждение
-            // о счёте и интервале (§10.3), оно появится в E2 отдельной
-            // сущностью и полем события не является.
+            // `Confidence` describes **the value**, not verification (§4.9):
+            // the owner entering a top-up manually knows its amount.
+            // The lack of independent confirmation is a statement
+            // about the account and interval (§10.3); it will appear in E2 as a separate
+            // entity and is not an event field.
             confidence: Confidence::Known,
             idempotency_key: operation.idempotency_key.clone(),
         },
     })
 }
 
-/// Перевод десятичной суммы в минимальные единицы **без округления**.
+/// Convert a decimal amount to minimum units **without rounding**.
 ///
-/// Сумма с большей точностью, чем минимальная единица валюты, — это
-/// не «почти правильная» сумма, а неверные входные данные: округлив её,
-/// система запишет факт, которого не было (§3.4).
+/// An amount with greater precision than the currency's smallest unit is
+/// not an “almost correct” amount but invalid input: rounding it would make the
+/// system record a fact that did not occur (§3.4).
 pub fn to_minor_units(
     value: rust_decimal::Decimal,
     currency: CurrencyCode,
@@ -219,7 +219,7 @@ pub fn to_minor_units(
         return Err(Rejection {
             field: field.to_owned(),
             expected: format!(
-                "не более {scale} знаков после запятой для {}",
+                "no more than {scale} decimal places for {}",
                 currency.code()
             ),
             actual: value.to_string(),
@@ -230,7 +230,7 @@ pub fn to_minor_units(
         .checked_mul(factor)
         .ok_or_else(|| Rejection {
             field: field.to_owned(),
-            expected: "представимая сумма".into(),
+            expected: "representable amount".into(),
             actual: value.to_string(),
         })?
         .normalize();
@@ -239,7 +239,7 @@ pub fn to_minor_units(
         .filter(|_| scaled.scale() == 0)
         .ok_or_else(|| Rejection {
             field: field.to_owned(),
-            expected: "целое число минимальных единиц".into(),
+            expected: "an integer number of minor units".into(),
             actual: scaled.to_string(),
         })
 }
@@ -248,27 +248,27 @@ fn money(minor: i64, currency: CurrencyCode) -> Money {
     Money::new(PostedMinor::new(minor), currency)
 }
 
-/// Величина обязана быть положительной.
+/// The value must be positive.
 ///
-/// Имя поля и величина в отказе — те же, что прислал клиент: `amount`,
-/// а не `amount_minor`, и `-5.00`, а не `-500`. Отказ, называющий
-/// внутреннее имя и внутренние единицы, отправляет клиента чинить поле,
-/// которого он не отправлял (§10.4).
+/// The field name and value in the rejection are exactly what the client sent: `amount`,
+/// not `amount_minor`, and `-5.00`, not `-500`. A rejection that names
+/// an internal name and internal units tells the client to fix a field
+/// that it did not send (§10.4).
 fn positive(value: i64, field: &str, currency: CurrencyCode) -> Result<i64, Rejection> {
     if value > 0 {
         Ok(value)
     } else {
         Err(Rejection {
             field: field.to_owned(),
-            expected: "положительная величина".into(),
+            expected: "positive value".into(),
             actual: money(value, currency).to_calc_dec().inner().to_string(),
         })
     }
 }
 
-/// Построение типа события и ног.
+/// Constructing the event type and legs.
 ///
-/// Диспетчер исчерпывающий: новый вид операции обязан сломать сборку.
+/// The dispatcher is exhaustive: a new operation kind must fail to compile.
 fn build(
     operation: &SubmittedOperation,
     kind: &OperationKind,
@@ -303,14 +303,14 @@ fn build(
             if *to == account {
                 return Err(Rejection {
                     field: "to".into(),
-                    expected: "счёт, отличный от счёта операции".into(),
+                    expected: "an account different from the operation account".into(),
                     actual: to.inner().to_string(),
                 });
             }
             let amount = money(positive(*amount_minor, "amount", *currency)?, *currency);
             let outgoing = amount.checked_negate().map_err(|error| Rejection {
                 field: "amount".into(),
-                expected: "представимая сумма".into(),
+                expected: "representable amount".into(),
                 actual: error.to_string(),
             })?;
             Ok((
@@ -370,7 +370,7 @@ fn build(
             settlement -= fee.map_or(0, |value| value.amount().raw());
             let sold = quantity.checked_neg().map_err(|error| Rejection {
                 field: "quantity".into(),
-                expected: "представимое количество".into(),
+                expected: "representable quantity".into(),
                 actual: error.to_string(),
             })?;
             Ok((
@@ -422,8 +422,8 @@ fn build(
             amount_minor,
             currency,
         } => {
-            // Восстановленный остаток может быть отрицательным (§15.9),
-            // поэтому нуля здесь не требуется, а знак берётся как есть.
+            // The reconstructed balance may be negative (§15.9),
+            // so zero is not required here; the sign is used as-is.
             let amount = money(*amount_minor, *currency);
             Ok((
                 EventKind::OpeningCash { amount },
@@ -474,8 +474,8 @@ fn build(
     }
 }
 
-/// Комиссия и НКД приходят положительными: знак задаёт `trade_settlement`
-/// ядра, и дублировать это решение в приёмке нельзя.
+/// Commission and accrued coupon income are positive: the sign is determined by `trade_settlement`
+/// the core, and this decision must not be duplicated in ingestion.
 fn fee_money(value: Option<i64>, currency: CurrencyCode) -> Result<Option<Money>, Rejection> {
     match value {
         None => Ok(None),

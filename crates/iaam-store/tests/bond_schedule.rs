@@ -1,4 +1,4 @@
-//! Снимки графика выплат: дедуп, чтение на координату знания, исчезновение строк.
+//! Payout schedule snapshots: deduplication, reading at a knowledge date, disappearing rows.
 
 use iaam_core::ids::InstrumentId;
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
@@ -9,22 +9,22 @@ use iaam_store::schedule::{
     CouponPeriodRow, OfferWindowRow, PrincipalRepaymentRow, ScheduleSnapshotRow,
 };
 
-// Приём взят из `market_observations.rs`: инструмент заводится публичным
-// `upsert_instrument`, а не сырым SQL — тест не должен знать схему лучше,
-// чем её знает хранилище.
+// Pattern taken from `market_observations.rs`: the instrument is created through the public
+// `upsert_instrument`, rather than raw SQL—the test should not know the schema better
+// than the store itself does.
 fn store() -> (SqliteStore, InstrumentId) {
-    let store = SqliteStore::open_in_memory().expect("база в памяти");
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
     let instrument = InstrumentId::new_random();
     store
         .upsert_instrument(&InstrumentRecord {
             id: instrument,
             kind: Some(InstrumentKind::Bond),
             symbol: "SU46020RMFS2".to_owned(),
-            title: "ОФЗ 46020".to_owned(),
+            title: "OFZ 46020".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
         })
-        .expect("инструмент заведён");
+        .expect("instrument created");
     (store, instrument)
 }
 
@@ -62,8 +62,8 @@ fn snapshot(instrument: InstrumentId, observed_at: &str, hash: &str) -> Schedule
 
 #[test]
 fn an_unchanged_snapshot_is_not_written_twice() {
-    // Иначе ежедневная синхронизация писала бы неизменный график каждый
-    // день, и ряд рос бы в сотни раз без единого нового факта.
+    // Otherwise, daily synchronization would write the unchanged schedule every
+    // day, and the series would grow a hundredfold without a single new fact.
     let (mut store, instrument) = store();
     let rows = vec![coupon("2026-02-15", "2026-08-15")];
     let first = store
@@ -73,7 +73,7 @@ fn an_unchanged_snapshot_is_not_written_twice() {
             &[],
             &[],
         )
-        .expect("первый снимок");
+        .expect("first snapshot");
     let second = store
         .record_schedule_snapshot(
             &snapshot(instrument, "2026-08-28T12:00:00Z", "hash-1"),
@@ -81,16 +81,16 @@ fn an_unchanged_snapshot_is_not_written_twice() {
             &[],
             &[],
         )
-        .expect("повтор с тем же содержимым");
-    assert!(first.written, "первый снимок обязан записаться");
-    assert!(!second.written, "неизменный снимок писаться не должен");
+        .expect("repeat with the same contents");
+    assert!(first.written, "the first snapshot must be written");
+    assert!(!second.written, "an unchanged snapshot must not be written");
     assert_eq!(first.snapshot_id, second.snapshot_id);
 }
 
 #[test]
 fn a_row_missing_from_the_next_snapshot_disappears() {
-    // Это то, чего построчная модель не умела: отменённая амортизация
-    // обязана исчезнуть, а не остаться рядом с новым графиком.
+    // This is what the row-based model could not do: a cancelled amortization
+    // must disappear rather than remain alongside the new schedule.
     let (mut store, instrument) = store();
     store
         .record_schedule_snapshot(
@@ -99,7 +99,7 @@ fn a_row_missing_from_the_next_snapshot_disappears() {
             &[repayment("2034-08-09", "25"), repayment("2035-02-07", "25")],
             &[],
         )
-        .expect("снимок с двумя возвратами");
+        .expect("snapshot with two repayments");
     store
         .record_schedule_snapshot(
             &snapshot(instrument, "2026-08-28T12:00:00Z", "hash-2"),
@@ -107,7 +107,7 @@ fn a_row_missing_from_the_next_snapshot_disappears() {
             &[repayment("2035-02-07", "25")],
             &[],
         )
-        .expect("снимок с одним возвратом");
+        .expect("snapshot with one repayment");
 
     let later = store
         .schedule_at_or_before(
@@ -115,16 +115,16 @@ fn a_row_missing_from_the_next_snapshot_disappears() {
             "moex-iss",
             "2026-08-29T00:00:00Z",
         )
-        .expect("чтение")
-        .expect("снимок найден");
+        .expect("read")
+        .expect("snapshot found");
     assert_eq!(later.principal_repayments.len(), 1);
     assert_eq!(later.principal_repayments[0].repayment_date, "2035-02-07");
 }
 
 #[test]
 fn a_later_snapshot_does_not_change_an_earlier_answer() {
-    // Свойство монотонности по оси знания: добавление более позднего
-    // наблюдения не меняет ответ на меньший knowledge_as_of.
+    // Monotonicity along the knowledge axis: adding a later
+    // Observations do not change the answer for an earlier knowledge_as_of.
     let (mut store, instrument) = store();
     store
         .record_schedule_snapshot(
@@ -133,15 +133,15 @@ fn a_later_snapshot_does_not_change_an_earlier_answer() {
             &[repayment("2034-08-09", "25"), repayment("2035-02-07", "25")],
             &[],
         )
-        .expect("первый снимок");
+        .expect("first snapshot");
     let before = store
         .schedule_at_or_before(
             &instrument.inner().to_string(),
             "moex-iss",
             "2026-08-27T23:59:59Z",
         )
-        .expect("чтение")
-        .expect("снимок найден");
+        .expect("read")
+        .expect("snapshot found");
     store
         .record_schedule_snapshot(
             &snapshot(instrument, "2026-08-28T12:00:00Z", "hash-2"),
@@ -149,23 +149,23 @@ fn a_later_snapshot_does_not_change_an_earlier_answer() {
             &[repayment("2035-02-07", "25")],
             &[],
         )
-        .expect("второй снимок");
+        .expect("second snapshot");
     let again = store
         .schedule_at_or_before(
             &instrument.inner().to_string(),
             "moex-iss",
             "2026-08-27T23:59:59Z",
         )
-        .expect("чтение")
-        .expect("снимок найден");
+        .expect("read")
+        .expect("snapshot found");
     assert_eq!(before.principal_repayments, again.principal_repayments);
     assert_eq!(again.principal_repayments.len(), 2);
 }
 
 #[test]
 fn an_offer_window_without_conditions_reads_back_as_absent_not_zero() {
-    // Пустая цена выкупа — незнание условий. Ноль здесь означал бы
-    // выкуп даром, и метрика посчиталась бы правдоподобно неверно.
+    // An empty redemption price means the terms are unknown. Zero here would mean
+    // free redemption, and the metric would be calculated plausibly incorrectly.
     let (mut store, instrument) = store();
     store
         .record_schedule_snapshot(
@@ -182,14 +182,14 @@ fn an_offer_window_without_conditions_reads_back_as_absent_not_zero() {
                 source_entry_id: None,
             }],
         )
-        .expect("снимок с окном");
+        .expect("snapshot with window");
     let stored = store
         .schedule_at_or_before(
             &instrument.inner().to_string(),
             "moex-iss",
             "2026-08-27T23:59:59Z",
         )
-        .expect("чтение")
-        .expect("снимок найден");
+        .expect("read")
+        .expect("snapshot found");
     assert_eq!(stored.offer_windows[0].price_percent, None);
 }

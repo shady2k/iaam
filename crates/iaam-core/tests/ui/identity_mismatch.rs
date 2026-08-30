@@ -1,4 +1,4 @@
-//! Идентификаторы разных сущностей не взаимозаменяемы (§4.5).
+//! Identifiers for different entities are not interchangeable (§4.5).
 
 use iaam_core::ids::{AccountId, OwnerId};
 

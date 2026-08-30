@@ -1,46 +1,46 @@
-//! Секреты, предъявляемые по HTTP: сам токен и его хеш (§14).
+//! Secrets presented over HTTP: the token itself and its hash (§14).
 //!
-//! Живут в приложении, а не в транспорте, потому что выпускает токен
-//! порт `TokenAdmin`, а реализует его адаптер хранилища: адаптеру нужно
-//! посчитать **тот же** хеш, каким транспорт потом токен ищет. Вторая
-//! реализация хеша разошлась бы молча — выпущенный токен просто
-//! перестал бы находиться, и искать причину пришлось бы в
-//! аутентификации, а не в выпуске. `iaam-server` переэкспортирует
-//! `hash_token` и своей копии не заводит.
+//! They reside in the application, not the transport, because the token is issued by
+//! the `TokenAdmin` port, implemented by the storage adapter: the adapter needs to
+//! calculate **the same** hash that the transport later uses to look it up. A second
+//! hash implementation could silently diverge — the issued token would simply
+//! stop being found, and the cause would have to be sought in
+//! authentication, not issuance. `iaam-server` re-exports
+//! `hash_token` and does not maintain its own copy.
 
 use rand::TryRng;
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 
-/// Хеш токена.
+/// Token hash.
 ///
-/// SHA-256, а не пароль-хеш: токен — это 256 случайных бит из системного
-/// источника, перебирать его нечем, и argon2 на каждом запросе стоит
-/// дороже, чем даёт. Для паролей владельца — если они когда-нибудь
-/// появятся — вывод обратный.
+/// SHA-256, not a password hash: the token is 256 random bits from a system
+/// source, there is no practical way to brute-force it, and argon2 on every request costs
+/// more than it provides. For owner passwords — if they ever
+/// appear — the conclusion is the opposite.
 ///
-/// **Сравнения за постоянное время здесь нет, и это осознанно.** Поиск
-/// идёт запросом `WHERE token_hash = ?`, то есть сравнение выполняет
-/// SQLite, и оно не является постоянным по времени. Утечка времени
-/// сравнения даёт атакующему возможность подбирать хеш по префиксу —
-/// но подбирать нужно образ SHA-256 от 256-битного случайного значения,
-/// а не сам токен. Функция «постоянное сравнение», не используемая
-/// на пути аутентификации, обещала бы защиту, которой нет: такая
-/// функция здесь была и удалена.
+/// **There is no constant-time comparison here, and that is deliberate.** Lookup
+/// uses `WHERE token_hash = ?`, so the comparison is performed by
+/// SQLite, and is not constant-time. The comparison timing leak
+/// lets an attacker guess the hash one prefix at a time —
+/// but what must be guessed is the SHA-256 output of a random 256-bit value,
+/// not the token itself. A «constant-time comparison» function not used
+/// on the authentication path would promise protection that does not exist: such a
+/// function used to be here and was removed.
 #[must_use]
 pub fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Случайный секрет в шестнадцатеричном виде.
+/// A random secret in hexadecimal.
 ///
-/// Источник — `SysRng`, а не `rand::rng()`: и токен, и код присвоения
-/// суть ключи от чужих денег, и слабый генератор здесь дороже всего
-/// остального в этом файле. Отказ источника возвращается ошибкой, а не
-/// подменяется запасным генератором: секрет, выпущенный неизвестно чем,
-/// хуже невыпущенного — про первый никто не узнает.
+/// The source is `SysRng`, not `rand::rng()`: both the token and the claim code
+/// are effectively keys to other people's money, and a weak generator here costs more than
+/// everything else in this file. Source failure is returned as an error, not
+/// replaced with a fallback generator: a secret issued by unknown means,
+/// is worse than one not issued — no one will know about the former.
 pub fn secret_hex(bytes: usize) -> Result<String, AppError> {
     let mut buffer = vec![0_u8; bytes];
     rand::rngs::SysRng
@@ -55,25 +55,25 @@ mod tests {
 
     #[test]
     fn the_hash_is_stable_and_does_not_contain_the_token() {
-        let hash = hash_token("секрет");
-        assert_eq!(hash, hash_token("секрет"));
+        let hash = hash_token("secret");
+        assert_eq!(hash, hash_token("secret"));
         assert_eq!(hash.len(), 64);
-        assert!(!hash.contains("секрет"));
-        assert_ne!(hash, hash_token("секрет "));
+        assert!(!hash.contains("secret"));
+        assert_ne!(hash, hash_token("secret "));
     }
 
     #[test]
     fn a_secret_is_hex_of_the_requested_length_and_never_repeats() {
-        // Длина в символах вдвое больше длины в байтах: секрет
-        // короче заказанного — это стойкость ниже заказанной, и
-        // заметить её потом нечем.
-        let first = secret_hex(32).expect("источник случайности");
-        let second = secret_hex(32).expect("источник случайности");
+        // The character length is twice the byte length: a secret
+        // shorter than requested provides less security than requested, and
+        // there is no way to detect this later.
+        let first = secret_hex(32).expect("randomness source");
+        let second = secret_hex(32).expect("randomness source");
         assert_eq!(first.len(), 64);
         assert!(first.chars().all(|symbol| symbol.is_ascii_hexdigit()));
         assert_ne!(
             first, second,
-            "повторяющийся секрет означает, что генератор не случаен"
+            "a repeated secret means the generator is not random"
         );
     }
 }

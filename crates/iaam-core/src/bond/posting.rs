@@ -1,17 +1,17 @@
-//! Ближайшая выплата по бумаге (§5 спеки E3.4.4).
+//! Nearest payment for a security (§5 of spec E3.4.4).
 
 use time::Date;
 
 use crate::bond::{AccrualPeriod, PrincipalReturn};
 
-/// Дата ближайшей ЛЮБОЙ выплаты не раньше `as_of`.
+/// Date of the nearest payment of ANY kind not earlier than `as_of`.
 ///
-/// Купон берётся по `payment_date`: перенос с выходного двигает платёж,
-/// но не начисление, и `accrual_end` обещал бы деньги раньше срока.
+/// Coupons use `payment_date`: moving a weekend shifts the payment,
+/// not accrual, and `accrual_end` would promise money before its due date.
 ///
-/// Окно оферты из графика сюда НЕ входит — это право, а не платёж
-/// (E3.4.6). Входит расчёт по уже поданной заявке: она приходит из
-/// проекции заявок, а не из графика источника.
+/// An offer window from the schedule is NOT included — it is a right, not a
+/// payment (E3.4.6). Settlement for an already submitted application is
+/// included: it comes from the application projection, not the source schedule.
 #[must_use]
 pub fn next_posting_date(
     periods: &[AccrualPeriod],
@@ -38,9 +38,8 @@ mod tests {
 
     #[test]
     fn a_coupon_is_taken_by_its_payment_date_not_by_its_accrual_end() {
-        // Перенос с выходного двигает платёж на 3 декабря, начисление
-        // остаётся на 2-е. Взять accrual_end значит обещать деньги
-        // на день раньше, чем они придут.
+        // Moving a weekend shifts payment to December 3, while accrual stays
+        // on the 2nd. Using accrual_end would promise money a day early.
         let periods = vec![AccrualPeriod {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),
@@ -56,8 +55,8 @@ mod tests {
 
     #[test]
     fn an_amortisation_competes_with_the_coupon_on_equal_terms() {
-        // Выбор только из купонного графика был бы неполон: на
-        // амортизируемой бумаге ближайшие деньги — возврат номинала.
+        // Looking only at the coupon schedule would be incomplete: for an
+        // amortising security, the nearest cash is a principal return.
         let periods = vec![AccrualPeriod {
             period_start: date!(2026 - 06 - 03),
             accrual_end: date!(2026 - 12 - 02),
@@ -77,8 +76,9 @@ mod tests {
 
     #[test]
     fn a_submitted_offer_settlement_competes_too() {
-        // Окно оферты из графика — право, а не платёж (E3.4.6).
-        // Уже ПОДАННАЯ заявка — платёж, и она приходит из проекции.
+        // An offer window from the schedule is a right, not a payment (E3.4.6).
+        // An already SUBMITTED application is a payment, and comes from the
+        // projection.
         assert_eq!(
             next_posting_date(&[], &[], &[date!(2026 - 09 - 01)], date!(2026 - 08 - 20)),
             Some(date!(2026 - 09 - 01))

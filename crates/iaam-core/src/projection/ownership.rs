@@ -1,4 +1,4 @@
-//! Вывод владения из диапазона возможного количества.
+//! Deriving ownership from a range of possible quantities.
 
 use serde::{Deserialize, Serialize};
 use time::Date;
@@ -7,7 +7,7 @@ use crate::money::Quantity;
 use crate::numeric::decimal::Dec;
 use crate::settlement::{Applied, SettlementKnowledge};
 
-/// Статус владения на календарную дату.
+/// Ownership status on a calendar date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ownership {
     Owned,
@@ -15,30 +15,30 @@ pub enum Ownership {
     Unknown,
 }
 
-/// Одно изменение количества и знание о дате его расчёта.
+/// A single quantity change and knowledge of its settlement date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct OwnershipChange {
     delta: Quantity,
     settlement: SettlementKnowledge,
 }
 
-/// История владения парой «счёт, инструмент».
+/// Ownership history for an «account, instrument» pair.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnershipHistory {
     changes: Vec<OwnershipChange>,
 }
 
 impl OwnershipHistory {
-    /// Добавить изменение количества с известной степенью точности расчёта.
+    /// Add a quantity change with a known degree of settlement-date precision.
     pub fn observe(&mut self, delta: Quantity, settlement: SettlementKnowledge) {
         self.changes.push(OwnershipChange { delta, settlement });
     }
 
-    /// Вывести владение из минимального и максимального возможного остатка.
+    /// Derive ownership from the minimum and maximum possible balances.
     ///
-    /// Ошибка возможна только в сторону лишнего `Unknown`: неопределённое
-    /// событие расширяет диапазон, а не позволяет получить ложные `Owned`
-    /// или `NotOwned`.
+    /// The only possible error is an extra `Unknown`: an indeterminate
+    /// event widens the range rather than producing a false `Owned`
+    /// or `NotOwned`.
     #[must_use]
     pub fn ownership_at(&self, day: Date) -> Ownership {
         let mut minimum = Dec::zero();
@@ -96,8 +96,8 @@ mod tests {
 
     #[test]
     fn overlapping_settlement_windows_make_ownership_unknown_without_crossing_zero_in_journal() {
-        // Даже при журнальном переходе 1→2→1 продажа могла рассчитаться
-        // первой, поэтому на 11 и 12 марта фактический остаток мог быть нулём.
+        // Even with the journal transition 1→2→1, the sale could have settled
+        // first, so the actual balance could have been zero on March 11 and 12.
         let mut history = OwnershipHistory::default();
         history.observe(
             quantity(1),
@@ -134,8 +134,8 @@ mod tests {
 
     #[test]
     fn exact_settlement_has_no_false_boundary_at_the_settlement_date() {
-        // На дате расчёта закрытый интервал даёт Maybe, а не придуманное
-        // начало или конец внутридневного перехода прав.
+        // On the settlement date, the closed interval yields Maybe, rather than an invented
+        // start or end of the intraday transfer of rights.
         let date = date!(2026 - 03 - 10);
         let mut history = OwnershipHistory::default();
         history.observe(quantity(1), SettlementKnowledge::Exact(date));
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn exact_sale_is_owned_before_and_not_owned_after_its_settlement() {
-        // Точная продажа закрывает владение только после даты её расчёта.
+        // A sale with an exact settlement date ends ownership only after that date.
         let bought = date!(2026 - 03 - 01);
         let sold = date!(2026 - 03 - 10);
         let mut history = OwnershipHistory::default();
@@ -172,9 +172,9 @@ mod tests {
 
     #[test]
     fn an_unbounded_sale_from_a_bad_source_preserves_a_proven_positive_minimum() {
-        // Плохой источник не делает неизвестным весь остаток: продажа 10
-        // без даты после точного приобретения 100 оставляет минимум 90,
-        // поэтому доказанное владение должно остаться Owned.
+        // An unreliable source does not make the entire balance unknown: a sale of 10
+        // without a date after an exact acquisition of 100 leaves a minimum of 90,
+        // so proven ownership must remain Owned.
         let mut history = OwnershipHistory::default();
         history.observe(
             quantity(100),
@@ -190,8 +190,8 @@ mod tests {
 
     #[test]
     fn quantity_bounds_use_decimal_checked_arithmetic() {
-        // Переполнение нельзя превратить в правдоподобное владение: безопасный
-        // отказ — Unknown, потому что точный диапазон больше не доказан.
+        // Overflow must not be turned into plausible ownership: the safe
+        // fallback is Unknown, because the exact range is no longer proven.
         let mut history = OwnershipHistory::default();
         history.observe(
             Quantity(Dec::new(Decimal::MAX)),

@@ -1,9 +1,9 @@
-//! Метаморфные тесты сверки (§15.6).
+//! Metamorphic reconciliation tests (§15.6).
 //!
-//! Метаморфное отношение проверяет не конкретное число, а поведение при
-//! известном преобразовании входа. Здесь это главное: сверка обязана
-//! **не заметить** компенсирующую ошибку разбора — и обязана не выдать
-//! за независимое подтверждение то, что им не является.
+//! A metamorphic relation checks behavior under a known input transformation,
+//! not a specific number. That is the key here: reconciliation must
+//! **not detect** a compensating parsing error—and must not
+//! present as independent confirmation something that is not independent.
 
 use iaam_core::event::Event;
 use iaam_core::event::kind::EventKind;
@@ -25,12 +25,12 @@ fn march() -> AssertionPeriod {
     AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31)).unwrap()
 }
 
-/// Журнал одного документа: операция и полный набор контрольных секций,
-/// согласованных между собой.
+/// A single-document journal: an operation and a complete set of control sections
+/// consistent with one another.
 ///
-/// `shift` сдвигает **обе** стороны сразу — это и есть компенсирующая
-/// ошибка парсера: одна и та же ошибка разбора попала и в операцию,
-/// и в контрольную секцию.
+/// `shift` shifts **both** sides at once—this is the compensating
+/// parser error: the same parsing error affected both the operation
+/// and the control section.
 fn statement(owner: OwnerId, account: AccountId, channel: &TestChannel, shift: i64) -> Vec<Event> {
     let deposit = 100_000 + shift;
     let mut events = vec![event_on(
@@ -86,10 +86,10 @@ fn statement(owner: OwnerId, account: AccountId, channel: &TestChannel, shift: i
 
 #[test]
 fn a_compensating_parser_error_never_reaches_independent() {
-    // Критерий приёмки эпика. Парсер ошибся на семь копеек одинаково
-    // в операции и в контрольной секции: обе стороны съехали, сверка
-    // сошлась, и это ровно тот случай, ради которого §10.3 вводит
-    // третий уровень вместо двух. Статус обязан остаться internal.
+    // The epic acceptance criterion. The parser made the same seven-kopeck error
+    // in the operation and the control section: both sides shifted, reconciliation
+    // still matched, and this is exactly the case for which §10.3 introduces
+    // a third level instead of two. The status must remain internal.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
 
@@ -113,9 +113,9 @@ fn a_compensating_parser_error_never_reaches_independent() {
 
     assert_eq!(
         honest_status, skewed_status,
-        "сверка внутри одного документа не отличает верный разбор от \
-         компенсирующе неверного — и именно поэтому не имеет права \
-         называть его независимым"
+        "reconciliation within a single document cannot distinguish a correct parse from \
+         an incorrect parse with compensating errors—and that is exactly why it must not \
+         call it independent"
     );
     assert_eq!(skewed_status, DimensionStatus::AcceptedInternal);
     assert_ne!(skewed_status, DimensionStatus::AcceptedIndependent);
@@ -123,9 +123,9 @@ fn a_compensating_parser_error_never_reaches_independent() {
 
 #[test]
 fn a_second_channel_catches_what_one_document_cannot() {
-    // Обратная сторона: ошибка, невидимая внутри документа, становится
-    // видимой, как только появляется независимый канал. Если бы это
-    // было не так, второй канал не имел бы смысла.
+    // Conversely, an error that is invisible within the document becomes
+    // visible as soon as an independent channel is introduced. If this
+    // were not the case, the second channel would be pointless.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
 
@@ -135,8 +135,8 @@ fn a_second_channel_catches_what_one_document_cannot() {
         &TestChannel::new("tinkoff-xlsx/1", "march"),
         7,
     );
-    // Второй канал видит верную сумму — и расходится с журналом,
-    // в который попала ошибка первого.
+    // The second channel sees the correct amount—and disagrees with the journal,
+    // which contains the error from the first channel.
     let api = TestChannel::new("tinkoff-api/1", "apimarch");
     events.push(event_on(
         &api,
@@ -161,14 +161,14 @@ fn a_second_channel_catches_what_one_document_cannot() {
     assert_eq!(
         ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
         DimensionStatus::Discrepant,
-        "независимый канал обязан поймать ошибку, которую документ \
-         скрыл от самого себя"
+        "an independent channel must catch the error that the document \
+         concealed from itself"
     );
 }
 
 #[test]
 fn reordering_the_journal_does_not_change_any_status() {
-    // Проекция определяется журналом, а не порядком его чтения.
+    // The projection is determined by the journal, not by its read order.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let events = statement(
@@ -186,16 +186,16 @@ fn reordering_the_journal_does_not_change_any_status() {
         assert_eq!(
             straight.status_for(account, date!(2026 - 03 - 15), dimension),
             backwards.status_for(account, date!(2026 - 03 - 15), dimension),
-            "порядок чтения журнала изменил статус измерения {dimension:?}"
+            "journal read order changed the status of dimension {dimension:?}"
         );
     }
 }
 
 #[test]
 fn scaling_every_amount_keeps_the_status() {
-    // Умножение всех сумм на одно число — преобразование, при котором
-    // сверка обязана вести себя одинаково: она сравнивает стороны,
-    // а не оценивает масштаб.
+    // Multiplying all amounts by the same number is a transformation under which
+    // reconciliation must behave identically: it compares the two sides,
+    // rather than assessing the scale.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let small = ReconciliationLedger::build(&statement(

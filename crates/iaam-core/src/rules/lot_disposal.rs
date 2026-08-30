@@ -1,9 +1,9 @@
-//! Списание лотов (§4.12).
+//! Lot disposal (§4.12).
 //!
-//! FIFO предписан ст. 214.1 НК РФ, но **не является глобальной очередью
-//! по портфелю**: область задаётся налогоплательщиком, агентом, базой,
-//! инструментом, счётом, режимом и годом. На этапе 1 область — пара
-//! «счёт × инструмент»; расширение до полной области — эпик E5.
+//! FIFO is prescribed by Article 214.1 of the Russian Tax Code, but it is
+//! **not a global portfolio queue**: the scope is defined by taxpayer, agent,
+//! basis, instrument, account, regime, and year. At stage 1 the scope is the
+//! “account × instrument” pair; extending it to the full scope is epic E5.
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -25,43 +25,42 @@ impl LotId {
     }
 }
 
-/// Экономический лот: партия приобретения.
+/// Economic lot: a purchase batch.
 ///
-/// Позиция является проекцией набора лотов, а не самостоятельной сущностью.
-/// Без лотов невозможен ЛДВ: три года владения — свойство покупки,
-/// у позиции со средней ценой возраста нет.
+/// A position is a projection of a set of lots, not an independent entity.
+/// Without lots, the long-term ownership deduction is impossible: three years
+/// of ownership belong to the purchase, while an averaged position has no age.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lot {
     pub id: LotId,
     pub instrument: InstrumentId,
-    /// Может быть неизвестна для восстановленной позиции (§10.7).
+    /// May be unknown for a restored position (§10.7).
     pub acquired: Option<TradeDate>,
     pub quantity: Quantity,
     pub cost_basis: Money,
-    /// Историческая стоимость приобретения; амортизация её не уменьшает.
+    /// Historical acquisition cost; amortisation does not reduce it.
     #[serde(default)]
     pub acquisition_basis: Option<Money>,
-    /// НКД, уплаченный при приобретении лота; неизвестное не превращается
-    /// в ноль (§4.9).
+    /// Accrued interest paid when acquiring the lot; unknown does not become
+    /// zero (§4.9).
     #[serde(default)]
     pub accrued_interest_paid: Option<Money>,
-    /// Денежные выплаты, уже полученные этим лотом.
+    /// Cash payments already received for this lot.
     #[serde(default)]
     pub received_to_date: Option<Money>,
 }
 
-/// Идентификатор версии правила. Входит в результат и в след аудита.
+/// Identifier of the applied rule version. Included in the result and audit trail.
 ///
-/// Владеющая `String`, а не `&'static str`: десериализация заимствованной
-/// строки с временем жизни `'static` из обычного JSON не является корректным
-/// контрактом — входные данные столько не живут.
+/// An owned `String`, not `&'static str`: deserialising a borrowed string with
+/// a `'static` lifetime from ordinary JSON is not a valid contract — input data
+/// does not live that long.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RuleId(pub String);
 
 impl RuleId {
-    /// Тривиальная упаковка поля: логики, которую стоило бы вынести ради
-    /// мутационного заслона, здесь нет, поэтому слепота `cargo-mutants`
-    /// к имени `new` ничего не скрывает.
+    /// Trivial field wrapping: there is no logic worth moving out for the
+    /// mutation guard, so `cargo-mutants` being blind to `new` hides nothing.
     #[must_use]
     pub fn new(id: &str) -> Self {
         Self(id.to_owned())
@@ -70,12 +69,12 @@ impl RuleId {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisposalInput {
-    /// Лоты в порядке приобретения. Порядок обеспечивает вызывающий.
+    /// Lots in acquisition order. The caller provides the order.
     pub lots: Vec<Lot>,
     pub quantity: Quantity,
 }
 
-/// Часть лота, списанная при выбытии.
+/// Part of a lot disposed of in a sale.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisposedPart {
     pub lot: LotId,
@@ -90,36 +89,36 @@ pub struct DisposalResult {
     pub rule: RuleId,
     pub disposed: Vec<DisposedPart>,
     pub remaining: Vec<Lot>,
-    /// Суммарная списанная стоимость. Компонент тождества §6.5.
+    /// Total disposed basis. Component of identity §6.5.
     pub basis_released: Money,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DisposalError {
-    #[error("недостаточно количества: запрошено {requested}, доступно {available}")]
+    #[error("insufficient quantity: requested {requested}, available {available}")]
     InsufficientQuantity {
         requested: String,
         available: String,
     },
-    #[error("лоты в разных валютах не поддерживаются в одном выбытии")]
+    #[error("lots in different currencies are not supported in one disposal")]
     MixedCurrencies,
-    #[error("список лотов пуст")]
+    #[error("lot list is empty")]
     NoLots,
     #[error(transparent)]
     Money(#[from] MoneyError),
 }
 
-/// Стратегия списания. Доменная стратегия, **не порт ввода-вывода**:
-/// передаётся в ядро как неизменяемый вход, чистота сохраняется (§3.2).
+/// Disposal strategy. A domain strategy, **not an I/O port**:
+/// it is passed into the core as an immutable input, preserving purity (§3.2).
 pub trait LotDisposalRule: Send + Sync {
     fn id(&self) -> RuleId;
     fn apply(&self, input: &DisposalInput) -> Result<DisposalResult, DisposalError>;
 }
 
-/// FIFO по ст. 214.1 НК РФ.
+/// FIFO under Article 214.1 of the Russian Tax Code.
 ///
-/// Specific lot identification в РФ недоступна: продал — списались первые
-/// по времени приобретения, независимо от намерения.
+/// Specific-lot identification is unavailable in Russia: when you sell, the
+/// lots acquired earliest are disposed of regardless of intent.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FifoV1;
 
@@ -165,7 +164,7 @@ impl LotDisposalRule for FifoV1 {
                 continue;
             }
             if lot_qty <= left {
-                // Лот списывается целиком.
+                // The lot is disposed of in full.
                 disposed.push(DisposedPart {
                     lot: lot.id,
                     quantity: lot.quantity,
@@ -175,8 +174,9 @@ impl LotDisposalRule for FifoV1 {
                 });
                 left -= lot_qty;
             } else {
-                // Лот делится. Денежные величины разносится пропорционально
-                // количеству; остаток округления остаётся у невыбывшей части.
+                // The lot is split. Monetary values are allocated
+                // proportionally to quantity; rounding remainder stays with
+                // the part that remains.
                 let taken_basis = split_basis(lot.cost_basis, left, lot_qty)?;
                 let kept_basis = lot.cost_basis.try_sub(taken_basis)?;
                 let (taken_accrued_interest, kept_accrued_interest) =
@@ -215,17 +215,17 @@ impl LotDisposalRule for FifoV1 {
     }
 }
 
-/// Разнесение стоимости лота пропорционально списываемому количеству.
+/// Allocate a lot's basis proportionally to the disposed quantity.
 ///
-/// Округление — половина к чётному, однократно, на границе представления
-/// в минимальных единицах (§6.6). Остаток от округления остаётся
-/// в невыбывшей части: суммарная стоимость лота сохраняется.
+/// Rounding is half to even, once, at the representation boundary in minor
+/// units (§6.6). The rounding remainder stays with the undisposed part:
+/// the lot's total basis is preserved.
 pub(crate) fn split_basis(
     total: Money,
     taken_qty: Decimal,
     lot_qty: Decimal,
 ) -> Result<Money, DisposalError> {
-    debug_assert!(!lot_qty.is_zero(), "количество лота не может быть нулевым");
+    debug_assert!(!lot_qty.is_zero(), "lot quantity cannot be zero");
     let minor = Decimal::from(total.amount().raw());
     let scaled = (minor * taken_qty) / lot_qty;
     let rounded =
@@ -262,8 +262,8 @@ mod tests {
 
     #[test]
     fn a_lot_written_with_principal_still_reads_without_it() {
-        // Старый снимок содержит удалённое поле: лишние поля
-        // десериализатор Lot обязан игнорировать.
+        // The old snapshot contains a removed field: the Lot deserialiser must
+        // ignore unknown fields.
         let value = serde_json::json!({
             "id": LotId::new_random(),
             "instrument": InstrumentId::new_random(),
@@ -325,9 +325,9 @@ mod tests {
         Quantity(Dec::new(Decimal::from(n)))
     }
 
-    /// Два лота: сначала дороже, потом дешевле.
-    /// Ровно случай из постановки задачи: «купил 10 яблок дороже,
-    /// потом 10 дешевле, брокер показывает среднюю».
+    /// Two lots: first more expensive, then cheaper.
+    /// The exact case from the task statement: “bought 10 apples at a higher
+    /// price, then 10 cheaper; the broker shows an average”.
     fn two_lots() -> Vec<Lot> {
         vec![
             Lot {
@@ -337,7 +337,7 @@ mod tests {
                 accrued_interest_paid: None,
                 received_to_date: None,
                 quantity: qty(10),
-                cost_basis: rub(100_000), // 10 шт по 100 ₽
+                cost_basis: rub(100_000), // 10 units at 100 ₽ each
                 acquisition_basis: None,
             },
             Lot {
@@ -347,14 +347,14 @@ mod tests {
                 accrued_interest_paid: None,
                 received_to_date: None,
                 quantity: qty(10),
-                cost_basis: rub(90_000), // 10 шт по 90 ₽
+                cost_basis: rub(90_000), // 10 units at 90 ₽ each
                 acquisition_basis: None,
             },
         ]
     }
 
-    /// Один лот с заданными количеством и стоимостью — для проверки
-    /// разнесения стоимости при делении лота.
+    /// One lot with specified quantity and cost, for testing
+    /// cost allocation when splitting a lot.
     fn single_lot(quantity: i64, basis_minor: i64) -> Vec<Lot> {
         vec![Lot {
             id: LotId::new_random(),
@@ -379,12 +379,12 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(out.disposed.len(), 1, "списан ровно один лот");
-        assert_eq!(out.disposed[0].lot, lots[0].id, "списан первый по времени");
+        assert_eq!(out.disposed.len(), 1, "exactly one lot disposed");
+        assert_eq!(out.disposed[0].lot, lots[0].id, "earliest lot disposed");
         assert_eq!(
             out.basis_released,
             rub(100_000),
-            "по цене первого лота, не средней"
+            "at the first lot's price, not the average"
         );
         assert_eq!(out.remaining.len(), 1);
         assert_eq!(out.remaining[0].quantity, qty(10));
@@ -401,7 +401,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(out.disposed.len(), 2);
-        // 1000,00 за первый лот целиком + половина второго = 450,00
+        // 1000.00 for the first lot in full plus half of the second = 450.00
         assert_eq!(out.basis_released, rub(145_000));
         assert_eq!(out.disposed[1].lot, lots[1].id);
         assert_eq!(out.disposed[1].quantity, qty(5));
@@ -462,8 +462,8 @@ mod tests {
 
     #[test]
     fn an_empty_lot_list_is_an_error_not_a_zero_basis() {
-        // §4.9: неизвестное — не нулевая заглушка. Списывать не из чего —
-        // это отказ, а не выбытие на нулевую стоимость.
+        // §4.9: unknown is not a zero placeholder. There is nothing to dispose
+        // of: this is a refusal, not a disposal at zero cost.
         let out = FifoV1.apply(&DisposalInput {
             lots: Vec::new(),
             quantity: qty(1),
@@ -484,29 +484,29 @@ mod tests {
 
     #[test]
     fn splitting_rounds_halves_to_the_even_minor_unit() {
-        // 5 минимальных единиц на 2 штуки: половина — 2,5, к чётному → 2.
+        // 5 minor units for 2 units: half is 2.5, half to even → 2.
         let down = FifoV1
             .apply(&DisposalInput {
                 lots: single_lot(2, 5),
                 quantity: qty(1),
             })
             .unwrap();
-        assert_eq!(down.basis_released, rub(2), "2,5 → 2, а не 3");
+        assert_eq!(down.basis_released, rub(2), "2.5 → 2, not 3");
 
-        // 15 минимальных единиц на 2 штуки: половина — 7,5, к чётному → 8.
+        // 15 minor units for 2 units: half is 7.5, half to even → 8.
         let up = FifoV1
             .apply(&DisposalInput {
                 lots: single_lot(2, 15),
                 quantity: qty(1),
             })
             .unwrap();
-        assert_eq!(up.basis_released, rub(8), "7,5 → 8, а не 7");
+        assert_eq!(up.basis_released, rub(8), "7.5 → 8, not 7");
     }
 
     #[test]
     fn the_rounding_remainder_stays_with_the_part_not_disposed() {
-        // Суммарная стоимость лота сохраняется: округление не создаёт
-        // и не уничтожает копейки.
+        // The lot's total basis is preserved: rounding creates and destroys
+        // no kopecks.
         let out = FifoV1
             .apply(&DisposalInput {
                 lots: single_lot(3, 100),

@@ -1,8 +1,8 @@
-//! Сценарии видимых и изменяемых правил классификации.
+//! Scenarios for viewing and modifying classification rules.
 //!
-//! Хранилище отвечает только за историю версий. Разбор доменных JSON и
-//! вызов чистого пересчёта остаются в application-сценарии; сам алгоритм
-//! классификации принадлежит `iaam-ingest`.
+//! The store is responsible only for version history. Parsing domain JSON and
+//! invoking pure recomputation remain in the application scenario; the classification
+//! algorithm itself belongs to `iaam-ingest`.
 
 use std::collections::BTreeMap;
 
@@ -52,11 +52,11 @@ pub async fn retire_rule(
     recompute_history(services, principal.owner).await
 }
 
-/// Пересчитывает действующую историю после изменения правил.
+/// Recomputes the current history after rule changes.
 ///
-/// `recompute_plan` остаётся единственным местом, где определяется, какие
-/// события требуют исправления. Этот сценарий не меняет события
-/// самостоятельно и не выполняет денежную арифметику в оболочке.
+/// `recompute_plan` remains the sole place that determines which
+/// events require correction. This scenario does not modify events
+/// itself or perform monetary arithmetic in the wrapper.
 async fn recompute_history(services: &AppServices, owner: OwnerId) -> Result<(), AppError> {
     let events = services.store.load_events_through(owner, Date::MAX).await?;
     let stored = services.rules.list_rules(owner).await?;
@@ -71,7 +71,7 @@ async fn recompute_history(services: &AppServices, owner: OwnerId) -> Result<(),
         .collect::<BTreeMap<EventId, ClassificationSubject>>();
     recompute_plan(&events, &subjects, &rules)
         .map(|_| ())
-        .map_err(|error| AppError::Store(format!("пересчёт классификации: {error}")))
+        .map_err(|error| AppError::Store(format!("classification recomputation: {error}")))
 }
 
 fn domain_rule(rule: ClassificationRuleView) -> Result<ClassificationRule, AppError> {
@@ -94,12 +94,12 @@ fn json_object(raw: &str, field: &str) -> Result<Map<String, Value>, AppError> {
         Ok(Value::Object(object)) => Ok(object),
         Ok(_) => Err(AppError::Invalid {
             field: field.to_owned(),
-            expected: "JSON-объект правила классификации".to_owned(),
-            actual: "JSON не является объектом".to_owned(),
+            expected: "classification rule JSON object".to_owned(),
+            actual: "JSON is not an object".to_owned(),
         }),
         Err(error) => Err(AppError::Invalid {
             field: field.to_owned(),
-            expected: "JSON-объект правила классификации".to_owned(),
+            expected: "classification rule JSON object".to_owned(),
             actual: error.to_string(),
         }),
     }
@@ -115,7 +115,7 @@ fn optional_string(
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(actual) => Err(AppError::Invalid {
             field: group.to_owned(),
-            expected: format!("поле {field} является строкой"),
+            expected: format!("field {field} is a string"),
             actual: actual.to_string(),
         }),
     }
@@ -125,13 +125,13 @@ fn parse_outcome(outcome: Map<String, Value>) -> Result<Classification, AppError
     let kind = outcome
         .get("kind")
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid_outcome("поле kind"))?;
+        .ok_or_else(|| invalid_outcome("field kind"))?;
     match kind {
         "internal_transfer" => {
             let raw = outcome
                 .get("to")
                 .and_then(Value::as_str)
-                .ok_or_else(|| invalid_outcome("поле to"))?;
+                .ok_or_else(|| invalid_outcome("field to"))?;
             let to = Uuid::parse_str(raw).map_err(|_| invalid_outcome(raw))?;
             Ok(Classification::InternalTransfer { to: AccountId(to) })
         }
@@ -145,7 +145,7 @@ fn parse_outcome(outcome: Map<String, Value>) -> Result<Classification, AppError
                 Some("margin_interest") => FeeOrigin::MarginInterest,
                 Some("other") => FeeOrigin::Other,
                 Some(actual) => return Err(invalid_outcome(actual)),
-                None => return Err(invalid_outcome("поле origin")),
+                None => return Err(invalid_outcome("field origin")),
             },
         }),
         actual => Err(invalid_outcome(actual)),
@@ -155,7 +155,7 @@ fn parse_outcome(outcome: Map<String, Value>) -> Result<Classification, AppError
 fn invalid_outcome(actual: &str) -> AppError {
     AppError::Invalid {
         field: "outcome".to_owned(),
-        expected: "internal_transfer, external_flow, income или fee".to_owned(),
+        expected: "internal_transfer, external_flow, income or fee".to_owned(),
         actual: actual.to_owned(),
     }
 }
@@ -178,12 +178,12 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         | EventKind::OpeningCash { .. }
         | EventKind::Valuation { .. }
         | EventKind::ControlAssertion { .. }
-        // Корпоративное действие и оферта субъектом классификации
-        // не становятся. Отдать их как приход означало бы спросить
-        // владельца «этот приход — доход?» про амортизацию и записать
-        // его ответ правилом: возврат собственного капитала (§6.5)
-        // навсегда учёлся бы доходом. Та же причина, по которой
-        // `classification_of` возвращает по ним `None`.
+        // A corporate action and an offer do not become classification
+        // subjects. Returning them as inflows would mean asking
+        // the owner «this inflow — is it income?» about amortisation and recording
+        // their answer as a rule: a return of their own capital (§6.5)
+        // would forever be counted as income. This is also why
+        // `classification_of` returns `None` for them.
         | EventKind::CorporateAction { .. }
         | EventKind::OfferExercise { .. } => return None,
     };
@@ -239,10 +239,10 @@ mod tests {
 
     #[test]
     fn an_amortisation_is_not_offered_to_the_owner_as_an_inflow() {
-        // Отдать амортизацию субъектом с `Movement::In` означало бы
-        // спросить владельца «этот приход — доход?» и записать его ответ
-        // правилом: возврат собственного капитала (§6.5) навсегда
-        // учёлся бы доходом.
+        // Returning amortisation as a subject with `Movement::In` would mean
+        // asking the owner «this inflow — is it income?» and recording their answer
+        // as a rule: a return of their own capital (§6.5) would forever
+        // be counted as income.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let compensation = rub(2_000_000);

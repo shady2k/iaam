@@ -1,9 +1,9 @@
-//! Словарь кодов рыночного источника (§2.5 спеки E3.4).
+//! Market source code dictionary (§2.5 of the E3.4 spec).
 //!
-//! Тот же механизм, что `broker_operation_kinds`, и по той же причине:
-//! множество кодов принадлежит источнику, а не нам. Вид права по оферте
-//! у MOEX — свободный русский текст, и `match` по нему ломается от правки
-//! формулировки на стороне биржи.
+//! The same mechanism as `broker_operation_kinds`, for the same reason:
+//! many codes belong to the source, not to us. The right type in the offer
+//! at MOEX is free-form Russian text, and matching on it breaks when the
+//! exchange changes the wording.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +11,7 @@ use rusqlite::{TransactionBehavior, params};
 
 use crate::{SqliteStore, StoreError, now};
 
-/// Строка словаря.
+/// Dictionary entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceCodeEntry {
     pub domain: String,
@@ -19,10 +19,10 @@ pub struct SourceCodeEntry {
     pub meaning: String,
 }
 
-/// Итог пополнения.
+/// Result of adding entries.
 ///
-/// `already_known` считается отдельно: «добавили» и «уже знали» — разные
-/// события, и слить их значит потерять признак расхождения с источником.
+/// `already_known` is counted separately: “added” and “already known” are different
+/// events, and merging them would lose the indication of a discrepancy with the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DictionaryOutcome {
     pub added: usize,
@@ -30,7 +30,7 @@ pub struct DictionaryOutcome {
 }
 
 impl SqliteStore {
-    /// Пополнить словарь засевом. Существующие строки не трогаются.
+    /// Seed the dictionary. Existing entries are left untouched.
     pub fn extend_market_source_codes(
         &mut self,
         source_id: &str,
@@ -69,7 +69,7 @@ impl SqliteStore {
         })
     }
 
-    /// Записать решение владельца. Оно перекрывает засев и им не затирается.
+    /// Record the owner's decision. It overrides the seed and is not overwritten by it.
     pub fn set_market_source_code(
         &mut self,
         source_id: &str,
@@ -93,7 +93,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Прочитать словарь одной области целиком.
+    /// Read the entire dictionary for one area.
     pub fn market_source_codes(
         &self,
         source_id: &str,

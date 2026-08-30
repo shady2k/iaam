@@ -1,11 +1,11 @@
-//! Проекции журнала со снимками (§3.1).
+//! Snapshot-based log projections (§3.1).
 //!
-//! «Весь журнал в память» — умолчание, а не архитектурный инвариант.
-//! Поэтому публичный интерфейс с самого начала знает про снимок:
-//! [`project`] строит его с нуля, [`advance`] продвигает существующий,
-//! и полный пересчёт остаётся эталоном для инкрементального.
+//! “The entire log in memory” is the default, not an architectural invariant.
+//! Therefore, the public interface supports snapshots from the outset:
+//! [`project`] builds one from scratch, [`advance`] advances an existing one,
+//! and full recomputation remains the reference for the incremental path.
 //!
-//! Снимки и кэш хранит **оболочка**: ядро остаётся без состояния.
+//! Snapshots and the cache are stored by the **wrapper**: the core remains stateless.
 
 pub mod active_instruments;
 pub mod balances;
@@ -36,18 +36,18 @@ use invariants::{InvariantReport, InvariantViolation};
 use lots::{LotBook, LotError};
 use state::{LedgerState, StateHash};
 
-/// Версия формата проекции. Снимок, построенный другой версией,
-/// продвигать нельзя: смысл полей мог измениться.
+/// Projection format version. A snapshot built by another version
+/// cannot be advanced: the meaning of its fields may have changed.
 ///
-/// Версия 7: номинал ушёл из лота, отпечаток префикса покрывает
-/// содержимое события (`prefix_digest/v2`). Снимки версии 6 несовместимы
-/// и вызывают полный пересчёт.
+/// Version 7: face value was removed from the lot, and the prefix fingerprint covers
+/// the event contents (`prefix_digest/v2`). Version 6 snapshots are incompatible
+/// and trigger a full recomputation.
 pub const PROJECTION_VERSION: u32 = 7;
 
-/// Неизменяемый вход проекции: границы контура и версии правил.
+/// Immutable projection input: scope boundaries and rule versions.
 ///
-/// `Debug` не выводится: `RuleRegistry` хранит трейт-объекты стратегий,
-/// у которых отладочного представления нет и быть не может.
+/// `Debug` is not derived: `RuleRegistry` stores strategy trait objects
+/// that do not and cannot have a debug representation.
 #[derive(Clone, Copy)]
 pub struct ProjectionContext<'a> {
     pub contour: &'a ContourDefinition,
@@ -57,13 +57,15 @@ pub struct ProjectionContext<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProjectionError {
-    #[error("снимок построен версией проекции {found}, текущая — {expected}")]
+    #[error("snapshot was built by projection version {found}, current version is {expected}")]
     SnapshotVersionMismatch { expected: u32, found: u32 },
-    #[error("отпечаток снимка не совпадает с его состоянием: снимок собран мимо ядра")]
+    #[error(
+        "snapshot fingerprint does not match its state: snapshot was assembled without the core"
+    )]
     SnapshotFingerprintMismatch,
     #[error(
-        "снимок построен для контура {snapshot_contour:?} версии {snapshot_version:?}, \
-         запрошен {requested_contour:?} версии {requested_version:?}"
+        "snapshot was built for scope {snapshot_contour:?} version {snapshot_version:?}, \
+         requested {requested_contour:?} version {requested_version:?}"
     )]
     SnapshotContourMismatch {
         snapshot_contour: ContourId,
@@ -71,14 +73,14 @@ pub enum ProjectionError {
         requested_contour: ContourId,
         requested_version: ContourVersion,
     },
-    #[error("снимок построен правилом списания {snapshot:?}, запрошено {requested:?}")]
+    #[error("snapshot was built with disposal rule {snapshot:?}, requested {requested:?}")]
     SnapshotRuleMismatch {
         snapshot: LotRuleVersion,
         requested: LotRuleVersion,
     },
     #[error(
-        "действующий журнал до границы снимка изменился: снимок продвигать нельзя, \
-         нужен полный пересчёт"
+        "the active log up to the snapshot boundary has changed: the snapshot cannot be advanced, \
+         a full recomputation is required"
     )]
     PrefixChanged {
         expected: StateHash,
@@ -99,7 +101,7 @@ pub enum ProjectionError {
 }
 
 impl ProjectionError {
-    /// Машиночитаемый код для API и логов.
+    /// Machine-readable code for APIs and logs.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -117,14 +119,14 @@ impl ProjectionError {
         }
     }
 
-    /// Отличает нарушение инварианта от неполноты входа (§15.2).
+    /// Distinguishes an invariant violation from incomplete input (§15.2).
     #[must_use]
     pub const fn is_invariant_violation(&self) -> bool {
         matches!(self, Self::Invariant(_))
     }
 }
 
-/// Снимок состояния на границе `through`.
+/// State snapshot at the `through` boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     projection_version: u32,
@@ -134,7 +136,7 @@ pub struct Snapshot {
     through: Option<EffectiveOrder>,
     state: LedgerState,
     fingerprint: StateHash,
-    /// Отпечаток действующего журнала, свёрнутого в этот снимок.
+    /// Fingerprint of the active log folded into this snapshot.
     prefix_digest: StateHash,
 }
 
@@ -174,19 +176,19 @@ impl Snapshot {
         self.fingerprint
     }
 
-    /// Отпечаток свёрнутого префикса журнала. Позволяет отличить
-    /// «журнал тот же» от «журнал изменился до границы снимка».
+    /// Fingerprint of the folded log prefix. Distinguishes
+    /// “the log is unchanged” from “the log changed before the snapshot boundary”.
     #[must_use]
     pub const fn prefix_digest(&self) -> StateHash {
         self.prefix_digest
     }
 }
 
-/// Разобранный снимок.
+/// Decomposed snapshot.
 ///
-/// Существует ради хранилища: снимок кладётся в базу по частям и
-/// собирается обратно. Собранный таким образом снимок ядро проверяет
-/// отпечатком — оболочка могла собрать его неверно или не полностью.
+/// Exists for storage: the snapshot is stored in the database in parts and
+/// assembled again. The core verifies a snapshot assembled this way
+/// using its fingerprint—the wrapper may have assembled it incorrectly or incompletely.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotParts {
     pub projection_version: u32,
@@ -200,9 +202,9 @@ pub struct SnapshotParts {
 }
 
 impl Snapshot {
-    /// Сборка снимка из сохранённых частей. Отпечаток **не** пересчитывается:
-    /// смысл проверки в `advance` именно в том, чтобы сравнить заявленный
-    /// отпечаток с фактическим состоянием.
+    /// Assembles a snapshot from stored parts. The fingerprint is **not** recomputed:
+    /// the point of the check in `advance` is precisely to compare the declared
+    /// fingerprint against the actual state.
     #[must_use]
     pub fn restore(parts: SnapshotParts) -> Self {
         Self {
@@ -232,7 +234,7 @@ impl Snapshot {
     }
 }
 
-/// Результат проекции: снимок плюс перечень проверенных инвариантов.
+/// Projection result: a snapshot plus the list of verified invariants.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Projection {
     snapshot: Snapshot,
@@ -261,28 +263,28 @@ impl Projection {
     }
 }
 
-/// Полный пересчёт с нуля. Эталон для [`advance`].
+/// Full recomputation from scratch. The reference for [`advance`].
 pub fn project(events: &[Event], ctx: &ProjectionContext) -> Result<Projection, ProjectionError> {
     let state = LedgerState::new(LotBook::new(ctx.lot_rule));
     let effective = resolve(events)?;
     fold(state, &[], &effective, ctx)
 }
 
-/// Продвижение снимка **полным срезом журнала**.
+/// Advances a snapshot using a **full log slice**.
 ///
-/// Принимает тот же срез, что и [`project`], а не «пачку новых событий».
-/// Это не удобство, а требование корректности: событие, добавленное
-/// задним числом до границы снимка, не меняет ни границу, ни состояние
-/// снимка. Вызывающий, отбирающий «всё, что позже границы», молча
-/// потеряет такое событие — и получит правдоподобные, но неверные
-/// остатки, лоты и доходность. Проверено ревью: ровно этот дефект был
-/// в первой редакции этого модуля.
+/// Takes the same slice as [`project`], not a “batch of new events”.
+/// This is not a convenience but a correctness requirement: an event added
+/// retroactively before the snapshot boundary changes neither the boundary nor the state
+/// of the snapshot. A caller that selects “everything after the boundary” will silently
+/// miss such an event—and obtain plausible but incorrect
+/// balances, lots, and returns. Code review confirmed this: this exact bug was
+/// present in the first revision of this module.
 ///
-/// Поэтому решение о применимости снимка принимает ядро: оно сворачивает
-/// действующий набор, сравнивает отпечаток префикса и продвигает состояние
-/// только тем, что за границей. Несовпадение префикса — не ошибка работы,
-/// а сигнал «нужен полный пересчёт»; сторнирование события внутри снимка
-/// проявляется именно так, потому что удаляет его из действующего набора.
+/// Therefore, the core determines whether the snapshot is applicable: it folds
+/// the active set, compares the prefix fingerprint, and advances the state
+/// only with events beyond the boundary. A prefix mismatch is not an operational error,
+/// but a signal that “a full recomputation is required”; reversing an event within the snapshot
+/// appears exactly this way because it removes the event from the active set.
 pub fn advance(
     previous: &Snapshot,
     events: &[Event],
@@ -330,12 +332,12 @@ pub fn advance(
     fold(previous.state.clone(), prefix, suffix, ctx)
 }
 
-/// Применение действующего набора событий к состоянию.
+/// Applies the active event set to the state.
 ///
-/// Три независимых читателя журнала — остатки, лоты, потоки — вызываются
-/// по очереди для каждого события. Общих вспомогательных функций у них
-/// нет намеренно: инвариант «сумма лотов равна позиции» держится ровно
-/// на этой независимости (§15.4).
+/// Three independent log readers—balances, lots, and flows—are invoked
+/// in sequence for each event. They intentionally share no helper functions:
+/// the invariant “the sum of lots equals the position” holds precisely
+/// because of this independence (§15.4).
 fn fold(
     mut state: LedgerState,
     already_applied: &[&Event],
@@ -372,9 +374,9 @@ fn fold(
         through = Some(event.order);
     }
 
-    // Инварианты проверяются по всему действующему набору, а не только
-    // по продвинутой части: состояние общее, и нарушение могло прийти
-    // из снимка, которому ядро не обязано верить (§15.2).
+    // Invariants are checked against the entire active set, not only
+    // the advanced portion: the state is shared, and the violation may have come
+    // from a snapshot that the core is not required to trust (§15.2).
     let all: Vec<&Event> = already_applied
         .iter()
         .chain(effective.iter())
@@ -442,9 +444,9 @@ mod tests {
 
     #[test]
     fn a_snapshot_reports_its_version_and_its_boundary() {
-        // Версия проекции и граница снимка — контракт хранилища: по ним
-        // оболочка решает, годится ли снимок вообще. Молчаливый ноль
-        // вместо версии сделал бы негодный снимок пригодным.
+        // The projection version and snapshot boundary form the storage contract: based on them
+        // the wrapper decides whether the snapshot is usable at all. A silent zero
+        // instead of the version would make an unusable snapshot usable.
         let account = AccountId::new_random();
         let contour = contour_of(account);
         let rules = RuleRegistry::with_defaults();
@@ -459,7 +461,7 @@ mod tests {
         assert_eq!(
             empty.snapshot.through(),
             None,
-            "у пустого журнала границы нет"
+            "an empty log has no boundary"
         );
 
         let events = deposits(account);
@@ -468,13 +470,13 @@ mod tests {
         assert_eq!(
             full.snapshot.through(),
             Some(events[3].order),
-            "граница — порядок последнего действующего события"
+            "the boundary is the order of the last active event"
         );
 
-        // Снимок, пришедший из хранилища, несёт СВОЮ версию, а не версию
-        // текущего кода: именно на этом различии держится отказ
-        // `SnapshotVersionMismatch`. Аксессор, возвращающий константу,
-        // сделал бы снимок чужой версии пригодным.
+        // A snapshot loaded from storage carries ITS OWN version, not the version
+        // of the current code: rejection with
+        // `SnapshotVersionMismatch` depends on exactly this distinction. An accessor returning a constant
+        // would make a snapshot from another version usable.
         let foreign = Snapshot::restore(SnapshotParts {
             projection_version: PROJECTION_VERSION + 41,
             ..full.snapshot.into_parts()
@@ -488,8 +490,8 @@ mod tests {
 
     #[test]
     fn only_an_invariant_violation_is_reported_as_one() {
-        // §15.2 требует отличать нарушение инварианта от неполноты входа:
-        // первое отменяет отчёт, второе помечает его невычислимым.
+        // §15.2 requires distinguishing an invariant violation from incomplete input:
+        // the former invalidates the report, while the latter marks it as uncomputable.
         let mismatched = ProjectionError::SnapshotRuleMismatch {
             snapshot: LotRuleVersion(1),
             requested: LotRuleVersion(2),
@@ -511,8 +513,8 @@ mod tests {
 
     #[test]
     fn advancing_a_snapshot_equals_a_full_recompute() {
-        // Инкрементальный путь обязан совпадать с эталонным: снимок —
-        // оптимизация, а не другая модель (§3.1).
+        // The incremental path must match the reference path: a snapshot is
+        // an optimization, not a different model (§3.1).
         let account = AccountId::new_random();
         let contour = contour_of(account);
         let rules = RuleRegistry::with_defaults();
@@ -525,7 +527,7 @@ mod tests {
 
         let full = project(&events, &ctx).unwrap();
         let head = project(&events[..2], &ctx).unwrap();
-        // Срез передаётся целиком: ядро само решает, что уже свёрнуто.
+        // The full slice is passed in: the core decides what has already been folded.
         let advanced = advance(head.snapshot(), &events, &ctx).unwrap();
 
         assert_eq!(
@@ -541,8 +543,8 @@ mod tests {
 
     #[test]
     fn import_order_does_not_change_the_projection() {
-        // Свойство §15.3: проекция зависит от EffectiveOrder, а не от того,
-        // в каком порядке загрузили файлы.
+        // Property §15.3: the projection depends on EffectiveOrder, not on
+        // the order in which the files were loaded.
         let account = AccountId::new_random();
         let contour = contour_of(account);
         let rules = RuleRegistry::with_defaults();
@@ -563,7 +565,7 @@ mod tests {
 
     #[test]
     fn a_tampered_snapshot_is_rejected() {
-        // Снимок хранит оболочка; ядро не обязано ей верить.
+        // The wrapper stores the snapshot; the core is not required to trust it.
         let account = AccountId::new_random();
         let contour = contour_of(account);
         let rules = RuleRegistry::with_defaults();
@@ -575,8 +577,8 @@ mod tests {
         let events = deposits(account);
         let snapshot = project(&events, &ctx).unwrap().into_snapshot();
 
-        // Оболочка собрала снимок из частей и подставила чужое состояние,
-        // оставив прежний отпечаток.
+        // The wrapper assembled the snapshot from parts and substituted an unrelated state,
+        // while retaining the old fingerprint.
         let other = project(&events[..2], &ctx).unwrap().into_snapshot();
         let mut parts = snapshot.into_parts();
         parts.state = other.into_parts().state;
@@ -590,11 +592,11 @@ mod tests {
 
     #[test]
     fn an_event_inserted_before_the_snapshot_boundary_forces_a_full_recompute() {
-        // Самый опасный случай: событие пришло задним числом и встало
-        // ДО границы снимка. Оно не меняет ни границу, ни состояние
-        // снимка, поэтому наивное «взять всё, что позже границы» молча
-        // потеряло бы его — и выдало бы правдоподобные, но неверные
-        // остатки. Ядро обязано это заметить.
+        // The most dangerous case: an event arrived retroactively and was inserted
+        // BEFORE the snapshot boundary. It changes neither the boundary nor the state
+        // of the snapshot, so a naive “take everything after the boundary” would silently
+        // miss it—and produce plausible but incorrect
+        // balances. The core must detect this.
         let account = AccountId::new_random();
         let contour = contour_of(account);
         let rules = RuleRegistry::with_defaults();
@@ -606,7 +608,7 @@ mod tests {
         let events = deposits(account);
         let snapshot = project(&events, &ctx).unwrap().into_snapshot();
 
-        // Забытое пополнение с датой в середине уже свёрнутого периода.
+        // A forgotten deposit dated in the middle of the already folded period.
         let forgotten = event_with(
             account,
             date!(2025 - 01 - 02),
@@ -620,10 +622,10 @@ mod tests {
         let error = advance(&snapshot, &with_backdated, &ctx).unwrap_err();
         assert!(
             matches!(error, ProjectionError::PrefixChanged { .. }),
-            "ожидалось PrefixChanged, получено {error}"
+            "expected PrefixChanged, got {error}"
         );
 
-        // Полный пересчёт видит забытое событие.
+        // A full recomputation sees the forgotten event.
         let recomputed = project(&with_backdated, &ctx).unwrap();
         assert_eq!(
             recomputed
@@ -636,9 +638,9 @@ mod tests {
 
     #[test]
     fn reversing_an_event_inside_the_snapshot_forces_a_full_recompute() {
-        // Сторнирование удаляет событие из действующего набора, то есть
-        // меняет уже свёрнутый префикс. Вычесть его из агрегата нельзя,
-        // и притвориться, что можно, значит тихо потерять исправление.
+        // A reversal removes an event from the active set, which means it
+        // changes the already folded prefix. It cannot be subtracted from the aggregate,
+        // and pretending otherwise means silently losing the correction.
         let account = AccountId::new_random();
         let contour = contour_of(account);
         let rules = RuleRegistry::with_defaults();
@@ -695,11 +697,11 @@ mod tests {
 
     #[test]
     fn a_leg_contradicting_the_event_never_reaches_the_projection() {
-        // Событие, чья нога говорит не то, что тип события, отклоняется
-        // входным заслоном — до того, как попадёт в append-only журнал.
-        // Инвариант «сумма лотов равна позиции» остаётся вторым рубежом:
-        // он ловит то же расхождение, если оно придёт из хранилища,
-        // наполненного в обход приёмки (§15.2).
+        // An event whose leg contradicts its event type is rejected
+        // by the input gate—before it enters the append-only log.
+        // The invariant “the sum of lots equals the position” remains the second line of defense:
+        // it catches the same mismatch if it comes from storage
+        // populated by bypassing ingestion (§15.2).
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = contour_of(account);
@@ -723,19 +725,19 @@ mod tests {
             },
             vec![
                 Leg::cash(account, rub(-1_000_000)),
-                // Нога говорит 90 бумаг, тип события — 100.
+                // The leg says 90 securities, while the event type says 100.
                 Leg::security(account, CustodyId::new_random(), instrument, qty(90)),
             ],
         );
 
-        // Заслон формы события отклоняет противоречие сам по себе.
+        // The event-shape gate rejects the contradiction on its own.
         assert!(matches!(
             event.validate_structure(),
             Err(crate::event::EventValidationError::LegDoesNotMatchEvent { .. })
         ));
 
-        // И проекция такого события не строит: она перепроверяет форму,
-        // потому что не обязана верить тому, что лежит в хранилище.
+        // Nor is a projection built from such an event: it rechecks the shape
+        // because it is not required to trust what is stored.
         let error = project(&[event], &ctx).unwrap_err();
         assert!(error.is_invariant_violation(), "{error}");
         assert_eq!(error.code(), "invariant");

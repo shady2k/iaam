@@ -1,8 +1,8 @@
-//! Ядро учёта инвестиций.
+//! Investment accounting core.
 //!
-//! Чистые синхронные функции над загруженным срезом данных.
-//! Ни ввода-вывода, ни `async`, ни `Mutex`, ни зависимостей на другие
-//! крейты воркспейса. См. §3.1 спецификации.
+//! Pure synchronous functions over a loaded data slice.
+//! No I/O, `async`, `Mutex`, or dependencies on other workspace crates.
+//! See §3.1 of the specification.
 
 pub mod bond;
 pub mod contour;

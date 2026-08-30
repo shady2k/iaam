@@ -1,4 +1,4 @@
-//! Знание о расчётах по событиям, меняющим количество.
+//! Settlement knowledge for events that change quantity.
 
 use std::collections::BTreeMap;
 
@@ -8,18 +8,18 @@ use time::{Date, Duration};
 use crate::dates::EventDates;
 use crate::event::provenance::ParserVersion;
 
-/// Что известно о дате фактического расчёта по событию.
+/// What is known about an event's actual settlement date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SettlementKnowledge {
-    /// Источник сообщил дату расчётов.
+    /// The source reported the settlement date.
     Exact(Date),
-    /// Известна дата сделки; расчёт произошёл где-то внутри полосы.
+    /// The trade date is known; settlement occurred somewhere within the band.
     Bounded { earliest: Date, latest: Date },
-    /// Смысл даты источника не доказан: расчёт мог произойти когда угодно.
+    /// The source date's meaning is unproven: settlement may have happened at any time.
     Unbounded,
 }
 
-/// Применилось ли событие к дате.
+/// Whether the event had taken effect by a date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
     Yes,
@@ -28,9 +28,9 @@ pub enum Applied {
 }
 
 impl SettlementKnowledge {
-    /// Интервал замкнут с обоих концов: внутридневного времени нет, поэтому
-    /// расчёт ровно в `latest` возможен. `Exact(d)` — тот же вырожденный
-    /// интервал `[d, d]`, поэтому на самой `d` ответ `Maybe`.
+    /// The interval is closed at both ends: there is no intraday time, so
+    /// settlement exactly on `latest` is possible. `Exact(d)` is the same
+    /// degenerate interval `[d, d]`, so the answer on `d` itself is `Maybe`.
     #[must_use]
     pub fn applied_before(&self, day: Date) -> Applied {
         match self {
@@ -51,19 +51,19 @@ impl SettlementKnowledge {
     }
 }
 
-/// Версия таблицы полос расчётов.
+/// Version of the settlement-lag table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SettlementLagPolicyVersion(pub u32);
 
-/// Максимальная задержка расчётов по профилю источника.
+/// Maximum settlement delay for a source profile.
 ///
-/// Дни календарные, а не рабочие: производственного календаря в ядре нет.
+/// Days are calendar days, not business days: the core has no production calendar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettlementLagPolicy {
     version: SettlementLagPolicyVersion,
-    /// Таблица v1 намеренно пуста: ни один профиль пока не имеет письменного
-    /// обоснования верхней границы задержки. Добавление профиля требует такого
-    /// обоснования, а не наблюдения обычаев вроде «обычно T+1».
+    /// Table v1 is intentionally empty: no profile yet has a written
+    /// justification for an upper delay bound. Adding a profile requires that
+    /// justification, not an observation of habits such as “usually T+1”.
     max_calendar_days: BTreeMap<ParserVersion, u32>,
 }
 
@@ -88,14 +88,14 @@ impl SettlementLagPolicy {
         self.version
     }
 
-    /// Добавить доказанную календарную полосу для конкретной версии парсера.
+    /// Add a proven calendar band for one parser version.
     #[must_use]
     pub fn with_profile(mut self, profile: ParserVersion, max_calendar_days: u32) -> Self {
         self.max_calendar_days.insert(profile, max_calendar_days);
         self
     }
 
-    /// Вывести знание о расчёте из дат события и профиля парсера.
+    /// Derive settlement knowledge from event dates and parser profile.
     #[must_use]
     pub fn knowledge(
         &self,
@@ -135,8 +135,8 @@ mod tests {
 
     #[test]
     fn exact_settlement_uses_a_closed_calendar_boundary() {
-        // На самой дате расчёта нельзя приписать событие началу дня без
-        // времени: это сохранило бы меньше неопределённости, чем есть.
+        // On the settlement date itself, the event cannot be assigned to the
+        // start of the day without a time; that would discard real uncertainty.
         let date = time::macros::date!(2026 - 03 - 10);
         let knowledge = SettlementKnowledge::Exact(date);
         assert_eq!(
@@ -152,8 +152,8 @@ mod tests {
 
     #[test]
     fn policy_prefers_exact_settlement_and_keeps_unknown_profiles_unbounded() {
-        // Одинаковое поле даты у разных профилей не даёт права переносить
-        // доказанную полосу одного источника на другой.
+        // The same date field in different profiles does not permit carrying
+        // one source's proven band over to another.
         let trade = time::macros::date!(2026 - 03 - 10);
         let exact = EventDates::for_trade(
             TradeDate(trade),

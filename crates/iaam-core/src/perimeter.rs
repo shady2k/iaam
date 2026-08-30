@@ -1,13 +1,13 @@
-//! Периметр: шорты, маржа, РЕПО и ПФИ вне периметра (§11).
+//! Perimeter: shorts, margin, repos, and derivatives are outside the perimeter (§11).
 //!
-//! Граница **возможностная, а не документная**: встретив
-//! неподдерживаемую операцию, система не отклоняет отчёт. Наблюдаемый
-//! денежный эффект сохраняется всегда; выдумывать экономику
-//! неподдерживаемого финансирования система отказывается.
+//! The boundary is **capability-based, not document-based**: encountering an
+//! unsupported operation does not reject the report. Its observable cash effect
+//! is always retained; the system refuses to invent unsupported financing
+//! economics.
 //!
-//! Отрицательный денежный остаток поддерживается и в long-only системе:
-//! он возникает из-за таймингов расчётов, комиссий и технического
-//! овердрафта. В NAV он входит обязательством, а не исчезает.
+//! Negative cash is supported even in a long-only system: it can arise from
+//! settlement timing, fees, and technical overdrafts. It enters NAV as a
+//! liability; it does not disappear.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,11 +22,11 @@ use crate::money::{CurrencyCode, PostedMinor};
 use crate::reconciliation::Dimension;
 use crate::reconciliation::check::ReconciliationException;
 
-/// Политика периметра.
+/// Perimeter policy.
 ///
-/// Окно расчётов задаётся параметром, а не константой: «допустимый
-/// срок» (§11) без торгового календаря не вычисляется, а календарь —
-/// это E3. Значение по умолчанию покрывает T+2 с выходными.
+/// The settlement window is a parameter, not a constant: a “permitted term”
+/// (§11) cannot be computed without a trading calendar, and the calendar is
+/// E3. The default covers T+2 with weekends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerimeterPolicy {
     pub settlement_window_days: u16,
@@ -40,14 +40,14 @@ impl Default for PerimeterPolicy {
     }
 }
 
-/// Классификация отрицательного остатка (§11, таблица).
+/// Classification of negative cash (§11, table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NegativeCashClassification {
-    /// Закрывается известным расчётом в допустимый срок: расчёты разрешены.
+    /// Closed by known settlement within the permitted term: settlement is allowed.
     TemporarySettlementDeficit,
-    /// Присутствуют проценты по марже или признак кредита.
+    /// Margin interest or a credit indicator is present.
     UnsupportedMarginLiability,
-    /// Причина неизвестна.
+    /// The reason is unknown.
     UnclassifiedNegativeCash,
 }
 
@@ -61,8 +61,8 @@ impl NegativeCashClassification {
         }
     }
 
-    /// Блокирует ли классификация налоговые и финансовые отчёты за
-    /// период (§11). Временный дефицит расчётов — нет.
+    /// Whether this classification blocks tax and financial reports for the
+    /// period (§11). A temporary settlement deficit does not.
     #[must_use]
     pub const fn blocks_reports(self) -> bool {
         match self {
@@ -72,32 +72,32 @@ impl NegativeCashClassification {
     }
 }
 
-/// Промежуток отрицательного остатка.
+/// Negative-cash interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NegativeCashSpan {
     pub account: AccountId,
     pub currency: CurrencyCode,
     pub from: Date,
-    /// Дата возврата в неотрицательный остаток. `None` — не закрылся.
+    /// Date on which the balance returned to non-negative. `None` means it remains open.
     pub resolved: Option<Date>,
     pub classification: NegativeCashClassification,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PerimeterError {
-    #[error("событие {event:?} не имеет даты и не может быть отнесено к промежутку")]
+    #[error("event {event:?} has no date and cannot be assigned to a span")]
     EventWithoutDate { event: EventId },
-    #[error("переполнение остатка счёта {account:?} в {currency:?}")]
+    #[error("account {account:?} balance overflow in {currency:?}")]
     Overflow {
         account: AccountId,
         currency: CurrencyCode,
     },
 }
 
-/// Исключения сверки, объяснённые границей периметра.
+/// Reconciliation exceptions explained by the perimeter boundary.
 ///
-/// Существуют, чтобы владелец не получал задание «починить» то, что
-/// система намеренно не поддерживает (§11).
+/// They prevent the owner from being told to “fix” something the system
+/// deliberately does not support (§11).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PerimeterExceptions {
     entries: Vec<(AccountId, Dimension, ReconciliationException)>,
@@ -136,18 +136,18 @@ impl PerimeterExceptions {
         self.entries.is_empty()
     }
 
-    /// Сколько различных исключений записано.
+    /// Number of distinct recorded exceptions.
     ///
-    /// Существует не для удобства: без него нельзя проверить, что
-    /// повтор одного исключения не удваивает список, а `is_empty`
-    /// на это не отвечает.
+    /// This is not just a convenience: without it one cannot verify that
+    /// repeating an exception does not duplicate the list, while `is_empty`
+    /// cannot answer that question.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 }
 
-/// Оценка периметра по журналу.
+/// Perimeter assessment from the journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PerimeterAssessment {
     policy: PerimeterPolicy,
@@ -156,7 +156,7 @@ pub struct PerimeterAssessment {
 }
 
 impl PerimeterAssessment {
-    /// Пустая оценка: журнала нет или он не рассматривался.
+    /// Empty assessment: there is no journal, or it was not examined.
     #[must_use]
     pub fn empty(policy: PerimeterPolicy) -> Self {
         Self {
@@ -176,17 +176,17 @@ impl PerimeterAssessment {
         self.policy
     }
 
-    /// Есть ли на счёте финансирование вне периметра.
+    /// Whether the account has financing outside the perimeter.
     #[must_use]
     pub fn financing_present(&self, account: AccountId) -> bool {
         self.financing.contains(&account)
     }
 
-    /// Отказываются ли налоговые и финансовые отчёты считаться по этому
-    /// счёту.
+    /// Whether tax and financial reports should refuse calculation for this
+    /// account.
     ///
-    /// Про **другие** счета не говорит ничего: §11 требует, чтобы
-    /// остальные продолжали считаться.
+    /// This says nothing about **other** accounts: §11 requires that the
+    /// remainder continue to be calculated.
     #[must_use]
     pub fn blocks_period_reports(&self, account: AccountId) -> bool {
         self.spans
@@ -194,7 +194,7 @@ impl PerimeterAssessment {
             .any(|span| span.account == account && span.classification.blocks_reports())
     }
 
-    /// Исключения сверки, следующие из оценки.
+    /// Reconciliation exceptions implied by the assessment.
     #[must_use]
     pub fn exceptions(&self) -> PerimeterExceptions {
         let mut exceptions = PerimeterExceptions::default();
@@ -209,9 +209,9 @@ impl PerimeterAssessment {
     }
 }
 
-/// Оценка периметра по журналу.
+/// Perimeter assessment from the journal.
 ///
-/// Логика вынесена из конструктора с именем `new` намеренно (§15.7).
+/// Logic is intentionally outside the constructor named `new` (§15.7).
 pub fn assess(
     events: &[Event],
     policy: PerimeterPolicy,
@@ -226,9 +226,8 @@ pub fn assess(
     }
     ordered.sort_by_key(|(date, event)| (*date, event.order));
 
-    // Признак кредита собирается по всему журналу заранее: проценты по
-    // марже могут быть списаны и после закрытия минуса, но относятся
-    // к нему.
+    // Detect credit across the whole journal up front: margin interest may be
+    // charged after the deficit closes, but still belongs to that deficit.
     let mut financing: BTreeSet<AccountId> = BTreeSet::new();
     for (_, event) in &ordered {
         if matches!(
@@ -273,7 +272,7 @@ pub fn assess(
             }
         }
     }
-    // Промежутки, не закрывшиеся до конца журнала.
+    // Intervals that remain open at the end of the journal.
     for (key, start) in open {
         spans.push(classify(key, start, None, &financing, policy));
     }
@@ -293,10 +292,10 @@ fn classify(
     policy: PerimeterPolicy,
 ) -> NegativeCashSpan {
     let (account, currency) = key;
-    // Порядок ветвей значим: признак кредита сильнее срока. Минус,
-    // закрывшийся за день, но сопровождённый процентами по марже,
-    // остаётся маржинальным обязательством — экономику финансирования
-    // система не достраивает независимо от того, как быстро он закрылся.
+    // Branch order matters: a credit indicator outranks the time limit. A
+    // deficit closed within a day but accompanied by margin interest remains a
+    // margin liability—the system does not invent financing economics regardless
+    // of how quickly it closed.
     let classification = if financing.contains(&account) {
         NegativeCashClassification::UnsupportedMarginLiability
     } else if resolved
@@ -322,9 +321,10 @@ mod tests {
 
     #[test]
     fn every_classification_has_a_distinct_machine_readable_code() {
-        // Внешний агент разбирает код, а не текст. Пустая строка вместо
-        // кода неотличима от «классификации нет», а один код на все три —
-        // от «минус есть, а какой, неизвестно».
+        // The external agent parses the code, not the text. An empty code is
+        // indistinguishable from “no classification”, while one code for all
+        // three is indistinguishable from “there is a deficit, but its kind is
+        // unknown”.
         let all = [
             NegativeCashClassification::TemporarySettlementDeficit,
             NegativeCashClassification::UnsupportedMarginLiability,
@@ -334,7 +334,7 @@ mod tests {
         let count = codes.len();
         codes.sort_unstable();
         codes.dedup();
-        assert_eq!(codes.len(), count, "коды классификаций совпали");
+        assert_eq!(codes.len(), count, "classification codes collided");
         assert_eq!(
             codes,
             vec![
@@ -347,9 +347,9 @@ mod tests {
 
     #[test]
     fn only_the_temporary_deficit_lets_period_reports_through() {
-        // §11: в двух случаях из трёх налоговые и финансовые отчёты
-        // за период возвращают not_computable. Ошибка здесь выдала бы
-        // экономику неподдерживаемого финансирования за посчитанную.
+        // §11: in two of three cases, tax and financial reports for the period
+        // return not_computable. A mistake here would report unsupported
+        // financing economics as calculated.
         assert!(!NegativeCashClassification::TemporarySettlementDeficit.blocks_reports());
         assert!(NegativeCashClassification::UnsupportedMarginLiability.blocks_reports());
         assert!(NegativeCashClassification::UnclassifiedNegativeCash.blocks_reports());
@@ -357,8 +357,8 @@ mod tests {
 
     #[test]
     fn an_exception_is_recorded_once_per_account_and_dimension() {
-        // Повтор того же исключения не удваивает список: владелец
-        // увидел бы одну причину дважды и решил, что проблем две.
+        // Repeating the same exception does not duplicate the list: the owner
+        // would see one reason twice and infer two problems.
         let account = AccountId::new_random();
         let mut exceptions = PerimeterExceptions::default();
         assert!(exceptions.is_empty());
@@ -378,14 +378,14 @@ mod tests {
             exceptions.covers(account, Dimension::Cash),
             Some(ReconciliationException::UnsupportedFinancingPresent)
         );
-        assert_eq!(exceptions.len(), 1, "повтор не добавил вторую запись");
+        assert_eq!(exceptions.len(), 1, "repeat did not add a second entry");
     }
 
     #[test]
     fn exceptions_are_kept_apart_by_account_dimension_and_reason() {
-        // Три поля ключа, и каждое обязано различать записи. Слипшийся
-        // ключ либо прячет исключение чужого счёта, либо накрывает
-        // измерение, которого причина не объясняет.
+        // Three key fields, and each must distinguish entries. A collapsed key
+        // either hides another account's exception or covers a dimension that
+        // the reason does not explain.
         let ours = AccountId::new_random();
         let theirs = AccountId::new_random();
         let mut exceptions = PerimeterExceptions::default();
@@ -411,7 +411,7 @@ mod tests {
             ReconciliationException::UnsupportedRepoEncumbrance,
         );
 
-        assert_eq!(exceptions.len(), 4, "различающиеся записи не слились");
+        assert_eq!(exceptions.len(), 4, "distinct entries were merged");
         assert_eq!(
             exceptions.covers(ours, Dimension::Positions),
             Some(ReconciliationException::UnsupportedRepoEncumbrance)
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(
             exceptions.covers(AccountId::new_random(), Dimension::Cash),
             None,
-            "счёт без исключений ничем не накрыт"
+            "account without exceptions is covered by nothing"
         );
     }
 

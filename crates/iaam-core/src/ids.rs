@@ -1,8 +1,8 @@
-//! Раздельные идентичности (§4.5).
+//! Separate identities (§4.5).
 //!
-//! Брокерский счёт не является одновременно владельцем, денежным счётом
-//! и местом хранения бумаг: перевод бумаг между депозитариями внутри
-//! одного брокера — реальная операция.
+//! A brokerage account is not simultaneously an owner, a cash account, and a
+//! place where securities are held: moving securities between custodians at
+//! one broker is a real operation.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -28,41 +28,41 @@ macro_rules! typed_id {
 }
 
 typed_id!(
-    /// Владелец портфеля.
+    /// Portfolio owner.
     OwnerId
 );
 typed_id!(
-    /// Денежный счёт: брокерский, банковский, вклад, кошелёк.
+    /// Cash account: brokerage account, bank account, deposit, or wallet.
     AccountId
 );
 typed_id!(
-    /// Место хранения бумаг (депозитарий, субсчёт).
+    /// Place where securities are held (custodian or sub-account).
     CustodyId
 );
 typed_id!(
-    /// Инструмент.
+    /// Instrument.
     InstrumentId
 );
 typed_id!(
-    /// Источник данных: конкретный отчёт, синхронизация, ручной ввод.
+    /// Data source: a specific report, synchronisation, or manual entry.
     SourceId
 );
 typed_id!(
-    /// Событие журнала.
+    /// Journal event.
     EventId
 );
 typed_id!(
-    /// Перевод денег между счетами. Связывает обе стороны движения:
-    /// без него классификатор контура не знает второй счёт (§4.10).
+    /// Transfer of money between accounts. Links both sides of the movement:
+    /// without it, the contour classifier cannot see the other account (§4.10).
     TransferId
 );
 typed_id!(
-    /// Правило классификации владельца (§10.4).
+    /// Owner classification rule (§10.4).
     ///
-    /// Не путать с [`crate::rules::lot_disposal::RuleId`]: тот называет
-    /// версию правила списания лотов (`fifo/214.1/v1`), одну на всю
-    /// программу, а этот — решение конкретного владельца о конкретной
-    /// операции, которое он заводит, правит и выводит из обращения.
+    /// Do not confuse this with [`crate::rules::lot_disposal::RuleId`], which
+    /// names the lot-disposal rule version (`fifo/214.1/v1`) used by the whole
+    /// program; this names one owner's decision about one operation, which the
+    /// owner creates, edits, and retires.
     ClassificationRuleId
 );
 
@@ -85,13 +85,13 @@ mod tests {
 
     #[test]
     fn ids_of_different_kinds_are_distinct_types() {
-        // Несовместимость типов проверена исполнением: строка ниже даёт
-        // E0308 «expected `AccountId`, found `OwnerId`». Постоянной
-        // проверки на это НЕТ — она требует trybuild, которого в этом
-        // плане не появляется; закомментированная строка её не заменяет.
+        // Type incompatibility is checked by execution: the line below would
+        // produce E0308, “expected `AccountId`, found `OwnerId`”. There is no
+        // permanent check for this—it would require trybuild, which is not in
+        // this plan; the commented-out line is not a substitute.
         // let _: AccountId = OwnerId::new_random();
         let a = AccountId::new_random();
         let b = AccountId::new_random();
-        assert_ne!(a, b, "два случайных идентификатора не совпадают");
+        assert_ne!(a, b, "two random identifiers are equal");
     }
 }

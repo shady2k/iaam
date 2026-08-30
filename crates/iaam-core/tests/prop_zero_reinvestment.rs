@@ -1,8 +1,8 @@
-//! Свойства и метаморфные проверки нулевого реинвестирования (§15.3, §15.6).
+//! Properties and metamorphic checks for zero reinvestment (§15.3, §15.6).
 //!
-//! Генераторы здесь не сужают область до удобных делителей: остаток
-//! распределения и порядок событий проверяются на произвольных допустимых
-//! количествах и денежных величинах.
+//! The generators here do not narrow the scope to convenient divisors: the distribution
+//! remainder and event order are checked for arbitrary valid
+//! quantities and monetary amounts.
 
 use std::collections::BTreeMap;
 
@@ -72,14 +72,14 @@ fn postings_wealth(plan: &CashflowPlan) -> Dec {
         .iter()
         .map(|posting| posting.amount.value())
         .try_fold(Dec::zero(), |sum, amount| sum.checked_add(amount))
-        .expect("сумма допустимых выплат не переполняется")
+        .expect("sum of valid payouts does not overflow")
 }
 
 proptest! {
-    /// Область: любые положительные количества когорт и любая положительная
-    /// выплата. `lifetime_cohort_metrics` распределяет каждый posting, а
-    /// последняя когорта получает точный остаток. Повторный вызов на том же
-    /// входе закрепляет детерминированность остатка.
+    /// Scope: any positive cohort quantities and any positive
+    /// payout. `lifetime_cohort_metrics` distributes each posting, and
+    /// the last cohort receives the exact remainder. Repeated invocation on the same
+    /// input establishes that the remainder is deterministic.
     #[test]
     fn every_payment_is_conserved_by_cohort_allocation(
         quantities in prop::collection::vec(1_i64..=1_000, 1..8),
@@ -102,12 +102,12 @@ proptest! {
 
         let first = lifetime_cohort_metrics(&cohorts, &plan);
         let second = lifetime_cohort_metrics(&cohorts, &plan);
-        prop_assert_eq!(&first, &second, "остаток распределения обязан быть детерминированным");
+        prop_assert_eq!(&first, &second, "distribution remainder must be deterministic");
 
         let metrics = match first {
             Computed::Value(metrics) => metrics,
             Computed::NotComputable { reason } => {
-                prop_assert!(false, "допустимое распределение отказало: {}", reason.code());
+                prop_assert!(false, "valid distribution failed: {}", reason.code());
                 return Ok(());
             }
         };
@@ -115,25 +115,25 @@ proptest! {
             .iter()
             .map(|cohort| match &cohort.metrics {
                 Computed::Value(ZeroReinvestmentMetrics { postings, .. }) => postings[0].amount.value(),
-                Computed::NotComputable { reason } => panic!("доля выплаты не вычислена: {}", reason.code()),
+                Computed::NotComputable { reason } => panic!("payout share was not computed: {}", reason.code()),
             })
             .try_fold(Dec::zero(), |sum, amount| sum.checked_add(amount))
-            .expect("сумма долей не переполняется");
+            .expect("sum of shares does not overflow");
         let difference = allocated
             .checked_sub(dec(payment))
-            .expect("разность сумм долей не переполняется");
+            .expect("difference between share sums does not overflow");
         prop_assert!(
             difference.inner().abs() <= Decimal::new(1, 2),
-            "разность {} превышает одну минорную единицу",
+            "difference {} exceeds one minor unit",
             difference.inner()
         );
     }
 
-    /// Область: один положительный лот, любое частичное (включая нулевое)
-    /// списание и известная либо неизвестная история выплат. Публичный
-    /// `DisposalResult` не содержит списанную received_to_date, поэтому
-    /// списанную долю считаем тем же детерминированным правилом округления и
-    /// проверяем инвариант «остаток = исходное − списанное».
+    /// Scope: one positive lot, any partial disposal (including zero),
+    /// and either known or unknown payout history. The public
+    /// `DisposalResult` does not contain the disposed received_to_date, so
+    /// we calculate the disposed share using the same deterministic rounding rule and
+    /// check the invariant «remainder = original − disposed».
     #[test]
     fn fifo_split_conserves_received_to_date(
         (quantity, sold, received) in (1_i64..=1_000).prop_flat_map(|quantity| {
@@ -156,7 +156,7 @@ proptest! {
                 lots: vec![lot],
                 quantity: qty(sold),
             })
-            .expect("списываемое количество находится в лоте");
+            .expect("disposed quantity is within the lot");
 
         match received {
             None => prop_assert_eq!(result.remaining[0].received_to_date, None),
@@ -167,7 +167,7 @@ proptest! {
                     .mantissa() as i64;
                 let remaining = result.remaining[0]
                     .received_to_date
-                    .expect("известная величина должна остаться известной")
+                    .expect("known value must remain known")
                     .amount()
                     .raw();
                 prop_assert_eq!(taken + remaining, original);
@@ -175,9 +175,9 @@ proptest! {
         }
     }
 
-    /// Область: положительный C0 и неотрицательное терминальное богатство.
-    /// При фиксированном C0 HPR = W_T / C0 − 1, поэтому увеличение W_T не
-    /// может уменьшить результат.
+    /// Scope: positive C0 and nonnegative terminal wealth.
+    /// For fixed C0, HPR = W_T / C0 − 1, so increasing W_T
+    /// cannot decrease the result.
     #[test]
     fn hpr_is_monotone_in_terminal_wealth(
         c0_minor in 1_i64..=100_000_000,
@@ -201,23 +201,23 @@ proptest! {
         let lower_hpr = match lower {
             Computed::Value(metrics) => match metrics.hpr {
                 Computed::Value(value) => value,
-                Computed::NotComputable { reason } => panic!("нижний HPR не вычислен: {}", reason.code()),
+                Computed::NotComputable { reason } => panic!("lower HPR was not computed: {}", reason.code()),
             },
-            Computed::NotComputable { reason } => panic!("нижняя метрика не вычислена: {}", reason.code()),
+            Computed::NotComputable { reason } => panic!("lower metric was not computed: {}", reason.code()),
         };
         let upper_hpr = match upper {
             Computed::Value(metrics) => match metrics.hpr {
                 Computed::Value(value) => value,
-                Computed::NotComputable { reason } => panic!("верхний HPR не вычислен: {}", reason.code()),
+                Computed::NotComputable { reason } => panic!("upper HPR was not computed: {}", reason.code()),
             },
-            Computed::NotComputable { reason } => panic!("верхняя метрика не вычислена: {}", reason.code()),
+            Computed::NotComputable { reason } => panic!("upper metric was not computed: {}", reason.code()),
         };
         prop_assert!(lower_hpr <= upper_hpr);
     }
 
-    /// Область: два валидных рублёвых графика, где второй добавляет вправо
-    /// известный купон и переносит часть возврата номинала на новую дату.
-    /// Сумма номинала сохраняется, а новый неотрицательный купон не уменьшает
+    /// Scope: two valid ruble-denominated schedules, where the second adds
+    /// a known coupon to the right and moves part of the principal repayment to a new date.
+    /// The total principal is preserved, and the new nonnegative coupon does not reduce
     /// terminal wealth.
     #[test]
     fn extending_schedule_to_the_right_does_not_reduce_terminal_wealth(
@@ -289,7 +289,7 @@ proptest! {
                 as_of,
                 report_currency: CurrencyCode::Rub,
             })
-            .expect("исходный график валиден");
+            .expect("original schedule is valid");
         let extended_plan = CashflowProjectionV1
             .future_postings(&iaam_core::rules::CashflowInput {
                 schedule: &extended,
@@ -298,16 +298,16 @@ proptest! {
                 as_of,
                 report_currency: CurrencyCode::Rub,
             })
-            .expect("удлинённый график валиден");
+            .expect("extended schedule is valid");
         prop_assert!(postings_wealth(&extended_plan) >= postings_wealth(&original_plan));
     }
 }
 
-/// Кто и куда записывает — тройка, неизменная для всех событий сценария.
+/// Who records what and where is represented by a triple that remains unchanged for all scenario events.
 ///
-/// Структура, а не три аргумента подряд: `OwnerId`, `SourceId` и
-/// `AccountId` — разные типы, но в списке из семи позиций перепутать их
-/// местами легко, а тест от этого молча поменяет смысл.
+/// Use a struct rather than three consecutive arguments: `OwnerId`, `SourceId`, and
+/// `AccountId` are distinct types, but in a seven-item argument list they are easy
+/// to swap, silently changing the meaning of the test.
 #[derive(Debug, Clone, Copy)]
 struct Party {
     owner: OwnerId,
@@ -332,7 +332,7 @@ fn event(party: Party, day: Date, sequence: u32, kind: EventKind, legs: Vec<Leg>
         legs,
         provenance: Provenance::new(
             source,
-            RawHash::parse(&"a".repeat(64)).expect("хеш"),
+            RawHash::parse(&"a".repeat(64)).expect("hash"),
             ParserVersion("prop-zero/1".into()),
         ),
         relation: Relation::None,
@@ -391,9 +391,9 @@ fn income_event(
 }
 
 proptest! {
-    /// Метаморфное свойство: перестановка входящих прошлых выплат не меняет
-    /// ни одну когорту. Порядок двух покупок фиксирован, а список выплат
-    /// циклически переставляется перед повторным импортом.
+    /// Metamorphic property: permuting incoming historical payouts does not change
+    /// any cohort. The order of the two purchases is fixed, while the payout list
+    /// is cyclically rotated before reimporting.
     #[test]
     fn permuting_import_order_of_past_payments_preserves_cohorts(
         first_quantity in 1_i64..=1_000,
@@ -448,8 +448,8 @@ proptest! {
     }
 }
 
-/// Метаморфное свойство: повторная синхронизация неизменного журнала через
-/// `advance` не меняет отчётные величины при той же координате знания.
+/// Metamorphic property: resynchronizing an unchanged journal via
+/// `advance` does not change the reported values at the same knowledge coordinate.
 #[test]
 fn resyncing_the_same_issue_keeps_every_report_number() {
     let account = AccountId::new_random();
@@ -475,9 +475,9 @@ fn resyncing_the_same_issue_keeps_every_report_number() {
         rules: &rules,
         lot_rule: LotRuleVersion(1),
     };
-    let initial = project(&events, &context).expect("исходная синхронизация строится");
+    let initial = project(&events, &context).expect("initial synchronization succeeds");
     let resynced = advance(initial.snapshot(), &events, &context)
-        .expect("повторная синхронизация неизменного журнала строится");
+        .expect("resynchronization of the unchanged journal succeeds");
     let fx = FxTable::new(FxSource::OwnerSupplied);
     let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
     let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
@@ -501,6 +501,6 @@ fn resyncing_the_same_issue_keeps_every_report_number() {
     assert_eq!(
         returns_report(initial.state(), &request),
         returns_report(resynced.state(), &request),
-        "неизменный выпуск не должен менять ни одной цифры отчёта",
+        "an unchanged issue must not change any report figures",
     );
 }

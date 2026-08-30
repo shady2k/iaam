@@ -1,9 +1,9 @@
-//! Деньги и количества.
+//! Money and quantities.
 //!
-//! Разделяются две категории величин (§3.4):
-//! - **проведённые суммы** — целые в минимальных единицах, в опубликованной
-//!   источником точности; это факты, их нельзя пересчитывать;
-//! - **расчётные величины** — [`crate::numeric::decimal::Dec`].
+//! Two categories of values are kept separate (§3.4):
+//! - **posted amounts**—integers in minor units, at the precision published by
+//!   the source; these are facts and must not be recalculated;
+//! - **calculated values**—[`crate::numeric::decimal::Dec`].
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -13,23 +13,22 @@ use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 use crate::numeric::exact::Exact;
 
-/// Валюта. Исчерпаемый `enum`, а не строка (§15.1): добавление валюты
-/// обязано сломать сборку везде, где её не обработали.
-/// Атрибут `#[non_exhaustive]` намеренно **не** применяется: он запретил бы
-/// исчерпывающий `match` внешним крейтам и тем самым отменил бы гарантию
-/// «добавление валюты ломает сборку везде, где её не обработали» (§15.1).
+/// Currency. An exhaustive `enum`, not a string (§15.1): adding a currency
+/// must break compilation everywhere it is not handled.
+/// `#[non_exhaustive]` is deliberately **not** used: it would prevent an
+/// exhaustive `match` in external crates and cancel that guarantee (§15.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CurrencyCode {
     Rub,
     Usd,
     Eur,
     Cny,
-    /// Золото в граммах — металлический счёт (§9.5).
+    /// Gold in grams—a metal account (§9.5).
     Xau,
 }
 
 impl CurrencyCode {
-    /// Число знаков после запятой в минимальной единице.
+    /// Number of decimal places in the minor unit.
     #[must_use]
     pub const fn minor_units(self) -> u32 {
         match self {
@@ -49,7 +48,7 @@ impl CurrencyCode {
         }
     }
 
-    /// Разбор ISO-кода без подстановки валюты по умолчанию.
+    /// Parse an ISO code without choosing a default currency.
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         [Self::Rub, Self::Usd, Self::Eur, Self::Cny, Self::Xau]
@@ -58,28 +57,27 @@ impl CurrencyCode {
     }
 }
 
-/// Проведённая сумма в минимальных единицах валюты.
+/// Posted amount in the currency's minor units.
 ///
-/// Обёртка, а не голый `i64`: смешать её с количеством бумаг или
-/// с расчётной величиной невозможно.
-/// Поле **приватное**: публичное `pub i64` делало бы тривиальным обход
-/// запрета на смешение валют — достаточно было бы сложить сырые `i64`.
-/// Доступ к сырому значению даётся только точному арифметическому слою
-/// и сериализации.
+/// A wrapper, not a bare `i64`: it cannot be mixed with a security quantity or
+/// a calculated value.
+/// The field is **private**: a public `pub i64` would make the currency-mixing
+/// prohibition trivial to bypass by adding raw `i64` values.
+/// Raw access is available only to exact arithmetic and serialisation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PostedMinor(i64);
 
 impl PostedMinor {
-    /// Тривиальная упаковка поля: логики, которую стоило бы вынести
-    /// в отдельную функцию ради мутационного заслона, здесь нет.
-    /// Слепота `cargo-mutants` к имени `new` тут ничего не скрывает.
+    /// Trivial field packing: there is no logic here worth extracting into a
+    /// separate function for the mutation guard.
+    /// `cargo-mutants`' blindness to the name `new` hides nothing here.
     #[must_use]
     pub const fn new(value: i64) -> Self {
         Self(value)
     }
 
-    /// Сырое значение. Предназначено для сериализации, форматирования
-    /// и перевода в точный режим — не для арифметики над деньгами.
+    /// Raw value. Intended for serialisation, formatting, and conversion to
+    /// exact mode—not for arithmetic on money.
     #[must_use]
     pub const fn raw(self) -> i64 {
         self.0
@@ -101,7 +99,8 @@ impl PostedMinor {
     }
 }
 
-/// Количество бумаг. Дробное — крипта и дробные остатки после сплитов.
+/// Security quantity. Fractional values support crypto and fractional
+/// remainders after splits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Quantity(pub Dec);
 
@@ -114,23 +113,23 @@ impl Quantity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MoneyError {
-    #[error("нельзя смешивать валюты: {left:?} и {right:?}")]
+    #[error("currencies cannot be mixed: {left:?} and {right:?}")]
     CurrencyMismatch {
         left: CurrencyCode,
         right: CurrencyCode,
     },
-    #[error("переполнение при сложении сумм")]
+    #[error("amount addition overflow")]
     Overflow,
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
 
-/// Денежная сумма с валютой.
+/// Monetary amount with a currency.
 ///
-/// **Намеренно не реализует `std::ops::Add`.** Сложить можно только через
-/// [`Money::try_add`], который обязывает обработать несовпадение валют.
-/// Это компенсация за рантайм-тег валюты вместо фантомного типа —
-/// обоснование в описании задачи 8 плана.
+/// **Deliberately does not implement `std::ops::Add`.** Addition is available
+/// only through [`Money::try_add`], which requires handling a currency mismatch.
+/// This compensates for a runtime currency tag instead of a phantom type—the
+/// rationale is in task 8 of the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Money {
     amount: PostedMinor,
@@ -138,10 +137,8 @@ pub struct Money {
 }
 
 impl Money {
-    /// Тривиальная упаковка двух полей: проверять при сборке нечего,
-    /// валюта и сумма независимы. Выносить в приватную функцию ради
-    /// мутационного заслона нечего — тела, которое он мог бы проверить,
-    /// не существует.
+    /// Trivial packing of two fields: the amount and currency are independent.
+    /// There is no body to extract for the mutation guard.
     #[must_use]
     pub const fn new(amount: PostedMinor, currency: CurrencyCode) -> Self {
         Self { amount, currency }
@@ -193,9 +190,9 @@ impl Money {
         })
     }
 
-    /// Вычитание через `checked_sub`, а **не** через отрицание:
-    /// `-i64::MIN` не представим, поэтому реализация через `negate`
-    /// делала бы метод паническим при обещанном в сигнатуре `Result`.
+    /// Subtract through `checked_sub`, **not** negation:
+    /// `-i64::MIN` is unrepresentable, so implementing this through `negate`
+    /// would make a method panic despite its `Result` contract.
     pub fn try_sub(self, other: Self) -> Result<Self, MoneyError> {
         self.require_same_currency(other)?;
         let amount = self
@@ -216,31 +213,31 @@ impl Money {
         })
     }
 
-    /// Сумма списка. Валюта задаётся явно, чтобы пустой список давал
-    /// осмысленный ноль, а не паниковал и не угадывал.
+    /// Sum a list. The currency is explicit so an empty list has a meaningful
+    /// zero rather than panicking or guessing.
     pub fn sum(items: &[Self], currency: CurrencyCode) -> Result<Self, MoneyError> {
         items
             .iter()
             .try_fold(Self::zero(currency), |acc, item| acc.try_add(*item))
     }
 
-    /// Переход в денежный режим: сумма как десятичная дробь.
+    /// Convert to calculated money: represent the amount as a decimal.
     ///
-    /// Единственная разрешённая точка перехода «проведённая сумма →
-    /// расчётная величина» (§3.4). Обратного перехода нет намеренно:
-    /// расчётная величина становится проведённой суммой только через
-    /// факт источника, а не через округление.
+    /// This is the only permitted transition from a “posted amount” to a
+    /// “calculated value” (§3.4). There is deliberately no reverse transition:
+    /// a calculated value becomes a posted amount only through a source fact,
+    /// not by rounding.
     #[must_use]
     pub fn to_calc_dec(&self) -> Dec {
         Dec::new(Decimal::new(self.amount.raw(), self.currency.minor_units()))
     }
 
-    /// Точное представление: `amount / 10^minor_units`.
+    /// Exact representation: `amount / 10^minor_units`.
     ///
-    /// Отказать здесь нечему: `minor_units()` не превышает 4, поэтому
-    /// `10^minor_units` не переполняет `i128` и всегда положителен,
-    /// а числитель — образ `i64`. `Result` сохранён в сигнатуре ради
-    /// устойчивости к появлению валюты с большей точностью.
+    /// Nothing can fail here: `minor_units()` is at most 4, so
+    /// `10^minor_units` cannot overflow `i128` and is always positive, while
+    /// the numerator is an `i64` value. `Result` remains in the signature to
+    /// stay robust if a higher-precision currency is added.
     pub fn to_exact(&self) -> Result<Exact, MoneyError> {
         let den = 10_i128
             .checked_pow(self.currency.minor_units())
@@ -249,16 +246,16 @@ impl Money {
     }
 }
 
-/// Расчётная денежная величина с валютой.
+/// Calculated monetary value with a currency.
 ///
-/// В отличие от [`Money`], который хранит проведённую сумму в целых
-/// минимальных единицах, `CalcMoney` хранит точное значение [`Dec`],
-/// вычисленное по условиям выпуска или графику. Поэтому дробные доли
-/// минимальной единицы не округляются во время расчёта.
+/// Unlike [`Money`], which stores a posted amount in integer minor units,
+/// `CalcMoney` stores the exact [`Dec`] value calculated from issue terms or a
+/// schedule. Fractions of a minor unit are therefore not rounded during
+/// calculation.
 ///
-/// Обратного перехода в [`Money`] нет намеренно: расчётная величина становится
-/// проведённой суммой только через подтверждённый факт источника, а не через
-/// округление результата.
+/// There is deliberately no transition back to [`Money`]: a calculated value
+/// becomes a posted amount only through a confirmed source fact, not by
+/// rounding the result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalcMoney {
     value: Dec,
@@ -266,8 +263,8 @@ pub struct CalcMoney {
 }
 
 impl CalcMoney {
-    /// Тривиальная упаковка двух независимых полей — проверять при
-    /// сборке нечего, как и у [`Money::new`].
+    /// Trivial packing of two independent fields; there is nothing to validate
+    /// during construction, just as with [`Money::new`].
     #[must_use]
     pub const fn new(value: Dec, currency: CurrencyCode) -> Self {
         Self { value, currency }
@@ -315,16 +312,16 @@ impl CalcMoney {
     }
 }
 
-/// Денежная величина **на одну единицу** — расчётная, а не проведённая.
+/// Calculated **per-unit** monetary value, not a posted amount.
 ///
-/// Номинал выпуска и купон на бумагу договорные, а не списанные со счёта:
-/// [`Money`] хранит minor units, и номинал 333.3333 в нём потерял бы два
-/// знака. Отдельный тип не даёт сложить расчётную величину с проведённой
-/// суммой — по §3.4 это разные вещи.
+/// Issue face value and coupon per security are contractual, not debits from
+/// the account: [`Money`] stores minor units, so face value 333.3333 would lose
+/// two decimal places. A separate type prevents adding a calculated value to a
+/// posted amount—under §3.4 they are different things.
 ///
-/// Валютного инварианта внутри нет намеренно: величина одна, смешивать
-/// нечего. Валютные сверки живут там, где встречаются две величины, —
-/// в состоянии номинала лота и в правиле амортизации.
+/// It intentionally has no internal currency invariant: it represents one
+/// value, so there is nothing to mix. Currency reconciliation belongs where two
+/// values meet—in lot principal state and in the amortisation rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerUnitAmount {
     value: Dec,
@@ -332,8 +329,8 @@ pub struct PerUnitAmount {
 }
 
 impl PerUnitAmount {
-    /// Тривиальная упаковка двух независимых полей — проверять при
-    /// сборке нечего, как и у [`Money::new`].
+    /// Trivial packing of two independent fields; there is nothing to validate
+    /// during construction, just as with [`Money::new`].
     #[must_use]
     pub const fn new(value: Dec, currency: CurrencyCode) -> Self {
         Self { value, currency }
@@ -349,8 +346,8 @@ impl PerUnitAmount {
         self.currency
     }
 
-    /// Всего по позиции. Возвращает [`Dec`], а не [`Money`]: результат
-    /// остаётся расчётным, пока его не провели по счёту (§3.4).
+    /// Total for the position. Returns [`Dec`], not [`Money`]: the result
+    /// remains calculated until posted to the account (§3.4).
     pub fn checked_mul_quantity(&self, quantity: Quantity) -> Result<Dec, NumericError> {
         self.value.checked_mul(quantity.0)
     }
@@ -364,7 +361,7 @@ mod tests {
         Dec::new(Decimal::from_str_exact(text).unwrap())
     }
 
-    // --- Расчётная денежная величина ---
+    // --- Calculated monetary value ---
 
     #[test]
     fn calc_money_keeps_value_and_currency() {
@@ -424,7 +421,7 @@ mod tests {
         ));
     }
 
-    // --- Величина на единицу ---
+    // --- Per-unit value ---
 
     #[test]
     fn per_unit_amount_multiplied_by_quantity_stays_a_calculated_value() {
@@ -437,8 +434,8 @@ mod tests {
 
     #[test]
     fn per_unit_amount_keeps_precision_finer_than_a_minor_unit() {
-        // Минимальная единица рубля — копейка; номинал 333.3333 в `Money`
-        // потерял бы два знака (§3.4).
+        // The rouble minor unit is a kopeck; face value 333.3333 in `Money`
+        // would lose two decimal places (§3.4).
         assert_eq!(
             PerUnitAmount::new(dec("333.3333"), CurrencyCode::Rub).value(),
             dec("333.3333")
@@ -463,7 +460,7 @@ mod tests {
         );
     }
 
-    // --- Валюта ---
+    // --- Currency ---
 
     #[test]
     fn minor_units_follow_the_currency() {
@@ -471,7 +468,7 @@ mod tests {
         assert_eq!(CurrencyCode::Usd.minor_units(), 2);
         assert_eq!(CurrencyCode::Eur.minor_units(), 2);
         assert_eq!(CurrencyCode::Cny.minor_units(), 2);
-        // Металлический счёт (§9.5) ведётся с большей точностью.
+        // The metal account (§9.5) uses finer precision.
         assert_eq!(CurrencyCode::Xau.minor_units(), 4);
     }
 
@@ -496,7 +493,7 @@ mod tests {
         assert_eq!(CurrencyCode::Xau.code(), "XAU");
     }
 
-    // --- Проведённая сумма ---
+    // --- Posted amount ---
 
     #[test]
     fn posted_minor_keeps_the_value_it_was_given() {
@@ -526,7 +523,7 @@ mod tests {
         assert_eq!(PostedMinor::new(i64::MIN).checked_neg(), None);
     }
 
-    // --- Количество ---
+    // --- Quantity ---
 
     #[test]
     fn quantity_zero_is_the_decimal_zero() {
@@ -534,7 +531,7 @@ mod tests {
         assert!(Quantity::zero().0.to_exact().unwrap().is_zero());
     }
 
-    // --- Деньги ---
+    // --- Money ---
 
     #[test]
     fn same_currency_adds() {
@@ -591,8 +588,8 @@ mod tests {
 
     #[test]
     fn subtracting_from_the_minimum_does_not_panic() {
-        // `-i64::MIN` не представим. Реализация через отрицание сделала бы
-        // try_sub паническим при обещанном Result.
+        // `-i64::MIN` is unrepresentable. Implementing subtraction through
+        // negation would make try_sub panic despite its Result contract.
         let min = Money::new(PostedMinor::new(i64::MIN), CurrencyCode::Rub);
         let one = Money::new(PostedMinor::new(1), CurrencyCode::Rub);
         assert!(matches!(min.try_sub(one), Err(MoneyError::Overflow)));
@@ -633,7 +630,7 @@ mod tests {
         assert!(!Money::new(PostedMinor::new(-1), CurrencyCode::Eur).is_zero());
     }
 
-    // --- Суммирование списка ---
+    // --- List summation ---
 
     #[test]
     fn sum_of_empty_is_zero_in_requested_currency() {
@@ -643,8 +640,8 @@ mod tests {
 
     #[test]
     fn sum_accumulates_every_item() {
-        // Слагаемые различны и знакопеременны: потеря любого из них
-        // или остановка после первого меняет результат.
+        // Terms are distinct and alternate in sign: dropping any term or
+        // stopping after the first changes the result.
         let items = [
             Money::new(PostedMinor::new(1_000), CurrencyCode::Rub),
             Money::new(PostedMinor::new(250), CurrencyCode::Rub),
@@ -667,8 +664,8 @@ mod tests {
 
     #[test]
     fn sum_rejects_items_of_a_currency_other_than_requested() {
-        // Валюта задана явно: однородный список в другой валюте — тоже ошибка,
-        // а не «вывели валюту из первого элемента».
+        // The currency is explicit: a uniform list in another currency is also
+        // an error, rather than deriving the currency from the first item.
         let items = [Money::new(PostedMinor::new(1), CurrencyCode::Usd)];
         assert!(matches!(
             Money::sum(&items, CurrencyCode::Rub),
@@ -691,11 +688,11 @@ mod tests {
         ));
     }
 
-    // --- Перевод в точный режим ---
+    // --- Conversion to exact mode ---
 
     #[test]
     fn to_exact_is_scaled_by_minor_units() {
-        // 350,50 ₽ == 35050/100
+        // 350.50 ₽ == 35050/100
         let m = Money::new(PostedMinor::new(35_050), CurrencyCode::Rub);
         let e = m.to_exact().unwrap();
         assert_eq!(e, crate::numeric::exact::Exact::new(35_050, 100).unwrap());
@@ -703,7 +700,7 @@ mod tests {
 
     #[test]
     fn to_exact_uses_the_scale_of_its_own_currency() {
-        // У XAU четыре знака: 12345 минимальных единиц — это 1,2345 г.
+        // XAU has four decimal places: 12345 minor units equal 1.2345 g.
         let m = Money::new(PostedMinor::new(12_345), CurrencyCode::Xau);
         assert_eq!(m.to_exact().unwrap(), Exact::new(12_345, 10_000).unwrap());
     }
@@ -716,11 +713,10 @@ mod tests {
 
     #[test]
     fn to_exact_survives_the_most_extreme_posted_amount() {
-        // i64::MIN = -2^63, минимальная единица XAU = 10^-4.
-        // -2^63 / 10^4 в несократимом виде: НОД(2^63, 10^4) = 2^4 = 16,
-        // откуда -576460752303423488/625. Знаменатель 10^4 не переполняет
-        // i128, а числитель — образ i64, поэтому Exact::new здесь
-        // не может отказать.
+        // i64::MIN = -2^63; the XAU minor unit is 10^-4.
+        // In reduced form, -2^63 / 10^4 = -576460752303423488/625 because
+        // gcd(2^63, 10^4) = 2^4 = 16. The denominator fits in i128 and the
+        // numerator is an i64 value, so Exact::new cannot fail here.
         let m = Money::new(PostedMinor::new(i64::MIN), CurrencyCode::Xau);
         let e = m.to_exact().unwrap();
         assert_eq!(e.numerator(), -576_460_752_303_423_488);

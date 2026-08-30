@@ -1,9 +1,9 @@
-//! Свойства сверки с указанием области применимости (§15.3).
+//! Cross-checking properties with their domains of applicability (§15.3).
 //!
-//! Свойства сформулированы из правил §10.3, а не выведены из прогона
-//! программы (§15.5). Каждое сопровождается оговоркой о том, где оно
-//! выполняется: свойство без области — источник ложных падений, на
-//! которые проще всего ответить ослаблением генератора до тавтологии.
+//! The properties are formulated from the rules in §10.3, not inferred by running
+//! the program (§15.5). Each includes a qualification specifying where it
+//! applies: a property without a domain causes false failures, which are
+//! most easily addressed by weakening the generator into a tautology.
 
 use iaam_core::event::Event;
 use iaam_core::event::kind::EventKind;
@@ -26,12 +26,12 @@ fn march() -> AssertionPeriod {
     AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31)).unwrap()
 }
 
-/// Журнал из нескольких документов **одного парсера**.
+/// A log containing several documents parsed by **the same parser**.
 ///
-/// Документы различаются именем, суммы произвольны, контрольные секции
-/// согласованы с операцией — то есть сверка сойдётся. Именно на таком
-/// входе проверяется, что совпадение внутри одного кода разбора не
-/// повышает статус до независимого.
+/// The documents have different names, arbitrary amounts, and control sections
+/// consistent with the operation — so the cross-check will succeed. This input
+/// specifically verifies that agreement within a single parsing implementation does not
+/// elevate the status to independent.
 fn one_parser_journal(deposits: &[i64]) -> (AccountId, Vec<Event>) {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -54,7 +54,7 @@ fn one_parser_journal(deposits: &[i64]) -> (AccountId, Vec<Event>) {
             vec![Leg::cash(account, rub(*amount))],
         ));
     }
-    // Контрольные секции последнего документа согласованы с итогом.
+    // The last document's control sections agree with the result.
     let channel = TestChannel::new("same/1", "control");
     for (index, claim) in [
         ControlClaim::CashBalance {
@@ -90,11 +90,11 @@ fn one_parser_journal(deposits: &[i64]) -> (AccountId, Vec<Event>) {
 }
 
 proptest! {
-    /// **Область:** журналы, все каналы которых делят версию парсера.
+        /// **Domain:** logs whose channels all share the same parser version.
     ///
-    /// Правило §10.3: подтверждающие данные не должны проходить через
-    /// тот же код разбора. Пока парсер один, независимости нет ни при
-    /// каком совпадении цифр — сколько бы документов ни сошлось.
+        /// Rule §10.3: corroborating data must not pass through
+        /// the same parsing implementation. As long as there is only one parser, there is no
+        /// independence regardless of whether the figures agree — no matter how many documents agree.
     #[test]
     fn one_parser_never_reaches_independent(
         deposits in prop::collection::vec(1_i64..=1_000_000, 1..=5)
@@ -106,17 +106,17 @@ proptest! {
             prop_assert_ne!(
                 status,
                 DimensionStatus::AcceptedIndependent,
-                "измерение {:?} объявлено независимо подтверждённым на одном парсере",
+                    "measurement {:?} was declared independently corroborated using a single parser",
                 dimension
             );
         }
     }
 
-    /// **Область:** журналы, в которых ровно одно утверждение заведомо
-    /// не сходится, а остальные сходятся.
+        /// **Domain:** logs in which exactly one assertion is known to
+        /// disagree while all others agree.
     ///
-    /// Расхождение поглощает: подтверждение не затирает несошедшуюся
-    /// цифру, сколько бы сошедшихся утверждений ни стояло рядом.
+        /// A mismatch is absorbing: corroboration does not overwrite the mismatched
+        /// figure, no matter how many agreeing assertions accompany it.
     #[test]
     fn a_single_discrepancy_absorbs_any_number_of_confirmations(
         deposits in prop::collection::vec(1_i64..=1_000_000, 1..=5),
@@ -152,10 +152,10 @@ proptest! {
         );
     }
 
-    /// **Область:** любой журнал контрольных утверждений.
+        /// **Domain:** any log of control assertions.
     ///
-    /// Реестр — чистая функция: тот же вход даёт тот же выход. Без
-    /// этого показанную владельцу цифру невозможно воспроизвести (§3.1).
+        /// The registry is a pure function: the same input produces the same output. Without
+        /// this, the figure shown to the owner cannot be reproduced (§3.1).
     #[test]
     fn the_ledger_is_deterministic(
         deposits in prop::collection::vec(1_i64..=1_000_000, 1..=5)

@@ -1,8 +1,8 @@
-//! Контуры (§4.10).
+//! Contours (§4.10).
 //!
-//! Брокер считает перевод со вклада пополнением, потому что его контур —
-//! только его собственный счёт. Владелец видит всю картину, поэтому
-//! границу проводит он.
+//! A broker treats a transfer from a deposit as a contribution because its
+//! contour is only its own account. The owner sees the whole picture, so the
+//! owner draws the boundary.
 
 use std::collections::BTreeSet;
 
@@ -23,14 +23,14 @@ impl ContourId {
     }
 }
 
-/// Версия определения контура.
+/// Version of the contour definition.
 ///
-/// Расчёт доходности ссылается на версию: без этого изменение состава
-/// контура задним числом молча меняет исторические цифры.
+/// Return calculations reference the version: without it, changing contour
+/// membership retroactively and silently changes historical figures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ContourVersion(pub u32);
 
-/// Состав контура на конкретной версии.
+/// Contour membership at a specific version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContourDefinition {
     id: ContourId,
@@ -39,9 +39,9 @@ pub struct ContourDefinition {
 }
 
 impl ContourDefinition {
-    /// Тело вынесено в `from_parts`: `cargo-mutants` молча пропускает
-    /// любую функцию с именем `new`, и сборка состава внутри `new`
-    /// осталась бы вне мутационного заслона (§15.7).
+    /// The body lives in `from_parts`: `cargo-mutants` silently skips any
+    /// function named `new`, so building membership inside `new` would remain
+    /// outside the mutation guard (§15.7).
     #[must_use]
     pub fn new(
         id: ContourId,
@@ -79,31 +79,30 @@ impl ContourDefinition {
     }
 }
 
-/// Отношение события к границе контура.
+/// An event's relation to the contour boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowClass {
-    /// Деньги вошли в контур извне. Входит в XIRR со знаком плюс.
+    /// Money entered the contour from outside. It enters XIRR with a plus sign.
     ExternalIn {
         contour: ContourId,
         version: ContourVersion,
     },
-    /// Деньги вышли из контура. Входит в XIRR со знаком минус.
+    /// Money left the contour. It enters XIRR with a minus sign.
     ExternalOut {
         contour: ContourId,
         version: ContourVersion,
     },
-    /// Внутри контура: меняет аллокацию, но не доходность.
+    /// Inside the contour: changes allocation, not return.
     Internal,
-    /// Событие к этому контуру не относится.
+    /// The event does not concern this contour.
     Irrelevant,
 }
 
-/// Классификация события относительно контура.
+/// Classify an event relative to the contour.
 ///
-/// Ключевое место всей системы: именно из-за путаницы здесь сервисы
-/// показывают доходность, в которой собственные пополнения выглядят
-/// заработком. Для перевода классификация определяется **парой**
-/// принадлежностей, поэтому оба счёта обязаны храниться в событии.
+/// This is a key point in the system: confusion here makes services report
+/// transfers into one's own accounts as earnings. Classification therefore
+/// uses the **pair** of memberships, so both accounts must be stored in the event.
 #[must_use]
 pub fn classify(def: &ContourDefinition, event: &Event) -> FlowClass {
     let inbound = FlowClass::ExternalIn {
@@ -159,20 +158,19 @@ mod tests {
     use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
     use crate::numeric::decimal::Dec;
 
-    // Суммы записываются в минимальных единицах одним числом: группировка
-    // вида `100_000_00` не компилируется (clippy::inconsistent_digit_grouping
-    // входит в `all`, а `all = deny`).
+    // Amounts are recorded in minor units as one number: grouping such as
+    // `100_000_00` does not compile (clippy::inconsistent_digit_grouping is
+    // part of `all`, and `all = deny`).
     fn rub(minor: i64) -> Money {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
     }
 
-    /// Перевод между двумя счетами.
+    /// Transfer between two accounts.
     ///
-    /// Ноги переписываются целиком, а не только `kind`: перевод требует
-    /// **двух встречных денежных ног на объявленных счетах**
-    /// (`validate_structure`, задача 10), а `sample_event` даёт одну ногу
-    /// прихода. Событие, не проходящее структурную проверку, не может
-    /// служить основанием для утверждений о классификации.
+    /// The legs are rewritten in full, not only `kind`: a transfer requires
+    /// **two opposing cash legs on the declared accounts** (`validate_structure`,
+    /// task 10), while `sample_event` provides one inbound leg. An event that
+    /// fails structural validation cannot support classification claims.
     fn transfer(from: AccountId, to: AccountId) -> Event {
         let amount = rub(10_000_000);
         let mut event = sample_event(0);
@@ -187,7 +185,7 @@ mod tests {
         event
     }
 
-    /// Приход денег извне на счёт.
+    /// Money entering an account from outside.
     fn cash_in(account: AccountId) -> Event {
         let amount = rub(1_000_000);
         let mut event = sample_event(0);
@@ -197,7 +195,7 @@ mod tests {
         event
     }
 
-    /// Уход денег со счёта наружу.
+    /// Money leaving an account.
     fn cash_out(account: AccountId) -> Event {
         let amount = rub(-1_000_000);
         let mut event = sample_event(0);
@@ -207,13 +205,13 @@ mod tests {
         event
     }
 
-    /// Покупка бумаги: движение внутри одного счёта.
+    /// Security purchase: movement within one account.
     fn purchase(account: AccountId) -> Event {
         let gross = rub(5_000_000);
         let instrument = InstrumentId::new_random();
-        // Количество положительное и совпадает с ногой: структурная
-        // проверка сверяет ногу с событием (§4.3), и нулевое количество
-        // здесь означало бы сделку, которой не было.
+        // The quantity is positive and matches the leg: structural validation
+        // checks the leg against the event (§4.3), and zero would mean a trade
+        // that did not happen.
         let quantity = Quantity(Dec::new(rust_decimal::Decimal::from(100)));
         let mut event = sample_event(0);
         event.account = account;
@@ -238,10 +236,10 @@ mod tests {
 
     #[test]
     fn every_event_used_as_evidence_is_structurally_valid() {
-        // Расхождение с планом. Тесты плана строили перевод подменой одного
-        // лишь `kind` у `sample_event`, оставляя единственную ногу прихода:
-        // такое событие отклоняется `validate_structure`. Классификация
-        // события, которое журнал не принял бы, ничего не доказывает.
+        // Divergence from the plan. Plan tests built a transfer by replacing
+        // only `kind` on `sample_event`, leaving its single inbound leg:
+        // that event is rejected by `validate_structure`. Classifying an event
+        // the journal would reject proves nothing.
         let deposit = AccountId::new_random();
         let broker = AccountId::new_random();
         for event in [
@@ -253,18 +251,18 @@ mod tests {
             let verdict = event.validate_structure();
             assert!(
                 verdict.is_ok(),
-                "{} не проходит структурную проверку: {verdict:?}",
+                "{} fails structural validation: {verdict:?}",
                 event.kind.discriminant()
             );
         }
     }
 
-    // --- Критерии приёмки ---
+    // --- Acceptance criteria ---
 
     #[test]
     fn transfer_between_two_inside_accounts_is_internal() {
-        // Вклад -> брокерский счёт, оба внутри контура «весь капитал».
-        // Это не пополнение: доходность не меняется, меняется аллокация.
+        // Deposit → brokerage account, both inside the “whole capital” contour.
+        // This is not a contribution: return is unchanged; allocation changes.
         let deposit = AccountId::new_random();
         let broker = AccountId::new_random();
         let def = contour(vec![deposit, broker]);
@@ -276,9 +274,9 @@ mod tests {
 
     #[test]
     fn the_same_event_is_external_for_a_narrower_contour() {
-        // Событие ОДНО И ТО ЖЕ, меняется только определение контура.
-        // Прежняя редакция плана подменяла здесь CashTransfer на CashIn
-        // и потому перевод вообще не тестировала.
+        // The exact same event; only the contour definition changes.
+        // The previous plan replaced CashTransfer with CashIn here and therefore
+        // did not test a transfer at all.
         let deposit = AccountId::new_random();
         let broker = AccountId::new_random();
         let event = transfer(deposit, broker);
@@ -289,7 +287,7 @@ mod tests {
         assert_eq!(classify(&wide, &event), FlowClass::Internal);
         assert!(
             matches!(classify(&narrow, &event), FlowClass::ExternalIn { .. }),
-            "для узкого контура тот же перевод — приход извне"
+            "the same transfer is an external inflow for the narrow contour"
         );
     }
 
@@ -314,8 +312,8 @@ mod tests {
 
     #[test]
     fn the_direction_of_a_transfer_decides_the_sign_of_the_external_flow() {
-        // Тот же контур и та же пара счетов: меняется только направление.
-        // Перепутанные стороны дали бы XIRR приток вместо оттока.
+        // Same contour and same pair of accounts; only direction changes.
+        // Reversing the sides would produce an XIRR inflow instead of an outflow.
         let broker = AccountId::new_random();
         let outside = AccountId::new_random();
         let def = contour(vec![broker]);
@@ -344,7 +342,7 @@ mod tests {
         assert_eq!(classify(&def, &cash_in(outside)), FlowClass::Irrelevant);
     }
 
-    // --- Полная таблица решений ---
+    // --- Complete decision table ---
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Expected {
@@ -365,10 +363,10 @@ mod tests {
 
     #[test]
     fn every_combination_of_movement_and_membership_is_classified() {
-        // Четыре формы движения на четырёх составах контура. Для перевода
-        // значима вся пара принадлежностей; для остальных форм второй счёт
-        // не должен влиять ни на что — это и проверяют столбцы «только
-        // второй счёт» и «оба счёта».
+        // Four movement forms across four contour memberships. Membership of
+        // the whole pair matters for transfers; for the other forms the second
+        // account must have no effect—these are the “second account only” and
+        // “both accounts” columns.
         use Expected::{In, Internal, Irrelevant, Out};
 
         let first = AccountId::new_random();
@@ -376,30 +374,30 @@ mod tests {
         let unrelated = AccountId::new_random();
 
         let contours = [
-            ("ни одного из счетов события", contour(vec![unrelated])),
-            ("только первый счёт", contour(vec![first])),
-            ("только второй счёт", contour(vec![second])),
-            ("оба счёта", contour(vec![first, second])),
+            ("neither event account", contour(vec![unrelated])),
+            ("first account only", contour(vec![first])),
+            ("second account only", contour(vec![second])),
+            ("both accounts", contour(vec![first, second])),
         ];
 
         let rows: [(&str, Event, [Expected; 4]); 4] = [
             (
-                "приход извне на первый счёт",
+                "inflow from outside to first account",
                 cash_in(first),
                 [Irrelevant, In, Irrelevant, In],
             ),
             (
-                "уход наружу с первого счёта",
+                "outflow from first account",
                 cash_out(first),
                 [Irrelevant, Out, Irrelevant, Out],
             ),
             (
-                "перевод с первого счёта на второй",
+                "transfer from first account to second",
                 transfer(first, second),
                 [Irrelevant, Out, In, Internal],
             ),
             (
-                "покупка на первом счёте",
+                "purchase on first account",
                 purchase(first),
                 [Irrelevant, Internal, Irrelevant, Internal],
             ),
@@ -410,13 +408,13 @@ mod tests {
                 assert_eq!(
                     observed(classify(def, event)),
                     *expected,
-                    "{movement} при контуре «{shape}»"
+                    "{movement} with contour “{shape}”"
                 );
             }
         }
     }
 
-    // --- Определение контура ---
+    // --- Contour definition ---
 
     #[test]
     fn contour_version_is_carried_into_the_classification() {
@@ -430,14 +428,14 @@ mod tests {
                 assert_eq!(contour, id);
                 assert_eq!(version, ContourVersion(7));
             }
-            other => panic!("ожидался ExternalIn, получено {other:?}"),
+            other => panic!("expected ExternalIn, got {other:?}"),
         }
     }
 
     #[test]
     fn an_outbound_flow_carries_the_same_definition() {
-        // Без версии в исходящем потоке пересчёт задним числом молча
-        // изменил бы исторические цифры только по одной стороне.
+        // Without a version on an outbound flow, a retroactive recalculation
+        // would silently change historical figures on only one side.
         let broker = AccountId::new_random();
         let id = ContourId::new_random();
         let def = ContourDefinition::new(id, ContourVersion(3), vec![broker]);
@@ -446,7 +444,7 @@ mod tests {
                 assert_eq!(contour, id);
                 assert_eq!(version, ContourVersion(3));
             }
-            other => panic!("ожидался ExternalOut, получено {other:?}"),
+            other => panic!("expected ExternalOut, got {other:?}"),
         }
     }
 
@@ -461,9 +459,9 @@ mod tests {
 
     #[test]
     fn a_repeated_account_does_not_make_a_different_definition() {
-        // Состав — множество: счёт, названный дважды, не даёт второго
-        // членства, иначе сравнение определений зависело бы от порядка
-        // и повторов во входных данных.
+        // Membership is a set: naming an account twice does not create a second
+        // membership, or definition comparison would depend on input order and
+        // duplicates.
         let id = ContourId::new_random();
         let account = AccountId::new_random();
         let twice = ContourDefinition::new(id, ContourVersion(1), vec![account, account]);
@@ -483,7 +481,7 @@ mod tests {
 
     #[test]
     fn a_definition_keeps_every_account_it_was_given() {
-        // Отбрасывание состава сделало бы весь капитал внешним.
+        // Dropping membership would make all capital external.
         let first = AccountId::new_random();
         let second = AccountId::new_random();
         let def = contour(vec![first, second]);

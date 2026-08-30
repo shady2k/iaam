@@ -1,15 +1,15 @@
-//! Отчёт о доходности (§6.1, §10.5, §16.3).
+//! Return report (§6.1, §10.5, §16.3).
 //!
-//! Честная формулировка результата этапа 1: **XIRR до налога** для
-//! простых long-only бумаг. Налоги появляются в E5, и до тех пор ни
-//! одно поле этого отчёта не притворяется доходностью после налога.
+//! An honest description of the stage 1 result: **XIRR before tax** for
+//! simple long-only securities. Taxes appear in E5, and until then no
+//! no field in this report pretends to be a return after tax.
 //!
-//! **Период отчёта — вся история счёта.** XIRR за произвольный интервал
-//! требует оценки NAV на начало интервала как терминального потока,
-//! а оценка на этапе 1 существует только на дату отчёта. Считать
-//! интервал, подставив вместо начальной стоимости себестоимость,
-//! означало бы выдать за доходность величину, которой не соответствует
-//! ни одна сделка.
+//! **Report period — the entire account history.** XIRR over an arbitrary interval
+//! requires an opening NAV valuation as a terminal cash flow,
+//! and stage 1 valuation exists only as of the report date. Calculating
+//! the interval by substituting cost basis for the opening value,
+//! would mean presenting as return a value that does not correspond to
+//! any transaction.
 
 pub mod xirr;
 pub mod zero_reinvestment;
@@ -54,11 +54,11 @@ use crate::valuation::{
     ValuationError, Venue, candidate_from_legacy_valuation,
 };
 
-/// Величина, которую система может отказаться вычислить.
+/// A value the system may refuse to compute.
 ///
-/// Отказ — часть контракта, а не исключительная ситуация: неизвестная
-/// цена, отсутствующий курс и уравнение без единственного корня
-/// встречаются в нормальной работе (§5.4, §6.1, §10.7).
+/// Failure — part of the contract, not an exceptional condition: an unknown
+/// price, a missing exchange rate, and an equation with no unique root
+/// occur during normal operation (§5.4, §6.1, §10.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Computed<T> {
     Value(T),
@@ -83,78 +83,78 @@ impl<T> Computed<T> {
     }
 }
 
-/// Почему величина не вычислена.
+/// Why the value was not computed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotComputable {
-    /// Нет цены инструмента: стоимость позиции неизвестна.
+    /// No instrument price: the position value is unknown.
     MissingPrice { instrument: InstrumentId },
-    /// Нет курса на дату.
+    /// No exchange rate for the date.
     MissingFxRate {
         from: CurrencyCode,
         to: CurrencyCode,
         date: Date,
     },
-    /// Основание котировки не доказано источником.
+    /// The quote basis is not substantiated by the source.
     QuotationBasisUnknown { instrument: InstrumentId },
-    /// Записанное основание противоречит доказательству источника.
+    /// The recorded basis conflicts with the source evidence.
     QuotationBasisContradictsEvidence { instrument: InstrumentId },
-    /// Номинал бумаги неизвестен.
+    /// The bond's face value is unknown.
     RemainingFaceUnknown { instrument: InstrumentId },
-    /// Для пересчёта котировки не передан номинал.
+    /// No face value was provided for quote conversion.
     PrincipalUnknown,
-    /// Решатель отказался: корня нет, корней несколько, не сошлось.
+    /// The solver failed: no root, multiple roots, or no convergence.
     SolverRefused { refusal: SolverRefusal },
-    /// Ни одного потока, пересекающего границу контура.
+    /// No flows cross the perimeter boundary.
     NoExternalFlows,
-    /// Срез журнала содержит события позже даты отчёта: он собран неверно.
+    /// The log slice contains events after the report date: it was assembled incorrectly.
     StateNewerThanReport { last_event: Date, as_of: Date },
-    /// Арифметическая невозможность: переполнение, деление на ноль.
+    /// Arithmetic impossibility: overflow, division by zero.
     Numeric { code: &'static str },
-    /// На счёте финансирование вне периметра: экономику система не достраивает.
+    /// The account has funding outside the perimeter: the system does not reconstruct the economics.
     UnsupportedFinancing { account: AccountId },
-    /// Снимка графика выпуска на координату знания отсутствует.
+    /// No issue schedule snapshot exists at the knowledge coordinate.
     ScheduleMissing { instrument: InstrumentId },
-    /// Наблюдение НКД на дату выхода отсутствует.
+    /// No accrued interest observation exists for the exit date.
     AccruedObservationMissing { instrument: InstrumentId },
-    /// Сумма купона текущего периода не определена.
+    /// The current period coupon amount is unknown.
     CouponUndetermined { instrument: InstrumentId },
-    /// Дата отчёта вне покрытия графика.
+    /// The report date is outside the schedule coverage.
     OutsideScheduleCoverage { instrument: InstrumentId },
-    /// Дата отчёта покрыта несколькими периодами графика.
+    /// The report date is covered by multiple schedule periods.
     OverlappingScheduleCoverage { instrument: InstrumentId },
-    /// Исполнимого выхода нет: реализовать НКД сегодня нельзя.
+    /// No feasible exit: accrued interest cannot be realized today.
     ExitNotExecutable,
-    /// Дата окончания горизонта не позже координаты метрики.
+    /// The horizon end date is no later than the metric coordinate.
     NonPositiveDuration {
         coordinate: Date,
         terminal_date: Date,
     },
-    /// Начальная стоимость не положительна.
+    /// The initial value is not positive.
     NonPositiveInitialCapital,
-    /// Терминальное благосостояние отрицательно.
+    /// Terminal wealth is negative.
     NegativeTerminalWealth,
-    /// Историческая стоимость приобретения когорты неизвестна.
+    /// The cohort's historical acquisition cost is unknown.
     AcquisitionBasisUnknown,
-    /// Уплаченный при приобретении НКД неизвестен.
+    /// Accrued interest paid on acquisition is unknown.
     AccruedInterestAtAcquisitionUnknown,
-    /// История полученных выплат агрегирована неизвестно.
+    /// The received payment history was aggregated in an unknown way.
     HistoricalReceiptsUnknown,
-    /// Когорта не может быть построена.
+    /// The cohort cannot be constructed.
     CohortGap {
         gap: crate::projection::lots::CohortGap,
     },
-    /// Денежные величины имеют разные валюты.
+    /// Monetary amounts have different currencies.
     CurrencyMismatch {
         expected: CurrencyCode,
         actual: CurrencyCode,
     },
-    /// Расход неизвестен и не ограничен сверху.
+    /// The expense is unknown and has no upper bound.
     ExpenseUnknown,
 }
 
 impl NotComputable {
-    /// Машиночитаемый код для API (§13). Внешний агент разбирает код,
-    /// а текст предназначен человеку.
+    /// Machine-readable code for the API (§13). The external agent parses the code,
+    /// and the text is intended for humans.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -202,14 +202,14 @@ impl From<ValuationError> for NotComputable {
     }
 }
 
-/// Состояние качества данных (§10.5).
+/// Data quality state (§10.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataQualityStatus {
-    /// Все данные подтверждены. На этапе 1 недостижимо: сверки нет.
+    /// All data has been confirmed. Unattainable at stage 1: no reconciliation.
     Clean,
-    /// Часть данных не подтверждена независимо.
+    /// Some data has not been independently confirmed.
     Mixed,
-    /// Данных не хватает для полного ответа.
+    /// Not enough data for a complete answer.
     Incomplete,
 }
 
@@ -224,59 +224,59 @@ impl DataQualityStatus {
     }
 }
 
-/// Материальная проблема качества данных. Показывается владельцу
-/// только тогда, когда влияет на ответ (§10.5).
+/// Material data quality issue. Shown to the owner
+/// only when it affects the result (§10.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaterialIssue {
-    /// Позиция восстановлена без документированной стоимости (§10.7).
+    /// The position was reconstructed without documented cost (§10.7).
     RestoredWithoutBasis { account: AccountId },
-    /// Доля разнесения амортизации не выведена, поэтому возвращённая
-    /// стоимость и реализованный результат по позиции не считаются
-    /// (§4.9). Чинится проверенным графиком выпуска.
+    /// The amortization allocation share was not derived, so the returned
+    /// position value and realized result are not calculated
+    /// (§4.9). Fixed with a verified issuance schedule.
     AmortisationAllocationUnknown {
         account: AccountId,
         instrument: InstrumentId,
     },
-    /// Отрицательный денежный остаток — обязательство в NAV (§15.9).
+    /// A negative cash balance is a liability in NAV (§15.9).
     NegativeCash {
         account: AccountId,
         currency: CurrencyCode,
     },
-    /// Данных до этой даты нет; всё, что раньше, в расчёт не вошло.
+    /// No data exists before this date; anything earlier was excluded from the calculation.
     HistoryStartsAt { date: Date },
-    /// Независимого подтверждения по счёту нет (§10.5).
+    /// There is no independent confirmation for the account (§10.5).
     NoIndependentSource {
         account: AccountId,
         dimension: Dimension,
     },
-    /// Сверка по счёту не сходится.
+    /// Account reconciliation fails.
     Discrepancy {
         account: AccountId,
         dimension: Dimension,
     },
-    /// На счёте присутствует финансирование вне периметра (§11).
+    /// The account includes funding outside the perimeter (§11).
     UnsupportedFinancing { account: AccountId },
-    /// Поданная заявка ссылается на окно, которого нет в графике.
+    /// The submitted order references a window absent from the schedule.
     OfferWindowUnresolved {
         submission: crate::event::offer::OfferSubmissionId,
     },
-    /// Запланированная выплата не подтверждена датированным фактом
-    /// дохода.
+    /// The scheduled payment is not confirmed by a dated fact
+    /// of income.
     ///
-    /// Счёт обязателен: одна бумага на двух счетах иначе даёт две
-    /// неразличимые проблемы. Вид выплаты обязателен: «не пришёл купон»
-    /// и «не пришёл возврат номинала» требуют от владельца разных
-    /// действий и ищутся в разных событиях журнала.
+    /// Account is required: otherwise one security in two accounts yields two
+    /// indistinguishable issues. Payment type is required: «the coupon did not arrive»
+    /// and «the principal repayment did not arrive» require different
+    /// actions and are sought in different log events.
     ScheduledPostingNotReceived {
         account: AccountId,
         instrument: InstrumentId,
         date: Date,
         kind: PostingKind,
     },
-    /// Сверку одной запланированной выплаты провести нечем.
+    /// There is no basis for reconciling one scheduled payment.
     ///
-    /// Дата и вид делают проблему адресной: недоказуемость одной выплаты
-    /// не должна скрывать доказуемый пропуск другой выплаты той же пары.
+    /// The date and type pinpoint the issue: inability to prove one payment
+    /// must not hide a provable omission of another payment for the same pair.
     ScheduledPostingUnverifiable {
         account: AccountId,
         instrument: InstrumentId,
@@ -284,13 +284,13 @@ pub enum MaterialIssue {
         kind: PostingKind,
         reason: UnverifiableReason,
     },
-    /// Несколько запланированных выплат недоказуемы по одной причине.
+    /// Several scheduled payments are unprovable for the same reason.
     ///
-    /// Свёртка, а не список одиночных проблем: причина уровня источника
-    /// чинится одним действием, и десять одинаковых строк не несут
-    /// десяти единиц информации. Число и границы дат оставлены,
-    /// потому что «где-то в истории плохая дата» так же бесполезно,
-    /// как десять повторов.
+    /// An aggregation, not a list of individual issues: a source-level cause
+    /// can be fixed with one action, and ten identical rows carry no
+    /// ten pieces of information. The number and date boundaries are retained,
+    /// because «a bad date somewhere in the history» is just as useless,
+    /// as ten repetitions.
     ScheduledPostingsUnverifiable {
         account: AccountId,
         instrument: InstrumentId,
@@ -300,7 +300,7 @@ pub enum MaterialIssue {
         first_date: Date,
         last_date: Date,
     },
-    /// Расчётный и наблюдённый НКД разошлись больше допуска.
+    /// Calculated and observed accrued interest differ by more than the tolerance.
     AccruedInterestMismatch {
         instrument: InstrumentId,
         computed: Dec,
@@ -313,30 +313,30 @@ pub enum MaterialIssue {
 }
 
 impl MaterialIssue {
-    /// Делает ли проблема ответ **неполным**.
+    /// Whether the issue makes the answer **incomplete**.
     ///
-    /// Две проблемы неполнотой не являются и потому не переводят статус
-    /// в `Incomplete`:
+    /// Two issues do not constitute incompleteness and therefore do not change the status
+    /// in `Incomplete`:
     ///
-    /// - начало истории — это факт о периоде, а не дефект (§10.7);
-    /// - отсутствие независимого источника — нормальное состояние
-    ///   данных: §10.5 прямо требует считать такие записи в отчётах по
-    ///   умолчанию, иначе система бесполезна именно для банков без
-    ///   экспорта и ручного ввода. Показывать это надо, объявлять ответ
-    ///   неполным — нельзя, иначе `Incomplete` перестанет что-либо
-    ///   означать, потому что будет стоять почти всегда.
+    /// - the start of history is a fact about the period, not a defect (§10.7);
+    /// - the absence of an independent source is a normal state
+    ///   data: §10.5 explicitly requires counting such records in reports on
+    ///   by default, otherwise the system is useless specifically for banks without
+    ///   exports and manual input. This must be shown, but the answer must not be declared
+    ///   incomplete data — this must not be done, otherwise `Incomplete` will cease to
+    ///   mean anything, because it will be present almost always.
     ///
-    /// Насколько велика неподтверждённая доля, говорит `navCoverage`,
-    /// а не статус.
+    /// `navCoverage` indicates how large the unconfirmed share is,
+    /// rather than a status.
     #[must_use]
     pub const fn is_defect(&self) -> bool {
         match self {
             Self::HistoryStartsAt { .. } | Self::NoIndependentSource { .. } => false,
-            // Горизонт журнала зеркалит `HistoryStartsAt`: это факт о
-            // периоде, а не дефект. Владелец, чей журнал начинается
-            // позже выпуска бумаги, иначе получил бы вечный `Incomplete`
-            // Остальные причины чинятся дозагрузкой фактов и потому
-            // являются дефектами.
+            // The journal horizon mirrors `HistoryStartsAt`: this is a fact about
+            // the period, not a defect. An owner whose journal starts
+            // later than the security's issuance would otherwise get a permanent `Incomplete`
+            // Other causes can be fixed by loading more facts and are therefore
+            // are defects.
             Self::ScheduledPostingUnverifiable { reason, .. }
             | Self::ScheduledPostingsUnverifiable { reason, .. } => {
                 !matches!(reason, UnverifiableReason::HistoryStartsAfterSchedule)
@@ -353,25 +353,25 @@ impl MaterialIssue {
     }
 }
 
-/// Почему сверку запланированных выплат провести нечем (§6.1).
+/// Why there is nothing to reconcile scheduled payments against (§6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnverifiableReason {
-    /// Границу владения провести нечем: у партии нет даты приобретения
-    /// либо есть количество, восстановленное без стоимости.
+    /// The ownership boundary cannot be established: the lot has no acquisition date
+    /// or there is a quantity reconstructed without cost basis.
     AcquisitionDateUnknown,
-    /// Владение на дату фиксации выплаты нельзя доказать.
+    /// Ownership on the payment record date cannot be proven.
     OwnershipUnknown,
-    /// Источник не сообщил дату, на которую определяется право на выплату.
+    /// The source did not report the date on which payment entitlement is determined.
     EntitlementDateUnknown,
-    /// По паре есть выплата, вид которой не установлен: на график её
-    /// не положить.
+    /// The pair has a payment of unknown type: it cannot be mapped to the schedule
+    /// not include it.
     IncomeKindUnknown,
-    /// По паре есть выплата без даты зачисления и без даты выплаты.
+    /// The pair has a payment with neither a credit date nor a payment date.
     PaymentDateUnknown,
-    /// Выплата прошла границу владения, но её дата раньше первого
-    /// события журнала: фактов под неё нет и быть не может.
+    /// The payment crossed the ownership boundary, but its date precedes the first
+    /// log event: there are no facts for it and cannot be any.
     HistoryStartsAfterSchedule,
-    /// График нельзя использовать как доказательство прошлых выплат.
+    /// The schedule cannot serve as evidence of past payments.
     ScheduleNotTrusted,
 }
 impl UnverifiableReason {
@@ -389,26 +389,26 @@ impl UnverifiableReason {
     }
 }
 
-/// Причина, по которой позиция не вошла в денежную стоимость.
+/// Reason the position was excluded from the monetary value.
 ///
-/// Первые варианты описывают решение политики выбора цены. Вариант
-/// `NotComputable` сохраняет конкретную причину отказа пересчёта, чтобы
-/// покрытие не объявляло позицию оценённой без денежного вклада.
+/// The first variants represent the price-selection policy outcome. The variant
+/// `NotComputable` retains the specific reason for recalculation failure, so that
+/// coverage does not mark a position as valued without a monetary contribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UncoveredReason {
-    /// Для инструмента нет ни одного наблюдения.
+    /// There are no observations for the instrument.
     NoObservation,
-    /// Все наблюдения старше предельного возраста.
+    /// All observations exceed the maximum age.
     TooOld,
-    /// Нельзя однозначно определить площадку.
+    /// The venue cannot be determined unambiguously.
     AmbiguousVenue,
-    /// После отбора осталось несколько кандидатов.
+    /// Several candidates remain after filtering.
     AmbiguousCandidate,
-    /// Выбранное наблюдение нельзя перевести в деньги.
+    /// The selected observation cannot be converted to cash.
     NotComputable { reason: NotComputable },
 }
 
-/// Позиция без выбранного кандидата и причина отсутствия покрытия.
+/// A position with no selected candidate and the reason it is not covered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UncoveredPosition {
     pub account: AccountId,
@@ -417,7 +417,7 @@ pub struct UncoveredPosition {
     pub reason: UncoveredReason,
 }
 
-/// Позиция, оставшаяся на вычисленном старым правилом значении.
+/// A position left at the value computed by the old rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyDerivedPosition {
     pub account: AccountId,
@@ -426,7 +426,7 @@ pub struct LegacyDerivedPosition {
     pub quality: PriceQuality,
 }
 
-/// Позиция с выбранным кандидатом и полным основанием решения политики.
+/// A position with a selected candidate and the complete policy decision rationale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluatedPosition {
     pub account: AccountId,
@@ -435,22 +435,22 @@ pub struct EvaluatedPosition {
     pub quantity: crate::money::Quantity,
     pub price: SelectedPrice,
 }
-/// Атрибуты облигационной позиции (§5.1: атрибуты, не оценочная база).
+/// Bond position attributes (§5.1: attributes, not a valuation basis).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BondPositionAttributes {
     pub account: AccountId,
     pub custody: Option<crate::ids::CustodyId>,
     pub instrument: InstrumentId,
-    /// Начисленный на дату доход по позиции: НКД на бумагу × количество.
+    /// Income accrued on the position as of the date: accrued interest per bond × quantity.
     pub accrued_interest: Computed<Dec>,
-    /// Фактически реализуемая сегодня сумма (§4.2). Не договорная.
+    /// Amount actually realizable today (§4.2). Not contractual.
     pub accrued_interest_payable_on_termination: Computed<Dec>,
-    /// Ближайшая любая выплата.
+    /// Nearest payment of any kind.
     pub next_posting_date: Option<Date>,
-    /// Окончателен ли ближайший возврат номинала, если он и есть.
+    /// Whether the nearest principal repayment is final, if any.
     pub next_principal_return_finality: Option<PrincipalReturnFinality>,
 }
-/// Метрики всех сценариев одной облигационной позиции.
+/// Metrics for all scenarios of one bond position.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BondPositionMetrics {
     pub account: AccountId,
@@ -459,8 +459,8 @@ pub struct BondPositionMetrics {
     pub scenarios: Vec<crate::returns::zero_reinvestment::BondScenarioResult>,
 }
 
-/// Покрытие ценой: только количество позиций, без выдуманного денежного
-/// знаменателя для позиций, которым цена не найдена.
+/// Price coverage: position count only, with no fabricated monetary
+/// denominator for positions for which no price was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionCoverage {
     pub evaluated_positions: u32,
@@ -470,7 +470,7 @@ pub struct PositionCoverage {
     pub legacy_derived: Vec<LegacyDerivedPosition>,
 }
 
-/// Доли исполнимости от стоимости **оценённых позиций**.
+/// Executable fractions of the value of **valued positions**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutabilityShares {
     pub evaluated_positions_value: Dec,
@@ -479,64 +479,64 @@ pub struct ExecutabilityShares {
     pub unknown: Dec,
 }
 
-/// Денежная величина, для которой отсутствие знания нельзя заменить нулём.
+/// A monetary amount for which lack of knowledge cannot be replaced with zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmountQualification {
     Known(Dec),
     Unknown,
 }
 
-/// Оценка до издержек выхода и до налога.
+/// Valuation before exit costs and tax.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiquidationEstimate {
     pub value_before_exit_costs_and_tax: Computed<Dec>,
     pub executability: ExecutabilityShares,
     pub exit_costs: AmountQualification,
     pub tax: AmountQualification,
-    /// Реализуемый сегодня НКД по всем облигационным позициям.
+    /// Accrued interest realizable today across all bond positions.
     ///
-    /// `NotComputable` здесь делает неполноценной именно эту оценку,
-    /// но не переносит неизвестность в `terminal_value` (§4.2).
+    /// `NotComputable` makes this specific estimate incomplete,
+    /// but does not propagate uncertainty into `terminal_value` (§4.2).
     pub accrued_interest_payable_on_termination: Computed<Dec>,
 }
 
-/// Покрытие стоимости портфеля уровнями достоверности (§10.5).
+/// Portfolio value coverage by confidence level (§10.5).
 ///
-/// Доли считаются по **модулю** стоимости счёта: счёт с отрицательным
-/// остатком тоже покрыт или не покрыт сверкой, и выбросить его значило
-/// бы посчитать долю от неполного портфеля.
+/// Fractions are calculated using the **absolute value** of account value: an account with negative
+/// the remainder is also either covered or not covered by reconciliation, and discarding it would
+/// mean calculating the share of an incomplete portfolio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NavCoverage {
     pub accepted_independent: Dec,
     pub accepted_internal: Dec,
     pub provisional: Dec,
-    /// Доля стоимости, по которой сверка не сходится.
+    /// Share of value for which reconciliation fails.
     ///
-    /// §10.5 показывает в примере три доли. Четвёртая добавлена
-    /// намеренно: без неё расходящийся счёт попадал бы в `provisional`
-    /// и выглядел как «просто пока не подтверждён» — то есть проблема
-    /// пряталась бы ровно в той цифре, которая существует, чтобы её
-    /// показывать.
+    /// §10.5 shows three shares in the example. The fourth was added
+    /// intentionally: without it, an unreconciled account would fall into `provisional`
+    /// and looked like «merely not yet confirmed» — that is, the issue
+    /// would be hidden in the very figure that exists to
+    /// show it.
     pub discrepant: Dec,
 }
 
-/// Блок качества данных.
+/// Data quality block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataQuality {
     pub status: DataQualityStatus,
-    /// Сверка денежных и позиционных измерений по счетам.
+    /// Reconciliation of cash and position measurements by account.
     pub nav_coverage: NavCoverage,
-    /// Покрытие ценами и причины непокрытых позиций.
+    /// Price coverage and reasons for uncovered positions.
     pub position_coverage: PositionCoverage,
-    /// Доли исполнимости от стоимости оценённых позиций.
+    /// Feasibility shares by value of priced positions.
     pub executability: ExecutabilityShares,
     pub material_issues: Vec<MaterialIssue>,
 }
-/// Что именно применялось при расчёте. Без этого цифру не воспроизвести
+/// The exact inputs used in the calculation. Without this, the figure cannot be reproduced
 /// (§3.2, §6.1).
 ///
-/// `Eq` не выводится: политика решателя содержит допуск в двоичной
-/// плавающей точке, а равенство таких величин не рефлексивно.
+/// `Eq` is not derived: the solver policy includes a tolerance in binary
+/// floating-point arithmetic, and equality for such values is not reflexive.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppliedRules {
     pub contour: ContourId,
@@ -544,27 +544,27 @@ pub struct AppliedRules {
     pub lot_rule: Option<RuleId>,
     pub fx_source: FxSource,
     pub day_count: DayCount,
-    /// Версия правила построения будущего потока облигации.
+    /// Version of the rule for constructing a bond's future cash flow.
     pub cashflow_projection: CashflowProjectionVersion,
-    /// Версия политики учёта расходов.
+    /// Version of the expense accounting policy.
     pub expense_policy: zero_reinvestment::ExpensePolicyVersion,
     pub solver_policy: SolverPolicy,
-    /// Порог, по которому классифицирован отрицательный остаток (§11).
-    /// Цифра, зависящая от порога, обязана нести порог рядом с собой.
+    /// Threshold used to classify the negative balance (§11).
+    /// A threshold-dependent figure must carry its threshold alongside it.
     pub perimeter_policy: PerimeterPolicy,
-    /// Версия единого правила пересчёта котировки в деньги.
+    /// Version of the unified quote-to-cash conversion rule.
     pub quotation_rule: QuotationRuleVersion,
-    /// Версия правила расчёта НКД.
+    /// Version of the accrued interest calculation rule.
     pub accrued_interest_rule: AccruedInterestRuleVersion,
-    /// Версия правила сверки запланированных выплат с журналом.
+    /// Version of the rule for reconciling scheduled payments with the journal.
     pub posting_match: PostingMatchVersion,
 }
 
-/// Координата знания, зафиксированная отчётом (§4).
+/// Knowledge coordinate recorded by the report (§4).
 ///
-/// Это тройка версий и момента знания, а не перечень идентификаторов
-/// наблюдений: append-only журнал и детерминированный выбор восстанавливают
-/// набор входов по одной и той же координате.
+/// This is a tuple of versions and a knowledge timestamp, not a list of identifiers
+/// for observations: the append-only log and deterministic selection reconstruct
+/// the input set at the same coordinate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnowledgeCoordinate {
     pub knowledge_as_of: OffsetDateTime,
@@ -582,7 +582,7 @@ impl Default for KnowledgeCoordinate {
     }
 }
 
-/// Запрос отчёта.
+/// Report request.
 #[derive(Debug, Clone, Copy)]
 pub struct ReturnsRequest<'a> {
     pub contour: &'a ContourDefinition,
@@ -590,59 +590,59 @@ pub struct ReturnsRequest<'a> {
     pub report_currency: CurrencyCode,
     pub fx: &'a FxTable,
     pub solver_policy: SolverPolicy,
-    /// Координата набора наблюдений, использованного при расчёте.
+    /// Coordinate of the observation set used in the calculation.
     pub coordinate: KnowledgeCoordinate,
-    /// Реестр сверки: без него доля подтверждённого неизвестна (§10.5).
+    /// Reconciliation registry: without it, the confirmed share is unknown (§10.5).
     pub ledger: &'a ReconciliationLedger,
-    /// Оценка периметра: без неё отчёт не знает, где отказаться
-    /// считать (§11).
+    /// Perimeter assessment: without it, the report does not know where to opt out
+    /// calculate (§11).
     pub perimeter: &'a PerimeterAssessment,
-    /// Кандидаты из рыночного хранилища.
+    /// Candidates from the market store.
     ///
-    /// Приходят отдельным входом, а не событиями журнала, — тем же путём,
-    /// каким уже приходят официальные курсы (E3.3, дизайн 2.1). Пустой
-    /// срез означает «биржевых наблюдений нет», а не ошибку: решение о
-    /// покрытии принимает политика.
+    /// Provided as separate input rather than journal events, — via the same path,
+    /// for which official exchange rates are already available (E3.3, design 2.1). An empty
+    /// slice means «no market observations», not an error: the decision about
+    /// coverage is decided by policy.
     pub market_prices: &'a [PriceCandidate],
-    /// График выплат на координату знания, по инструменту.
+    /// Payment schedule at the knowledge coordinate, by instrument.
     pub bond_schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
-    /// Наблюдённый НКД на одну бумагу, с привязкой к площадке и дате сделки.
+    /// Observed accrued interest per bond, tied to the venue and trade date.
     pub accrued_observations: &'a BTreeMap<(InstrumentId, Venue, Date), PerUnitAmount>,
 }
 
-/// Ответ на три вопроса этапа 1.
+/// Answers to the three questions in phase 1.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnsReport {
     pub as_of: Date,
     pub history_starts: Option<Date>,
     pub report_currency: CurrencyCode,
-    /// Координата, по которой выбран набор входов отчёта.
+    /// Coordinate at which the report input set was selected.
     pub coordinate: KnowledgeCoordinate,
-    /// SHA-256 канонической выборки входов.
+    /// SHA-256 of the canonical input selection.
     pub inputs_hash: String,
-    /// Внесено в контур за всю историю.
+    /// Added to the perimeter over the entire history.
     pub contributed: Computed<Dec>,
-    /// Выведено из контура за всю историю.
+    /// Removed from the perimeter over the entire history.
     pub withdrawn: Computed<Dec>,
-    /// Стоимость контура на дату отчёта: деньги плюс позиции по цене.
+    /// Portfolio value as of the report date: cash plus positions valued at their prices.
     pub terminal_value: Computed<Dec>,
-    /// Метрики облигационных позиций по каждому доступному сценарию.
+    /// Bond position metrics for each available scenario.
     pub bond_metrics: Vec<BondPositionMetrics>,
-    /// Стоимость до издержек выхода и до налога.
+    /// Value before exit costs and before tax.
     pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimate,
-    /// Внутренняя норма доходности **до налога**.
+    /// Internal rate of return **before tax**.
     pub xirr: Computed<RateOutcome>,
     pub applied_rules: AppliedRules,
-    /// Атрибуты облигационных позиций (§4 спеки E3.4.4).
+    /// Bond position attributes (§4 of the E3.4.4 spec).
     pub bond_attributes: Vec<BondPositionAttributes>,
     pub data_quality: DataQuality,
 }
 
 impl ReturnsReport {
-    /// Ярлык результата. Существует, чтобы никакой потребитель API
-    /// не назвал эту величину «доходностью» без оговорки (§16.3).
+    /// Result label. Exists so that no API consumer
+    /// calls this figure «return» without qualification (§16.3).
     pub const XIRR_LABEL: &'static str = "xirr_pre_tax";
-    /// Оценка без издержек гипотетического выхода и без налога (§6.2).
+    /// Valuation excluding hypothetical exit costs and tax (§6.2).
     pub const LIQUIDATION_LABEL: &'static str = "liquidation_value_before_exit_costs_and_tax";
 }
 
@@ -657,10 +657,10 @@ struct SelectedPosition {
 
 #[derive(Serialize)]
 enum PositionValuation {
-    /// Наблюдение в боксе: с основанием котировки вариант перевесил
-    /// остальные вчетверо, и перечисление стало занимать размер самого
-    /// большого на каждой позиции (clippy::large_enum_variant). Тот же
-    /// приём уже применён к `PositionAssessmentKind::Selected`.
+    /// Boxed observation: with the quote basis, the variant outweighed
+    /// the others by a factor of four, and the enum grew to the size of the
+    /// large on every position (clippy::large_enum_variant). The same
+    /// the same technique has already been applied to `PositionAssessmentKind::Selected`.
     Selected(Box<SelectedObservation>),
     LegacyDerived {
         quality: PriceQuality,
@@ -831,9 +831,9 @@ struct SelectedInputs<'a> {
     offer_book: &'a OfferBook,
     cashflow_projection: CashflowProjectionVersion,
     expense_policy: u32,
-    /// Версия правила сверки: изменение входа отчёта обязано менять
-    /// отпечаток, иначе два несравнимых ответа выглядели бы
-    /// воспроизведением одного.
+    /// Reconciliation rule version: changing the report input must change
+    /// fingerprint, otherwise two incomparable answers would look
+    /// by reproducing one.
     posting_match: PostingMatchVersion,
 }
 
@@ -965,12 +965,12 @@ fn inputs_hash_with_bond_inputs(
     hash_selected(&selected)
 }
 
-/// Отпечаток отобранных входов.
+/// Fingerprint of the selected inputs.
 ///
-/// Вынесен из [`inputs_hash_with_bond_inputs`], чтобы тест мог менять
-/// одно поле входа и проверять, что отпечаток на это отзывается:
-/// собрать `SelectedInputs` руками дешевле, чем воспроизводить целое
-/// состояние ради одной версии правила.
+/// Extracted from [`inputs_hash_with_bond_inputs`], so that the test can change
+/// change one input field, and verify that the fingerprint responds to it:
+/// building `SelectedInputs` manually is cheaper than recreating an entire
+/// state for a single rule version.
 fn hash_selected(selected: &SelectedInputs<'_>) -> String {
     let mut encoded = Vec::new();
     if ciborium::into_writer(selected, &mut encoded).is_err() {
@@ -988,15 +988,15 @@ fn hash_selected(selected: &SelectedInputs<'_>) -> String {
     }
     result
 }
-/// Правило пересчёта котировки, применяемое отчётом.
+/// Quote conversion rule used by the report.
 ///
-/// Один помощник нужен, чтобы оценка позиции и XIRR не получили
-/// расходящиеся реализации пересчёта.
+/// One helper is needed so that position valuation and XIRR do not receive
+/// divergent conversion implementations.
 pub(crate) const fn quotation_rule() -> (QuotationRuleVersion, QuotationV1) {
     (QuotationRuleVersion(1), QuotationV1)
 }
 
-/// Версия правила построения сценарных потоков.
+/// Scenario cash flow construction rule version.
 pub(crate) const fn cashflow_projection_rule() -> (
     CashflowProjectionVersion,
     crate::rules::CashflowProjectionV2,
@@ -1007,17 +1007,17 @@ pub(crate) const fn cashflow_projection_rule() -> (
     )
 }
 
-/// Правило сверки запланированных выплат с датированными фактами.
+/// Rule for reconciling scheduled payments against dated facts.
 pub(crate) const fn posting_match_rule() -> (PostingMatchVersion, PostingMatchV2) {
     (PostingMatchVersion(2), PostingMatchV2::new())
 }
 
-/// Версия политики расходов, применяемой до появления налогового контура.
+/// Expense policy version used before the tax scope is introduced.
 pub(crate) const fn expense_policy_rule() -> zero_reinvestment::ExpensePolicyVersion {
     zero_reinvestment::ExpensePolicyVersion(1)
 }
 
-/// Правило расчёта НКД, применяемое отчётом.
+/// Accrued interest calculation rule used by the report.
 pub(crate) const fn accrued_interest_rule() -> (AccruedInterestRuleVersion, AccruedInterestV1) {
     (AccruedInterestRuleVersion(1), AccruedInterestV1)
 }
@@ -1171,10 +1171,10 @@ fn bond_position_attributes(
         .collect()
 }
 
-/// Материально ли расхождение расчёта НКД с наблюдением.
+/// Whether the discrepancy between calculated accrued interest and the observation is material.
 ///
-/// Допуск — одна минорная единица валюты: расхождение в копейку
-/// объясняется округлением, а не ошибкой правила.
+/// Tolerance is one minor currency unit: a discrepancy of one kopeck
+/// is due to rounding, not a rule error.
 fn accrued_mismatch_is_material(computed: Dec, observed: Dec, currency: CurrencyCode) -> bool {
     let Ok(difference) = computed.checked_sub(observed) else {
         return true;
@@ -1229,11 +1229,11 @@ fn accrued_mismatch_issues(
         .collect()
 }
 
-/// Реализуемая при выходе сумма (§4.2).
+/// Amount realizable on exit (§4.2).
 ///
-/// НКД становится реализуемым только при цене, которую источник объявил
-/// исполнимой. Индикативное закрытие и отсутствие выбранной цены — отказ,
-/// а не нулевой результат и не гарантия ликвидности.
+/// Accrued interest becomes realizable only at a price the source has declared
+/// executable. An indicative close and the absence of a selected price — failures,
+/// rather than a zero result or a guarantee of liquidity.
 fn payable_on_termination(
     accrued: &Computed<Dec>,
     executability: SourceExecutability,
@@ -1266,19 +1266,19 @@ fn aggregate_payable_on_termination(attributes: &[BondPositionAttributes]) -> Co
     Computed::Value(total)
 }
 
-/// Расчёт отчёта без отдельной книги заявок.
+/// Report calculation without a separate order book.
 #[must_use]
 pub fn returns_report(state: &LedgerState, request: &ReturnsRequest) -> ReturnsReport {
     let offer_book = OfferBook::default();
     returns_report_with_bond_inputs(state, request, &offer_book)
 }
 
-/// Расчёт отчёта с входами, которые относятся только к облигационным
-/// сценариям. Книга заявок строится оболочкой приложения из журнала.
+/// Report calculation with inputs specific to bond
+/// scenarios. The order book is built from the log by the application shell.
 ///
-/// Ядро не ходит за данными: цены и курсы приходят готовыми, границы
-/// контура заданы явно. Всё, чего не хватает, превращается в отказ
-/// с указанием причины, а не в подставленное значение.
+/// The core does not fetch data: prices and exchange rates are supplied ready to use, and the boundaries
+/// of the perimeter are explicit. Everything, if missing, becomes a failure
+/// with a stated reason, not a substituted value.
 #[must_use]
 pub fn returns_report_with_bond_inputs(
     state: &LedgerState,
@@ -1471,11 +1471,11 @@ fn unavailable_prospective(
     }
 }
 
-/// Входы одной облигационной позиции, общие для всех её сценариев.
+/// Inputs for one bond position, shared by all its scenarios.
 ///
-/// Структура, а не семь аргументов: набор един на позицию, а меняется
-/// между вызовами только сценарий, и перепутать местами две ссылки
-/// одного типа в списке из семи слишком легко.
+/// A struct rather than seven arguments: there is one set per position, and only
+/// the scenario changes between calls, and swapping two references
+/// of the same type in a list of seven is all too easy.
 struct BondScenarioInputs<'a> {
     assessment: &'a PositionAssessment,
     request: &'a ReturnsRequest<'a>,
@@ -1485,9 +1485,9 @@ struct BondScenarioInputs<'a> {
     accrued_rule: &'a dyn AccruedInterestRule,
 }
 
-/// Поток одного сценария. Вынесен из [`bond_scenario`], потому что
-/// сверка прошлого строит его отдельно и обязана строить тем же
-/// правилом: иначе `past` у сверки и у сценария разошлись бы.
+/// Flow for a single scenario. Extracted from [`bond_scenario`], because
+/// historical reconciliation constructs it separately and must use the same
+/// rule: otherwise `past` would diverge between the reconciliation and the scenario.
 fn scenario_plan(
     inputs: &BondScenarioInputs<'_>,
     choice: &OfferChoice,
@@ -1572,12 +1572,12 @@ fn bond_scenario(
     }
 }
 
-/// Сворачивает повторяющиеся недоказуемости после завершения всей сверки.
+/// Coalesces repeated unprovability reports after the entire reconciliation is complete.
 ///
-/// Источник проблемы чинится одним действием, поэтому повтор одной причины
-/// не должен занимать в отчёте место каждой отдельной выплаты. При этом
-/// остальные проблемы проходят без фильтрации: обвинение в пропуске остаётся
-/// адресным, а разные причины не смешиваются.
+/// The issue source can be fixed with one action, so repeating the same reason
+/// should not consume a report entry for every individual payment. At the same time
+/// all other issues pass through unfiltered: the omission finding remains
+/// specific, and distinct causes are not conflated.
 fn collapse_scheduled_posting_unverifiable(issues: Vec<MaterialIssue>) -> Vec<MaterialIssue> {
     type Key = (AccountId, InstrumentId, PostingKind, UnverifiableReason);
 
@@ -1593,14 +1593,14 @@ fn collapse_scheduled_posting_unverifiable(issues: Vec<MaterialIssue>) -> Vec<Ma
         else {
             continue;
         };
-        // Профиль источника намеренно не входит в ключ: книга лотов не
-        // отслеживает происхождение событий, а количество и период уже
-        // дают владельцу нужное действие для исправления.
+        // The source profile is intentionally excluded from the key: the lot book does not
+        // tracks event provenance, while the quantity and period already
+        // provide the owner with the required corrective action.
         let key = (*account, *instrument, *kind, *reason);
         groups
             .entry(key)
             .and_modify(|(count, first_date, last_date)| {
-                *count = count.checked_add(1).expect("слишком много выплат");
+                *count = count.checked_add(1).expect("too many payments");
                 *first_date = (*first_date).min(*date);
                 *last_date = (*last_date).max(*date);
             })
@@ -1626,7 +1626,7 @@ fn collapse_scheduled_posting_unverifiable(issues: Vec<MaterialIssue>) -> Vec<Ma
             continue;
         }
         let (count, first_date, last_date) =
-            groups.remove(&key).expect("группа недоказуемости потеряна");
+            groups.remove(&key).expect("unprovability group was lost");
         if count == 1 {
             collapsed.push(MaterialIssue::ScheduledPostingUnverifiable {
                 account,
@@ -1650,12 +1650,12 @@ fn collapse_scheduled_posting_unverifiable(issues: Vec<MaterialIssue>) -> Vec<Ma
     collapsed
 }
 
-/// Сверка прошлого по книге лотов, независимо от текущих позиций.
+/// Historical reconciliation against the lot book, independently of current positions.
 ///
-/// Полностью проданная бумага остаётся в книге лотов, но исчезает из
-/// позиций вместе с местом хранения. Поэтому проход обязан идти по
-/// [`LotKey`]: здесь собираются только проблемы, а метрики по-прежнему
-/// считает отдельный проход по позициям.
+/// A fully sold security remains in the lot book, but disappears from
+/// the positions, along with its storage location. Therefore the pass must iterate over
+/// [`LotKey`]: only issues are collected here, while metrics still
+/// is computed in a separate pass over the positions.
 fn historical_reconciliation_issues(
     state: &LedgerState,
     request: &ReturnsRequest<'_>,
@@ -1673,10 +1673,10 @@ fn historical_reconciliation_issues(
         let postings = match historical_schedule_postings(schedule, request.as_of) {
             Ok(postings) => postings,
             Err(_) => {
-                // Ошибка доверия относится ко всей паре: даты и вида
-                // выплаты взять неоткуда, но форма проблемы обязана быть
-                // заполнена, поэтому здесь честно используем дату отчёта
-                // и нейтральный вид Coupon.
+                // The trust error applies to the entire pair: the date and kind of
+                // the payment cannot be obtained, but the problem shape must be
+                // populated, so we honestly use the report date here
+                // and the neutral Coupon kind.
                 issues.push(MaterialIssue::ScheduledPostingUnverifiable {
                     account: key.account,
                     instrument: key.instrument,
@@ -1730,9 +1730,9 @@ fn historical_reconciliation_issues(
             judged.push((posting, ownership));
         }
 
-        // Все выплаты, дошедшие до третьего шага, передаются одним вызовом:
-        // иначе факт недоказуемой выплаты мог бы закрыть соседнюю и спрятать
-        // настоящий пропуск.
+        // All payments that reach the third step are passed in a single call:
+        // otherwise an unverifiable payment could cover an adjacent one and hide
+        // the actual omission.
         for ((posting, _), verdict) in judged
             .iter()
             .zip(posting_match.judge_all(&judged, state.income().postings(key)))
@@ -1836,8 +1836,8 @@ fn unresolved_offer_issues(
 
 #[derive(Debug)]
 enum PositionAssessmentKind {
-    /// Кандидат в боксе: без него перечисление раздувается до размера
-    /// самого большого варианта на каждой позиции (clippy::large_enum_variant).
+    /// Boxed candidate: without it, the enum grows to the size of
+    /// largest variant on every position (clippy::large_enum_variant).
     Selected(Box<SelectedPrice>),
     LegacyDerived(PriceQuality),
     Uncovered(UncoveredReason),
@@ -1883,9 +1883,9 @@ fn position_assessments(
                     instrument: price.instrument,
                     price: price.price,
                     currency: price.currency,
-                    // §10.3: цена владельца — деньги за единицу
-                    // по определению, а не по догадке. Ввод процента
-                    // номинала через `EventKind::Valuation` запрещён.
+                    // §10.3: owner price — money per unit
+                    // by definition, not guesswork. Entering a percentage
+                    // of face value via `EventKind::Valuation` is prohibited.
                     basis: crate::valuation::QuotationBasis::MoneyPerUnit,
                     basis_evidence: "journal:valuation".to_owned(),
                     basis_evidence_contradicts: false,
@@ -2025,11 +2025,11 @@ struct PositionQuotation<'a> {
     rule: &'a dyn QuotationRule,
 }
 
-/// Почему остаток номинала не выведен из графика.
+/// Why the remaining face value was not derived from the schedule.
 ///
-/// Отказ доверия к графику отображается отдельно от неизвестного
-/// номинала: в первом случае владельцу нужен проверенный снимок
-/// выпуска, во втором — сам номинал.
+/// A schedule trust failure is represented separately from an unknown
+/// face value: in the first case, the holder needs a verified snapshot
+/// of the issue, while in the second — the face value itself.
 fn remaining_principal_reason(
     error: crate::bond::RemainingPrincipalError,
     instrument: InstrumentId,
@@ -2102,8 +2102,8 @@ fn position_value(
         .map_err(|_| NotComputable::Numeric { code: "numeric" })
 }
 
-/// Блок качества данных строится из состояния, реестра сверки и оценки
-/// периметра, а не из желания показать зелёный статус.
+/// The data quality block is built from state, the reconciliation registry and valuation
+/// the perimeter, not a desire to show a green status.
 fn data_quality(
     state: &LedgerState,
     request: &ReturnsRequest,
@@ -2198,9 +2198,9 @@ fn data_quality(
         }
     }
 
-    // Стоимость по счетам может не посчитаться — например, без цены.
-    // Тогда взвешивать покрытие нечем, и оно честно остаётся
-    // неизвестным, а не выдаётся за полное.
+    // The account value may be impossible to calculate — for example, without a price.
+    // Then there is nothing to weight coverage by, and it honestly remains
+    // unknown rather than being presented as complete.
     let values =
         xirr::account_values_from_position_values(state, request, positions).unwrap_or_default();
     let mut shares = Shares::default();
@@ -2208,19 +2208,19 @@ fn data_quality(
         if request.perimeter.financing_present(*account) {
             issues.push(MaterialIssue::UnsupportedFinancing { account: *account });
         }
-        // Деньги подтверждаются измерением `cash`, бумаги — измерением
-        // `positions`. Это разные утверждения о разных частях счёта,
-        // и взвешивать их одним статусом значило бы либо занижать
-        // подтверждение денег из-за неподтверждённых бумаг, либо
-        // наоборот.
+        // Cash is confirmed by the `cash` measurement, securities — by the
+        // `positions`. These are different assertions about different parts of the account,
+        // and weighting them under a single status would either understate
+        // cash confirmation because of unconfirmed securities, or
+        // vice versa.
         for (part, dimension) in [
             (value.cash, Dimension::Cash),
             (value.positions, Dimension::Positions),
         ] {
             if part.is_zero() {
-                // Измерению, в котором у счёта ничего нет, нечего
-                // подтверждать: сообщать о его неподтверждённости —
-                // это шум, а не проблема.
+                // A measurement in which the account has nothing has nothing to
+                // confirm: reporting it as unconfirmed is
+                // noise, not a problem.
                 continue;
             }
             let status = request
@@ -2303,10 +2303,10 @@ impl ExecutabilityAccumulator {
     }
 }
 
-/// Накопитель долей.
+/// Fraction accumulator.
 ///
-/// Считает в `rust_decimal`, потому что доля — расчётная величина,
-/// а не проведённая сумма (§3.4).
+/// Computes using `rust_decimal`, because the share is a calculated value,
+/// rather than the settled amount (§3.4).
 #[derive(Debug, Default)]
 struct Shares {
     independent: rust_decimal::Decimal,
@@ -2326,12 +2326,12 @@ impl Shares {
         *slot += weight;
     }
 
-    /// Доли от суммы весов.
+    /// Shares of the sum of weights.
     ///
-    /// Нулевая сумма означает пустой портфель или непосчитанную
-    /// стоимость: доли неопределимы, и честный ответ — «ничего не
-    /// подтверждено», а не деление на ноль и не выдуманная единица
-    /// в независимом подтверждении.
+    /// A zero total means an empty portfolio or an uncalculated value
+    /// value: the shares are indeterminate, and the honest answer is «nothing to
+    /// confirmed», rather than division by zero or a fabricated unit
+    /// in independent confirmation.
     fn finish(self) -> NavCoverage {
         let total = self.independent + self.internal + self.provisional + self.discrepant;
         if total.is_zero() {
@@ -2585,7 +2585,7 @@ mod tests {
             vec![Leg::security(account, custody, instrument, quantity)],
         );
         let state = project(&[opening], &context)
-            .expect("проекция позиции")
+            .expect("position projection")
             .snapshot()
             .state()
             .clone();
@@ -2912,7 +2912,7 @@ mod tests {
         let attributes = report
             .bond_attributes
             .first()
-            .expect("облигация должна иметь атрибуты");
+            .expect("bond must have attributes");
         assert!(matches!(
             attributes.accrued_interest,
             Computed::NotComputable {
@@ -2944,7 +2944,7 @@ mod tests {
             .bond_attributes
             .iter()
             .find(|attributes| attributes.instrument == instrument)
-            .expect("процентная облигация должна иметь атрибуты");
+            .expect("coupon bond must have attributes");
 
         assert_eq!(attributes.next_posting_date, Some(date!(2026 - 09 - 01)));
         assert_eq!(attributes.next_principal_return_finality, None);
@@ -2973,7 +2973,7 @@ mod tests {
             .bond_attributes
             .iter()
             .find(|attributes| attributes.instrument == instrument)
-            .expect("процентная облигация должна иметь атрибуты");
+            .expect("coupon bond must have attributes");
 
         assert_eq!(attributes.next_posting_date, Some(date!(2026 - 09 - 15)));
         assert_eq!(
@@ -3263,7 +3263,7 @@ mod tests {
         assert_ne!(
             hash_for_venue("moex"),
             hash_for_venue("corrected-source"),
-            "исправление provenance выбранного наблюдения внутри окна обязано менять хеш"
+            "correcting the provenance of the selected observation within the window must change the hash"
         );
     }
     #[test]
@@ -3348,14 +3348,14 @@ mod tests {
         assert_ne!(
             hash_for_basis(QuotationBasis::MoneyPerUnit),
             hash_for_basis(QuotationBasis::PercentOfRemainingFace),
-            "смена доказанного основания обязана менять хеш входов"
+            "changing the proven basis must change the input hash"
         );
     }
 
     #[test]
     fn an_owner_valuation_is_money_per_unit_by_contract_not_by_guess() {
-        // §10.3: журнальная цена владельца — деньги за единицу
-        // по определению, а не процент номинала.
+        // §10.3: the owner's journal price — money per unit
+        // by definition, not as a percentage of face value.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
@@ -3392,7 +3392,7 @@ mod tests {
             vec![],
         );
         let state = project(&[opening, valuation], &context)
-            .expect("проекция владельческой оценки")
+            .expect("owner valuation projection")
             .snapshot()
             .state()
             .clone();
@@ -3414,7 +3414,7 @@ mod tests {
         };
         let assessments = position_assessments(&state, &request);
         let PositionAssessmentKind::Selected(selected) = &assessments[0].kind else {
-            panic!("владельческая оценка обязана быть выбрана");
+            panic!("owner valuation must be selected");
         };
         assert_eq!(
             selected.candidate.basis,
@@ -3446,7 +3446,7 @@ mod tests {
             vec![Leg::cash(account, amount)],
         );
         let future_state = project(&[future_event], &context)
-            .expect("будущее состояние")
+            .expect("future state")
             .snapshot()
             .state()
             .clone();
@@ -3460,8 +3460,8 @@ mod tests {
 
     #[test]
     fn every_data_quality_status_has_a_machine_readable_code() {
-        // Внешний агент разбирает код, а не текст. Пустая строка вместо
-        // кода неотличима от «статуса нет».
+        // The external agent parses the code, not the text. An empty string instead of
+        // is indistinguishable in code from «no status».
         assert_eq!(DataQualityStatus::Clean.code(), "clean");
         assert_eq!(DataQualityStatus::Mixed.code(), "mixed");
         assert_eq!(DataQualityStatus::Incomplete.code(), "incomplete");
@@ -3501,8 +3501,8 @@ mod tests {
         );
     }
 
-    /// Строит состояние из одного пополнения и одной оценки заданного
-    /// качества. Больше в блоке качества данных ничего не участвует.
+    /// Builds state from one deposit and one valuation of the specified
+    /// quality. Nothing else contributes to the data quality block.
     fn quality_of(price_quality: PriceQuality) -> DataQuality {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
@@ -3535,10 +3535,10 @@ mod tests {
                 vec![],
             ),
         ];
-        let projection = project(&events, &ctx).expect("проекция");
-        // Реестр сверки пуст, оценка периметра пуста: этот помощник
-        // проверяет ровно материальные проблемы состояния, а покрытие
-        // и периметр разобраны отдельными тестами.
+        let projection = project(&events, &ctx).expect("projection");
+        // The reconciliation registry is empty, and the scope estimate is empty: this helper
+        // checks exactly the material state issues, while coverage
+        // and the scope are covered by separate tests.
         let ledger = crate::reconciliation::ReconciliationLedger::default();
         let perimeter = crate::perimeter::PerimeterAssessment::empty(PerimeterPolicy::default());
         let fx = FxTable::new(FxSource::OwnerSupplied);
@@ -3561,10 +3561,10 @@ mod tests {
 
     #[test]
     fn the_start_of_history_is_a_fact_about_the_period_not_a_defect() {
-        // Полная цена и никаких других проблем: остаётся только отметка
-        // «данных ранее такой-то даты нет». Она сообщается всегда, но
-        // неполнотой не является — иначе статус `Incomplete` перестал бы
-        // что-либо означать, потому что стоял бы всегда.
+        // Dirty price and no other problems: only the marker remains
+        // “there is no data before this date.” It is always reported, but
+        // does not constitute incompleteness — otherwise the `Incomplete` status would cease to
+        // mean anything, because it would always be present.
         let quality = quality_of(PriceQuality::Executable);
         assert_eq!(quality.status, DataQualityStatus::Mixed);
         assert!(
@@ -3572,7 +3572,7 @@ mod tests {
                 .material_issues
                 .iter()
                 .any(|issue| matches!(issue, MaterialIssue::HistoryStartsAt { .. })),
-            "начало истории обязано быть названо"
+            "the history start must be specified"
         );
     }
 
@@ -3770,7 +3770,7 @@ mod tests {
             ..
         } = &issues[0]
         else {
-            panic!("ожидалось расхождение НКД");
+            panic!("expected an accrued-interest discrepancy");
         };
         assert_eq!(*computed, dec("2500.00"));
         assert_eq!(*computed_currency, CurrencyCode::Rub);
@@ -3839,7 +3839,7 @@ mod tests {
             ..
         } = &issues[0]
         else {
-            panic!("ожидалось расхождение НКД");
+            panic!("expected an accrued-interest discrepancy");
         };
         assert_eq!(*computed_currency, CurrencyCode::Rub);
         assert_eq!(*computed, dec("25.00"));
@@ -4108,8 +4108,8 @@ mod tests {
 
     #[test]
     fn a_not_computable_value_carries_no_number() {
-        // Тип не позволяет прочитать число там, где его нет:
-        // «ноль с предупреждением» невозможно построить (§15.2).
+        // The type prevents reading a number where none exists:
+        // “zero with a warning” cannot be constructed (§15.2).
         let value: Computed<Dec> = Computed::NotComputable {
             reason: NotComputable::NoExternalFlows,
         };
@@ -4126,7 +4126,7 @@ mod tests {
         let attributes = report
             .bond_attributes
             .first()
-            .expect("облигация должна иметь атрибуты");
+            .expect("bond must have attributes");
         assert!(matches!(
             attributes.accrued_interest_payable_on_termination,
             Computed::NotComputable {
@@ -4159,7 +4159,7 @@ mod tests {
                 quantity,
             )],
         );
-        // Помощник моделирует источник, сообщающий дату перехода прав.
+        // The helper models a source that reports the ownership transfer date.
         event.dates.settled = Some(crate::dates::SettledDate(day));
         event
     }
@@ -4177,7 +4177,7 @@ mod tests {
                     account,
                     instrument,
                     date!(2026 - 08 - 01) + time::Duration::days(index as i64),
-                    u32::try_from(index + 1).expect("номер покупки"),
+                    u32::try_from(index + 1).expect("purchase number"),
                 )
             })
             .collect();
@@ -4188,7 +4188,7 @@ mod tests {
             lot_rule: LotRuleVersion(1),
         };
         let state = project(&events, &context)
-            .expect("проекция покупок")
+            .expect("purchase projection")
             .snapshot()
             .state()
             .clone();
@@ -4219,21 +4219,21 @@ mod tests {
 
     #[test]
     fn a_percent_quote_uses_the_issue_remainder_for_every_lot() {
-        // Остаток принадлежит выпуску: две партии, купленные в разные
-        // дни, оцениваются по одному и тому же непогашенному номиналу.
+        // The balance belongs to the issue: two lots purchased at different
+        // days are evaluated against the same outstanding face value.
         let mut schedule = coupon_schedule(&[date!(2026 - 06 - 01)], date!(2026 - 08 - 15));
         schedule.principal_returns[0].share_percent = dec("30");
         let report = percentage_price_report_from_purchases(2, Some(schedule));
 
-        // 20 бумаг × 700 остатка × 98.5% = 13_790.
+        // 20 securities × 700 balance × 98.5% = 13_790.
         assert_eq!(report.terminal_value, Computed::Value(dec("13790")));
     }
 
     #[test]
     fn a_position_with_unpriced_quantity_still_projects_a_flow_but_has_no_lifetime_metrics() {
-        // Номинал принадлежит выпуску, поэтому неизвестность стоимости
-        // части позиции не мешает построить поток на всё количество.
-        // Пожизненные метрики при этом остаются невычислимыми.
+        // Face value belongs to the issue, so an unknown valuation
+        // a partial position does not prevent constructing a flow for the entire quantity.
+        // Lifetime metrics remain incalculable.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -4251,7 +4251,7 @@ mod tests {
             }
         }
         let EventKind::OpeningPosition { cost_basis, .. } = &mut unpriced.kind else {
-            panic!("ожидалась открытая позиция");
+            panic!("expected an open position");
         };
         *cost_basis = None;
         let events = vec![priced, unpriced];
@@ -4262,7 +4262,7 @@ mod tests {
             lot_rule: LotRuleVersion(1),
         };
         let state = project(&events, &context)
-            .expect("проекция смешанной позиции")
+            .expect("mixed-position projection")
             .snapshot()
             .state()
             .clone();
@@ -4313,7 +4313,7 @@ mod tests {
             lot_rule: LotRuleVersion(1),
         };
         project(std::slice::from_ref(event), &context)
-            .expect("проекция тестового события")
+            .expect("test event projection")
             .snapshot()
             .state()
             .clone()
@@ -4520,7 +4520,7 @@ mod tests {
             lot_rule: LotRuleVersion(1),
         };
         project(&[opening, valuation], &context)
-            .expect("проекция позиции с унаследованной оценкой")
+            .expect("position projection with inherited valuation")
             .snapshot()
             .state()
             .clone()
@@ -4780,8 +4780,8 @@ mod tests {
         let metrics = bond_position_metrics(&state, &request, &positions, &OfferBook::default());
 
         assert!(metrics.is_empty());
-        // Нулевая позиция не создаёт записи LotKey в пустой книге, поэтому
-        // отдельный проход по книге также не находит пару для сверки.
+        // A zero position does not create a `LotKey` entry in an empty book, so
+        // a separate pass through the book also finds no pair to reconcile.
         assert!(historical_reconciliation_issues(&state, &request).is_empty());
     }
 
@@ -4833,7 +4833,7 @@ mod tests {
             )],
         );
         let state = project(&[first_opening, second_opening], &context)
-            .expect("проекция двух позиций")
+            .expect("two-position projection")
             .snapshot()
             .state()
             .clone();
@@ -4870,7 +4870,7 @@ mod tests {
                 instrument: first_instrument,
                 quantity,
             })
-            .expect("подача заявки");
+            .expect("order submission");
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let ledger = ReconciliationLedger::default();
         let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
@@ -4899,7 +4899,7 @@ mod tests {
             .bond_metrics
             .iter()
             .find(|metrics| metrics.instrument == first_instrument)
-            .expect("метрики первой бумаги");
+            .expect("first security metrics");
         assert_eq!(first_metrics.scenarios.len(), 1);
         assert!(matches!(
             first_metrics.scenarios[0].choice,
@@ -4909,7 +4909,7 @@ mod tests {
             .bond_metrics
             .iter()
             .find(|metrics| metrics.instrument == second_instrument)
-            .expect("метрики второй бумаги");
+            .expect("second security metrics");
         assert_eq!(second_metrics.scenarios.len(), 2);
     }
     #[test]
@@ -4960,22 +4960,22 @@ mod tests {
         assert_eq!(first_hash, second_hash);
     }
 
-    /// График облигации с перечисленными купонными датами и одним
-    /// погашением.
+    /// Bond schedule with listed coupon dates and one
+    /// redemption.
     ///
-    /// Полнота, флаги дефолта и валютные роли заданы явно: без них
-    /// правило потока отказывается строить план, `past` не появляется
-    /// вовсе, и тест проверял бы отказ построения, а не сверку.
+    /// Completeness, default flags, and currency roles are explicit: without them
+    /// if the cash flow rule refuses to build a plan, `past` does not appear
+    /// at all, and the test would verify construction failure rather than reconciliation.
     fn coupon_schedule(coupons: &[Date], repayment: Date) -> BondSchedule {
         schedule_with_offers(coupons, repayment, &[])
     }
 
     fn schedule_with_offers(coupons: &[Date], repayment: Date, offers: &[Date]) -> BondSchedule {
         BondSchedule {
-            // Период начинается предыдущей выплатой: замкнутая цепь
-            // нужна не сверке, а НКД — без покрытия даты отчёта отказ
-            // приходит из расчёта НКД, и тест перестал бы отличать
-            // молчание сверки от несостоявшегося сценария.
+            // The period starts with the previous payment: a closed chain
+            // is needed not for reconciliation but for accrued interest — without coverage through the report date, the failure
+            // comes from the accrued-interest calculation, and the test would stop distinguishing
+            // reconciliation silence caused by a scenario that did not occur.
             periods: coupons
                 .iter()
                 .enumerate()
@@ -4987,8 +4987,8 @@ mod tests {
                     },
                     accrual_end: *payment_date,
                     payment_date: *payment_date,
-                    // Тесты сверки проверяют владение на дату права, поэтому
-                    // дата фиксации в этом валидном графике известна.
+                    // Reconciliation tests verify ownership on the entitlement date, so
+                    // the record date in this valid schedule is known.
                     record_date: Some(*payment_date),
                     coupon_per_unit: Some(PerUnitAmount::new(dec("50"), CurrencyCode::Rub)),
                 })
@@ -5032,11 +5032,11 @@ mod tests {
         )
     }
 
-    /// Покупка облигации. Дата сделки задаётся отдельным полем, потому
-    /// что именно её книга лотов кладёт в `Lot.acquired`, а конверт
-    /// `event_with` заполняет только дату зачисления денег. `None`
-    /// воспроизводит обычную покупку без даты сделки: схема её
-    /// допускает (§4.9), и счёт при этом не становится восстановленным.
+    /// Bond purchase. The trade date is specified in a separate field, because
+    /// that its lot book is what writes to `Lot.acquired`, while the envelope
+    /// `event_with` populates only the money credit date. `None`
+    /// reproduces a regular purchase without a trade date: the schema
+    /// permits (§4.9), and the account is not thereby considered reconstructed.
     fn bond_purchase(
         account: AccountId,
         instrument: InstrumentId,
@@ -5064,16 +5064,16 @@ mod tests {
             ],
         );
         event.dates.trade = trade.map(crate::dates::TradeDate);
-        // Помощник моделирует источник, сообщающий дату расчётов; при
-        // отсутствии даты сделки источник также не сообщает и расчёты.
+        // The helper models a source that reports the settlement date; with
+        // when the trade date is absent the source also does not report settlements.
         event.dates.settled = trade.map(crate::dates::SettledDate);
         event
     }
 
-    /// Восстановленная позиция с заявленной датой сделки пятилетней
-    /// давности. Дата зачисления остаётся днём записи, поэтому журнал
-    /// начинается позже, чем куплена бумага, — ровно тот случай,
-    /// который обязан отличаться от пропущенной выплаты.
+    /// Reconstructed position with a stated five-year-old trade date
+    /// age. The credit date remains the entry date, so the log
+    /// starts after the security was purchased — exactly the case
+    /// which must be distinct from a missed payment.
     fn restored_position(
         account: AccountId,
         instrument: InstrumentId,
@@ -5103,15 +5103,15 @@ mod tests {
             )],
         );
         event.dates.trade = Some(crate::dates::TradeDate(trade));
-        // Восстановление моделирует источник с известным расчётом в день
-        // записи, а историческая дата сделки остаётся отдельным фактом.
+        // Recovery models a source with known settlement on the day
+        // records, while the historical trade date remains a separate fact.
         event.dates.settled = Some(crate::dates::SettledDate(day));
         event
     }
 
-    /// Продажа облигации целиком одной партией. Дата сделки задаётся
-    /// отдельно от даты зачисления денег по той же причине, что
-    /// и у покупки.
+    /// Sale of the bond in full as one lot. The trade date is specified
+    /// separately from the cash credit date for the same reason as
+    /// and for the purchase.
     fn bond_sale(
         account: AccountId,
         instrument: InstrumentId,
@@ -5140,15 +5140,15 @@ mod tests {
             ],
         );
         event.dates.trade = trade.map(crate::dates::TradeDate);
-        // Помощник моделирует источник, сообщающий дату расчётов; она
-        // совпадает с датой сделки, если та известна.
+        // The helper models a source that reports the settlement date; it
+        // matches the trade date, if known.
         event.dates.settled = trade.map(crate::dates::SettledDate);
         event
     }
 
-    /// Покупка в названное место хранения. Отдельным помощником, потому
-    /// что `покупка_облигации` выдумывает депозитарий на каждый вызов,
-    /// а здесь важно, что бумага легла именно в этот.
+    /// Purchase into the specified custody location. A separate helper, because
+    /// that `bond_purchase` fabricates a depository on every call,
+    /// and here it matters that the security was booked specifically to this one.
     fn bond_purchase_in_custody(
         account: AccountId,
         instrument: InstrumentId,
@@ -5186,10 +5186,10 @@ mod tests {
         )
     }
 
-    /// Отчёт по журналу облигации.
+    /// Bond journal report.
     ///
-    /// Позиция получает биржевую цену, потому что непокрытая позиция
-    /// сама делает отчёт неполным и скрыла бы вклад сверки в статус.
+    /// The position receives an exchange price because the uncovered position
+    /// by itself makes the report incomplete and would hide the contribution of reconciliation to the status.
     fn reconciliation_report(
         accounts: &[AccountId],
         instrument: InstrumentId,
@@ -5205,9 +5205,9 @@ mod tests {
         )
     }
 
-    /// Тот же отчёт с явной датой отчёта. Отдельным параметром, потому
-    /// что отсрочка перед тревогой считается от неё: без вариации
-    /// `as_of` границу срока ожидания проверить нечем.
+    /// The same report with an explicit report date. A separate parameter, because
+    /// that the grace period before an alert is measured from it: without variation
+    /// the waiting-period boundary cannot be checked at `as_of`.
     fn reconciliation_report_at(
         accounts: &[AccountId],
         instrument: InstrumentId,
@@ -5227,12 +5227,12 @@ mod tests {
             lot_rule: LotRuleVersion(1),
         };
         let state = project(events, &context)
-            .expect("проекция журнала облигации")
+            .expect("bond journal projection")
             .snapshot()
             .state()
             .clone();
-        // Цена наблюдена накануне отчёта: политика отбора цену из
-        // будущего не берёт, и позиция осталась бы непокрытой.
+        // The price was observed the day before the report: the selection policy does not use a price from
+        // the future, and the position would remain uncovered.
         let candidate = market_price(instrument, as_of.saturating_sub(time::Duration::days(1)));
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let ledger = ReconciliationLedger::default();
@@ -5267,8 +5267,8 @@ mod tests {
             .collect()
     }
 
-    /// Журнал с одной пропущенной выплатой: купон 15.03 подтверждён
-    /// фактом 16.03, купон 15.06 не подтверждён ничем.
+    /// Journal with one missed payment: the coupon on 15.03 is confirmed
+    /// by the fact dated 16.03, the coupon dated 15.06 is not supported by any evidence.
     fn journal_with_missing_coupon(
         account: AccountId,
         instrument: InstrumentId,
@@ -5305,7 +5305,7 @@ mod tests {
         );
 
         let issues = missing_postings(&report);
-        assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+        assert_eq!(issues.len(), 1, "issues: {issues:?}");
         assert!(matches!(
             issues[0],
             MaterialIssue::ScheduledPostingNotReceived {
@@ -5321,8 +5321,8 @@ mod tests {
 
     #[test]
     fn a_coupon_before_the_history_horizon_is_unverifiable_even_before_purchase() {
-        // Владение до покупки доказано как `NotOwned`, но порядок правил
-        // сначала обязан назвать отсутствие покрытия истории.
+        // Ownership before purchase is proven as `NotOwned`, but the rule ordering
+        // must first report the lack of historical coverage.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -5344,8 +5344,8 @@ mod tests {
         ];
         let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        // Оба купона раньше первого события счёта: здесь нельзя обвинять
-        // эмитента, даже если книга уже знает, что покупка была позже.
+        // Both coupons predate the account's first event: they cannot be blamed
+        // the issuer, even if the book already knows that the purchase was later.
         let reasons: Vec<_> = report
             .data_quality
             .material_issues
@@ -5375,9 +5375,9 @@ mod tests {
 
     #[test]
     fn a_restored_history_reports_that_it_cannot_verify_rather_than_crying_wolf() {
-        // Заявленная дата сделки пятилетней давности проводит границу
-        // владения до начала журнала: купоны 2021–2025 её проходят,
-        // но фактов под них в журнале нет и быть не может.
+        // A declared trade date five years in the past establishes the boundary
+        // ownership before the journal began: the 2021–2025 coupons pass through it,
+        // but there are no facts for them in the journal and there cannot be.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -5400,8 +5400,8 @@ mod tests {
         )];
         let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        // Июнь 2026 уже покрыт журналом, поэтому его отсутствие теперь
-        // проверяем отдельно; пять купонов 2021–2025 названы недоказуемыми.
+        // June 2026 is already covered by the journal, so its absence is now
+        // is tested separately; five 2021–2025 coupons are marked unverifiable.
         assert_eq!(missing_postings(&report).len(), 1);
         assert!(contains(&report, |issue| matches!(
             issue,
@@ -5416,10 +5416,10 @@ mod tests {
     }
     #[test]
     fn a_posting_before_the_journal_does_not_silence_a_provable_miss_after_it() {
-        // Восстановленная позиция 2021 года, журнал с 01.01.2026,
-        // купоны 15.09.2025, 15.12.2025 и 15.03.2026, мартовский не пришёл.
-        // Ранние возвраты объявлялись недоказуемыми по одному, а мартовский
-        // пропуск не должен исчезнуть вместе со свёрткой.
+        // A position recovered in 2021, with a journal starting on 01.01.2026,
+        // the coupons dated 15.09.2025, 15.12.2025 and 15.03.2026, the March one did not arrive.
+        // Earlier returns were deemed unverifiable individually, while the March
+        // the omission must not disappear during deduplication.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -5437,8 +5437,8 @@ mod tests {
             date!(2021 - 05 - 01),
         )];
         let report = reconciliation_report(&[account], instrument, &events, &schedule);
-        // Две одинаковые недоказуемости должны слиться только после
-        // полного обхода, не поглотив отдельное обвинение ниже.
+        // Two identical unprovabilities must merge only after
+        // the full traversal, without swallowing the separate finding below.
         assert!(
             report
                 .data_quality
@@ -5466,30 +5466,30 @@ mod tests {
             .collect();
         assert!(
             dates.contains(&date!(2026 - 03 - 15)),
-            "пропуск внутри покрытия обязан быть назван: {dates:?}"
+            "a gap within coverage must be identified: {dates:?}"
         );
         assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
     }
 
     #[test]
     fn a_posting_on_the_first_journal_day_is_covered_but_settlement_is_unknown() {
-        // Граница начала журнала полуоткрыта: день первого события
-        // покрыт, поэтому недоказуемость не должна маскироваться
-        // причиной `HistoryStartsAfterSchedule`.
-        // Но дата права совпадает с точной датой расчётов, а закрытая
-        // граница владения намеренно даёт `OwnershipUnknown`.
+        // The journal start boundary is half-open: the day of the first event
+        // is covered, so unverifiability must not be masked
+        // by the `HistoryStartsAfterSchedule` reason.
+        // But the entitlement date exactly matches the settlement date, and the closed
+        // the ownership boundary intentionally yields `OwnershipUnknown`.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let first_day = date!(2026 - 01 - 01);
         let schedule = coupon_schedule(&[first_day, date!(2026 - 06 - 15)], date!(2026 - 12 - 15));
-        // Дата сделки заявлена раньше журнала: границу владения купон
-        // первого дня проходит, и решает его судьбу именно граница
-        // истории, а не отбор по владению.
+        // The declared trade date predates the journal: the coupon's ownership boundary
+        // passes the first-day check, and its fate is determined precisely by the boundary
+        // history rather than ownership-based selection.
         let mut restored = restored_position(account, instrument, first_day, date!(2025 - 06 - 01));
-        // Проверяем именно границу `Exact`: утверждение совпадает с днём
-        // открытия журнала, поэтому владение в этот день ещё неоднозначно.
+        // We specifically test the `Exact` boundary: the assertion falls on the same day as
+        // the journal opening, so ownership on that day remains ambiguous.
         let EventKind::OpeningPosition { assertions, .. } = &mut restored.kind else {
-            unreachable!("помощник создаёт opening_position");
+            unreachable!("the helper creates opening_position");
         };
         assertions.acquisition_date = Some(first_day);
         assertions.acquisition_date_certainty = crate::event::kind::DateCertainty::Known;
@@ -5504,7 +5504,7 @@ mod tests {
                     ..
                 }
             )),
-            "день первого события журналом покрыт: недоказуемости здесь нет"
+            "the first event day is covered by the journal: there is no unprovability here"
         );
         assert!(contains(&report, |issue| matches!(
             issue,
@@ -5514,10 +5514,10 @@ mod tests {
                 ..
             } if *date == first_day
         )));
-        // Купон июня обвинён по существу: владение на его отсечку
-        // доказано датой расчётов восстановленной позиции, а факта нет.
-        // Прежнее ожидание тишины досталось от эпохи, когда одна
-        // недоказуемая выплата глушила всю пару (iaam-d8b.21).
+        // The June coupon is correctly flagged: ownership on its record date
+        // is established by the settlement date of the reconstructed position, but that fact is absent.
+        // The previous expectation of silence came from the era when a single
+        // an unverifiable payment suppressed the entire pair (iaam-d8b.21).
         let missing_dates: Vec<_> = missing_postings(&report)
             .into_iter()
             .filter_map(|issue| match issue {
@@ -5530,9 +5530,9 @@ mod tests {
 
     #[test]
     fn a_purchase_without_a_trade_date_leaves_the_ownership_bound_undrawable() {
-        // `Lot.acquired` — `Option<TradeDate>`, и схема отсутствие даты
-        // допускает (§4.9). Здесь источник также не сообщает расчёты,
-        // поэтому владение на дату права остаётся недоказуемым.
+        // `Lot.acquired` — `Option<TradeDate>`, and in the schema the absence of a date
+        // permits this (§4.9). Here the source also does not report settlements,
+        // so ownership on the record date remains unverifiable.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -5564,8 +5564,8 @@ mod tests {
             MaterialIssue::RestoredWithoutBasis { .. }
         )));
         assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
-        // Статус неполон именно из-за сверки: других дефектов в отчёте
-        // нет, иначе тест проходил бы и без нового варианта.
+        // The status is incomplete specifically because of reconciliation: there are no other defects in the report
+        // there are none, otherwise the test would pass without the new variant.
         let others: Vec<_> = report
             .data_quality
             .material_issues
@@ -5579,14 +5579,14 @@ mod tests {
                     )
             })
             .collect();
-        assert!(others.is_empty(), "посторонние дефекты: {others:?}");
+        assert!(others.is_empty(), "extraneous defects: {others:?}");
     }
 
     #[test]
     fn an_event_without_settlement_date_reports_unknown_ownership() {
-        // Источник, не сообщающий дату перехода прав, делает владение
-        // недоказуемым: система обязана признаться, а не угадать дату
-        // сделки или выдать обвинение.
+        // A source that does not report the ownership transfer date makes ownership
+        // unverifiable: the system must admit this rather than guess the trade date
+        // trade date or report a finding.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(&[date!(2026 - 03 - 15)], date!(2026 - 12 - 15));
@@ -5615,7 +5615,7 @@ mod tests {
 
     #[test]
     fn the_history_horizon_is_reported_but_does_not_make_the_answer_incomplete() {
-        // Зеркалит `HistoryStartsAt`: факт о периоде, а не дефект.
+        // Mirrors `HistoryStartsAt`: a fact about the period, not a defect.
         assert!(
             !MaterialIssue::ScheduledPostingUnverifiable {
                 account: AccountId::new_random(),
@@ -5646,7 +5646,7 @@ mod tests {
                     reason,
                 }
                 .is_defect(),
-                "{reason:?} чинится дозагрузкой фактов и потому дефект"
+                "{reason:?} can be fixed by loading more facts and is therefore a defect"
             );
         }
     }
@@ -5679,16 +5679,16 @@ mod tests {
         .map(UnverifiableReason::code)
         .collect();
 
-        // Семь вариантов должны оставаться разными: каждый дефект
-        // чинится своей дозагрузкой и не может сливаться в один код.
+        // All seven variants must remain distinct: each defect
+        // requires its own data backfill and cannot be merged into a single code.
         assert_eq!(codes.len(), 7);
     }
 
     #[test]
     fn an_income_of_unknown_kind_is_reported_before_the_ownership_bound() {
-        // Неизвестный вид ломает сторону фактов: сверять нечем при любой
-        // границе владения, поэтому причина именно эта, а не отсутствие
-        // даты сделки, которого здесь нет.
+        // An unknown kind breaks the facts side: there is nothing to reconcile with any
+        // at the ownership boundary, so this is precisely the reason rather than the absence of
+        // the trade date, which is absent here.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -5737,8 +5737,8 @@ mod tests {
 
     #[test]
     fn a_bond_with_several_offer_windows_reports_one_miss_once() {
-        // `bond_scenario` вызывается по разу на сценарий, а прошлое у
-        // сценариев общее: сверка внутри сценария задвоила бы проблему.
+        // `bond_scenario` is called once per scenario, while the history of
+        // All scenarios share this: reconciliation within a scenario would duplicate the issue.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = schedule_with_offers(
@@ -5760,21 +5760,21 @@ mod tests {
         assert_eq!(
             report.bond_metrics[0].scenarios.len(),
             3,
-            "сценариев должно быть больше одного, иначе тест ничего не доказывает"
+            "there must be more than one scenario, otherwise the test proves nothing"
         );
         assert_eq!(missing_postings(&report).len(), 1);
     }
 
-    /// Журнал здоровой бумаги: две покупки и продажа ранней партии,
-    /// все прошедшие купоны подтверждены фактами.
+    /// Journal for a healthy bond: two purchases and sale of the early lot,
+    /// all past coupons are supported by facts.
     fn journal_with_early_lot_sold(
         account: AccountId,
         instrument: InstrumentId,
         fact_dates: &[Date],
     ) -> Vec<crate::event::Event> {
-        // Одно место хранения на весь журнал: иначе продажа списала бы
-        // бумагу из депозитария, в который её не клали, и позиций стало
-        // бы три — тест проверял бы задвоение, а не границу владения.
+        // One storage location for the entire journal: otherwise a sale would have removed
+        // the security from a depository where it was never deposited, and the number of positions would
+        // be three — the test would check duplication rather than the ownership boundary.
         let custody = CustodyId::new_random();
         let mut events = vec![
             cash_in(account, date!(2026 - 01 - 05)),
@@ -5794,7 +5794,7 @@ mod tests {
                 account,
                 instrument,
                 *day,
-                5 + u32::try_from(index).expect("номер факта"),
+                5 + u32::try_from(index).expect("fact number"),
             )
         }));
         events
@@ -5802,9 +5802,9 @@ mod tests {
 
     #[test]
     fn a_coupon_whose_waiting_window_is_still_running_is_not_reported_as_missing() {
-        // Деньги идут по депозитарной цепочке до трёх недель, и всё это
-        // время отсутствие факта ничего не доказывает. Граница: +20
-        // дней — молчание, +21 — тревога.
+        // Money travels through the depository chain for up to three weeks, and all of that
+        // during that time the absence of a fact proves nothing. Boundary: +20
+        // days — silence, +21 — alert.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -5824,8 +5824,8 @@ mod tests {
             &schedule,
             date!(2026 - 07 - 05),
         );
-        // Поток построен, значит сверка до плана дошла и промолчала
-        // по существу, а не из-за отказа построения.
+        // The flow was built, so reconciliation reached the plan and stayed silent
+        // on the merits, not because construction failed.
         assert!(matches!(
             still_pending.bond_metrics[0].scenarios[0]
                 .prospective
@@ -5848,7 +5848,7 @@ mod tests {
         assert_eq!(
             missing_postings(&expired).len(),
             1,
-            "проблемы: {:?}",
+            "problems: {:?}",
             missing_postings(&expired)
         );
     }
@@ -5856,10 +5856,10 @@ mod tests {
     #[test]
     fn a_payment_whose_waiting_window_is_still_running_is_not_a_reason_to_call_the_report_unverifiable()
      {
-        // Выплата, срок которой ещё идёт, исключается из проверки
-        // целиком: она не повод ни для тревоги, ни для причины
-        // недоказуемости. Здесь её дата раньше первого события журнала
-        // — прежде это давало `HistoryStartsAfterSchedule`.
+        // A payment whose period is still ongoing is excluded from the check
+        // entirely: it is neither grounds for an alert, nor a reason for
+        // unverifiability. Here its date precedes the first journal event
+        // — previously this yielded `HistoryStartsAfterSchedule`.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -5883,9 +5883,9 @@ mod tests {
 
     #[test]
     fn a_fully_sold_bond_is_still_reconciled_from_the_lot_book() {
-        // Проданная в ноль бумага исчезает из позиций, но запись LotKey
-        // остаётся: мартовский купон за период владения нельзя потерять
-        // вместе с текущим количеством.
+        // A security sold down to zero disappears from positions, but its `LotKey` record
+        // remains: the March coupon from the ownership period must not be lost
+        // together with the current quantity.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
@@ -5906,7 +5906,7 @@ mod tests {
 
         assert!(report.bond_metrics.is_empty());
         let issues = missing_postings(&report);
-        assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+        assert_eq!(issues.len(), 1, "issues: {issues:?}");
         assert!(matches!(
             issues[0],
             MaterialIssue::ScheduledPostingNotReceived { date, .. }
@@ -5916,8 +5916,8 @@ mod tests {
 
     #[test]
     fn reconciliation_survives_an_unknown_nominal_when_scenario_cannot_be_built() {
-        // Номинал нужен сценарию для денег, но не датам сверки: отказ
-        // сценария не должен выключать проверку пропущенного купона.
+        // Face value is needed by the scenario for monetary amounts, but not reconciliation dates: the failure
+        // the scenario must not disable the missing-coupon check.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut schedule = coupon_schedule(
@@ -5955,8 +5955,8 @@ mod tests {
 
     #[test]
     fn an_untrusted_schedule_reports_one_pair_level_refusal() {
-        // Неполному графику нельзя приписывать ни пропуск, ни отсутствие
-        // права: владелец должен увидеть отдельную причину доверия к графику.
+        // Neither a gap, nor an absence can be attributed to an incomplete schedule
+        // entitlement: the owner must see a separate reason to trust the schedule.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut schedule = coupon_schedule(
@@ -5993,15 +5993,15 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(refusals.len(), 1, "проблемы: {refusals:?}");
+        assert_eq!(refusals.len(), 1, "issues: {refusals:?}");
         assert!(missing_postings(&report).is_empty());
     }
 
     #[test]
     fn a_missing_coupon_is_still_named_after_the_earliest_lot_was_sold() {
-        // Граница владения — самая ранняя дата приобретения, когда-либо
-        // наблюдённая по паре. Иначе продажа январской партии подняла бы
-        // границу до апреля и спрятала мартовский пропуск.
+        // The ownership boundary is the earliest acquisition date ever
+        // observed for the pair. Otherwise selling the January lot would raise
+        // extended the boundary through April and hid the March omission.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -6016,7 +6016,7 @@ mod tests {
         let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         let issues = missing_postings(&report);
-        assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+        assert_eq!(issues.len(), 1, "issues: {issues:?}");
         assert!(matches!(
             issues[0],
             MaterialIssue::ScheduledPostingNotReceived { date, .. }
@@ -6026,8 +6026,8 @@ mod tests {
 
     #[test]
     fn a_healthy_history_with_a_sold_early_lot_raises_no_alarm() {
-        // Обратная сторона той же границы: полная история полученных
-        // купонов не даёт ни одной тревоги.
+        // The converse of the same boundary: a complete history of received payments
+        // coupons produce no alerts.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -6054,9 +6054,9 @@ mod tests {
 
     #[test]
     fn a_bond_kept_in_two_custodies_reports_one_miss_once() {
-        // Позиция обходится по `PositionKey` с местом хранения,
-        // а сверяется `LotKey` без него: одна и та же проблема иначе
-        // выдаётся по разу на депозитарий.
+        // Position iteration uses `PositionKey` with the storage location,
+        // while `LotKey` is reconciled without it: the same problem would otherwise
+        // is emitted once per depository.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -6074,18 +6074,18 @@ mod tests {
         assert_eq!(
             report.bond_metrics.len(),
             2,
-            "позиций должно быть две, иначе тест ничего не доказывает"
+            "there must be two positions, otherwise the test proves nothing"
         );
         let issues = missing_postings(&report);
-        assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
+        assert_eq!(issues.len(), 1, "issues: {issues:?}");
     }
 
     #[test]
     fn moving_a_bond_between_custodies_raises_no_false_alarm() {
-        // Отдельного вида события для перевода бумаги между
-        // депозитариями в модели нет: перевод виден только состоянием —
-        // один `LotKey` под двумя `PositionKey`. Оно и проверяется:
-        // полная история купонов не даёт ни одной тревоги.
+        // There is no separate event kind for transferring a security between
+        // There are no transfers between depositories in the model: a transfer is visible only through state —
+        // one `LotKey` under two `PositionKey` entries. That is exactly what is being tested:
+        // a complete coupon history produces no alerts.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -6111,7 +6111,7 @@ mod tests {
         )));
     }
 
-    /// Одна бумага на одном счёте в двух местах хранения.
+    /// One security in one account at two custody locations.
     fn journal_for_bond_in_two_custodies(
         account: AccountId,
         instrument: InstrumentId,
@@ -6139,7 +6139,7 @@ mod tests {
                 account,
                 instrument,
                 *day,
-                4 + u32::try_from(index).expect("номер факта"),
+                4 + u32::try_from(index).expect("fact number"),
             )
         }));
         events
@@ -6191,9 +6191,9 @@ mod tests {
 
     #[test]
     fn the_posting_match_version_reaches_the_inputs_hash() {
-        // Версия правила — вход отчёта: её смена обязана менять
-        // отпечаток, иначе два несравнимых ответа выглядели бы
-        // воспроизведением одного.
+        // The rule version is a report input: changing it must change
+        // a fingerprint, otherwise two incomparable answers would appear
+        // by reproducing a single one.
         let contour = ContourDefinition::new(
             ContourId(uuid::Uuid::nil()),
             ContourVersion(1),
@@ -6233,9 +6233,9 @@ mod tests {
     }
     #[test]
     fn five_unverifiable_postings_with_one_reason_become_one_issue() {
-        // Одна причина уровня источника чинится одним действием, поэтому
-        // пять адресных строк должны сообщить одну проблему с полным
-        // количеством и периодом, а не пять раз повторить одно указание.
+        // A single source-level cause is fixed by one action, so
+        // five targeted lines must report one issue with the full
+        // with the quantity and period, rather than repeating the same instruction five times.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let issues = (0..5)
@@ -6265,8 +6265,8 @@ mod tests {
 
     #[test]
     fn one_unverifiable_posting_stays_an_addressed_issue() {
-        // Свёртка нужна только для повторов: одна выплата должна сохранить
-        // старую адресную форму, чтобы не создавать ложную семантику группы.
+        // Deduplication is needed only for duplicates: a single payment must preserve
+        // the old address-specific form, to avoid creating false group semantics.
         let issue = MaterialIssue::ScheduledPostingUnverifiable {
             account: AccountId::new_random(),
             instrument: InstrumentId::new_random(),
@@ -6282,8 +6282,8 @@ mod tests {
 
     #[test]
     fn collapsing_unverifiable_postings_keeps_an_interleaved_missing_posting() {
-        // Обвинение в конкретном пропуске чинится поиском этого платежа,
-        // поэтому оно обязано пережить глобальную свёртку соседних причин.
+        // Flagging a specific missing payment is fixed by finding that payment,
+        // so it must survive global deduplication of adjacent reasons.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let issues = vec![
@@ -6334,8 +6334,8 @@ mod tests {
 
     #[test]
     fn different_unverifiable_reasons_do_not_merge() {
-        // Разные причины требуют разных исправляющих действий, поэтому
-        // одинаковая пара и вид выплаты не дают права потерять различие.
+        // Different reasons require different corrective actions, so
+        // the same pair and payment type do not justify losing the distinction.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let issues = vec![

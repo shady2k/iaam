@@ -1,7 +1,7 @@
-//! Восемь оснований автоматического повышения статуса (§10.3, таблица).
+//! Eight grounds for automatic status promotion (§10.3, table).
 //!
-//! Тест перечисляет основания по спеке построчно. Ожидаемые уровни взяты
-//! из таблицы §10.3, а не из вывода программы (§15.5).
+//! The test lists the grounds from the spec line by line. The expected levels are taken
+//! from the table in §10.3, not from the program output (§15.5).
 
 use std::collections::BTreeSet;
 
@@ -10,14 +10,14 @@ use iaam_core::ids::SourceId;
 use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
 use iaam_core::reconciliation::{ConfidenceLevel, Dimension};
 
-/// Хеш документа из читаемого имени.
+/// Document hash from a human-readable name.
 ///
-/// Имя кодируется шестнадцатерично и дополняется до шестидесяти четырёх
-/// знаков: `RawHash` принимает только корректный SHA-256, а тесту нужны
-/// различимые и узнаваемые в отладке документы, а не настоящие хеши.
+/// The name is hex-encoded and padded to sixty-four
+/// characters: `RawHash` accepts only a valid SHA-256, while the test needs
+/// documents that are distinct and recognizable in debug output, not real hashes.
 fn hash(seed: &str) -> RawHash {
     let mut hex: String = seed.bytes().map(|byte| format!("{byte:02x}")).collect();
-    assert!(hex.len() <= 64, "имя документа {seed} слишком длинное");
+    assert!(hex.len() <= 64, "document name {seed} is too long");
     while hex.len() < 64 {
         hex.push('0');
     }
@@ -33,7 +33,7 @@ fn report_channel(parser: &str, document: &str) -> SourceChannel {
 }
 
 fn api_channel(parser: &str) -> SourceChannel {
-    // У ответа API документа нет: это поток, а не файл.
+    // An API response has no document: it is a stream, not a file.
     SourceChannel {
         source: SourceId::new_random(),
         parser_version: ParserVersion(parser.to_owned()),
@@ -47,9 +47,9 @@ fn dims(list: &[Dimension]) -> BTreeSet<Dimension> {
 
 #[test]
 fn ground_one_opening_matches_prior_closing_is_internal_only() {
-    // Тот же брокер и тот же парсер: общая ошибка разбора исказит обе
-    // стороны одинаково, и сверка её не заметит. Это непрерывность,
-    // а не независимость.
+    // The same broker and the same parser: a shared parsing error will distort both
+    // sides identically, and reconciliation will not detect it. This is continuity,
+    // not independence.
     let evidence = Evidence::from_match(
         Ground::OpeningMatchesPriorClosing,
         report_channel("tinkoff-xlsx/1", "b"),
@@ -74,8 +74,8 @@ fn ground_two_continuity_is_internal_only() {
 
 #[test]
 fn ground_three_broker_api_against_a_parsed_report_is_independent() {
-    // Другой канал получения и другой код разбора — условие §10.3
-    // выполнено, и только здесь появляется independent.
+    // A different retrieval channel and different parsing code—the condition in §10.3
+    // is met, and independent appears only here.
     let evidence = Evidence::from_match(
         Ground::BrokerApiAgreesWithStatement,
         api_channel("tinkoff-api/1"),
@@ -88,9 +88,9 @@ fn ground_three_broker_api_against_a_parsed_report_is_independent() {
 
 #[test]
 fn ground_three_degrades_to_internal_when_the_channel_is_not_independent() {
-    // Ключевая проверка §10.3: уровень определяется независимостью
-    // канала, а не типом основания. Если «API» разобран тем же кодом
-    // и тем же документом, никакой независимости нет.
+    // The key check from §10.3: the level is determined by channel independence,
+    // not by the type of ground. If «API» is parsed using the same code
+    // and the same document, there is no independence.
     let evidence = Evidence::from_match(
         Ground::BrokerApiAgreesWithStatement,
         report_channel("tinkoff-xlsx/1", "a"),
@@ -101,15 +101,15 @@ fn ground_three_degrades_to_internal_when_the_channel_is_not_independent() {
     assert_eq!(
         evidence.level(),
         ConfidenceLevel::AcceptedInternal,
-        "тот же парсер и тот же документ не дают независимости"
+        "the same parser and the same document do not provide independence"
     );
 }
 
 #[test]
 fn a_later_statement_of_the_same_broker_never_reaches_independent() {
-    // Прямая формулировка спеки: «Следующий отчёт того же брокера,
-    // разобранный тем же парсером, — это непрерывность, а не
-    // независимость». Документы разные, парсер один.
+    // Exact wording from the spec: «The next report from the same broker,
+    // parsed by the same parser, is continuity, not
+    // independence». The documents are different, but the parser is the same.
     let confirmed = report_channel("tinkoff-xlsx/3", "march");
     let confirming = report_channel("tinkoff-xlsx/3", "april");
     assert!(!confirming.is_independent_of(&confirmed));
@@ -129,7 +129,7 @@ fn a_later_statement_of_the_same_broker_never_reaches_independent() {
         if let Some(evidence) = evidence {
             assert!(
                 evidence.level() <= ConfidenceLevel::AcceptedInternal,
-                "основание {ground:?} выдало independent на одном парсере"
+                "ground {ground:?} yielded independent with a single parser"
             );
         }
     }
@@ -137,9 +137,9 @@ fn a_later_statement_of_the_same_broker_never_reaches_independent() {
 
 #[test]
 fn a_reparse_of_the_same_document_by_a_new_parser_is_not_independent() {
-    // Новая версия парсера по тому же документу — это исправленный
-    // разбор, а не второй источник. Документ один, и ошибка в нём самом
-    // останется незамеченной обеими сторонами.
+    // A new parser version for the same document is a corrected
+    // parse, not a second source. There is only one document, and an error in it
+    // will go unnoticed by both sides.
     let confirmed = report_channel("tinkoff-xlsx/1", "march");
     let confirming = report_channel("tinkoff-xlsx/2", "march");
     assert!(!confirming.is_independent_of(&confirmed));
@@ -147,8 +147,8 @@ fn a_reparse_of_the_same_document_by_a_new_parser_is_not_independent() {
 
 #[test]
 fn independence_ignores_the_source_identifier() {
-    // Два источника могут делить код разбора. Разные идентификаторы
-    // при одном парсере и одном документе независимости не создают.
+    // Two sources may share parsing code. Different identifiers
+    // with the same parser and the same document do not create independence.
     let left = SourceChannel {
         source: SourceId::new_random(),
         parser_version: ParserVersion("shared/1".to_owned()),
@@ -165,9 +165,9 @@ fn independence_ignores_the_source_identifier() {
 
 #[test]
 fn ground_four_depositary_report_raises_positions_only() {
-    // Депозитарий подтверждает количества и место хранения. О деньгах
-    // он не говорит ничего, и повысить ими денежное измерение значило
-    // бы выдать подтверждение, которого не было.
+    // The depository confirms quantities and the custody location. As for money,
+    // it says nothing, and using this to promote the monetary dimension would
+    // amount to issuing confirmation that was never provided.
     let evidence = Evidence::from_match(
         Ground::DepositaryReportConfirms,
         report_channel("depositary-pdf/1", "b"),
@@ -181,7 +181,7 @@ fn ground_four_depositary_report_raises_positions_only() {
 
 #[test]
 fn ground_five_separate_sections_agree_is_internal_across_dimensions() {
-    // Независимые уравнения, но один документ и один парсер.
+    // Independent equations, but one document and one parser.
     let channel = report_channel("tinkoff-xlsx/1", "march");
     let evidence = Evidence::from_match(
         Ground::SeparateSectionsAgree,
@@ -199,8 +199,8 @@ fn ground_five_separate_sections_agree_is_internal_across_dimensions() {
 
 #[test]
 fn ground_six_payout_is_independent_only_through_another_channel() {
-    // Выписка банка против нашей проекции — независимо. Та же выписка,
-    // что дала условия договора, — нет.
+    // A bank statement checked against our projection is independent. The same statement
+    // that provided the contract terms is not.
     let terms = report_channel("bank-statement/1", "contract");
     let independent = Evidence::from_match(
         Ground::PayoutConfirmsSchedule,
@@ -236,8 +236,8 @@ fn ground_seven_corporate_action_terms_raise_positions() {
 
 #[test]
 fn ground_eight_tax_certificate_raises_income_and_tax_basis_only() {
-    // Отдельный документ, отдельный парсер — independent, но только по
-    // агрегатам: справка не подтверждает ни остаток, ни количества.
+    // A separate document and a separate parser are independent, but only for
+    // aggregates: the certificate confirms neither the balance nor the quantities.
     let evidence = Evidence::from_match(
         Ground::TaxAgentCertificate,
         report_channel("tax-certificate/1", "b"),
@@ -254,10 +254,10 @@ fn ground_eight_tax_certificate_raises_income_and_tax_basis_only() {
 
 #[test]
 fn an_owner_stated_balance_is_internal_and_touches_cash_and_positions_only() {
-    // §10.4: названный владельцем остаток подтверждает снимок и не
-    // трогает налоговую стоимость и доходы. Уровень — internal: владелец
-    // мог прочитать ту же цифру в том же отчёте, и независимость здесь
-    // не доказана, а §10.3 требует доказательства.
+    // §10.4: the balance stated by the owner confirms the snapshot and does not
+    // affect the tax basis or income. The level is internal: the owner
+    // could have read the same figure in the same report, so independence
+    // has not been proven here, while §10.3 requires evidence.
     let owner = SourceChannel {
         source: SourceId::new_random(),
         parser_version: ParserVersion("owner/1".to_owned()),
@@ -284,9 +284,9 @@ fn an_owner_stated_balance_is_internal_and_touches_cash_and_positions_only() {
 
 #[test]
 fn evidence_without_any_confirmed_dimension_does_not_exist() {
-    // Основание, ничего не подтверждающее, — это не основание. Пустое
-    // множество измерений здесь опаснее ошибки: оно молча добавляет
-    // строку в список доказательств.
+    // A basis that confirms nothing is no basis at all. An empty
+    // set of dimensions is more dangerous than an error here: it silently adds
+    // a row to the list of evidence.
     let channel = report_channel("tinkoff-xlsx/1", "a");
     assert!(
         Evidence::from_match(
@@ -296,7 +296,7 @@ fn evidence_without_any_confirmed_dimension_does_not_exist() {
             dims(&[Dimension::Cash]),
         )
         .is_none(),
-        "депозитарий не подтверждает деньги — основания нет"
+        "the depository does not confirm money — no basis"
     );
 }
 
@@ -308,14 +308,17 @@ fn every_ground_has_a_distinct_machine_readable_code() {
     codes.sort_unstable();
     codes.dedup();
     assert_eq!(codes.len(), count);
-    assert_eq!(count, 9, "восемь оснований §10.3 плюс остаток от владельца");
+    assert_eq!(
+        count, 9,
+        "eight bases under §10.3 plus the owner-reported balance"
+    );
 }
 
 #[test]
 fn no_ground_raises_a_dimension_it_cannot_speak_about() {
-    // Обход по всем основаниям: подтверждённые измерения обязаны быть
-    // подмножеством того, о чём основание вправе говорить. Это свойство,
-    // а не пример, и оно ловит расширение любого основания задним числом.
+    // Check all bases: the confirmed dimensions must be
+    // a subset of those the basis is entitled to cover. This is a property,
+    // not an example, and it catches any retroactive expansion of a basis.
     let confirming = api_channel("other/1");
     let confirmed = report_channel("report/1", "a");
     let everything = dims(&[
@@ -331,10 +334,10 @@ fn no_ground_raises_a_dimension_it_cannot_speak_about() {
             confirmed.clone(),
             everything.clone(),
         )
-        .expect("хотя бы одно измерение подтверждается каждым основанием");
+        .expect("each basis must confirm at least one dimension");
         assert!(
             evidence.dimensions().is_subset(&ground.dimensions()),
-            "основание {ground:?} повысило измерение, о котором не говорит"
+            "basis {ground:?} promoted a dimension it does not cover"
         );
     }
 }

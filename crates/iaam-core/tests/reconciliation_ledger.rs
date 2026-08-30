@@ -1,4 +1,4 @@
-//! Статус полноты счёта на интервале по измерению (§10.3).
+//! Account completeness status over an interval, by dimension (§10.3).
 
 use iaam_core::event::Event;
 use iaam_core::event::kind::EventKind;
@@ -34,7 +34,7 @@ fn deposit(channel: &TestChannel, owner: OwnerId, account: AccountId, minor: i64
     )
 }
 
-/// Контрольные величины одного документа.
+/// Control figures for a single document.
 struct Sections {
     opening: i64,
     closing: i64,
@@ -42,11 +42,11 @@ struct Sections {
     credit: i64,
 }
 
-/// Полный набор контрольных секций одного документа: остаток на начало,
-/// остаток на конец и обороты. Именно такой набор даёт основание 5.
+/// Complete set of control sections for a single document: opening balance,
+/// closing balance, and turnover. Exactly this set provides basis 5.
 ///
-/// Дата утверждений — конец интервала: контрольная секция говорит о
-/// периоде целиком, и отдельным аргументом её задавать незачем.
+/// The assertion date is the end of the interval: the control section refers to
+/// the period as a whole, so there is no need to provide it as a separate argument.
 fn full_sections(
     channel: &TestChannel,
     owner: OwnerId,
@@ -91,8 +91,8 @@ fn full_sections(
 
 #[test]
 fn separate_sections_that_all_agree_raise_the_period_to_internal() {
-    // Основание 5: независимые уравнения, но один документ и один
-    // парсер. Выше internal подняться не может по устройству.
+    // Basis 5: independent equations, but a single document and a single
+    // parser. By design, internal cannot be promoted any higher.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let march_channel = TestChannel::new("tinkoff-xlsx/1", "march");
@@ -118,15 +118,15 @@ fn separate_sections_that_all_agree_raise_the_period_to_internal() {
     assert_eq!(
         ledger.status_for(account, date!(2026 - 03 - 15), Dimension::TaxBasis),
         DimensionStatus::Provisional,
-        "налоговая стоимость денежным остатком не подтверждается"
+        "the tax basis is not confirmed by the cash balance"
     );
 }
 
 #[test]
 fn one_agreeing_section_is_not_enough_for_ground_five() {
-    // Один сошедшийся остаток не является совпадением независимых
-    // уравнений: он подтверждает сам себя. Основание 5 требует, чтобы
-    // сошлись и остаток, и оборот — величины, считающиеся по-разному.
+    // A single reconciled balance is not agreement between independent
+    // equations: it confirms itself. Basis 5 requires both
+    // the balance and turnover to reconcile—quantities calculated in different ways.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let march_channel = TestChannel::new("tinkoff-xlsx/1", "march");
@@ -161,14 +161,14 @@ fn one_agreeing_section_is_not_enough_for_ground_five() {
 
 #[test]
 fn a_discrepancy_wins_over_any_amount_of_confirmation() {
-    // Подтверждение не затирает несошедшуюся цифру. Иначе достаточно
-    // было бы приложить второй документ, чтобы расхождение исчезло
-    // с экрана, оставшись в данных.
+    // Confirmation does not overwrite an unreconciled figure. Otherwise, it would be enough
+    // to attach a second document for the discrepancy to disappear
+    // from the screen while remaining in the data.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let march_channel = TestChannel::new("tinkoff-xlsx/1", "march");
     let mut events = vec![deposit(&march_channel, owner, account, 100_000)];
-    // Обороты сойдутся, а конечный остаток — нет.
+    // Turnover will reconcile, but the ending balance will not.
     events.extend(full_sections(
         &march_channel,
         owner,
@@ -191,8 +191,8 @@ fn a_discrepancy_wins_over_any_amount_of_confirmation() {
 
 #[test]
 fn two_independent_channels_over_the_same_period_reach_independent() {
-    // Основание 3. Тот же период, те же цифры, другой парсер и другой
-    // документ — условие независимости §10.3 выполнено.
+    // Basis 3. The same period, the same figures, a different parser and a different
+    // document—the independence requirement of §10.3 is met.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let apimarch_channel = TestChannel::new("tinkoff-api/1", "apimarch");
@@ -232,9 +232,9 @@ fn two_independent_channels_over_the_same_period_reach_independent() {
 
 #[test]
 fn two_statements_of_the_same_parser_never_reach_independent() {
-    // Прямая формулировка §10.3. Два разных документа одного брокера,
-    // разобранные одним парсером, — это непрерывность, а не
-    // независимость.
+    // The literal wording of §10.3. Two different documents from the same broker,
+    // parsed by the same parser, provide continuity, not
+    // independence.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let copyone_channel = TestChannel::new("tinkoff-xlsx/1", "copyone");
@@ -275,9 +275,9 @@ fn two_statements_of_the_same_parser_never_reach_independent() {
 
 #[test]
 fn the_opening_of_the_next_statement_confirms_the_previous_period() {
-    // Основание 1. Апрельский отчёт начинается с того остатка, который
-    // мы насчитали за март: подтверждается МАРТ, а не апрель — в апреле
-    // подтверждать ещё нечего.
+    // Basis 1. The April report begins with the balance that
+    // we calculated for March: MARCH is confirmed, not April—there is
+    // nothing to confirm in April yet.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let april_channel = TestChannel::new("tinkoff-xlsx/1", "april");
@@ -285,7 +285,7 @@ fn the_opening_of_the_next_statement_confirms_the_previous_period() {
     let april = AssertionPeriod::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30)).unwrap();
 
     let mut events = vec![deposit(&march_channel, owner, account, 100_000)];
-    // Март: только конечный остаток, без оборотов — основания 5 не даёт.
+    // March: ending balance only, no turnover—does not qualify for basis 5.
     events.push(event_on(
         &march_channel,
         Posting {
@@ -304,7 +304,7 @@ fn the_opening_of_the_next_statement_confirms_the_previous_period() {
         },
         vec![],
     ));
-    // Апрель: начальный остаток совпадает с вычисленным мартовским.
+    // April: the opening balance matches the calculated March balance.
     events.push(event_on(
         &april_channel,
         Posting {
@@ -328,19 +328,19 @@ fn the_opening_of_the_next_statement_confirms_the_previous_period() {
     assert_eq!(
         ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
         DimensionStatus::AcceptedInternal,
-        "подтверждён март"
+        "March confirmed"
     );
     assert_eq!(
         ledger.status_for(account, date!(2026 - 04 - 15), Dimension::Cash),
         DimensionStatus::Provisional,
-        "апрель начальным остатком не подтверждается: в нём подтверждать нечего"
+        "April is not confirmed by its opening balance: there is nothing to confirm in April yet"
     );
 }
 
 #[test]
 fn a_period_without_assertions_stays_provisional() {
-    // Отсутствие утверждений — это отсутствие подтверждения, а не
-    // подтверждение отсутствия проблем.
+    // The absence of assertions is the absence of confirmation, not
+    // confirmation that there are no problems.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let none_channel = TestChannel::new("manual/1", "none");
@@ -356,8 +356,8 @@ fn a_period_without_assertions_stays_provisional() {
 
 #[test]
 fn the_ledger_is_a_pure_function_of_the_journal() {
-    // Тот же журнал — тот же статус. Иначе воспроизвести показанную
-    // владельцу цифру невозможно, а §3.1 требует именно этого.
+    // The same journal means the same status. Otherwise, reproducing the figure shown
+    // to the owner is impossible, and §3.1 specifically requires that.
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let march_channel = TestChannel::new("tinkoff-xlsx/1", "march");
@@ -387,9 +387,9 @@ fn the_ledger_is_a_pure_function_of_the_journal() {
 
 #[test]
 fn a_discrepancy_covered_by_a_perimeter_exception_is_excepted_not_discrepant() {
-    // §11: система знает, почему цифры не сходятся, и не отправляет
-    // владельца чинить то, что не поддерживает. Но подтверждением это
-    // не становится: измерение не поднимается выше provisional.
+    // §11: the system knows why the figures do not reconcile and does not send
+    // the owner to fix something it does not support. But this does not
+    // constitute confirmation: the measurement cannot rise above provisional.
     use iaam_core::perimeter::PerimeterExceptions;
     use iaam_core::reconciliation::check::{ClaimOutcome, ReconciliationException};
 
@@ -415,7 +415,7 @@ fn a_discrepancy_covered_by_a_perimeter_exception_is_excepted_not_discrepant() {
     assert_eq!(
         bare.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
         DimensionStatus::Discrepant,
-        "без исключения это обычное расхождение"
+        "without an exception, this is a regular discrepancy"
     );
 
     let mut exceptions = PerimeterExceptions::default();
@@ -429,33 +429,33 @@ fn a_discrepancy_covered_by_a_perimeter_exception_is_excepted_not_discrepant() {
     assert_eq!(
         excused.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
         DimensionStatus::Provisional,
-        "исключение снимает требование чинить, но не подтверждает данные"
+        "an exception removes the requirement to fix it but does not confirm the data"
     );
     let status = excused
         .statuses()
         .find(|status| status.account() == account)
-        .expect("статус за март");
+        .expect("March status");
     assert!(
         status
             .outcomes()
             .iter()
             .any(|check| matches!(check.outcome, ClaimOutcome::Excepted { .. })),
-        "исход обязан быть помечен исключением, а не расхождением"
+        "the outcome must be marked as an exception, not a discrepancy"
     );
     assert!(
         !status
             .outcomes()
             .iter()
             .any(|check| matches!(check.outcome, ClaimOutcome::Discrepant(_))),
-        "накрытое исключением расхождение не остаётся расхождением"
+        "a discrepancy covered by an exception does not remain a discrepancy"
     );
 }
 
 #[test]
 fn a_status_carries_the_grounds_that_produced_it() {
-    // Владелец спрашивает не только «можно ли верить», но и «почему».
-    // Статус без оснований — это цифра без объяснения, а §10.3 вводит
-    // основания именно для того, чтобы уровень можно было проверить.
+    // The owner asks not only whether it can be trusted, but also why.
+    // A status without a basis is a figure without an explanation, and §10.3 introduces
+    // bases specifically so that the level can be verified.
     use iaam_core::reconciliation::evidence::Ground;
 
     let owner = OwnerId::new_random();
@@ -480,7 +480,7 @@ fn a_status_carries_the_grounds_that_produced_it() {
     let status = ledger
         .statuses()
         .find(|status| status.account() == account)
-        .expect("статус за март");
+        .expect("March status");
 
     assert_eq!(status.period(), march());
     let grounds: Vec<Ground> = status
@@ -491,11 +491,11 @@ fn a_status_carries_the_grounds_that_produced_it() {
     assert_eq!(
         grounds,
         vec![Ground::SeparateSectionsAgree],
-        "статус обязан назвать основание, по которому он получен"
+        "the status must state the basis on which it was obtained"
     );
     assert_eq!(
         status.outcomes().len(),
         3,
-        "все три проверенных утверждения остаются видимыми"
+        "all three verified assertions remain visible"
     );
 }

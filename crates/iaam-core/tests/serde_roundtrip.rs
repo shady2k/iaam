@@ -1,9 +1,9 @@
-//! Round-trip журнала через JSON (незакрытый вопрос первого плана).
+//! Journal JSON round trip (an unresolved first-order issue).
 //!
-//! `docs/irreversible-core.md` фиксировал: корректность `Serialize`/
-//! `Deserialize` держится на том, что derive компилируется. Журнал фактов,
-//! не переживающий сериализацию, бесполезен — хранилище кладёт событие
-//! в текстовое поле и читает обратно.
+//! `docs/irreversible-core.md` stated that correctness of `Serialize`/
+//! `Deserialize` rests on the derives compiling. A fact journal
+//! that does not survive serialization is useless — the storage layer writes the event
+//! to a text field and reads it back.
 
 use std::collections::BTreeSet;
 
@@ -34,7 +34,7 @@ fn qty(units: i64) -> Quantity {
 
 fn per_unit(text: &str) -> PerUnitAmount {
     PerUnitAmount::new(
-        Dec::new(Decimal::from_str_exact(text).expect("десятичное число")),
+        Dec::new(Decimal::from_str_exact(text).expect("decimal number")),
         CurrencyCode::Rub,
     )
 }
@@ -56,15 +56,15 @@ fn envelope(kind: EventKind, legs: Vec<Leg>) -> Event {
         legs,
         provenance: Provenance::new(
             SourceId::new_random(),
-            RawHash::parse(&"f".repeat(64)).expect("хеш"),
+            RawHash::parse(&"f".repeat(64)).expect("hash"),
             ParserVersion("manual/1".into()),
         )
         .with_source_operation_id("op-42")
         .with_row(RowLocator {
-            // Документ назван хешом, а не именем файла: тот же отчёт,
-            // сохранённый под другим именем, обязан остаться тем же
-            // документом.
-            document: RawHash::parse(&"a".repeat(64)).expect("хеш документа"),
+            // The document is identified by its hash, not its filename: the same report,
+            // saved under a different name, must remain the same
+            // document.
+            document: RawHash::parse(&"a".repeat(64)).expect("document hash"),
             sheet: Some("Сделки".into()),
             row: 17,
         }),
@@ -76,8 +76,8 @@ fn envelope(kind: EventKind, legs: Vec<Leg>) -> Event {
     }
 }
 
-/// Каждый вариант `EventKind`, чтобы новый вариант ломал этот тест
-/// вместе со сборкой, а не молча оставался непроверенным.
+/// Every variant of `EventKind`, so that adding a new variant breaks this test
+/// and the build, rather than silently leaving it untested.
 fn every_kind() -> Vec<Event> {
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
@@ -154,7 +154,7 @@ fn every_kind() -> Vec<Event> {
         envelope(
             EventKind::ControlAssertion {
                 period: AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
-                    .expect("интервал"),
+                    .expect("interval"),
                 claim: ControlClaim::CashTurnover {
                     currency: CurrencyCode::Rub,
                     debit: PostedMinor::new(150_000),
@@ -256,11 +256,11 @@ fn every_kind() -> Vec<Event> {
     ]
 }
 
-/// Все виды события, которые обязан покрывать круг через JSON.
+/// All event kinds that the JSON round trip must cover.
 ///
-/// Список закреплён вручную и сверяется с образцами: без сверки тест
-/// продолжал бы называться «каждый вид», покрывая не каждый. Так уже
-/// было — `control_assertion` в образцах отсутствовал.
+/// The list is pinned manually and checked against the samples: without this check, the test
+/// would still call itself «every kind» without covering every kind. This has already
+/// happened — `control_assertion` was missing from the samples.
 const EVERY_DISCRIMINANT: [&str; 12] = [
     "trade",
     "cash_in",
@@ -276,9 +276,9 @@ const EVERY_DISCRIMINANT: [&str; 12] = [
     "offer_exercise",
 ];
 
-/// Заслон полноты списка выше: новый вариант обязан сломать сборку
-/// здесь. Ветки `_` нет намеренно — она и есть та дыра, ради которой
-/// заслон существует (§15.1).
+/// Exhaustiveness guard for the list above: a new variant must break the build
+/// here. There is intentionally no `_` arm — it is exactly the hole that
+/// this guard exists to prevent (§15.1).
 fn is_known(kind: &EventKind) -> bool {
     match kind {
         EventKind::Trade { .. }
@@ -306,30 +306,30 @@ fn the_round_trip_covers_every_event_kind() {
     let expected: BTreeSet<&str> = EVERY_DISCRIMINANT.into_iter().collect();
     assert_eq!(
         covered, expected,
-        "у вида события нет образца: круг через JSON его не проверяет"
+        "the event kind has no sample: the JSON round trip does not test it"
     );
 }
 
 #[test]
 fn every_event_kind_survives_a_json_round_trip() {
     for event in every_kind() {
-        let json = serde_json::to_string(&event).expect("сериализация");
-        let back: Event = serde_json::from_str(&json).expect("разбор");
-        assert_eq!(back, event, "round-trip изменил событие: {json}");
+        let json = serde_json::to_string(&event).expect("serialization");
+        let back: Event = serde_json::from_str(&json).expect("parsing");
+        assert_eq!(back, event, "round trip changed the event: {json}");
     }
 }
 
 #[test]
 fn a_partial_redemption_written_before_the_allocation_field_reads_as_unknown() {
-    // Тело записано до появления `basis_allocation`. Читаться обязано,
-    // и доля обязана быть неизвестной, а не нулевой.
+    // The body was written before `basis_allocation` was introduced. It must still parse,
+    // and the fraction must be unknown, not zero.
     let text = r#"{"PartialRedemption":{"instrument":"8e27804a-de75-417e-a6ad-a68e919aed97","custody":"269bd88e-c7f0-422b-85ac-e56b0eba6485","quantity":"10","principal_returned_per_unit":{"value":"200.0000","currency":"Rub"},"compensation":{"amount":200000,"currency":"Rub"},"effective_date":[2026,166],"record_date":[2026,164],"grounds":"решение эмитента №4"}}"#;
-    let action: CorporateAction = serde_json::from_str(text).expect("старое тело читается");
+    let action: CorporateAction = serde_json::from_str(text).expect("legacy body parses");
     let CorporateAction::PartialRedemption {
         basis_allocation, ..
     } = action
     else {
-        panic!("ожидалась амортизация");
+        panic!("expected an amortization event");
     };
     assert_eq!(
         basis_allocation,
@@ -347,8 +347,8 @@ fn a_lot_archive_with_removed_principal_field_still_reads() {
         "cost_basis": rub(100_000),
         "principal": "Unknown",
     });
-    let text = serde_json::to_string(&value).expect("старое тело сериализуется");
-    let lot: Lot = serde_json::from_str(&text).expect("старое тело читается");
+    let text = serde_json::to_string(&value).expect("legacy body serializes");
+    let lot: Lot = serde_json::from_str(&text).expect("legacy body parses");
     assert_eq!(lot.quantity, qty(10));
     assert_eq!(lot.cost_basis, rub(100_000));
     assert_eq!(lot.acquisition_basis, None);
@@ -358,11 +358,11 @@ fn a_lot_archive_with_removed_principal_field_still_reads() {
 
 #[test]
 fn a_decimal_keeps_its_scale_through_json() {
-    // Масштаб — часть значения: 1.2340 и 1.234 различаются точностью
-    // источника, и потеря масштаба меняет смысл цены (§3.4).
+    // Scale is part of the value: 1.2340 and 1.234 have different source precision,
+    // and losing the scale changes the meaning of the price (§3.4).
     let price = Dec::new(Decimal::new(12_340, 4));
-    let json = serde_json::to_string(&price).expect("сериализация");
-    let back: Dec = serde_json::from_str(&json).expect("разбор");
-    assert_eq!(back.inner().scale(), 4, "масштаб потерян: {json}");
+    let json = serde_json::to_string(&price).expect("serialization");
+    let back: Dec = serde_json::from_str(&json).expect("parsing");
+    assert_eq!(back.inner().scale(), 4, "scale lost: {json}");
     assert_eq!(back, price);
 }

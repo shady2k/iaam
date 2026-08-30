@@ -1,8 +1,8 @@
-//! Границы отчёта: дата отчёта включительно и запрет считать по срезу,
-//! собранному не на ту дату.
+//! Report boundaries: the report date is inclusive, and calculations must not use a snapshot
+//! assembled for a different date.
 //!
-//! Обе проверки — про строгость сравнения дат. Ошибка в один день здесь
-//! не выглядит ошибкой: она даёт цифру, просто не ту.
+//! Both checks concern strict date comparisons. An off-by-one-day error here
+//! does not look like an error: it produces a number, just not the right one.
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -40,7 +40,7 @@ fn deposit(owner: OwnerId, account: AccountId, day: Date, sequence: u32, minor: 
         legs: vec![Leg::cash(account, amount)],
         provenance: Provenance::new(
             SourceId::new_random(),
-            RawHash::parse(&"8".repeat(64)).expect("хеш"),
+            RawHash::parse(&"8".repeat(64)).expect("hash"),
             ParserVersion("boundary/1".into()),
         ),
         relation: Relation::None,
@@ -80,7 +80,7 @@ fn project_days(days: &[(Date, i64)]) -> Fixture {
             lot_rule: LotRuleVersion(1),
         },
     )
-    .expect("проекция строится");
+    .expect("projection succeeds");
     Fixture {
         contour,
         projection,
@@ -89,15 +89,15 @@ fn project_days(days: &[(Date, i64)]) -> Fixture {
 
 #[test]
 fn a_flow_on_the_report_date_is_included() {
-    // Дата отчёта включительна. Строгое «раньше» отрезало бы операцию
-    // того же дня, и отчёт «на сегодня» не видел бы сегодняшнее
-    // пополнение.
+    // The report date is inclusive. A strict «before» comparison would exclude a transaction
+    // from the same day, and an «as of today» report would not include today's
+    // deposit.
     let as_of = date!(2026 - 01 - 01);
     let fixture = project_days(&[(date!(2025 - 06 - 01), 10_000_000), (as_of, 5_000_000)]);
     let fx = FxTable::new(FxSource::OwnerSupplied);
-    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
-    // а не подтверждение данных. Пустые реестр и оценка означают
-    // «ничего не подтверждено», что для расчёта нейтрально.
+    // Reconciliation and the perimeter are not involved in this test: it checks the calculation,
+    // not data confirmation. An empty registry and assessment mean
+    // «nothing confirmed», which is neutral for the calculation.
     let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
     let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
         iaam_core::perimeter::PerimeterPolicy::default(),
@@ -116,22 +116,26 @@ fn a_flow_on_the_report_date_is_included() {
         accrued_observations: &std::collections::BTreeMap::new(),
     };
 
-    let series = flow_series(fixture.projection.state(), &request).expect("ряд потоков");
-    assert_eq!(series.flows.len(), 2, "поток на дату отчёта обязан войти");
+    let series = flow_series(fixture.projection.state(), &request).expect("flow series");
+    assert_eq!(
+        series.flows.len(),
+        2,
+        "flow on the report date must be included"
+    );
     assert_eq!(series.contributed, Dec::new(Decimal::from(150_000)));
 }
 
 #[test]
 fn a_slice_containing_events_after_the_report_date_is_refused() {
-    // Срез на дату собирает оболочка. Событие позже даты отчёта означает,
-    // что срез собран неверно, и посчитать по нему — значит выдать отчёт
-    // на дату, которого на эту дату не существовало.
+    // The wrapper assembles the snapshot for the date. An event after the report date means
+    // that the snapshot was assembled incorrectly, and calculating from it would produce a report
+    // for a date that did not yet exist on that date.
     let as_of = date!(2026 - 01 - 01);
     let fixture = project_days(&[(as_of, 10_000_000), (date!(2026 - 02 - 01), 1_000_000)]);
     let fx = FxTable::new(FxSource::OwnerSupplied);
-    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
-    // а не подтверждение данных. Пустые реестр и оценка означают
-    // «ничего не подтверждено», что для расчёта нейтрально.
+    // Reconciliation and the perimeter are not involved in this test: it checks the calculation,
+    // not data confirmation. An empty registry and assessment mean
+    // «nothing confirmed», which is neutral for the calculation.
     let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
     let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
         iaam_core::perimeter::PerimeterPolicy::default(),
@@ -162,14 +166,14 @@ fn a_slice_containing_events_after_the_report_date_is_refused() {
 
 #[test]
 fn a_slice_ending_exactly_on_the_report_date_is_accepted() {
-    // Граница на единицу: последнее событие ровно на дату отчёта —
-    // это нормальный срез, а не сбор на будущее.
+    // One-unit boundary: when the last event falls exactly on the report date,
+    // this is a valid snapshot, not one assembled for the future.
     let as_of = date!(2026 - 01 - 01);
     let fixture = project_days(&[(as_of, 10_000_000)]);
     let fx = FxTable::new(FxSource::OwnerSupplied);
-    // Сверка и периметр в этом тесте не участвуют: он проверяет расчёт,
-    // а не подтверждение данных. Пустые реестр и оценка означают
-    // «ничего не подтверждено», что для расчёта нейтрально.
+    // Reconciliation and the perimeter are not involved in this test: it checks the calculation,
+    // not data confirmation. An empty registry and assessment mean
+    // «nothing confirmed», which is neutral for the calculation.
     let ledger = iaam_core::reconciliation::ReconciliationLedger::default();
     let perimeter = iaam_core::perimeter::PerimeterAssessment::empty(
         iaam_core::perimeter::PerimeterPolicy::default(),

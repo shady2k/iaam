@@ -1,8 +1,8 @@
-//! Метрики облигационного сценария без реинвестирования (§7.1).
+//! Bond scenario metrics without reinvestment (§7.1).
 //!
-//! Все денежные величины остаются в расчётном режиме [`CalcMoney`].
-//! Промежуточные выплаты сохраняются до конца горизонта под нулевой ставкой;
-//! ряд до налога, пока E5 не добавит налоговую политику.
+//! All monetary values remain in the [`CalcMoney`] calculation mode.
+//! Intermediate payments are held at a zero rate until the end of the horizon;
+//! pre-tax cash flows until E5 adds a tax policy.
 
 use crate::bond::offer::OfferChoice;
 use crate::dates::TradeDate;
@@ -18,7 +18,7 @@ use time::Date;
 
 use super::{Computed, NotComputable};
 
-/// Пять величин §7.1 для одного сценария.
+/// The five §7.1 quantities for a single scenario.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZeroReinvestmentMetrics {
     pub postings: Vec<ExpectedPosting>,
@@ -30,14 +30,14 @@ pub struct ZeroReinvestmentMetrics {
     pub pre_tax: bool,
 }
 
-/// Подпись ставки на соответствующей проспективной координате.
+/// Rate label for the corresponding prospective coordinate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrrLabel {
     YieldToMaturity,
     YieldToOffer,
 }
 
-/// Проспективная координата: удержание от `as_of`.
+/// Prospective coordinate: holding from `as_of`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProspectiveMetric {
     pub as_of: Date,
@@ -48,7 +48,7 @@ pub struct ProspectiveMetric {
     pub irr_label: IrrLabel,
 }
 
-/// Пожизненная метрика одной когорты.
+/// Lifetime metric for a single cohort.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifetimeCohortMetric {
     pub acquired: TradeDate,
@@ -59,7 +59,7 @@ pub struct LifetimeCohortMetric {
     pub irr_absent_because: &'static str,
 }
 
-/// Результат по одному идентификатору сценария.
+/// Result for a single scenario identifier.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BondScenarioResult {
     pub choice: OfferChoice,
@@ -67,11 +67,11 @@ pub struct BondScenarioResult {
     pub lifetime: Computed<Vec<LifetimeCohortMetric>>,
 }
 
-/// Версия политики расходов.
+/// Expense policy version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpensePolicyVersion(pub u32);
 
-/// Статус знания расходов.
+/// Expense knowledge status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpenseTreatment {
     Known { amount: Money, on: Date },
@@ -80,8 +80,8 @@ pub enum ExpenseTreatment {
     Unknown,
 }
 
-/// Результат, который сохраняет диапазон при неизвестном, но ограниченном
-/// расходе. Нельзя заменять этот тип точным числом с флагом рядом (§4.9).
+/// Result that preserves the range for an unknown but bounded
+/// expense. This type must not be replaced with an exact number and an adjacent flag (§4.9).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExpenseMetrics {
     Exact(ZeroReinvestmentMetrics),
@@ -94,7 +94,7 @@ pub enum ExpenseMetrics {
     },
 }
 
-/// Рассчитать пять величин для будущего потока.
+/// Calculate the five quantities for the future cash flow.
 #[must_use]
 pub fn zero_reinvestment_metrics(
     postings: Vec<ExpectedPosting>,
@@ -111,7 +111,7 @@ pub fn zero_reinvestment_metrics(
     )
 }
 
-/// Рассчитать пять величин с явно указанной политикой решателя CAGR.
+/// Calculate the five quantities with an explicitly specified CAGR solver policy.
 #[must_use]
 pub fn zero_reinvestment_metrics_with_policy(
     postings: Vec<ExpectedPosting>,
@@ -235,12 +235,12 @@ fn rate_refusal(reason: NotComputable) -> Computed<RateOutcome> {
     Computed::NotComputable { reason }
 }
 
-/// Получить текущую грязную стоимость позиции через правило котировки.
+/// Get the position's current dirty value using the quotation rule.
 ///
-/// `accrued_interest` должен быть полной суммой НКД позиции. Чистота цены
-/// является предусловием входа: [`QuotationBasis`] различает деньги и процент
-/// номинала, но не clean/dirty; безусловно прибавлять НКД к dirty-котировке
-/// запрещено, поскольку это даст двойной счёт.
+/// `accrued_interest` must be the position's total accrued interest. Whether the price is clean or dirty
+/// is an input precondition: [`QuotationBasis`] distinguishes money from percentage
+/// of par, but not clean/dirty; unconditionally adding accrued interest to a dirty quote
+/// is prohibited because it would result in double counting.
 #[must_use]
 pub fn prospective_c0(
     quantity: Quantity,
@@ -289,7 +289,7 @@ fn quote_error(error: QuotationError) -> NotComputable {
     }
 }
 
-/// Построить проспективную координату и YTM/доходность к оферте.
+/// Build the prospective coordinate and YTM/yield to offer.
 #[must_use]
 pub fn prospective_metric(
     as_of: Date,
@@ -361,8 +361,8 @@ fn irr_for_postings(
     }
 }
 
-/// Рассчитать одну пожизненную метрику. Прошлые выплаты без дат входят в
-/// терминальное богатство, но не в `postings`: исторический IRR отсутствует.
+/// Calculate a single lifetime metric. Past undated payments are included in
+/// terminal wealth, but not in `postings`: historical IRR is unavailable.
 #[must_use]
 pub fn lifetime_cohort_metric(
     cohort: Cohort,
@@ -437,12 +437,12 @@ pub fn lifetime_cohort_metric(
         terminal_date,
         c0,
         metrics,
-        irr_absent_because: "прошлые выплаты хранятся одной суммой без дат, поэтому ряд потоков для пожизненного IRR нельзя восстановить; YTM рассчитывается только для проспективного знаменателя",
+        irr_absent_because: "past payments are stored as a single amount without dates, so the cash-flow series for lifetime IRR cannot be reconstructed; YTM is calculated only for the prospective denominator",
     }
 }
 
-/// Рассчитать пожизненные метрики всех когорт, распределяя будущие выплаты
-/// от текущего количества. Последняя когорта получает остаток каждой суммы.
+/// Calculate lifetime metrics for all cohorts, allocating future payments
+/// based on the current quantity. The last cohort receives the remainder of each amount.
 #[must_use]
 pub fn lifetime_cohort_metrics(
     cohorts: &[Cohort],
@@ -476,8 +476,8 @@ pub fn lifetime_cohort_metrics(
     Computed::Value(result)
 }
 
-/// Построить пожизненный результат прямо из книги лотов, сохраняя любой
-/// `CohortGap` как различимый отказ вместо пустого списка когорт.
+/// Build the lifetime result directly from the lot book, preserving any
+/// `CohortGap` as a distinct failure instead of an empty cohort list.
 #[must_use]
 pub fn lifetime_metrics_from_lots(
     lots: &InstrumentLots,
@@ -525,7 +525,7 @@ fn split_postings(
     Ok((result, remainder))
 }
 
-/// Добавить известный расход как датированный отрицательный поток.
+/// Add a known expense as a dated negative cash flow.
 pub fn apply_expense(
     mut postings: Vec<ExpectedPosting>,
     treatment: ExpenseTreatment,
@@ -546,8 +546,8 @@ pub fn apply_expense(
     }
     Ok(postings)
 }
-/// Рассчитать IRR с учётом политики расходов. Для неизвестного расхода
-/// единственный честный результат — отказ: даты и места списания нет.
+/// Calculate IRR under the expense policy. For an unknown expense
+/// the only honest result is failure: there is no date or point of deduction.
 pub fn irr_for_expense_policy(
     postings: Vec<ExpectedPosting>,
     c0: CalcMoney,
@@ -576,7 +576,7 @@ pub fn irr_for_expense_policy(
     }
 }
 
-/// Применить политику расходов, сохранив верхнюю и нижнюю границы.
+/// Apply the expense policy while preserving the upper and lower bounds.
 pub fn expense_adjusted_metrics(
     postings: Vec<ExpectedPosting>,
     c0: CalcMoney,
@@ -671,7 +671,7 @@ fn exact_expense_metrics(
     }
 }
 
-/// Точное значение CAGR при полной потере капитала.
+/// Exact CAGR value for a total loss of capital.
 #[must_use]
 pub fn exact_minus_one_rate() -> RateOutcome {
     RateOutcome::exact(-1.0, SolverPolicy::returns_default(), DayCount::Act365)
@@ -858,7 +858,7 @@ mod tests {
         assert_eq!(metrics.hpr, Computed::Value(dec("0")));
         assert_eq!(
             metric.irr_absent_because,
-            "прошлые выплаты хранятся одной суммой без дат, поэтому ряд потоков для пожизненного IRR нельзя восстановить; YTM рассчитывается только для проспективного знаменателя"
+            "past payments are stored as a single amount without dates, so the cash-flow series for lifetime IRR cannot be reconstructed; YTM is calculated only for the prospective denominator"
         );
     }
 

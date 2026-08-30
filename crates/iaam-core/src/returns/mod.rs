@@ -35,7 +35,7 @@ use crate::numeric::approx::SolverPolicy;
 use crate::numeric::decimal::Dec;
 use crate::numeric::xirr::{DayCount, RateOutcome, SolverRefusal};
 use crate::perimeter::{PerimeterAssessment, PerimeterPolicy};
-use crate::projection::lots::LotKey;
+use crate::projection::lots::{BasisGap, LotKey};
 use crate::projection::offers::{OfferBook, unresolved_submissions};
 use crate::projection::ownership::Ownership;
 use crate::projection::state::LedgerState;
@@ -233,6 +233,13 @@ impl DataQualityStatus {
 pub enum MaterialIssue {
     /// Позиция восстановлена без документированной стоимости (§10.7).
     RestoredWithoutBasis { account: AccountId },
+    /// Доля разнесения амортизации не выведена, поэтому возвращённая
+    /// стоимость и реализованный результат по позиции не считаются
+    /// (§4.9). Чинится проверенным графиком выпуска.
+    AmortisationAllocationUnknown {
+        account: AccountId,
+        instrument: InstrumentId,
+    },
     /// Отрицательный денежный остаток — обязательство в NAV (§15.9).
     NegativeCash {
         account: AccountId,
@@ -331,7 +338,7 @@ impl MaterialIssue {
             // Горизонт журнала зеркалит `HistoryStartsAt`: это факт о
             // периоде, а не дефект. Владелец, чей журнал начинается
             // позже выпуска бумаги, иначе получил бы вечный `Incomplete`
-            // Остальные шесть причин чинятся дозагрузкой фактов и потому
+            // Остальные причины чинятся дозагрузкой фактов и потому
             // являются дефектами.
             Self::ScheduledPostingUnverifiable { reason, .. }
             | Self::ScheduledPostingsUnverifiable { reason, .. } => {
@@ -339,6 +346,7 @@ impl MaterialIssue {
             }
             Self::AccruedInterestMismatch { .. }
             | Self::RestoredWithoutBasis { .. }
+            | Self::AmortisationAllocationUnknown { .. }
             | Self::NegativeCash { .. }
             | Self::Discrepancy { .. }
             | Self::UnsupportedFinancing { .. }
@@ -2107,6 +2115,14 @@ fn data_quality(
     let mut issues = Vec::new();
     for account in state.coverage().restored_accounts() {
         issues.push(MaterialIssue::RestoredWithoutBasis { account: *account });
+    }
+    for (key, lots) in state.book().iter() {
+        if matches!(lots.gap(), Some(BasisGap::AmortisationAllocationUnknown)) {
+            issues.push(MaterialIssue::AmortisationAllocationUnknown {
+                account: key.account,
+                instrument: key.instrument,
+            });
+        }
     }
     for (account, money) in state.balances().negative_cash() {
         issues.push(MaterialIssue::NegativeCash {

@@ -3617,6 +3617,158 @@ async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
     assert_eq!(response[0]["verdict"], "rejected", "{response}");
     assert_eq!(response[0]["field"], "fact", "{response}");
 }
+#[tokio::test]
+async fn the_ingest_route_ignores_a_client_supplied_allocation() {
+    let (harness, path) = harness_on_disk();
+    let body = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                "compensation": { "amount": "1000.00", "currency": "RUB" },
+                "effective_date": "2026-05-20",
+                "basis_allocation": { "state": "known", "share": "0.9" }
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let store = SqliteStore::open(&path).expect("второе соединение");
+    let allocation = store
+        .load_events_through(harness.owner, Date::MAX)
+        .expect("события амортизации")
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::CorporateAction {
+                action:
+                    iaam_core::event::corporate_action::CorporateAction::PartialRedemption {
+                        basis_allocation,
+                        ..
+                    },
+            } => Some(basis_allocation),
+            _ => None,
+        })
+        .expect("амортизация");
+    assert!(
+        matches!(
+            &allocation,
+            iaam_core::event::allocation::BasisAllocation::Unknown(
+                iaam_core::event::allocation::AllocationGap::ScheduleMissing
+            )
+        ),
+        "доля должна быть выведена приложением без графика: {allocation:?}"
+    );
+    assert!(
+        !matches!(
+            &allocation,
+            iaam_core::event::allocation::BasisAllocation::Known { .. }
+        ),
+        "клиентская доля не должна попасть в событие: {allocation:?}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn an_unknown_allocation_is_named_to_the_owner() {
+    let harness = harness();
+    let contour = json!({
+        "title": "Портфель с амортизацией",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("контур")
+        .to_owned();
+
+    let operations = json!({
+        "source_label": "тест",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "buy",
+            "instrument": harness.instrument.inner(),
+            "custody": harness.custody.inner(),
+            "quantity": "10",
+            "amount": "1000.00",
+            "currency": "RUB",
+            "dates": { "trade": "2026-05-01", "cash_posted": "2026-05-01" }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let journal = json!({
+        "source_label": "тест",
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                "compensation": { "amount": "1000.00", "currency": "RUB" },
+                "effective_date": "2026-05-20"
+            }
+        }]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &journal),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-05-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["data_quality"]["status"], "incomplete", "{report}");
+    let expected = format!(
+        "доля разнесения амортизации инструмента {} на счёте {} не выведена: дозагрузите проверенный график выпуска",
+        harness.instrument.inner(),
+        harness.account.inner()
+    );
+    assert!(
+        report["data_quality"]["material_issues"]
+            .as_array()
+            .expect("материальные проблемы")
+            .iter()
+            .any(|issue| issue.as_str() == Some(expected.as_str())),
+        "владелец не увидел разрыв: {report}"
+    );
+}
 
 #[tokio::test]
 async fn a_read_only_token_may_not_submit_journal_events() {

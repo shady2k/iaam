@@ -1670,6 +1670,14 @@ fn issue(value: &MaterialIssue) -> String {
             "счёт {} восстановлен без документированной стоимости",
             account.inner()
         ),
+        MaterialIssue::AmortisationAllocationUnknown {
+            account,
+            instrument,
+        } => format!(
+            "доля разнесения амортизации инструмента {} на счёте {} не выведена: дозагрузите проверенный график выпуска",
+            instrument.inner(),
+            account.inner()
+        ),
         MaterialIssue::NegativeCash { account, currency } => format!(
             "отрицательный остаток на счёте {} в {}",
             account.inner(),

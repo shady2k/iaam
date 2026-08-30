@@ -238,6 +238,7 @@ proptest! {
             completeness: iaam_core::bond::ScheduleCompleteness::Validated,
             default_flags: Some(DefaultFlags { declared: false, technical: false }),
             currency_roles: Some(CurrencyRoles::uniform(CurrencyCode::Rub)),
+            initial_principal: Some(principal),
             ..BondSchedule::default()
         };
         let original = common(
@@ -285,7 +286,6 @@ proptest! {
         let original_plan = CashflowProjectionV1
             .future_postings(&iaam_core::rules::CashflowInput {
                 schedule: &original,
-                principal: PrincipalState::known(principal, principal).unwrap(),
                 quantity: qty(1),
                 choice: &hold,
                 as_of,
@@ -295,7 +295,6 @@ proptest! {
         let extended_plan = CashflowProjectionV1
             .future_postings(&iaam_core::rules::CashflowInput {
                 schedule: &extended,
-                principal: PrincipalState::known(principal, principal).unwrap(),
                 quantity: qty(1),
                 choice: &hold,
                 as_of,

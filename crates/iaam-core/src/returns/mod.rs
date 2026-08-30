@@ -1494,17 +1494,13 @@ fn scenario_plan(
         assessment,
         request,
         schedule,
-        lots,
+        lots: _,
         cashflow,
         accrued_rule: _,
     } = *inputs;
-    let principal = lots
-        .map(|lots| zero_reinvestment::common_principal_state(lots, assessment.instrument))
-        .unwrap_or(Ok(crate::rules::lot_disposal::PrincipalState::Unknown))?;
     cashflow
         .future_postings(&CashflowInput {
             schedule,
-            principal,
             quantity: assessment.quantity,
             choice,
             as_of: request.as_of,
@@ -4675,7 +4671,7 @@ mod tests {
                 repayment_date: date!(2026 - 12 - 02),
                 share_percent: dec("100"),
             }],
-            initial_principal: None,
+            initial_principal: Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub)),
             offer_windows: vec![crate::bond::OfferWindowTerms {
                 window: crate::bond::OfferWindowId::new_random(),
                 right: crate::bond::OfferRight::HolderPut,
@@ -5007,7 +5003,7 @@ mod tests {
                 repayment_date: repayment,
                 share_percent: dec("100"),
             }],
-            initial_principal: None,
+            initial_principal: Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub)),
             offer_windows: offers
                 .iter()
                 .map(|execution_date| crate::bond::OfferWindowTerms {
@@ -5974,7 +5970,7 @@ mod tests {
         // сценария не должен выключать проверку пропущенного купона.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let mut schedule = график_купонов(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5982,6 +5978,7 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
+        schedule.initial_principal = None;
         let events = vec![
             пополнение(account, date!(2026 - 01 - 05)),
             покупка_облигации(

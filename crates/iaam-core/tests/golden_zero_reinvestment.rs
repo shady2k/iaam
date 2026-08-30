@@ -136,7 +136,7 @@ fn schedule_from_fixture(raw: &str, instrument: InstrumentId) -> BondSchedule {
     BondSchedule {
         periods,
         principal_returns,
-        initial_principal: None,
+        initial_principal: Some(PerUnitAmount::new(dec("1000"), CurrencyCode::Rub)),
         offer_windows,
         completeness: ScheduleCompleteness::Validated,
         default_flags: Some(DefaultFlags {
@@ -145,14 +145,6 @@ fn schedule_from_fixture(raw: &str, instrument: InstrumentId) -> BondSchedule {
         }),
         currency_roles: Some(CurrencyRoles::uniform(CurrencyCode::Rub)),
     }
-}
-
-fn principal() -> iaam_core::rules::lot_disposal::PrincipalState {
-    iaam_core::rules::lot_disposal::PrincipalState::known(
-        PerUnitAmount::new(dec("1000"), CurrencyCode::Rub),
-        PerUnitAmount::new(dec("1000"), CurrencyCode::Rub),
-    )
-    .expect("известный номинал")
 }
 
 fn project(
@@ -165,7 +157,6 @@ fn project(
     CashflowProjectionV1
         .future_postings(&CashflowInput {
             schedule: &schedule,
-            principal: principal(),
             quantity: Quantity(dec("1")),
             choice,
             as_of,
@@ -341,7 +332,6 @@ fn floater_fixture_has_reproducible_coupon_undetermined_refusal() {
     let error = CashflowProjectionV1
         .future_postings(&CashflowInput {
             schedule: &schedule,
-            principal: principal(),
             quantity: Quantity(dec("1")),
             choice: &choice,
             as_of: date!(2020 - 05 - 12),

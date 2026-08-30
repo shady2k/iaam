@@ -1,20 +1,20 @@
-//! Вычисление доли разнесения при приёмке амортизации.
+//! Вычисление доли разнесения как версионированное правило ядра.
 //!
-//! Живёт в слое приложения, а не в `iaam-ingest`: приёмка обязана
-//! оставаться чистой функцией и не знать ни структуры справочника,
-//! ни координаты знания, ни хранилища. В нормализатор уходит уже
-//! готовое значение.
+//! Денежная арифметика живёт в `iaam-core`, потому что именно ядро
+//! обязано вычислять числа в ответах API. Приёмка читает график и
+//! координату знания, затем передаёт готовое значение в чистый
+//! нормализатор `iaam-ingest`.
 
 use std::fmt::Write as _;
 
-use iaam_core::bond::{BondSchedule, PrincipalReturn, ScheduleCompleteness};
-use iaam_core::event::allocation::{
+use crate::bond::{BondSchedule, PrincipalReturn, ScheduleCompleteness};
+use crate::event::allocation::{
     AllocationAlgorithmVersion, AllocationEvidence, AllocationGap, AllocationInputsHash,
     BasisAllocation,
 };
-use iaam_core::money::PerUnitAmount;
-use iaam_core::numeric::decimal::Dec;
-use iaam_core::rules::ReturnedShare;
+use crate::money::PerUnitAmount;
+use crate::numeric::decimal::Dec;
+use crate::rules::ReturnedShare;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use time::{Date, OffsetDateTime};
@@ -168,10 +168,10 @@ const ALLOCATION_ALGORITHM_V1: AllocationAlgorithmVersion = AllocationAlgorithmV
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iaam_core::bond::{BondSchedule, PrincipalReturn, ScheduleCompleteness};
-    use iaam_core::event::allocation::{AllocationGap, BasisAllocation};
-    use iaam_core::money::{CurrencyCode, PerUnitAmount};
-    use iaam_core::numeric::decimal::Dec;
+    use crate::bond::{BondSchedule, PrincipalReturn, ScheduleCompleteness};
+    use crate::event::allocation::{AllocationGap, BasisAllocation};
+    use crate::money::{CurrencyCode, PerUnitAmount};
+    use crate::numeric::decimal::Dec;
     use rust_decimal::Decimal;
     use time::macros::{date, datetime};
 

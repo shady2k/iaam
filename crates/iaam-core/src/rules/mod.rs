@@ -5,6 +5,7 @@
 //! Реестр закрытый: плагины в рантайме не нужны.
 
 mod accrued_interest;
+pub mod allocation;
 pub mod amortisation;
 pub mod cashflow;
 pub mod lot_disposal;
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use accrued_interest::{
     AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
 };
+pub use allocation::resolve_basis_allocation;
 use amortisation::{AmortisationRule, AmortisationRuleVersion, ProRataV1};
 use lot_disposal::{FifoV1, LotDisposalRule};
 

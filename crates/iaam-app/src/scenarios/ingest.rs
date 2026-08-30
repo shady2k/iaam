@@ -138,7 +138,7 @@ pub async fn submit_journal_events(
                     None => (None, String::new()),
                 };
                 JournalEventEnrichment {
-                    basis_allocation: crate::allocation::resolve_basis_allocation(
+                    basis_allocation: iaam_core::rules::resolve_basis_allocation(
                         *principal_returned_per_unit,
                         *effective_date,
                         schedule.as_ref(),

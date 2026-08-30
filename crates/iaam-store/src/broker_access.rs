@@ -1,19 +1,19 @@
-//! Доступ к брокерскому каналу (§14).
+//! Broker channel access (§14).
 //!
-//! Хранилище держит nonce и шифротекст **непрозрачными байтами**:
-//! расшифровка живёт в `iaam-broker`, и адаптер хранилища о ней
-//! не знает. Адаптер, знающий криптографию соседнего адаптера,
-//! превращает слои в клубок.
+//! The store keeps the nonce and ciphertext as **opaque bytes**:
+//! decryption lives in `iaam-broker`, and the storage adapter knows
+//! nothing about it. An adapter that knows the neighboring adapter's
+//! cryptography turns the layers into a tangled mess.
 //!
-//! Область прав и среда хранятся строками по той же причине, что
-//! `matcher` и `outcome` правил: хранилище их не толкует, оно хранит.
-//! Разбирает их `iaam-broker`: строка, обещающая торговые права, даёт
-//! там отказ, а не доступ, а среда решает, к какому шлюзу идти.
+//! Scope and environment are stored as strings for the same reason that
+//! `matcher` and `outcome` are: the store does not interpret them; it stores them.
+//! `iaam-broker` parses them: a string promising trading permissions is denied
+//! there rather than granted access, while the environment determines which gateway to use.
 //!
-//! Сред у брокера может быть несколько, и токены у них **разные**:
-//! боевой токен песочница не принимает, песочный не принимает бой.
-//! Поэтому действующий доступ один на тройку владелец+брокер+среда,
-//! а не на пару владелец+брокер.
+//! A broker may have multiple environments, and their tokens are **different**:
+//! the production token is not accepted by the sandbox, and the sandbox token is not accepted in production.
+//! Therefore, active access is defined by the owner+broker+environment tuple,
+//! not the owner+broker pair.
 
 use iaam_core::ids::OwnerId;
 use rusqlite::{TransactionBehavior, params};
@@ -22,23 +22,23 @@ use uuid::Uuid;
 use crate::documents::BrokerCode;
 use crate::{SqliteStore, StoreError, now};
 
-/// Заводимый доступ.
+/// Access to be provisioned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewBrokerAccess {
     pub id: Uuid,
     pub owner: OwnerId,
     pub broker: BrokerCode,
-    /// Среда брокера: боевая или песочница. Толкуется в `iaam-broker`.
+    /// Broker environment: production or sandbox. Interpreted in `iaam-broker`.
     pub environment: String,
     pub scope: String,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
 }
 
-/// Новые криптографические части существующей записи доступа.
+/// New cryptographic components for an existing access record.
 ///
-/// Идентичность и историю записи хранилище сохраняет; меняются только
-/// nonce и шифротекст.
+/// The store preserves the record's identity and history; only the
+/// nonce and ciphertext change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerAccessCiphertext {
     pub id: Uuid,
@@ -46,7 +46,7 @@ pub struct BrokerAccessCiphertext {
     pub ciphertext: Vec<u8>,
 }
 
-/// Сохранённый доступ.
+/// Stored access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerAccess {
     pub id: Uuid,
@@ -57,40 +57,40 @@ pub struct BrokerAccess {
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
     pub created_at: String,
-    /// Момент отзыва. `None` — доступ действует.
+    /// Revocation time. `None` means the access is active.
     pub revoked_at: Option<String>,
 }
 
 impl BrokerAccess {
-    /// Пара «nonce и шифротекст» для расшифровки в `iaam-broker`.
+    /// A `nonce` and ciphertext pair for decryption in `iaam-broker`.
     ///
-    /// Возвращается кортежем, а не типом криптографии: хранилище
-    /// не зависит от `iaam-broker` и собрать его тип не может.
+    /// Returned as a tuple rather than a cryptographic type: the store
+    /// does not depend on `iaam-broker` and cannot construct its type.
     #[must_use]
     pub fn sealed_parts(&self) -> (&[u8], &[u8]) {
         (&self.nonce, &self.ciphertext)
     }
 }
 
-/// Кого считать владельцем, когда его не назвали явно.
+/// Who to consider the owner when none was named explicitly.
 ///
-/// Идентификатор владельца нигде не печатается — при выпуске токена
-/// наружу уходит только сам токен, — и человеку взять его неоткуда.
-/// Поэтому единственного владельца система умеет узнать сама, а
-/// выбирать между несколькими отказывается: завести брокерский доступ
-/// не тому владельцу означает обнаружить это по чужим сделкам
-/// в портфеле.
+/// The owner's identifier is never printed anywhere—when the token is issued
+/// externally, only the token itself is sent out—and the person has no way to obtain it.
+/// Therefore, the system can identify the sole owner itself, but
+/// refuses to choose among several: creating broker access
+/// for the wrong owner means discovering it through someone else's trades
+/// in the portfolio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoleOwner {
-    /// Токен ещё не выпускался.
+    /// The token has not yet been issued.
     None,
     Single(OwnerId),
-    /// Владельцев несколько: выбирать за человека нельзя.
+    /// There are multiple owners: no choice can be made on the person's behalf.
     Several,
 }
 
 impl SqliteStore {
-    /// Владелец, если он в системе один.
+    /// The owner, if there is only one in the system.
     pub fn sole_token_owner(&self) -> Result<SoleOwner, StoreError> {
         let mut statement = self
             .conn
@@ -101,7 +101,7 @@ impl SqliteStore {
             let raw = row?;
             owners.push(OwnerId(Uuid::parse_str(&raw).map_err(|_| {
                 StoreError::NotFound {
-                    what: "владелец",
+                    what: "owner",
                     id: raw,
                 }
             })?));
@@ -113,11 +113,11 @@ impl SqliteStore {
         })
     }
 
-    /// Заведение доступа.
+    /// Provisioning access.
     ///
-    /// Второй действующий доступ к тому же брокеру отбивается
-    /// уникальным индексом: неизвестно, каким из двух система ходила
-    /// бы к брокеру.
+    /// A second active access to the same broker is rejected
+    /// by the unique index: it is unknown which of the two the system
+    /// would use to access the broker.
     pub fn insert_broker_access(&mut self, access: &NewBrokerAccess) -> Result<(), StoreError> {
         let transaction = self
             .conn
@@ -137,15 +137,16 @@ impl SqliteStore {
                 now(),
             ],
         );
-        // Нарушение уникальности — это «доступ в этой среде уже есть»,
-        // а не сбой хранилища. Разбирается здесь: дальше по слоям едет
-        // ответ на вопрос владельца, а не текст SQLite, из которого
-        // наружу видно устройство схемы.
+        // A uniqueness violation means “access already exists in this environment”,
+
+        // not a storage failure. Handle it here: otherwise it propagates through the layers.
+        // the answer to the owner's question, not SQLite text that
+        // reveals the schema's structure externally.
         if let Err(rusqlite::Error::SqliteFailure(error, _)) = &inserted
             && error.code == rusqlite::ErrorCode::ConstraintViolation
         {
             return Err(StoreError::AlreadyExists {
-                what: "действующий доступ к брокеру в этой среде",
+                what: "active broker access in this environment",
             });
         }
         inserted?;
@@ -153,12 +154,12 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Атомарно заменяет шифротексты всех переданных доступов.
+    /// Atomically replaces the ciphertexts of all supplied accesses.
     ///
-    /// Список строится вызывающим слоем после расшифровки старым ключом.
-    /// Отозванные строки тоже входят в историю и потому должны быть
-    /// переданы сюда. Если хотя бы одного идентификатора нет, транзакция
-    /// откатывается целиком.
+    /// The list is built by the calling layer after decryption with the old key.
+    /// Revoked rows are also part of the history and therefore must be
+    /// passed here. If even one identifier is missing, the transaction
+    /// is rolled back in its entirety.
     pub fn rotate_broker_access_ciphertexts(
         &mut self,
         replacements: &[BrokerAccessCiphertext],
@@ -179,7 +180,7 @@ impl SqliteStore {
             )?;
             if changed != 1 {
                 return Err(StoreError::NotFound {
-                    what: "доступ к брокеру",
+                    what: "broker access",
                     id: replacement.id.to_string(),
                 });
             }
@@ -188,11 +189,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Действующий доступ владельца к брокеру в названной среде.
+    /// The owner's active broker access in the named environment.
     ///
-    /// Отозванный не находится: отозванным доступом не ходят. Среда
-    /// обязательна и умолчания не имеет: доступ, выбранный за вызывающего,
-    /// — это поход в чужую среду, замеченный по чужому ответу.
+    /// Revoked access is not returned: a revoked access is not used to reach the broker. The environment
+    /// is mandatory and has no default: access selected on the caller's behalf
+    /// means a trip into someone else's environment, detected from someone else's response.
     pub fn find_broker_access(
         &self,
         owner: OwnerId,
@@ -209,7 +210,7 @@ impl SqliteStore {
         Ok(found.pop())
     }
 
-    /// Все доступы владельца, включая отозванные.
+    /// All of the owner's accesses, including revoked ones.
     pub fn broker_access_history(&self, owner: OwnerId) -> Result<Vec<BrokerAccess>, StoreError> {
         self.query_access(
             "SELECT id, broker, environment, scope, nonce, ciphertext, created_at, revoked_at
@@ -219,13 +220,13 @@ impl SqliteStore {
         )
     }
 
-    /// Отзыв доступа.
+    /// Revoke access.
     ///
-    /// Не удаление: отозванный доступ остаётся историей — «когда
-    /// система перестала ходить к брокеру» является вопросом, на
-    /// который нужен ответ.
+    /// Not deletion: revoked access remains part of the history—“when the
+    /// system stopped accessing the broker” is a question
+    /// that needs an answer.
     ///
-    /// Все доступы всех владельцев, включая отозванные.
+    /// All accesses for all owners, including revoked ones.
     pub fn all_broker_access_history(&self) -> Result<Vec<BrokerAccess>, StoreError> {
         let mut statement = self
             .conn
@@ -235,7 +236,7 @@ impl SqliteStore {
         for owner in owners {
             let owner = owner?;
             let owner = OwnerId(Uuid::parse_str(&owner).map_err(|_| StoreError::NotFound {
-                what: "владелец",
+                what: "owner",
                 id: owner,
             })?);
             history.extend(self.broker_access_history(owner)?);
@@ -250,7 +251,7 @@ impl SqliteStore {
         )?;
         if updated == 0 {
             return Err(StoreError::NotFound {
-                what: "действующий доступ к брокеру",
+                what: "active broker access",
                 id: id.to_string(),
             });
         }
@@ -281,13 +282,13 @@ impl SqliteStore {
             let (id, broker, environment, scope, nonce, ciphertext, created_at, revoked_at) = row?;
             access.push(BrokerAccess {
                 id: Uuid::parse_str(&id).map_err(|_| StoreError::NotFound {
-                    what: "доступ к брокеру",
+                    what: "broker access",
                     id: id.clone(),
                 })?,
                 owner,
                 broker: BrokerCode::parse(&broker).ok_or(StoreError::DocumentDecode {
                     id,
-                    detail: "код брокера пуст".to_owned(),
+                    detail: "broker code is empty".to_owned(),
                 })?,
                 environment,
                 scope,

@@ -1,21 +1,21 @@
-//! Приёмка журнальных фактов: корпоративных действий и оферты
+//! Ingestion of journal facts: corporate actions and offers
 //! (§4.7, §3.5).
 //!
-//! Отдельный вход, а не новые члены `OperationKind`, и причина
-//! механическая, а не вкусовая: [`crate::operation::OperationDates`]
-//! жёстко проставляет `entitlement: None`, то есть операционная модель
-//! дат не умеет выразить дату фиксации реестра вовсе. У корпоративного
-//! действия она — часть факта. Расширение операций потребовало бы либо
-//! деформировать общую модель дат, либо носить даты в двух местах сразу.
+//! A separate entry point, rather than new `OperationKind` members, for
+//! a mechanical, not stylistic, reason: [`crate::operation::OperationDates`]
+//! hard-codes `entitlement: None`, meaning the operational date model
+//! cannot express a record date at all. For a corporate action, it is
+//! part of the fact. Extending the operations would require either
+//! distorting the shared date model or carrying dates in two places at once.
 //!
-//! Оферта здесь рядом с корпоративными действиями как **сосед**,
-//! а не как член семейства: `event/offer.rs` фиксирует, что оферта —
-//! право владельца, а не решение эмитента. Общее у них — канал приёмки
-//! и журнал, а не природа факта.
+//! An offer belongs here alongside corporate actions as a **neighbor**,
+//! not as a member of the family: `event/offer.rs` establishes that an offer is
+//! the holder's right, not the issuer's decision. What they share is the
+//! ingestion channel and journal, not the nature of the fact.
 //!
-//! Как и в операциях, **знаки и ноги строит приёмка**: клиент присылает
-//! положительные величины, а отрицательное количество выбывающей бумаги
-//! и денежный итог расчёта считаются здесь.
+//! As with operations, **ingestion constructs the signs and legs**: the client sends
+//! positive quantities, while the negative quantity of the departing security
+//! and the cash settlement total are calculated here.
 
 use iaam_core::dates::{EffectiveOrder, EntitlementDate, EventDates, SettledDate, TradeDate};
 use iaam_core::event::allocation::BasisAllocation;
@@ -34,61 +34,61 @@ use time::Date;
 use crate::operation::{NormalizationContext, Normalized};
 use crate::verdict::Rejection;
 
-/// Версия разбора журнальных фактов.
+/// Journal-fact parsing version.
 ///
-/// Своя, а не общая с операциями: происхождение обязано называть тот
-/// разбор, который событие построил. Одна версия на два непохожих
-/// разбора не даст отличить ошибку одного от ошибки другого (§4.1).
+/// Its own, rather than shared with operations: the origin must name the
+/// parsing that built the event. One version for two dissimilar parsers would
+/// not distinguish one parser's error from the other's (§4.1).
 pub const PARSER_VERSION: &str = "ingest/journal/1";
 
-/// Журнальный факт, пришедший через API.
+/// A journal fact received through the API.
 ///
-/// Две семьи под одной крышей — это общий канал приёмки, а не общая
-/// природа: корпоративное действие решает эмитент, оферту предъявляет
-/// владелец. Приём произвольного `EventKind` здесь невозможен намеренно:
-/// вход принимает ровно те семьи, которые перечислены.
+/// Two families under one roof mean a shared ingestion channel, not a shared
+/// Nature: a corporate action is decided by the issuer, while an offer is submitted by
+/// the holder. Accepting an arbitrary `EventKind` here is intentionally impossible:
+/// the input accepts exactly the families listed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JournalFact {
-    /// Даты внутри самого факта: у корпоративного действия дата
-    /// вступления в силу — часть идентичности, а не свойство подачи.
+    /// Dates within the fact itself: for a corporate action, the effective date
+    /// is part of its identity, not a property of its submission.
     CorporateAction(CorporateAction),
-    /// У оферты собственной даты нет: `event/offer.rs` описывает
-    /// заявку и расчёт, но не день, когда это случилось. Значит, день
-    /// присылает клиент — выдумать его приёмке нечем.
+    /// An offer has no date of its own: `event/offer.rs` describes the
+    /// request and settlement, but not the day it occurred. Therefore, the day
+    /// is supplied by the client—there is nothing for acceptance to invent.
     OfferExercise {
         action: OfferExerciseAction,
         day: Date,
     },
 }
 
-/// Журнальное событие, поданное на приёмку.
+/// Journal event submitted for acceptance.
 ///
-/// Полей знака и ног здесь нет: их строит приёмка (см. модульный
-/// комментарий), клиент присылает только положительные величины.
+/// There are no signs or legs here: acceptance builds them (see the module
+/// comment); the client sends only positive amounts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmittedJournalEvent {
     pub account: AccountId,
     pub fact: JournalFact,
-    /// Ключ идемпотентности клиента (§10.6).
+    /// Client idempotency key (§10.6).
     pub idempotency_key: Option<String>,
-    /// Идентификатор факта в источнике, если он есть.
+    /// Identifier of the fact in the source, if present.
     pub source_operation_id: Option<String>,
 }
 
-/// Дополнительное значение, вычисленное приложением перед нормализацией.
+/// Additional value calculated by the application before normalization.
 ///
-/// Приёмка не знает ни графика, ни хранилища: она получает только готовую
-/// долю и сохраняет её в амортизации.
+/// Acceptance knows neither the schedule nor the storage: it receives only the prepared
+/// fraction and stores it in amortization.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct JournalEventEnrichment {
     pub basis_allocation: BasisAllocation,
 }
 
-/// Превращение журнального факта в событие журнала.
+/// Conversion of a journal fact into a journal event.
 ///
-/// Форму события — какие ноги обязаны быть у каждого члена — проверяет
-/// ядро своим `validate_structure()` на общем шве приёмки, а не этот
-/// нормализатор. Двойная проверка разошлась бы с ядром молча.
+/// The event form—which legs each member must have—is checked by
+/// the core via `validate_structure()` at the common acceptance boundary, not by this
+/// normalizer. A duplicate check would silently diverge from the core.
 pub fn normalize_journal_event(
     submitted: &SubmittedJournalEvent,
     enrichment: &JournalEventEnrichment,
@@ -96,8 +96,8 @@ pub fn normalize_journal_event(
 ) -> Result<Normalized, Rejection> {
     let (dates, day) = dates_of(&submitted.fact);
     let (kind, legs) = build(submitted.account, &submitted.fact, enrichment)?;
-    // Отпечаток считается там же, где дедупликация: второй экземпляр
-    // этой функции разошёлся бы с первым молча (§10.6).
+    // The fingerprint is computed in the same place as deduplication: a second instance
+    // of this function would silently diverge from the first (§10.6).
     let raw_hash = crate::dedup::fingerprint_journal_event(submitted);
 
     Ok(Normalized {
@@ -108,7 +108,7 @@ pub fn normalize_journal_event(
             account: submitted.account,
             kind,
             dates,
-            // Временный номер: окончательный ставит хранилище (§4.8).
+            // Temporary number: the final one is assigned by storage (§4.8).
             order: EffectiveOrder::new(day, 1),
             legs,
             provenance: {
@@ -129,17 +129,17 @@ pub fn normalize_journal_event(
     })
 }
 
-/// Даты события и день, по которому оно попадает в порядок.
+/// Event dates and the day on which it enters the ordering.
 ///
-/// День возвращается рядом с датами, а не достаётся потом через
-/// `effective_date()`: у обеих семей он есть по построению, и отказ
-/// «дат нет» был бы веткой, в которую нельзя попасть.
+/// The day is returned alongside the dates rather than fetched later through
+/// `effective_date()`: both families have it by construction, and the “no dates”
+/// failure would be an unreachable branch.
 fn dates_of(fact: &JournalFact) -> (EventDates, Date) {
     match fact {
-        // Дата вступления в силу — это день, когда факт состоялся
-        // на счёте: номинал уменьшился, бумага выбыла, замещение
-        // произошло. Дата фиксации реестра идёт в `entitlement`:
-        // ради неё вход и заведён отдельно от операций.
+        // The effective date is the day on which the fact occurred
+        // on the account: the face value decreased, the security left, or the replacement
+        // occurred. The registry record date goes in `entitlement`:
+        // the input is kept separate for it from the operations.
         JournalFact::CorporateAction(action) => {
             let day = action.effective_date();
             (
@@ -151,8 +151,8 @@ fn dates_of(fact: &JournalFact) -> (EventDates, Date) {
                 day,
             )
         }
-        // Подача и отзыв ничего не двигают, поэтому их день — `trade`,
-        // день действия владельца, а не расчёта, которого не было.
+        // Submission and withdrawal move nothing, so their day is `trade`,
+        // the owner's action, not settlement, which did not occur.
         JournalFact::OfferExercise {
             action: OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. },
             day,
@@ -176,9 +176,9 @@ fn dates_of(fact: &JournalFact) -> (EventDates, Date) {
     }
 }
 
-/// Построение типа события и ног.
+/// Construct the event type and legs.
 ///
-/// Диспетчер исчерпывающий: новый член семьи обязан сломать сборку.
+/// The dispatcher is exhaustive: a new family member must break compilation.
 fn build(
     account: AccountId,
     fact: &JournalFact,
@@ -211,10 +211,10 @@ fn corporate_action_legs(
     action: &CorporateAction,
 ) -> Result<Vec<Leg>, Rejection> {
     match action {
-        // Одна нога `Principal` и ни одной бумажной: количество бумаг
-        // амортизация не меняет (§6.5). Пары «Cash + Principal» нет —
-        // `Principal` уже входит в денежный эффект, и пара удвоила бы
-        // приход.
+        // One `Principal` leg and no security legs: the number of securities
+        // is unchanged by amortization (§6.5). There is no “Cash + Principal” pair —
+        // `Principal` is already included in the monetary effect, and the pair would double
+        // the inflow.
         CorporateAction::PartialRedemption {
             instrument,
             compensation,
@@ -253,12 +253,12 @@ fn corporate_action_legs(
 
 fn offer_legs(account: AccountId, action: &OfferExerciseAction) -> Result<Vec<Leg>, Rejection> {
     match action {
-        // Ног нет — и это форма, а не их отсутствие по недосмотру.
+        // There are no legs — and this is a form, not their absence due to oversight.
         OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {
             Ok(Vec::new())
         }
-        // Выкуп: бумага выбывает за деньги. Ноги `Principal` нет —
-        // номинал не возвращается, бумагу выкупают.
+        // Redemption: the security leaves in exchange for cash. There is no `Principal` leg —
+        // the principal is not returned; the security is redeemed.
         OfferExerciseAction::Settled {
             instrument,
             custody,
@@ -274,11 +274,11 @@ fn offer_legs(account: AccountId, action: &OfferExerciseAction) -> Result<Vec<Le
     }
 }
 
-/// Денежный итог выкупа: комиссия уменьшает поступление, накопленный
-/// купон увеличивает — та же арифметика, что у продажи.
+/// Redemption cash total: the fee reduces the proceeds, while accrued
+/// coupon increases them—the same arithmetic as for a sale.
 ///
-/// Складывается `Money`, а не минорные единицы: сложение денег разных
-/// валют обязано быть отказом, а на голых `i64` оно молча пройдёт.
+/// Add `Money`, not minor units: adding money in different currencies
+/// must fail, whereas adding bare `i64` values would silently succeed.
 fn settlement(
     gross: Money,
     fee: Option<Money>,
@@ -288,28 +288,28 @@ fn settlement(
     if let Some(accrued) = accrued {
         total = total.try_add(accrued).map_err(|error| Rejection {
             field: "accrued_interest".into(),
-            expected: "сумма в валюте выкупа, дающая представимый итог".into(),
+            expected: "a sum in the redemption currency yielding a representable result".into(),
             actual: error.to_string(),
         })?;
     }
     if let Some(fee) = fee {
         total = total.try_sub(fee).map_err(|error| Rejection {
             field: "fee".into(),
-            expected: "сумма в валюте выкупа, дающая представимый итог".into(),
+            expected: "a sum in the redemption currency yielding a representable result".into(),
             actual: error.to_string(),
         })?;
     }
     Ok(total)
 }
 
-/// Количество выбывающей бумаги. Клиент присылает положительное —
-/// знак ставит приёмка.
+/// Quantity of the security being disposed of. The client sends a positive value —
+/// the ingestion layer supplies the sign.
 ///
-/// Отказ пробрасывается, хотя ни одно `Decimal` его сегодня не вызывает
-/// (`checked_neg` — это `0 - self`, и у `Decimal` результат представим
-/// всегда): `unwrap` здесь утверждал бы, что так будет и впредь, о чём
-/// эта функция знать не может. Тот же приём, что в `operation.rs`
-/// у продажи.
+/// The error is propagated, although no `Decimal` currently produces one
+/// (`checked_neg` is `0 - self`, and the result is always representable for `Decimal`):
+/// `unwrap` here would assert that this remains true, which this function
+/// cannot know. The same approach as in `operation.rs`
+/// for a sale.
 fn retired(quantity: Quantity) -> Result<Quantity, Rejection> {
     quantity
         .0
@@ -317,7 +317,7 @@ fn retired(quantity: Quantity) -> Result<Quantity, Rejection> {
         .map(Quantity)
         .map_err(|error| Rejection {
             field: "quantity".into(),
-            expected: "представимое количество".into(),
+            expected: "representable quantity".into(),
             actual: error.to_string(),
         })
 }
@@ -379,20 +379,20 @@ mod tests {
         }
     }
 
-    /// Форму события проверяет ядро, а не приёмка: нормализатор обязан
-    /// строить ровно те ноги, которых ядро ждёт, иначе запись отклонят
-    /// уже после — на общем шве.
+    /// The event's shape is checked by the core, not ingestion: the normalizer must
+    /// construct exactly the legs the core expects, otherwise the record will be rejected
+    /// later—at the common boundary.
     fn normalized_and_valid(fact: JournalFact) -> iaam_core::event::Event {
         let event = normalize_journal_event(
             &submitted(fact),
             &JournalEventEnrichment::default(),
             context(),
         )
-        .expect("нормализация обязана пройти")
+        .expect("normalization must succeed")
         .event;
         event
             .validate_structure()
-            .expect("ноги обязаны совпасть с формой, которую ждёт ядро");
+            .expect("legs must match the shape expected by the core");
         event
     }
 
@@ -407,15 +407,15 @@ mod tests {
         );
     }
 
-    /// Ровно то поле, ради которого заведён отдельный вход: у операций
-    /// его выразить нечем.
+    /// The very field for which a separate input was introduced: operations
+    /// have no way to express it.
     #[test]
     fn the_record_date_reaches_the_entitlement_date() {
         let event = normalized_and_valid(JournalFact::CorporateAction(partial_redemption()));
         assert_eq!(
             event.dates.entitlement.map(|day| day.0),
             Some(date!(2026 - 05 - 18)),
-            "дата фиксации реестра обязана доехать до события"
+            "the registry fixing date must reach the event"
         );
     }
 
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(
             event.dates.effective_date(),
             Some(date!(2026 - 05 - 20)),
-            "без даты событие не попадёт ни в один период"
+            "without a date, the event will not fall into any period"
         );
     }
 
@@ -485,8 +485,8 @@ mod tests {
         assert_eq!(event.legs.len(), 3, "{:?}", event.legs);
     }
 
-    /// Подача заявки ничего не двигает — и отсутствие ног проверяется
-    /// наравне с их наличием.
+    /// Submitting an order moves nothing—and the absence of legs is checked
+    /// just like their presence.
     #[test]
     fn an_offer_application_moves_neither_money_nor_securities() {
         let event = normalized_and_valid(JournalFact::OfferExercise {
@@ -514,9 +514,9 @@ mod tests {
         assert!(event.legs.is_empty(), "{:?}", event.legs);
     }
 
-    /// Расчёт по оферте — это выбытие бумаги за деньги: комиссия
-    /// уменьшает поступление, накопленный купон увеличивает. Знак
-    /// количества ставит приёмка, а не клиент.
+    /// An offer calculation is a disposal of the security for cash: the fee
+    /// reduces the proceeds, while accrued coupon increases them. The sign
+    /// of the quantity is set by ingestion, not by the client.
     #[test]
     fn a_settled_offer_pays_gross_less_fee_plus_accrued_interest() {
         let event = normalized_and_valid(JournalFact::OfferExercise {
@@ -535,16 +535,16 @@ mod tests {
             .legs
             .iter()
             .find_map(iaam_core::event::leg::Leg::cash_effect)
-            .expect("расчёт обязан двигать деньги");
+            .expect("the calculation must move money");
         assert_eq!(cash.amount().raw(), 501_000, "500000 - 1000 + 2000");
-        // Без даты расчёт не попадёт ни в один период: деньги пришли
-        // и бумага выбыла в никуда.
+        // Without a date, the calculation will not fall into any period: the money arrived
+        // and the security disappeared into nowhere.
         assert_eq!(event.dates.effective_date(), Some(date!(2026 - 04 - 20)));
     }
 
-    /// Отпечаток обязан РАЗЛИЧАТЬ факты, а не только совпадать сам
-    /// с собой: постоянная каноническая форма даёт один отпечаток всему
-    /// на свете, и дедупликация объявит дубликатом что угодно (§10.6).
+    /// A fingerprint must DISTINGUISH facts, not merely match itself:
+    /// a fixed canonical form gives everything in the world one fingerprint,
+    /// and deduplication will declare anything a duplicate (§10.6).
     #[test]
     fn two_different_facts_get_two_different_fingerprints() {
         let account = AccountId::new_random();
@@ -567,12 +567,12 @@ mod tests {
         assert_ne!(
             crate::dedup::fingerprint_journal_event(&one),
             crate::dedup::fingerprint_journal_event(&two),
-            "две разные выплаты обязаны дать разные отпечатки"
+            "two different payouts must produce different fingerprints"
         );
     }
 
-    /// Счёт входит в отпечаток: тот же факт на другом счёте — другой
-    /// факт, и слипаться они не должны.
+    /// The account is part of the fingerprint: the same fact on another account is a different
+    /// fact, and they must not merge.
     #[test]
     fn the_same_fact_on_another_account_is_another_fingerprint() {
         let fact = partial_redemption();
@@ -594,8 +594,8 @@ mod tests {
         );
     }
 
-    /// Нулевая компенсация — не «амортизация на ноль», а брак источника.
-    /// Отказ обязан случиться до записи: журнал append-only.
+    /// Zero compensation is not “zero amortization” but a source defect.
+    /// The rejection must occur before writing: the journal is append-only.
     #[test]
     fn a_zero_compensation_is_refused_and_never_becomes_cash() {
         let event = normalize_journal_event(
@@ -615,16 +615,16 @@ mod tests {
             &JournalEventEnrichment::default(),
             context(),
         )
-        .expect("нормализация формы не проверяет")
+        .expect("form normalization is not checked")
         .event;
         assert!(
             event.validate_structure().is_err(),
-            "нулевая выплата обязана быть отклонена"
+            "a zero payout must be rejected"
         );
     }
 
-    /// Комиссия в чужой валюте — не «почти правильный» выкуп: сложив
-    /// её с суммой, приёмка записала бы поступление, которого не было.
+    /// A fee in a different currency is not a “nearly correct” redemption: adding
+    /// it to the amount would make acceptance record an inflow that never occurred.
     #[test]
     fn a_fee_in_another_currency_is_refused_instead_of_being_added() {
         let rejection = normalize_journal_event(
@@ -643,7 +643,7 @@ mod tests {
             &JournalEventEnrichment::default(),
             context(),
         )
-        .expect_err("выкуп с комиссией в чужой валюте обязан быть отклонён");
+        .expect_err("a redemption with a fee in a different currency must be rejected");
         assert_eq!(rejection.field, "fee");
     }
 
@@ -665,12 +665,12 @@ mod tests {
             &JournalEventEnrichment::default(),
             context(),
         )
-        .expect_err("накопленный купон в чужой валюте обязан быть отклонён");
+        .expect_err("an accrued coupon in a different currency must be rejected");
         assert_eq!(rejection.field, "accrued_interest");
     }
 
-    /// Идентификатор факта в источнике доезжает до происхождения: без
-    /// него сверку с выгрузкой брокера не на чем строить (§4.1).
+    /// The fact identifier from the source reaches provenance: without
+    /// it, there is no basis for reconciling with the broker export (§4.1).
     #[test]
     fn the_source_identifier_reaches_the_provenance() {
         let event = normalize_journal_event(
@@ -683,7 +683,7 @@ mod tests {
             &JournalEventEnrichment::default(),
             context(),
         )
-        .expect("нормализация обязана пройти")
+        .expect("normalization must succeed")
         .event;
         assert_eq!(
             event.provenance.source_operation_id(),
@@ -701,22 +701,22 @@ mod tests {
             },
             context(),
         )
-        .expect("нормализация обязана пройти")
+        .expect("normalization must succeed")
         .event;
         let EventKind::CorporateAction { action } = event.kind else {
-            panic!("ожидалось корпоративное действие")
+            panic!("a corporate action was expected")
         };
         let CorporateAction::PartialRedemption {
             basis_allocation, ..
         } = action
         else {
-            panic!("ожидалась амортизация")
+            panic!("an amortization was expected")
         };
         assert_eq!(basis_allocation, expected);
     }
 
-    /// Отпечаток называет факт, а не подачу: тот же факт с другим ключом
-    /// идемпотентности обязан дать тот же отпечаток (§10.6).
+    /// The fingerprint identifies the fact, not the submission: the same fact with a different idempotency
+    /// key must produce the same fingerprint (§10.6).
     #[test]
     fn the_fingerprint_names_the_fact_not_the_submission() {
         let fact = partial_redemption();
@@ -724,13 +724,13 @@ mod tests {
         let one = SubmittedJournalEvent {
             account,
             fact: JournalFact::CorporateAction(fact.clone()),
-            idempotency_key: Some("первый".into()),
+            idempotency_key: Some("first".into()),
             source_operation_id: None,
         };
         let two = SubmittedJournalEvent {
             account,
             fact: JournalFact::CorporateAction(fact),
-            idempotency_key: Some("второй".into()),
+            idempotency_key: Some("second".into()),
             source_operation_id: Some("внешний-1".into()),
         };
         assert_eq!(

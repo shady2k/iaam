@@ -1,14 +1,14 @@
-//! Разбор CSV (§10.1).
+//! CSV parsing (§10.1).
 //!
-//! Строка — единица разбора: непонятая строка получает вердикт, а
-//! документ продолжает разбираться. Счёт и инструмент указываются
-//! человеческими именами и разрешаются справочником: идентификаторы
-//! UUID в файле, который заполняет человек, — способ гарантировать
-//! ошибки.
+//! A line is a parsing unit: an unrecognized line receives a verdict, and
+//! document parsing continues. Account and instrument are specified by
+//! human-readable names and resolved through the reference directory: UUIDs
+//! in a file filled in by a human are a way to guarantee
+//! errors.
 //!
-//! Суммы записываются как десятичные числа. Число с большей точностью,
-//! чем минимальная единица валюты, **отклоняется**, а не округляется:
-//! округление входных данных — это тихое изменение факта.
+//! Amounts are recorded as decimal numbers. A number with greater precision,
+//! than the currency's minimum unit is **rejected**, not rounded:
+//! rounding input data is a silent alteration of the fact.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,31 +26,31 @@ use time::macros::format_description;
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::verdict::Rejection;
 
-/// Справочник имён. Заполняется оболочкой из таблиц счетов и инструментов.
+/// Name directory. Populated by a wrapper from account and instrument tables.
 #[derive(Debug, Clone, Default)]
 pub struct Directory {
     pub accounts: AccountNames,
     pub custodies: CustodyNames,
     pub instruments: InstrumentAliases,
-    /// Место хранения по умолчанию для счёта без указанного депозитария.
+    /// Default custody location for an account without a specified custodian.
     pub default_custody: Option<CustodyId>,
 }
 
-/// Названия счетов с сохранением всех совпадений.
+/// Account names, preserving all matches.
 pub type AccountNames = BTreeMap<String, Vec<AccountId>>;
 
-/// Названия мест хранения с сохранением всех совпадений.
+/// Custody location names, preserving all matches.
 pub type CustodyNames = BTreeMap<String, Vec<CustodyId>>;
 
-/// Псевдонимы инструмента со своими интервалами действия.
+/// Instrument aliases with their validity intervals.
 ///
-/// Плоская карта «код → идентификатор» здесь неверна: один ISIN
-/// в разные годы принадлежит разным выпускам, а один выпуск за свою
-/// жизнь меняет ISIN корпоративным действием (§4.7). Разрешение идёт
-/// на дату строки, а не на «сегодня».
+/// A flat “code → identifier” map is incorrect: one ISIN
+/// belongs to different issues in different years, while one issue changes its
+/// ISIN through a corporate action during its lifetime (§4.7). Resolution is performed
+/// for the row date, not “today”.
 pub type InstrumentAliases = BTreeMap<String, Vec<(String, AliasInterval, InstrumentId)>>;
 
-/// Инструмент по коду на дату строки.
+/// Instrument by code on the row date.
 pub fn resolve_instrument(
     aliases: &InstrumentAliases,
     code: &str,
@@ -59,7 +59,7 @@ pub fn resolve_instrument(
     let Some(candidates) = aliases.get(code) else {
         return Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код инструмента из справочника".into(),
+            expected: "instrument code from the reference directory".into(),
             actual: code.to_owned(),
         });
     };
@@ -69,18 +69,18 @@ pub fn resolve_instrument(
         .map(|(_, _, id)| *id)
         .collect();
     match matching.len() {
-        1 => Ok(*matching.first().expect("непустое множество")),
-        // Код известен, но не на эту дату. Отдельный текст, а не общий
-        // отказ: это признак испорченной даты документа, а не новой
-        // бумаги, и разбирающийся должен видеть разницу.
+        1 => Ok(*matching.first().expect("non-empty set")),
+        // The code is known, but not for this date. Use a separate message rather than a generic
+        // rejection: this indicates a corrupted document date, not a new
+        // instrument, and the person investigating must see the difference.
         0 => Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код, действующий на дату операции".into(),
+            expected: "code effective on the operation date".into(),
             actual: code.to_owned(),
         }),
-        // Несколько пространств могут содержать один и тот же код. Это
-        // безопасно, если они указывают на один выпуск; разные выпуски
-        // требуют явного исправления входных данных.
+        // Multiple namespaces may contain the same code. This is
+        // safe if they refer to the same issue; different issues
+        // require an explicit correction to the input data.
         _ => {
             let namespaces: BTreeSet<&str> = candidates
                 .iter()
@@ -89,9 +89,9 @@ pub fn resolve_instrument(
                 .collect();
             Err(Rejection {
                 field: "instrument".to_owned(),
-                expected: "один инструмент среди действующих пространств имён".into(),
+                expected: "one instrument among the active namespaces".into(),
                 actual: format!(
-                    "{code}: неоднозначность между пространствами имён {}",
+                    "{code}: ambiguity between namespaces {}",
                     namespaces.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             })
@@ -99,10 +99,10 @@ pub fn resolve_instrument(
     }
 }
 
-/// Инструмент по коду из названного пространства имён на дату.
+/// Instrument for a code from the named namespace on the given date.
 ///
-/// Явное пространство не допускает fallback в другой namespace: отчёт,
-/// назвавший тикер, не должен случайно подобрать `broker_code`.
+/// An explicit namespace does not fall back to another namespace: a report
+/// that names a ticker must not accidentally select `broker_code`.
 pub(crate) fn resolve_instrument_in_namespace(
     aliases: &InstrumentAliases,
     namespace: &str,
@@ -112,7 +112,7 @@ pub(crate) fn resolve_instrument_in_namespace(
     let Some(candidates) = aliases.get(code) else {
         return Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код инструмента из справочника".into(),
+            expected: "instrument code from the reference directory".into(),
             actual: code.to_owned(),
         });
     };
@@ -122,7 +122,7 @@ pub(crate) fn resolve_instrument_in_namespace(
     {
         return Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код инструмента из справочника".into(),
+            expected: "instrument code from the reference directory".into(),
             actual: code.to_owned(),
         });
     }
@@ -134,21 +134,21 @@ pub(crate) fn resolve_instrument_in_namespace(
         .map(|(_, _, id)| *id)
         .collect();
     match matching.len() {
-        1 => Ok(*matching.first().expect("непустое множество")),
+        1 => Ok(*matching.first().expect("non-empty set")),
         0 => Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код, действующий на дату операции".into(),
+            expected: "code effective on the operation date".into(),
             actual: code.to_owned(),
         }),
         _ => Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "один инструмент среди действующих пространств имён".into(),
-            actual: format!("{code}: неоднозначность в пространстве имён {namespace}"),
+            expected: "one instrument among the active namespaces".into(),
+            actual: format!("{code}: ambiguity in namespace {namespace}"),
         }),
     }
 }
 
-/// Инструмент по коду из названного пространства без даты снимка.
+/// Instrument for a code from the named namespace without a snapshot date.
 pub(crate) fn resolve_instrument_in_namespace_without_date(
     aliases: &InstrumentAliases,
     namespace: &str,
@@ -157,7 +157,7 @@ pub(crate) fn resolve_instrument_in_namespace_without_date(
     let Some(candidates) = aliases.get(code) else {
         return Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код инструмента из справочника".into(),
+            expected: "instrument code from the reference directory".into(),
             actual: code.to_owned(),
         });
     };
@@ -169,22 +169,22 @@ pub(crate) fn resolve_instrument_in_namespace_without_date(
         [(_, _, instrument)] => Ok(*instrument),
         [] => Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код инструмента из справочника".into(),
+            expected: "instrument code from the reference directory".into(),
             actual: code.to_owned(),
         }),
         _ => Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "дата снимка отчёта для выбора кода инструмента".into(),
+            expected: "report snapshot date for selecting the instrument code".into(),
             actual: code.to_owned(),
         }),
     }
 }
 
-/// Инструмент для снимка без даты: допустим только единственный псевдоним.
+/// Instrument for a snapshot without a date: only a single alias is allowed.
 ///
-/// Если отчёт не назвал дату снимка, несколько исторических вариантов
-/// нельзя разрешить догадкой. Единственная запись сохраняет прежний
-/// однозначный сценарий; история из двух и более записей даёт отказ.
+/// If the report did not specify the snapshot date, multiple historical variants
+/// cannot be resolved by guessing. A single record preserves the previous
+/// unambiguous scenario; a history of two or more records is rejected.
 pub fn resolve_instrument_without_date(
     aliases: &InstrumentAliases,
     code: &str,
@@ -192,7 +192,7 @@ pub fn resolve_instrument_without_date(
     let Some(candidates) = aliases.get(code) else {
         return Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код инструмента из справочника".into(),
+            expected: "instrument code from the reference directory".into(),
             actual: code.to_owned(),
         });
     };
@@ -200,18 +200,18 @@ pub fn resolve_instrument_without_date(
         [(_, _, instrument)] => Ok(*instrument),
         [] => Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "код, действующий на дату операции".into(),
+            expected: "code effective on the operation date".into(),
             actual: code.to_owned(),
         }),
         _ => Err(Rejection {
             field: "instrument".to_owned(),
-            expected: "дата снимка отчёта для выбора кода инструмента".into(),
+            expected: "report snapshot date for selecting the instrument code".into(),
             actual: code.to_owned(),
         }),
     }
 }
 
-/// Одна строка файла в сыром виде.
+/// One file row in raw form.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Row {
     pub date: String,
@@ -237,15 +237,15 @@ pub struct Row {
     pub idempotency_key: Option<String>,
 }
 
-/// Результат разбора одной строки.
+/// The result of parsing one row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedRow {
     Operation(Box<SubmittedOperation>),
     Rejected(Rejection),
 }
 
-/// Разбор всего документа. Возвращает по элементу на строку, включая
-/// отклонённые: номер строки — это индекс в результате плюс единица.
+/// Parse the entire document. Returns one item per row, including
+/// rejected rows: the row number is the result index plus one.
 #[must_use]
 pub fn parse(content: &str, directory: &Directory) -> Vec<ParsedRow> {
     let mut reader = csv::ReaderBuilder::new()
@@ -260,7 +260,7 @@ pub fn parse(content: &str, directory: &Directory) -> Vec<ParsedRow> {
             },
             Err(error) => ParsedRow::Rejected(Rejection {
                 field: "row".into(),
-                expected: "строка в формате заголовка файла".into(),
+                expected: "file header row format".into(),
                 actual: error.to_string(),
             }),
         });
@@ -271,7 +271,7 @@ pub fn parse(content: &str, directory: &Directory) -> Vec<ParsedRow> {
 fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperation, Rejection> {
     let date = parse_date(&row.date)?;
     let currency = parse_currency(&row.currency)?;
-    let account = lookup(&directory.accounts, &row.account, "account", "счёта")?;
+    let account = lookup(&directory.accounts, &row.account, "account", "account")?;
     let kind = build_kind(row, directory, currency, date)?;
 
     Ok(SubmittedOperation {
@@ -307,7 +307,7 @@ fn build_kind(
                 &directory.accounts,
                 row.counterparty_account.as_deref().unwrap_or_default(),
                 "counterparty_account",
-                "счёта",
+                "account",
             )?,
             amount_minor: minor(row.amount.as_deref(), "amount", currency)?,
             currency,
@@ -320,8 +320,8 @@ fn build_kind(
             },
             gross_minor: minor(row.amount.as_deref(), "amount", currency)?,
             currency,
-            // У строки CSV колонки вида дохода нет: источник его
-            // не называл, и подставить вид было бы выдумкой (§4.9).
+            // The CSV row has no income-type column: the source
+            // did not specify one, and supplying a type would be fabrication (§4.9).
             kind: None,
         }),
         "fee" => Ok(OperationKind::Fee {
@@ -337,44 +337,42 @@ fn build_kind(
             )?,
             price: Dec::new(decimal(row.amount.as_deref(), "amount")?),
             currency,
-            // Цена, названная владельцем, не является исполнимой (§5.4).
+            // The owner's quoted price is not executable (§5.4).
             quality: PriceQuality::OwnerEstimate,
         }),
         other => Err(Rejection {
             field: "type".into(),
-            expected: "deposit, withdrawal, transfer, buy, sell, income, fee или valuation".into(),
+            expected: "deposit, withdrawal, transfer, buy, sell, income, fee or valuation".into(),
             actual: other.to_owned(),
         }),
     }
 }
 
-/// Место хранения: названное разрешается справочником, неназванное
-/// берётся из умолчания.
+/// Storage location: a named one is validated against the directory, an unnamed one
+/// is taken from the default.
 ///
-/// Вынесено отдельной функцией **ради проверяемости, а не читаемости**.
-/// Изнутри `parse` пустую строку получить нельзя: разбор CSV отдаёт для
-/// пустой ячейки `None`, а не `Some("")`. Ветка с проверкой на пустоту
-/// оказалась бы недостижимой, и мутационный заслон назвал бы её
-/// эквивалентной. Недостижимая проверка — это проверка, про которую
-/// неизвестно, работает ли она; отдельную функцию можно вызвать
-/// напрямую и на пустой строке тоже.
+/// Extracted into a separate function **for testability, not readability**.
+/// An empty string cannot be obtained from inside `parse`: CSV parsing returns
+/// `None` for an empty cell, not `Some("")`. The branch checking for emptiness
+/// would therefore be unreachable, and the mutation shield would call it
+/// equivalent. An unreachable check is one whose behavior is unknown;
+/// a separate function can be called directly, including with an empty string.
 fn resolve_custody(name: Option<&str>, directory: &Directory) -> Result<CustodyId, Rejection> {
     match name {
         Some(name) if !name.is_empty() => resolve_named_custody(name, directory, "custody"),
         _ => directory.default_custody.ok_or_else(|| Rejection {
             field: "custody".into(),
-            expected: "известное место хранения или значение по умолчанию".into(),
-            actual: "не указано".into(),
+            expected: "known storage location or default value".into(),
+            actual: "not specified".into(),
         }),
     }
 }
-
 pub(crate) fn resolve_named_account(
     name: &str,
     directory: &Directory,
     field: &'static str,
 ) -> Result<AccountId, Rejection> {
-    lookup(&directory.accounts, name, field, "счёта")
+    lookup(&directory.accounts, name, field, "account")
 }
 
 pub(crate) fn resolve_named_custody(
@@ -382,7 +380,7 @@ pub(crate) fn resolve_named_custody(
     directory: &Directory,
     field: &'static str,
 ) -> Result<CustodyId, Rejection> {
-    lookup(&directory.custodies, name, field, "места хранения")
+    lookup(&directory.custodies, name, field, "storage location")
 }
 
 fn build_trade(
@@ -438,7 +436,7 @@ fn lookup<T: Copy>(
     let Some(candidates) = table.get(name) else {
         return Err(Rejection {
             field: field.to_owned(),
-            expected: "имя из справочника".into(),
+            expected: "directory name".into(),
             actual: name.to_owned(),
         });
     };
@@ -446,14 +444,14 @@ fn lookup<T: Copy>(
         [single] => Ok(*single),
         [] => Err(Rejection {
             field: field.to_owned(),
-            expected: "имя из справочника".into(),
+            expected: "directory name".into(),
             actual: name.to_owned(),
         }),
         _ => Err(Rejection {
             field: field.to_owned(),
-            expected: "однозначное имя из справочника".into(),
+            expected: "unambiguous name from the directory".into(),
             actual: format!(
-                "{name}: название {entity} неоднозначно: {} {entity}",
+                "{name}: {entity} name is ambiguous: {} {entity}s",
                 candidates.len()
             ),
         }),
@@ -463,7 +461,7 @@ fn lookup<T: Copy>(
 fn parse_date(value: &str) -> Result<Date, Rejection> {
     Date::parse(value, format_description!("[year]-[month]-[day]")).map_err(|_| Rejection {
         field: "date".into(),
-        expected: "дата в формате ГГГГ-ММ-ДД".into(),
+        expected: "date in YYYY-MM-DD format".into(),
         actual: value.to_owned(),
     })
 }
@@ -477,7 +475,7 @@ fn parse_currency(value: &str) -> Result<CurrencyCode, Rejection> {
         "XAU" => Ok(CurrencyCode::Xau),
         other => Err(Rejection {
             field: "currency".into(),
-            expected: "RUB, USD, EUR, CNY или XAU".into(),
+            expected: "RUB, USD, EUR, CNY or XAU".into(),
             actual: other.to_owned(),
         }),
     }
@@ -487,7 +485,7 @@ fn decimal(value: Option<&str>, field: &'static str) -> Result<Decimal, Rejectio
     let raw = value.unwrap_or_default();
     raw.parse::<Decimal>().map_err(|_| Rejection {
         field: field.to_owned(),
-        expected: "десятичное число".into(),
+        expected: "decimal number".into(),
         actual: raw.to_owned(),
     })
 }
@@ -534,7 +532,7 @@ mod tests {
 
         let found = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01));
 
-        assert_eq!(found.expect("код разрешён"), instrument);
+        assert_eq!(found.expect("code is allowed"), instrument);
     }
     #[test]
     fn an_explicit_namespace_does_not_fall_back_to_other_namespaces() {
@@ -554,10 +552,13 @@ mod tests {
 
         let refused =
             resolve_instrument_in_namespace(&aliases, "ticker", "SBER", date!(2024 - 03 - 01))
-                .expect_err("тикер не должен искать в broker_code");
+                .expect_err("ticker must not search broker_code");
 
         assert_eq!(refused.field, "instrument");
-        assert_eq!(refused.expected, "код инструмента из справочника");
+        assert_eq!(
+            refused.expected,
+            "instrument code from the reference directory"
+        );
         assert_eq!(refused.actual, "SBER");
     }
 
@@ -590,7 +591,7 @@ mod tests {
         let found = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01));
 
         assert_eq!(
-            found.expect("коды разных пространств разрешены"),
+            found.expect("codes from different namespaces are allowed"),
             instrument
         );
     }
@@ -623,7 +624,7 @@ mod tests {
         );
 
         let refused = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01))
-            .expect_err("одинаковое значение в разных пространствах неоднозначно");
+            .expect_err("the same value in different namespaces is ambiguous");
 
         assert_eq!(refused.field, "instrument");
         assert!(refused.actual.contains("SBER"));
@@ -658,11 +659,11 @@ mod tests {
         );
 
         let refused = resolve_instrument_without_date(&aliases, "SBER")
-            .expect_err("без даты нельзя выбрать пространство имён");
+            .expect_err("a namespace cannot be selected without a date");
 
         assert_eq!(
             refused.expected,
-            "дата снимка отчёта для выбора кода инструмента"
+            "report snapshot date for selecting the instrument code"
         );
     }
 
@@ -684,7 +685,7 @@ mod tests {
 
         assert_eq!(
             resolve_instrument_in_namespace_without_date(&aliases, "ticker", "SBER")
-                .expect("единственный псевдоним разрешён"),
+                .expect("only one alias is allowed"),
             instrument
         );
     }
@@ -706,10 +707,13 @@ mod tests {
         );
 
         let refused = resolve_instrument_in_namespace_without_date(&aliases, "ticker", "SBER")
-            .expect_err("чужое пространство не должно разрешаться");
+            .expect_err("a foreign namespace must not be resolved");
 
         assert_eq!(refused.field, "instrument");
-        assert_eq!(refused.expected, "код инструмента из справочника");
+        assert_eq!(
+            refused.expected,
+            "instrument code from the reference directory"
+        );
         assert_eq!(refused.actual, "SBER");
     }
 
@@ -741,11 +745,11 @@ mod tests {
         );
 
         let refused = resolve_instrument_in_namespace_without_date(&aliases, "ticker", "SBER")
-            .expect_err("несколько псевдонимов требуют дату снимка");
+            .expect_err("multiple aliases require a snapshot date");
 
         assert_eq!(
             refused.expected,
-            "дата снимка отчёта для выбора кода инструмента"
+            "report snapshot date for selecting the instrument code"
         );
         assert_eq!(refused.actual, "SBER");
     }
@@ -768,10 +772,10 @@ mod tests {
 
         let refused =
             resolve_instrument_in_namespace(&aliases, "ticker", "SBER", date!(2024 - 03 - 01))
-                .expect_err("код вне интервала должен быть отвергнут");
+                .expect_err("a code outside the interval must be rejected");
 
         assert_eq!(refused.field, "instrument");
-        assert_eq!(refused.expected, "код, действующий на дату операции");
+        assert_eq!(refused.expected, "code effective on the operation date");
         assert_eq!(refused.actual, "SBER");
     }
 
@@ -785,11 +789,11 @@ mod tests {
             .insert("НРД".into(), vec![first, second]);
 
         let refused = resolve_custody(Some("НРД"), &directory)
-            .expect_err("одинаковое название места хранения неоднозначно");
+            .expect_err("the same custody name is ambiguous");
 
         assert_eq!(refused.field, "custody");
         assert!(refused.actual.contains("НРД"));
-        assert!(refused.actual.contains("неоднозначно"));
+        assert!(refused.actual.contains("ambiguous"));
     }
 
     #[test]
@@ -809,7 +813,7 @@ mod tests {
         );
 
         let refused = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01))
-            .expect_err("интервал уже закончился");
+            .expect_err("the interval has already ended");
 
         assert_eq!(refused.field, "instrument");
     }
@@ -818,8 +822,8 @@ mod tests {
     fn an_unknown_code_is_refused_and_not_skipped() {
         let aliases = BTreeMap::new();
 
-        let refused = resolve_instrument(&aliases, "NOPE", date!(2024 - 03 - 01))
-            .expect_err("неизвестный код");
+        let refused =
+            resolve_instrument(&aliases, "NOPE", date!(2024 - 03 - 01)).expect_err("unknown code");
 
         assert_eq!(refused.field, "instrument");
     }
@@ -841,22 +845,22 @@ mod tests {
         );
 
         let unknown = resolve_instrument(&BTreeMap::new(), "SBER", date!(2024 - 03 - 01))
-            .expect_err("код отсутствует");
+            .expect_err("code is missing");
         let too_early = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01))
-            .expect_err("код ещё не действовал");
+            .expect_err("code was not yet in effect");
 
         assert_ne!(
             unknown.expected, too_early.expected,
-            "новая бумага и испорченная дата обязаны звучать по-разному"
+            "new security and corrupted date must sound different"
         );
     }
 
     #[test]
     fn an_unnamed_custody_falls_back_to_the_default_and_a_named_one_is_looked_up() {
-        // Три состояния имени: не задано, задано пустым, задано.
-        // Пустая строка означает то же, что и отсутствие: места хранения
-        // не назвали. Изнутри разбора CSV пустую строку не получить,
-        // поэтому проверка вызывается здесь напрямую.
+        // Three name states: unset, set to empty, set.
+        // An empty string means the same as absence: the custody was not named.
+        // An empty string cannot be obtained from inside CSV parsing,
+        // so the check is called directly here.
         let default = CustodyId::new_random();
         let named = CustodyId::new_random();
         let mut directory = Directory {
@@ -881,7 +885,7 @@ mod tests {
         let directory = Directory::default();
         let rejection = resolve_custody(None, &directory).unwrap_err();
         assert_eq!(rejection.field, "custody");
-        assert_eq!(rejection.actual, "не указано");
+        assert_eq!(rejection.actual, "not specified");
     }
     #[test]
     fn a_known_code_outside_its_interval_reports_a_date_specific_rejection() {
@@ -900,12 +904,12 @@ mod tests {
         );
 
         let refused = resolve_instrument(&aliases, "SBER", date!(2024 - 03 - 01))
-            .expect_err("код известен, но не действует на дату");
+            .expect_err("code is known but not effective on the date");
 
         assert_eq!(refused.field, "instrument");
         assert_eq!(
-            refused.expected, "код, действующий на дату операции",
-            "код, известный справочнику, должен отличаться от неизвестного"
+            refused.expected, "code effective on the operation date",
+            "a code known to the reference data must differ from an unknown code"
         );
         assert_eq!(refused.actual, "SBER");
     }
@@ -927,7 +931,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_instrument_without_date(&aliases, "SBER").expect("единственный код"),
+            resolve_instrument_without_date(&aliases, "SBER").expect("the only code"),
             instrument
         );
     }
@@ -938,10 +942,10 @@ mod tests {
         aliases.insert("SBER".to_owned(), Vec::new());
 
         let refused = resolve_instrument_without_date(&aliases, "SBER")
-            .expect_err("пустая история инструмента");
+            .expect_err("empty instrument history");
 
         assert_eq!(refused.field, "instrument");
-        assert_eq!(refused.expected, "код, действующий на дату операции");
+        assert_eq!(refused.expected, "code effective on the operation date");
         assert_eq!(refused.actual, "SBER");
     }
 
@@ -950,11 +954,11 @@ mod tests {
         let mut directory = Directory::default();
         directory.custodies.insert("НРД".into(), Vec::new());
 
-        let refused = resolve_named_custody("НРД", &directory, "custody")
-            .expect_err("пустая история места хранения");
+        let refused =
+            resolve_named_custody("НРД", &directory, "custody").expect_err("empty custody history");
 
         assert_eq!(refused.field, "custody");
-        assert_eq!(refused.expected, "имя из справочника");
+        assert_eq!(refused.expected, "directory name");
         assert_eq!(refused.actual, "НРД");
     }
 }

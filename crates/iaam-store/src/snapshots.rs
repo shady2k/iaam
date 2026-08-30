@@ -1,13 +1,13 @@
-//! Снимки проекций.
+//! Projection snapshots.
 //!
-//! Снимок — **кэш**: его потеря не является потерей данных, потому что
-//! он восстановим полным пересчётом журнала. Поэтому формат выбран
-//! из соображений «переживёт ли он состав состояния», а не долговечности.
+//! A snapshot is a **cache**: losing it does not mean losing data because
+//! it can be restored by fully replaying the journal. Therefore, the format was chosen
+//! based on whether it will survive the state schema, not on durability.
 //!
-//! Формат — CBOR, а не JSON. Состояние содержит карты с составными
-//! ключами (счёт + валюта, счёт + место хранения + инструмент), которые
-//! JSON представить не может: `serde_json` отказывает с «key must be
-//! a string». Проверено исполнением.
+//! The format is CBOR, not JSON. The state contains maps with composite
+//! keys (account + currency, account + custody + instrument), which JSON cannot
+//! represent: `serde_json` fails with “key must be a string”. Verified by running it.
+//!
 
 use iaam_core::contour::{ContourId, ContourVersion};
 use iaam_core::ids::OwnerId;
@@ -20,9 +20,9 @@ use time::format_description::well_known::Rfc3339;
 use crate::{SqliteStore, StoreError};
 
 impl SqliteStore {
-    /// Сохранение снимка. Ключ — контур, его версия и версия правила
-    /// списания: снимок, построенный другими правилами, не является
-    /// снимком того же расчёта.
+    /// Save a snapshot. The key is the projection, its version, and the rule version
+    /// for debiting: a snapshot built with different rules is not
+    /// a snapshot of the same calculation.
     pub fn save_snapshot(&self, owner: OwnerId, snapshot: &Snapshot) -> Result<(), StoreError> {
         let mut body = Vec::new();
         ciborium::into_writer(snapshot, &mut body)
@@ -59,11 +59,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Чтение снимка.
+    /// Read a snapshot.
     ///
-    /// Снимок, который не читается, — не ошибка работы: формат мог
-    /// измениться вместе с версией проекции. Вызывающий получает `None`
-    /// и пересчитывает журнал с нуля.
+    /// A snapshot that cannot be read is not an operational error: the format may have
+    /// changed along with the projection version. The caller receives `None`
+    /// and replays the journal from scratch.
     pub fn load_snapshot(
         &self,
         owner: OwnerId,
@@ -91,8 +91,8 @@ impl SqliteStore {
         Ok(ciborium::from_reader(body.as_slice()).ok())
     }
 
-    /// Удаление снимка. Единственная операция удаления в хранилище:
-    /// кэш выбрасывать можно, факты — нет.
+    /// Delete a snapshot. The only deletion operation in the store:
+    /// the cache may be discarded; facts may not.
     pub fn drop_snapshot(
         &self,
         owner: OwnerId,

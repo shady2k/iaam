@@ -1,22 +1,22 @@
-//! Контрольные секции отчёта (§10.3).
+//! Report control sections (§10.3).
 //!
-//! Отчёт содержит не только операции: остатки на начало и конец,
-//! обороты, количества бумаг, суммы комиссий, купонов и дивидендов,
-//! удержанный налог. Это факты источника, и они становятся
-//! [`ControlClaim`] — утверждениями, с которыми потом сходится
-//! посчитанное по журналу.
+//! The report contains more than just transactions: opening and closing balances,
+//! turnover, security quantities, commission, coupon, and dividend amounts,
+//! and tax withheld. These are source facts, and they become
+//! [`ControlClaim`]s—claims against which the journal-based calculation is later reconciled.
+//! calculated from the journal.
 //!
-//! **Секции, которой в документе нет, не существует.** Ноль здесь —
-//! утверждение источника о том, что комиссий не было, а отсутствие
-//! секции не утверждает ничего (§4.9). Поэтому каждое поле
-//! необязательно, а собранный список утверждений короче на те секции,
-//! которых в отчёте не оказалось.
+//! **A section absent from the document does not exist.** Zero here is
+//! the source's assertion that there were no commissions, while the absence
+//! of a section asserts nothing (§4.9). Therefore, every field
+//! is optional, and the collected list of claims is shorter when
+//! those sections are absent from the report.
 
 use iaam_core::ids::{CustodyId, InstrumentId};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 
-/// Остаток денег, заявленный секцией.
+/// Cash balance reported by the section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CashSection {
     pub currency: CurrencyCode,
@@ -24,7 +24,7 @@ pub struct CashSection {
     pub at: BalancePoint,
 }
 
-/// Обороты за интервал. Обе стороны — модули.
+/// Turnover for the interval. Both sides are magnitudes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnoverSection {
     pub currency: CurrencyCode,
@@ -32,14 +32,14 @@ pub struct TurnoverSection {
     pub credit: PostedMinor,
 }
 
-/// Итог за интервал: комиссии, доходы или удержанный налог.
+/// Total for the interval: commissions, income, or tax withheld.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TotalSection {
     pub currency: CurrencyCode,
     pub amount: PostedMinor,
 }
 
-/// Количество бумаг, заявленное секцией.
+/// Security quantity reported by the section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PositionSection {
     pub instrument: InstrumentId,
@@ -48,7 +48,7 @@ pub struct PositionSection {
     pub at: BalancePoint,
 }
 
-/// Контрольные секции, найденные парсером в одном отчёте.
+/// Control sections found by the parser in a single report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlSections {
     pub cash_balances: Vec<CashSection>,
@@ -60,12 +60,12 @@ pub struct ControlSections {
 }
 
 impl ControlSections {
-    /// Утверждения источника из найденных секций.
+    /// Source assertions from the sections found.
     ///
-    /// Порядок устойчив: остатки, обороты, количества, затем итоги.
-    /// Порядок, зависящий от того, в каком месте документа секция
-    /// встретилась, сделал бы сравнение двух разборов одного файла
-    /// невозможным.
+    /// The order is stable: balances, turnover, quantities, then totals.
+    /// An order dependent on where the section
+    /// appeared in the document would make comparing two parses of the same file
+    /// impossible.
     #[must_use]
     pub fn claims(&self) -> Vec<ControlClaim> {
         let mut claims = Vec::new();

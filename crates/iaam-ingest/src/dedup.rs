@@ -1,31 +1,31 @@
-//! Идемпотентность и дедупликация (§10.6).
+//! Idempotency and deduplication (§10.6).
 //!
-//! Иерархия ключей и порядок, в котором из них выбирают:
+//! Key hierarchy and the order in which keys are selected:
 //!
-//! | §10.6 | Ключ | Когда действует |
+//! | §10.6 | Key | When it applies |
 //! |---|---|---|
-//! | 1 | `SourceOperationId` | источник дал стабильный идентификатор |
-//! | 2 | `IdempotencyKey` | клиент назвал подачу |
-//! | 4 | `DocumentRow` | известен документ **и** локатор строки |
-//! | 3 | `NormalizedFingerprint` | документ известен, а локатора нет |
-//! | 5 | подсказка по отпечатку | совпадение с записью другого документа |
+//! | 1 | `SourceOperationId` | source provided a stable identifier |
+//! | 2 | `IdempotencyKey` | client named the submission |
+//! | 4 | `DocumentRow` | document **and** row locator are known |
+//! | 3 | `NormalizedFingerprint` | document is known, but the locator is not |
+//! | 5 | fingerprint hint | matches a record from another document |
 //!
-//! **Порядок выбора — 1, 2, 4, 3, а не 1, 2, 3, 4.** Спека нумерует
-//! отпечаток третьим, но она же прямым текстом запрещает считать
-//! дубликатом две законные одинаковые покупки в один день, а отпечаток
-//! у них совпадает. Одно из двух обязано уступить, и уступает
-//! нумерация: **внутри документа тождество строки — это её локатор,
-//! а не её содержимое**. Документ и есть свидетельство того, что
-//! операций было две: парсер увидел две строки.
+//! **The selection order is 1, 2, 4, 3, not 1, 2, 3, 4.** The spec numbers the
+//! fingerprint third, but it also explicitly prohibits treating
+//! two legitimate identical purchases on the same day as duplicates, while their fingerprints
+//! match. One of the two must give way, and the numbering gives way:
+//! **within a document, row identity is its locator, not its contents**.
+//! The document itself is evidence that there were two operations:
+//! the parser saw two rows.
 //!
-//! Отсюда же следует, что совпадение отпечатка внутри **одного**
-//! документа на другом локаторе — `Fresh`, и даже не подсказка: иначе
-//! отчёт с двумя одинаковыми покупками завалил бы владельца
-//! подсказками на ровном месте. Между разными документами тот же
-//! отпечаток — подсказка пятого уровня, которая ничего не удаляет.
+//! This also means that a fingerprint match within the **same**
+//! document at another locator is `Fresh`, not even a hint: otherwise
+//! a report with two identical purchases would arbitrarily bury its owner in
+//! hints. Between different documents, the same
+//! fingerprint is a level-five hint that deletes nothing.
 //!
-//! Естественный ключ «счёт + дата + сумма» не используется нигде: он
-//! даёт ложные совпадения и не ловит дубликаты после нормализации.
+//! The natural key “account + date + amount” is not used anywhere: it
+//! produces false matches and fails to catch duplicates after normalization.
 
 use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, EventId};
@@ -35,26 +35,26 @@ use sha2::{Digest, Sha256};
 use crate::journal_event::{JournalFact, SubmittedJournalEvent};
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation};
 
-/// Версия канонической формы отпечатка.
+/// Version of the canonical fingerprint form.
 ///
-/// Входит в саму форму: по отпечаткам уже дедуплицировано, и смена
-/// формы обязана быть видимой, а не тихой.
+/// It is part of the form itself: fingerprints have already been deduplicated, and changing
+/// the form must be visible, not silent.
 const CANONICAL_VERSION: u8 = 1;
 
-/// Уровень иерархии §10.6, по которому принято решение.
+/// Hierarchy level §10.6 at which the decision was made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DedupLevel {
     SourceOperationId,
     IdempotencyKey,
     NormalizedFingerprint,
     DocumentRow,
-    /// Вероятностная оценка. Показывается владельцу, ничего не удаляет.
+    /// Probabilistic estimate. Shown to the owner; deletes nothing.
     Probabilistic,
 }
 
 impl DedupLevel {
-    /// Номер уровня в §10.6. Нужен ответу владельцу: «почему система
-    /// решила, что это уже было» — это ссылка на уровень спеки.
+    /// Level number in §10.6. Needed in the response to the owner: “why did the system
+    /// decide this had already occurred?” — this references the specification level.
     #[must_use]
     pub const fn number(self) -> u8 {
         match self {
@@ -67,7 +67,7 @@ impl DedupLevel {
     }
 }
 
-/// Ключ, по которому строка признаётся уже виденной.
+/// Key by which a row is recognized as already seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DedupKey {
     SourceOperationId(String),
@@ -94,11 +94,11 @@ impl DedupKey {
         }
     }
 
-    /// Порядок выбора: чем меньше, тем сильнее.
+    /// Selection order: the lower the value, the stronger the key.
     ///
-    /// Отличается от номера уровня §10.6 намеренно — см. заголовок
-    /// модуля. Вынесен отдельным числом, чтобы выбор сильнейшего был
-    /// проверяемым, а не следствием порядка ветвей в `choose_key`.
+    /// Deliberately differs from the §10.6 level number — see the module
+    /// header. Kept as a separate number so choosing the strongest key is
+    /// verifiable rather than a consequence of branch order in `choose_key`.
     #[must_use]
     pub const fn precedence(&self) -> u8 {
         match self {
@@ -110,10 +110,10 @@ impl DedupKey {
     }
 }
 
-/// Откуда пришла строка.
+/// Where the row came from.
 ///
-/// `document: None` — канал без файла: ответ API брокера это поток,
-/// а не документ, и `None` означает именно «файла не было».
+/// `document: None` — a channel without a file: a broker API response is a stream,
+/// not a document, and `None` means exactly that “there was no file.”
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentContext {
     pub document: Option<RawHash>,
@@ -121,10 +121,10 @@ pub struct DocumentContext {
     pub row: Option<u64>,
 }
 
-/// Уже записанный факт, с которым сравнивают.
+/// An already recorded fact against which comparison is made.
 ///
-/// Собирается оболочкой из журнала: всё перечисленное лежит
-/// в `provenance` события.
+/// Constructed by the wrapper from the log: everything listed below is stored
+/// in the event's `provenance`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownRecord {
     pub event: EventId,
@@ -136,26 +136,26 @@ pub struct KnownRecord {
     pub row: Option<u64>,
 }
 
-/// Что делать со строкой.
+/// What to do with the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DedupDecision {
-    /// Уже записано ранее.
+    /// Already recorded.
     Duplicate { key: DedupKey, existing: EventId },
-    /// Не встречалось.
+    /// Not encountered.
     Fresh,
-    /// Похоже на дубликат, но доказательства нет.
+    /// Looks like a duplicate, but there is no evidence.
     ///
-    /// **Никогда** не приводит к удалению: показывается владельцу
-    /// вместе с записанной строкой (§10.6).
+    /// **Never** leads to deletion: shown to the owner
+    /// together with the recorded row (§10.6).
     PossibleDuplicate { of: EventId, level: DedupLevel },
 }
 
 impl DedupDecision {
-    /// Записывается ли строка.
+    /// Whether the row is recorded.
     ///
-    /// Существует ради того, чтобы «вероятностный дубликат не
-    /// отбрасывается» было проверяемым свойством, а не обещанием
-    /// в комментарии.
+    /// Exists so that “probabilistic duplicate is not
+    /// discarded” is a verifiable property, rather than a promise
+    /// in a comment.
     #[must_use]
     pub const fn records_the_row(&self) -> bool {
         match self {
@@ -165,12 +165,12 @@ impl DedupDecision {
     }
 }
 
-/// Сильнейший доступный ключ. `None` — строку не называет ничто.
+/// Strongest available key. `None` — nothing identifies the row.
 #[must_use]
 pub fn choose_key(operation: &SubmittedOperation, context: &DocumentContext) -> Option<DedupKey> {
     let mut available: Vec<DedupKey> = Vec::new();
-    // Порядок добавления намеренно не совпадает с иерархией: её задаёт
-    // `precedence`, а не случайный порядок появления кандидатов.
+    // The insertion order intentionally does not match the hierarchy: it is defined by
+    // `precedence`, not by the arbitrary order in which candidates appear.
     if let Some(document) = context.document.clone() {
         match context.row {
             Some(row) => available.push(DedupKey::DocumentRow {
@@ -194,11 +194,11 @@ pub fn choose_key(operation: &SubmittedOperation, context: &DocumentContext) -> 
     available.into_iter().next()
 }
 
-/// Решение по строке.
+/// Decision for the row.
 ///
-/// Порядок: точное совпадение выбранного ключа — дубликат; иначе
-/// совпадение отпечатка с записью **другого** документа или канала без
-/// файла — подсказка; иначе строка новая.
+/// Order: an exact match of the selected key — duplicate; otherwise
+/// a fingerprint match with a record from **another** document or a channel without
+/// a file — hint; otherwise the row is new.
 #[must_use]
 pub fn assess(
     key: Option<&DedupKey>,
@@ -225,13 +225,13 @@ pub fn assess(
         })
 }
 
-/// Доказано ли, что запись и строка пришли из одного документа.
+/// Whether it has been proven that the record and row came from the same document.
 ///
-/// Только доказанное совпадение снимает подсказку: документ —
-/// свидетельство того, что операций было две. Два канала без файла
-/// такого свидетельства не дают, и `None == None` здесь означало бы
-/// «оба ниоткуда, значит из одного места» — молчаливый пропуск
-/// повторной выгрузки из API.
+/// Only a proven match removes the hint: the document is evidence
+/// that there were two operations. Two channels without a file
+/// no such evidence is provided, and `None == None` here would mean
+/// “both from nowhere, therefore from the same place” — silently allowing
+/// a repeated export from the API.
 fn same_document(record: &KnownRecord, context: &DocumentContext) -> bool {
     matches!(
         (record.document.as_ref(), context.document.as_ref()),
@@ -239,10 +239,10 @@ fn same_document(record: &KnownRecord, context: &DocumentContext) -> bool {
     )
 }
 
-/// Совпадает ли запись с ключом.
+/// Does the record match the key?
 ///
-/// Исчерпывающий `match`: новый вид ключа обязан сломать сборку здесь,
-/// а не молча перестать ловить дубликаты.
+/// Exhaustive `match`: a new key type must break the build here,
+/// rather than silently stopping duplicate detection.
 fn matches_key(record: &KnownRecord, key: &DedupKey) -> bool {
     match key {
         DedupKey::SourceOperationId(id) => record.source_operation_id.as_deref() == Some(id),
@@ -263,12 +263,12 @@ fn matches_key(record: &KnownRecord, key: &DedupKey) -> bool {
     }
 }
 
-/// Каноническая форма операции: то, от чего считается отпечаток.
+/// Canonical operation form: the basis for computing the fingerprint.
 ///
-/// Ключ идемпотентности и идентификатор операции источника в неё
-/// **не входят**: они называют подачу, а не операцию. Одна и та же
-/// операция, посланная с разными ключами, обязана давать один
-/// отпечаток — иначе третий уровень не поймает ничего.
+/// The idempotency key and source operation identifier are
+/// **not included**: they identify the submission, not the operation. The same
+/// operation sent with different keys must produce the same
+/// fingerprint — otherwise the third level will catch nothing.
 #[must_use]
 pub fn canonical_form(operation: &SubmittedOperation) -> String {
     let canonical = Canonical {
@@ -280,23 +280,23 @@ pub fn canonical_form(operation: &SubmittedOperation) -> String {
     serde_json::to_string(&canonical).unwrap_or_else(|_| unrepresentable_operation())
 }
 
-/// Отпечаток нормализованной записи (§10.6, третий уровень).
+/// Fingerprint of a normalized record (§10.6, level three).
 #[must_use]
 pub fn fingerprint(operation: &SubmittedOperation) -> RawHash {
     let digest = Sha256::digest(canonical_form(operation).as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    // Длина и алфавит гарантированы SHA-256, поэтому разбор не может
-    // отказать; но подставлять заглушку в случае отказа нельзя —
-    // отпечаток без хеша не должен существовать.
+    // Length and alphabet are guaranteed by SHA-256, so parsing cannot
+    // fail; but a placeholder must not be substituted on failure —
+    // a fingerprint without a hash must not exist.
     RawHash::parse(&hex).unwrap_or_else(|| unreachable_hash())
 }
 
-/// Отпечаток журнального факта (§10.6, третий уровень).
+/// Fingerprint of a journal fact (§10.6, level three).
 ///
-/// Отдельная функция, а не общая с операциями: канонические формы
-/// разные, и объединение их одним `enum` сделало бы формат операции
-/// зависимым от появления второй семьи. Отпечаток — это формат, и он
-/// не должен меняться от того, что рядом завели новый вход.
+/// A separate function rather than one shared with operations: the canonical forms
+/// differ, and combining them into one `enum` would make the operation format
+/// depend on the appearance of a second family. A fingerprint is a format, and it
+/// must not change just because a new input was introduced alongside it.
 #[must_use]
 pub fn fingerprint_journal_event(submitted: &SubmittedJournalEvent) -> RawHash {
     let digest = Sha256::digest(canonical_journal_form(submitted).as_bytes());
@@ -304,11 +304,11 @@ pub fn fingerprint_journal_event(submitted: &SubmittedJournalEvent) -> RawHash {
     RawHash::parse(&hex).unwrap_or_else(|| unreachable_hash())
 }
 
-/// Каноническая форма журнального факта.
+/// Canonical form of a journal fact.
 ///
-/// Ключ идемпотентности и идентификатор факта в источнике в неё
-/// **не входят** — по той же причине, что и у операций: они называют
-/// подачу, а не факт.
+/// The idempotency key and the fact identifier in the source are not
+/// **included** for the same reason as for operations: they identify
+/// the submission, not the fact.
 #[must_use]
 pub fn canonical_journal_form(submitted: &SubmittedJournalEvent) -> String {
     let canonical = CanonicalJournalEvent {
@@ -319,10 +319,10 @@ pub fn canonical_journal_form(submitted: &SubmittedJournalEvent) -> String {
     serde_json::to_string(&canonical).unwrap_or_else(|_| unrepresentable_operation())
 }
 
-/// Каноническая форма журнального факта. Даты внутри самого факта
-/// и сериализуются его собственным представлением: именно им факт
-/// уходит в хранилище (`iaam-store/src/events.rs`), и вторая запись
-/// того же факта другой формой разошлась бы с первой.
+/// Canonical form of a journal fact. Dates within the fact itself
+/// are also serialized using its own representation: this is how the fact
+/// is stored (`iaam-store/src/events.rs`), and a second record of
+/// the same fact in another form would differ from the first.
 #[derive(Serialize)]
 struct CanonicalJournalEvent<'a> {
     v: u8,
@@ -330,8 +330,8 @@ struct CanonicalJournalEvent<'a> {
     fact: &'a JournalFact,
 }
 
-/// Каноническая форма. Поля в порядке объявления — этот порядок и есть
-/// формат, поэтому структура отдельная, а не заимствованная у DTO.
+/// Canonical form. Fields are in declaration order—this order is the
+/// format, so the structure is separate rather than borrowed from the DTO.
 #[derive(Serialize)]
 struct Canonical<'a> {
     v: u8,
@@ -340,11 +340,11 @@ struct Canonical<'a> {
     dates: CanonicalDates,
 }
 
-/// Даты в канонической форме — строки ISO 8601.
+/// Dates in canonical form are ISO 8601 strings.
 ///
-/// Собственная сериализация `time::Date` даёт порядковую дату
-/// (`[2026, 91]`): она зависит от внутреннего представления библиотеки
-/// и нечитаема глазом, а формат отпечатка обязан быть и тем, и другим.
+/// The built-in serialization of `time::Date` produces an ordinal date
+/// (`[2026, 91]`): it depends on the library's internal representation
+/// and is unreadable to humans, while the fingerprint format must be both.
 #[derive(Serialize)]
 struct CanonicalDates {
     trade: Option<String>,
@@ -354,8 +354,8 @@ struct CanonicalDates {
 }
 
 impl CanonicalDates {
-    /// `Display` у `time::Date` — это ISO 8601 календарная дата, и
-    /// отказать он не может, в отличие от форматирования по описанию.
+    /// `Display` for `time::Date` is an ISO 8601 calendar date, and
+    /// it cannot fail, unlike formatting by a format description.
     fn of(dates: OperationDates) -> Self {
         Self {
             trade: dates.trade.map(|day| day.to_string()),
@@ -366,12 +366,12 @@ impl CanonicalDates {
     }
 }
 
-/// Отдельные функции вместо `unwrap`: `unwrap` в этих местах читался бы
-/// как «а вдруг», хотя оба варианта невозможны по построению.
+/// Separate functions instead of `unwrap`: `unwrap` here would read
+/// as “what if?”, although both cases are impossible by construction.
 fn unrepresentable_operation() -> ! {
-    panic!("операция состоит из чисел, строк и дат: JSON её представляет всегда")
+    panic!("an operation consists of numbers, strings, and dates: JSON always represents it")
 }
 
 fn unreachable_hash() -> ! {
-    panic!("SHA-256 всегда даёт 64 шестнадцатеричных знака")
+    panic!("SHA-256 always produces 64 hexadecimal digits")
 }

@@ -10,12 +10,12 @@ fn list_tokens_returns_owner_tokens_without_their_secret_hashes() {
     let record = TokenRecord {
         id: Uuid::new_v4(),
         owner,
-        label: "отчёты".into(),
+        label: "reports".into(),
         scope: TokenScope::ReadOnly,
         revoked: false,
     };
 
-    store.insert_token(&record, "секретный-хеш").unwrap();
+    store.insert_token(&record, "secret-hash").unwrap();
     let listed = store.list_tokens(owner).unwrap();
 
     assert_eq!(listed.len(), 1);

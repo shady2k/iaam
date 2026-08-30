@@ -1,7 +1,7 @@
-//! Приёмка синтетического отчёта Т-Инвестиций (§10.1, §10.3, §11).
+//! Acceptance test for the T-Investments synthetic report (§10.1, §10.3, §11).
 //!
-//! Ожидаемые числа ниже выписаны вручную из `tinkoff-synthetic.xlsx`.
-//! Тест намеренно не получает эталон из вывода парсера (§15.5).
+//! The expected numbers below were transcribed manually from `tinkoff-synthetic.xlsx`.
+//! The test intentionally does not obtain the reference from the parser output (§15.5).
 
 use iaam_core::event::kind::{FeeOrigin, TradeSide};
 use iaam_core::event::provenance::ParserVersion;
@@ -331,13 +331,13 @@ fn tinkoff_report_preserves_rows_operations_period_controls_and_repo_quarantine(
                 kind,
             } => {
                 assert_eq!(*currency, CurrencyCode::Rub);
-                // Лист «Купоны и дивиденды» смешивает оба вида и вида
-                // построчно не называет: «не утверждалось» здесь честно,
-                // а угадывание по типу бумаги — нет.
+                // The «Купоны и дивиденды» sheet mixes both types and does not identify them
+                // row by row: “not asserted” is honest here,
+                // whereas guessing based on the security type is not.
                 assert_eq!(*kind, None);
                 incomes.push((*actual_instrument, *gross_minor));
             }
-            other => panic!("неожиданный вид операции: {other:?}"),
+            other => panic!("unexpected operation kind: {other:?}"),
         }
     }
     assert_eq!((deposits, withdrawals, buys, sells, fees), (1, 1, 1, 1, 1));

@@ -1,11 +1,11 @@
-//! Вердикты приёмки (§10.4).
+//! Ingestion verdicts (§10.4).
 
 use iaam_core::ids::{AccountId, EventId};
 use iaam_core::reconciliation::Dimension;
 use serde::{Deserialize, Serialize};
 
-/// Почему строка отклонена. Поле, ожидаемое и полученное — требование
-/// §13 к ответам `422`.
+/// Why the row was rejected. The field, expected value, and received value are required by
+/// §13 for `422` responses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rejection {
     pub field: String,
@@ -13,40 +13,40 @@ pub struct Rejection {
     pub actual: String,
 }
 
-/// Вердикт по одной строке.
+/// Verdict for one row.
 ///
-/// Отдельного шага подтверждения в нормальном пути нет: есть отправка
-/// и вердикт (§10.4). Шесть вердиктов спеки — `Accepted`,
+/// There is no separate confirmation step in the normal flow: there is submission
+/// and a verdict (§10.4). The six verdicts in the spec are `Accepted`,
 /// `Provisional`, `Discrepancy`, `NeedsReconciliation`,
-/// `NeedsClassification`, `Unsupported`. `Duplicate` и `Rejected`
-/// служебные: первый отвечает на повтор (§10.6), второй — на строку,
-/// которую не удалось разобрать (§10.1).
+/// `NeedsClassification`, `Unsupported`. `Duplicate` and `Rejected`
+/// are operational: the former handles retries (§10.6), the latter a row
+/// that could not be parsed (§10.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
-    /// Записано, сверка сошлась.
+    /// Recorded; reconciliation matched.
     Accepted { event: EventId },
-    /// Записано, независимого подтверждения пока нет.
+    /// Recorded; independent confirmation is not yet available.
     Provisional { event: EventId },
-    /// Записано, но сверка не сходится: владелец разбирается.
+    /// Recorded, but reconciliation does not match: the owner is investigating.
     Discrepancy {
         event: EventId,
         account: AccountId,
         dimension: Dimension,
         detail: String,
     },
-    /// Сверять не с чем: требуется остаток от владельца.
+    /// Nothing to reconcile against: a remainder from the owner is required.
     NeedsReconciliation {
         account: AccountId,
         dimension: Dimension,
     },
-    /// Уже записано ранее по ключу идемпотентности (§10.6).
+    /// Already recorded previously under the idempotency key (§10.6).
     Duplicate { existing: EventId },
-    /// Классификация неоднозначна: нужен ответ владельца.
+    /// Classification is ambiguous: an answer from the owner is required.
     NeedsClassification { question: String },
-    /// Операция вне периметра (§11): денежный эффект сохранён,
-    /// экономика не достраивается.
+    /// Operation outside the scope (§11): the monetary effect is preserved,
+    /// but the economic interpretation is not reconstructed.
     Unsupported { reason: String },
-    /// Строка не разобрана.
+    /// The row could not be parsed.
     Rejected { rejection: Rejection },
 }
 
@@ -65,11 +65,11 @@ impl Verdict {
         }
     }
 
-    /// Была ли строка записана в журнал.
+    /// Whether the row was recorded in the journal.
     ///
-    /// Расхождение записано: факт получен, и скрывать его до выяснения
-    /// значило бы терять данные. Требование сверки — нет: там записывать
-    /// нечего, вопрос задан владельцу.
+    /// Discrepancy recorded: the fact was received and must not be hidden until clarified.
+    /// would mean losing data. The reconciliation requirement does not: there is nothing
+    /// to record there; the question has been put to the owner.
     #[must_use]
     pub const fn is_recorded(&self) -> bool {
         match self {
@@ -99,7 +99,7 @@ mod tests {
                 event,
                 account,
                 dimension: Dimension::Cash,
-                detail: "остаток на конец марта".to_owned(),
+                detail: "balance at the end of March".to_owned(),
             },
             Verdict::NeedsReconciliation {
                 account,
@@ -107,7 +107,7 @@ mod tests {
             },
             Verdict::Duplicate { existing: event },
             Verdict::NeedsClassification {
-                question: "перевод внутренний?".to_owned(),
+                question: "an internal transfer?".to_owned(),
             },
             Verdict::Unsupported {
                 reason: "РЕПО".to_owned(),
@@ -115,8 +115,8 @@ mod tests {
             Verdict::Rejected {
                 rejection: Rejection {
                     field: "date".to_owned(),
-                    expected: "ДД.ММ.ГГГГ".to_owned(),
-                    actual: "вчера".to_owned(),
+                    expected: "DD.MM.YYYY".to_owned(),
+                    actual: "yesterday".to_owned(),
                 },
             },
         ]
@@ -124,16 +124,16 @@ mod tests {
 
     #[test]
     fn every_verdict_has_a_distinct_code_and_all_six_spec_verdicts_exist() {
-        // §10.4 называет шесть вердиктов. Duplicate и Rejected служебные:
-        // они отвечают на повтор и на неразобранную строку, а не на
-        // результат приёмки. Проверяется и то, и другое — потерянный
-        // вердикт превращается в молчание там, где владелец ждёт ответа.
+        // §10.4 names six verdicts. Duplicate and Rejected are service variants:
+        // they handle a duplicate and an unparsed row, rather than the
+        // acceptance result. Both are checked—the loss of a verdict
+        // becomes silence where the owner expects a response.
         let all = every_verdict();
         let mut codes: Vec<&str> = all.iter().map(Verdict::code).collect();
         let count = codes.len();
         codes.sort_unstable();
         codes.dedup();
-        assert_eq!(codes.len(), count, "коды вердиктов совпали");
+        assert_eq!(codes.len(), count, "verdict codes match");
 
         for verdict in [
             "accepted",
@@ -143,15 +143,15 @@ mod tests {
             "needs_classification",
             "unsupported",
         ] {
-            assert!(codes.contains(&verdict), "вердикт {verdict} потерян");
+            assert!(codes.contains(&verdict), "verdict {verdict} lost");
         }
     }
 
     #[test]
     fn a_discrepancy_is_recorded_and_a_reconciliation_request_is_not() {
-        // Расхождение — записанный факт с открытым вопросом. Требование
-        // сверки — вопрос без факта. Слить их значит либо потерять
-        // данные, либо записать в журнал то, чего не было.
+        // A discrepancy is a recorded fact with an open question. The reconciliation
+        // requirement is a question without a fact. Merging them means either losing
+        // data or recording in the log something that did not happen.
         let event = EventId::new_random();
         let account = AccountId::new_random();
         assert!(
@@ -174,11 +174,11 @@ mod tests {
 
     #[test]
     fn a_verdict_survives_a_serde_round_trip() {
-        // Вердикт уходит наружу по REST: вариант, который не переживает
-        // сериализацию, обнаружится у внешнего агента, а не здесь.
+        // The verdict is exposed through REST: an option that does not survive
+        // serialization will be caught by the external agent, not here.
         for verdict in every_verdict() {
-            let json = serde_json::to_string(&verdict).expect("сериализация");
-            let back: Verdict = serde_json::from_str(&json).expect("разбор");
+            let json = serde_json::to_string(&verdict).expect("serialization");
+            let back: Verdict = serde_json::from_str(&json).expect("parsing");
             assert_eq!(back, verdict);
         }
     }

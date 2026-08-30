@@ -1,7 +1,7 @@
-//! Идемпотентность и дедупликация (§10.6).
+//! Idempotency and deduplication (§10.6).
 //!
-//! Пять уровней иерархии и правило, ради которого она существует:
-//! вероятностный дубликат показывается владельцу, а не удаляется.
+//! Five hierarchy levels and the rule they exist for:
+//! a probable duplicate is shown to the owner rather than deleted.
 
 use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, EventId, InstrumentId};
@@ -34,7 +34,7 @@ fn deposit(account: AccountId, minor: i64) -> SubmittedOperation {
     }
 }
 
-/// Строка документа: и документ, и локатор известны.
+/// Document row: both the document and locator are known.
 fn from_row(document: &RawHash, row: u64) -> DocumentContext {
     DocumentContext {
         document: Some(document.clone()),
@@ -43,7 +43,7 @@ fn from_row(document: &RawHash, row: u64) -> DocumentContext {
     }
 }
 
-/// Канал без файла: API брокера.
+/// Channel without a file: broker API.
 fn from_stream() -> DocumentContext {
     DocumentContext {
         document: None,
@@ -66,10 +66,10 @@ fn recorded(operation: &SubmittedOperation, context: &DocumentContext) -> KnownR
 
 #[test]
 fn the_strongest_available_key_wins() {
-    // Иерархия от сильного к слабому: стабильный идентификатор источника
-    // сильнее клиентского ключа, а клиентский — сильнее места в файле.
-    // Взять слабый при доступном сильном значит потерять точность
-    // дедупликации на ровном месте.
+    // Hierarchy from strongest to weakest: a stable source identifier
+    // is stronger than a client key, and a client key is stronger than a file location.
+    // Using a weak key when a strong one is available means losing deduplication
+    // accuracy for no reason.
     let mut operation = deposit(AccountId::new_random(), 100_000);
     operation.source_operation_id = Some("OP-4417".to_owned());
     operation.idempotency_key = Some("client-1".to_owned());
@@ -94,8 +94,8 @@ fn the_client_key_is_taken_when_the_source_names_nothing() {
 
 #[test]
 fn the_row_locator_outranks_a_bare_fingerprint() {
-    // Отпечаток не является тождеством: две законные одинаковые покупки
-    // дают один отпечаток. Локатор — является.
+    // A fingerprint is not identity: two legitimate identical purchases
+    // produce one fingerprint. A locator is identity.
     let operation = deposit(AccountId::new_random(), 100_000);
     let document = hash("b");
 
@@ -111,8 +111,8 @@ fn the_row_locator_outranks_a_bare_fingerprint() {
 
 #[test]
 fn a_channel_without_a_row_number_falls_back_to_the_fingerprint() {
-    // Выписка, разобранная не по таблице: документ есть, номера строки
-    // нет. Это и есть уровень 3 §10.6.
+    // A statement parsed without a table: the document exists, but there is no row number.
+    // This is level 3 of §10.6.
     let operation = deposit(AccountId::new_random(), 100_000);
     let document = hash("c");
     let context = DocumentContext {
@@ -132,24 +132,24 @@ fn a_channel_without_a_row_number_falls_back_to_the_fingerprint() {
 
 #[test]
 fn a_submission_that_nothing_identifies_has_no_key() {
-    // Канал без файла и без идентификаторов: жёсткого ключа нет, и
-    // выдумывать его нельзя — остаётся вероятностный уровень.
+    // A channel without a file or identifiers: there is no hard key, and
+    // one must not be invented—the probabilistic level remains.
     let operation = deposit(AccountId::new_random(), 100_000);
     assert_eq!(choose_key(&operation, &from_stream()), None);
 }
 
 #[test]
 fn two_identical_purchases_on_one_day_are_not_a_duplicate() {
-    // Прямое требование §10.6. Естественный ключ «счёт + дата + сумма»
-    // объявил бы их одной сделкой, и вторая покупка исчезла бы из
-    // портфеля — молча и навсегда.
+    // Direct requirement of §10.6. The natural key “account + date + amount”
+    // would declare them to be the same transaction, and the second purchase would disappear
+    // from the portfolio—silently and forever.
     let account = AccountId::new_random();
     let document = hash("d");
     let first = deposit(account, 100_000);
     let first_context = from_row(&document, 7);
     let known = vec![recorded(&first, &first_context)];
 
-    // Та же операция, но другая строка того же документа.
+    // Same operation, but a different row of the same document.
     let second = deposit(account, 100_000);
     let second_context = from_row(&document, 8);
     let key = choose_key(&second, &second_context);
@@ -157,14 +157,14 @@ fn two_identical_purchases_on_one_day_are_not_a_duplicate() {
     assert_eq!(
         assess(key.as_ref(), &fingerprint(&second), &second_context, &known),
         DedupDecision::Fresh,
-        "документ и есть свидетельство того, что операций было две"
+        "the document itself is evidence that there were two operations"
     );
 }
 
 #[test]
 fn reloading_the_same_document_duplicates_every_row() {
-    // Тот же файл, те же строки: нормальный путь — владелец загрузил
-    // отчёт дважды.
+    // Same file, same rows: the normal path is that the owner uploaded
+    // the report twice.
     let account = AccountId::new_random();
     let document = hash("e");
     let rows = [7_u64, 8, 9];
@@ -179,7 +179,7 @@ fn reloading_the_same_document_duplicates_every_row() {
         let key = choose_key(&operation, &context);
         let decision = assess(key.as_ref(), &fingerprint(&operation), &context, &known);
         let DedupDecision::Duplicate { key, .. } = decision else {
-            panic!("повторная загрузка строки {row} обязана быть дубликатом: {decision:?}");
+            panic!("reloading row {row} must be a duplicate: {decision:?}");
         };
         assert_eq!(key.level(), DedupLevel::DocumentRow);
     }
@@ -187,8 +187,8 @@ fn reloading_the_same_document_duplicates_every_row() {
 
 #[test]
 fn the_same_fingerprint_across_documents_is_only_a_hint() {
-    // Отпечаток совпал, но документы разные: это может быть законная
-    // одинаковая операция. Показываем, не удаляем.
+    // The fingerprint matched, but the documents differ: this may be a legitimate
+    // identical operation. Show it, do not delete it.
     let account = AccountId::new_random();
     let earlier = deposit(account, 100_000);
     let known = vec![recorded(&earlier, &from_row(&hash("a"), 7))];
@@ -209,9 +209,9 @@ fn the_same_fingerprint_across_documents_is_only_a_hint() {
 
 #[test]
 fn a_possible_duplicate_is_still_recorded() {
-    // Вероятностная оценка не приводит к автоматическому удалению
-    // (§10.6): решение обязано отличаться от `Duplicate` именно тем,
-    // что записи не отменяет.
+    // A probabilistic assessment does not result in automatic deletion
+    // (§10.6): the decision must differ from `Duplicate` precisely in that
+    // it does not cancel the record.
     let account = AccountId::new_random();
     let known = vec![recorded(&deposit(account, 100_000), &from_stream())];
     let operation = deposit(account, 100_000);
@@ -221,7 +221,7 @@ fn a_possible_duplicate_is_still_recorded() {
     let decision = assess(key.as_ref(), &fingerprint(&operation), &context, &known);
     assert!(
         decision.records_the_row(),
-        "вероятностный дубликат записывается: {decision:?}"
+        "probable duplicate is recorded: {decision:?}"
     );
     assert!(
         !DedupDecision::Duplicate {
@@ -235,9 +235,9 @@ fn a_possible_duplicate_is_still_recorded() {
 
 #[test]
 fn two_identical_submissions_from_a_stream_are_a_hint() {
-    // У канала без файла нет свидетельства, что операций было две:
-    // документа, в котором видны две строки, не существует. Молчаливый
-    // `Fresh` здесь удвоил бы позицию, а §10.6 требует показать.
+    // A channel without a file has no evidence that there were two operations:
+    // there is no document showing two rows. Silently treating this as
+    // `Fresh` would double the position, and §10.6 requires showing it.
     let account = AccountId::new_random();
     let known = vec![recorded(&deposit(account, 100_000), &from_stream())];
     let repeat = deposit(account, 100_000);
@@ -265,8 +265,8 @@ fn the_client_key_catches_a_resubmission_without_a_document() {
     let context = from_stream();
     let known = vec![recorded(&operation, &context)];
 
-    // Повтор с тем же ключом, но другой суммой: клиент повторил запрос,
-    // а не прислал новую операцию.
+    // A repeat with the same key but a different amount: the client repeated the request,
+    // rather than submitting a new operation.
     let mut repeat = deposit(account, 999_000);
     repeat.idempotency_key = Some("client-1".to_owned());
     let key = choose_key(&repeat, &context);
@@ -413,21 +413,25 @@ fn owner_hint_contains_fifth_level() {
         &incoming_context,
         &known,
     ) else {
-        panic!("совпадение отпечатка разных документов обязано стать подсказкой");
+        panic!("a fingerprint match across different documents must become a hint");
     };
     assert_eq!(
         level,
         DedupLevel::Probabilistic,
-        "владелец должен видеть вероятностный уровень"
+        "the owner must see the probabilistic level"
     );
-    assert_eq!(level.number(), 5, "номер уровня — часть объяснения решения");
+    assert_eq!(
+        level.number(),
+        5,
+        "the level number is part of the decision explanation"
+    );
 }
 
 #[test]
 fn the_fingerprint_ignores_the_keys_that_name_the_submission() {
-    // Ключ идемпотентности называет подачу, а не операцию: одна и та же
-    // операция, посланная с разными ключами, обязана давать один
-    // отпечаток — иначе уровень 3 не поймает ничего.
+    // The idempotency key identifies the submission, not the operation: one and the same
+    // An operation sent with different keys must produce the same
+    // fingerprint—otherwise level 3 will catch nothing.
     let account = AccountId::new_random();
     let mut named = deposit(account, 100_000);
     named.idempotency_key = Some("client-1".to_owned());
@@ -460,10 +464,10 @@ fn different_operations_have_different_fingerprints() {
     );
 }
 
-/// Каноническая форма, от которой считается отпечаток.
+/// Canonical form used to compute the fingerprint.
 ///
-/// Записана здесь дословно и **вручную**: по ней уже дедуплицировано,
-/// и молчаливое изменение формы обесценило бы все прежние отпечатки.
+/// Written here verbatim and **manually**: deduplication has already been performed against it,
+/// and silently changing the form would devalue all previous fingerprints.
 const FROZEN_CANONICAL: &str = concat!(
     r#"{"v":1,"account":"00000000-0000-0000-0000-000000000001","#,
     r#""kind":{"Deposit":{"amount_minor":100000,"currency":"Rub"}},"#,
@@ -478,14 +482,14 @@ fn the_canonical_form_is_the_frozen_one() {
 
 #[test]
 fn the_canonical_fingerprint_is_frozen() {
-    // Значение посчитано независимо от программы (§15.5):
+    // The value was computed independently of the program (§15.5):
     //
     //   printf '%s' "$FROZEN_CANONICAL" | sha256sum
     //
-    // Если этот тест упал, значит изменилась каноническая форма, и
-    // прежние отпечатки перестали совпадать с новыми. Чинить его
-    // подстановкой нового значения нельзя: формат версионирован полем
-    // `v`, и смена формы обязана поднимать версию.
+    // If this test fails, the canonical form has changed, and
+    // previous fingerprints no longer match the new ones. Fixing it
+    // by substituting a new value is not allowed: the format is versioned by
+    // `v`, and changing the form must bump the version.
     let operation = deposit(AccountId(Uuid::from_u128(1)), 100_000);
     assert_eq!(
         fingerprint(&operation).as_str(),

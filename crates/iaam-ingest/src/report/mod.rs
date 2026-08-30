@@ -1,18 +1,18 @@
-//! Разбор брокерских отчётов (§10.1).
+//! Parsing broker reports (§10.1).
 //!
-//! Парсер выбирается **по содержимому книги**, а не по имени файла:
-//! имя не гарантирует ничего, и отчёт Финама, сохранённый под именем
-//! отчёта Т-Инвестиций, обязан разбираться как отчёт Финама.
+//! The parser is selected **by the contents of the workbook**, not by the file name:
+//! the name guarantees nothing, and a Finam report saved under the name
+//! of a T-Investments report must be parsed as a Finam report.
 //!
-//! **Строка — единица разбора.** Непонятая строка получает исход
-//! и не отменяет документ (§10.1); строка вне периметра уходит
-//! в карантин с причиной и тоже не отменяет документ (§11).
+//! **A row is the unit of parsing.** An unrecognized row receives its raw input
+//! and does not invalidate the document (§10.1); a row outside the perimeter goes
+//! to quarantine with a reason and likewise does not invalidate the document (§11).
 //!
-//! **Этот код не переиспользуется каналом API.** Общая функция
-//! нормализации между разбором отчёта и разбором ответа брокера
-//! уничтожила бы независимость, ради которой второй канал заводится:
-//! общая ошибка исказила бы обе стороны, и сверка её не заметила бы
-//! (§10.3). Заслон на это ставится задачей 21.
+//! **This code is not reused by the API channel.** A shared function
+//! for normalization between report parsing and broker-response parsing
+//! would destroy the independence for which the second channel is introduced:
+//! a shared error would distort both sides, and reconciliation would not detect it
+//! (§10.3). Task 21 puts a barrier against this.
 
 pub mod finam;
 pub mod sections;
@@ -27,7 +27,7 @@ use crate::csv_source::{Directory, ParsedRow};
 use sections::ControlSections;
 use workbook::Workbook;
 
-/// Брокер, чей отчёт разбирается.
+/// The broker whose report is being parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Broker {
     Tinkoff,
@@ -44,7 +44,7 @@ impl Broker {
     }
 }
 
-/// Формат файла отчёта.
+/// Report file format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReportFormat {
     Xlsx,
@@ -61,7 +61,7 @@ impl ReportFormat {
     }
 }
 
-/// Почему строка отнесена к непокрытому периметру (§11).
+/// Why the row was assigned to the uncovered perimeter (§11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnsupportedReason {
     Repo,
@@ -82,30 +82,30 @@ impl UnsupportedReason {
     }
 }
 
-/// Строка отчёта с местом, откуда она взята.
+/// A report row with the location from which it was taken.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocatedRow {
     pub locator: RowLocator,
     pub outcome: ParsedRow,
 }
 
-/// Строка вне периметра.
+/// A row outside the perimeter.
 ///
-/// Денежный эффект такой операции сохраняется отдельно; экономика
-/// не достраивается, и расхождение по этой причине — исключение,
-/// а не «почини это» (§11).
+/// The monetary effect of such an operation is stored separately; the economics
+/// are not reconstructed, and a discrepancy for this reason is an exception,
+/// not “fix it” (§11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quarantined {
     pub locator: RowLocator,
     pub reason: UnsupportedReason,
 }
 
-/// Результат разбора одного отчёта.
+/// Result of parsing a single report.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedReport {
-    /// Интервал, о котором говорит отчёт. `None` — период в документе
-    /// не назван; выводить его из дат операций нельзя, это была бы
-    /// догадка о полноте (§10.3).
+    /// The interval described by the report. `None` means the period is not
+    /// named in the document; it must not be inferred from operation dates, as
+    /// that would be a guess about completeness (§10.3).
     pub period: Option<AssertionPeriod>,
     pub rows: Vec<LocatedRow>,
     pub sections: ControlSections,
@@ -113,8 +113,8 @@ pub struct ParsedReport {
 }
 
 impl ParsedReport {
-    /// Пустой результат. Логики здесь нет, поэтому имя `empty`,
-    /// а не `new`: конструктор не скрывает ни одной проверки.
+    /// An empty result. There is no logic here, hence the name `empty`,
+    /// rather than `new`: the constructor hides no checks.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -126,40 +126,40 @@ impl ParsedReport {
     }
 }
 
-/// Контракт парсера отчёта.
+/// Report parser contract.
 pub trait ReportParser {
     fn broker(&self) -> Broker;
     fn format(&self) -> ReportFormat;
-    /// Версия разбора. Часть контракта, а не деталь: без неё нельзя
-    /// отличить ошибку источника от ошибки разбора, исправленной
-    /// позже (§4.1). Попадает в provenance каждой строки.
+    /// Parsing version. Part of the contract, not an implementation detail: without it, one cannot
+    /// distinguish a source error from a parsing error fixed
+    /// later (§4.1). It is included in each row's provenance.
     fn version(&self) -> ParserVersion;
-    /// Опознаёт ли парсер эту книгу. Смотрит на содержимое: имена
-    /// листов и опорные ячейки заголовка.
+    /// Whether the parser recognizes this workbook. It examines the contents: sheet
+    /// names and header anchor cells.
     fn recognises(&self, workbook: &Workbook) -> bool;
     fn parse(&self, workbook: &Workbook, directory: &Directory) -> ParsedReport;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DetectError {
-    #[error("книга не опознана ни одним парсером")]
+    #[error("the workbook was not recognized by any parser")]
     Unrecognised,
-    #[error("книгу опознали два парсера: {} и {}", first.code(), second.code())]
+    #[error("the workbook was recognized by two parsers: {} and {}", first.code(), second.code())]
     Ambiguous { first: Broker, second: Broker },
 }
 
-/// Реестр парсеров.
+/// Parser registry.
 #[derive(Default)]
 pub struct ParserRegistry {
     parsers: Vec<Box<dyn ReportParser>>,
 }
 
 impl ParserRegistry {
-    /// Встроенные парсеры.
+    /// Built-in parsers.
     ///
-    /// Пуст, пока парсеры не написаны (задачи 15 и 16). Пустой реестр
-    /// отказывает опознать что угодно — это честнее, чем реестр,
-    /// делающий вид, что умеет читать отчёты.
+    /// Empty until the parsers are written (tasks 15 and 16). An empty registry
+    /// refuses to recognize anything—it is more honest than a registry
+    /// pretending that it can read reports.
     #[must_use]
     pub fn builtin() -> Self {
         Self {
@@ -172,11 +172,11 @@ impl ParserRegistry {
         Self { parsers }
     }
 
-    /// Парсер для этой книги.
+    /// Parser for this workbook.
     ///
-    /// Опознали двое — ошибка, а не первый выигравший: два парсера на
-    /// один файл означают, что признак опознания слишком слаб, и молча
-    /// взять любой значит записать факты чужим разбором.
+    /// Two matches are an error, not the first winner: two parsers for
+    /// one file mean the recognition criterion is too weak, and silently
+    /// choosing either would record facts from the wrong parser.
     pub fn detect(&self, workbook: &Workbook) -> Result<&dyn ReportParser, DetectError> {
         let mut found: Option<&dyn ReportParser> = None;
         for parser in &self.parsers {

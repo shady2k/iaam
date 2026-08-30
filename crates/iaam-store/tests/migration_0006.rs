@@ -1,12 +1,12 @@
-//! Миграция 0006: битемпоральные наблюдения рынка.
+//! Migration 0006: bi-temporal market observations.
 //!
-//! Наблюдение за тем же торговым днём не является перезаписью: источник
-//! может прислать исправленное значение, и обе версии должны остаться в базе.
+//! Observing the same trading day is not an overwrite: the source
+//! may send a corrected value, and both versions must remain in the database.
 
 use rusqlite::Connection;
 
 fn database_at_version_five() -> Connection {
-    let conn = Connection::open_in_memory().expect("база в памяти");
+    let conn = Connection::open_in_memory().expect("in-memory database");
     conn.execute_batch(
         "CREATE TABLE instruments (
              id       TEXT PRIMARY KEY,
@@ -15,17 +15,17 @@ fn database_at_version_five() -> Connection {
              currency TEXT NOT NULL
          ) STRICT;
          INSERT INTO instruments (id, symbol, title, currency)
-         VALUES ('instrument-1', 'SBER', 'Сбербанк', 'RUB');
+         VALUES ('instrument-1', 'SBER', 'Sberbank', 'RUB');
          PRAGMA user_version = 5;",
     )
-    .expect("схема версии 5");
+    .expect("schema version 5");
     conn
 }
 
 fn apply_migration_0006(conn: &Connection) {
     let sql = include_str!("../migrations/0006_market_observations.sql");
     conn.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = 6; COMMIT;"))
-        .expect("миграция 0006");
+        .expect("migration 0006");
 }
 
 fn insert_sync_run(conn: &Connection, id: &str, status: &str) {
@@ -38,7 +38,7 @@ fn insert_sync_run(conn: &Connection, id: &str, status: &str) {
                  '2026-08-02T00:00:00Z', ?3)",
         (id, status, format!("lease-{id}")),
     )
-    .expect("запуск синхронизации");
+    .expect("synchronization run");
 }
 
 fn insert_price(conn: &Connection, sync_run_id: &str, observed_at: &str, price: &str) {
@@ -55,7 +55,7 @@ fn insert_price(conn: &Connection, sync_run_id: &str, observed_at: &str, price: 
             sync_run_id,
         ),
     )
-    .expect("наблюдение цены");
+    .expect("price observation");
 }
 
 #[test]
@@ -79,8 +79,8 @@ fn migration_creates_all_observation_tables_and_preserves_history() {
                 [table],
                 |row| row.get(0),
             )
-            .expect("проверка таблицы");
-        assert!(exists, "таблица {table} создана");
+            .expect("table check");
+        assert!(exists, "table {table} created");
     }
 
     let instrument: String = conn
@@ -89,7 +89,7 @@ fn migration_creates_all_observation_tables_and_preserves_history() {
             [],
             |row| row.get(0),
         )
-        .expect("существующий инструмент сохранён");
+        .expect("existing instrument saved");
     assert_eq!(instrument, "SBER");
 
     insert_sync_run(&conn, "run-1", "succeeded");
@@ -106,8 +106,11 @@ fn migration_creates_all_observation_tables_and_preserves_history() {
             [],
             |row| row.get(0),
         )
-        .expect("количество наблюдений");
-    assert_eq!(count, 2, "исправление добавлено, а не затёрло старую цену");
+        .expect("observation count");
+    assert_eq!(
+        count, 2,
+        "correction was added rather than overwriting the old price"
+    );
 
     let latest_as_known: String = conn
         .query_row(
@@ -124,7 +127,7 @@ fn migration_creates_all_observation_tables_and_preserves_history() {
             [],
             |row| row.get(0),
         )
-        .expect("последнее известное наблюдение");
+        .expect("latest known observation");
     assert_eq!(latest_as_known, "101.00");
 }
 
@@ -145,7 +148,7 @@ fn observation_rows_are_immutable_and_running_series_has_a_lease() {
     );
     assert!(
         second_running.is_err(),
-        "две синхронизации одной серии не стартуют"
+        "two synchronizations of the same series cannot start"
     );
 
     insert_sync_run(&conn, "run-done", "succeeded");
@@ -157,7 +160,7 @@ fn observation_rows_are_immutable_and_running_series_has_a_lease() {
             [],
         )
         .is_err(),
-        "наблюдения нельзя исправить UPDATE"
+        "observations cannot be corrected with UPDATE"
     );
     assert!(
         conn.execute(
@@ -165,7 +168,7 @@ fn observation_rows_are_immutable_and_running_series_has_a_lease() {
             [],
         )
         .is_err(),
-        "наблюдения нельзя удалить"
+        "observations cannot be deleted"
     );
 }
 
@@ -181,7 +184,7 @@ fn completeness_key_allows_an_unknown_boundary_but_stays_unique() {
                  '2026-08-02T00:00:00Z')",
         [],
     )
-    .expect("граница полноты может быть неизвестной");
+    .expect("completeness boundary may be unknown");
     assert!(
         conn.execute(
             "INSERT INTO series_completeness
@@ -191,6 +194,6 @@ fn completeness_key_allows_an_unknown_boundary_but_stays_unique() {
             [],
         )
         .is_err(),
-        "единица полноты уникальна даже с NULL-границей"
+        "completeness unit is unique even with NULL boundary"
     );
 }

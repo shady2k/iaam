@@ -1826,7 +1826,7 @@ async fn ambiguous_account_name_is_rejected_when_resolving_row() {
     assert_eq!(body[0]["verdict"], "rejected");
     assert_eq!(body[0]["field"], "account");
     let actual = body[0]["actual"].as_str().expect("причина отказа");
-    assert_eq!(actual, "Брокерский: название счёта неоднозначно: 2 счёта");
+    assert_eq!(actual, "Брокерский: account name is ambiguous: 2 accounts");
     assert_eq!(body[1]["verdict"], "provisional");
 
     drop(harness);
@@ -3049,7 +3049,7 @@ async fn ingest_verdicts_return_their_populated_fields() {
     assert_eq!(status, StatusCode::OK, "{rejected}");
     assert_eq!(rejected[0]["verdict"], "rejected");
     assert_eq!(rejected[0]["field"], "amount");
-    assert_eq!(rejected[0]["expected"], "положительная величина");
+    assert_eq!(rejected[0]["expected"], "positive value");
     assert_eq!(rejected[0]["actual"], "-5.00");
 }
 

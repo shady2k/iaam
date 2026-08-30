@@ -1,4 +1,4 @@
-//! Миграция 0007: исполнимость — только атрибут источника.
+//! Migration 0007: executability — source attribute only.
 
 use rusqlite::Connection;
 
@@ -18,7 +18,7 @@ type PriceRow = (
 );
 
 fn database_at_version_six() -> Connection {
-    let conn = Connection::open_in_memory().expect("база в памяти");
+    let conn = Connection::open_in_memory().expect("in-memory database");
     conn.execute_batch(
         "CREATE TABLE instruments (
              id       TEXT PRIMARY KEY,
@@ -27,21 +27,21 @@ fn database_at_version_six() -> Connection {
              currency TEXT NOT NULL
          ) STRICT;
          INSERT INTO instruments (id, symbol, title, currency)
-         VALUES ('instrument-1', 'SBER', 'Сбербанк', 'RUB');
+         VALUES ('instrument-1', 'SBER', 'Sberbank', 'RUB');
          PRAGMA user_version = 5;",
     )
-    .expect("схема версии 5");
+    .expect("schema version 5");
 
     let sql = include_str!("../migrations/0006_market_observations.sql");
     conn.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = 6; COMMIT;"))
-        .expect("миграция 0006");
+        .expect("migration 0006");
     conn
 }
 
 fn apply_migration_0007(conn: &Connection) {
     let sql = include_str!("../migrations/0007_executability_without_stale.sql");
     conn.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = 7; COMMIT;"))
-        .expect("миграция 0007");
+        .expect("migration 0007");
 }
 
 fn insert_sync_run(conn: &Connection) {
@@ -53,7 +53,7 @@ fn insert_sync_run(conn: &Connection) {
                  '2026-08-01', '2026-08-01', '2026-08-02T00:00:00Z', 'lease-1')",
         [],
     )
-    .expect("запуск синхронизации");
+    .expect("synchronization run");
 }
 
 fn insert_price(conn: &Connection, observed_at: &str, price: &str, executability: &str) {
@@ -70,7 +70,7 @@ fn insert_price(conn: &Connection, observed_at: &str, price: &str, executability
             format!("hash-{observed_at}"),
         ),
     )
-    .expect("наблюдение цены");
+    .expect("price observation");
 }
 
 fn price_rows(conn: &Connection) -> Vec<PriceRow> {
@@ -81,7 +81,7 @@ fn price_rows(conn: &Connection) -> Vec<PriceRow> {
              FROM price_observations
              ORDER BY observed_at",
         )
-        .expect("запрос наблюдений");
+        .expect("query observations");
     statement
         .query_map([], |row| {
             Ok((
@@ -99,9 +99,9 @@ fn price_rows(conn: &Connection) -> Vec<PriceRow> {
                 row.get(11)?,
             ))
         })
-        .expect("чтение наблюдений")
+        .expect("reading observations")
         .collect::<Result<Vec<_>, _>>()
-        .expect("строки наблюдений")
+        .expect("observation rows")
 }
 
 #[test]
@@ -119,10 +119,10 @@ fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
 
     apply_migration_0007(&conn);
 
-    assert_eq!(price_rows(&conn), before, "история сохранена без изменений");
+    assert_eq!(price_rows(&conn), before, "history preserved unchanged");
     let version: u32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .expect("версия схемы");
+        .expect("schema version");
     assert_eq!(version, 7);
 
     let index_count: i64 = conn
@@ -132,8 +132,8 @@ fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
             [],
             |row| row.get(0),
         )
-        .expect("индекс наблюдений");
-    assert_eq!(index_count, 1, "индекс сохранён");
+        .expect("observation index");
+    assert_eq!(index_count, 1, "index preserved");
 
     for trigger in [
         "price_observations_are_immutable",
@@ -146,8 +146,8 @@ fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
                 [trigger],
                 |row| row.get(0),
             )
-            .expect("триггер наблюдений");
-        assert_eq!(trigger_count, 1, "триггер {trigger} сохранён");
+            .expect("observation trigger");
+        assert_eq!(trigger_count, 1, "trigger {trigger} preserved");
     }
 
     let err = conn
@@ -159,8 +159,8 @@ fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
                      '2026-08-04T09:00:00Z', '102.00', 'RUB', 'stale', 'hash-stale', 'run-1')",
             [],
         )
-        .expect_err("stale должен быть отвергнут");
-    assert!(err.to_string().contains("CHECK"), "ошибка CHECK: {err}");
+        .expect_err("stale must be rejected");
+    assert!(err.to_string().contains("CHECK"), "CHECK error: {err}");
 
     let err = conn
         .execute(
@@ -168,10 +168,10 @@ fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
              WHERE observed_at = '2026-08-02T09:00:00Z'",
             [],
         )
-        .expect_err("изменение наблюдения должно быть запрещено");
+        .expect_err("observation modification must be forbidden");
     assert!(
         err.to_string().contains("append-only"),
-        "ошибка триггера: {err}"
+        "trigger error: {err}"
     );
 
     let err = conn
@@ -180,11 +180,11 @@ fn migration_rejects_stale_and_preserves_rows_index_and_triggers() {
              WHERE observed_at = '2026-08-02T09:00:00Z'",
             [],
         )
-        .expect_err("удаление наблюдения должно быть запрещено");
+        .expect_err("deleting an observation should be forbidden");
     assert!(
         err.to_string().contains("append-only"),
-        "ошибка триггера: {err}"
+        "trigger error: {err}"
     );
 
-    assert_eq!(price_rows(&conn), before, "триггеры не изменили историю");
+    assert_eq!(price_rows(&conn), before, "triggers did not alter history");
 }

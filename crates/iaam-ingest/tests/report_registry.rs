@@ -1,4 +1,4 @@
-//! Реестр парсеров отчётов и контрольные секции (§10.1, §10.3).
+//! Report parser registry and control sections (§10.1, §10.3).
 
 use iaam_core::event::provenance::{ParserVersion, RawHash, RowLocator};
 use iaam_core::ids::{CustodyId, InstrumentId};
@@ -35,8 +35,8 @@ fn text_sheet(name: &str, rows: &[&[&str]]) -> Sheet {
     }
 }
 
-/// Парсер, опознающий книгу по имени листа. Настоящие приходят
-/// задачами 15 и 16; этому достаточно уметь опознавать и отчитываться.
+/// A parser that identifies a workbook by sheet name. The real ones arrive
+/// in tasks 15 and 16; this only needs to identify and report.
 struct MarkerParser {
     broker: Broker,
     marker: &'static str,
@@ -87,7 +87,7 @@ fn finam_like() -> Box<dyn ReportParser> {
 
 #[test]
 fn a_workbook_is_recognised_by_what_is_inside_it() {
-    // Имя файла в опознание не входит вовсе: у `detect` его нет.
+    // The filename is not part of identification at all: `detect` does not have it.
     let book = Workbook::of(vec![text_sheet("Сделки", &[&["Дата", "Тип"]])]);
     let registry = registry(vec![tinkoff_like(), finam_like()]);
 
@@ -100,8 +100,8 @@ fn an_unrecognised_workbook_is_an_error_not_a_guess() {
     let book = Workbook::of(vec![text_sheet("Лист1", &[&["что-то"]])]);
     let registry = registry(vec![tinkoff_like(), finam_like()]);
 
-    // `map` до брокера: сравнивать ошибку можно только у результата,
-    // который умеет печататься, а трейт-объект печататься не умеет.
+    // `map` before erasure: the error can only be compared on a result
+    // that can be printed; a trait object cannot be printed.
     assert_eq!(
         registry
             .detect(&book)
@@ -113,8 +113,8 @@ fn an_unrecognised_workbook_is_an_error_not_a_guess() {
 
 #[test]
 fn two_parsers_claiming_one_workbook_is_an_error() {
-    // Два парсера на один файл означают, что признак опознания слишком
-    // слаб. Взять любой значит записать факты чужим разбором.
+    // Two parsers for one file mean that the identification criterion is too
+    // weak. Choosing any one would record facts using another parser.
     let book = Workbook::of(vec![
         text_sheet("Сделки", &[&["Дата"]]),
         text_sheet("Операции", &[&["Дата"]]),
@@ -135,9 +135,9 @@ fn two_parsers_claiming_one_workbook_is_an_error() {
 
 #[test]
 fn the_builtin_registry_recognises_nothing_until_parsers_arrive() {
-    // Честнее пустого реестра только реестр с парсерами. Парсеры
-    // приходят задачами 15 и 16; до тех пор опознание отказывает,
-    // а не выбирает наугад.
+    // More honest than an empty registry is a registry with parsers. The parsers
+    // arrive in tasks 15 and 16; until then identification fails,
+    // rather than choosing at random.
     let book = Workbook::of(vec![text_sheet("Сделки", &[&["Дата"]])]);
     assert_eq!(
         ParserRegistry::builtin()
@@ -158,15 +158,18 @@ fn a_real_xlsx_opens_into_sheets_and_cells() {
     assert_eq!(
         sheet.cell(1, 2).number(),
         Some(Dec::new(Decimal::new(123_456, 2))),
-        "число читается десятичным, а не двоичной плавающей точкой"
+        "the number is read as decimal, not as a binary floating-point value"
     );
-    assert!(sheet.cell(9, 9).is_empty(), "ячейки за краем листа пусты");
+    assert!(
+        sheet.cell(9, 9).is_empty(),
+        "cells beyond the sheet boundary are empty"
+    );
 }
 
 #[test]
 fn a_date_cell_arrives_as_a_date_and_not_as_a_number() {
-    // В XLSX дата — число со стилем. Без чтения стиля 46154 осталось бы
-    // числом, и парсер разобрал бы его как сумму.
+    // In XLSX, a date is a number with a style. Without reading the style, 46154 would remain
+    // a number, and the parser would interpret it as an amount.
     let book = Workbook::open(MINIMAL_WORKBOOK).unwrap();
     let sheet = book.sheet("Сделки").unwrap();
 
@@ -175,7 +178,7 @@ fn a_date_cell_arrives_as_a_date_and_not_as_a_number() {
 
 #[test]
 fn an_unreadable_stream_is_a_typed_error() {
-    // Не книга — это отказ с причиной, а не паника посреди импорта.
+    // It is not the book that is rejected with a reason, rather than a panic midway through import.
     assert!(matches!(
         Workbook::open(b"\x00\x01 not a workbook"),
         Err(WorkbookError::Unreadable { .. })
@@ -184,15 +187,15 @@ fn an_unreadable_stream_is_a_typed_error() {
 
 #[test]
 fn an_unparsed_row_does_not_cancel_the_document() {
-    // §10.1: строка, которую не поняли, получает исход и остаётся
-    // строкой — документ продолжает разбираться.
+    // §10.1: a row that could not be understood receives an issue and remains
+    // a row—the document continues to be parsed.
     let mut report = ParsedReport::empty();
     report.rows.push(LocatedRow {
         locator: locator("Сделки", 12),
         outcome: ParsedRow::Rejected(Rejection {
             field: "type".into(),
-            expected: "известный вид операции".into(),
-            actual: "непонятное слово".into(),
+            expected: "known operation kind".into(),
+            actual: "unrecognized word".into(),
         }),
     });
 
@@ -203,8 +206,8 @@ fn an_unparsed_row_does_not_cancel_the_document() {
 
 #[test]
 fn a_quarantined_row_does_not_cancel_the_document() {
-    // §11: операция вне периметра уходит в карантин с причиной, а не
-    // отменяет отчёт и не достраивает экономику.
+    // §11: an operation outside the scope is sent to quarantine with a reason, rather than
+    // invalidating the report and fabricating its economics.
     let mut report = ParsedReport::empty();
     report.unsupported.push(Quarantined {
         locator: locator("Сделки", 13),
@@ -226,8 +229,8 @@ fn locator(sheet: &str, row: u64) -> RowLocator {
 
 #[test]
 fn an_absent_control_section_never_becomes_a_zero() {
-    // Секции, которой в документе нет, не существует. Ноль здесь —
-    // утверждение источника о том, что комиссий не было (§4.9).
+    // A section that is absent from the document does not exist. Zero here is
+    // the source's assertion that there were no fees (§4.9).
     let sections = ControlSections::default();
     assert_eq!(sections.claims(), vec![]);
 }
@@ -265,7 +268,11 @@ fn present_control_sections_become_claims_of_the_right_dimension() {
     };
 
     let claims = sections.claims();
-    assert_eq!(claims.len(), 5, "секции без данных не превращаются в ноль");
+    assert_eq!(
+        claims.len(),
+        5,
+        "sections without data do not turn into zero"
+    );
     assert!(claims.contains(&ControlClaim::CashBalance {
         currency: CurrencyCode::Rub,
         amount: PostedMinor::new(-12_500),
@@ -280,14 +287,14 @@ fn present_control_sections_become_claims_of_the_right_dimension() {
     assert!(dimensions.contains(&Dimension::TaxBasis));
     assert!(
         !dimensions.contains(&Dimension::Income),
-        "секции дохода не было"
+        "there was no income section"
     );
 }
 
 #[test]
 fn each_parser_carries_its_own_version() {
-    // Версия парсера — часть его контракта: без неё нельзя отличить
-    // ошибку источника от ошибки разбора, исправленной позже.
+    // The parser version is part of its contract: without it, it is impossible to distinguish
+    // a source error from a parsing error fixed later.
     assert_eq!(
         tinkoff_like().version(),
         ParserVersion("tinkoff-xlsx/1".to_owned())

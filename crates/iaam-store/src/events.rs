@@ -1,4 +1,4 @@
-//! Журнал фактов: запись и чтение.
+//! Fact log: recording and reading.
 
 use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::{Event, Relation};
@@ -9,11 +9,11 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::{SqliteStore, StoreError};
 
-/// Что произошло при попытке записи.
+/// What happened while attempting to record.
 ///
-/// Повтор — не ошибка: повторный вызов с тем же ключом обязан вернуть
-/// тот же результат, иначе клиент, не получивший ответа, не может
-/// безопасно повторить запрос (§10.6).
+/// A retry is not an error: a repeated call with the same key must return
+/// the same result; otherwise, a client that did not receive a response cannot
+/// safely retry the request (§10.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Appended {
     Inserted { id: EventId },
@@ -21,10 +21,10 @@ pub enum Appended {
 }
 
 impl SqliteStore {
-    /// Запись события с уже назначенным порядком.
+    /// Record an event with an already assigned sequence.
     ///
-    /// Применяется там, где порядок задан извне и менять его нельзя:
-    /// импорт архивного бандла и восстановление из архива.
+    /// Used where the sequence is defined externally and cannot be changed:
+    /// importing an archived bundle and restoring from an archive.
     pub fn append_event(&self, event: &Event) -> Result<Appended, StoreError> {
         if let Some(existing) = find_duplicate(&self.conn, event)? {
             return Ok(Appended::Duplicate { existing });
@@ -33,16 +33,16 @@ impl SqliteStore {
         Ok(Appended::Inserted { id: event.id })
     }
 
-    /// Запись события с назначением порядкового номера **в той же
-    /// транзакции**.
+    /// Record an event while assigning its sequence number **in the same
+    /// transaction**.
     ///
-    /// Раздельные «узнать `MAX(sequence) + 1`» и «вставить» — гонка:
-    /// два одновременных запроса получают один и тот же номер, и порядок
-    /// внутри дня начинает определяться случайным идентификатором вместо
-    /// объявленной семантики (§4.8). Транзакция с немедленным захватом
-    /// записи закрывает гонку и между процессами, а уникальный индекс
-    /// `(owner, effective_date, sequence)` превращает оставшийся зазор
-    /// в ошибку вместо тихой перестановки.
+    /// Separating “get `MAX(sequence) + 1`” and “insert” is a race:
+    /// two concurrent requests receive the same number, and the order
+    /// within the day starts being determined by a random identifier instead of
+    /// the declared semantics (§4.8). A transaction with immediate lock acquisition
+    /// closes the race between processes as well, while the unique index
+    /// `(owner, effective_date, sequence)` turns any remaining gap
+    /// into an error instead of silently reordering entries.
     pub fn append_event_in_order(&mut self, event: &Event) -> Result<Appended, StoreError> {
         let transaction = self
             .conn
@@ -65,10 +65,10 @@ impl SqliteStore {
         Ok(Appended::Inserted { id: stamped.id })
     }
 
-    /// Весь журнал владельца в порядке `EffectiveOrder`.
+    /// The owner's entire log in `EffectiveOrder`.
     ///
-    /// Порядок задаётся базой, но проекция всё равно сортирует срез сама:
-    /// ядро не обязано верить порядку, пришедшему снаружи (§4.8).
+    /// The database defines the order, but the projection still sorts the slice itself:
+    /// the core need not trust the order received from outside (§4.8).
     pub fn load_events(&self, owner: OwnerId) -> Result<Vec<Event>, StoreError> {
         self.query_events(
             "SELECT id, payload FROM events
@@ -78,8 +78,8 @@ impl SqliteStore {
         )
     }
 
-    /// Журнал владельца по дату включительно. Срез для отчёта на дату
-    /// собирает оболочка: ядро событий по датам не фильтрует (§6.1).
+    /// Owner ledger through and including the date. The report-date slice
+    /// is assembled by the wrapper: the event core does not filter by date (§6.1).
     pub fn load_events_through(
         &self,
         owner: OwnerId,
@@ -113,9 +113,9 @@ impl SqliteStore {
     }
 }
 
-/// Вставка события. Тело вынесено из публичных методов: оба пути записи
-/// обязаны класть в базу одно и то же, и второй экземпляр этого SQL
-/// когда-нибудь разошёлся бы с первым.
+/// Insert an event. The body is factored out of the public methods: both write paths
+/// must insert the same data into the database, and a second copy of this SQL
+/// would eventually drift from the first.
 pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), StoreError> {
     let payload = serde_json::to_string(event).map_err(StoreError::EventEncode)?;
     let (relation_kind, relation_target) = match event.relation {
@@ -154,11 +154,11 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
     Ok(())
 }
 
-/// Поиск дубликата по ключам от сильного к слабому (§10.6).
+/// Find a duplicate by keys from strongest to weakest (§10.6).
 ///
-/// Естественный ключ «счёт + дата + сумма» здесь намеренно отсутствует:
-/// две одинаковые покупки в один день — законная ситуация, и склеивать
-/// их значит терять факт.
+/// The natural key “account + date + amount” is intentionally absent here:
+/// two identical purchases on the same day are a legitimate situation, and merging
+/// them would mean losing the fact.
 pub(crate) fn find_duplicate(
     conn: &Connection,
     event: &Event,

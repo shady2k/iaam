@@ -1,13 +1,13 @@
-//! Сырьё источников: документы и строки (§10.1).
+//! Raw source materials: documents and rows (§10.1).
 //!
-//! Версия парсера пишется в `provenance` ради повторного разбора, а
-//! повторить разбор без сырья нельзя: исправленный парсер оказался бы
-//! бесполезен для уже загруженного отчёта. Поэтому тело документа и
-//! каждая его строка хранятся целиком и неизменяемо.
+//! The parser version is written to `provenance` to allow reprocessing, but
+//! reprocessing without the raw source is impossible: a corrected parser would be
+//! useless for a report that has already been loaded. Therefore, the document body and
+//! each of its rows are stored in full and remain immutable.
 //!
-//! Хранилище не знает, какие бывают брокеры и форматы: закрытый набор
-//! живёт в реестре парсеров, а здесь код брокера — имя, под которым
-//! реестр себя назвал. Разбирать его тут не на что и незачем.
+//! The storage does not know which brokers or formats exist: the closed set
+//! lives in the parser registry, and here the broker code is the name under which
+//! the registry identifies it. There is nothing to parse here, nor any reason to.
 
 use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::ids::{OwnerId, SourceId};
@@ -15,24 +15,24 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::{SqliteStore, StoreError, now};
 
-/// Код брокера, под которым его знает реестр парсеров.
+/// The broker code under which the parser registry identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BrokerCode(String);
 
-/// Формат отчёта, под которым его знает реестр парсеров.
+/// The report format under which the parser registry identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReportFormat(String);
 
 macro_rules! named_code {
     ($name:ident, $what:literal) => {
         impl $name {
-            /// Принимает только непустое имя.
+            /// Accepts only a non-empty name.
             ///
-            /// Проверка живёт здесь, а не в конструкторе с именем `new`:
-            /// `cargo-mutants` молча пропускает функции с этим именем.
+            /// The check lives here rather than in the constructor named `new`:
+            /// `cargo-mutants` silently skips functions with this name.
             ///
-            #[doc = concat!("Пустая строка в колонке `", $what, "` неотличима от «не знаем",)]
-            /// », а неизвестное значение — это `Option`, а не заглушка (§4.9).
+            #[doc = concat!("An empty string in column `", $what, "` is indistinguishable from “we don't know",)]
+            /// ”, while an unknown value is an `Option`, not a placeholder (§4.9).
             #[must_use]
             pub fn parse(value: &str) -> Option<Self> {
                 let trimmed = value.trim();
@@ -50,11 +50,11 @@ macro_rules! named_code {
 named_code!(BrokerCode, "broker");
 named_code!(ReportFormat, "format");
 
-/// Загружаемый документ: то, что пришло от владельца.
+/// A loadable document: what came from the owner.
 ///
-/// Момента загрузки здесь нет: его ставит хранилище, потому что часы
-/// одни на всю крейту, а присланный клиентом момент — это момент,
-/// которому нечем верить.
+/// There is no loading timestamp here: the storage sets it, because there is
+/// one clock for the entire crate, while a timestamp supplied by the client is a moment
+/// that cannot be trusted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewDocument {
     pub id: SourceId,
@@ -66,7 +66,7 @@ pub struct NewDocument {
     pub body: Vec<u8>,
 }
 
-/// Сохранённый документ.
+/// A stored document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentRecord {
     pub id: SourceId,
@@ -79,27 +79,27 @@ pub struct DocumentRecord {
     pub body: Vec<u8>,
 }
 
-/// Что произошло при загрузке.
+/// What happened during loading.
 ///
-/// Повторная отправка того же файла — не ошибка и не второй документ:
-/// клиент, не получивший ответа, обязан иметь право повторить (§10.6).
+/// Resubmitting the same file is neither an error nor a second document:
+/// a client that did not receive a response must be able to retry (§10.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentStored {
     Inserted { id: SourceId },
     AlreadyPresent { existing: SourceId },
 }
 
-/// Что стало со строкой при разборе.
+/// What happened to the row during parsing.
 ///
-/// Различаются два исхода, потому что ровно их видит хранилище: строка
-/// стала фактом журнала или не стала. Более тонкие исходы — повтор,
-/// операция вне периметра — живут в вердикте приёмки, а не в сырье:
-/// сырьё описывает документ, а не решение по нему.
+/// There are two outcomes because they are exactly what the storage sees: the row
+/// became a journal fact or it did not. Finer-grained outcomes—a duplicate,
+/// an operation outside the scope—belong in the acceptance verdict, not in the raw input:
+/// the raw input describes the document, not the decision about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RowStatus {
-    /// Строка разобрана и стала фактом.
+    /// The row was parsed and became a fact.
     Parsed,
-    /// Строку не разобрали. Документ этим не отменяется (§10.1).
+    /// The row was not parsed. This does not invalidate the document (§10.1).
     Unparsed,
 }
 
@@ -122,14 +122,14 @@ impl RowStatus {
     }
 }
 
-/// Строка документа с локатором.
+/// Document row with a locator.
 ///
-/// Документа в самой строке нет: он один на всю пачку и передаётся
-/// отдельно. Второй экземпляр этого поля разошёлся бы с первым, и
-/// строка одного документа оказалась бы записана в другой.
+/// The document itself is not in the row: there is one document for the entire batch, and it is passed
+/// separately. A second copy of this field would diverge from the first, and
+/// a row from one document could end up being written to another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawRow {
-    /// Лист. `None` — листа не было (CSV), а не «лист не разобрали».
+    /// Sheet. `None` means there was no sheet (CSV), not “the sheet was not parsed.”
     pub sheet: Option<String>,
     pub row: u64,
     pub payload: String,
@@ -137,11 +137,11 @@ pub struct RawRow {
 }
 
 impl SqliteStore {
-    /// Сохранение документа целиком.
+    /// Saving the entire document.
     ///
-    /// Проверка «этот файл уже есть» и вставка идут одной немедленной
-    /// транзакцией: раздельно они образуют гонку, в которой два
-    /// одновременных запроса получают два документа с одним хешом.
+    /// Checking whether “this file already exists” and inserting it are performed in one immediate
+    /// transaction: separately, they create a race in which two
+    /// simultaneous requests receive two documents with the same hash.
     pub fn insert_document(
         &mut self,
         document: &NewDocument,
@@ -161,7 +161,7 @@ impl SqliteStore {
             .optional()?;
         if let Some(existing) = existing {
             return Ok(DocumentStored::AlreadyPresent {
-                existing: SourceId(parse_uuid(&existing, "документ")?),
+                existing: SourceId(parse_uuid(&existing, "document")?),
             });
         }
         transaction.execute(
@@ -183,10 +183,10 @@ impl SqliteStore {
         Ok(DocumentStored::Inserted { id: document.id })
     }
 
-    /// Чтение документа владельца.
+    /// Read the owner's document.
     ///
-    /// Владелец входит в запрос, а не проверяется после чтения: чужой
-    /// документ не должен доезжать до вызывающего даже на мгновение.
+    /// The owner is included in the query rather than checked after reading: a foreign
+    /// document must not reach the caller even for an instant.
     pub fn load_document(
         &self,
         owner: OwnerId,
@@ -200,17 +200,17 @@ impl SqliteStore {
         )?
         .pop()
         .ok_or_else(|| StoreError::NotFound {
-            what: "документ",
+            what: "document",
             id: id.inner().to_string(),
         })
     }
 
-    /// Документы, разобранные не этой версией парсера.
+    /// Documents parsed by a different parser version.
     ///
-    /// Это список кандидатов на повторный разбор, а не список
-    /// невыполненной работы: строка документа неизменяема, и отметки
-    /// «переразобрано» в ней не появляется. Что разбор состоялся,
-    /// видно по `provenance` событий, а не отсюда.
+    /// This is a list of candidates for re-parsing, not a list of
+    /// unfinished work: the document row is immutable, so no
+    /// “re-parsed” marker is added to it. The fact that parsing occurred
+    /// is shown by the events' `provenance`, not here.
     pub fn documents_needing_reparse(
         &self,
         owner: OwnerId,
@@ -248,21 +248,21 @@ impl SqliteStore {
         for row in rows {
             let (id, broker, format, parser_version, document_hash, uploaded_at, body) = row?;
             documents.push(DocumentRecord {
-                id: SourceId(parse_uuid(&id, "документ")?),
+                id: SourceId(parse_uuid(&id, "document")?),
                 owner,
                 broker: BrokerCode::parse(&broker).ok_or_else(|| StoreError::DocumentDecode {
                     id: id.clone(),
-                    detail: "код брокера пуст".to_owned(),
+                    detail: "broker code is empty".to_owned(),
                 })?,
                 format: ReportFormat::parse(&format).ok_or_else(|| StoreError::DocumentDecode {
                     id: id.clone(),
-                    detail: "формат отчёта пуст".to_owned(),
+                    detail: "report format is empty".to_owned(),
                 })?,
                 parser_version: ParserVersion(parser_version),
                 document_hash: RawHash::parse(&document_hash).ok_or_else(|| {
                     StoreError::DocumentDecode {
                         id: id.clone(),
-                        detail: "хеш документа не является SHA-256".to_owned(),
+                        detail: "document hash is not SHA-256".to_owned(),
                     }
                 })?,
                 uploaded_at,
@@ -272,11 +272,11 @@ impl SqliteStore {
         Ok(documents)
     }
 
-    /// Запись пачки строк документа.
+    /// Write a batch of document rows.
     ///
-    /// Пачка кладётся одной транзакцией: половина сырья хуже, чем его
-    /// отсутствие — по неполному набору строк повторный разбор молча
-    /// даст неполный результат.
+    /// The batch is written in a single transaction: half the raw data is worse than none—
+    /// re-parsing an incomplete set of rows will silently
+    /// produce an incomplete result.
     pub fn insert_rows(
         &mut self,
         owner: OwnerId,
@@ -304,7 +304,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Строки документа в порядке локатора.
+    /// Document rows ordered by locator.
     pub fn rows_of_document(
         &self,
         owner: OwnerId,
@@ -334,7 +334,7 @@ impl SqliteStore {
                 status: RowStatus::from_code(&status).ok_or_else(|| {
                     StoreError::DocumentDecode {
                         id: document.inner().to_string(),
-                        detail: format!("неизвестный статус строки: {status}"),
+                        detail: format!("unknown row status: {status}"),
                     }
                 })?,
             });
@@ -343,10 +343,10 @@ impl SqliteStore {
     }
 }
 
-/// Проверка, что документ принадлежит владельцу.
+/// Verify that the document belongs to the owner.
 ///
-/// Отсутствие и чужое владение дают одну ошибку намеренно: разные
-/// ответы сообщили бы постороннему, что такой документ существует.
+/// Missing and foreign ownership intentionally produce the same error: different
+/// responses would reveal to an outsider that such a document exists.
 fn owned_document(
     conn: &rusqlite::Connection,
     owner: OwnerId,
@@ -360,13 +360,13 @@ fn owned_document(
         )
         .optional()?;
     found.map(|_| ()).ok_or(StoreError::NotFound {
-        what: "документ",
+        what: "document",
         id: document.inner().to_string(),
     })
 }
 
-/// Номер строки в SQLite — знаковый. Номер, который туда не влезает,
-/// становится ошибкой, а не молча урезанным числом.
+/// A SQLite row number is signed. A number that does not fit becomes
+/// an error rather than being silently truncated.
 fn row_number_to_sql(row: u64) -> Result<i64, StoreError> {
     i64::try_from(row).map_err(|_| StoreError::RowNumberOutOfRange { row })
 }
@@ -374,7 +374,7 @@ fn row_number_to_sql(row: u64) -> Result<i64, StoreError> {
 fn row_number_from_sql(row: i64, document: SourceId) -> Result<u64, StoreError> {
     u64::try_from(row).map_err(|_| StoreError::DocumentDecode {
         id: document.inner().to_string(),
-        detail: format!("отрицательный номер строки: {row}"),
+        detail: format!("negative row number: {row}"),
     })
 }
 

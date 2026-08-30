@@ -1,6 +1,6 @@
-//! Нормализованная операция обязана давать событие, проходящее
-//! структурную проверку ядра. Это шов, на котором ломается всё:
-//! приёмка строит ноги, а форму этих ног задаёт ядро.
+//! A normalized operation must produce an event that passes the core's
+//! structural validation. This is the seam where everything breaks:
+//! ingestion builds the legs, and the core defines their shape.
 
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
 use iaam_core::ids::EventId;
@@ -109,17 +109,17 @@ fn every_operation_kind_produces_a_structurally_valid_event() {
     for kind in all_kinds() {
         let operation = submit(kind.clone());
         let normalized = normalize(&operation, context())
-            .unwrap_or_else(|rejection| panic!("{kind:?} отклонена: {rejection:?}"));
+            .unwrap_or_else(|rejection| panic!("{kind:?} rejected: {rejection:?}"));
         normalized
             .event
             .validate_structure()
-            .unwrap_or_else(|error| panic!("{kind:?} даёт неверную форму: {error}"));
+            .unwrap_or_else(|error| panic!("{kind:?} has an invalid shape: {error}"));
     }
 }
 
 #[test]
 fn a_purchase_settles_for_body_plus_accrued_plus_fee() {
-    // 9 000,00 тела + 7,00 НКД + 15,00 комиссии = списание 9 022,00.
+    // 9 000,00 principal + 7,00 accrued interest + 15,00 commission = debit of 9 022,00.
     let operation = submit(OperationKind::Buy {
         instrument: InstrumentId::new_random(),
         custody: CustodyId::new_random(),
@@ -132,13 +132,13 @@ fn a_purchase_settles_for_body_plus_accrued_plus_fee() {
     let event = normalize(&operation, context()).unwrap().event;
     let cash = event
         .cash_effect(CurrencyCode::Rub)
-        .expect("денежный эффект");
+        .expect("monetary effect");
     assert_eq!(cash.amount(), PostedMinor::new(-902_200));
 }
 
 #[test]
 fn a_sale_settles_for_body_plus_accrued_minus_fee() {
-    // 9 500,00 тела + 3,00 НКД − 15,00 комиссии = приход 9 488,00.
+    // 9 500,00 principal + 3,00 accrued interest − 15,00 commission = credit of 9 488,00.
     let operation = submit(OperationKind::Sell {
         instrument: InstrumentId::new_random(),
         custody: CustodyId::new_random(),
@@ -151,29 +151,29 @@ fn a_sale_settles_for_body_plus_accrued_minus_fee() {
     let event = normalize(&operation, context()).unwrap().event;
     let cash = event
         .cash_effect(CurrencyCode::Rub)
-        .expect("денежный эффект");
+        .expect("monetary effect");
     assert_eq!(cash.amount(), PostedMinor::new(948_800));
     match event.kind {
         EventKind::Trade { side, .. } => assert_eq!(side, TradeSide::Sell),
-        other => panic!("ожидалась сделка, получено {other:?}"),
+        other => panic!("expected a trade, got {other:?}"),
     }
 }
 
 #[test]
 fn a_negative_amount_is_rejected_with_field_expected_actual() {
-    // Знак задаёт вид операции, а не клиент: отрицательное пополнение
-    // не «исправляется» в вывод средств (§13, ответ 422).
+    // The sign determines the operation type, not the client: a negative deposit
+    // is not “corrected” into a withdrawal (§13, 422 response).
     let operation = submit(OperationKind::Deposit {
         amount_minor: -1,
         currency: CurrencyCode::Rub,
     });
     let rejection = normalize(&operation, context()).unwrap_err();
-    // Поле и величина называются так же, как их прислал клиент: одна
-    // копейка — это «-0.01», а не «-1». Отказ, говорящий во внутренних
-    // единицах, отправляет чинить не то, что отправляли.
+    // The field and amount are named exactly as the client sent them: one
+    // kopeck is “-0.01”, not “-1”. A rejection stated in
+    // internal units sends us to fix something other than what was sent.
     assert_eq!(rejection.field, "amount");
     assert_eq!(rejection.actual, "-0.01");
-    assert_eq!(rejection.expected, "положительная величина");
+    assert_eq!(rejection.expected, "positive value");
 }
 
 #[test]
@@ -202,13 +202,13 @@ fn a_transfer_to_the_same_account_is_rejected_before_the_legs_are_built() {
 
 #[test]
 fn every_verdict_has_a_machine_readable_code_and_says_whether_it_was_recorded() {
-    // Вердикт — это контракт с внешним агентом (§10.4): он разбирает код
-    // и решает, повторять ли отправку. Пустой код неотличим от «вердикта
-    // нет», а «записано» и «не записано», слипшись в одно значение,
-    // превращают повтор либо в дубль, либо в потерю операции.
+    // The verdict is a contract with the external agent (§10.4): it parses the code
+    // and decides whether to retry submission. An empty code is indistinguishable from “no verdict”,
+    // while “recorded” and “not recorded”, collapsed into one value,
+    // turn a retry into either a duplicate or a lost operation.
     let rejection = Rejection {
         field: "amount".into(),
-        expected: "положительная величина".into(),
+        expected: "positive value".into(),
         actual: "-1".into(),
     };
     let table = [
@@ -228,14 +228,14 @@ fn every_verdict_has_a_machine_readable_code_and_says_whether_it_was_recorded() 
         ),
         (
             Verdict::NeedsClassification {
-                question: "не понят вид операции".into(),
+                question: "operation kind not understood".into(),
             },
             "needs_classification",
             false,
         ),
         (
             Verdict::Unsupported {
-                reason: "производные вне периметра".into(),
+                reason: "derivatives outside scope".into(),
             },
             "unsupported",
             false,
@@ -247,24 +247,24 @@ fn every_verdict_has_a_machine_readable_code_and_says_whether_it_was_recorded() 
         assert_eq!(
             verdict.is_recorded(),
             recorded,
-            "вердикт {code}: записано ли в журнал"
+            "verdict {code}: recorded in the log"
         );
     }
 }
 
 #[test]
 fn a_zero_amount_is_rejected_just_like_a_negative_one() {
-    // Граница: ноль положительной величиной не является. Операция на
-    // нулевую сумму — это не операция, и записывать её как факт значит
-    // засорять журнал событиями, которых не было.
+    // Boundary: zero is not a positive amount. An operation for
+    // a zero amount is not an operation, and recording it as a fact
+    // clutters the log with events that did not occur.
     let zero = submit(OperationKind::Deposit {
         amount_minor: 0,
         currency: CurrencyCode::Rub,
     });
-    let rejection = normalize(&zero, context()).expect_err("ноль обязан быть отклонён");
+    let rejection = normalize(&zero, context()).expect_err("zero must be rejected");
     assert_eq!(rejection.field, "amount");
     assert_eq!(
         rejection.actual, "0.00",
-        "величина печатается в тех же единицах, что прислал клиент"
+        "amount is printed in the same units sent by the client"
     );
 }

@@ -1,8 +1,8 @@
-//! Снятие сырых ответов T-Invest API с песочницы.
+//! Capture raw responses from the T-Invest sandbox API.
 //!
-//! Команда нужна только для подготовки замороженных образцов: она берёт
-//! заведённый доступ из базы, но не печатает и не сохраняет расшифрованный
-//! токен. После обезличивания образцы используются тестами без сети.
+//! This command exists only to prepare frozen samples: it takes an existing
+//! access record from the database, but never prints or stores the decrypted
+//! token. After anonymisation, the samples are used by tests without a network.
 //!
 //! ```text
 //! IAAM_DATABASE=/path/to/iaam.sqlite \
@@ -10,9 +10,9 @@
 //! nix develop -c cargo run -p iaam-broker --example tinkoff-record
 //! ```
 //!
-//! Каталог образцов задаётся `IAAM_TINKOFF_FIXTURES_DIR` и по умолчанию
-//! равен `tests/fixtures/api/`. Длина интервала в полных днях задаётся
-//! `IAAM_TINKOFF_INTERVAL_DAYS` и по умолчанию равна 30.
+//! The sample directory is set by `IAAM_TINKOFF_FIXTURES_DIR` and defaults to
+//! `tests/fixtures/api/`. The interval length in whole days is set by
+//! `IAAM_TINKOFF_INTERVAL_DAYS` and defaults to 30.
 
 use std::env;
 use std::error::Error;
@@ -54,30 +54,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let owner = match store.sole_token_owner()? {
         SoleOwner::Single(owner) => owner,
         SoleOwner::None => {
-            return Err(io::Error::other("в базе нет владельца доступа к брокеру").into());
+            return Err(io::Error::other("the database has no broker-access owner").into());
         }
         SoleOwner::Several => {
             return Err(io::Error::other(
-                "в базе несколько владельцев: команда отказывается выбирать одного",
+                "the database has several owners: the command refuses to choose one",
             )
             .into());
         }
     };
-    let broker =
-        BrokerCode::parse(BROKER).ok_or_else(|| io::Error::other("внутренний код брокера пуст"))?;
+    let broker = BrokerCode::parse(BROKER)
+        .ok_or_else(|| io::Error::other("the internal broker code is empty"))?;
     let access = store
         .find_broker_access(owner, &broker, Environment::Sandbox.code())?
-        .ok_or_else(|| io::Error::other("песочный доступ к tinkoff не заведён"))?;
+        .ok_or_else(|| io::Error::other("sandbox access to tinkoff is not configured"))?;
     if BrokerScope::parse(&access.scope) != Some(BrokerScope::ReadOnly) {
-        return Err(io::Error::other("доступ к tinkoff не имеет только права чтения").into());
+        return Err(io::Error::other("tinkoff access is not read-only").into());
     }
 
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))?;
     let client = HttpClient::new();
 
-    // Запрашиваем только действующие счета: закрытый счёт не подходит для
-    // следующих вызовов и сделал бы запись образцов случайной.
+    // Request only open accounts: a closed account is unsuitable for the
+    // following calls and would make the sample set non-deterministic.
     let accounts = fetch_raw(
         &client,
         Destination::TinkoffSandbox,
@@ -112,8 +112,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }),
     )
     .await?;
-    // Нельзя заморозить только первую страницу: такой файл выглядел бы полным,
-    // но последующие операции остались бы за пределами интервала.
+    // Freezing only the first page would make the file look complete while
+    // leaving later operations outside the interval.
     ensure_complete_operations(&operations)?;
     write_fixture(&fixtures_dir, "tinkoff-operations.json", &operations)?;
 
@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 fn required_path(variable: &str) -> Result<std::path::PathBuf, io::Error> {
     env::var_os(variable)
         .map(std::path::PathBuf::from)
-        .ok_or_else(|| io::Error::other(format!("переменная {variable} не задана")))
+        .ok_or_else(|| io::Error::other(format!("environment variable {variable} is not set")))
 }
 
 fn interval_days() -> Result<u64, io::Error> {
@@ -132,13 +132,15 @@ fn interval_days() -> Result<u64, io::Error> {
     };
     let value = value
         .into_string()
-        .map_err(|_| io::Error::other(format!("{INTERVAL_DAYS_ENV} не является UTF-8")))?;
+        .map_err(|_| io::Error::other(format!("{INTERVAL_DAYS_ENV} is not UTF-8")))?;
     let days = value.parse::<u64>().map_err(|_| {
-        io::Error::other(format!("{INTERVAL_DAYS_ENV} должно быть целым числом дней"))
+        io::Error::other(format!(
+            "{INTERVAL_DAYS_ENV} must be a whole number of days"
+        ))
     })?;
     if days == 0 {
         return Err(io::Error::other(format!(
-            "{INTERVAL_DAYS_ENV} должно быть больше нуля"
+            "{INTERVAL_DAYS_ENV} must be greater than zero"
         )));
     }
     Ok(days)
@@ -147,17 +149,17 @@ fn interval_days() -> Result<u64, io::Error> {
 fn interval(days: u64) -> Result<(String, String), io::Error> {
     let to = OffsetDateTime::now_utc();
     let days = i64::try_from(days)
-        .map_err(|_| io::Error::other("интервал слишком велик для календаря"))?;
+        .map_err(|_| io::Error::other("the interval is too large for the calendar"))?;
     let from = to
         .checked_sub(Duration::days(days))
-        .ok_or_else(|| io::Error::other("интервал выходит за начало календаря"))?;
+        .ok_or_else(|| io::Error::other("the interval extends before the start of the calendar"))?;
 
-    let from = from
-        .format(&Rfc3339)
-        .map_err(|error| io::Error::other(format!("начало интервала не форматируется: {error}")))?;
-    let to = to
-        .format(&Rfc3339)
-        .map_err(|error| io::Error::other(format!("конец интервала не форматируется: {error}")))?;
+    let from = from.format(&Rfc3339).map_err(|error| {
+        io::Error::other(format!("the interval start cannot be formatted: {error}"))
+    })?;
+    let to = to.format(&Rfc3339).map_err(|error| {
+        io::Error::other(format!("the interval end cannot be formatted: {error}"))
+    })?;
     Ok((from, to))
 }
 
@@ -176,9 +178,9 @@ async fn fetch_raw(
     .with_bearer(token);
     let response = client.send(&request).await?;
     if !(200..=299).contains(&response.status) {
-        // Тело отказа не попадает ни в файл, ни в ошибку: шлюз не обязан
-        // отделять диагностические данные от данных владельца.
-        return Err(io::Error::other(format!("{method} вернул HTTP {}", response.status)).into());
+        // The refusal body is written neither to a file nor to the error: the
+        // gateway is not required to separate diagnostics from owner data.
+        return Err(io::Error::other(format!("{method} returned HTTP {}", response.status)).into());
     }
     Ok(response.body)
 }
@@ -188,13 +190,13 @@ fn account_id(body: &[u8]) -> Result<String, Box<dyn Error>> {
     let accounts = response
         .get("accounts")
         .and_then(Value::as_array)
-        .ok_or_else(|| io::Error::other("в ответе GetAccounts нет массива счетов"))?;
+        .ok_or_else(|| io::Error::other("GetAccounts response has no account array"))?;
     if accounts.is_empty() {
-        return Err(io::Error::other("GetAccounts вернул пустой список счетов").into());
+        return Err(io::Error::other("GetAccounts returned an empty account list").into());
     }
     if accounts.len() > 1 {
         return Err(io::Error::other(
-            "GetAccounts вернул несколько счетов: команда отказывается выбирать один",
+            "GetAccounts returned several accounts: the command refuses to choose one",
         )
         .into());
     }
@@ -204,7 +206,7 @@ fn account_id(body: &[u8]) -> Result<String, Box<dyn Error>> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| io::Error::other("в ответе GetAccounts нет идентификатора счёта").into())
+        .ok_or_else(|| io::Error::other("GetAccounts response has no account identifier").into())
 }
 
 fn ensure_complete_operations(body: &[u8]) -> Result<(), Box<dyn Error>> {
@@ -213,10 +215,10 @@ fn ensure_complete_operations(body: &[u8]) -> Result<(), Box<dyn Error>> {
         .get("hasNext")
         .or_else(|| response.get("has_next"))
         .and_then(Value::as_bool)
-        .ok_or_else(|| io::Error::other("в ответе операций нет признака пагинации"))?;
+        .ok_or_else(|| io::Error::other("operations response has no pagination flag"))?;
     if has_next {
         return Err(io::Error::other(
-            "GetOperationsByCursor вернул неполную страницу: образец не записан",
+            "GetOperationsByCursor returned an incomplete page: sample not written",
         )
         .into());
     }
@@ -227,6 +229,6 @@ fn write_fixture(dir: &Path, name: &str, body: &[u8]) -> Result<(), Box<dyn Erro
     fs::create_dir_all(dir)?;
     let path = dir.join(name);
     fs::write(&path, body)?;
-    eprintln!("снят ответ: {}", path.display());
+    eprintln!("response captured: {}", path.display());
     Ok(())
 }

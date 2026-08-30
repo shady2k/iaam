@@ -1,7 +1,7 @@
-//! Приёмка синтетического отчёта Финама.
+//! Acceptance test for the Finam synthetic report.
 //!
-//! Ожидаемые числа ниже выписаны вручную из `finam-synthetic.xls`.
-//! Тест намеренно не получает эталон из вывода парсера (§15.5).
+//! The expected numbers below were transcribed manually from `finam-synthetic.xls`.
+//! The test intentionally does not derive the reference from the parser output (§15.5).
 
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::event::provenance::ParserVersion;
@@ -161,10 +161,10 @@ fn finam_fixture_is_recognised_by_contents_and_has_its_own_version() {
     assert!(parser.recognises(&workbook));
     assert_eq!(parser.broker().code(), "finam");
     assert_eq!(parser.format(), ReportFormat::Xls);
-    // Версия поднята до /2 вместе с семантикой разбора: дата расчётов
-    // перестала уезжать в cash_posted, а её отсутствие перестало
-    // подставлять дату сделки (iaam-d8b.22). Отпечаток разобранной
-    // строки от этого меняется, и версия обязана это отражать.
+    // The version was bumped to /2 along with the parsing semantics: the settlement date
+    // stopped being moved to cash_posted, and its absence stopped
+    // substituting the trade date (iaam-d8b.22). The parsed
+    // row's fingerprint changes as a result, and the version must reflect this.
     assert_eq!(parser.version(), ParserVersion("finam-xls/2".to_owned()));
 }
 
@@ -316,14 +316,14 @@ fn finam_report_preserves_rows_operations_period_controls_and_repo_quarantine() 
                 kind,
             } => {
                 assert_eq!(*currency, CurrencyCode::Rub);
-                // Отчёт Финама называет вид словом, и слово доходит
-                // до операции: лист «Выплаты» принимает только купон
-                // и дивиденд, поэтому «не утверждалось» здесь было бы
-                // потерей, а не честностью.
-                assert!(kind.is_some(), "вид дохода потерян отчётом");
+                // The Finam report names the type with a word, and the word reaches
+                // the operation: the «Выплаты» sheet accepts only coupon
+                // and dividend, so saying «not asserted» here would be
+                // a loss, not honesty.
+                assert!(kind.is_some(), "income type lost from report");
                 incomes.push((*actual_instrument, *gross_minor));
             }
-            other => panic!("неожиданный вид операции: {other:?}"),
+            other => panic!("unexpected operation type: {other:?}"),
         }
     }
     assert_eq!((deposits, withdrawals, buys, sells, fees), (1, 1, 1, 1, 1));

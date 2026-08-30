@@ -1,8 +1,8 @@
-//! Парсер XLSX-отчёта Т-Инвестиций (§10.1, §10.3).
+//! Parser for the T-Investments XLSX report (§10.1, §10.3).
 //!
-//! Формат распознаётся по содержимому книги. Операционные листы разбираются
-//! построчно: ошибка одной строки становится `Rejected`, а РЕПО сохраняется
-//! отдельно в карантине (§11).
+//! The format is recognized by the workbook contents. Operational sheets are parsed
+//! row by row: an error in one row becomes `Rejected`, while REPO is stored
+//! separately in quarantine (§11).
 
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::event::provenance::{ParserVersion, RawHash, RowLocator};
@@ -31,7 +31,7 @@ use crate::verdict::Rejection;
 const PARSER_VERSION: &str = "tinkoff-xlsx/1";
 const DOCUMENT_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// Парсер выгрузки брокерского отчёта Т-Инвестиций.
+/// Parser for a T-Investments broker report export.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TinkoffParser;
 
@@ -194,7 +194,7 @@ fn parse_trade_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Locate
                     accrued_interest_minor,
                     currency,
                 },
-                other => return Err(rejection("type", "Покупка или Продажа", other)),
+                other => return Err(rejection("type", "buy or sell", other)),
             };
             Ok(operation(
                 account,
@@ -248,7 +248,7 @@ fn parse_cash_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Located
                     currency,
                 }
             } else {
-                return Err(rejection("type", "Пополнение или Вывод", &operation_text));
+                return Err(rejection("type", "deposit or withdrawal", &operation_text));
             };
             Ok(operation(account, kind, date, None))
         })();
@@ -333,10 +333,10 @@ fn parse_income_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Locat
                     instrument,
                     gross_minor,
                     currency,
-                    // Лист «Купоны и дивиденды» смешивает оба вида
-                    // и не называет вид построчно. `None` — «не
-                    // утверждалось»: угадать по типу бумаги значило бы
-                    // выдать догадку за слова источника (§4.9).
+                    // The «Купоны и дивиденды» sheet mixes both types
+                    // and does not name the type per row. `None` means “not
+                    // asserted”: guessing based on the security type would
+                    // present a guess as the source wording (§4.9).
                     kind: None,
                 },
                 date,
@@ -552,7 +552,7 @@ fn cell_date(cell: &Cell) -> Option<Date> {
 }
 
 fn date_value(cell: &Cell, field: &'static str) -> Result<Date, Rejection> {
-    cell_date(cell).ok_or_else(|| rejection(field, "дата отчёта", &cell_description(cell)))
+    cell_date(cell).ok_or_else(|| rejection(field, "report date", &cell_description(cell)))
 }
 
 fn parse_date_text(value: &str) -> Result<Date, ()> {
@@ -568,7 +568,7 @@ fn currency_value(cell: &Cell) -> Result<CurrencyCode, Rejection> {
         "EUR" | "€" => Ok(CurrencyCode::Eur),
         "CNY" => Ok(CurrencyCode::Cny),
         "XAU" => Ok(CurrencyCode::Xau),
-        value => Err(rejection("currency", "RUB, USD, EUR, CNY или XAU", value)),
+        value => Err(rejection("currency", "RUB, USD, EUR, CNY or XAU", value)),
     }
 }
 
@@ -579,12 +579,8 @@ fn decimal_value(cell: &Cell, field: &'static str) -> Result<Decimal, Rejection>
             .replace(['\u{a0}', ' '], "")
             .replace(',', ".")
             .parse::<Decimal>()
-            .map_err(|_| rejection(field, "десятичное число", value)),
-        _ => Err(rejection(
-            field,
-            "десятичное число",
-            &cell_description(cell),
-        )),
+            .map_err(|_| rejection(field, "decimal number", value)),
+        _ => Err(rejection(field, "decimal number", &cell_description(cell))),
     }
 }
 
@@ -611,7 +607,7 @@ fn quantity_value(cell: &Cell, field: &'static str) -> Result<Dec, Rejection> {
 fn text_value(cell: &Cell) -> Result<&str, Rejection> {
     cell.text()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| rejection("value", "непустой текст", &cell_description(cell)))
+        .ok_or_else(|| rejection("value", "non-empty text", &cell_description(cell)))
 }
 
 fn optional_text(cell: &Cell) -> Option<&str> {
@@ -695,7 +691,7 @@ fn rejection(field: &'static str, expected: &str, actual: &str) -> Rejection {
 
 fn cell_description(cell: &Cell) -> String {
     match cell {
-        Cell::Empty => "пусто".to_owned(),
+        Cell::Empty => "empty".to_owned(),
         Cell::Text(value) | Cell::Error(value) => value.clone(),
         Cell::Number(value) => value.inner().to_string(),
         Cell::Date(value) => value.to_string(),

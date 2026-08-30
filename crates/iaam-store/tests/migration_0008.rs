@@ -1,10 +1,10 @@
-//! Миграция 0008: основание котировки в наблюдении цены.
+//! Migration 0008: quote basis in a price observation.
 
 use iaam_store::SqliteStore;
 use rusqlite::Connection;
 
 fn database_at_version_seven() -> Connection {
-    let conn = Connection::open_in_memory().expect("база в памяти");
+    let conn = Connection::open_in_memory().expect("in-memory database");
     conn.execute_batch(
         "CREATE TABLE instruments (
              id       TEXT PRIMARY KEY,
@@ -13,10 +13,10 @@ fn database_at_version_seven() -> Connection {
              currency TEXT NOT NULL
          ) STRICT;
          INSERT INTO instruments (id, symbol, title, currency)
-         VALUES ('instrument-1', 'SBER', 'Сбербанк', 'RUB');
+         VALUES ('instrument-1', 'SBER', 'Sberbank', 'RUB');
          PRAGMA user_version = 5;",
     )
-    .expect("схема версии 5");
+    .expect("schema version 5");
 
     for (version, sql) in [
         (
@@ -31,7 +31,7 @@ fn database_at_version_seven() -> Connection {
         conn.execute_batch(&format!(
             "BEGIN; {sql} PRAGMA user_version = {version}; COMMIT;"
         ))
-        .expect("применение предыдущей миграции");
+        .expect("applying previous migration");
     }
     conn.execute(
         "INSERT INTO sync_runs
@@ -41,7 +41,7 @@ fn database_at_version_seven() -> Connection {
                  '2026-08-01', '2026-08-01', '2026-08-02T00:00:00Z', 'lease-1')",
         [],
     )
-    .expect("запуск синхронизации");
+    .expect("running synchronization");
     conn.execute(
         "INSERT INTO price_observations
              (instrument_id, board, session, trade_date, kind, source_id,
@@ -51,17 +51,17 @@ fn database_at_version_seven() -> Connection {
                  'hash-1', 'run-1')",
         [],
     )
-    .expect("старое наблюдение цены");
+    .expect("old price observation");
     conn
 }
 
 #[test]
 fn an_existing_observation_migrates_to_an_undecided_basis() {
-    // Подставить старой строке `money_per_unit` значило бы объявить
-    // доказанным то, чего никто не доказывал: облигационных строк
-    // в ней могло и не быть, а могло и быть (§10.4).
+    // Filling the old row's `money_per_unit` would mean declaring
+    // proven something no one proved: there may have been bond rows
+    // in it, or there may not have been (§10.4).
     let conn = database_at_version_seven();
-    iaam_store::schema::migrate(&conn).expect("миграция 0008");
+    iaam_store::schema::migrate(&conn).expect("migration 0008");
 
     let basis: String = conn
         .query_row(
@@ -69,21 +69,21 @@ fn an_existing_observation_migrates_to_an_undecided_basis() {
             [],
             |row| row.get(0),
         )
-        .expect("основание старой строки");
+        .expect("basis of old row");
     assert_eq!(basis, "unknown");
     let version: u32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .expect("версия схемы");
-    // Сверяется с константой, а не с цифрой 8: этот тест про то, что
-    // миграция 0008 делает со старой строкой, а не про то, сколько
-    // миграций в проекте всего. Вшитая цифра краснела бы у каждой
-    // следующей схемы, ничего о ней не проверяя.
+        .expect("schema version");
+    // Compare against the constant, not the digit 8: this test is about what
+    // migration 0008 does to the old row, not how many
+    // migrations there are in the project overall. A hardcoded digit would turn red with every
+    // subsequent schema, without checking anything about it.
     assert_eq!(version, iaam_store::schema::SCHEMA_VERSION);
 }
 
 #[test]
 fn an_unknown_basis_code_is_refused_by_the_table() {
-    let store = SqliteStore::open_in_memory().expect("актуальная схема");
+    let store = SqliteStore::open_in_memory().expect("current schema");
     let refused = store.connection().execute(
         "INSERT INTO price_observations (
              instrument_id, board, session, trade_date, kind, source_id,
@@ -93,17 +93,14 @@ fn an_unknown_basis_code_is_refused_by_the_table() {
                    '100','RUB','percent','x','executable','h','r')",
         [],
     );
-    assert!(
-        refused.is_err(),
-        "неизвестный код основания обязан быть отвергнут"
-    );
+    assert!(refused.is_err(), "an unknown basis code must be rejected");
 }
 
 #[test]
 fn the_append_only_triggers_survive_the_migration() {
-    // Правка таблицы не имеет права снять заслон: пересоздание через
-    // `_new` уносит триггеры вместе со старой таблицей.
-    let store = SqliteStore::open_in_memory().expect("актуальная схема");
+    // Table changes must not be allowed to remove the guard: recreating via
+    // `_new` carries the triggers along with the old table.
+    let store = SqliteStore::open_in_memory().expect("up-to-date schema");
     let count: i64 = store
         .connection()
         .query_row(
@@ -112,6 +109,6 @@ fn the_append_only_triggers_survive_the_migration() {
             [],
             |row| row.get(0),
         )
-        .expect("триггеры наблюдений");
-    assert_eq!(count, 2, "оба триггера append-only обязаны существовать");
+        .expect("observation triggers");
+    assert_eq!(count, 2, "both append-only triggers must exist");
 }

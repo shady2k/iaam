@@ -1,15 +1,15 @@
-//! Архивный бандл (§14).
+//! Archive bundle (§14).
 //!
-//! **Копия файла базы не является полноценным бэкапом**, а экспорт одних
-//! событий — тем более: из него получатся другие проекции, потому что
-//! состав контуров и справочники останутся снаружи. Бандл везёт всё,
-//! что нужно, чтобы повторить расчёт: события, счета, версии контуров
-//! и версию схемы, под которой всё это записано.
+//! **A copy of the database file is not a complete backup**, and exporting only
+//! events is even less so: it would produce different projections because the
+//! set of scopes and reference data would remain outside. The bundle carries everything
+//! needed to repeat the calculation: events, accounts, scope versions,
+//! and the schema version under which all this is recorded.
 //!
-//! Чего в бандле этапа 1 ещё нет и почему: рыночных данных и курсов
-//! (появятся в E3), налогового контекста (E5), правил классификации
-//! (E2). Каждая из этих секций добавится в бандл вместе со своим эпиком,
-//! и версия формата на это и существует.
+//! What is not yet included in the stage 1 bundle, and why: market data and rates
+//! (to be added in E3), tax context (E5), and classification rules
+//! (E2). Each of these sections will be added to the bundle with its own epic,
+//! and that is what the format version is for.
 
 use iaam_core::event::Event;
 use iaam_core::ids::OwnerId;
@@ -22,8 +22,8 @@ use time::format_description::well_known::Rfc3339;
 use crate::events::{find_duplicate, insert_event};
 use crate::{SqliteStore, StoreError};
 
-/// Версия формата бандла. Бандл более новой версии не читается:
-/// молча пропустить неизвестную секцию значит потерять данные.
+/// Bundle format version. A bundle with a newer version is not read:
+/// silently skipping an unknown section would result in data loss.
 pub const BUNDLE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,7 +41,7 @@ pub struct AccountSection {
     pub institution: Option<String>,
 }
 
-/// Бандл целиком.
+/// The complete bundle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bundle {
     pub bundle_version: u32,
@@ -51,13 +51,13 @@ pub struct Bundle {
     pub events: Vec<Event>,
     pub accounts: Vec<AccountSection>,
     pub contours: Vec<ContourSection>,
-    /// Контрольная сумма содержимого. Считается по каноническому
-    /// представлению всех секций, кроме самой суммы.
+    /// Content checksum. Computed from the canonical
+    /// representation of all sections except the checksum itself.
     pub checksum: String,
 }
 
-/// Содержимое бандла без служебных полей. Существует ради контрольной
-/// суммы: считать её нужно по всему, что бандл переносит, и только по нему.
+/// Bundle contents without metadata fields. Exists for the checksum:
+/// it must be computed over everything the bundle carries, and only that.
 #[derive(Debug, Serialize)]
 struct BundleContent<'a> {
     bundle_version: u32,
@@ -69,16 +69,16 @@ struct BundleContent<'a> {
 }
 
 impl Bundle {
-    /// Контрольная сумма содержимого.
+    /// Content checksum.
     ///
-    /// Считается по **канонической сериализации всего содержимого**.
-    /// Первая редакция хешировала только идентификаторы событий и хеши
-    /// сырья — при такой сумме подменённая денежная величина проходила
-    /// проверку, а повреждённый архив выглядел целым. Это ровно тот
-    /// отказ, ради предотвращения которого сумма и существует (§14).
+    /// Computed from the **canonical serialization of all contents**.
+    /// The first revision hashed only event identifiers and hashes
+    /// of the raw data—at such a checksum, a substituted monetary value passed
+    /// validation, and a corrupted archive appeared intact. This is exactly the
+    /// failure the checksum exists to prevent (§14).
     ///
-    /// Дата выгрузки в сумму не входит: она описывает выгрузку,
-    /// а не переносимые факты, и её изменение ничего не портит.
+    /// The export date is not included in the checksum: it describes the export,
+    /// not the facts being transferred, and changing it corrupts nothing.
     #[must_use]
     pub fn compute_checksum(&self) -> String {
         let content = BundleContent {
@@ -91,7 +91,7 @@ impl Bundle {
         };
         let mut body = Vec::new();
         ciborium::into_writer(&content, &mut body)
-            .unwrap_or_else(|error| panic!("бандл не сериализуется: {error}"));
+            .unwrap_or_else(|error| panic!("bundle cannot be serialized: {error}"));
         let digest = Sha256::digest(&body);
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -99,12 +99,12 @@ impl Bundle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportOutcome {
-    /// Сколько событий добавлено и сколько уже было.
+    /// How many events were added and how many already existed.
     Applied { inserted: usize, duplicates: usize },
 }
 
 impl SqliteStore {
-    /// Экспорт бандла.
+    /// Bundle export.
     pub fn export_bundle(&self, owner: OwnerId) -> Result<Bundle, StoreError> {
         let events = self.load_events(owner)?;
         let accounts = self
@@ -170,16 +170,16 @@ impl SqliteStore {
         Ok(bundle)
     }
 
-    /// Импорт бандла.
+    /// Bundle import.
     ///
-    /// Идемпотентен: события с известными ключами не создаются повторно.
-    /// Выполняется **одной транзакцией**: частично импортированный архив
-    /// — это состояние, которого никогда не существовало, и разбираться
-    /// с ним хуже, чем с неудавшимся импортом.
+    /// Idempotent: events with known keys are not created again.
+    /// Runs in **a single transaction**: a partially imported archive
+    /// is a state that never existed, and dealing with it is worse
+    /// than dealing with a failed import.
     ///
-    /// Отклоняется бандл, который: новее поддерживаемого формата; записан
-    /// схемой новее поддерживаемой; не сходится с контрольной суммой;
-    /// содержит события чужого владельца.
+    /// Rejects a bundle that is: newer than the supported format; written
+    /// with a schema newer than supported; inconsistent with the checksum;
+    /// contains events belonging to another owner.
     pub fn import_bundle(&mut self, bundle: &Bundle) -> Result<ImportOutcome, StoreError> {
         if bundle.bundle_version > BUNDLE_VERSION {
             return Err(StoreError::SchemaTooNew {
@@ -195,22 +195,19 @@ impl SqliteStore {
         }
         if bundle.checksum != bundle.compute_checksum() {
             return Err(StoreError::BundleCorrupted {
-                detail: "контрольная сумма не совпадает с содержимым".into(),
+                detail: "checksum does not match contents".into(),
             });
         }
-        // Владелец в бандле один. Событие чужого владельца означает либо
-        // склейку двух архивов, либо подмену: и то и другое сделало бы
-        // границу владельца фикцией (§14).
+        // There is one owner in a bundle. An event belonging to another owner means either
+        // that two archives were joined or that a substitution occurred; either would make
+        // the ownership boundary fictitious (§14).
         if let Some(foreign) = bundle
             .events
             .iter()
             .find(|event| event.owner != bundle.owner)
         {
             return Err(StoreError::BundleCorrupted {
-                detail: format!(
-                    "событие {} принадлежит другому владельцу",
-                    foreign.id.inner()
-                ),
+                detail: format!("event {} belongs to another owner", foreign.id.inner()),
             });
         }
 
@@ -239,8 +236,8 @@ impl SqliteStore {
         }
 
         for contour in &bundle.contours {
-            // Версия контура неизменяема: уже существующая пропускается,
-            // а не переписывается.
+            // The scope version is immutable: an existing one is skipped,
+            // rather than overwritten.
             let known: Option<u32> = transaction
                 .query_row(
                     "SELECT version FROM contour_versions

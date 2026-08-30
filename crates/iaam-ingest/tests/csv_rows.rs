@@ -1,4 +1,4 @@
-//! Построчный разбор CSV: одна непонятая строка не отменяет документ.
+//! Line-by-line CSV parsing: one unrecognized row does not invalidate the document.
 
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::instrument::AliasInterval;
@@ -56,7 +56,7 @@ fn a_good_document_parses_into_operations() {
                 }
             );
         }
-        other => panic!("ожидалась операция, получено {other:?}"),
+        other => panic!("expected operation, got {other:?}"),
     }
 
     match &rows[1] {
@@ -68,13 +68,13 @@ fn a_good_document_parses_into_operations() {
                 ..
             } => {
                 assert_eq!(*parsed, instrument);
-                // 29 050,50 рубля = 2 905 050 копеек; комиссия 35,00 = 3 500.
+                // 29,050.50 rubles = 2,905,050 kopecks; fee 35.00 = 3,500.
                 assert_eq!(*gross_minor, 2_905_050);
                 assert_eq!(*fee_minor, Some(3_500));
             }
-            other => panic!("ожидалась покупка, получено {other:?}"),
+            other => panic!("expected purchase, got {other:?}"),
         },
-        other => panic!("ожидалась операция, получено {other:?}"),
+        other => panic!("expected operation, got {other:?}"),
     }
 }
 
@@ -100,19 +100,16 @@ fn ambiguous_account_name_is_rejected_only_in_referencing_row() {
     let rows = parse(&document, &dir);
 
     let ParsedRow::Rejected(rejection) = &rows[0] else {
-        panic!(
-            "неоднозначное название должно быть отвергнуто: {:?}",
-            rows[0]
-        );
+        panic!("ambiguous name must be rejected: {:?}", rows[0]);
     };
     assert_eq!(rejection.field, "account");
     assert_eq!(
         rejection.actual,
-        "Брокерский: название счёта неоднозначно: 2 счёта"
+        "Брокерский: account name is ambiguous: 2 accounts"
     );
 
     let ParsedRow::Operation(operation) = &rows[1] else {
-        panic!("однозначное название должно разрешаться: {:?}", rows[1]);
+        panic!("unambiguous name must resolve: {:?}", rows[1]);
     };
     assert_eq!(operation.account, unique);
 }
@@ -135,7 +132,7 @@ fn one_bad_row_does_not_cancel_the_document() {
         .iter()
         .map(|row| match row {
             ParsedRow::Rejected(rejection) => rejection.field.as_str(),
-            ParsedRow::Operation(_) => "операция",
+            ParsedRow::Operation(_) => "operation",
         })
         .collect();
     assert_eq!(fields, vec!["date", "account", "type"]);
@@ -143,7 +140,7 @@ fn one_bad_row_does_not_cancel_the_document() {
 
 #[test]
 fn an_amount_more_precise_than_the_currency_is_rejected_not_rounded() {
-    // Округлив входную сумму, система запишет факт, которого не было.
+    // Rounding the input amount would make the system record a fact that never occurred.
     let (dir, _, _) = directory();
     let document = format!("{HEADER}\n2026-01-10,deposit,Брокерский,,,,,100.005,,,RUB,\n");
     let rows = parse(&document, &dir);
@@ -152,16 +149,16 @@ fn an_amount_more_precise_than_the_currency_is_rejected_not_rounded() {
             assert_eq!(rejection.field, "amount");
             assert_eq!(rejection.actual, "100.005");
         }
-        other => panic!("ожидался отказ, получено {other:?}"),
+        other => panic!("rejection expected, got {other:?}"),
     }
 }
 
 #[test]
 fn a_parsed_row_carries_the_date_into_both_the_trade_and_the_cash_date() {
-    // CSV даёт одну дату, а событие несёт шесть семантических (§4.2).
-    // Строка заполняет ту, в которой операция произошла, и ту, в которую
-    // прошли деньги: потерянная дата сделки уводит операцию в другой
-    // налоговый период, потерянная дата денег — из ряда потоков.
+    // The CSV provides one date, while the event carries six semantic dates (§4.2).
+    // The row fills the date on which the operation occurred and the date on which
+    // the money arrived: losing the trade date moves the operation to another
+    // tax period, while losing the money date removes it from the cash-flow series.
     let (dir, _, _) = directory();
     let document = format!(
         "{HEADER}\n\
@@ -169,7 +166,7 @@ fn a_parsed_row_carries_the_date_into_both_the_trade_and_the_cash_date() {
     );
     let rows = parse(&document, &dir);
     let ParsedRow::Operation(operation) = &rows[0] else {
-        panic!("строка обязана разобраться: {:?}", rows[0]);
+        panic!("row must parse: {:?}", rows[0]);
     };
     let expected = time::macros::date!(2026 - 01 - 10);
     assert_eq!(operation.dates.trade, Some(expected));
@@ -178,14 +175,14 @@ fn a_parsed_row_carries_the_date_into_both_the_trade_and_the_cash_date() {
 
 #[test]
 fn an_empty_custody_column_falls_back_to_the_default_and_a_named_one_does_not() {
-    // Пустая ячейка и отсутствующая колонка означают одно: места
-    // хранения не назвали, поэтому берётся значение по умолчанию.
-    // Названное место обязано разрешаться справочником — иначе бумаги
-    // легли бы в депозитарий по умолчанию вопреки написанному в файле.
+    // An empty cell and a missing column mean the same thing: the custody was
+    // not specified, so the default value is used.
+    // A named custody must resolve through the directory; otherwise the securities
+    // would be placed in the default custody contrary to what the file says.
     let (mut dir, _, _) = directory();
     let named = CustodyId::new_random();
     dir.custodies.insert("НРД".into(), vec![named]);
-    let default = dir.default_custody.expect("умолчание задано");
+    let default = dir.default_custody.expect("default is set");
 
     let document = format!(
         "{HEADER}\n\
@@ -199,7 +196,7 @@ fn an_empty_custody_column_falls_back_to_the_default_and_a_named_one_does_not() 
     let custody_of = |row: &ParsedRow| match row {
         ParsedRow::Operation(operation) => match operation.kind {
             OperationKind::Buy { custody, .. } => Some(custody),
-            _ => panic!("ожидалась покупка"),
+            _ => panic!("purchase expected"),
         },
         ParsedRow::Rejected(_) => None,
     };
@@ -208,7 +205,7 @@ fn an_empty_custody_column_falls_back_to_the_default_and_a_named_one_does_not() 
     assert_eq!(
         custody_of(&rows[2]),
         None,
-        "неизвестное имя — отказ, а не молчаливое умолчание"
+        "an unknown name must be rejected, not silently defaulted"
     );
     let ParsedRow::Rejected(rejection) = &rows[2] else {
         unreachable!()

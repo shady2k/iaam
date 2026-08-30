@@ -1,4 +1,4 @@
-//! Доступ к брокеру в хранилище (§14).
+//! Broker access in the store (§14).
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 const SECRET: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
 
-/// Каталог под файловую базу. Файл нужен буквально: проверяется, что
-/// токена нет в байтах на диске, а базу в памяти на диск не посмотришь.
+/// Directory for the file-based database. The file is needed literally: we check that
+/// the token is not present in the bytes on disk, whereas an in-memory database cannot be inspected on disk.
 struct TempDatabase {
     path: PathBuf,
 }
@@ -22,7 +22,7 @@ struct TempDatabase {
 impl TempDatabase {
     fn create(label: &str) -> Self {
         let path = std::env::temp_dir().join(format!("iaam-{label}-{}", Uuid::new_v4()));
-        fs::create_dir_all(&path).expect("каталог под базу");
+        fs::create_dir_all(&path).expect("database directory");
         Self { path }
     }
 
@@ -30,13 +30,13 @@ impl TempDatabase {
         self.path.join("iaam.sqlite3")
     }
 
-    /// Все файлы базы, включая журнал WAL: секрет, не попавший
-    /// в основной файл, но осевший в журнале, утёк ровно так же.
+    /// All database files, including the WAL: a secret that did not make it
+    /// into the main file but settled in the log has leaked in exactly the same way.
     fn bytes(&self) -> Vec<u8> {
         let mut all = Vec::new();
-        for entry in fs::read_dir(&self.path).expect("чтение каталога базы") {
-            let entry = entry.expect("файл базы");
-            all.extend(fs::read(entry.path()).expect("байты файла базы"));
+        for entry in fs::read_dir(&self.path).expect("reading database directory") {
+            let entry = entry.expect("database file");
+            all.extend(fs::read(entry.path()).expect("database file bytes"));
         }
         all
     }
@@ -63,10 +63,10 @@ fn access(owner: OwnerId, broker: &str, environment: Environment, key: &Key) -> 
 
 #[test]
 fn a_leaked_database_file_does_not_leak_the_token() {
-    // §14 буквально: утечка файла базы не должна давать доступа
-    // к брокерскому счёту. Проверяется не «мы позвали шифрование»,
-    // а отсутствие подстроки в байтах на диске — единственная форма
-    // этой проверки, которую нельзя пройти случайно.
+    // §14 literally: leaking the database file must not provide access
+    // to the broker account. We check not that “we called encryption,”
+    // but the absence of the substring in the bytes on disk—the only form
+    // of this check that cannot pass accidentally.
     let directory = TempDatabase::create("leak");
     let key = Key::from_bytes([9; 32]);
     let owner = OwnerId::new_random();
@@ -78,26 +78,26 @@ fn a_leaked_database_file_does_not_leak_the_token() {
     }
 
     let bytes = directory.bytes();
-    // Сначала проверяется, что тест вообще смотрит на записанные
-    // данные: тест, ищущий секрет в пустом файле, проходит всегда.
+    // First, verify that the test is actually looking at the written
+    // data: a test searching for a secret in an empty file always passes.
     assert!(
         bytes
             .windows(ciphertext.len())
             .any(|window| window == ciphertext.as_slice()),
-        "шифротекста нет в файле базы: тест смотрит не туда"
+        "no ciphertext in the database file: the test is looking in the wrong place"
     );
     assert!(
         !bytes
             .windows(SECRET.len())
             .any(|window| window == SECRET.as_bytes()),
-        "токен найден в файле базы"
+        "token found in database file"
     );
 }
 
 #[test]
 fn an_archive_bundle_carries_no_broker_access() {
-    // Переносимый архив с живым доступом к брокерскому счёту — это
-    // способ вынести доступ из системы вместе с архивом.
+    // A portable archive with live access to the broker account is
+    // a way to take access out of the system along with the archive.
     let mut store = SqliteStore::open_in_memory().unwrap();
     let key = Key::from_bytes([8; 32]);
     let owner = OwnerId::new_random();
@@ -112,7 +112,7 @@ fn an_archive_bundle_carries_no_broker_access() {
         !serialised
             .windows(ciphertext.len())
             .any(|window| window == ciphertext.as_slice()),
-        "шифротекст доступа попал в архив"
+        "access ciphertext was included in the archive"
     );
 }
 
@@ -184,8 +184,8 @@ fn a_revoked_access_is_not_found_but_stays_in_history() {
 
 #[test]
 fn a_second_active_access_for_one_broker_is_refused() {
-    // Два действующих доступа в одной среде означают, что неизвестно,
-    // каким из них система ходит к брокеру.
+    // Two active credentials in one environment mean it is unclear
+    // which one the system uses to access the broker.
     let mut store = SqliteStore::open_in_memory().unwrap();
     let key = Key::from_bytes([4; 32]);
     let owner = OwnerId::new_random();
@@ -197,7 +197,7 @@ fn a_second_active_access_for_one_broker_is_refused() {
         store
             .insert_broker_access(&access(owner, "tinkoff", Environment::Prod, &key))
             .is_err(),
-        "второй действующий доступ к тому же брокеру заведён"
+        "a second active credential for the same broker was registered"
     );
 }
 
@@ -223,10 +223,10 @@ fn a_revoked_access_makes_room_for_a_new_one() {
 
 #[test]
 fn the_two_environments_of_one_broker_live_side_by_side() {
-    // Токены у сред разные: боевой песочница не принимает, песочный
-    // не принимает бой. Значит оба доступа обязаны существовать
-    // одновременно, иначе живая проверка и боевой канал исключают
-    // друг друга.
+    // Tokens differ between environments: a production token is not accepted by the sandbox,
+    // and a sandbox token is not accepted in production. Therefore both credentials must exist
+    // simultaneously; otherwise the live check and the production channel rule
+    // each other out.
     let mut store = SqliteStore::open_in_memory().unwrap();
     let key = Key::from_bytes([2; 32]);
     let owner = OwnerId::new_random();
@@ -293,9 +293,9 @@ fn a_mid_rotation_failure_leaves_every_ciphertext_under_the_old_key() {
 
 #[test]
 fn an_access_of_one_environment_is_not_found_in_the_other() {
-    // Иначе живая проверка молча сходила бы в песочницу боевым
-    // токеном — и получила бы отказ, по которому о среде
-    // не догадаться.
+    // Otherwise, the live check could silently access the sandbox with a production
+    // token and receive an error that would not reveal the environment
+    // it was using.
     let mut store = SqliteStore::open_in_memory().unwrap();
     let key = Key::from_bytes([1; 32]);
     let owner = OwnerId::new_random();
@@ -314,8 +314,8 @@ fn an_access_of_one_environment_is_not_found_in_the_other() {
 
 #[test]
 fn a_revoked_access_makes_room_only_in_its_own_environment() {
-    // Отзыв песочного доступа не должен освобождать место боевому:
-    // это разные записи и разные токены.
+    // Revoking the sandbox credential must not free the production slot:
+    // these are different records with different tokens.
     let mut store = SqliteStore::open_in_memory().unwrap();
     let key = Key::from_bytes([10; 32]);
     let owner = OwnerId::new_random();
@@ -332,17 +332,17 @@ fn a_revoked_access_makes_room_only_in_its_own_environment() {
             .find_broker_access(owner, &broker, Environment::Prod.code())
             .unwrap()
             .is_some(),
-        "отзыв песочного доступа задел боевой"
+        "revoking the sandbox credential affected the production one"
     );
     assert!(
         store
             .insert_broker_access(&access(owner, "tinkoff", Environment::Prod, &key))
             .is_err(),
-        "место боевого доступа освободилось от чужого отзыва"
+        "the production slot was freed by an unrelated revocation"
     );
 }
 
-// --- кого считать владельцем, когда его не назвали ---
+// --- who counts as the owner when no owner was specified ---
 
 #[test]
 fn without_a_single_token_there_is_no_owner_to_assume() {
@@ -352,23 +352,23 @@ fn without_a_single_token_there_is_no_owner_to_assume() {
 
 #[test]
 fn one_owner_is_assumed_when_only_one_exists() {
-    // Владелец не печатается при выпуске токена, и знать свой
-    // идентификатор ему неоткуда: единственного нужно уметь узнать.
+    // The owner is not printed when the token is issued, and has no way to know their
+    // identifier: the sole owner must be discoverable.
     let store = SqliteStore::open_in_memory().unwrap();
     let owner = OwnerId::new_random();
-    issue(&store, owner, "ноутбук");
-    issue(&store, owner, "телефон");
+    issue(&store, owner, "laptop");
+    issue(&store, owner, "phone");
 
     assert_eq!(store.sole_token_owner().unwrap(), SoleOwner::Single(owner));
 }
 
 #[test]
 fn several_owners_are_never_guessed_between() {
-    // Выбрать владельца за человека значит завести брокерский доступ
-    // не тому — и обнаружить это по чужим сделкам в портфеле.
+    // Choosing the owner on the user's behalf means registering a broker credential
+    // not the right one — and detect it through someone else's trades in the portfolio.
     let store = SqliteStore::open_in_memory().unwrap();
-    issue(&store, OwnerId::new_random(), "первый");
-    issue(&store, OwnerId::new_random(), "второй");
+    issue(&store, OwnerId::new_random(), "first");
+    issue(&store, OwnerId::new_random(), "second");
 
     assert_eq!(store.sole_token_owner().unwrap(), SoleOwner::Several);
 }
@@ -383,7 +383,7 @@ fn issue(store: &SqliteStore, owner: OwnerId, label: &str) {
                 scope: iaam_store::tokens::TokenScope::Owner,
                 revoked: false,
             },
-            &format!("хеш-{label}-{}", owner.inner()),
+            &format!("hash-{label}-{}", owner.inner()),
         )
         .unwrap();
 }

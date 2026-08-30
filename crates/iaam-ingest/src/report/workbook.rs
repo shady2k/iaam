@@ -1,12 +1,12 @@
-//! Книга отчёта: листы и ячейки.
+//! Report workbook: sheets and cells.
 //!
-//! Тип собственный, а не заимствованный у `calamine`: парсеры и тесты
-//! не зависят от API библиотеки чтения, книгу можно собрать в памяти
-//! без файла, а замена библиотеки не трогает ни один парсер.
+//! This type is self-owned rather than borrowed from `calamine`: parsers and tests
+//! do not depend on the reader library's API, the workbook can be built in memory
+//! without a file, and replacing the library does not affect any parser.
 //!
-//! **Здесь проходит граница ввода-вывода.** XLSX хранит числа двоичной
-//! плавающей точкой, а даты — числами со стилем даты. Разбор этого
-//! живёт в одном месте, чтобы доменные величины `f64` не видели.
+//! **This is the I/O boundary.** XLSX stores numbers as binary floating-point
+//! values, and dates as numbers with a date style. Parsing this
+//! belongs in one place so domain values of type `f64` never see it.
 
 use std::io::Cursor;
 
@@ -18,20 +18,20 @@ use thiserror::Error;
 use time::Date;
 use time::macros::date;
 
-/// Эпоха дат Excel. Тридцатое декабря 1899 года, а не тридцать первое:
-/// Excel считает 1900 год високосным, и эпоха сдвинута на день, чтобы
-/// его ошибка компенсировалась.
+/// Excel date epoch. December 30, 1899, not December 31:
+/// Excel treats 1900 as a leap year, shifting the epoch by one day so that
+/// its error is compensated for.
 const EXCEL_EPOCH: Date = date!(1899 - 12 - 30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorkbookError {
-    #[error("книга не читается: {detail}")]
+    #[error("workbook cannot be read: {detail}")]
     Unreadable { detail: String },
-    #[error("лист {sheet} не читается: {detail}")]
+    #[error("sheet {sheet} cannot be read: {detail}")]
     UnreadableSheet { sheet: String, detail: String },
 }
 
-/// Ячейка книги.
+/// Workbook cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cell {
     Empty,
@@ -39,10 +39,10 @@ pub enum Cell {
     Number(Dec),
     Date(Date),
     Bool(bool),
-    /// Ячейка с ошибкой вычисления (`#DIV/0!` и подобные).
+    /// A cell with a calculation error (`#DIV/0!` and similar).
     ///
-    /// Отдельно от текста намеренно: `#Н/Д`, попавшее в текстовую
-    /// ячейку, парсер принял бы за подпись.
+    /// Kept separate from text intentionally: `#Н/Д` in a text
+    /// cell would be mistaken for a label by the parser.
     Error(String),
 }
 
@@ -77,7 +77,7 @@ impl Cell {
     }
 }
 
-/// Лист книги.
+/// Workbook sheet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sheet {
     pub name: String,
@@ -85,10 +85,10 @@ pub struct Sheet {
 }
 
 impl Sheet {
-    /// Ячейка по нулевым индексам строки и колонки.
+    /// Cell at zero-based row and column indices.
     ///
-    /// За краем листа — пусто, а не отказ: отчёты приходят с рваными
-    /// строками, и обращение к отсутствующей ячейке в них нормально.
+    /// Beyond the sheet edge, it is empty rather than an error: reports arrive with ragged
+    /// rows, and accessing a missing cell in them is normal.
     #[must_use]
     pub fn cell(&self, row: usize, column: usize) -> &Cell {
         self.rows
@@ -97,8 +97,8 @@ impl Sheet {
             .unwrap_or(&Cell::Empty)
     }
 
-    /// Есть ли в листе текстовая ячейка, содержащая подстроку.
-    /// Регистр не важен: заголовки в отчётах пишут как придётся.
+    /// Does the sheet contain a text cell containing the substring.
+    /// Case does not matter: report headers are written however people happen to write them.
     #[must_use]
     pub fn contains_text(&self, needle: &str) -> bool {
         let needle = needle.to_lowercase();
@@ -109,21 +109,21 @@ impl Sheet {
     }
 }
 
-/// Открытая книга.
+/// Open workbook.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workbook {
     sheets: Vec<Sheet>,
 }
 
 impl Workbook {
-    /// Книга из готовых листов. Нужна тестам и парсерам, собирающим
-    /// книгу иначе: опознание проверяется без двоичных фикстур.
+    /// A workbook from ready-made sheets. Needed by tests and parsers assembling
+    /// the workbook differently: recognition is checked without binary fixtures.
     #[must_use]
     pub const fn of(sheets: Vec<Sheet>) -> Self {
         Self { sheets }
     }
 
-    /// Чтение книги из байтов. Формат определяется содержимым.
+    /// Reading a workbook from bytes. The format is determined by the contents.
     pub fn open(bytes: &[u8]) -> Result<Self, WorkbookError> {
         let mut book =
             calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec())).map_err(|error| {
@@ -170,10 +170,10 @@ impl Workbook {
     }
 }
 
-/// Перевод ячейки библиотеки в ячейку книги.
+/// Conversion of a library cell to a workbook cell.
 ///
-/// Исчерпывающий `match`: новый вид данных библиотеки обязан сломать
-/// сборку здесь, а не молча стать пустой ячейкой.
+/// Exhaustive `match`: a new library data kind must break
+/// the build here, rather than silently become an empty cell.
 fn convert(data: &Data) -> Cell {
     match data {
         Data::Empty => Cell::Empty,
@@ -182,19 +182,19 @@ fn convert(data: &Data) -> Cell {
         Data::Int(value) => Cell::Number(Dec::new(Decimal::from(*value))),
         Data::Bool(value) => Cell::Bool(*value),
         Data::DateTime(value) => excel_serial(value.as_f64()),
-        // Строка даты и длительность приходят уже текстом: разбирать их
-        // здесь нечем — формат задаёт отчёт, а не книга.
+        // The date row and duration arrive already as text: there is nothing to parse
+        // here—the report, not the workbook, defines the format.
         Data::DateTimeIso(value) | Data::DurationIso(value) => Cell::Text(value.clone()),
         Data::Error(error) => Cell::Error(format!("{error:?}")),
     }
 }
 
-/// Двоичная плавающая точка в десятичную.
+/// Binary floating point to decimal.
 ///
-/// Через кратчайшее обратимое строковое представление: `1234.56`
-/// в книге обязано стать `1234.56`, а не `1234.5599999999999`.
-/// Число, которого десятичный тип не представляет, остаётся текстом —
-/// не нулём и не потерянной ячейкой (§4.9).
+/// Via the shortest reversible string representation: `1234.56`
+/// in the workbook must become `1234.56`, not `1234.5599999999999`.
+/// A number that the decimal type cannot represent remains text—
+/// not zero or a lost cell (§4.9).
 fn decimal(value: f64) -> Cell {
     let rendered = format!("{value}");
     rendered
@@ -204,14 +204,14 @@ fn decimal(value: f64) -> Cell {
         })
 }
 
-/// Число со стилем даты в дату.
+/// A number with a date style to a date.
 ///
-/// Дробная часть отбрасывается: время суток в брокерском отчёте не
-/// является датой операции, а датой операции является день.
+/// The fractional part is discarded: the time of day in the broker report
+/// is not the operation date; the operation date is the day.
 fn excel_serial(serial: f64) -> Cell {
-    // Перевод идёт через десятичный тип, а не приведением `as`:
-    // приведение вне диапазона молча даёт край типа, и дата уехала бы
-    // на столетия без единого признака ошибки.
+    // Conversion goes through the decimal type, not an `as` cast:
+    // conversion outside the range silently produces the type limit, and the date would shift by centuries without any indication of an error.
+    //
     let Some(days) = Decimal::from_f64_retain(serial)
         .map(|days| days.trunc())
         .and_then(|days| days.to_i64())

@@ -4675,6 +4675,7 @@ mod tests {
                 repayment_date: date!(2026 - 12 - 02),
                 share_percent: dec("100"),
             }],
+            initial_principal: None,
             offer_windows: vec![crate::bond::OfferWindowTerms {
                 window: crate::bond::OfferWindowId::new_random(),
                 right: crate::bond::OfferRight::HolderPut,
@@ -5006,6 +5007,7 @@ mod tests {
                 repayment_date: repayment,
                 share_percent: dec("100"),
             }],
+            initial_principal: None,
             offer_windows: offers
                 .iter()
                 .map(|execution_date| crate::bond::OfferWindowTerms {

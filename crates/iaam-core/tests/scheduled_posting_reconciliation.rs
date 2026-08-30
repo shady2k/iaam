@@ -267,6 +267,7 @@ fn график(купоны: &[Date], возвраты: &[(Date, &str)]) -> Bon
                 share_percent: dec(доля),
             })
             .collect(),
+        initial_principal: None,
         offer_windows: Vec::new(),
         completeness: ScheduleCompleteness::Validated,
         default_flags: Some(DefaultFlags {

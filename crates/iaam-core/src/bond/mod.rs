@@ -16,9 +16,11 @@ use crate::numeric::decimal::Dec;
 pub mod finality;
 pub mod offer;
 pub mod posting;
+pub mod principal;
 pub use offer::{
     OfferRight, OfferWindowError, OfferWindowId, OfferWindowTerms, ScheduleCompleteness,
 };
+pub use principal::{RemainingPrincipalError, remaining_principal};
 
 /// Объявленный дефолт по выпуску.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +74,17 @@ pub struct PrincipalReturn {
 pub struct BondSchedule {
     pub periods: Vec<AccrualPeriod>,
     pub principal_returns: Vec<PrincipalReturn>,
+    /// Первоначальный номинал на одну бумагу.
+    ///
+    /// `None` — источник не сообщил либо бумага не долговая. Ноль
+    /// подставлять запрещено (§4.9): «номинал ноль» и «номинал
+    /// неизвестен» требуют от владельца разных действий.
+    ///
+    /// Текущий номинал здесь отсутствует намеренно: остаток выводится
+    /// из первоначального и ряда возвратов, и второй источник истины
+    /// разошёлся бы с первым молча.
+    #[serde(default)]
+    pub initial_principal: Option<PerUnitAmount>,
     #[serde(default)]
     pub offer_windows: Vec<offer::OfferWindowTerms>,
     #[serde(default)]
@@ -122,6 +135,7 @@ mod tests {
         let schedule = BondSchedule {
             periods: Vec::new(),
             principal_returns: Vec::new(),
+            initial_principal: None,
             offer_windows: vec![offer::OfferWindowTerms {
                 window,
                 right: offer::OfferRight::HolderPut,

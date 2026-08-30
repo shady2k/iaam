@@ -266,6 +266,7 @@ async fn market_price_candidates(
                     principal_returns: crate::market_candidate::principal_returns_from_snapshot(
                         &snapshot,
                     )?,
+                    initial_principal: None,
                     offer_windows: crate::market_candidate::offer_windows_from_snapshot(
                         &snapshot,
                         instrument,

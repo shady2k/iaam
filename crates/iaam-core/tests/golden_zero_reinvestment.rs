@@ -136,6 +136,7 @@ fn schedule_from_fixture(raw: &str, instrument: InstrumentId) -> BondSchedule {
     BondSchedule {
         periods,
         principal_returns,
+        initial_principal: None,
         offer_windows,
         completeness: ScheduleCompleteness::Validated,
         default_flags: Some(DefaultFlags {

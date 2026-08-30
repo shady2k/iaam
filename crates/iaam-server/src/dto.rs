@@ -2907,7 +2907,7 @@ mod tests {
     /// пара назвала бы противоречивую запись доказанной — то есть ровно
     /// то, что витрина обязана различать.
     #[test]
-    fn отображение_доменного_статуса_в_dto_не_путает_ветви() {
+    fn domain_status_to_dto_does_not_confuse_branches() {
         use iaam_app::scenarios::market_reference::QuotationBasisStatus;
 
         assert_eq!(
@@ -2925,7 +2925,7 @@ mod tests {
     }
 
     #[test]
-    fn каждый_статус_основания_называет_себя_в_api() {
+    fn each_basis_status_names_itself_in_api() {
         use std::collections::HashSet;
 
         let values = [

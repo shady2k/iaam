@@ -1393,7 +1393,7 @@ mod tests {
         book
     }
 
-    fn лот_с_датой(instrument: InstrumentId, acquired: Option<Date>) -> Lot {
+    fn lot_with_acquired_date(instrument: InstrumentId, acquired: Option<Date>) -> Lot {
         Lot {
             id: LotId::new_random(),
             instrument,
@@ -1407,17 +1407,17 @@ mod tests {
     }
 
     #[test]
-    fn граница_владения_берёт_самую_раннюю_дату_приобретения() {
+    fn ownership_boundary_uses_earliest_acquisition_date() {
         // Партии кладутся `push_lot`, а не присваиванием: история
         // приобретений пополняется только через него, и тест, минующий
         // его, проверял бы фикстуру, а не книгу лотов.
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
-        entry.push_lot(лот_с_датой(
+        entry.push_lot(lot_with_acquired_date(
             instrument,
             Some(date!(2025 - 07 - 01)),
         ));
-        entry.push_lot(лот_с_датой(
+        entry.push_lot(lot_with_acquired_date(
             instrument,
             Some(date!(2024 - 03 - 01)),
         ));
@@ -1429,20 +1429,20 @@ mod tests {
     }
 
     #[test]
-    fn партия_без_даты_приобретения_не_даёт_провести_границу_владения() {
+    fn lot_without_acquisition_date_cannot_establish_ownership_boundary() {
         let instrument = InstrumentId::new_random();
         let mut entry = InstrumentLots::default();
-        entry.push_lot(лот_с_датой(
+        entry.push_lot(lot_with_acquired_date(
             instrument,
             Some(date!(2024 - 03 - 01)),
         ));
-        entry.push_lot(лот_с_датой(instrument, None));
+        entry.push_lot(lot_with_acquired_date(instrument, None));
 
         assert_eq!(entry.earliest_acquired(), None);
     }
 
     #[test]
-    fn восстановленное_количество_не_даёт_провести_границу_владения() {
+    fn restored_quantity_cannot_establish_ownership_boundary() {
         // Оно приобретено раньше всего, что система видела, и даты у
         // него нет: любая граница по оставшимся партиям была бы позже
         // настоящей и скрыла бы пропуск.
@@ -1451,7 +1451,7 @@ mod tests {
             unpriced: qty(5),
             ..Default::default()
         };
-        entry.push_lot(лот_с_датой(
+        entry.push_lot(lot_with_acquired_date(
             instrument,
             Some(date!(2024 - 03 - 01)),
         ));
@@ -1460,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn граница_владения_не_поднимается_после_выбытия_ранней_партии() {
+    fn ownership_boundary_does_not_rise_after_early_lot_disposal() {
         // Купили в январе, купили в апреле, продали январскую партию.
         // Граница обязана остаться январской: бумага в марте была
         // на руках, и пропущенный за март купон надо назвать.
@@ -1468,27 +1468,27 @@ mod tests {
         let mut book = LotBook::new(LotRuleVersion(1));
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let январь = Trade {
+        let january = Trade {
             account,
             instrument,
             day: date!(2026 - 01 - 10),
             units: 10,
             gross: 100_000,
         };
-        let апрель = Trade {
+        let april = Trade {
             day: date!(2026 - 04 - 10),
-            ..январь
+            ..january
         };
-        let продажа = Trade {
+        let sale = Trade {
             day: date!(2026 - 07 - 10),
             gross: 120_000,
-            ..январь
+            ..january
         };
-        book.apply(&dated_buy(&январь, 1), &rules).unwrap();
-        book.apply(&dated_buy(&апрель, 2), &rules).unwrap();
-        book.apply(&sell(&продажа, 3), &rules).unwrap();
+        book.apply(&dated_buy(&january, 1), &rules).unwrap();
+        book.apply(&dated_buy(&april, 2), &rules).unwrap();
+        book.apply(&sell(&sale, 3), &rules).unwrap();
 
-        let entry = book.entry(&key(&январь)).unwrap();
+        let entry = book.entry(&key(&january)).unwrap();
         assert_eq!(
             entry.lots().len(),
             1,
@@ -1501,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn выбытие_партии_без_даты_не_делает_границу_владения_известной() {
+    fn disposing_lot_without_date_does_not_make_ownership_boundary_known() {
         // Партия без даты приобретена неизвестно когда, и продажа
         // этого не проясняет. Признать границу апрельской значило бы
         // объявить известным то, чего журнал не говорит (§4.9).
@@ -1509,27 +1509,27 @@ mod tests {
         let mut book = LotBook::new(LotRuleVersion(1));
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let без_даты = Trade {
+        let without_date = Trade {
             account,
             instrument,
             day: date!(2026 - 01 - 10),
             units: 10,
             gross: 100_000,
         };
-        let апрель = Trade {
+        let april = Trade {
             day: date!(2026 - 04 - 10),
-            ..без_даты
+            ..without_date
         };
-        let продажа = Trade {
+        let sale = Trade {
             day: date!(2026 - 07 - 10),
             gross: 120_000,
-            ..без_даты
+            ..without_date
         };
-        book.apply(&buy(&без_даты, 1), &rules).unwrap();
-        book.apply(&dated_buy(&апрель, 2), &rules).unwrap();
-        book.apply(&sell(&продажа, 3), &rules).unwrap();
+        book.apply(&buy(&without_date, 1), &rules).unwrap();
+        book.apply(&dated_buy(&april, 2), &rules).unwrap();
+        book.apply(&sell(&sale, 3), &rules).unwrap();
 
-        let entry = book.entry(&key(&без_даты)).unwrap();
+        let entry = book.entry(&key(&without_date)).unwrap();
         assert_eq!(entry.lots().len(), 1);
         assert_eq!(entry.earliest_acquired(), None);
     }

@@ -281,7 +281,7 @@ fn the_client_key_catches_a_resubmission_without_a_document() {
 }
 
 #[test]
-fn повторный_источник_побеждает_локатор_и_становится_дубликатом() {
+fn repeated_source_wins_locator_and_becomes_duplicate() {
     let account = AccountId::new_random();
     let document = hash("1");
     let mut first = deposit(account, 100_000);
@@ -303,7 +303,7 @@ fn повторный_источник_побеждает_локатор_и_ст
 }
 
 #[test]
-fn разные_идентификаторы_источника_не_сливаются() {
+fn different_source_identifiers_do_not_merge() {
     let account = AccountId::new_random();
     let mut first = deposit(account, 100_000);
     first.source_operation_id = Some("OP-1".to_owned());
@@ -321,7 +321,7 @@ fn разные_идентификаторы_источника_не_слива�
 }
 
 #[test]
-fn тот_же_документ_и_отпечаток_становятся_дубликатом() {
+fn same_document_and_fingerprint_become_duplicate() {
     let account = AccountId::new_random();
     let document = hash("2");
     let context = DocumentContext {
@@ -347,7 +347,7 @@ fn тот_же_документ_и_отпечаток_становятся_ду�
 }
 
 #[test]
-fn тот_же_документ_с_другим_отпечатком_проходит_в_журнал() {
+fn same_document_with_different_fingerprint_enters_journal() {
     let account = AccountId::new_random();
     let document = hash("3");
     let context = DocumentContext {
@@ -366,7 +366,7 @@ fn тот_же_документ_с_другим_отпечатком_прохо�
 }
 
 #[test]
-fn другой_документ_с_тем_же_отпечатком_остаётся_подсказкой() {
+fn different_document_with_same_fingerprint_remains_a_hint() {
     let account = AccountId::new_random();
     let known_context = DocumentContext {
         document: Some(hash("4")),
@@ -398,7 +398,7 @@ fn другой_документ_с_тем_же_отпечатком_остаё�
 }
 
 #[test]
-fn подсказка_владельцу_содержит_пятый_уровень() {
+fn owner_hint_contains_fifth_level() {
     let account = AccountId::new_random();
     let known_context = from_row(&hash("6"), 7);
     let incoming_context = from_row(&hash("7"), 8);

@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(provenance.price_max_age, 30);
     }
     #[test]
-    fn известное_время_отчёта_побеждает_неизвестное_в_любом_порядке() {
+    fn known_report_time_beats_unknown_in_any_order() {
         let query = query(date!(2026 - 08 - 10));
         let known_at = datetime!(2026 - 08 - 10 11:00 UTC);
         let known = candidate_from_origin(
@@ -839,7 +839,7 @@ mod tests {
         }
     }
     #[test]
-    fn рыночное_время_побеждает_журнальное_безвременное_в_любом_порядке() {
+    fn market_time_beats_timeless_journal_time_in_any_order() {
         let query = query(date!(2026 - 08 - 10));
         let mut journal = candidate_from_origin(
             query.instrument,
@@ -871,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn журнальные_кандидаты_без_времени_детерминированы_и_не_зависят_от_координаты() {
+    fn timeless_journal_candidates_are_deterministic_and_coordinate_independent() {
         let instrument = instrument();
         let mut first = candidate(instrument, date!(2026 - 08 - 10));
         first.observed_at = None;

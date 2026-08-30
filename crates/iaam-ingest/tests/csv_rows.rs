@@ -79,7 +79,7 @@ fn a_good_document_parses_into_operations() {
 }
 
 #[test]
-fn неоднозначное_название_счёта_отвергается_только_в_ссылающейся_строке() {
+fn ambiguous_account_name_is_rejected_only_in_referencing_row() {
     let (mut dir, _, _) = directory();
     let duplicate = AccountId::new_random();
     let unique = AccountId::new_random();

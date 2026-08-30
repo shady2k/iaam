@@ -1788,7 +1788,7 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
 }
 
 #[tokio::test]
-async fn неоднозначное_название_счёта_отвергается_при_разрешении_строки() {
+async fn ambiguous_account_name_is_rejected_when_resolving_row() {
     let (harness, path) = harness_on_disk();
     {
         let store = SqliteStore::open(&path).expect("второе соединение");

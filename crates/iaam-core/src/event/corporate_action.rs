@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn дата_фиксации_реестра_остаётся_доступной_для_проверки_права() {
+    fn record_date_remains_available_for_entitlement_check() {
         let action = sample_conversion();
         let record_date = action
             .record_date()

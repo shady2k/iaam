@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(as_shares[0].price, as_bonds[0].price, "цена не меняется");
     }
     #[test]
-    fn совпадающее_известное_основание_доказано() {
+    fn matching_known_basis_is_proven() {
         let (basis, contradicts) = reconcile_quotation_basis(
             QuotationBasis::PercentOfRemainingFace,
             "iss:engines/stock/markets/bonds",
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn известное_противоречащее_основание_становится_unknown() {
+    fn known_contradictory_basis_becomes_unknown() {
         let (basis, contradicts) = reconcile_quotation_basis(
             QuotationBasis::MoneyPerUnit,
             "iss:engines/stock/markets/bonds",
@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn недоказанное_unknown_основание_проходит() {
+    fn unproven_unknown_basis_is_accepted() {
         for evidence in ["", "test:market", "iss:engines/stock/markets/futures"] {
             let (basis, contradicts) = reconcile_quotation_basis(QuotationBasis::Unknown, evidence);
             assert_eq!(basis, QuotationBasis::Unknown, "признак: {evidence}");
@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn известное_основание_без_доказательства_гасится() {
+    fn known_basis_without_evidence_is_cleared() {
         for evidence in ["", "test:market", "iss:engines/stock/markets/futures"] {
             let (basis, contradicts) =
                 reconcile_quotation_basis(QuotationBasis::MoneyPerUnit, evidence);
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn обратный_разбор_возвращает_основание_для_известной_пары() {
+    fn reverse_parsing_returns_basis_for_known_pair() {
         for (engine, market) in [("stock", "bonds"), ("stock", "shares")] {
             let segment = MarketSegment { engine, market };
             let (basis, evidence) = segment.quotation_basis();
@@ -514,7 +514,7 @@ mod tests {
         }
     }
     #[test]
-    fn обратный_разбор_отвергает_пустой_engine() {
+    fn reverse_parsing_rejects_empty_engine() {
         assert_eq!(
             quotation_basis_from_evidence("iss:engines//markets/shares"),
             None
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn обратный_разбор_отвергает_пустой_market() {
+    fn reverse_parsing_rejects_empty_market() {
         assert_eq!(
             quotation_basis_from_evidence("iss:engines/stock/markets/"),
             None
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn обратный_разбор_отвергает_slash_в_engine() {
+    fn reverse_parsing_rejects_slash_in_engine() {
         assert_eq!(
             quotation_basis_from_evidence("iss:engines/stock/extra/markets/shares"),
             None
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn обратный_разбор_отвергает_slash_в_market() {
+    fn reverse_parsing_rejects_slash_in_market() {
         assert_eq!(
             quotation_basis_from_evidence("iss:engines/stock/markets/shares/extra"),
             None
@@ -546,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn неизвестный_сегмент_отличается_от_неполного_признака() {
+    fn unknown_segment_differs_from_incomplete_evidence() {
         assert_eq!(
             quotation_basis_from_evidence("iss:engines/other/markets/futures"),
             Some(QuotationBasis::Unknown)

@@ -2633,7 +2633,7 @@ mod tests {
         (returns_report(&state, &request), instrument)
     }
     #[test]
-    fn legacy_оценка_входит_в_terminal_value_как_деньги_за_единицу() {
+    fn legacy_valuation_enters_terminal_value_as_money_per_unit() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -2670,7 +2670,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_оценка_без_raw_price_становится_непокрытой_с_missing_price() {
+    fn legacy_valuation_without_raw_price_becomes_uncovered_with_missing_price() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -2699,7 +2699,7 @@ mod tests {
     }
 
     #[test]
-    fn непокрытая_позиция_отображает_все_причины_в_not_computable() {
+    fn uncovered_position_reports_all_reasons_in_not_computable() {
         let account = AccountId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
         let fx = FxTable::new(FxSource::OwnerSupplied);
@@ -2750,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn uncovered_reason_code_имеет_коды_для_всех_ветвей() {
+    fn uncovered_reason_code_has_codes_for_all_branches() {
         let instrument = InstrumentId::new_random();
         assert_eq!(
             uncovered_reason_code(&UncoveredReason::NoObservation),
@@ -2774,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_uncovered_reason_отображает_все_четыре_варианта() {
+    fn policy_uncovered_reason_displays_all_four_variants() {
         assert_eq!(
             policy_uncovered_reason(PolicyUncoveredReason::NoObservation),
             UncoveredReason::NoObservation
@@ -2794,7 +2794,7 @@ mod tests {
     }
 
     #[test]
-    fn биржевая_оценка_без_журнальной_оценки_входит_в_стоимость_контура() {
+    fn exchange_valuation_without_journal_valuation_enters_contour_value() {
         let (report, instrument) = report_with_market_basis(QuotationBasis::MoneyPerUnit);
 
         assert_eq!(report.terminal_value, Computed::Value(dec("985")));
@@ -2809,7 +2809,7 @@ mod tests {
         );
     }
     #[test]
-    fn неизвестное_основание_делает_позицию_непокрытой_с_причиной_пересчёта() {
+    fn unknown_basis_makes_position_uncovered_with_recalculation_reason() {
         let (report, instrument) = report_with_market_basis(QuotationBasis::Unknown);
         let coverage = &report.data_quality.position_coverage;
 
@@ -2851,7 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn противоречие_основания_имеет_отдельную_причину_позиции() {
+    fn basis_contradiction_has_separate_position_reason() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -2883,7 +2883,7 @@ mod tests {
     }
 
     #[test]
-    fn покрытие_считает_каждую_позицию_ровно_один_раз() {
+    fn coverage_counts_each_position_exactly_once() {
         let (report, _) = report_with_market_basis(QuotationBasis::MoneyPerUnit);
         let coverage = &report.data_quality.position_coverage;
 
@@ -3010,7 +3010,7 @@ mod tests {
     }
 
     #[test]
-    fn процентная_котировка_входит_в_nav_через_остаточный_номинал() {
+    fn percentage_quote_enters_nav_through_remaining_principal() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -4135,7 +4135,7 @@ mod tests {
         ));
     }
 
-    fn покупка_с_известной_стоимостью(
+    fn purchase_with_known_cost(
         account: AccountId,
         instrument: InstrumentId,
         day: Date,
@@ -4164,7 +4164,7 @@ mod tests {
         event
     }
 
-    fn отчёт_процентной_цены_по_покупкам(
+    fn percentage_price_report_from_purchases(
         lot_count: usize,
         schedule: Option<BondSchedule>,
     ) -> ReturnsReport {
@@ -4173,7 +4173,7 @@ mod tests {
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
         let events: Vec<_> = (0..lot_count)
             .map(|index| {
-                покупка_с_известной_стоимостью(
+                purchase_with_known_cost(
                     account,
                     instrument,
                     date!(2026 - 08 - 01) + time::Duration::days(index as i64),
@@ -4192,7 +4192,7 @@ mod tests {
             .snapshot()
             .state()
             .clone();
-        let mut candidate = рыночная_цена(instrument, date!(2026 - 08 - 25));
+        let mut candidate = market_price(instrument, date!(2026 - 08 - 25));
         candidate.price = dec("98.5");
         candidate.basis = QuotationBasis::PercentOfRemainingFace;
         let bond_schedules = schedule
@@ -4221,11 +4221,9 @@ mod tests {
     fn a_percent_quote_uses_the_issue_remainder_for_every_lot() {
         // Остаток принадлежит выпуску: две партии, купленные в разные
         // дни, оцениваются по одному и тому же непогашенному номиналу.
-        let mut schedule =
-            график_купонов(&[date!(2026 - 06 - 01)], date!(2026 - 08 - 15));
+        let mut schedule = coupon_schedule(&[date!(2026 - 06 - 01)], date!(2026 - 08 - 15));
         schedule.principal_returns[0].share_percent = dec("30");
-        let report =
-            отчёт_процентной_цены_по_покупкам(2, Some(schedule));
+        let report = percentage_price_report_from_purchases(2, Some(schedule));
 
         // 20 бумаг × 700 остатка × 98.5% = 13_790.
         assert_eq!(report.terminal_value, Computed::Value(dec("13790")));
@@ -4240,23 +4238,13 @@ mod tests {
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
         let custody = CustodyId::new_random();
-        let mut priced = покупка_с_известной_стоимостью(
-            account,
-            instrument,
-            date!(2026 - 08 - 01),
-            1,
-        );
+        let mut priced = purchase_with_known_cost(account, instrument, date!(2026 - 08 - 01), 1);
         for leg in &mut priced.legs {
             if leg.quantity.is_some() {
                 leg.custody = Some(custody);
             }
         }
-        let mut unpriced = покупка_с_известной_стоимостью(
-            account,
-            instrument,
-            date!(2026 - 08 - 02),
-            2,
-        );
+        let mut unpriced = purchase_with_known_cost(account, instrument, date!(2026 - 08 - 02), 2);
         for leg in &mut unpriced.legs {
             if leg.quantity.is_some() {
                 leg.custody = Some(custody);
@@ -4278,8 +4266,8 @@ mod tests {
             .snapshot()
             .state()
             .clone();
-        let schedule = график_купонов(&[date!(2026 - 09 - 01)], date!(2027 - 08 - 15));
-        let candidate = рыночная_цена(instrument, date!(2026 - 08 - 25));
+        let schedule = coupon_schedule(&[date!(2026 - 09 - 01)], date!(2027 - 08 - 15));
+        let candidate = market_price(instrument, date!(2026 - 08 - 25));
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let ledger = ReconciliationLedger::default();
         let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
@@ -4308,7 +4296,7 @@ mod tests {
 
     #[test]
     fn a_percent_quote_without_a_schedule_is_not_computable_with_a_named_reason() {
-        let report = отчёт_процентной_цены_по_покупкам(1, None);
+        let report = percentage_price_report_from_purchases(1, None);
 
         assert!(matches!(
             report.terminal_value,
@@ -4317,10 +4305,7 @@ mod tests {
             }
         ));
     }
-    fn состояние_из_события(
-        contour: &ContourDefinition,
-        event: &crate::event::Event,
-    ) -> LedgerState {
+    fn state_from_event(contour: &ContourDefinition, event: &crate::event::Event) -> LedgerState {
         let rules = RuleRegistry::with_defaults();
         let context = ProjectionContext {
             contour,
@@ -4334,7 +4319,7 @@ mod tests {
             .clone()
     }
 
-    fn хеш_отчёта(state: &LedgerState, contour: &ContourDefinition) -> String {
+    fn report_hash(state: &LedgerState, contour: &ContourDefinition) -> String {
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let ledger = ReconciliationLedger::default();
         let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
@@ -4342,7 +4327,7 @@ mod tests {
         returns_report(state, &request).inputs_hash
     }
 
-    fn рыночная_цена(instrument: InstrumentId, trade_date: Date) -> PriceCandidate {
+    fn market_price(instrument: InstrumentId, trade_date: Date) -> PriceCandidate {
         PriceCandidate {
             instrument,
             price: dec("100"),
@@ -4363,7 +4348,7 @@ mod tests {
         }
     }
 
-    fn отчёт_с_рыночной_ценой(
+    fn report_with_market_price(
         state: &LedgerState,
         contour: &ContourDefinition,
         candidate: PriceCandidate,
@@ -4388,7 +4373,7 @@ mod tests {
     }
 
     #[test]
-    fn поток_после_даты_отчёта_не_попадает_в_публичный_отпечаток() {
+    fn post_report_date_flow_is_excluded_from_public_fingerprint() {
         let account = AccountId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
         let amount = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
@@ -4403,8 +4388,8 @@ mod tests {
         future_event.dates =
             crate::dates::EventDates::for_cash(crate::dates::CashPostedDate(date!(2026 - 08 - 27)));
         future_event.order = crate::dates::EffectiveOrder::new(date!(2026 - 08 - 27), 1);
-        let included = состояние_из_события(&contour, &event);
-        let excluded = состояние_из_события(&contour, &future_event);
+        let included = state_from_event(&contour, &event);
+        let excluded = state_from_event(&contour, &future_event);
         let baseline_event = event_with(
             account,
             date!(2026 - 08 - 26),
@@ -4412,20 +4397,20 @@ mod tests {
             EventKind::OpeningCash { amount },
             vec![Leg::cash(account, amount)],
         );
-        let baseline = состояние_из_события(&contour, &baseline_event);
+        let baseline = state_from_event(&contour, &baseline_event);
 
         assert_ne!(
-            хеш_отчёта(&included, &contour),
-            хеш_отчёта(&baseline, &contour)
+            report_hash(&included, &contour),
+            report_hash(&baseline, &contour)
         );
         assert_eq!(
-            хеш_отчёта(&excluded, &contour),
-            хеш_отчёта(&baseline, &contour)
+            report_hash(&excluded, &contour),
+            report_hash(&baseline, &contour)
         );
     }
 
     #[test]
-    fn поток_чужого_контура_исключается_из_публичного_отпечатка() {
+    fn foreign_contour_flow_is_excluded_from_public_fingerprint() {
         let account = AccountId::new_random();
         let id = ContourId::new_random();
         let contour = ContourDefinition::new(id, ContourVersion(1), [account]);
@@ -4438,8 +4423,8 @@ mod tests {
             EventKind::CashIn { amount },
             vec![Leg::cash(account, amount)],
         );
-        let included = состояние_из_события(&contour, &event);
-        let excluded = состояние_из_события(&foreign, &event);
+        let included = state_from_event(&contour, &event);
+        let excluded = state_from_event(&foreign, &event);
         let baseline_event = event_with(
             account,
             date!(2026 - 08 - 26),
@@ -4447,20 +4432,20 @@ mod tests {
             EventKind::OpeningCash { amount },
             vec![Leg::cash(account, amount)],
         );
-        let baseline = состояние_из_события(&contour, &baseline_event);
+        let baseline = state_from_event(&contour, &baseline_event);
 
         assert_ne!(
-            хеш_отчёта(&included, &contour),
-            хеш_отчёта(&baseline, &contour)
+            report_hash(&included, &contour),
+            report_hash(&baseline, &contour)
         );
         assert_eq!(
-            хеш_отчёта(&excluded, &contour),
-            хеш_отчёта(&baseline, &contour)
+            report_hash(&excluded, &contour),
+            report_hash(&baseline, &contour)
         );
     }
 
     #[test]
-    fn поток_старой_версии_контура_исключается_из_публичного_отпечатка() {
+    fn old_contour_version_flow_is_excluded_from_public_fingerprint() {
         let account = AccountId::new_random();
         let id = ContourId::new_random();
         let contour = ContourDefinition::new(id, ContourVersion(2), [account]);
@@ -4473,8 +4458,8 @@ mod tests {
             EventKind::CashIn { amount },
             vec![Leg::cash(account, amount)],
         );
-        let included = состояние_из_события(&contour, &event);
-        let excluded = состояние_из_события(&foreign, &event);
+        let included = state_from_event(&contour, &event);
+        let excluded = state_from_event(&foreign, &event);
         let baseline_event = event_with(
             account,
             date!(2026 - 08 - 26),
@@ -4482,19 +4467,19 @@ mod tests {
             EventKind::OpeningCash { amount },
             vec![Leg::cash(account, amount)],
         );
-        let baseline = состояние_из_события(&contour, &baseline_event);
+        let baseline = state_from_event(&contour, &baseline_event);
 
         assert_ne!(
-            хеш_отчёта(&included, &contour),
-            хеш_отчёта(&baseline, &contour)
+            report_hash(&included, &contour),
+            report_hash(&baseline, &contour)
         );
         assert_eq!(
-            хеш_отчёта(&excluded, &contour),
-            хеш_отчёта(&baseline, &contour)
+            report_hash(&excluded, &contour),
+            report_hash(&baseline, &contour)
         );
     }
 
-    fn состояние_позиции_с_унаследованной_оценкой(
+    fn position_state_with_inherited_valuation(
         contour: &ContourDefinition,
         instrument: InstrumentId,
         account: AccountId,
@@ -4542,18 +4527,15 @@ mod tests {
     }
 
     #[test]
-    fn будущий_рыночный_кандидат_не_отменяет_унаследованную_оценку() {
+    fn future_market_candidate_does_not_override_inherited_valuation() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
-        let state =
-            состояние_позиции_с_унаследованной_оценкой(
-                &contour, instrument, account,
-            );
-        let report = отчёт_с_рыночной_ценой(
+        let state = position_state_with_inherited_valuation(&contour, instrument, account);
+        let report = report_with_market_price(
             &state,
             &contour,
-            рыночная_цена(instrument, date!(2026 - 08 - 27)),
+            market_price(instrument, date!(2026 - 08 - 27)),
         );
 
         assert_eq!(
@@ -4564,18 +4546,15 @@ mod tests {
     }
 
     #[test]
-    fn кандидат_чужого_инструмента_не_отменяет_унаследованную_оценку() {
+    fn candidate_for_foreign_instrument_does_not_override_inherited_valuation() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
-        let state =
-            состояние_позиции_с_унаследованной_оценкой(
-                &contour, instrument, account,
-            );
-        let report = отчёт_с_рыночной_ценой(
+        let state = position_state_with_inherited_valuation(&contour, instrument, account);
+        let report = report_with_market_price(
             &state,
             &contour,
-            рыночная_цена(InstrumentId::new_random(), date!(2026 - 08 - 25)),
+            market_price(InstrumentId::new_random(), date!(2026 - 08 - 25)),
         );
 
         assert_eq!(
@@ -4586,7 +4565,7 @@ mod tests {
     }
 
     #[test]
-    fn рыночная_цена_чужого_инструмента_не_покрывает_позицию() {
+    fn market_price_for_foreign_instrument_does_not_cover_position() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -4607,11 +4586,11 @@ mod tests {
                 Quantity(dec("10")),
             )],
         );
-        let state = состояние_из_события(&contour, &opening);
-        let report = отчёт_с_рыночной_ценой(
+        let state = state_from_event(&contour, &opening);
+        let report = report_with_market_price(
             &state,
             &contour,
-            рыночная_цена(InstrumentId::new_random(), date!(2026 - 08 - 25)),
+            market_price(InstrumentId::new_random(), date!(2026 - 08 - 25)),
         );
 
         assert!(matches!(
@@ -4624,7 +4603,7 @@ mod tests {
     }
 
     #[test]
-    fn будущая_рыночная_цена_не_покрывает_позицию() {
+    fn future_market_price_does_not_cover_position() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -4646,11 +4625,11 @@ mod tests {
             )],
         );
 
-        let state = состояние_из_события(&contour, &opening);
-        let report = отчёт_с_рыночной_ценой(
+        let state = state_from_event(&contour, &opening);
+        let report = report_with_market_price(
             &state,
             &contour,
-            рыночная_цена(instrument, date!(2026 - 08 - 27)),
+            market_price(instrument, date!(2026 - 08 - 27)),
         );
 
         assert!(matches!(
@@ -4663,7 +4642,7 @@ mod tests {
     }
 
     #[test]
-    fn отчёт_показывает_накопленную_долю_unknown_по_двум_позициям() {
+    fn report_shows_accumulated_unknown_share_for_two_positions() {
         let mut shares = ExecutabilityAccumulator::default();
         shares.add(SourceExecutability::Executable, dec("2"));
         shares.add(SourceExecutability::IndicativePreviousClose, dec("1"));
@@ -4987,15 +4966,11 @@ mod tests {
     /// Полнота, флаги дефолта и валютные роли заданы явно: без них
     /// правило потока отказывается строить план, `past` не появляется
     /// вовсе, и тест проверял бы отказ построения, а не сверку.
-    fn график_купонов(coupons: &[Date], repayment: Date) -> BondSchedule {
-        график_с_офертами(coupons, repayment, &[])
+    fn coupon_schedule(coupons: &[Date], repayment: Date) -> BondSchedule {
+        schedule_with_offers(coupons, repayment, &[])
     }
 
-    fn график_с_офертами(
-        coupons: &[Date],
-        repayment: Date,
-        offers: &[Date],
-    ) -> BondSchedule {
+    fn schedule_with_offers(coupons: &[Date], repayment: Date, offers: &[Date]) -> BondSchedule {
         BondSchedule {
             // Период начинается предыдущей выплатой: замкнутая цепь
             // нужна не сверке, а НКД — без покрытия даты отчёта отказ
@@ -5046,7 +5021,7 @@ mod tests {
         }
     }
 
-    fn пополнение(account: AccountId, day: Date) -> crate::event::Event {
+    fn cash_in(account: AccountId, day: Date) -> crate::event::Event {
         let amount = Money::new(PostedMinor::new(1_000_000), CurrencyCode::Rub);
         event_with(
             account,
@@ -5062,7 +5037,7 @@ mod tests {
     /// `event_with` заполняет только дату зачисления денег. `None`
     /// воспроизводит обычную покупку без даты сделки: схема её
     /// допускает (§4.9), и счёт при этом не становится восстановленным.
-    fn покупка_облигации(
+    fn bond_purchase(
         account: AccountId,
         instrument: InstrumentId,
         day: Date,
@@ -5099,7 +5074,7 @@ mod tests {
     /// давности. Дата зачисления остаётся днём записи, поэтому журнал
     /// начинается позже, чем куплена бумага, — ровно тот случай,
     /// который обязан отличаться от пропущенной выплаты.
-    fn восстановленная_позиция(
+    fn restored_position(
         account: AccountId,
         instrument: InstrumentId,
         day: Date,
@@ -5137,7 +5112,7 @@ mod tests {
     /// Продажа облигации целиком одной партией. Дата сделки задаётся
     /// отдельно от даты зачисления денег по той же причине, что
     /// и у покупки.
-    fn продажа_облигации(
+    fn bond_sale(
         account: AccountId,
         instrument: InstrumentId,
         day: Date,
@@ -5174,14 +5149,14 @@ mod tests {
     /// Покупка в названное место хранения. Отдельным помощником, потому
     /// что `покупка_облигации` выдумывает депозитарий на каждый вызов,
     /// а здесь важно, что бумага легла именно в этот.
-    fn покупка_облигации_в_депозитарии(
+    fn bond_purchase_in_custody(
         account: AccountId,
         instrument: InstrumentId,
         day: Date,
         custody: CustodyId,
         sequence: u32,
     ) -> crate::event::Event {
-        let mut event = покупка_облигации(account, instrument, day, Some(day));
+        let mut event = bond_purchase(account, instrument, day, Some(day));
         event.order = crate::dates::EffectiveOrder::new(day, sequence);
         for leg in &mut event.legs {
             if leg.quantity.is_some() {
@@ -5191,7 +5166,7 @@ mod tests {
         event
     }
 
-    fn купонный_факт(
+    fn coupon_fact(
         account: AccountId,
         instrument: InstrumentId,
         day: Date,
@@ -5215,13 +5190,13 @@ mod tests {
     ///
     /// Позиция получает биржевую цену, потому что непокрытая позиция
     /// сама делает отчёт неполным и скрыла бы вклад сверки в статус.
-    fn отчёт_сверки(
+    fn reconciliation_report(
         accounts: &[AccountId],
         instrument: InstrumentId,
         events: &[crate::event::Event],
         schedule: &BondSchedule,
     ) -> ReturnsReport {
-        отчёт_сверки_на(
+        reconciliation_report_at(
             accounts,
             instrument,
             events,
@@ -5233,7 +5208,7 @@ mod tests {
     /// Тот же отчёт с явной датой отчёта. Отдельным параметром, потому
     /// что отсрочка перед тревогой считается от неё: без вариации
     /// `as_of` границу срока ожидания проверить нечем.
-    fn отчёт_сверки_на(
+    fn reconciliation_report_at(
         accounts: &[AccountId],
         instrument: InstrumentId,
         events: &[crate::event::Event],
@@ -5258,8 +5233,7 @@ mod tests {
             .clone();
         // Цена наблюдена накануне отчёта: политика отбора цену из
         // будущего не берёт, и позиция осталась бы непокрытой.
-        let candidate =
-            рыночная_цена(instrument, as_of.saturating_sub(time::Duration::days(1)));
+        let candidate = market_price(instrument, as_of.saturating_sub(time::Duration::days(1)));
         let fx = FxTable::new(FxSource::OwnerSupplied);
         let ledger = ReconciliationLedger::default();
         let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
@@ -5280,14 +5254,11 @@ mod tests {
         returns_report(&state, &request)
     }
 
-    fn содержит(
-        report: &ReturnsReport,
-        predicate: impl Fn(&MaterialIssue) -> bool,
-    ) -> bool {
+    fn contains(report: &ReturnsReport, predicate: impl Fn(&MaterialIssue) -> bool) -> bool {
         report.data_quality.material_issues.iter().any(predicate)
     }
 
-    fn непринятые(report: &ReturnsReport) -> Vec<&MaterialIssue> {
+    fn missing_postings(report: &ReturnsReport) -> Vec<&MaterialIssue> {
         report
             .data_quality
             .material_issues
@@ -5298,19 +5269,19 @@ mod tests {
 
     /// Журнал с одной пропущенной выплатой: купон 15.03 подтверждён
     /// фактом 16.03, купон 15.06 не подтверждён ничем.
-    fn журнал_с_пропущенным_купоном(
+    fn journal_with_missing_coupon(
         account: AccountId,
         instrument: InstrumentId,
     ) -> Vec<crate::event::Event> {
         vec![
-            пополнение(account, date!(2026 - 01 - 05)),
-            покупка_облигации(
+            cash_in(account, date!(2026 - 01 - 05)),
+            bond_purchase(
                 account,
                 instrument,
                 date!(2026 - 01 - 10),
                 Some(date!(2026 - 01 - 10)),
             ),
-            купонный_факт(account, instrument, date!(2026 - 03 - 16), 3),
+            coupon_fact(account, instrument, date!(2026 - 03 - 16), 3),
         ]
     }
 
@@ -5318,7 +5289,7 @@ mod tests {
     fn a_missing_coupon_is_named_with_its_account_instrument_date_and_kind() {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5326,14 +5297,14 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let report = отчёт_сверки(
+        let report = reconciliation_report(
             &[account],
             instrument,
-            &журнал_с_пропущенным_купоном(account, instrument),
+            &journal_with_missing_coupon(account, instrument),
             &schedule,
         );
 
-        let issues = непринятые(&report);
+        let issues = missing_postings(&report);
         assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
         assert!(matches!(
             issues[0],
@@ -5354,7 +5325,7 @@ mod tests {
         // сначала обязан назвать отсутствие покрытия истории.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5363,15 +5334,15 @@ mod tests {
             date!(2026 - 12 - 15),
         );
         let events = vec![
-            пополнение(account, date!(2026 - 07 - 01)),
-            покупка_облигации(
+            cash_in(account, date!(2026 - 07 - 01)),
+            bond_purchase(
                 account,
                 instrument,
                 date!(2026 - 07 - 05),
                 Some(date!(2026 - 07 - 05)),
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         // Оба купона раньше первого события счёта: здесь нельзя обвинять
         // эмитента, даже если книга уже знает, что покупка была позже.
@@ -5399,7 +5370,7 @@ mod tests {
             reasons,
             vec![(2, date!(2026 - 03 - 15), date!(2026 - 06 - 15))]
         );
-        assert!(непринятые(&report).is_empty());
+        assert!(missing_postings(&report).is_empty());
     }
 
     #[test]
@@ -5409,7 +5380,7 @@ mod tests {
         // но фактов под них в журнале нет и быть не может.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2021 - 06 - 15),
                 date!(2022 - 06 - 15),
@@ -5421,18 +5392,18 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events = vec![восстановленная_позиция(
+        let events = vec![restored_position(
             account,
             instrument,
             date!(2026 - 01 - 01),
             date!(2021 - 05 - 01),
         )];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         // Июнь 2026 уже покрыт журналом, поэтому его отсутствие теперь
         // проверяем отдельно; пять купонов 2021–2025 названы недоказуемыми.
-        assert_eq!(непринятые(&report).len(), 1);
-        assert!(содержит(&report, |issue| matches!(
+        assert_eq!(missing_postings(&report).len(), 1);
+        assert!(contains(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable {
                 reason: UnverifiableReason::HistoryStartsAfterSchedule,
@@ -5451,7 +5422,7 @@ mod tests {
         // пропуск не должен исчезнуть вместе со свёрткой.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2025 - 09 - 15),
                 date!(2025 - 12 - 15),
@@ -5459,13 +5430,13 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events = vec![восстановленная_позиция(
+        let events = vec![restored_position(
             account,
             instrument,
             date!(2026 - 01 - 01),
             date!(2021 - 05 - 01),
         )];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
         // Две одинаковые недоказуемости должны слиться только после
         // полного обхода, не поглотив отдельное обвинение ниже.
         assert!(
@@ -5486,7 +5457,7 @@ mod tests {
                 ))
         );
 
-        let даты: Vec<_> = непринятые(&report)
+        let dates: Vec<_> = missing_postings(&report)
             .into_iter()
             .filter_map(|issue| match issue {
                 MaterialIssue::ScheduledPostingNotReceived { date, .. } => Some(*date),
@@ -5494,8 +5465,8 @@ mod tests {
             })
             .collect();
         assert!(
-            даты.contains(&date!(2026 - 03 - 15)),
-            "пропуск внутри покрытия обязан быть назван: {даты:?}"
+            dates.contains(&date!(2026 - 03 - 15)),
+            "пропуск внутри покрытия обязан быть назван: {dates:?}"
         );
         assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
     }
@@ -5509,32 +5480,24 @@ mod tests {
         // граница владения намеренно даёт `OwnershipUnknown`.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let первый_день = date!(2026 - 01 - 01);
-        let schedule = график_купонов(
-            &[первый_день, date!(2026 - 06 - 15)],
-            date!(2026 - 12 - 15),
-        );
+        let first_day = date!(2026 - 01 - 01);
+        let schedule = coupon_schedule(&[first_day, date!(2026 - 06 - 15)], date!(2026 - 12 - 15));
         // Дата сделки заявлена раньше журнала: границу владения купон
         // первого дня проходит, и решает его судьбу именно граница
         // истории, а не отбор по владению.
-        let mut restored = восстановленная_позиция(
-            account,
-            instrument,
-            первый_день,
-            date!(2025 - 06 - 01),
-        );
+        let mut restored = restored_position(account, instrument, first_day, date!(2025 - 06 - 01));
         // Проверяем именно границу `Exact`: утверждение совпадает с днём
         // открытия журнала, поэтому владение в этот день ещё неоднозначно.
         let EventKind::OpeningPosition { assertions, .. } = &mut restored.kind else {
             unreachable!("помощник создаёт opening_position");
         };
-        assertions.acquisition_date = Some(первый_день);
+        assertions.acquisition_date = Some(first_day);
         assertions.acquisition_date_certainty = crate::event::kind::DateCertainty::Known;
         let events = vec![restored];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         assert!(
-            !содержит(&report, |issue| matches!(
+            !contains(&report, |issue| matches!(
                 issue,
                 MaterialIssue::ScheduledPostingUnverifiable {
                     reason: UnverifiableReason::HistoryStartsAfterSchedule,
@@ -5543,26 +5506,26 @@ mod tests {
             )),
             "день первого события журналом покрыт: недоказуемости здесь нет"
         );
-        assert!(содержит(&report, |issue| matches!(
+        assert!(contains(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable {
                 date,
                 reason: UnverifiableReason::OwnershipUnknown,
                 ..
-            } if *date == первый_день
+            } if *date == first_day
         )));
         // Купон июня обвинён по существу: владение на его отсечку
         // доказано датой расчётов восстановленной позиции, а факта нет.
         // Прежнее ожидание тишины досталось от эпохи, когда одна
         // недоказуемая выплата глушила всю пару (iaam-d8b.21).
-        let непринятые_даты: Vec<_> = непринятые(&report)
+        let missing_dates: Vec<_> = missing_postings(&report)
             .into_iter()
             .filter_map(|issue| match issue {
                 MaterialIssue::ScheduledPostingNotReceived { date, .. } => Some(*date),
                 _ => None,
             })
             .collect();
-        assert_eq!(непринятые_даты, vec![date!(2026 - 06 - 15)]);
+        assert_eq!(missing_dates, vec![date!(2026 - 06 - 15)]);
     }
 
     #[test]
@@ -5572,7 +5535,7 @@ mod tests {
         // поэтому владение на дату права остаётся недоказуемым.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5581,12 +5544,12 @@ mod tests {
             date!(2026 - 12 - 15),
         );
         let events = vec![
-            пополнение(account, date!(2026 - 01 - 05)),
-            покупка_облигации(account, instrument, date!(2026 - 01 - 10), None),
+            cash_in(account, date!(2026 - 01 - 05)),
+            bond_purchase(account, instrument, date!(2026 - 01 - 10), None),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        assert!(содержит(&report, |issue| matches!(
+        assert!(contains(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable {
                 reason: UnverifiableReason::OwnershipUnknown,
@@ -5596,14 +5559,14 @@ mod tests {
                 ..
             }
         )));
-        assert!(!содержит(&report, |issue| matches!(
+        assert!(!contains(&report, |issue| matches!(
             issue,
             MaterialIssue::RestoredWithoutBasis { .. }
         )));
         assert_eq!(report.data_quality.status, DataQualityStatus::Incomplete);
         // Статус неполон именно из-за сверки: других дефектов в отчёте
         // нет, иначе тест проходил бы и без нового варианта.
-        let другие: Vec<_> = report
+        let others: Vec<_> = report
             .data_quality
             .material_issues
             .iter()
@@ -5616,7 +5579,7 @@ mod tests {
                     )
             })
             .collect();
-        assert!(другие.is_empty(), "посторонние дефекты: {другие:?}");
+        assert!(others.is_empty(), "посторонние дефекты: {others:?}");
     }
 
     #[test]
@@ -5626,19 +5589,19 @@ mod tests {
         // сделки или выдать обвинение.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(&[date!(2026 - 03 - 15)], date!(2026 - 12 - 15));
-        let mut purchase = покупка_облигации(
+        let schedule = coupon_schedule(&[date!(2026 - 03 - 15)], date!(2026 - 12 - 15));
+        let mut purchase = bond_purchase(
             account,
             instrument,
             date!(2026 - 01 - 10),
             Some(date!(2026 - 01 - 10)),
         );
         purchase.dates.settled = None;
-        let events = vec![пополнение(account, date!(2026 - 01 - 05)), purchase];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let events = vec![cash_in(account, date!(2026 - 01 - 05)), purchase];
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        assert!(непринятые(&report).is_empty());
-        assert!(содержит(&report, |issue| matches!(
+        assert!(missing_postings(&report).is_empty());
+        assert!(contains(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable {
                 reason: UnverifiableReason::OwnershipUnknown,
@@ -5728,7 +5691,7 @@ mod tests {
         // даты сделки, которого здесь нет.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5738,8 +5701,8 @@ mod tests {
         );
         let amount = Money::new(PostedMinor::new(50_000), CurrencyCode::Rub);
         let events = vec![
-            пополнение(account, date!(2026 - 01 - 05)),
-            покупка_облигации(
+            cash_in(account, date!(2026 - 01 - 05)),
+            bond_purchase(
                 account,
                 instrument,
                 date!(2026 - 01 - 10),
@@ -5757,10 +5720,10 @@ mod tests {
                 vec![Leg::cash(account, amount)],
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        assert!(непринятые(&report).is_empty());
-        assert!(содержит(&report, |issue| matches!(
+        assert!(missing_postings(&report).is_empty());
+        assert!(contains(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable {
                 reason: UnverifiableReason::IncomeKindUnknown,
@@ -5778,7 +5741,7 @@ mod tests {
         // сценариев общее: сверка внутри сценария задвоила бы проблему.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_с_офертами(
+        let schedule = schedule_with_offers(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5787,10 +5750,10 @@ mod tests {
             date!(2026 - 12 - 15),
             &[date!(2026 - 09 - 15), date!(2026 - 10 - 15)],
         );
-        let report = отчёт_сверки(
+        let report = reconciliation_report(
             &[account],
             instrument,
-            &журнал_с_пропущенным_купоном(account, instrument),
+            &journal_with_missing_coupon(account, instrument),
             &schedule,
         );
 
@@ -5799,37 +5762,25 @@ mod tests {
             3,
             "сценариев должно быть больше одного, иначе тест ничего не доказывает"
         );
-        assert_eq!(непринятые(&report).len(), 1);
+        assert_eq!(missing_postings(&report).len(), 1);
     }
 
     /// Журнал здоровой бумаги: две покупки и продажа ранней партии,
     /// все прошедшие купоны подтверждены фактами.
-    fn журнал_с_проданной_ранней_партией(
+    fn journal_with_early_lot_sold(
         account: AccountId,
         instrument: InstrumentId,
-        факты: &[Date],
+        fact_dates: &[Date],
     ) -> Vec<crate::event::Event> {
         // Одно место хранения на весь журнал: иначе продажа списала бы
         // бумагу из депозитария, в который её не клали, и позиций стало
         // бы три — тест проверял бы задвоение, а не границу владения.
         let custody = CustodyId::new_random();
         let mut events = vec![
-            пополнение(account, date!(2026 - 01 - 05)),
-            покупка_облигации_в_депозитарии(
-                account,
-                instrument,
-                date!(2026 - 01 - 10),
-                custody,
-                2,
-            ),
-            покупка_облигации_в_депозитарии(
-                account,
-                instrument,
-                date!(2026 - 04 - 10),
-                custody,
-                3,
-            ),
-            продажа_облигации(
+            cash_in(account, date!(2026 - 01 - 05)),
+            bond_purchase_in_custody(account, instrument, date!(2026 - 01 - 10), custody, 2),
+            bond_purchase_in_custody(account, instrument, date!(2026 - 04 - 10), custody, 3),
+            bond_sale(
                 account,
                 instrument,
                 date!(2026 - 07 - 10),
@@ -5838,8 +5789,8 @@ mod tests {
                 4,
             ),
         ];
-        events.extend(факты.iter().enumerate().map(|(index, day)| {
-            купонный_факт(
+        events.extend(fact_dates.iter().enumerate().map(|(index, day)| {
+            coupon_fact(
                 account,
                 instrument,
                 *day,
@@ -5856,7 +5807,7 @@ mod tests {
         // дней — молчание, +21 — тревога.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5864,9 +5815,9 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events = журнал_с_пропущенным_купоном(account, instrument);
+        let events = journal_with_missing_coupon(account, instrument);
 
-        let ещё_идёт = отчёт_сверки_на(
+        let still_pending = reconciliation_report_at(
             &[account],
             instrument,
             &events,
@@ -5876,16 +5827,18 @@ mod tests {
         // Поток построен, значит сверка до плана дошла и промолчала
         // по существу, а не из-за отказа построения.
         assert!(matches!(
-            ещё_идёт.bond_metrics[0].scenarios[0].prospective.metrics,
+            still_pending.bond_metrics[0].scenarios[0]
+                .prospective
+                .metrics,
             Computed::Value(_)
         ));
-        assert!(непринятые(&ещё_идёт).is_empty());
-        assert!(!содержит(&ещё_идёт, |issue| matches!(
+        assert!(missing_postings(&still_pending).is_empty());
+        assert!(!contains(&still_pending, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable { .. }
         )));
 
-        let истёк = отчёт_сверки_на(
+        let expired = reconciliation_report_at(
             &[account],
             instrument,
             &events,
@@ -5893,10 +5846,10 @@ mod tests {
             date!(2026 - 07 - 06),
         );
         assert_eq!(
-            непринятые(&истёк).len(),
+            missing_postings(&expired).len(),
             1,
             "проблемы: {:?}",
-            непринятые(&истёк)
+            missing_postings(&expired)
         );
     }
 
@@ -5909,20 +5862,20 @@ mod tests {
         // — прежде это давало `HistoryStartsAfterSchedule`.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[date!(2026 - 08 - 20), date!(2026 - 12 - 15)],
             date!(2026 - 12 - 15),
         );
-        let events = vec![восстановленная_позиция(
+        let events = vec![restored_position(
             account,
             instrument,
             date!(2026 - 08 - 22),
             date!(2021 - 05 - 01),
         )];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        assert!(непринятые(&report).is_empty());
-        assert!(!содержит(&report, |issue| matches!(
+        assert!(missing_postings(&report).is_empty());
+        assert!(!contains(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable { .. }
         )));
@@ -5936,17 +5889,11 @@ mod tests {
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let custody = CustodyId::new_random();
-        let schedule = график_купонов(&[date!(2026 - 03 - 15)], date!(2026 - 12 - 15));
+        let schedule = coupon_schedule(&[date!(2026 - 03 - 15)], date!(2026 - 12 - 15));
         let events = vec![
-            пополнение(account, date!(2026 - 01 - 05)),
-            покупка_облигации_в_депозитарии(
-                account,
-                instrument,
-                date!(2026 - 01 - 10),
-                custody,
-                2,
-            ),
-            продажа_облигации(
+            cash_in(account, date!(2026 - 01 - 05)),
+            bond_purchase_in_custody(account, instrument, date!(2026 - 01 - 10), custody, 2),
+            bond_sale(
                 account,
                 instrument,
                 date!(2026 - 05 - 10),
@@ -5955,10 +5902,10 @@ mod tests {
                 3,
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         assert!(report.bond_metrics.is_empty());
-        let issues = непринятые(&report);
+        let issues = missing_postings(&report);
         assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
         assert!(matches!(
             issues[0],
@@ -5973,7 +5920,7 @@ mod tests {
         // сценария не должен выключать проверку пропущенного купона.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let mut schedule = график_купонов(
+        let mut schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -5983,15 +5930,15 @@ mod tests {
         );
         schedule.initial_principal = None;
         let events = vec![
-            пополнение(account, date!(2026 - 01 - 05)),
-            покупка_облигации(
+            cash_in(account, date!(2026 - 01 - 05)),
+            bond_purchase(
                 account,
                 instrument,
                 date!(2026 - 01 - 10),
                 Some(date!(2026 - 01 - 10)),
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         assert!(matches!(
             report.bond_metrics[0].scenarios[0].prospective.metrics,
@@ -5999,7 +5946,7 @@ mod tests {
                 reason: NotComputable::PrincipalUnknown
             }
         ));
-        assert!(непринятые(&report).iter().any(|issue| matches!(
+        assert!(missing_postings(&report).iter().any(|issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingNotReceived { date, .. }
                 if *date == date!(2026 - 03 - 15)
@@ -6012,7 +5959,7 @@ mod tests {
         // права: владелец должен увидеть отдельную причину доверия к графику.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let mut schedule = график_купонов(
+        let mut schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -6022,15 +5969,15 @@ mod tests {
         );
         schedule.completeness = crate::bond::ScheduleCompleteness::Unknown;
         let events = vec![
-            пополнение(account, date!(2026 - 01 - 05)),
-            покупка_облигации(
+            cash_in(account, date!(2026 - 01 - 05)),
+            bond_purchase(
                 account,
                 instrument,
                 date!(2026 - 01 - 10),
                 Some(date!(2026 - 01 - 10)),
             ),
         ];
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         let refusals: Vec<_> = report
             .data_quality
@@ -6047,7 +5994,7 @@ mod tests {
             })
             .collect();
         assert_eq!(refusals.len(), 1, "проблемы: {refusals:?}");
-        assert!(непринятые(&report).is_empty());
+        assert!(missing_postings(&report).is_empty());
     }
 
     #[test]
@@ -6057,7 +6004,7 @@ mod tests {
         // границу до апреля и спрятала мартовский пропуск.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -6065,14 +6012,10 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events = журнал_с_проданной_ранней_партией(
-            account,
-            instrument,
-            &[date!(2026 - 06 - 16)],
-        );
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let events = journal_with_early_lot_sold(account, instrument, &[date!(2026 - 06 - 16)]);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        let issues = непринятые(&report);
+        let issues = missing_postings(&report);
         assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
         assert!(matches!(
             issues[0],
@@ -6087,7 +6030,7 @@ mod tests {
         // купонов не даёт ни одной тревоги.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -6095,15 +6038,15 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events = журнал_с_проданной_ранней_партией(
+        let events = journal_with_early_lot_sold(
             account,
             instrument,
             &[date!(2026 - 03 - 16), date!(2026 - 06 - 16)],
         );
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        assert!(непринятые(&report).is_empty());
-        assert!(!содержит(&report, |issue| matches!(
+        assert!(missing_postings(&report).is_empty());
+        assert!(!contains(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable { .. }
         )));
@@ -6116,7 +6059,7 @@ mod tests {
         // выдаётся по разу на депозитарий.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -6124,19 +6067,16 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events = журнал_бумаги_в_двух_депозитариях(
-            account,
-            instrument,
-            &[date!(2026 - 03 - 16)],
-        );
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let events =
+            journal_for_bond_in_two_custodies(account, instrument, &[date!(2026 - 03 - 16)]);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         assert_eq!(
             report.bond_metrics.len(),
             2,
             "позиций должно быть две, иначе тест ничего не доказывает"
         );
-        let issues = непринятые(&report);
+        let issues = missing_postings(&report);
         assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
     }
 
@@ -6148,7 +6088,7 @@ mod tests {
         // полная история купонов не даёт ни одной тревоги.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -6156,37 +6096,37 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let events = журнал_бумаги_в_двух_депозитариях(
+        let events = journal_for_bond_in_two_custodies(
             account,
             instrument,
             &[date!(2026 - 03 - 16), date!(2026 - 06 - 16)],
         );
-        let report = отчёт_сверки(&[account], instrument, &events, &schedule);
+        let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
         assert_eq!(report.bond_metrics.len(), 2);
-        assert!(непринятые(&report).is_empty());
-        assert!(!содержит(&report, |issue| matches!(
+        assert!(missing_postings(&report).is_empty());
+        assert!(!contains(&report, |issue| matches!(
             issue,
             MaterialIssue::ScheduledPostingUnverifiable { .. }
         )));
     }
 
     /// Одна бумага на одном счёте в двух местах хранения.
-    fn журнал_бумаги_в_двух_депозитариях(
+    fn journal_for_bond_in_two_custodies(
         account: AccountId,
         instrument: InstrumentId,
-        факты: &[Date],
+        fact_dates: &[Date],
     ) -> Vec<crate::event::Event> {
         let mut events = vec![
-            пополнение(account, date!(2026 - 01 - 05)),
-            покупка_облигации_в_депозитарии(
+            cash_in(account, date!(2026 - 01 - 05)),
+            bond_purchase_in_custody(
                 account,
                 instrument,
                 date!(2026 - 01 - 10),
                 CustodyId::new_random(),
                 2,
             ),
-            покупка_облигации_в_депозитарии(
+            bond_purchase_in_custody(
                 account,
                 instrument,
                 date!(2026 - 01 - 11),
@@ -6194,8 +6134,8 @@ mod tests {
                 3,
             ),
         ];
-        events.extend(факты.iter().enumerate().map(|(index, day)| {
-            купонный_факт(
+        events.extend(fact_dates.iter().enumerate().map(|(index, day)| {
+            coupon_fact(
                 account,
                 instrument,
                 *day,
@@ -6210,7 +6150,7 @@ mod tests {
         let first = AccountId::new_random();
         let second = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let schedule = график_купонов(
+        let schedule = coupon_schedule(
             &[
                 date!(2026 - 03 - 15),
                 date!(2026 - 06 - 15),
@@ -6218,11 +6158,9 @@ mod tests {
             ],
             date!(2026 - 12 - 15),
         );
-        let mut events = журнал_с_пропущенным_купоном(first, instrument);
-        events.extend(журнал_с_пропущенным_купоном(
-            second, instrument,
-        ));
-        let report = отчёт_сверки(&[first, second], instrument, &events, &schedule);
+        let mut events = journal_with_missing_coupon(first, instrument);
+        events.extend(journal_with_missing_coupon(second, instrument));
+        let report = reconciliation_report(&[first, second], instrument, &events, &schedule);
 
         let accounts: std::collections::BTreeSet<_> = report
             .data_quality

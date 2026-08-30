@@ -59,45 +59,45 @@ use uuid::Uuid;
 // Идентичности заданы числами, а не `new_random`: свойство о порядке
 // журнала сравнивает вердикты двух прогонов, и случайный `EventId`
 // сделал бы расхождение невоспроизводимым (§15.3).
-const ВЛАДЕЛЕЦ: OwnerId = OwnerId(Uuid::from_u128(1));
-const СЧЁТ: AccountId = AccountId(Uuid::from_u128(2));
-const БУМАГА: InstrumentId = InstrumentId(Uuid::from_u128(3));
-const ДЕПОЗИТАРИЙ: CustodyId = CustodyId(Uuid::from_u128(4));
-const ДРУГОЙ_ДЕПОЗИТАРИЙ: CustodyId = CustodyId(Uuid::from_u128(5));
-const ИСТОЧНИК: SourceId = SourceId(Uuid::from_u128(6));
+const OWNER: OwnerId = OwnerId(Uuid::from_u128(1));
+const ACCOUNT: AccountId = AccountId(Uuid::from_u128(2));
+const INSTRUMENT: InstrumentId = InstrumentId(Uuid::from_u128(3));
+const CUSTODY: CustodyId = CustodyId(Uuid::from_u128(4));
+const OTHER_CUSTODY: CustodyId = CustodyId(Uuid::from_u128(5));
+const SOURCE: SourceId = SourceId(Uuid::from_u128(6));
 
 /// Количество бумаг в одной покупке.
-const КОЛИЧЕСТВО: &str = "10";
+const PURCHASE_QUANTITY_TEXT: &str = "10";
 /// Дата отчёта по умолчанию.
-const ДАТА_ОТЧЁТА: Date = date!(2026 - 08 - 26);
+const REPORT_DATE: Date = date!(2026 - 08 - 26);
 
 fn dec(text: &str) -> Dec {
     Dec::new(Decimal::from_str_exact(text).expect("десятичная константа"))
 }
 
-fn рубли(minor: i64) -> Money {
+fn rubles(minor: i64) -> Money {
     Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
 }
 
-fn за_единицу(text: &str) -> PerUnitAmount {
+fn per_unit(text: &str) -> PerUnitAmount {
     PerUnitAmount::new(dec(text), CurrencyCode::Rub)
 }
 
 /// Конверт события. Идентификатор выводится из номера в журнале: он же
 /// задаёт порядок, поэтому два события с одним номером — ошибка теста,
 /// а не повод для случайности.
-fn событие(день: Date, номер: u32, вид: EventKind, ноги: Vec<Leg>) -> Event {
+fn event(date: Date, number: u32, kind: EventKind, legs: Vec<Leg>) -> Event {
     Event {
-        id: EventId(Uuid::from_u128(u128::from(номер))),
+        id: EventId(Uuid::from_u128(u128::from(number))),
         schema_version: SCHEMA_VERSION,
-        owner: ВЛАДЕЛЕЦ,
-        account: СЧЁТ,
-        kind: вид,
-        dates: EventDates::for_cash(CashPostedDate(день)),
-        order: EffectiveOrder::new(день, номер),
-        legs: ноги,
+        owner: OWNER,
+        account: ACCOUNT,
+        kind,
+        dates: EventDates::for_cash(CashPostedDate(date)),
+        order: EffectiveOrder::new(date, number),
+        legs,
         provenance: Provenance::new(
-            ИСТОЧНИК,
+            SOURCE,
             RawHash::parse(&"a".repeat(64)).expect("шестнадцатеричный хеш"),
             ParserVersion("test/scheduled-posting/1".to_owned()),
         ),
@@ -107,13 +107,13 @@ fn событие(день: Date, номер: u32, вид: EventKind, ноги: 
     }
 }
 
-fn пополнение(день: Date, номер: u32) -> Event {
-    let сумма = рубли(10_000_000);
-    событие(
-        день,
-        номер,
-        EventKind::CashIn { amount: сумма },
-        vec![Leg::cash(СЧЁТ, сумма)],
+fn cash_in(date: Date, number: u32) -> Event {
+    let amount = rubles(10_000_000);
+    event(
+        date,
+        number,
+        EventKind::CashIn { amount },
+        vec![Leg::cash(ACCOUNT, amount)],
     )
 }
 
@@ -123,109 +123,105 @@ fn пополнение(день: Date, номер: u32) -> Event {
 /// а из неё берётся нижняя граница владения. Покупка без даты сделки
 /// делает сверку недоказуемой — это отдельный случай, и он проверен
 /// модульным тестом ядра.
-fn покупка(депозитарий: CustodyId, день: Date, номер: u32) -> Event {
-    let количество = Quantity(dec(КОЛИЧЕСТВО));
-    let mut event = событие(
-        день,
-        номер,
+fn purchase(custody: CustodyId, date: Date, number: u32) -> Event {
+    let quantity = Quantity(dec(PURCHASE_QUANTITY_TEXT));
+    let mut event = event(
+        date,
+        number,
         EventKind::Trade {
             side: TradeSide::Buy,
-            instrument: БУМАГА,
-            quantity: количество,
-            gross: рубли(1_000_000),
+            instrument: INSTRUMENT,
+            quantity,
+            gross: rubles(1_000_000),
             fee: None,
             accrued_interest: None,
         },
         vec![
-            Leg::cash(СЧЁТ, рубли(-1_000_000)),
-            Leg::security(СЧЁТ, депозитарий, БУМАГА, количество),
+            Leg::cash(ACCOUNT, rubles(-1_000_000)),
+            Leg::security(ACCOUNT, custody, INSTRUMENT, quantity),
         ],
     );
     // Тест моделирует источник Finam, который сообщает дату расчётов;
     // здесь она совпадает с датой сделки, потому что расчёты отдельно
     // не проверяются.
-    event.dates.settled = Some(SettledDate(день));
-    event.dates.trade = Some(TradeDate(день));
+    event.dates.settled = Some(SettledDate(date));
+    event.dates.trade = Some(TradeDate(date));
     event
 }
 /// Покупка от источника, который не сообщает дату расчётов.
 ///
 /// Отсутствие `settled` намеренно оставляет владение недоказуемым:
 /// источник не даёт системе права угадывать дату перехода прав.
-fn покупка_без_даты_расчётов(
-    депозитарий: CustodyId,
-    день: Date,
-    номер: u32,
-) -> Event {
-    let mut event = покупка(депозитарий, день, номер);
+fn purchase_without_settlement_date(custody: CustodyId, date: Date, number: u32) -> Event {
+    let mut event = purchase(custody, date, number);
     event.dates.settled = None;
     event
 }
 
 /// Продажа всей партии из названного депозитария.
-fn продажа(депозитарий: CustodyId, день: Date, номер: u32) -> Event {
-    let количество = Quantity(dec(КОЛИЧЕСТВО));
-    let mut event = событие(
-        день,
-        номер,
+fn sale(custody: CustodyId, date: Date, number: u32) -> Event {
+    let quantity = Quantity(dec(PURCHASE_QUANTITY_TEXT));
+    let mut event = event(
+        date,
+        number,
         EventKind::Trade {
             side: TradeSide::Sell,
-            instrument: БУМАГА,
-            quantity: количество,
-            gross: рубли(1_000_000),
+            instrument: INSTRUMENT,
+            quantity,
+            gross: rubles(1_000_000),
             fee: None,
             accrued_interest: None,
         },
         vec![
-            Leg::cash(СЧЁТ, рубли(1_000_000)),
-            Leg::security(СЧЁТ, депозитарий, БУМАГА, Quantity(dec("-10"))),
+            Leg::cash(ACCOUNT, rubles(1_000_000)),
+            Leg::security(ACCOUNT, custody, INSTRUMENT, Quantity(dec("-10"))),
         ],
     );
     // Тест моделирует источник Finam, который сообщает дату расчётов;
     // здесь она совпадает с датой сделки, потому что расчёты отдельно
     // не проверяются.
-    event.dates.settled = Some(SettledDate(день));
-    event.dates.trade = Some(TradeDate(день));
+    event.dates.settled = Some(SettledDate(date));
+    event.dates.trade = Some(TradeDate(date));
     event
 }
 
 /// Пришедший купон: дата зачисления денег и есть дата факта.
-fn купон(день: Date, номер: u32) -> Event {
-    let сумма = рубли(50_000);
-    событие(
-        день,
-        номер,
+fn coupon(date: Date, number: u32) -> Event {
+    let amount = rubles(50_000);
+    event(
+        date,
+        number,
         EventKind::Income {
-            instrument: Some(БУМАГА),
-            gross: сумма,
+            instrument: Some(INSTRUMENT),
+            gross: amount,
             kind: Some(IncomeKind::Coupon),
         },
-        vec![Leg::cash(СЧЁТ, сумма)],
+        vec![Leg::cash(ACCOUNT, amount)],
     )
 }
 
 /// Амортизационная выплата: половина номинала деньгами, количество бумаг
 /// не меняется (§6.5). Единственный источник факта вида `PrincipalReturn`
 /// у бумаги, которая ещё не погашена.
-fn частичное_погашение(день: Date, номер: u32) -> Event {
-    let компенсация = рубли(500_000);
-    событие(
-        день,
-        номер,
+fn partial_redemption(date: Date, number: u32) -> Event {
+    let compensation = rubles(500_000);
+    event(
+        date,
+        number,
         EventKind::CorporateAction {
             action: CorporateAction::PartialRedemption {
-                instrument: БУМАГА,
-                custody: ДЕПОЗИТАРИЙ,
-                quantity: Quantity(dec(КОЛИЧЕСТВО)),
-                principal_returned_per_unit: за_единицу("500"),
-                compensation: компенсация,
-                effective_date: день,
+                instrument: INSTRUMENT,
+                custody: CUSTODY,
+                quantity: Quantity(dec(PURCHASE_QUANTITY_TEXT)),
+                principal_returned_per_unit: per_unit("500"),
+                compensation,
+                effective_date: date,
                 record_date: None,
                 grounds: None,
                 basis_allocation: iaam_core::event::allocation::BasisAllocation::default(),
             },
         },
-        vec![Leg::principal(СЧЁТ, БУМАГА, компенсация)],
+        vec![Leg::principal(ACCOUNT, INSTRUMENT, compensation)],
     )
 }
 
@@ -236,30 +232,30 @@ fn частичное_погашение(день: Date, номер: u32) -> Eve
 /// проверял бы отказ построения, а не сверку. Период начинается
 /// предыдущей выплатой: замкнутая цепь нужна расчёту НКД, иначе отказ
 /// приходит оттуда.
-fn график(купоны: &[Date], возвраты: &[(Date, &str)]) -> BondSchedule {
+fn schedule(coupon_dates: &[Date], returns: &[(Date, &str)]) -> BondSchedule {
     BondSchedule {
         // Тестовый график моделирует источник, который сообщает дату
         // фиксации реестра; дата фиксации совпадает с датой платежа.
-        periods: купоны
+        periods: coupon_dates
             .iter()
             .enumerate()
-            .map(|(индекс, дата)| AccrualPeriod {
-                period_start: if индекс == 0 {
-                    дата.saturating_sub(Duration::days(180))
+            .map(|(index, date)| AccrualPeriod {
+                period_start: if index == 0 {
+                    date.saturating_sub(Duration::days(180))
                 } else {
-                    купоны[индекс - 1]
+                    coupon_dates[index - 1]
                 },
-                accrual_end: *дата,
-                payment_date: *дата,
-                record_date: Some(*дата),
-                coupon_per_unit: Some(за_единицу("50")),
+                accrual_end: *date,
+                payment_date: *date,
+                record_date: Some(*date),
+                coupon_per_unit: Some(per_unit("50")),
             })
             .collect(),
-        principal_returns: возвраты
+        principal_returns: returns
             .iter()
-            .map(|(дата, доля)| PrincipalReturn {
-                repayment_date: *дата,
-                share_percent: dec(доля),
+            .map(|(date, share)| PrincipalReturn {
+                repayment_date: *date,
+                share_percent: dec(share),
             })
             .collect(),
         initial_principal: None,
@@ -273,25 +269,23 @@ fn график(купоны: &[Date], возвраты: &[(Date, &str)]) -> Bon
     }
 }
 /// График с номиналом, который приходит из справочника выпуска.
-fn график_с_номиналом(
-    купоны: &[Date], возвраты: &[(Date, &str)]
-) -> BondSchedule {
-    let mut график = график(купоны, возвраты);
-    график.initial_principal = Some(за_единицу("1000"));
-    график
+fn schedule_with_face_value(coupon_dates: &[Date], returns: &[(Date, &str)]) -> BondSchedule {
+    let mut schedule = schedule(coupon_dates, returns);
+    schedule.initial_principal = Some(per_unit("1000"));
+    schedule
 }
 
 /// Биржевая цена накануне отчёта: непокрытая позиция сама делает отчёт
 /// неполным и скрыла бы вклад сверки в статус качества.
-fn цена(дата_отчёта: Date) -> PriceCandidate {
+fn price(report_date: Date) -> PriceCandidate {
     PriceCandidate {
-        instrument: БУМАГА,
+        instrument: INSTRUMENT,
         price: dec("1000"),
         currency: CurrencyCode::Rub,
         basis: QuotationBasis::MoneyPerUnit,
         basis_evidence: "test:market".to_owned(),
         basis_evidence_contradicts: false,
-        trade_date: дата_отчёта.saturating_sub(Duration::days(1)),
+        trade_date: report_date.saturating_sub(Duration::days(1)),
         observed_at: None,
         origin: PriceOrigin::Market {
             venue: Venue {
@@ -308,34 +302,35 @@ fn цена(дата_отчёта: Date) -> PriceCandidate {
 ///
 /// Структурой, а не пятью позиционными аргументами: перепутать местами
 /// журнал и график легко, а заметить по красному тесту — нет.
-struct Сценарий<'a> {
-    события: &'a [Event],
-    график: &'a BondSchedule,
-    дата_отчёта: Date,
+struct Scenario<'a> {
+    events: &'a [Event],
+    schedule: &'a BondSchedule,
+    report_date: Date,
 }
 
-fn отчёт(сценарий: &Сценарий<'_>) -> ReturnsReport {
-    let contour = ContourDefinition::new(ContourId(Uuid::from_u128(7)), ContourVersion(1), [СЧЁТ]);
+fn build_report(scenario: &Scenario<'_>) -> ReturnsReport {
+    let contour =
+        ContourDefinition::new(ContourId(Uuid::from_u128(7)), ContourVersion(1), [ACCOUNT]);
     let rules = RuleRegistry::with_defaults();
     let context = ProjectionContext {
         contour: &contour,
         rules: &rules,
         lot_rule: LotRuleVersion(1),
     };
-    let state = project(сценарий.события, &context)
+    let state = project(scenario.events, &context)
         .expect("проекция журнала облигации")
         .state()
         .clone();
     let fx = iaam_core::valuation::FxTable::new(iaam_core::valuation::FxSource::OwnerSupplied);
     let ledger = ReconciliationLedger::default();
     let perimeter = PerimeterAssessment::empty(PerimeterPolicy::default());
-    let candidate = цена(сценарий.дата_отчёта);
-    let schedules = BTreeMap::from([(БУМАГА, сценарий.график.clone())]);
+    let candidate = price(scenario.report_date);
+    let schedules = BTreeMap::from([(INSTRUMENT, scenario.schedule.clone())]);
     returns_report(
         &state,
         &ReturnsRequest {
             contour: &contour,
-            as_of: сценарий.дата_отчёта,
+            as_of: scenario.report_date,
             report_currency: CurrencyCode::Rub,
             fx: &fx,
             solver_policy: SolverPolicy::returns_default(),
@@ -349,7 +344,7 @@ fn отчёт(сценарий: &Сценарий<'_>) -> ReturnsReport {
     )
 }
 
-fn непринятые(report: &ReturnsReport) -> Vec<&MaterialIssue> {
+fn missing_postings(report: &ReturnsReport) -> Vec<&MaterialIssue> {
     report
         .data_quality
         .material_issues
@@ -358,7 +353,7 @@ fn непринятые(report: &ReturnsReport) -> Vec<&MaterialIssue> {
         .collect()
 }
 
-fn недоказуемые(report: &ReturnsReport) -> Vec<&MaterialIssue> {
+fn unverifiable_postings(report: &ReturnsReport) -> Vec<&MaterialIssue> {
     report
         .data_quality
         .material_issues
@@ -374,7 +369,7 @@ fn недоказуемые(report: &ReturnsReport) -> Vec<&MaterialIssue> {
 }
 
 /// Вердикт сверки: обе её проблемы в порядке отчёта.
-fn вердикт(report: &ReturnsReport) -> Vec<MaterialIssue> {
+fn verdict(report: &ReturnsReport) -> Vec<MaterialIssue> {
     report
         .data_quality
         .material_issues
@@ -395,23 +390,26 @@ fn вердикт(report: &ReturnsReport) -> Vec<MaterialIssue> {
 ///
 /// Без этой проверки молчание сверки нельзя отличить от несостоявшегося
 /// сценария: отказ построения пропускает сверку целиком.
-fn поток_построен(report: &ReturnsReport) {
+fn assert_flow_built(report: &ReturnsReport) {
     assert!(
         !report.bond_metrics.is_empty(),
         "облигационная позиция не попала в отчёт: проверять нечего"
     );
-    for позиция in &report.bond_metrics {
+    for position in &report.bond_metrics {
         assert!(
-            matches!(позиция.scenarios[0].prospective.metrics, Computed::Value(_)),
+            matches!(
+                position.scenarios[0].prospective.metrics,
+                Computed::Value(_)
+            ),
             "поток не построен: {:?}",
-            позиция.scenarios[0].prospective.metrics
+            position.scenarios[0].prospective.metrics
         );
     }
 }
 
 /// Купонные даты, срок которых к дате отчёта уже прошёл: пять лет
 /// полугодовых выплат.
-const ПРОШЛЫЕ_КУПОНЫ: [Date; 10] = [
+const PAST_COUPON_DATES: [Date; 10] = [
     date!(2021 - 09 - 15),
     date!(2022 - 03 - 15),
     date!(2022 - 09 - 15),
@@ -425,18 +423,18 @@ const ПРОШЛЫЕ_КУПОНЫ: [Date; 10] = [
 ];
 
 /// График пятилетней бумаги: купоны и погашение без номинала.
-fn график_пятилетней_бумаги_без_номинала() -> BondSchedule {
-    let mut купоны = ПРОШЛЫЕ_КУПОНЫ.to_vec();
-    купоны.push(date!(2026 - 09 - 15));
-    купоны.push(date!(2027 - 03 - 15));
-    график(&купоны, &[(date!(2027 - 03 - 15), "100")])
+fn five_year_bond_schedule_without_face_value() -> BondSchedule {
+    let mut coupon_dates = PAST_COUPON_DATES.to_vec();
+    coupon_dates.push(date!(2026 - 09 - 15));
+    coupon_dates.push(date!(2027 - 03 - 15));
+    schedule(&coupon_dates, &[(date!(2027 - 03 - 15), "100")])
 }
 
 /// График пятилетней бумаги с номиналом из справочника выпуска.
-fn график_пятилетней_бумаги() -> BondSchedule {
-    let mut график = график_пятилетней_бумаги_без_номинала();
-    график.initial_principal = Some(за_единицу("1000"));
-    график
+fn five_year_bond_schedule() -> BondSchedule {
+    let mut schedule = five_year_bond_schedule_without_face_value();
+    schedule.initial_principal = Some(per_unit("1000"));
+    schedule
 }
 
 /// Пятилетняя история: покупка и купоны, пришедшие с задержкой
@@ -445,24 +443,19 @@ fn график_пятилетней_бумаги() -> BondSchedule {
 /// Сдвиг факта от плановой даты гуляет по всему разрешённому диапазону
 /// 1–7 дней: реальная выплата приходит не день в день, и тест обязан
 /// быть зелёным именно на таком журнале, а не на выдуманном идеальном.
-fn журнал_пятилетней_истории(
-    пропущенный: Option<Date>
-) -> Vec<Event> {
+fn five_year_journal(missing_date: Option<Date>) -> Vec<Event> {
     let mut events = vec![
-        пополнение(date!(2021 - 07 - 25), 1),
-        покупка(ДЕПОЗИТАРИЙ, date!(2021 - 08 - 01), 2),
+        cash_in(date!(2021 - 07 - 25), 1),
+        purchase(CUSTODY, date!(2021 - 08 - 01), 2),
     ];
-    let mut номер = 10;
-    for (индекс, дата) in ПРОШЛЫЕ_КУПОНЫ.iter().enumerate() {
-        if Some(*дата) == пропущенный {
+    let mut number = 10;
+    for (index, date) in PAST_COUPON_DATES.iter().enumerate() {
+        if Some(*date) == missing_date {
             continue;
         }
-        let сдвиг = i64::try_from(индекс % 7).expect("номер купона") + 1;
-        events.push(купон(
-            дата.saturating_add(Duration::days(сдвиг)),
-            номер,
-        ));
-        номер += 1;
+        let offset = i64::try_from(index % 7).expect("номер купона") + 1;
+        events.push(coupon(date.saturating_add(Duration::days(offset)), number));
+        number += 1;
     }
     events
 }
@@ -473,17 +466,17 @@ fn five_years_of_coupons_received_late_but_received_raise_no_alarm() {
     // на 1–7 дней — норма депозитарной цепочки, а не дефект, и если
     // такой журнал даёт хоть одну тревогу, сверка бесполезна: владелец
     // перестанет читать предупреждения на второй неделе.
-    let report = отчёт(&Сценарий {
-        события: &журнал_пятилетней_истории(None),
-        график: &график_пятилетней_бумаги(),
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let report = build_report(&Scenario {
+        events: &five_year_journal(None),
+        schedule: &five_year_bond_schedule(),
+        report_date: REPORT_DATE,
     });
 
-    поток_построен(&report);
+    assert_flow_built(&report);
     assert!(
-        вердикт(&report).is_empty(),
+        verdict(&report).is_empty(),
         "вердикт: {:?}",
-        вердикт(&report)
+        verdict(&report)
     );
 }
 
@@ -494,24 +487,24 @@ fn an_amortised_bond_closes_its_principal_returns_with_partial_redemptions() {
     // `PrincipalReturn` пока не несёт такого поля. Поэтому обе ветки
     // обязаны молчать именно об обвинении: без даты права нельзя объявить
     // возврат пропущенным, даже если факт возврата пришёл.
-    let график = график_с_номиналом(
+    let schedule = schedule_with_face_value(
         &[date!(2026 - 03 - 15), date!(2026 - 09 - 15)],
         &[(date!(2026 - 06 - 15), "50"), (date!(2026 - 09 - 15), "50")],
     );
-    let здоровый = vec![
-        пополнение(date!(2026 - 01 - 05), 1),
-        покупка(ДЕПОЗИТАРИЙ, date!(2026 - 01 - 10), 2),
-        купон(date!(2026 - 03 - 17), 3),
-        частичное_погашение(date!(2026 - 06 - 17), 4),
+    let healthy_events = vec![
+        cash_in(date!(2026 - 01 - 05), 1),
+        purchase(CUSTODY, date!(2026 - 01 - 10), 2),
+        coupon(date!(2026 - 03 - 17), 3),
+        partial_redemption(date!(2026 - 06 - 17), 4),
     ];
-    let проверить_недоказуемость = |report: &ReturnsReport| {
-        поток_построен(report);
+    let assert_unverifiable = |report: &ReturnsReport| {
+        assert_flow_built(report);
         assert!(
-            непринятые(report).is_empty(),
+            missing_postings(report).is_empty(),
             "без даты права нельзя объявлять возврат пропущенным: {:?}",
-            вердикт(report)
+            verdict(report)
         );
-        let issues = недоказуемые(report);
+        let issues = unverifiable_postings(report);
         assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
         assert!(
             matches!(
@@ -527,23 +520,23 @@ fn an_amortised_bond_closes_its_principal_returns_with_partial_redemptions() {
             issues[0]
         );
     };
-    let report = отчёт(&Сценарий {
-        события: &здоровый,
-        график: &график,
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let report = build_report(&Scenario {
+        events: &healthy_events,
+        schedule: &schedule,
+        report_date: REPORT_DATE,
     });
-    проверить_недоказуемость(&report);
+    assert_unverifiable(&report);
 
     // Тот же журнал без амортизационной выплаты: пока в модели нет даты
     // права для `PrincipalReturn`, отсутствие факта также нельзя назвать
     // пропуском — результат остаётся недоказуемым, а не обвинительным.
-    let без_амортизации: Vec<Event> = здоровый[..3].to_vec();
-    let report = отчёт(&Сценарий {
-        события: &без_амортизации,
-        график: &график,
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let without_amortisation: Vec<Event> = healthy_events[..3].to_vec();
+    let report = build_report(&Scenario {
+        events: &without_amortisation,
+        schedule: &schedule,
+        report_date: REPORT_DATE,
     });
-    проверить_недоказуемость(&report);
+    assert_unverifiable(&report);
 }
 
 #[test]
@@ -551,15 +544,15 @@ fn a_single_gap_in_the_middle_of_the_history_is_named_once_and_exactly() {
     // Пропуск в середине ряда — тот случай, ради которого сопоставление
     // сделано one-to-one: жадное сопоставление «любой факт закрывает
     // любую выплату» съело бы дыру соседними купонами и промолчало.
-    let пропущенный = date!(2023 - 09 - 15);
-    let report = отчёт(&Сценарий {
-        события: &журнал_пятилетней_истории(Some(пропущенный)),
-        график: &график_пятилетней_бумаги(),
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let missing_date = date!(2023 - 09 - 15);
+    let report = build_report(&Scenario {
+        events: &five_year_journal(Some(missing_date)),
+        schedule: &five_year_bond_schedule(),
+        report_date: REPORT_DATE,
     });
 
-    поток_построен(&report);
-    let issues = непринятые(&report);
+    assert_flow_built(&report);
+    let issues = missing_postings(&report);
     assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
     assert!(
         matches!(
@@ -569,32 +562,32 @@ fn a_single_gap_in_the_middle_of_the_history_is_named_once_and_exactly() {
                 instrument,
                 date,
                 kind: PostingKind::Coupon,
-            } if *account == СЧЁТ && *instrument == БУМАГА && *date == пропущенный
+            } if *account == ACCOUNT && *instrument == INSTRUMENT && *date == missing_date
         ),
         "проблема: {:?}",
         issues[0]
     );
-    assert!(недоказуемые(&report).is_empty());
+    assert!(unverifiable_postings(&report).is_empty());
 
     // Тот же вопрос ко всему ряду: изъятие любого из десяти купонов
     // обязано давать ровно одну проблему — свою. Без этого прохода
     // сверка могла бы проверять два-три купона из десяти, а остальные
     // молча пропускать, и первый тест файла всё равно был бы зелёным.
-    for пропущенный in ПРОШЛЫЕ_КУПОНЫ {
-        let report = отчёт(&Сценарий {
-            события: &журнал_пятилетней_истории(Some(пропущенный)),
-            график: &график_пятилетней_бумаги(),
-            дата_отчёта: ДАТА_ОТЧЁТА,
+    for missing_date in PAST_COUPON_DATES {
+        let report = build_report(&Scenario {
+            events: &five_year_journal(Some(missing_date)),
+            schedule: &five_year_bond_schedule(),
+            report_date: REPORT_DATE,
         });
-        let issues = непринятые(&report);
-        assert_eq!(issues.len(), 1, "купон {пропущенный}: {issues:?}");
+        let issues = missing_postings(&report);
+        assert_eq!(issues.len(), 1, "купон {missing_date}: {issues:?}");
         assert!(
             matches!(
                 issues[0],
                 MaterialIssue::ScheduledPostingNotReceived { date, .. }
-                    if *date == пропущенный
+                    if *date == missing_date
             ),
-            "купон {пропущенный}: {:?}",
+            "купон {missing_date}: {:?}",
             issues[0]
         );
     }
@@ -607,47 +600,47 @@ fn the_waiting_window_expires_exactly_twenty_one_days_after_the_scheduled_date()
     // тревога обязана быть. Граница проверяется тремя точками, потому
     // что сдвиг на день в любую сторону — это либо ложная тревога на
     // здоровой бумаге, либо молчание на пропущенной выплате.
-    let плановая = date!(2026 - 03 - 15);
-    let график = график_с_номиналом(
-        &[плановая, date!(2026 - 09 - 15)],
+    let scheduled_date = date!(2026 - 03 - 15);
+    let schedule = schedule_with_face_value(
+        &[scheduled_date, date!(2026 - 09 - 15)],
         &[(date!(2026 - 09 - 15), "100")],
     );
-    let события = vec![
-        пополнение(date!(2026 - 01 - 05), 1),
-        покупка(ДЕПОЗИТАРИЙ, date!(2026 - 01 - 10), 2),
+    let events = vec![
+        cash_in(date!(2026 - 01 - 05), 1),
+        purchase(CUSTODY, date!(2026 - 01 - 10), 2),
     ];
-    let на = |сдвиг: i64| {
-        отчёт(&Сценарий {
-            события: &события,
-            график: &график,
-            дата_отчёта: плановая.saturating_add(Duration::days(сдвиг)),
+    let as_of = |offset: i64| {
+        build_report(&Scenario {
+            events: &events,
+            schedule: &schedule,
+            report_date: scheduled_date.saturating_add(Duration::days(offset)),
         })
     };
 
-    let ещё_идёт = на(20);
-    поток_построен(&ещё_идёт);
+    let still_pending = as_of(20);
+    assert_flow_built(&still_pending);
     assert!(
-        вердикт(&ещё_идёт).is_empty(),
+        verdict(&still_pending).is_empty(),
         "на двадцатый день срок ещё идёт: {:?}",
-        вердикт(&ещё_идёт)
+        verdict(&still_pending)
     );
 
-    let истёк = на(21);
-    поток_построен(&истёк);
+    let expired = as_of(21);
+    assert_flow_built(&expired);
     assert_eq!(
-        непринятые(&истёк).len(),
+        missing_postings(&expired).len(),
         1,
         "проблемы: {:?}",
-        непринятые(&истёк)
+        missing_postings(&expired)
     );
 
-    let давно_истёк = на(22);
-    поток_построен(&давно_истёк);
+    let long_expired = as_of(22);
+    assert_flow_built(&long_expired);
     assert_eq!(
-        непринятые(&давно_истёк).len(),
+        missing_postings(&long_expired).len(),
         1,
         "проблемы: {:?}",
-        непринятые(&давно_истёк)
+        missing_postings(&long_expired)
     );
 }
 
@@ -656,27 +649,25 @@ fn the_waiting_window_expires_exactly_twenty_one_days_after_the_scheduled_date()
 /// Один депозитарий на весь журнал: иначе продажа списала бы бумагу
 /// оттуда, куда её не клали, и позиций стало бы три — тест проверял бы
 /// задвоение, а не границу владения.
-fn журнал_с_проданной_ранней_партией(
-    факты: &[Date]
-) -> Vec<Event> {
+fn journal_with_early_lot_sold(fact_dates: &[Date]) -> Vec<Event> {
     let mut events = vec![
-        пополнение(date!(2026 - 01 - 05), 1),
-        покупка(ДЕПОЗИТАРИЙ, date!(2026 - 01 - 10), 2),
-        покупка(ДЕПОЗИТАРИЙ, date!(2026 - 04 - 10), 3),
-        продажа(ДЕПОЗИТАРИЙ, date!(2026 - 07 - 10), 4),
+        cash_in(date!(2026 - 01 - 05), 1),
+        purchase(CUSTODY, date!(2026 - 01 - 10), 2),
+        purchase(CUSTODY, date!(2026 - 04 - 10), 3),
+        sale(CUSTODY, date!(2026 - 07 - 10), 4),
     ];
-    for (индекс, день) in факты.iter().enumerate() {
-        events.push(купон(
-            *день,
-            10 + u32::try_from(индекс).expect("номер факта"),
+    for (index, date) in fact_dates.iter().enumerate() {
+        events.push(coupon(
+            *date,
+            10 + u32::try_from(index).expect("номер факта"),
         ));
     }
     events
 }
 
 /// График бумаги с двумя прошедшими купонами и погашением в декабре.
-fn график_двух_купонов() -> BondSchedule {
-    график_с_номиналом(
+fn two_coupon_schedule() -> BondSchedule {
+    schedule_with_face_value(
         &[
             date!(2026 - 03 - 15),
             date!(2026 - 06 - 15),
@@ -693,16 +684,14 @@ fn a_coupon_missed_while_the_early_lot_was_held_is_named_after_it_was_sold() {
     // продажа январской партии подняла бы границу до апреля и спрятала
     // мартовский пропуск: владелец потерял бы деньги ровно там, где
     // сверка обязана его предупредить.
-    let report = отчёт(&Сценарий {
-        события: &журнал_с_проданной_ранней_партией(
-            &[date!(2026 - 06 - 16)],
-        ),
-        график: &график_двух_купонов(),
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let report = build_report(&Scenario {
+        events: &journal_with_early_lot_sold(&[date!(2026 - 06 - 16)]),
+        schedule: &two_coupon_schedule(),
+        report_date: REPORT_DATE,
     });
 
-    поток_построен(&report);
-    let issues = непринятые(&report);
+    assert_flow_built(&report);
+    let issues = missing_postings(&report);
     assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
     assert!(
         matches!(
@@ -719,20 +708,17 @@ fn a_coupon_missed_while_the_early_lot_was_held_is_named_after_it_was_sold() {
 fn two_purchases_with_a_complete_history_raise_no_alarm() {
     // Обратная сторона той же границы. Без этого теста границу можно
     // было бы «починить», объявив пропущенным всё подряд.
-    let report = отчёт(&Сценарий {
-        события: &журнал_с_проданной_ранней_партией(&[
-            date!(2026 - 03 - 16),
-            date!(2026 - 06 - 16),
-        ]),
-        график: &график_двух_купонов(),
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let report = build_report(&Scenario {
+        events: &journal_with_early_lot_sold(&[date!(2026 - 03 - 16), date!(2026 - 06 - 16)]),
+        schedule: &two_coupon_schedule(),
+        report_date: REPORT_DATE,
     });
 
-    поток_построен(&report);
+    assert_flow_built(&report);
     assert!(
-        вердикт(&report).is_empty(),
+        verdict(&report).is_empty(),
         "вердикт: {:?}",
-        вердикт(&report)
+        verdict(&report)
     );
 }
 
@@ -742,25 +728,25 @@ fn one_bond_in_two_custodies_reports_a_single_missing_coupon() {
     // (счёт, бумага) без него: одна и та же выплата иначе была бы
     // названа по разу на депозитарий, и владелец искал бы два пропуска
     // вместо одного.
-    let события = vec![
-        пополнение(date!(2026 - 01 - 05), 1),
-        покупка(ДЕПОЗИТАРИЙ, date!(2026 - 01 - 10), 2),
-        покупка(ДРУГОЙ_ДЕПОЗИТАРИЙ, date!(2026 - 01 - 11), 3),
-        купон(date!(2026 - 03 - 16), 4),
+    let events = vec![
+        cash_in(date!(2026 - 01 - 05), 1),
+        purchase(CUSTODY, date!(2026 - 01 - 10), 2),
+        purchase(OTHER_CUSTODY, date!(2026 - 01 - 11), 3),
+        coupon(date!(2026 - 03 - 16), 4),
     ];
-    let report = отчёт(&Сценарий {
-        события: &события,
-        график: &график_двух_купонов(),
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let report = build_report(&Scenario {
+        events: &events,
+        schedule: &two_coupon_schedule(),
+        report_date: REPORT_DATE,
     });
 
-    поток_построен(&report);
+    assert_flow_built(&report);
     assert_eq!(
         report.bond_metrics.len(),
         2,
         "позиций должно быть две, иначе тест ничего не доказывает"
     );
-    let issues = непринятые(&report);
+    let issues = missing_postings(&report);
     assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
     assert!(
         matches!(
@@ -780,18 +766,17 @@ fn one_bond_in_two_custodies_reports_a_single_missing_coupon() {
 /// невоспроизводимым. Константы — общеизвестные множитель и приращение
 /// LCG (Кнут); их качество здесь роли не играет, важна лишь
 /// повторяемость от прогона к прогону.
-fn переставленный(события: &[Event], семя: u64) -> Vec<Event> {
-    let mut порядок = события.to_vec();
-    let mut состояние = семя;
-    for индекс in (1..порядок.len()).rev() {
-        состояние = состояние
+fn shuffled(events: &[Event], seed: u64) -> Vec<Event> {
+    let mut order = events.to_vec();
+    let mut state = seed;
+    for index in (1..order.len()).rev() {
+        state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        let выбор =
-            usize::try_from(состояние >> 33).expect("старшие разряды семени") % (индекс + 1);
-        порядок.swap(индекс, выбор);
+        let choice = usize::try_from(state >> 33).expect("старшие разряды семени") % (index + 1);
+        order.swap(index, choice);
     }
-    порядок
+    order
 }
 
 #[test]
@@ -808,44 +793,48 @@ fn the_verdict_does_not_depend_on_the_order_of_the_journal() {
     // журнале у каждого свой, поэтому `EffectiveOrder` задаёт полный
     // порядок и действующий набор от перестановки не зависит по
     // построению. Журнал с исправлениями так переставлять нельзя.
-    let события = журнал_пятилетней_истории(Some(date!(2023 - 09 - 15)));
-    let эталон = вердикт(&отчёт(&Сценарий {
-        события: &события,
-        график: &график_пятилетней_бумаги(),
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let events = five_year_journal(Some(date!(2023 - 09 - 15)));
+    let baseline_verdict = verdict(&build_report(&Scenario {
+        events: &events,
+        schedule: &five_year_bond_schedule(),
+        report_date: REPORT_DATE,
     }));
-    assert_eq!(эталон.len(), 1, "вердикт эталона: {эталон:?}");
+    assert_eq!(
+        baseline_verdict.len(),
+        1,
+        "вердикт эталона: {baseline_verdict:?}"
+    );
 
     // Тасование обязано что-то переставлять: свойство, проверенное на
     // тождественной перестановке, не проверяет ничего.
-    let mut порядок_менялся = false;
-    for семя in 1..=32_u64 {
-        let переставленные = переставленный(&события, семя);
-        порядок_менялся |= переставленные != события;
-        let вердикт_перестановки = вердикт(&отчёт(&Сценарий {
-            события: &переставленные,
-            график: &график_пятилетней_бумаги(),
-            дата_отчёта: ДАТА_ОТЧЁТА,
+    let mut order_changed = false;
+    for seed in 1..=32_u64 {
+        let shuffled_events = shuffled(&events, seed);
+        order_changed |= shuffled_events != events;
+        let shuffled_verdict = verdict(&build_report(&Scenario {
+            events: &shuffled_events,
+            schedule: &five_year_bond_schedule(),
+            report_date: REPORT_DATE,
         }));
         assert_eq!(
-            вердикт_перестановки, эталон,
-            "перестановка с семенем {семя} изменила вердикт"
+            shuffled_verdict, baseline_verdict,
+            "перестановка с семенем {seed} изменила вердикт"
         );
     }
 
-    assert!(порядок_менялся, "тасование не переставило ни один журнал");
+    assert!(order_changed, "тасование не переставило ни один журнал");
 
     // Обратный порядок — не случайная перестановка, а самый вероятный
     // способ прочитать выгрузку брокера задом наперёд.
-    let mut обратный = события.clone();
-    обратный.reverse();
+    let mut reversed_events = events.clone();
+    reversed_events.reverse();
     assert_eq!(
-        вердикт(&отчёт(&Сценарий {
-            события: &обратный,
-            график: &график_пятилетней_бумаги(),
-            дата_отчёта: ДАТА_ОТЧЁТА,
+        verdict(&build_report(&Scenario {
+            events: &reversed_events,
+            schedule: &five_year_bond_schedule(),
+            report_date: REPORT_DATE,
         })),
-        эталон,
+        baseline_verdict,
         "обратный порядок изменил вердикт"
     );
 }
@@ -856,19 +845,24 @@ fn projecting_the_same_journal_twice_gives_the_same_verdict() {
     // состояние и тот же отчёт. Сверяется и отпечаток состояния, и
     // отпечаток входов отчёта, и сам вердикт: сверка читает состояние,
     // а не журнал, и разойтись они могут порознь.
-    let события = журнал_пятилетней_истории(Some(date!(2024 - 03 - 15)));
-    let сценарий = Сценарий {
-        события: &события,
-        график: &график_пятилетней_бумаги(),
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let events = five_year_journal(Some(date!(2024 - 03 - 15)));
+    let scenario = Scenario {
+        events: &events,
+        schedule: &five_year_bond_schedule(),
+        report_date: REPORT_DATE,
     };
 
-    let первый = отчёт(&сценарий);
-    let второй = отчёт(&сценарий);
+    let first_report = build_report(&scenario);
+    let second_report = build_report(&scenario);
 
-    assert_eq!(вердикт(&первый).len(), 1, "вердикт: {:?}", вердикт(&первый));
-    assert_eq!(вердикт(&первый), вердикт(&второй));
-    assert_eq!(первый.inputs_hash, второй.inputs_hash);
+    assert_eq!(
+        verdict(&first_report).len(),
+        1,
+        "вердикт: {:?}",
+        verdict(&first_report)
+    );
+    assert_eq!(verdict(&first_report), verdict(&second_report));
+    assert_eq!(first_report.inputs_hash, second_report.inputs_hash);
 }
 
 #[test]
@@ -877,14 +871,14 @@ fn without_the_face_value_the_reconciliation_still_runs() {
     // (`iaam-d8b.15`), из-за чего сверка молчала на всех реальных данных.
     // Историческое прошлое теперь строится прямо из графика и обязано
     // назвать пропущенный купон даже при неизвестном номинале.
-    let события = журнал_пятилетней_истории(Some(date!(2023 - 09 - 15)));
-    let report = отчёт(&Сценарий {
-        события: &события,
-        график: &график_пятилетней_бумаги_без_номинала(),
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let events = five_year_journal(Some(date!(2023 - 09 - 15)));
+    let report = build_report(&Scenario {
+        events: &events,
+        schedule: &five_year_bond_schedule_without_face_value(),
+        report_date: REPORT_DATE,
     });
 
-    let issues = непринятые(&report);
+    let issues = missing_postings(&report);
     assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
     assert!(
         matches!(
@@ -899,9 +893,9 @@ fn without_the_face_value_the_reconciliation_still_runs() {
         issues[0]
     );
     assert!(
-        недоказуемые(&report).is_empty(),
+        unverifiable_postings(&report).is_empty(),
         "известное владение не должно стать недоказуемостью: {:?}",
-        вердикт(&report)
+        verdict(&report)
     );
 }
 
@@ -910,21 +904,21 @@ fn a_source_without_settlement_dates_cannot_accuse_anyone() {
     // Источник, не сообщающий даты перехода прав, делает владение
     // недоказуемым. Система обязана признаться, а не угадать: обвинение
     // требует доказательства, признание незнания — нет.
-    let события = vec![
-        пополнение(date!(2026 - 01 - 05), 1),
-        покупка_без_даты_расчётов(ДЕПОЗИТАРИЙ, date!(2026 - 01 - 10), 2),
+    let events = vec![
+        cash_in(date!(2026 - 01 - 05), 1),
+        purchase_without_settlement_date(CUSTODY, date!(2026 - 01 - 10), 2),
     ];
-    let график = график(
+    let schedule = schedule(
         &[date!(2026 - 03 - 15), date!(2026 - 12 - 15)],
         &[(date!(2026 - 12 - 15), "100")],
     );
-    let report = отчёт(&Сценарий {
-        события: &события,
-        график: &график,
-        дата_отчёта: ДАТА_ОТЧЁТА,
+    let report = build_report(&Scenario {
+        events: &events,
+        schedule: &schedule,
+        report_date: REPORT_DATE,
     });
 
-    let issues = недоказуемые(&report);
+    let issues = unverifiable_postings(&report);
     assert_eq!(issues.len(), 1, "проблемы: {issues:?}");
     assert!(
         matches!(
@@ -940,8 +934,8 @@ fn a_source_without_settlement_dates_cannot_accuse_anyone() {
         issues[0]
     );
     assert!(
-        непринятые(&report).is_empty(),
+        missing_postings(&report).is_empty(),
         "без доказанного владения нельзя обвинять в пропуске: {:?}",
-        вердикт(&report)
+        verdict(&report)
     );
 }

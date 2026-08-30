@@ -234,7 +234,7 @@ async fn report_values_position_from_market_observation() {
 }
 
 #[tokio::test]
-async fn противоречивая_цена_делает_непокрытой_только_свою_позицию() {
+async fn contradictory_price_leaves_only_its_position_uncovered() {
     let services = services();
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();

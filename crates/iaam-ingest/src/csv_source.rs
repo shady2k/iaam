@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn пространство_без_даты_принимает_единственный_псевдоним() {
+    fn namespace_without_date_accepts_single_alias() {
         let instrument = InstrumentId::new_random();
         let mut aliases = BTreeMap::new();
         aliases.insert(
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn пространство_без_даты_отвергает_код_из_другого_пространства() {
+    fn namespace_without_date_rejects_code_from_other_namespace() {
         let instrument = InstrumentId::new_random();
         let mut aliases = BTreeMap::new();
         aliases.insert(
@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn пространство_без_даты_отвергает_несколько_псевдонимов_с_причиной() {
+    fn namespace_without_date_rejects_multiple_aliases_with_reason() {
         let first = InstrumentId::new_random();
         let second = InstrumentId::new_random();
         let mut aliases = BTreeMap::new();
@@ -751,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn пространство_с_датой_отличает_неработающий_код_от_неоднозначного() {
+    fn dated_namespace_distinguishes_unknown_code_from_ambiguous_code() {
         let instrument = InstrumentId::new_random();
         let mut aliases = BTreeMap::new();
         aliases.insert(

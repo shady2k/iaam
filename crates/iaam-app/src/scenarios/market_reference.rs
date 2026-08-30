@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn мигрированная_строка_unknown_без_признака_остаётся_витриной() {
+    fn migrated_row_without_basis_remains_a_view() {
         let view = price_view(
             PriceRow {
                 instrument_id: Uuid::nil().to_string(),
@@ -404,7 +404,7 @@ mod tests {
         assert!(view.basis_evidence.is_empty());
     }
     #[test]
-    fn совпадающее_основание_имеет_статус_доказано() {
+    fn matching_basis_has_proven_status() {
         let view = price_view(
             price_row(
                 "percent_of_remaining_face",
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn противоречащее_основание_имеет_статус_противоречит() {
+    fn contradictory_basis_has_contradicts_status() {
         let view = price_view(
             price_row("money_per_unit", "iss:engines/stock/markets/bonds"),
             None,
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn отсутствие_доказательства_имеет_статус_не_доказано() {
+    fn missing_evidence_has_not_proven_status() {
         let view =
             price_view(price_row("money_per_unit", "test:market"), None).expect("строка цены");
 

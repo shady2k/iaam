@@ -707,7 +707,7 @@ fn an_expired_lease_is_replaced_and_old_token_cannot_finish() {
 }
 
 #[test]
-fn цена_выбирает_последнюю_торговую_дату_а_затем_знание() {
+fn price_uses_latest_trade_date_then_knowledge() {
     let (mut store, instrument) = store_with_instrument();
     let old_day = store
         .begin_run(
@@ -788,7 +788,7 @@ fn цена_выбирает_последнюю_торговую_дату_а_з�
 }
 
 #[test]
-fn нкд_выбирает_последнюю_торговую_дату_а_затем_знание() {
+fn accrued_interest_uses_latest_trade_date_then_knowledge() {
     let (mut store, instrument) = store_with_instrument();
     let old_day = store
         .begin_run(
@@ -861,7 +861,7 @@ fn нкд_выбирает_последнюю_торговую_дату_а_за�
 }
 
 #[test]
-fn уточнение_внутри_торговой_даты_побеждает_для_цены_и_нкд() {
+fn same_day_observation_wins_for_price_and_accrued_interest() {
     let (mut store, instrument) = store_with_instrument();
     let first_price = store
         .begin_run(
@@ -1010,7 +1010,7 @@ fn уточнение_внутри_торговой_даты_побеждает_
 }
 
 #[test]
-fn наблюдение_после_координаты_знания_не_видно() {
+fn observation_after_knowledge_coordinate_is_hidden() {
     let (mut store, instrument) = store_with_instrument();
     let run = store
         .begin_run(
@@ -1117,7 +1117,7 @@ fn the_quotation_basis_survives_a_round_trip_through_every_read_path() {
 }
 
 #[test]
-fn граница_полноты_доступна_на_момент_знания_и_не_раньше() {
+fn completeness_boundary_is_available_at_knowledge_time_and_not_earlier() {
     let (mut store, _) = store_with_instrument();
     let series = series("SBER:TQBR:1");
     let run = store
@@ -1165,7 +1165,7 @@ fn граница_полноты_доступна_на_момент_знания
 }
 
 #[test]
-fn курсы_возвращаются_ровно_в_заданном_окне_и_на_момент_знания() {
+fn fx_rates_are_returned_only_within_window_and_at_knowledge_time() {
     let (mut store, _) = store_with_instrument();
     let series = series_with_dataset("fx", "USD/RUB");
     let run = store
@@ -1229,7 +1229,7 @@ fn курсы_возвращаются_ровно_в_заданном_окне_�
 }
 
 #[test]
-fn ключевые_ставки_возвращаются_ровно_до_границы_торговой_даты_и_знания() {
+fn key_rates_are_returned_only_through_trade_and_knowledge_boundaries() {
     let (mut store, _) = store_with_instrument();
     let series = series_with_dataset("key-rate", "CBR");
     let run = store

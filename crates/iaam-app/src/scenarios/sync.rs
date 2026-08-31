@@ -5,7 +5,7 @@
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::{BrokerChannel, Principal, Recorded};
+use crate::ports::{BrokerChannel, PortfolioAsOf, Principal, Recorded};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
@@ -31,6 +31,22 @@ use sha2::{Digest, Sha256};
 use time::Date;
 use time::OffsetDateTime;
 
+/// Why no control assertion was recorded, when none was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionsWithheld {
+    /// The current portfolio does not describe any day in the requested interval.
+    PortfolioDescribesAnotherDay { as_of: Date },
+}
+
+impl AssertionsWithheld {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::PortfolioDescribesAnotherDay { .. } => "portfolio_describes_another_day",
+        }
+    }
+}
+
 /// Result of synchronising one channel for one interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
@@ -38,6 +54,7 @@ pub struct SyncOutcome {
     pub duplicates: usize,
     pub possible_duplicates: usize,
     pub assertions: usize,
+    pub assertions_withheld: Option<AssertionsWithheld>,
 }
 
 /// Retrieves the broker's operations and portfolio and records new facts.
@@ -162,15 +179,34 @@ pub async fn sync_broker(
             duplicates,
             possible_duplicates,
             assertions: 0,
+            assertions_withheld: None,
         });
     }
 
-    let claims = broker
+    let snapshot = broker
         .fetch_portfolio(account, to)
         .await
         .map_err(broker_error)?;
+    let assertions_withheld = match snapshot.as_of {
+        PortfolioAsOf::Requested => None,
+        PortfolioAsOf::Current => {
+            let as_of = services.clock.today();
+            (!((from..=to).contains(&as_of)))
+                .then_some(AssertionsWithheld::PortfolioDescribesAnotherDay { as_of })
+        }
+    };
+    if assertions_withheld.is_some() {
+        return Ok(SyncOutcome {
+            recorded,
+            duplicates,
+            possible_duplicates,
+            assertions: 0,
+            assertions_withheld,
+        });
+    }
+
     let mut assertions = 0;
-    for (index, claim) in claims.into_iter().enumerate() {
+    for (index, claim) in snapshot.claims.into_iter().enumerate() {
         let event = assertion_event(
             AssertionTarget {
                 owner: principal.owner,
@@ -209,6 +245,7 @@ pub async fn sync_broker(
         duplicates,
         possible_duplicates,
         assertions,
+        assertions_withheld: None,
     })
 }
 

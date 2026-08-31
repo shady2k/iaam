@@ -19,7 +19,6 @@ use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::trade_allocation::{
     allocate_minor as core_allocate_minor, check_order_completeness,
@@ -30,7 +29,9 @@ use iaam_ingest::operation::{OperationDates, OperationKind};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::ports::{BrokerChannel, BrokerError, ParsedOperations, Quarantined};
+use crate::ports::{
+    BrokerChannel, BrokerError, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Quarantined,
+};
 
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
@@ -87,13 +88,13 @@ impl BrokerChannel for TinkoffChannel {
         &self,
         account: AccountId,
         _at: time::Date,
-    ) -> Result<Vec<ControlClaim>, BrokerError> {
+    ) -> Result<PortfolioSnapshot, BrokerError> {
         let body = self
             .client
             .get_portfolio(&account.inner().to_string())
             .await
             .map_err(tinkoff_error)?;
-        parse_portfolio(&body).map_err(parse_error)
+        adapt_portfolio(&body)
     }
 
     fn channel(&self) -> SourceChannel {
@@ -107,6 +108,15 @@ impl BrokerChannel for TinkoffChannel {
     fn identity_scope(&self) -> IdentityScope {
         IdentityScope::Account
     }
+}
+
+fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
+    parse_portfolio(body)
+        .map(|claims| PortfolioSnapshot {
+            as_of: PortfolioAsOf::Current,
+            claims,
+        })
+        .map_err(parse_error)
 }
 
 async fn fetch_operation_pages<F, Fut>(
@@ -755,8 +765,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        GetOperationsByCursorRequest, Quarantined, adapt_operations, fetch_operation_pages,
-        operation_to_submitted, order_state_reason, rfc3339_operation_end,
+        GetOperationsByCursorRequest, PortfolioAsOf, Quarantined, adapt_operations,
+        adapt_portfolio, fetch_operation_pages, operation_to_submitted, order_state_reason,
+        rfc3339_operation_end,
     };
     use iaam_broker::operation_kind::OperationKindDictionary;
 
@@ -1684,6 +1695,16 @@ mod tests {
         });
 
         assert_eq!(trade_custody, claim_custody);
+    }
+
+    #[test]
+    fn t_invest_portfolio_answers_with_current_date_semantics() {
+        let snapshot = adapt_portfolio(include_str!(
+            "../../../../tests/fixtures/api/tinkoff-portfolio.json"
+        ))
+        .expect("portfolio adaptation");
+
+        assert_eq!(snapshot.as_of, PortfolioAsOf::Current);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use iaam_app::ingest::dedup::IdentityScope;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
-    ParsedOperations, TokenAdmin, UnavailableOutboundHttp,
+    ParsedOperations, PortfolioAsOf, PortfolioSnapshot, TokenAdmin, UnavailableOutboundHttp,
 };
 use iaam_app::storage::SqliteStore;
 use iaam_app::storage::{
@@ -91,8 +91,11 @@ impl BrokerChannel for EmptyChannel {
         &self,
         _account: AccountId,
         _at: Date,
-    ) -> Result<Vec<iaam_core::reconciliation::claim::ControlClaim>, BrokerError> {
-        Ok(Vec::new())
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        Ok(PortfolioSnapshot {
+            as_of: PortfolioAsOf::Current,
+            claims: Vec::new(),
+        })
     }
 
     fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
@@ -139,8 +142,11 @@ impl BrokerChannel for PopulatedChannel {
         &self,
         _account: AccountId,
         _at: Date,
-    ) -> Result<Vec<iaam_core::reconciliation::claim::ControlClaim>, BrokerError> {
-        Ok(Vec::new())
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        Ok(PortfolioSnapshot {
+            as_of: PortfolioAsOf::Current,
+            claims: Vec::new(),
+        })
     }
 
     fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {

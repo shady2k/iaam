@@ -553,6 +553,27 @@ pub struct ParsedOperations {
     pub quarantined: Vec<Quarantined>,
 }
 
+/// What a channel's portfolio answer describes.
+///
+/// A channel that can only report its present holdings must say so rather
+/// than accept a date it will ignore: the caller records the answer as a
+/// fact, and a fact dated by the question rather than by the answer is
+/// false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortfolioAsOf {
+    /// The channel answered for the date that was requested.
+    Requested,
+    /// The channel reports its current portfolio, whatever was requested.
+    Current,
+}
+
+/// Portfolio claims together with the date semantics of the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortfolioSnapshot {
+    pub as_of: PortfolioAsOf,
+    pub claims: Vec<ControlClaim>,
+}
+
 /// Broker channel: a second way to obtain the same data.
 ///
 /// It exists to ensure independence (§10.3): a match between the parsed
@@ -574,7 +595,7 @@ pub trait BrokerChannel: Send + Sync {
         to: Date,
     ) -> Result<ParsedOperations, BrokerError>;
 
-    /// Control values as at a date: balances and quantities.
+    /// Portfolio claims for the requested account and their date semantics.
     ///
     /// Returns the source's assertions, not a calculation: the values calculated
     /// from the journal are subsequently reconciled against them.
@@ -582,7 +603,7 @@ pub trait BrokerChannel: Send + Sync {
         &self,
         account: AccountId,
         at: Date,
-    ) -> Result<Vec<ControlClaim>, BrokerError>;
+    ) -> Result<PortfolioSnapshot, BrokerError>;
 
     /// Exactly how the data was obtained. The parser version and absence
     /// of a document are what the channel's independence is derived from.

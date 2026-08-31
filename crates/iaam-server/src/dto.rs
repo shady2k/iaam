@@ -3165,6 +3165,15 @@ pub struct BrokerSyncRequest {
     pub to: Date,
 }
 
+/// Why a broker synchronisation withheld control assertions.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AssertionsWithheldDto {
+    pub code: String,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub as_of: Date,
+}
+
 /// Broker channel synchronisation result.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SyncOutcomeDto {
@@ -3172,6 +3181,8 @@ pub struct SyncOutcomeDto {
     pub duplicates: usize,
     pub possible_duplicates: usize,
     pub assertions: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assertions_withheld: Option<AssertionsWithheldDto>,
 }
 
 impl SyncOutcomeDto {
@@ -3187,6 +3198,14 @@ impl SyncOutcomeDto {
             duplicates: outcome.duplicates,
             possible_duplicates: outcome.possible_duplicates,
             assertions: outcome.assertions,
+            assertions_withheld: outcome.assertions_withheld.map(|withheld| match withheld {
+                iaam_app::sync::AssertionsWithheld::PortfolioDescribesAnotherDay { as_of } => {
+                    AssertionsWithheldDto {
+                        code: withheld.code().to_owned(),
+                        as_of,
+                    }
+                }
+            }),
         }
     }
 }

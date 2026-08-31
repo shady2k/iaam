@@ -3,8 +3,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
-use iaam_app::ports::{BrokerChannel, BrokerError, Clock, ParsedOperations, Principal, Scope};
-use iaam_app::sync::sync_broker;
+use iaam_app::ports::{
+    BrokerChannel, BrokerError, Clock, ParsedOperations, PortfolioAsOf, PortfolioSnapshot,
+    Principal, Scope,
+};
+use iaam_app::sync::{AssertionsWithheld, sync_broker};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance};
@@ -34,7 +37,7 @@ struct FakeBroker {
     source: SourceChannel,
     identity_scope: IdentityScope,
     operations: Result<ParsedOperations, BrokerError>,
-    portfolio: Result<Vec<ControlClaim>, BrokerError>,
+    portfolio: Result<PortfolioSnapshot, BrokerError>,
 }
 
 #[async_trait]
@@ -52,7 +55,7 @@ impl BrokerChannel for FakeBroker {
         &self,
         _account: AccountId,
         _at: Date,
-    ) -> Result<Vec<ControlClaim>, BrokerError> {
+    ) -> Result<PortfolioSnapshot, BrokerError> {
         self.portfolio.clone()
     }
 
@@ -74,6 +77,10 @@ fn principal(owner: OwnerId) -> Principal {
 }
 
 fn services() -> AppServices {
+    services_at(date!(2026 - 03 - 31))
+}
+
+fn services_at(today: Date) -> AppServices {
     let adapter = Arc::new(SqliteAdapter::new(
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}")),
     ));
@@ -82,7 +89,7 @@ fn services() -> AppServices {
         adapter.clone(),
         adapter.clone(),
         adapter,
-        Arc::new(FixedClock(date!(2026 - 04 - 01))),
+        Arc::new(FixedClock(today)),
     )
 }
 
@@ -178,11 +185,14 @@ fn api(_account: AccountId, source: SourceId, operation: SubmittedOperation) -> 
             accepted: vec![operation],
             quarantined: Vec::new(),
         }),
-        portfolio: Ok(vec![ControlClaim::CashBalance {
-            currency: CurrencyCode::Rub,
-            amount: PostedMinor::new(-10_000),
-            at: BalancePoint::Closing,
-        }]),
+        portfolio: Ok(PortfolioSnapshot {
+            as_of: PortfolioAsOf::Current,
+            claims: vec![ControlClaim::CashBalance {
+                currency: CurrencyCode::Rub,
+                amount: PostedMinor::new(-10_000),
+                at: BalancePoint::Closing,
+            }],
+        }),
     }
 }
 
@@ -246,7 +256,10 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
             accepted: vec![operation],
             quarantined: Vec::new(),
         }),
-        portfolio: Ok(Vec::new()),
+        portfolio: Ok(PortfolioSnapshot {
+            as_of: PortfolioAsOf::Current,
+            claims: Vec::new(),
+        }),
     };
 
     let first = sync_broker(
@@ -321,6 +334,7 @@ async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
         Some(Verdict::Duplicate { existing: id }) if *id == existing.id
     ));
     assert_eq!(outcome.assertions, 1);
+    assert_eq!(outcome.assertions_withheld, None);
     let events = load(&services, owner).await;
     assert_eq!(
         events
@@ -791,5 +805,92 @@ async fn out_of_interval_trade_fact_is_recorded_without_a_control_assertion() {
         !events
             .iter()
             .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
+    );
+}
+
+#[tokio::test]
+async fn a_current_portfolio_is_withheld_when_interval_ends_before_clock_date() {
+    let services = services_at(date!(2026 - 04 - 01));
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("past sync: {error}"));
+
+    assert_eq!(outcome.assertions, 0);
+    assert_eq!(
+        outcome.assertions_withheld,
+        Some(AssertionsWithheld::PortfolioDescribesAnotherDay {
+            as_of: date!(2026 - 04 - 01)
+        })
+    );
+    assert_eq!(
+        outcome.assertions_withheld.map(|withheld| withheld.code()),
+        Some("portfolio_describes_another_day"),
+    );
+    let events = load_all(&services, owner).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Trade { .. })),
+        "operation facts remain recordable"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. })),
+        "a portfolio from another day must not become an assertion"
+    );
+}
+
+#[tokio::test]
+async fn a_requested_portfolio_is_recorded_for_its_requested_interval() {
+    let services = services_at(date!(2026 - 04 - 01));
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let mut broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+    broker.portfolio.as_mut().expect("portfolio").as_of = PortfolioAsOf::Requested;
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("historical sync: {error}"));
+
+    assert_eq!(outcome.assertions, 1);
+    assert_eq!(outcome.assertions_withheld, None);
+    let events = load_all(&services, owner).await;
+    let assertion_period = events.iter().find_map(|event| match event.kind {
+        EventKind::ControlAssertion { period, .. } => Some(period),
+        _ => None,
+    });
+    assert_eq!(
+        assertion_period,
+        Some(
+            AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+                .expect("requested interval"),
+        )
     );
 }

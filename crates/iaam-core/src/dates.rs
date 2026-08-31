@@ -121,13 +121,38 @@ impl EventDates {
 
 /// Deterministic event order.
 ///
-/// When dates are equal, `sequence`, not import order, determines the order—
-/// otherwise the projection would depend on the order in which files were
-/// loaded and the determinism invariant (§15.3) would fail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Within a day, source times are ordered before events without a source time.
+/// An event the source dated to a day but not to a moment is a fact observed
+/// *over* that day, so it settles after the moments that are actually known.
+/// This is a chosen convention, not a derived time: §4.9 forbids inventing a
+/// time for an event that has none, and this ordering is the consequence of
+/// not inventing one. `sequence` remains the technical insertion tie-break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EffectiveOrder {
     date: Date,
+    #[serde(default)]
+    source_time: Option<time::Time>,
     sequence: u32,
+}
+
+impl PartialOrd for EffectiveOrder {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EffectiveOrder {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.date
+            .cmp(&other.date)
+            .then_with(|| match (self.source_time, other.source_time) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
 }
 
 impl EffectiveOrder {
@@ -137,12 +162,32 @@ impl EffectiveOrder {
     /// field declaration order, which the tests check.
     #[must_use]
     pub const fn new(date: Date, sequence: u32) -> Self {
-        Self { date, sequence }
+        Self {
+            date,
+            source_time: None,
+            sequence,
+        }
+    }
+
+    /// Construct an order with the source's time-of-day and a technical
+    /// insertion tie-break.
+    #[must_use]
+    pub const fn with_source_time(date: Date, source_time: time::Time, sequence: u32) -> Self {
+        Self {
+            date,
+            source_time: Some(source_time),
+            sequence,
+        }
     }
 
     #[must_use]
     pub const fn date(&self) -> Date {
         self.date
+    }
+
+    #[must_use]
+    pub const fn source_time(&self) -> Option<time::Time> {
+        self.source_time
     }
 
     #[must_use]
@@ -238,5 +283,34 @@ mod tests {
         let earlier_high_seq = EffectiveOrder::new(date!(2026 - 03 - 01), 99);
         let later_low_seq = EffectiveOrder::new(date!(2026 - 03 - 02), 0);
         assert!(earlier_high_seq < later_low_seq);
+    }
+    #[test]
+    fn timed_events_sort_by_source_time_before_sequence() {
+        let day = date!(2026 - 03 - 01);
+        let late =
+            EffectiveOrder::with_source_time(day, time::Time::from_hms(12, 0, 0).unwrap(), 0);
+        let early =
+            EffectiveOrder::with_source_time(day, time::Time::from_hms(9, 0, 0).unwrap(), 99);
+        assert!(early < late);
+    }
+
+    #[test]
+    fn timed_events_sort_before_untimed_events() {
+        let day = date!(2026 - 03 - 01);
+        let timed =
+            EffectiveOrder::with_source_time(day, time::Time::from_hms(23, 59, 59).unwrap(), 99);
+        let untimed = EffectiveOrder::new(day, 0);
+        assert!(timed < untimed);
+    }
+
+    #[test]
+    fn old_effective_order_payload_defaults_to_untimed() {
+        let day = date!(2026 - 03 - 01);
+        let value = serde_json::to_value(EffectiveOrder::new(day, 7)).unwrap();
+        let mut object = value.as_object().unwrap().clone();
+        object.remove("source_time");
+        let restored: EffectiveOrder = serde_json::from_value(object.into()).unwrap();
+        assert_eq!(restored, EffectiveOrder::new(day, 7));
+        assert_eq!(restored.source_time(), None);
     }
 }

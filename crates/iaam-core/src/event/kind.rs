@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::corporate_action::CorporateAction;
 use super::offer::OfferExerciseAction;
 use crate::ids::{AccountId, InstrumentId, TransferId};
-use crate::money::{CurrencyCode, Money, Quantity};
+use crate::money::{CalcMoney, CurrencyCode, Money, Quantity};
 use crate::numeric::decimal::Dec;
 use crate::reconciliation::claim::{AssertionPeriod, ControlClaim};
 use crate::valuation::PriceQuality;
@@ -138,6 +138,12 @@ pub enum EventKind {
         quantity: Quantity,
         gross: Money,
         fee: Option<Money>,
+        /// Posted basis-only fee; unlike `fee`, it is absent from the cash leg.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis_fee: Option<Money>,
+        /// Exact source commission retained for audit of `basis_fee` rounding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis_fee_exact: Option<CalcMoney>,
         /// Accrued coupon interest paid to the seller or received from the buyer (§7.2).
         accrued_interest: Option<Money>,
     },
@@ -415,6 +421,8 @@ mod tests {
             gross: rub(5_000_000),
             fee: None,
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         }
     }
 
@@ -544,6 +552,8 @@ mod tests {
             gross: rub(5_000_000),
             fee: None,
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         };
         assert_eq!(kind.flow_endpoints(), FlowEndpoints::WithinAccount);
     }

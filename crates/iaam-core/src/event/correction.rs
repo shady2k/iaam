@@ -97,8 +97,8 @@ pub fn resolve(events: &[Event]) -> Result<Vec<&Event>, CorrectionError> {
         .filter(|e| !matches!(e.relation, Relation::Reversal { .. }))
         .collect();
 
-    // 4. Stable sort: EffectiveOrder determines order; identifiers break ties.
-    effective.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
+    // Source times order known moments first; raw hashes reproduce equal-time ties.
+    effective.sort_by(|left, right| crate::event::compare_for_replay(left, right));
 
     Ok(effective)
 }

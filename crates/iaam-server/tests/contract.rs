@@ -15,6 +15,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
+use iaam_app::ingest::dedup::IdentityScope;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
@@ -97,6 +98,10 @@ impl BrokerChannel for EmptyChannel {
     fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
         self.source.clone()
     }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Source
+    }
 }
 
 struct PopulatedChannel {
@@ -122,6 +127,7 @@ impl BrokerChannel for PopulatedChannel {
                     cash_posted: Some(date!(2025 - 01 - 01)),
                     ..Default::default()
                 },
+                source_time: None,
                 idempotency_key: Some("sync-row-1".to_owned()),
                 source_operation_id: Some("broker-row-1".to_owned()),
             }],
@@ -139,6 +145,9 @@ impl BrokerChannel for PopulatedChannel {
 
     fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
         self.source.clone()
+    }
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Source
     }
 }
 
@@ -222,7 +231,7 @@ fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account:
     };
     SqliteStore::open(path)
         .expect("second connection")
-        .append_event(&event)
+        .append_event(&event, IdentityScope::Source)
         .expect("reconciliation assertion");
 }
 
@@ -778,16 +787,18 @@ async fn health_is_public_and_reports_versions() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Version 4: CorporateAction and OfferExercise were added after
-    // ControlAssertion (version 3), while Income gained an income type
-    // (§4.7); one version cannot denote two schemas (§4.1). An external
-    // agent reads this number to determine whether it can parse the response, so
-    // it is fixed here rather than derived from the code.
-    assert_eq!(body["schema_version"], 4);
-    // Version 7: the face value was removed from the lot, while the prefix fingerprint covers
-    // the event contents rather than only the submission identity. The version 6
-    // snapshot is incompatible and triggers a full recalculation.
-    assert_eq!(body["projection_version"], 7);
+    // Version 6: version 4 added CorporateAction, OfferExercise and the income
+    // type (§4.7); version 5 added the source time inside EffectiveOrder;
+    // version 6 added the basis-only trade fee. One version cannot denote two
+    // schemas (§4.1). An external agent reads this number to determine whether
+    // it can parse the response, so it is fixed here rather than derived from
+    // the code — a silent bump would tell that agent nothing had changed.
+    assert_eq!(body["schema_version"], 6);
+    // Version 8: version 7 removed the face value from the lot and made the
+    // prefix fingerprint cover the event contents; version 8 orders events
+    // within a day by the source's time. Snapshots from either earlier version
+    // are incompatible and trigger a full recalculation.
+    assert_eq!(body["projection_version"], 8);
 }
 
 #[tokio::test]
@@ -3087,6 +3098,7 @@ async fn a_document_verdict_return_contains_its_detail() {
 fn verdict_dto_json_contains_every_variant_field() {
     let event = iaam_core::ids::EventId::new_random();
     let account = AccountId::new_random();
+    let possible_event = iaam_core::ids::EventId::new_random();
     let cases = [
         (
             Verdict::Accepted { event },
@@ -3138,6 +3150,20 @@ fn verdict_dto_json_contains_every_variant_field() {
                 "row": 7,
                 "verdict": "duplicate",
                 "event_id": event.inner(),
+            }),
+        ),
+        (
+            Verdict::PossibleDuplicate {
+                event: possible_event,
+                of: event,
+                level: iaam_app::ingest::dedup::DedupLevel::Probabilistic,
+            },
+            json!({
+                "row": 7,
+                "verdict": "possible_duplicate",
+                "event_id": possible_event.inner(),
+                "of_event_id": event.inner(),
+                "level": 5,
             }),
         ),
         (

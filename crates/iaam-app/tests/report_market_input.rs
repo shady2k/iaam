@@ -11,6 +11,7 @@ use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::returns::{NotComputable, UncoveredReason};
 use iaam_core::valuation::{FxSource, FxTable};
+use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
@@ -72,6 +73,7 @@ async fn seed_position(
             cash_posted: Some(date!(2026 - 08 - 01)),
             paid: None,
         },
+        source_time: None,
         idempotency_key: None,
         source_operation_id: None,
     };
@@ -86,7 +88,7 @@ async fn seed_position(
     .event;
     services
         .store
-        .append_events(vec![event])
+        .append_events(vec![event], IdentityScope::Source)
         .await
         .unwrap_or_else(|error| panic!("append position: {error}"));
 }

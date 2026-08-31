@@ -222,6 +222,8 @@ mod tests {
             gross,
             fee: None,
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         };
         event.legs = vec![
             Leg::cash(account, rub(-5_000_000)),

@@ -40,9 +40,9 @@ use state::{LedgerState, StateHash};
 /// cannot be advanced: the meaning of its fields may have changed.
 ///
 /// Version 7: face value was removed from the lot, and the prefix fingerprint covers
-/// the event contents (`prefix_digest/v2`). Version 6 snapshots are incompatible
-/// and trigger a full recomputation.
-pub const PROJECTION_VERSION: u32 = 7;
+/// the event contents (`prefix_digest/v2`). Version 8 incorporates source-time
+/// ordering; older snapshots are incompatible and trigger a full recomputation.
+pub const PROJECTION_VERSION: u32 = 8;
 
 /// Immutable projection input: scope boundaries and rule versions.
 ///
@@ -405,7 +405,7 @@ mod tests {
     use super::*;
     use crate::contour::{ContourId, ContourVersion};
     use crate::event::Relation;
-    use crate::event::kind::EventKind;
+    use crate::event::kind::{EventKind, IncomeKind, TradeSide};
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
     use crate::ids::{AccountId, CustodyId, InstrumentId};
@@ -413,7 +413,7 @@ mod tests {
     use crate::numeric::decimal::Dec;
     use crate::rules::RuleRegistry;
     use rust_decimal::Decimal;
-    use time::macros::date;
+    use time::macros::{date, time};
 
     fn rub(minor: i64) -> Money {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
@@ -722,6 +722,8 @@ mod tests {
                 gross: rub(1_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(account, rub(-1_000_000)),
@@ -741,5 +743,111 @@ mod tests {
         let error = project(&[event], &ctx).unwrap_err();
         assert!(error.is_invariant_violation(), "{error}");
         assert_eq!(error.code(), "invariant");
+    }
+    #[test]
+    fn mixed_day_projection_is_reproducible() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let day = date!(2026 - 03 - 01);
+        let contour = contour_of(account);
+        let rules = RuleRegistry::with_defaults();
+        let ctx = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+
+        let mut buy = event_with(
+            account,
+            day,
+            1,
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity: qty(1),
+                gross: rub(100),
+                fee: None,
+                accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
+            },
+            vec![
+                Leg::cash(account, rub(-100)),
+                Leg::security(account, custody, instrument, qty(1)),
+            ],
+        );
+        buy.order = EffectiveOrder::with_source_time(day, time!(09:00:00), 1);
+
+        let mut sell = event_with(
+            account,
+            day,
+            2,
+            EventKind::Trade {
+                side: TradeSide::Sell,
+                instrument,
+                quantity: qty(1),
+                gross: rub(120),
+                fee: None,
+                accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
+            },
+            vec![
+                Leg::cash(account, rub(120)),
+                Leg::security(account, custody, instrument, qty(-1)),
+            ],
+        );
+        sell.order = EffectiveOrder::with_source_time(day, time!(10:00:00), 2);
+
+        let mut coupon = event_with(
+            account,
+            day,
+            3,
+            EventKind::Income {
+                instrument: Some(instrument),
+                gross: rub(10),
+                kind: Some(IncomeKind::Coupon),
+            },
+            vec![Leg::cash(account, rub(10))],
+        );
+        coupon.order = EffectiveOrder::new(day, 3);
+
+        let events = vec![buy, sell, coupon];
+        let mut reversed = events.clone();
+        reversed.reverse();
+        assert_eq!(
+            project(&events, &ctx).unwrap().snapshot().fingerprint(),
+            project(&reversed, &ctx).unwrap().snapshot().fingerprint()
+        );
+    }
+    #[test]
+    fn an_old_event_without_source_time_still_projects() {
+        let account = AccountId::new_random();
+        let contour = contour_of(account);
+        let rules = RuleRegistry::with_defaults();
+        let ctx = ProjectionContext {
+            contour: &contour,
+            rules: &rules,
+            lot_rule: LotRuleVersion(1),
+        };
+        let event = deposits(account).remove(0);
+        let mut value = serde_json::to_value(&event).unwrap();
+        value
+            .get_mut("order")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("source_time");
+        let restored = serde_json::from_value(value).unwrap();
+
+        let projection = project(&[restored], &ctx).unwrap();
+        assert_eq!(
+            projection
+                .state()
+                .balances()
+                .cash(account, CurrencyCode::Rub),
+            Some(rub(10_000))
+        );
     }
 }

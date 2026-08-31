@@ -53,6 +53,8 @@ fn purchase(owner: OwnerId, account: AccountId, instrument: InstrumentId) -> Eve
         gross: amount,
         fee: None,
         accrued_interest: None,
+        basis_fee: None,
+        basis_fee_exact: None,
     };
     event.legs = vec![
         Leg::cash(

@@ -1,25 +1,25 @@
 //! Migration 0010: bond payment schedule snapshots.
 
+mod common;
+
+use common::apply_migrations_through;
 use rusqlite::Connection;
 
-// The version 9 database is built by applying previous migrations to an empty
-// connection—the same approach as in `migration_0008.rs`. `SqliteStore` has no public
-// constructor from an existing `Connection`, and adding one just for the test would mean expanding
-// the API for a test.
+// The version-nine database must include every production table, index, and constraint from
+// migrations one through nine so migration 0010 runs against the schema it will encounter in
+// production.
 fn database_at_version_nine() -> Connection {
     let conn = Connection::open_in_memory().expect("in-memory database");
-    conn.execute_batch(
-        "CREATE TABLE instruments (
-             id       TEXT PRIMARY KEY,
-             symbol   TEXT NOT NULL,
-             title    TEXT NOT NULL,
-             currency TEXT NOT NULL
-         ) STRICT;
-         INSERT INTO instruments (id, symbol, title, currency)
-         VALUES ('instrument-1', 'SU46020RMFS2', 'OFZ 46020', 'RUB');
-         PRAGMA user_version = 9;",
+    apply_migrations_through(&conn, 9);
+    conn.execute(
+        "INSERT INTO instruments (
+             id, kind, symbol, title, denomination_currency,
+             settlement_currency, quote_currency, created_at
+         ) VALUES ('instrument-1', 'bond', 'SU46020RMFS2', 'OFZ 46020', 'RUB', 'RUB', 'RUB',
+                   '1970-01-01T00:00:00Z')",
+        [],
     )
-    .expect("schema version 9");
+    .expect("instrument");
     conn
 }
 

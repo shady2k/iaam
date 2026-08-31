@@ -360,6 +360,8 @@ fn buy_event(
             gross: rub(units * 1_000),
             fee: None,
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         },
         vec![
             Leg::cash(party.account, rub(-(units * 1_000))),

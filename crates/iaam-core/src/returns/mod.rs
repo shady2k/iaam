@@ -5057,6 +5057,8 @@ mod tests {
                 gross,
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(account, settlement),
@@ -5133,6 +5135,8 @@ mod tests {
                 gross,
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(account, gross),

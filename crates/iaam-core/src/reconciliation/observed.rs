@@ -554,6 +554,8 @@ mod tests {
                 gross: rub(-50_000),
                 fee: Some(rub(-120)),
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(account, rub(-50_000)),

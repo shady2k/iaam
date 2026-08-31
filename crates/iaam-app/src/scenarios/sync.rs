@@ -35,14 +35,15 @@ use time::OffsetDateTime;
 pub struct SyncOutcome {
     pub recorded: Vec<Verdict>,
     pub duplicates: usize,
+    pub possible_duplicates: usize,
     pub assertions: usize,
 }
 
 /// Retrieves the broker's operations and portfolio and records new facts.
 ///
 /// Matching against the existing journal is performed before calling the store:
-/// the storage layer knows only the source together with `source_operation_id`, while
-/// reconciliation of two independent channels must recognise the same operation even
+/// both gates apply the channel's declared identity scope to source operation identifiers.
+/// Reconciliation of two independent channels must still recognise the same operation even
 /// from different sources. A probable duplicate is not removed: it is only a hint
 /// at the §10.6 level, so it enters the journal as a new fact.
 pub async fn sync_broker(
@@ -74,12 +75,15 @@ pub async fn sync_broker(
     );
     let mut recorded = Vec::new();
     let mut duplicates = 0;
+    let mut possible_duplicates = 0;
 
     for operation in parsed.accepted {
         let context = DocumentContext {
+            account: operation.account,
             document: None,
             sheet: None,
             row: None,
+            identity_scope: broker.identity_scope(),
         };
         let key = dedup::choose_key(&operation, &context);
         let normalized = normalize(
@@ -96,14 +100,28 @@ pub async fn sync_broker(
         })?;
         let event = with_channel_provenance(normalized.event, &channel);
         let decision = dedup::assess(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        let possible_duplicate = match &decision {
+            DedupDecision::PossibleDuplicate { of, level } => Some((*of, *level)),
+            DedupDecision::Duplicate { .. } | DedupDecision::Fresh => None,
+        };
         if let DedupDecision::Duplicate { existing, .. } = decision {
             duplicates += 1;
             recorded.push(Verdict::Duplicate { existing });
             continue;
         }
 
-        let result = services.store.append_events(vec![event.clone()]).await?;
+        let result = services
+            .store
+            .append_events(vec![event.clone()], broker.identity_scope())
+            .await?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
+        let verdict = match (possible_duplicate, event_id_from_verdict(&verdict)) {
+            (Some((of, level)), Some(event)) => {
+                possible_duplicates += 1;
+                Verdict::PossibleDuplicate { event, of, level }
+            }
+            _ => verdict,
+        };
         if let Some(event_id) = event_id_from_verdict(&verdict) {
             known.push(known_record(&event, event_id));
         }
@@ -117,6 +135,7 @@ pub async fn sync_broker(
         return Ok(SyncOutcome {
             recorded,
             duplicates,
+            possible_duplicates,
             assertions: 0,
         });
     }
@@ -146,7 +165,10 @@ pub async fn sync_broker(
             recorded.push(Verdict::Duplicate { existing });
             continue;
         }
-        let result = services.store.append_events(vec![event.clone()]).await?;
+        let result = services
+            .store
+            .append_events(vec![event.clone()], broker.identity_scope())
+            .await?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         if matches!(verdict, Verdict::Provisional { .. }) {
             assertions += 1;
@@ -160,6 +182,7 @@ pub async fn sync_broker(
     Ok(SyncOutcome {
         recorded,
         duplicates,
+        possible_duplicates,
         assertions,
     })
 }
@@ -192,6 +215,7 @@ fn known_record(event: &Event, event_id: EventId) -> KnownRecord {
     let row = event.provenance.row();
     KnownRecord {
         event: event_id,
+        account: event.account,
         source_operation_id: event.provenance.source_operation_id().map(str::to_owned),
         idempotency_key: event.idempotency_key.clone(),
         fingerprint: event.provenance.raw_hash().clone(),
@@ -224,7 +248,8 @@ fn event_id_from_verdict(verdict: &Verdict) -> Option<EventId> {
     match verdict {
         Verdict::Provisional { event }
         | Verdict::Accepted { event }
-        | Verdict::Discrepancy { event, .. } => Some(*event),
+        | Verdict::Discrepancy { event, .. }
+        | Verdict::PossibleDuplicate { event, .. } => Some(*event),
         Verdict::Duplicate { .. }
         | Verdict::NeedsReconciliation { .. }
         | Verdict::NeedsClassification { .. }

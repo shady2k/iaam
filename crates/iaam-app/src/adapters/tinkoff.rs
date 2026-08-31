@@ -17,6 +17,7 @@ use iaam_core::money::CurrencyCode;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_ingest::SubmittedOperation;
+use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind};
 use uuid::Uuid;
 
@@ -91,6 +92,10 @@ impl BrokerChannel for TinkoffChannel {
             parser_version: ParserVersion(TINKOFF_PARSER_VERSION.to_owned()),
             document: None,
         }
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Account
     }
 }
 
@@ -214,6 +219,7 @@ fn operation_to_submitted(
             trade: operation.date,
             ..OperationDates::default()
         },
+        source_time: operation.source_time,
         idempotency_key: Some(operation.deduplication_key),
         source_operation_id: Some(operation.operation_id),
     })
@@ -229,10 +235,7 @@ fn trade_kind(
         .quantity
         .ok_or_else(|| unparsable("trading operation does not contain quantity"))?;
     let instrument = required_instrument(operation)?;
-    let fee_minor = operation
-        .commission
-        .map(|money| money_amount(money, "commission"))
-        .transpose()?;
+    let basis_fee = operation.commission;
     let custody = CustodyId(account.inner());
     Ok(if buy {
         OperationKind::Buy {
@@ -240,7 +243,8 @@ fn trade_kind(
             custody,
             quantity: quantity.0,
             gross_minor,
-            fee_minor,
+            fee_minor: None,
+            basis_fee,
             accrued_interest_minor: None,
             currency,
         }
@@ -250,7 +254,8 @@ fn trade_kind(
             custody,
             quantity: quantity.0,
             gross_minor,
-            fee_minor,
+            fee_minor: None,
+            basis_fee,
             accrued_interest_minor: None,
             currency,
         }
@@ -376,6 +381,7 @@ mod tests {
         ] {
             let operation = ChannelOperation {
                 date: None,
+                source_time: None,
                 broker_account_id: "account".to_owned(),
                 operation_id: "1".to_owned(),
                 parent_operation_id: None,
@@ -487,7 +493,8 @@ mod tests {
                     "state": "OPERATION_STATE_EXECUTED",
                     "instrumentUid": "01234567-89ab-cdef-0123-456789abcdef",
                     "quantity": "1",
-                    "payment": {"units": "-270", "nano": -130000000, "currency": "rub"}
+                    "payment": {"units": "-270", "nano": -130000000, "currency": "rub"},
+                    "commission": {"units": "0", "nano": -135065000, "currency": "rub"}
                 }]
             }"#,
         )?;
@@ -517,8 +524,10 @@ mod tests {
             OperationKind::Buy {
                 gross_minor: 27013,
                 quantity,
+                basis_fee: Some(basis_fee),
                 ..
             } if quantity.inner().to_string() == "1"
+                && basis_fee.value().inner().to_string() == "-0.135065"
         ));
         Ok(())
     }
@@ -531,8 +540,11 @@ mod tests {
         let account = AccountId(Uuid::parse_str("d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4")?);
         let parsed = adapt_operations(account, operations, &dictionary())?;
 
-        assert_eq!(parsed.accepted.len(), 2);
-        assert_eq!(parsed.quarantined.len(), 2);
+        assert_eq!(parsed.accepted.len(), 3);
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert!(parsed.accepted.iter().any(|operation| {
+            operation.source_operation_id.as_deref() == Some("06896b3e-038c-4970-85f2-fd5fc2dfb306")
+        }));
         assert!(!parsed.accepted.iter().any(|operation| {
             operation.source_operation_id.as_deref() == Some("7aa1cf04-71c7-4b62-81c7-7f27ec4cfb8d")
         }));

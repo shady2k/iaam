@@ -11,6 +11,7 @@ use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
+use iaam_ingest::dedup::IdentityScope;
 use time::Date;
 
 use crate::AppServices;
@@ -129,7 +130,10 @@ pub async fn record_owner_balance(
             )),
         })
         .collect();
-    services.store.append_events(events).await
+    services
+        .store
+        .append_events(events, IdentityScope::Source)
+        .await
 }
 
 #[cfg(test)]

@@ -88,6 +88,8 @@ fn buy(day: time::Date, sequence: u32, gross: i64) -> Event {
             gross: cost,
             fee: None,
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         },
         vec![
             Leg::cash(
@@ -114,6 +116,8 @@ fn sell(day: time::Date, sequence: u32, gross: i64) -> Event {
             gross: proceeds,
             fee: None,
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         },
         vec![
             Leg::cash(ACCOUNT, proceeds),

@@ -112,6 +112,8 @@ fn journal(fixture: &mut Fixture) -> Vec<Event> {
                     quantity: qty(100),
                     gross,
                     fee: Some(fee),
+                    basis_fee: None,
+                    basis_fee_exact: None,
                     accrued_interest: None,
                 },
                 EventDates::for_trade(TradeDate(date!(2025 - 01 - 15)), None),

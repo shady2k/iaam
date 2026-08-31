@@ -135,6 +135,8 @@ fn purchase(custody: CustodyId, date: Date, number: u32) -> Event {
             gross: rubles(1_000_000),
             fee: None,
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         },
         vec![
             Leg::cash(ACCOUNT, rubles(-1_000_000)),
@@ -171,6 +173,8 @@ fn sale(custody: CustodyId, date: Date, number: u32) -> Event {
             gross: rubles(1_000_000),
             fee: None,
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         },
         vec![
             Leg::cash(ACCOUNT, rubles(1_000_000)),

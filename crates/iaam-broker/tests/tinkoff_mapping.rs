@@ -7,11 +7,17 @@ use std::error::Error;
 
 use iaam_broker::tinkoff::{ParseError, TINKOFF_PARSER_VERSION, parse_operations, parse_portfolio};
 use iaam_core::event::provenance::ParserVersion;
-use iaam_core::money::{CurrencyCode, PostedMinor};
+use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
+use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
+use time::macros::time;
+
+fn dec(text: &str) -> Dec {
+    serde_json::from_value(serde_json::Value::String(text.to_owned())).expect("decimal")
+}
 
 #[test]
-fn parses_operations_without_sharing_report_parser_code() -> Result<(), Box<dyn Error>> {
+fn tinkoff_commission_is_exact_and_does_not_reject_the_trade() -> Result<(), Box<dyn Error>> {
     let body = include_str!("../../../tests/fixtures/api/tinkoff-operations.json");
     let operations = parse_operations(body)?;
     assert_eq!(operations.len(), 4);
@@ -35,7 +41,11 @@ fn parses_operations_without_sharing_report_parser_code() -> Result<(), Box<dyn 
         operation.price.as_ref().map(|money| money.amount),
         Some(PostedMinor::new(27_013))
     );
-    assert_eq!(operation.commission, None);
+    assert_eq!(
+        operation.commission,
+        Some(CalcMoney::new(dec("-0.135065"), CurrencyCode::Rub))
+    );
+    assert_eq!(operation.source_time, Some(time!(09:13:11.088291)));
     assert_eq!(operation.quantity_as_decimal(), Some("1".to_owned()));
     assert_eq!(
         operation.parser_version,
@@ -45,13 +55,7 @@ fn parses_operations_without_sharing_report_parser_code() -> Result<(), Box<dyn 
         operation.deduplication_key,
         "d87ca671-f5fd-4aa6-81f8-56aeaa2af6a4/06896b3e-038c-4970-85f2-fd5fc2dfb306"
     );
-    assert!(matches!(
-        operation.rejection.as_ref(),
-        Some(ParseError::NonRepresentableFraction {
-            field: "commission",
-            currency: CurrencyCode::Rub,
-        })
-    ));
+    assert_eq!(operation.rejection, None);
 
     let rejected = operations
         .iter()

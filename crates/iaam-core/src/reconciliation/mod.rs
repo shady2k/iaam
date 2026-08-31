@@ -20,7 +20,7 @@ use crate::event::{Event, kind::EventKind};
 use crate::ids::AccountId;
 use check::{ClaimOutcome, check_claim};
 use claim::{AssertionPeriod, BalancePoint, ControlClaim};
-use evidence::{Evidence, Ground, SourceChannel};
+pub use evidence::{Evidence, Ground, IdentityScope, SourceChannel};
 use observed::{ObserveError, observe};
 
 /// The dimension whose completeness is being asserted (§10.3).

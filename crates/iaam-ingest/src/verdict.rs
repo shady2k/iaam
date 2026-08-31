@@ -18,15 +18,23 @@ pub struct Rejection {
 /// There is no separate confirmation step in the normal flow: there is submission
 /// and a verdict (§10.4). The six verdicts in the spec are `Accepted`,
 /// `Provisional`, `Discrepancy`, `NeedsReconciliation`,
-/// `NeedsClassification`, `Unsupported`. `Duplicate` and `Rejected`
-/// are operational: the former handles retries (§10.6), the latter a row
-/// that could not be parsed (§10.1).
+/// `NeedsClassification`, `Unsupported`. `Duplicate`, `PossibleDuplicate`, and
+/// `Rejected` are operational: the former handles retries (§10.6), the
+/// possible duplicate preserves an uncertain match for the owner, and the
+/// latter a row that could not be parsed (§10.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     /// Recorded; reconciliation matched.
     Accepted { event: EventId },
     /// Recorded; independent confirmation is not yet available.
     Provisional { event: EventId },
+    /// Recorded, and it resembles a fact already in the journal (§10.6, level five).
+    /// Never deleted and never merged: the owner is shown both, and decides.
+    PossibleDuplicate {
+        event: EventId,
+        of: EventId,
+        level: crate::dedup::DedupLevel,
+    },
     /// Recorded, but reconciliation does not match: the owner is investigating.
     Discrepancy {
         event: EventId,
@@ -56,6 +64,7 @@ impl Verdict {
         match self {
             Self::Accepted { .. } => "accepted",
             Self::Provisional { .. } => "provisional",
+            Self::PossibleDuplicate { .. } => "possible_duplicate",
             Self::Discrepancy { .. } => "discrepancy",
             Self::NeedsReconciliation { .. } => "needs_reconciliation",
             Self::Duplicate { .. } => "duplicate",
@@ -76,6 +85,7 @@ impl Verdict {
             Self::Accepted { .. }
             | Self::Provisional { .. }
             | Self::Discrepancy { .. }
+            | Self::PossibleDuplicate { .. }
             | Self::Duplicate { .. } => true,
             Self::NeedsReconciliation { .. }
             | Self::NeedsClassification { .. }
@@ -89,12 +99,17 @@ impl Verdict {
 mod tests {
     use super::*;
 
-    fn every_verdict() -> [Verdict; 8] {
+    fn every_verdict() -> [Verdict; 9] {
         let event = EventId::new_random();
         let account = AccountId::new_random();
         [
             Verdict::Accepted { event },
             Verdict::Provisional { event },
+            Verdict::PossibleDuplicate {
+                event,
+                of: EventId::new_random(),
+                level: crate::dedup::DedupLevel::Probabilistic,
+            },
             Verdict::Discrepancy {
                 event,
                 account,

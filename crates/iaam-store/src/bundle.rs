@@ -281,7 +281,13 @@ impl SqliteStore {
         let mut inserted = 0;
         let mut duplicates = 0;
         for event in &bundle.events {
-            if find_duplicate(&transaction, event)?.is_some() {
+            if find_duplicate(
+                &transaction,
+                event,
+                iaam_core::reconciliation::evidence::IdentityScope::Source,
+            )?
+            .is_some()
+            {
                 duplicates += 1;
                 continue;
             }

@@ -26,6 +26,20 @@ pub struct SourceChannel {
     pub document: Option<RawHash>,
 }
 
+/// How far a source's operation identifier is guaranteed to be unique.
+///
+/// A source that numbers operations per account cannot have its identifiers
+/// compared across accounts: a reused number would suppress a legitimate fact.
+/// A source that numbers them globally must be compared across accounts, or a
+/// fact reported from two account views would be recorded twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IdentityScope {
+    /// Unique within the source, across all accounts.
+    Source,
+    /// Unique only within one account of the source.
+    Account,
+}
+
 impl SourceChannel {
     /// Whether this channel is independent of another (§10.3).
     ///

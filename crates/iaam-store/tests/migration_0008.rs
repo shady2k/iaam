@@ -1,38 +1,24 @@
 //! Migration 0008: quote basis in a price observation.
 
+mod common;
+
+use common::apply_migrations_through;
 use iaam_store::SqliteStore;
 use rusqlite::Connection;
 
 fn database_at_version_seven() -> Connection {
     let conn = Connection::open_in_memory().expect("in-memory database");
-    conn.execute_batch(
-        "CREATE TABLE instruments (
-             id       TEXT PRIMARY KEY,
-             symbol   TEXT NOT NULL,
-             title    TEXT NOT NULL,
-             currency TEXT NOT NULL
-         ) STRICT;
-         INSERT INTO instruments (id, symbol, title, currency)
-         VALUES ('instrument-1', 'SBER', 'Sberbank', 'RUB');
-         PRAGMA user_version = 5;",
+    apply_migrations_through(&conn, 7);
+    conn.execute(
+        "INSERT INTO instruments (
+             id, kind, symbol, title, denomination_currency,
+             settlement_currency, quote_currency, created_at
+         ) VALUES ('instrument-1', NULL, 'SBER', 'Sberbank', 'RUB', 'RUB', 'RUB',
+                   '1970-01-01T00:00:00Z')",
+        [],
     )
-    .expect("schema version 5");
+    .expect("instrument");
 
-    for (version, sql) in [
-        (
-            6,
-            include_str!("../migrations/0006_market_observations.sql"),
-        ),
-        (
-            7,
-            include_str!("../migrations/0007_executability_without_stale.sql"),
-        ),
-    ] {
-        conn.execute_batch(&format!(
-            "BEGIN; {sql} PRAGMA user_version = {version}; COMMIT;"
-        ))
-        .expect("applying previous migration");
-    }
     conn.execute(
         "INSERT INTO sync_runs
              (id, source_id, dataset, series_key, status,

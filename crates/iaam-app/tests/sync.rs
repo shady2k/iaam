@@ -14,8 +14,10 @@ use iaam_core::money::{CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::SourceChannel;
-use iaam_ingest::SubmittedOperation;
+use iaam_ingest::dedup::DedupLevel;
+use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::{SubmittedOperation, Verdict};
 use iaam_store::SqliteStore;
 use time::Date;
 use time::macros::date;
@@ -30,6 +32,7 @@ impl Clock for FixedClock {
 
 struct FakeBroker {
     source: SourceChannel,
+    identity_scope: IdentityScope,
     operations: Result<ParsedOperations, BrokerError>,
     portfolio: Result<Vec<ControlClaim>, BrokerError>,
 }
@@ -55,6 +58,10 @@ impl BrokerChannel for FakeBroker {
 
     fn channel(&self) -> SourceChannel {
         self.source.clone()
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        self.identity_scope
     }
 }
 
@@ -88,6 +95,7 @@ fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> Su
             quantity: Dec::one(),
             gross_minor: 10_000,
             fee_minor: None,
+            basis_fee: None,
             accrued_interest_minor: None,
             currency: CurrencyCode::Rub,
         },
@@ -97,6 +105,7 @@ fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> Su
             cash_posted: Some(date!(2026 - 03 - 17)),
             paid: None,
         },
+        source_time: None,
         idempotency_key: None,
         source_operation_id: Some("TRADE-MARCH-1".to_owned()),
     }
@@ -164,6 +173,7 @@ fn api(_account: AccountId, source: SourceId, operation: SubmittedOperation) -> 
             parser_version: ParserVersion("finam-api/1".to_owned()),
             document: None,
         },
+        identity_scope: IdentityScope::Source,
         operations: Ok(ParsedOperations {
             accepted: vec![operation],
             quarantined: Vec::new(),
@@ -185,18 +195,80 @@ async fn load(services: &AppServices, owner: OwnerId) -> Vec<Event> {
 }
 
 #[tokio::test]
+async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let source = SourceId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let first_account = AccountId::new_random();
+    let second_account = AccountId::new_random();
+    let first_operation = trade(first_account, instrument, custody);
+    let second_operation = trade(second_account, instrument, custody);
+    let make_broker = |operation| FakeBroker {
+        source: SourceChannel {
+            source,
+            parser_version: ParserVersion("account-scoped/1".to_owned()),
+            document: None,
+        },
+        identity_scope: IdentityScope::Account,
+        operations: Ok(ParsedOperations {
+            accepted: vec![operation],
+            quarantined: Vec::new(),
+        }),
+        portfolio: Ok(Vec::new()),
+    };
+
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &make_broker(first_operation),
+        first_account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first account sync: {error}"));
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &make_broker(second_operation),
+        second_account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("second account sync: {error}"));
+
+    assert_eq!(first.duplicates, 0);
+    assert_eq!(second.duplicates, 0);
+    assert_eq!(
+        load(&services, owner)
+            .await
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Trade { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
     let services = services();
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let operation = trade(account, InstrumentId::new_random(), CustodyId::new_random());
     let report_source = SourceId::new_random();
+    let existing = report_trade_event(owner, &operation, report_source);
     services
         .store
-        .append_events(vec![
-            report_trade_event(owner, &operation, report_source),
-            report_cash_assertion(owner, account, report_source),
-        ])
+        .append_events(
+            vec![
+                existing.clone(),
+                report_cash_assertion(owner, account, report_source),
+            ],
+            IdentityScope::Source,
+        )
         .await
         .unwrap_or_else(|error| panic!("seed report: {error}"));
 
@@ -213,6 +285,11 @@ async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
     .unwrap_or_else(|error| panic!("sync: {error}"));
 
     assert_eq!(outcome.duplicates, 1);
+    assert_eq!(outcome.possible_duplicates, 0);
+    assert!(matches!(
+        outcome.recorded.first(),
+        Some(Verdict::Duplicate { existing: id }) if *id == existing.id
+    ));
     assert_eq!(outcome.assertions, 1);
     let events = load(&services, owner).await;
     assert_eq!(
@@ -233,6 +310,155 @@ async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
         ),
         iaam_core::reconciliation::DimensionStatus::AcceptedIndependent,
     );
+}
+
+#[tokio::test]
+async fn a_fingerprint_match_is_recorded_as_a_possible_duplicate() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let mut operation = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    operation.source_operation_id = None;
+    let report_source = SourceId::new_random();
+    let existing = report_trade_event(owner, &operation, report_source);
+    services
+        .store
+        .append_events(vec![existing.clone()], IdentityScope::Source)
+        .await
+        .unwrap_or_else(|error| panic!("seed report: {error}"));
+
+    let broker = api(account, SourceId::new_random(), operation);
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    assert_eq!(outcome.possible_duplicates, 1);
+    let Verdict::PossibleDuplicate { event, of, level } = &outcome.recorded[0] else {
+        panic!(
+            "expected possible duplicate verdict: {:?}",
+            outcome.recorded[0]
+        );
+    };
+    assert_ne!(*event, existing.id);
+    assert_eq!(*of, existing.id);
+    assert_eq!(*level, DedupLevel::Probabilistic);
+    assert!(
+        load(&services, owner)
+            .await
+            .iter()
+            .any(|record| record.id == *event),
+        "possible duplicate event must be recorded"
+    );
+}
+
+#[tokio::test]
+async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let mut operation = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    operation.source_operation_id = Some("REN_NUMBERED-2".to_owned());
+    let report_source = SourceId::new_random();
+    let existing = report_trade_event(owner, &operation, report_source);
+    services
+        .store
+        .append_events(vec![existing.clone()], IdentityScope::Source)
+        .await
+        .unwrap_or_else(|error| panic!("seed report: {error}"));
+    assert_ne!(
+        operation.source_operation_id.as_deref(),
+        existing.provenance.source_operation_id()
+    );
+
+    let broker = api(account, SourceId::new_random(), operation);
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    assert_eq!(outcome.possible_duplicates, 1);
+    let Verdict::PossibleDuplicate { event, of, level } = &outcome.recorded[0] else {
+        panic!(
+            "expected possible duplicate verdict: {:?}",
+            outcome.recorded[0]
+        );
+    };
+    assert_ne!(*event, existing.id);
+    assert_eq!(*of, existing.id);
+    assert_eq!(*level, DedupLevel::Probabilistic);
+    assert!(
+        load(&services, owner)
+            .await
+            .iter()
+            .any(|record| record.id == *event),
+        "possible duplicate event must be recorded"
+    );
+}
+
+#[tokio::test]
+async fn mixed_sync_counts_possible_duplicates_separately_from_duplicates() {
+    let owner = OwnerId::new_random();
+    let services = services();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let duplicate = trade(account, instrument, custody);
+    let existing = report_trade_event(owner, &duplicate, SourceId::new_random());
+    services
+        .store
+        .append_events(vec![existing.clone()], IdentityScope::Source)
+        .await
+        .unwrap_or_else(|error| panic!("seed report: {error}"));
+
+    let mut possible = duplicate.clone();
+    possible.source_operation_id = None;
+    let mut fresh = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    fresh.source_operation_id = Some("FRESH-1".to_owned());
+    let mut broker = api(account, SourceId::new_random(), possible.clone());
+    broker.operations = Ok(ParsedOperations {
+        accepted: vec![possible, duplicate, fresh],
+        quarantined: Vec::new(),
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    assert_eq!(outcome.possible_duplicates, 1);
+    assert_eq!(outcome.duplicates, 1);
+    assert!(matches!(
+        outcome.recorded.first(),
+        Some(Verdict::PossibleDuplicate { of, .. }) if *of == existing.id
+    ));
+    assert!(matches!(
+        outcome.recorded.get(1),
+        Some(Verdict::Duplicate { existing: id }) if *id == existing.id
+    ));
+    assert!(matches!(
+        outcome.recorded.get(2),
+        Some(Verdict::Provisional { .. })
+    ));
+    assert_eq!(load(&services, owner).await.len(), 4);
 }
 
 #[tokio::test]
@@ -315,6 +541,7 @@ async fn one_broker_failure_does_not_poison_another_sync() {
             parser_version: ParserVersion("finam-api/1".to_owned()),
             document: None,
         },
+        identity_scope: IdentityScope::Source,
         operations: Err(BrokerError::Unreachable {
             broker: "finam".to_owned(),
             detail: "offline".to_owned(),

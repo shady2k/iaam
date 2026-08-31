@@ -90,6 +90,8 @@ fn every_kind() -> Vec<Event> {
                 quantity: qty(10),
                 gross: rub(100_000),
                 fee: Some(rub(500)),
+                basis_fee: None,
+                basis_fee_exact: None,
                 accrued_interest: Some(rub(1_234)),
             },
             vec![

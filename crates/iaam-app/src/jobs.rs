@@ -468,6 +468,8 @@ mod tests {
                 gross: rub(-1_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             Vec::new(),
         )

@@ -17,6 +17,7 @@ use thiserror::Error;
 
 use super::claim::{AssertionPeriod, BalancePoint};
 use crate::event::Event;
+use crate::event::correction::CorrectionError;
 use crate::event::kind::EventKind;
 use crate::event::leg::LegKind;
 use crate::ids::{AccountId, CustodyId, EventId, InstrumentId};
@@ -58,6 +59,8 @@ pub enum ObserveError {
     Overflow { field: &'static str },
     #[error(transparent)]
     Balance(#[from] BalanceError),
+    #[error(transparent)]
+    Correction(#[from] CorrectionError),
     #[error(transparent)]
     Numeric(#[from] NumericError),
 }
@@ -141,8 +144,13 @@ impl ObservedTotals {
 ///
 /// The logic was deliberately moved out of a constructor named `new`:
 /// `cargo-mutants` silently skips functions with that name (§15.7).
+///
+/// `events` is the **already-resolved** effective set, and the `&[&Event]`
+/// shape is the reminder: a raw slice would apply a reversal alongside the
+/// event it reverses and double it. `ReconciliationLedger::build_with`
+/// resolves once per build rather than once per group.
 pub fn observe(
-    events: &[Event],
+    events: &[&Event],
     account: AccountId,
     period: AssertionPeriod,
 ) -> Result<ObservedTotals, ObserveError> {
@@ -285,6 +293,7 @@ fn add_magnitude(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Relation;
     use crate::event::kind::{FeeOrigin, TradeSide};
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
@@ -292,6 +301,15 @@ mod tests {
     use crate::numeric::decimal::Dec;
     use rust_decimal::Decimal;
     use time::macros::date;
+
+    fn observe(
+        events: &[Event],
+        account: AccountId,
+        period: AssertionPeriod,
+    ) -> Result<ObservedTotals, ObserveError> {
+        let effective: Vec<&Event> = events.iter().collect();
+        super::observe(&effective, account, period)
+    }
 
     fn rub(minor: i64) -> Money {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
@@ -786,5 +804,50 @@ mod tests {
             observe(&[event], account, march()),
             Err(ObserveError::EventWithoutDate { .. })
         ));
+    }
+    #[test]
+    fn a_reversed_trade_contributes_nothing_to_observed_totals() {
+        let account = AccountId::new_random();
+        let custody = CustodyId::new_random();
+        let instrument = InstrumentId::new_random();
+        let quantity = qty(10);
+        let trade = event_with(
+            account,
+            date!(2026 - 03 - 10),
+            1,
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity,
+                gross: rub(-50_000),
+                fee: Some(rub(-120)),
+                accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
+            },
+            vec![
+                Leg::cash(account, rub(-50_000)),
+                Leg::fee(account, rub(-120)),
+                Leg::security(account, custody, instrument, quantity),
+            ],
+        );
+        let mut reversal = trade.clone();
+        reversal.id = crate::ids::EventId::new_random();
+        reversal.relation = Relation::Reversal { target: trade.id };
+
+        let raw = [trade, reversal];
+        let effective = crate::event::correction::resolve(&raw).unwrap();
+        let observed = super::observe(&effective, account, march()).unwrap();
+
+        assert_eq!(
+            observed.cash_at(BalancePoint::Opening, CurrencyCode::Rub),
+            None
+        );
+        assert_eq!(
+            observed.cash_at(BalancePoint::Closing, CurrencyCode::Rub),
+            None
+        );
+        assert_eq!(observed.turnover(CurrencyCode::Rub), None);
+        assert_eq!(observed.fees(CurrencyCode::Rub), None);
     }
 }

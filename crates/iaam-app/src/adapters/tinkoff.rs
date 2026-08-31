@@ -2026,7 +2026,7 @@ mod tests {
         .expect("trade normalization")
         .event;
         let observed =
-            iaam_core::reconciliation::observed::observe(&[event], trading_account(), period)
+            iaam_core::reconciliation::observed::observe(&[&event], trading_account(), period)
                 .expect("observation");
 
         assert_eq!(
@@ -2050,7 +2050,7 @@ mod tests {
         .expect("old trade normalization")
         .event;
         let old_observed =
-            iaam_core::reconciliation::observed::observe(&[old_event], trading_account(), period)
+            iaam_core::reconciliation::observed::observe(&[&old_event], trading_account(), period)
                 .expect("old observation");
         assert!(matches!(
             iaam_core::reconciliation::check::check_claim(&claim, &old_observed),

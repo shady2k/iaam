@@ -16,6 +16,7 @@ use thiserror::Error;
 use time::Date;
 
 use crate::event::Event;
+use crate::event::correction::resolve;
 use crate::event::kind::{EventKind, FeeOrigin};
 use crate::ids::{AccountId, EventId};
 use crate::money::{CurrencyCode, PostedMinor};
@@ -92,6 +93,8 @@ pub enum PerimeterError {
         account: AccountId,
         currency: CurrencyCode,
     },
+    #[error(transparent)]
+    Correction(#[from] crate::event::correction::CorrectionError),
 }
 
 /// Reconciliation exceptions explained by the perimeter boundary.
@@ -212,12 +215,17 @@ impl PerimeterAssessment {
 /// Perimeter assessment from the journal.
 ///
 /// Logic is intentionally outside the constructor named `new` (§15.7).
+///
+/// Corrections are resolved here rather than by the caller: a reversed event
+/// must contribute no cash effect, and a caller that forgot would double the
+/// very movement the reversal retracts.
 pub fn assess(
     events: &[Event],
     policy: PerimeterPolicy,
 ) -> Result<PerimeterAssessment, PerimeterError> {
-    let mut ordered: Vec<(Date, &Event)> = Vec::with_capacity(events.len());
-    for event in events {
+    let effective = resolve(events)?;
+    let mut ordered: Vec<(Date, &Event)> = Vec::with_capacity(effective.len());
+    for event in effective {
         let date = event
             .dates
             .effective_date()
@@ -318,6 +326,102 @@ fn classify(
 mod tests {
     use super::*;
     use crate::ids::AccountId;
+
+    use crate::event::Relation;
+    use crate::event::kind::TradeSide;
+    use crate::event::leg::Leg;
+    use crate::event::test_support::event_with;
+    use crate::money::{Money, Quantity};
+    use crate::numeric::decimal::Dec;
+    use rust_decimal::Decimal;
+    use time::macros::date;
+
+    fn rub(minor: i64) -> Money {
+        Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
+    }
+
+    fn reversed_trade(account: AccountId) -> (Event, Event) {
+        let instrument = crate::ids::InstrumentId::new_random();
+        let quantity = Quantity(Dec::new(Decimal::ONE));
+        let trade = event_with(
+            account,
+            date!(2026 - 03 - 10),
+            1,
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity,
+                gross: rub(-100),
+                fee: Some(rub(-10)),
+                accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
+            },
+            vec![
+                Leg::cash(account, rub(-100)),
+                Leg::fee(account, rub(-10)),
+                Leg::security(
+                    account,
+                    crate::ids::CustodyId::new_random(),
+                    instrument,
+                    quantity,
+                ),
+            ],
+        );
+        let mut reversal = trade.clone();
+        reversal.id = EventId::new_random();
+        reversal.relation = Relation::Reversal { target: trade.id };
+        (trade, reversal)
+    }
+
+    fn cash_out(account: AccountId, amount: i64) -> Event {
+        event_with(
+            account,
+            date!(2026 - 03 - 11),
+            2,
+            EventKind::CashOut {
+                amount: rub(-amount),
+            },
+            vec![Leg::cash(account, rub(-amount))],
+        )
+    }
+
+    #[test]
+    fn a_reversed_trade_contributes_nothing_to_the_perimeter() {
+        let account = AccountId::new_random();
+        let (trade, reversal) = reversed_trade(account);
+
+        let assessment = assess(&[trade, reversal], PerimeterPolicy::default()).unwrap();
+
+        assert!(assessment.spans().is_empty());
+    }
+
+    #[test]
+    fn a_reversed_trade_does_not_hide_a_real_negative_cash_span() {
+        let account = AccountId::new_random();
+        let (trade, reversal) = reversed_trade(account);
+        let remaining = cash_out(account, 50);
+
+        let assessment = assess(&[trade, reversal, remaining], PerimeterPolicy::default()).unwrap();
+
+        assert_eq!(assessment.spans().len(), 1);
+        assert_eq!(assessment.spans()[0].from, date!(2026 - 03 - 11));
+    }
+    #[test]
+    fn a_correction_failure_is_reported_by_perimeter_assessment() {
+        let account = AccountId::new_random();
+        let (_, mut reversal) = reversed_trade(account);
+        reversal.relation = Relation::Reversal {
+            target: EventId::new_random(),
+        };
+
+        assert!(matches!(
+            assess(&[reversal], PerimeterPolicy::default()),
+            Err(PerimeterError::Correction(
+                crate::event::correction::CorrectionError::DanglingTarget { .. }
+            ))
+        ));
+    }
 
     #[test]
     fn every_classification_has_a_distinct_machine_readable_code() {

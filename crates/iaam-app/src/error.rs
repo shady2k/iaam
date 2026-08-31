@@ -6,6 +6,7 @@
 
 use iaam_core::perimeter::PerimeterError;
 use iaam_core::projection::ProjectionError;
+use iaam_core::projection::active_instruments::ActiveInstrumentsError;
 use iaam_core::reconciliation::observed::ObserveError;
 use thiserror::Error;
 use uuid::Uuid;
@@ -64,11 +65,12 @@ pub enum AppError {
     #[error("{what}")]
     Conflict { what: String },
     /// There is no way to build the synchronisation schedule: deriving active securities
-    /// from the journal overflowed. Separate from `Reconciliation`, because
-    /// reconciliation is irrelevant here, while «reconciliation not built» would send
-    /// an investigator to inspect the reconciliation register instead of the quantity journal.
+    /// from the journal failed numerically or because the journal's corrections were invalid.
+    /// Separate from `Reconciliation`, because reconciliation is irrelevant here, while
+    /// “reconciliation not built” would send an investigator to inspect the register instead
+    /// of the quantity journal.
     #[error("synchronisation schedule not built: {0}")]
-    Schedule(#[source] iaam_core::numeric::NumericError),
+    Schedule(#[source] ActiveInstrumentsError),
 }
 
 impl From<ObserveError> for AppError {

@@ -249,13 +249,14 @@ fn compare_quantity(claimed: Quantity, observed: Quantity) -> ClaimOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Event;
     use crate::event::kind::EventKind;
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
     use crate::ids::{AccountId, CustodyId, InstrumentId};
     use crate::money::Money;
     use crate::reconciliation::claim::{AssertionPeriod, BalancePoint};
-    use crate::reconciliation::observed::observe;
+    use crate::reconciliation::observed::observe as observe_effective;
     use rust_decimal::Decimal;
     use time::macros::date;
 
@@ -265,6 +266,14 @@ mod tests {
 
     fn march() -> AssertionPeriod {
         AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31)).unwrap()
+    }
+    fn observe(
+        events: &[Event],
+        account: AccountId,
+        period: AssertionPeriod,
+    ) -> Result<ObservedTotals, super::super::observed::ObserveError> {
+        let effective: Vec<&Event> = events.iter().collect();
+        observe_effective(&effective, account, period)
     }
 
     fn journal_with_one_deposit(account: AccountId, minor: i64) -> Vec<crate::event::Event> {

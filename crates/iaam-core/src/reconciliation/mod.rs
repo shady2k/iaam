@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use time::Date;
 
+use crate::event::correction::resolve;
 use crate::event::{Event, kind::EventKind};
 use crate::ids::AccountId;
 use check::{ClaimOutcome, check_claim};
@@ -216,6 +217,7 @@ impl ReconciliationLedger {
         events: &[Event],
         exceptions: &crate::perimeter::PerimeterExceptions,
     ) -> Result<Self, ObserveError> {
+        let effective_events = resolve(events)?;
         let groups = collect_groups(events);
         let gaps = collect_coverage_gaps(events);
         let tainted: Vec<BTreeSet<Dimension>> = groups
@@ -226,7 +228,7 @@ impl ReconciliationLedger {
         // Step 1: reconcile each group against its projection.
         let mut checked: Vec<Vec<ClaimCheck>> = Vec::with_capacity(groups.len());
         for group in &groups {
-            let observed = observe(events, group.account, group.period)?;
+            let observed = observe(&effective_events, group.account, group.period)?;
             checked.push(
                 group
                     .claims
@@ -742,7 +744,9 @@ fn merge_status(into: &mut Vec<ReconciliationStatus>, status: ReconciliationStat
 #[cfg(test)]
 mod internals {
     use super::*;
+    use crate::event::Relation;
     use crate::event::provenance::{ParserVersion, RawHash};
+    use crate::event::test_support::sample_event_with;
     use crate::ids::{CustodyId, InstrumentId, SourceId};
     use crate::money::{CurrencyCode, PostedMinor, Quantity};
     use crate::numeric::decimal::Dec;
@@ -790,6 +794,23 @@ mod internals {
             channel: channel(parser),
             claims,
         }
+    }
+
+    #[test]
+    fn a_correction_failure_is_reported_by_reconciliation_build() {
+        let orphan = sample_event_with(
+            0,
+            Relation::Reversal {
+                target: crate::ids::EventId::new_random(),
+            },
+        );
+
+        assert!(matches!(
+            ReconciliationLedger::build(&[orphan]),
+            Err(ObserveError::Correction(
+                crate::event::correction::CorrectionError::DanglingTarget { .. }
+            ))
+        ));
     }
 
     #[test]

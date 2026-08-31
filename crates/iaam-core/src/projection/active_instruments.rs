@@ -6,13 +6,24 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use thiserror::Error;
+
 use crate::event::Event;
 use crate::event::corporate_action::CorporateAction;
+use crate::event::correction::{CorrectionError, resolve};
 use crate::event::kind::{EventKind, TradeSide};
 use crate::event::offer::OfferExerciseAction;
 use crate::ids::InstrumentId;
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ActiveInstrumentsError {
+    #[error(transparent)]
+    Numeric(#[from] NumericError),
+    #[error(transparent)]
+    Correction(#[from] CorrectionError),
+}
 
 /// Negating the quantity. A negation failure is propagated to the caller because
 /// “cannot compute” must not be replaced with the original quantity.
@@ -26,9 +37,12 @@ fn negated(quantity: Dec) -> Result<Dec, NumericError> {
 /// select instruments for synchronization. Quantity accumulation overflow is
 /// an explicit failure because continuing with the old value loses the delta and
 /// produces an incorrect set of active instruments.
-pub fn active_instruments(events: &[Event]) -> Result<BTreeSet<InstrumentId>, NumericError> {
+pub fn active_instruments(
+    events: &[Event],
+) -> Result<BTreeSet<InstrumentId>, ActiveInstrumentsError> {
+    let effective = resolve(events)?;
     let mut quantities = BTreeMap::<InstrumentId, Dec>::new();
-    for event in events {
+    for event in effective {
         // A list of pairs, not a single pair: replacement moves the quantity across
         // two securities at once, and reducing it to one would leave the
         // predecessor permanently active.
@@ -117,6 +131,33 @@ mod tests {
     use rust_decimal::Decimal;
     use time::macros::date;
 
+    #[test]
+    fn a_reversed_trade_does_not_leave_an_active_instrument() {
+        let instrument = InstrumentId::new_random();
+        let trade = opening(instrument, Dec::one());
+        let mut reversal = trade.clone();
+        reversal.id = EventId::new_random();
+        reversal.relation = Relation::Reversal { target: trade.id };
+
+        let active = active_instruments(&[trade, reversal]).unwrap();
+
+        assert!(!active.contains(&instrument));
+    }
+    #[test]
+    fn a_correction_failure_is_reported_by_active_instruments() {
+        let mut orphan = opening(InstrumentId::new_random(), Dec::one());
+        orphan.relation = Relation::Reversal {
+            target: EventId::new_random(),
+        };
+
+        assert!(matches!(
+            active_instruments(&[orphan]),
+            Err(ActiveInstrumentsError::Correction(
+                CorrectionError::DanglingTarget { .. }
+            ))
+        ));
+    }
+
     fn opening(instrument: InstrumentId, quantity: Dec) -> Event {
         Event {
             id: EventId::new_random(),
@@ -151,6 +192,9 @@ mod tests {
             opening(instrument, Dec::one()),
         ];
 
-        assert_eq!(active_instruments(&events), Err(NumericError::Overflow),);
+        assert_eq!(
+            active_instruments(&events),
+            Err(ActiveInstrumentsError::Numeric(NumericError::Overflow))
+        );
     }
 }

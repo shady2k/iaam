@@ -6,11 +6,12 @@ Preceding design: `.internal/specs/2026-08-31-t4-custody-design.md` §3.2,
 which introduced the refusal this task exists to lift. Line numbers are
 against `main` at commit `1698c40`.
 
-Reviewed adversarially by codex on 2026-08-31. Seven findings, all
-accepted; four of them made an earlier revision of this document
-unimplementable, and they are recorded in §4 and §5 rather than hidden.
-The one claim that survived the review unchanged is the central one:
-**no replacement event is fabricated.**
+Reviewed adversarially by codex on 2026-08-31; four of its findings made
+an earlier revision of this document unimplementable. Verifying the fifth
+against the release history then removed a prerequisite this document had
+invented (§4, second half). Both the findings and that reversal are
+recorded here rather than quietly dropped. The central claim survived
+unchanged: **no replacement event is fabricated.**
 
 ## 1. Problem
 
@@ -134,36 +135,48 @@ Reports reach the wrong answers directly: they call the raw perimeter
 assessment and then the raw reconciliation ledger
 (`iaam-app/src/scenarios/reports.rs:461-464`).
 
-**Second prerequisite: the store's duplicate search must not match a
-reversed event.** `find_duplicate` (`iaam-store/src/events.rs:200`)
-searches the raw table. Fixing `known_records` in the application
-(§5.2) is not enough: the corrected fact passes the application gate and
-is then suppressed by the store, so it is silently **missing** rather
-than doubled — the worse of the two failures, because nothing reports it.
-The relation columns are persisted (`events.rs:152`), so the query can
-exclude ids that appear as a reversal target.
+**A reversed fact's identity can never be reused, and the repair must not
+depend on reusing it.** An earlier revision of this document proposed
+making the store's duplicate search ignore reversed events. That is not
+implementable and, for this repair, not needed.
 
-## 5. Two application-side changes
+Not implementable: `events_idempotency_key` and `events_source_operation`
+are **unique** indexes (`iaam-store/migrations/0001_initial.sql:35`,
+`0012_account_scoped_source_operation.sql`), so a second event with the
+same identity is rejected by the database, not merely by
+`find_duplicate`. Marking the superseded row instead is refused by the
+`events_are_immutable` trigger (`0001_initial.sql:45`), which aborts every
+`UPDATE`. Correction-aware uniqueness would need the index itself to
+exempt corrections — a schema change, and out of this epic's scope.
 
-**5.1 The refusal predicate reads the effective set.**
+Not needed: the identities genuinely differ. Affected facts predate
+commit `c403337`, which shipped T2 and T4 **together** — per-fill identity
+and `position_uid` custody in one release. So no released build ever
+produced a fact with the new identity and the fabricated custody. An
+affected fact carries the bare `operation_id` and the channel's
+`deduplication_key`; its re-import carries `operation_id#trade_num` and
+`composite_identity(...)` (`iaam-app/src/adapters/tinkoff.rs:467` against
+`:698-706`). Neither unique index sees a collision, and the content
+fingerprint differs too, because custody is part of it.
+
+This is a load-bearing fact about the release history, so it is worth
+stating plainly: **had T2 and T4 shipped separately, this repair would be
+blocked** by a unique-index collision with no query-level fix.
+
+## 5. One application-side change
+
+**The refusal predicate reads the effective set.**
 `affected_trade_count` (`sync.rs:401`) scans the raw slice. A reversed
 trade is still in that slice, so after a successful repair the refusal
 would still fire and the account would still be unsynchronisable — the
 repair would appear to do nothing.
 
-**5.2 Deduplication reads the effective set.**
-`known_records` is built from the raw `bounded_events` (`sync.rs:395`),
-and `dedup::assess` suppresses an exact identity match (`dedup.rs:209`).
-A reversed fact must not suppress its own corrected re-import.
+Without it the repair writes reversals that change nothing observable.
 
-This is a wider rule than the repair: a reversed fact never deduplicates
-against anything, on any path. That is the right rule, and stating it
-once is better than special-casing the repair. It has one accepted
-consequence: `assess` also uses known records for `PossibleDuplicate`
-hints (`dedup.rs:225`), so some outcomes move from `PossibleDuplicate` to
-`Fresh` and lose the `of` audit link. The candidate is recorded either
-way, and for this repair the corrected custody changes the fingerprint,
-so the reversed target would not have supplied the hint anyway.
+Deduplication needs no change, for the reasons in §4: the corrected
+re-import differs from the affected fact in identity and in content
+fingerprint, so nothing suppresses it at either the application gate or
+the store.
 
 ## 6. What the repair costs the owner, stated honestly
 
@@ -239,19 +252,15 @@ nothing, which is how the owner sees idempotency rather than being told.
 
 1. **Corrections become effective where legs are summed** — `observe` via
    `build_with`, `perimeter::assess`, `active_instruments`. Tests prove a
-   reversed trade contributes nothing. (§4)
-2. **The store's duplicate search ignores reversed events.** Test: a fact
-   whose identity matches a reversed event is recorded, not suppressed.
-   (§4)
-3. **The refusal predicate and `known_records` read the effective set.**
-   (§5)
-4. **The repair scenario** — predicate, provenance, idempotency,
+   reversed trade contributes nothing. (§4) **Done: `iaam-tyvi`.**
+2. **The refusal predicate reads the effective set.** (§5)
+3. **The repair scenario** — predicate, provenance, idempotency,
    already-reversed from relations, the §6 preflight. (§3, §6)
-5. **The route and its DTOs**, including the acknowledgement for the
+4. **The route and its DTOs**, including the acknowledgement for the
    no-active-access case. (§7)
 
-Order matters: 1 and 2 are prerequisites. Landing 4 or 5 before them
-produces a repair that doubles the very facts it retracts.
+Order matters: 1 is the prerequisite. Landing 3 or 4 before it produces a
+repair that doubles the very facts it retracts.
 
 ## 10. Acceptance
 
@@ -261,9 +270,10 @@ produces a repair that doubles the very facts it retracts.
   asserted through the reconciliation ledger and the perimeter
   assessment, not only through the projection, because those are the
   consumers §4 is about.
-- A reversed fact does not suppress a re-import of the same underlying
-  row, proved on a fact whose identity matches, and proved at the store
-  level and not only in `known_records`.
+- After repair, a re-import of the same underlying rows records the
+  corrected facts — proved on the identities an affected fact and its
+  re-import actually carry, which differ (§4), not on a constructed
+  collision the schema would reject anyway.
 - Running the repair twice writes reversals once; the second run reports
   zero written and the same number already reversed.
 - An account with no affected trades: nothing written, zero reported, no

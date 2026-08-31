@@ -215,6 +215,42 @@ Cannot change without a migration:
   preserved, nor `rejected`, which carries a structured rejection of a row
   that could not be parsed.
 
+## E5: the journal starts correcting itself
+
+The custody repair (`iaam-y3a2`) is the first production code that writes a
+correction. Until it, `Relation::Reversal` existed and nothing produced one:
+`recompute_history` computed a correction plan and discarded it. The facts
+below have now been written, so they cannot be redefined.
+
+| Requirement | Where implemented |
+|---|---|
+| A correction retracts and does not fabricate: the corrected custody comes from the broker on re-import, never from the journal | `scenarios::custody_repair::repair_custody`, reversal only |
+| A reversed event is effective nowhere that sums legs | `resolve` inside `perimeter::assess` and `active_instruments`; `build_with` resolves once and `observe` takes `&[&Event]` |
+| A repaired account is no longer refused | `sync::affected_trade_count` over the resolved set |
+| A journal whose own correction links do not resolve is named as that, not as a failure to reconcile | `AppError::Correction`, code `corrections_do_not_resolve` |
+| An owner is told before facts are retracted that nothing may restore them | `CustodyRepairCase`, and the acknowledgement the route requires |
+
+Cannot change without a migration:
+
+- The repair's parser version `custody-repair/1` and its idempotency key
+  `custody-repair/{account}/{target}`. Both are in the journal; a different
+  key would write a second reversal for a target already reversed.
+- That a reversal's provenance carries **no** `source_operation_id`. It is not
+  a nicety: `find_duplicate` tests that identity before the idempotency key,
+  so a reversal carrying its target's identity is found as a duplicate of the
+  event it reverses and is never written — while the repair reports success.
+- That "already reversed" is read from `Relation` links rather than from a
+  store duplicate. Idempotency keys are client-supplied, so a taken key proves
+  only that it is taken.
+
+Two limits are worth stating because they look like defects otherwise. A
+reversed fact's identity can never be reused: `events_idempotency_key` and
+`events_source_operation` are unique, and `events_are_immutable` refuses to
+mark the superseded row, so correction-aware uniqueness would have to live in
+the index itself. And the repair's «can this be restored» test asks only
+whether the owner holds any unrevoked broker access — a revoked access's
+`SourceId` cannot be matched to the facts it recorded.
+
 ## Что менять нельзя без миграции
 
 - Состав и семантику `EventDates` — от них зависит налоговый период.

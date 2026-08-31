@@ -128,6 +128,7 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
         .routes(routes!(routes::ingest_csv))
         .routes(routes!(routes::upload_document))
         .routes(routes!(routes::reparse_document))
+        .routes(routes!(routes::repair_custody))
         .routes(routes!(routes::reconciliation))
         .routes(routes!(routes::reconciliation_balance))
         .routes(routes!(

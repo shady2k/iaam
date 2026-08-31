@@ -50,12 +50,12 @@ use crate::dto::{
     BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
     ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
-    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
-    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
-    MarketSyncRequest, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
-    ReconciliationParams, ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
-    TokenDto, TokenScopeDto, VerdictDto,
+    CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
+    EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
+    MarketKeyRateDto, MarketPriceDto, MarketSourceDto, MarketSyncRequest, OwnerBalanceRequest,
+    QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams, ReconciliationStatusDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -262,6 +262,37 @@ pub async fn reparse_document(
     )
     .await?;
     Ok(Json(document_dto(result)))
+}
+
+/// Retract trades whose custody was fabricated from the account identifier.
+#[utoipa::path(
+    post,
+    path = "/v1/accounts/{account}/repairs/custody",
+    params(("account" = Uuid, Path, description = "Account identifier")),
+    request_body = CustodyRepairRequest,
+    responses(
+        (status = 200, description = "Custody repair outcome", body = CustodyRepairOutcomeDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "Invalid repair request", body = ApiError),
+        (status = 409, description = "Repair idempotency conflict", body = ApiError),
+        (status = 503, description = "Broker access is not configured", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn repair_custody(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(account): Path<Uuid>,
+    Json(request): Json<CustodyRepairRequest>,
+) -> Result<Json<CustodyRepairOutcomeDto>, ApiFailure> {
+    let outcome = iaam_app::scenarios::custody_repair::repair_custody(
+        &state.services,
+        &principal,
+        AccountId(account),
+        request.acknowledge_without_live_access,
+    )
+    .await?;
+    Ok(Json(CustodyRepairOutcomeDto::from_domain(outcome)))
 }
 
 /// Reconciliation statuses with grounds and assertion outcomes.

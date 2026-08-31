@@ -606,6 +606,64 @@ pub struct SubmitOperationsRequest {
     pub operations: Vec<OperationDto>,
 }
 
+/// Acknowledgement required before retracting affected trades without live broker access.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CustodyRepairRequest {
+    /// Acknowledge that retracted facts may not be restored by a subsequent synchronisation.
+    #[serde(default)]
+    pub acknowledge_without_live_access: bool,
+}
+
+/// Which case the account was in when the repair ran.
+///
+/// An enum rather than a free string: the caller decides what to do next from this
+/// value, and a schema that does not enumerate the cases leaves them to be guessed
+/// from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CustodyRepairCaseDto {
+    /// Affected trades exist and an unrevoked broker access can restore them.
+    AffectedWithLiveAccess,
+    /// Affected trades exist and no unrevoked broker access can restore them.
+    AffectedWithoutLiveAccess,
+    /// Nothing was left to repair.
+    NothingAffected,
+}
+
+/// Outcome of repairing account-derived custody facts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct CustodyRepairOutcomeDto {
+    pub case: CustodyRepairCaseDto,
+    pub affected_trades: usize,
+    /// Reversed by an earlier run: a repeat run reports these and writes nothing.
+    pub already_reversed: usize,
+    /// Written by this run. A partial run reports what it managed, rather than
+    /// leaving the caller to infer it.
+    pub written: usize,
+}
+
+impl CustodyRepairOutcomeDto {
+    #[must_use]
+    pub fn from_domain(outcome: iaam_app::scenarios::custody_repair::CustodyRepairOutcome) -> Self {
+        use iaam_app::scenarios::custody_repair::CustodyRepairCase;
+        let case = match outcome.case {
+            CustodyRepairCase::AffectedWithLiveAccess => {
+                CustodyRepairCaseDto::AffectedWithLiveAccess
+            }
+            CustodyRepairCase::AffectedWithoutLiveAccess => {
+                CustodyRepairCaseDto::AffectedWithoutLiveAccess
+            }
+            CustodyRepairCase::NothingAffected => CustodyRepairCaseDto::NothingAffected,
+        };
+        Self {
+            case,
+            affected_trades: outcome.affected_trades,
+            already_reversed: outcome.already_reversed,
+            written: outcome.written,
+        }
+    }
+}
+
 /// Verdict for a single operation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VerdictDto {

@@ -277,8 +277,10 @@ impl Event {
                 self.validate_control_assertion(name, *period, *claim)
             }
             EventKind::ImportCoverageGap {
-                period, dimensions, ..
-            } => self.validate_import_coverage_gap(name, *period, dimensions),
+                period,
+                dimensions,
+                refused,
+            } => self.validate_import_coverage_gap(name, *period, dimensions, *refused),
             EventKind::CorporateAction { action } => self.validate_corporate_action(name, action),
             EventKind::OfferExercise { action } => self.validate_offer_exercise(name, action),
         }
@@ -739,12 +741,20 @@ impl Event {
         name: &'static str,
         period: crate::reconciliation::claim::AssertionPeriod,
         dimensions: &std::collections::BTreeSet<crate::reconciliation::Dimension>,
+        refused: u32,
     ) -> Result<(), EventValidationError> {
         if !period.is_well_formed() {
             return Err(EventValidationError::NonPositive {
                 kind: name,
                 field: "period",
                 value: format!("{} .. {}", period.from, period.to),
+            });
+        }
+        if refused < 1 {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "refused",
+                value: refused.to_string(),
             });
         }
         if dimensions.is_empty() {
@@ -2591,6 +2601,36 @@ mod tests {
         assert!(matches!(
             two.validate_structure(),
             Err(EventValidationError::LegCount { found: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn an_import_coverage_gap_requires_at_least_one_refused_row() {
+        let account = AccountId::new_random();
+        let period = crate::reconciliation::claim::AssertionPeriod::between(
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .expect("well-formed period");
+        let event = event(
+            EventKind::ImportCoverageGap {
+                period,
+                dimensions: [crate::reconciliation::Dimension::Cash]
+                    .into_iter()
+                    .collect(),
+                refused: 0,
+            },
+            Vec::new(),
+            account,
+        );
+
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::NonPositive {
+                field: "refused",
+                value,
+                ..
+            }) if value == "0"
         ));
     }
 

@@ -1390,6 +1390,40 @@ async fn a_current_portfolio_is_withheld_when_interval_ends_before_clock_date() 
         "a portfolio from another day must not become an assertion"
     );
 }
+#[tokio::test]
+async fn a_current_portfolio_is_withheld_when_interval_contains_today_but_ends_later() {
+    let today = date!(2026 - 04 - 01);
+    let services = services_at(today);
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let mut operation = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    operation.dates.trade = Some(today);
+    let broker = api(account, SourceId::new_random(), operation);
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 22),
+        date!(2026 - 04 - 11),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("future-ending sync: {error}"));
+
+    assert_eq!(outcome.assertions, 0);
+    assert_eq!(
+        outcome.assertions_withheld,
+        Some(AssertionsWithheld::PortfolioDescribesAnotherDay { as_of: today })
+    );
+    let events = load_all(&services, owner).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. })),
+        "a current portfolio cannot be recorded as a future closing assertion"
+    );
+}
 
 #[tokio::test]
 async fn a_requested_portfolio_is_recorded_for_its_requested_interval() {

@@ -241,8 +241,7 @@ pub async fn sync_broker(
         PortfolioAsOf::Requested => None,
         PortfolioAsOf::Current => {
             let as_of = services.clock.today();
-            (!((from..=to).contains(&as_of)))
-                .then_some(AssertionsWithheld::PortfolioDescribesAnotherDay { as_of })
+            (as_of != to).then_some(AssertionsWithheld::PortfolioDescribesAnotherDay { as_of })
         }
     };
     if assertions_withheld.is_some() {

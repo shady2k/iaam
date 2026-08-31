@@ -229,7 +229,14 @@ fn adapt_operations(
             quarantined.push(Quarantined {
                 raw,
                 reason,
-                dimensions: cash_positions(),
+                dimensions: if matches!(
+                    kind,
+                    ChannelOperationKind::Buy | ChannelOperationKind::Sell
+                ) {
+                    cash_positions()
+                } else {
+                    dimensions_for_kind(&kind)
+                },
             });
             continue;
         }
@@ -1341,11 +1348,51 @@ mod tests {
         );
         assert_eq!(
             parsed.quarantined[0].dimensions,
-            [Dimension::Cash, Dimension::Positions]
-                .into_iter()
-                .collect()
+            [Dimension::Cash, Dimension::Income].into_iter().collect()
         );
     }
+    #[test]
+    fn a_cancelled_dividend_taints_cash_and_income() {
+        let operations = parse_operations(&income_operation_with_state(
+            "OPERATION_TYPE_DIVIDEND",
+            "OPERATION_STATE_CANCELED",
+        ))
+        .expect("parsing");
+        let parsed = adapt_operations(
+            AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            operations,
+            &dictionary(),
+        )
+        .expect("adaptation");
+
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Cash, Dimension::Income].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_unknown_kind_taints_all_dimensions() {
+        let operations = parse_operations(&income_operation_with_state(
+            "OPERATION_TYPE_UNKNOWN",
+            "OPERATION_STATE_CANCELED",
+        ))
+        .expect("parsing");
+        let parsed = adapt_operations(
+            AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            operations,
+            &dictionary(),
+        )
+        .expect("adaptation");
+
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            Dimension::all().into_iter().collect()
+        );
+    }
+
     #[test]
     fn a_deposit_placeholder_trade_is_ignored_and_becomes_a_fact() {
         let body = r#"{

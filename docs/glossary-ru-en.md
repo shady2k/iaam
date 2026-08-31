@@ -68,6 +68,7 @@ is how you match a term in them to the code.
 | отпечаток | digest / fingerprint | `prefix_digest` and `fingerprint` are different things; do not mix |
 | дельта | delta | |
 | порядок (внутри дня) | effective order | |
+| состояние поручения | order state | `ChannelOrderState`; the broker channel's own state, not ours |
 
 ## Dates
 
@@ -97,6 +98,7 @@ is how you match a term in them to the code.
 | заслон | guard | the scripts under `scripts/` |
 | инвариант | invariant | |
 | порог | threshold | |
+| карантин | quarantine | the `Quarantined` row: neither a fact nor lost |
 
 ## Transport and infrastructure
 

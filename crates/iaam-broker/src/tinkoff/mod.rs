@@ -5,6 +5,6 @@ pub mod parse;
 
 pub use client::{GetOperationsByCursorRequest, TinkoffClient, TinkoffError};
 pub use parse::{
-    ChannelMoney, ChannelOperation, ChannelOperationKind, ParseError, TINKOFF_PARSER_VERSION,
-    parse_operations, parse_portfolio,
+    ChannelMoney, ChannelOperation, ChannelOperationKind, ChannelOrderState, ChannelTrade,
+    OperationsPage, ParseError, TINKOFF_PARSER_VERSION, parse_operations, parse_portfolio,
 };

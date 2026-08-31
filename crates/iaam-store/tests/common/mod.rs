@@ -18,6 +18,7 @@ pub fn apply_migrations_through(conn: &Connection, through: u32) {
         include_str!("../../migrations/0011_accrued_interest.sql"),
         include_str!("../../migrations/0012_account_scoped_source_operation.sql"),
         include_str!("../../migrations/0013_event_source_time.sql"),
+        include_str!("../../migrations/0014_securities_transfer_kinds.sql"),
     ];
     assert!(
         through <= migrations.len() as u32,

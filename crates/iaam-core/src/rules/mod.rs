@@ -12,6 +12,7 @@ pub mod lot_disposal;
 pub mod posting_match;
 pub mod quotation;
 pub mod returned_share;
+pub mod trade_allocation;
 pub mod valuation;
 
 use std::collections::BTreeMap;

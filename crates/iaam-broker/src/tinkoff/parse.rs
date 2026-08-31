@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/2";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/3";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -71,6 +71,35 @@ impl ChannelMoney {
     }
 }
 
+/// State the channel reported for the order.
+///
+/// Typed rather than a string so that an unrecognised value is a named
+/// variant carrying the raw text, and adding a member breaks compilation
+/// wherever the state is consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelOrderState {
+    /// `OPERATION_STATE_EXECUTED`: executed in part or in full.
+    Executed,
+    /// `OPERATION_STATE_CANCELED`.
+    Cancelled,
+    /// `OPERATION_STATE_PROGRESS`.
+    InProgress,
+    /// `OPERATION_STATE_UNSPECIFIED`: the channel did not name a state.
+    Unspecified,
+    /// A value absent from the contract, carrying the raw text.
+    Unrecognised(String),
+}
+
+/// One execution of a trading order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelTrade {
+    pub num: String,
+    pub at: OffsetDateTime,
+    pub quantity: Quantity,
+    /// Exact source price; it is not rounded until the gross is calculated.
+    pub price: CalcMoney,
+}
+
 /// Operation received from the T-Invest REST channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelOperation {
@@ -92,13 +121,25 @@ pub struct ChannelOperation {
     /// lives in data, decides what it becomes.
     pub source_kind: String,
     /// Original order state.
-    pub state: String,
+    pub state: ChannelOrderState,
+    /// Position UID reported by the operation row.
+    pub position_uid: Option<String>,
     /// Instrument UID, if the operation contains one.
     pub instrument_uid: Option<String>,
     /// FIGI, if the operation contains one.
     pub figi: Option<String>,
     /// Instrument quantity.
     pub quantity: Option<Quantity>,
+    /// Executions reported for this order.
+    pub trades: Vec<ChannelTrade>,
+    /// Total quantity executed by the gateway, including an absent-as-zero value.
+    pub quantity_done: Quantity,
+    /// Quantity remaining in the order, including an absent-as-zero value.
+    pub quantity_rest: Quantity,
+    /// Gateway explanation for a cancelled order, if supplied.
+    pub cancel_reason: Option<String>,
+    /// Accrued interest reported for the whole order, if known.
+    pub accrued_interest: Option<ChannelMoney>,
     /// Monetary effect of the operation.
     pub payment: Option<ChannelMoney>,
     /// Price of one unit.
@@ -123,8 +164,22 @@ impl ChannelOperation {
     }
 }
 
-/// Parse a complete `GetOperationsByCursor` response without network access.
-pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError> {
+/// One parsed page of a `GetOperationsByCursor` response.
+///
+/// Pagination belongs to the caller because this parser has no transport
+/// access and cannot decide whether another page should be requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationsPage {
+    /// Operations in the response's order.
+    pub operations: Vec<ChannelOperation>,
+    /// Whether the gateway says another page follows.
+    pub has_next: bool,
+    /// Cursor to use for the next page, when one is available.
+    pub next_cursor: Option<String>,
+}
+
+/// Parse one `GetOperationsByCursor` response page without network access.
+pub fn parse_operations(body: &str) -> Result<OperationsPage, ParseError> {
     let response: RawOperationsResponse = parse_json(body)?;
     let has_next = response
         .has_next
@@ -135,15 +190,19 @@ pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError>
     if has_next && response.next_cursor.as_deref().is_none_or(str::is_empty) {
         return Err(ParseError::PartialResponse);
     }
-    Ok(items
-        .into_iter()
-        .map(
-            |raw| match serde_json::from_value::<RawOperation>(raw.clone()) {
-                Ok(item) => parse_operation(item, raw),
-                Err(error) => rejected_operation(raw, ParseError::Json(error.to_string())),
-            },
-        )
-        .collect())
+    Ok(OperationsPage {
+        operations: items
+            .into_iter()
+            .map(
+                |raw| match serde_json::from_value::<RawOperation>(raw.clone()) {
+                    Ok(item) => parse_operation(item, raw),
+                    Err(error) => rejected_operation(raw, ParseError::Json(error.to_string())),
+                },
+            )
+            .collect(),
+        has_next,
+        next_cursor: response.next_cursor,
+    })
 }
 
 /// Parse portfolio cash and positions into control claims.
@@ -225,9 +284,20 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         required_or_reject(item.broker_account_id, "brokerAccountId", &mut rejection);
     let cursor = required_or_reject(item.cursor, "cursor", &mut rejection);
     let date = date_or_reject(item.date, "date", &mut rejection);
-    let source_time = source_time_or_reject(item.trades_info, &mut rejection);
     let operation_type = required_or_reject(item.operation_type, "type", &mut rejection);
-    let state = required_or_reject(item.state, "state", &mut rejection);
+    let trades_info = item.trades_info;
+    let trades = parse_trades(trades_info)
+        .map_err(|error| {
+            if rejection.is_none() {
+                rejection = Some(error);
+            }
+        })
+        .ok()
+        .unwrap_or_default();
+    let source_time = trades
+        .first()
+        .map(|trade| trade.at.to_offset(UtcOffset::UTC).time());
+    let state = order_state_or_reject(item.state, &mut rejection);
     let quantity = keep_or_reject(
         item.quantity
             .as_deref()
@@ -235,6 +305,16 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
             .transpose(),
         &mut rejection,
     );
+    let quantity_done =
+        integer_quantity_or_zero(item.quantity_done, "quantityDone", &mut rejection);
+    let quantity_rest =
+        integer_quantity_or_zero(item.quantity_rest, "quantityRest", &mut rejection);
+    let cancel_reason = nonempty(item.cancel_reason);
+    let accrued_interest = keep_or_reject(
+        parse_optional_money(item.accrued_interest.as_ref(), "accruedInt"),
+        &mut rejection,
+    );
+
     let payment = keep_or_reject(
         parse_optional_money(item.payment.as_ref(), "payment"),
         &mut rejection,
@@ -257,9 +337,16 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         source_kind: operation_type.clone(),
         state,
         instrument_uid: nonempty(item.instrument_uid),
+        position_uid: nonempty(item.position_uid),
         figi: nonempty(item.figi),
         quantity,
+        trades,
+        quantity_done,
+        quantity_rest,
+        cancel_reason,
         payment,
+        accrued_interest,
+
         price,
         commission,
         deduplication_key: format!("{broker_account_id}/{operation_id}"),
@@ -278,10 +365,17 @@ fn rejected_operation(raw: Value, reason: ParseError) -> ChannelOperation {
         parent_operation_id: None,
         cursor: String::new(),
         source_kind: String::new(),
-        state: String::new(),
+        state: ChannelOrderState::Unspecified,
+        position_uid: None,
         instrument_uid: None,
         figi: None,
         quantity: None,
+        trades: Vec::new(),
+        quantity_done: Quantity::zero(),
+        quantity_rest: Quantity::zero(),
+        cancel_reason: None,
+        accrued_interest: None,
+
         payment: None,
         price: None,
         commission: None,
@@ -298,6 +392,27 @@ fn required_or_reject(
     rejection: &mut Option<ParseError>,
 ) -> String {
     keep_or_reject(required(value, field).map(Some), rejection).unwrap_or_default()
+}
+
+fn order_state_or_reject(
+    value: Option<String>,
+    rejection: &mut Option<ParseError>,
+) -> ChannelOrderState {
+    keep_or_reject(
+        required(value, "state").map(|value| Some(parse_order_state(value))),
+        rejection,
+    )
+    .unwrap_or(ChannelOrderState::Unspecified)
+}
+
+fn parse_order_state(raw: String) -> ChannelOrderState {
+    match raw.as_str() {
+        "OPERATION_STATE_EXECUTED" => ChannelOrderState::Executed,
+        "OPERATION_STATE_CANCELED" => ChannelOrderState::Cancelled,
+        "OPERATION_STATE_PROGRESS" => ChannelOrderState::InProgress,
+        "OPERATION_STATE_UNSPECIFIED" => ChannelOrderState::Unspecified,
+        _ => ChannelOrderState::Unrecognised(raw),
+    }
 }
 
 fn date_or_reject(
@@ -510,20 +625,55 @@ fn parse_date(value: &str, field: &'static str) -> Result<Date, ParseError> {
     parse_timestamp(value, field).map(|timestamp| timestamp.date())
 }
 
-fn source_time_or_reject(
-    trades_info: Option<RawTradesInfo>,
+fn parse_trades(trades_info: Option<RawTradesInfo>) -> Result<Vec<ChannelTrade>, ParseError> {
+    let trades = trades_info.and_then(|info| info.trades).unwrap_or_default();
+    // Cash operations carry a zero-valued placeholder whose empty currency
+    // distinguishes it from an execution; its other fields are not required.
+    trades
+        .into_iter()
+        .filter(|trade| {
+            !matches!(
+                trade
+                    .price
+                    .as_ref()
+                    .and_then(|price| price.currency.as_deref()),
+                Some("")
+            )
+        })
+        .map(parse_trade)
+        .collect()
+}
+
+fn parse_trade(trade: RawTrade) -> Result<ChannelTrade, ParseError> {
+    let num = required(trade.num, "num")?;
+    let at = required(trade.date, "date").and_then(|value| parse_timestamp(&value, "date"))?;
+    let quantity = required(trade.quantity, "quantity")
+        .and_then(|value| parse_integer_quantity(&value, "quantity"))?;
+    let price = trade
+        .price
+        .as_ref()
+        .ok_or(ParseError::MissingField { field: "price" })
+        .and_then(|value| parse_calc_money(value, "price"))?;
+    Ok(ChannelTrade {
+        num,
+        at,
+        quantity,
+        price,
+    })
+}
+
+fn integer_quantity_or_zero(
+    value: Option<String>,
+    field: &'static str,
     rejection: &mut Option<ParseError>,
-) -> Option<Time> {
-    let trade = trades_info
-        .and_then(|info| info.trades)
-        .and_then(|trades| trades.into_iter().next())?;
+) -> Quantity {
     keep_or_reject(
-        required(trade.date, "tradesInfo.trades[0].date").and_then(|value| {
-            parse_timestamp(&value, "tradesInfo.trades[0].date")
-                .map(|timestamp| Some(timestamp.to_offset(UtcOffset::UTC).time()))
-        }),
+        value
+            .map(|value| parse_integer_quantity(&value, field))
+            .transpose(),
         rejection,
     )
+    .unwrap_or_else(Quantity::zero)
 }
 
 fn required(value: Option<String>, field: &'static str) -> Result<String, ParseError> {
@@ -563,11 +713,21 @@ struct RawOperation {
     state: Option<String>,
     #[serde(rename = "instrumentUid")]
     instrument_uid: Option<String>,
+    #[serde(rename = "positionUid")]
+    position_uid: Option<String>,
     figi: Option<String>,
     payment: Option<RawMoneyValue>,
     price: Option<RawMoneyValue>,
     commission: Option<RawMoneyValue>,
+    #[serde(rename = "accruedInt")]
+    accrued_interest: Option<RawMoneyValue>,
     quantity: Option<String>,
+    #[serde(rename = "quantityRest")]
+    quantity_rest: Option<String>,
+    #[serde(rename = "quantityDone")]
+    quantity_done: Option<String>,
+    #[serde(rename = "cancelReason")]
+    cancel_reason: Option<String>,
     #[serde(rename = "tradesInfo")]
     trades_info: Option<RawTradesInfo>,
 }
@@ -579,7 +739,10 @@ struct RawTradesInfo {
 
 #[derive(Debug, Deserialize)]
 struct RawTrade {
+    num: Option<String>,
     date: Option<String>,
+    quantity: Option<String>,
+    price: Option<RawMoneyValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -615,4 +778,311 @@ struct RawQuotation {
     units: Option<String>,
     #[serde(default)]
     nano: i64,
+}
+#[cfg(test)]
+mod tests {
+    use super::{ChannelOrderState, ParseError, parse_operations as parse_page};
+
+    fn parse_operations(body: &str) -> Result<Vec<super::ChannelOperation>, ParseError> {
+        parse_page(body).map(|page| page.operations)
+    }
+
+    fn operation_json(state: Option<&str>) -> String {
+        let state = state.map_or(String::new(), |state| format!(r#","state":"{state}""#));
+        format!(
+            r#"{{
+                "hasNext": false,
+                "items": [{{
+                    "cursor": "cursor-1",
+                    "brokerAccountId": "account-1",
+                    "id": "operation-1",
+                    "date": "2026-08-20T10:11:12Z",
+                    "type": "OPERATION_TYPE_BUY"{state}
+                }}]
+            }}"#
+        )
+    }
+    #[test]
+    fn preserves_pagination_metadata_for_the_caller() {
+        let page = parse_page(r#"{"hasNext":true,"nextCursor":"cursor-2","items":[]}"#)
+            .expect("page parses");
+
+        assert!(page.has_next);
+        assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
+        assert!(page.operations.is_empty());
+    }
+
+    #[test]
+    fn parses_each_contract_order_state() {
+        let cases = [
+            ("OPERATION_STATE_EXECUTED", ChannelOrderState::Executed),
+            ("OPERATION_STATE_CANCELED", ChannelOrderState::Cancelled),
+            ("OPERATION_STATE_PROGRESS", ChannelOrderState::InProgress),
+            (
+                "OPERATION_STATE_UNSPECIFIED",
+                ChannelOrderState::Unspecified,
+            ),
+        ];
+
+        for (wire, expected) in cases {
+            let operation = parse_operations(&operation_json(Some(wire)))
+                .expect("response parses")
+                .pop()
+                .expect("one operation");
+            assert_eq!(operation.state, expected);
+        }
+    }
+
+    #[test]
+    fn preserves_unrecognised_order_state_verbatim() {
+        let operation = parse_operations(&operation_json(Some("OPERATION_STATE_SOMETHING_NEW")))
+            .expect("response parses")
+            .pop()
+            .expect("one operation");
+
+        assert_eq!(
+            operation.state,
+            ChannelOrderState::Unrecognised("OPERATION_STATE_SOMETHING_NEW".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_an_operation_without_order_state() {
+        let operation = parse_operations(&operation_json(None))
+            .expect("response parses")
+            .pop()
+            .expect("one operation");
+
+        assert_eq!(
+            operation.rejection,
+            Some(ParseError::MissingField { field: "state" })
+        );
+        assert_eq!(operation.state, ChannelOrderState::Unspecified);
+    }
+    #[test]
+    fn parses_each_trade_with_its_own_fields() {
+        let operation = parse_operations(
+            r#"{
+                "hasNext": false,
+                "items": [{
+                    "cursor": "cursor-1",
+                    "brokerAccountId": "account-1",
+                    "id": "operation-1",
+                    "date": "2026-08-20T10:11:12Z",
+                    "type": "OPERATION_TYPE_BUY",
+                    "state": "OPERATION_STATE_EXECUTED",
+                    "positionUid": "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a",
+                    "quantityDone": "12",
+                    "quantityRest": "3",
+                    "cancelReason": "operator cancelled",
+                    "tradesInfo": {"trades": [
+                        {
+                            "num": "trade-1",
+                            "date": "2026-08-21T11:12:13+03:00",
+                            "quantity": "10",
+                            "price": {"units": "12", "nano": 345600000, "currency": "rub"}
+                        },
+                        {
+                            "num": "trade-2",
+                            "date": "2026-08-22T12:13:14Z",
+                            "quantity": "2",
+                            "price": {"units": "13", "nano": 450000000, "currency": "rub"}
+                        }
+                    ]}
+                }]
+            }"#,
+        )
+        .expect("response parses")
+        .pop()
+        .expect("one operation");
+        assert_eq!(
+            operation.position_uid.as_deref(),
+            Some("f1a60ae6-3f1e-43c8-8d46-042df0fdc97a")
+        );
+
+        assert_eq!(operation.trades.len(), 2);
+        assert_eq!(operation.trades[0].num, "trade-1");
+        assert_eq!(operation.trades[0].quantity.0.inner().to_string(), "10");
+        assert_eq!(
+            operation.trades[0].price.value().inner().to_string(),
+            "12.3456"
+        );
+        assert_eq!(
+            operation.trades[0].at,
+            time::macros::datetime!(2026-08-21 11:12:13 +03:00)
+        );
+        assert_eq!(operation.trades[1].num, "trade-2");
+        assert_eq!(operation.trades[1].quantity.0.inner().to_string(), "2");
+        assert_eq!(
+            operation.trades[1].price.value().inner().to_string(),
+            "13.45"
+        );
+        assert_eq!(
+            operation.trades[1].at,
+            time::macros::datetime!(2026-08-22 12:13:14 +00:00)
+        );
+        assert_eq!(operation.quantity_done.0.inner().to_string(), "12");
+        assert_eq!(operation.quantity_rest.0.inner().to_string(), "3");
+        assert_eq!(
+            operation.cancel_reason.as_deref(),
+            Some("operator cancelled")
+        );
+        assert_eq!(operation.source_time, Some(time::macros::time!(08:12:13)));
+    }
+
+    #[test]
+    fn absent_or_empty_trades_info_means_no_trades() {
+        for trades_info in ["", r#","tradesInfo": {"trades": []}"#] {
+            let body = format!(
+                r#"{{
+                    "hasNext": false,
+                    "items": [{{
+                        "cursor": "cursor-1",
+                        "brokerAccountId": "account-1",
+                        "id": "operation-1",
+                        "date": "2026-08-20T10:11:12Z",
+                        "type": "OPERATION_TYPE_BUY",
+                        "state": "OPERATION_STATE_CANCELED"{trades_info}
+                    }}]
+                }}"#
+            );
+            let operation = parse_operations(&body)
+                .expect("response parses")
+                .pop()
+                .expect("one operation");
+            assert!(operation.trades.is_empty());
+            assert_eq!(operation.rejection, None);
+        }
+    }
+
+    #[test]
+    fn absent_quantity_done_is_present_as_zero() {
+        let operation = parse_operations(&operation_json(Some("OPERATION_STATE_EXECUTED")))
+            .expect("response parses")
+            .pop()
+            .expect("one operation");
+
+        assert!(operation.quantity_done.0.is_zero());
+        assert!(operation.quantity_rest.0.is_zero());
+    }
+
+    #[test]
+    fn a_trade_missing_a_required_field_rejects_the_whole_row_and_keeps_raw_json() {
+        let body = r#"{
+            "hasNext": false,
+            "items": [{
+                "cursor": "cursor-1",
+                "brokerAccountId": "account-1",
+                "id": "operation-1",
+                "date": "2026-08-20T10:11:12Z",
+                "type": "OPERATION_TYPE_BUY",
+                "state": "OPERATION_STATE_EXECUTED",
+                "tradesInfo": {"trades": [{
+                    "num": "trade-1",
+                    "date": "2026-08-21T11:12:13Z",
+                    "quantity": "10"
+                }]}
+            }]
+        }"#;
+        let operation = parse_operations(body)
+            .expect("response parses")
+            .pop()
+            .expect("one operation");
+
+        assert_eq!(
+            operation.rejection,
+            Some(ParseError::MissingField { field: "price" })
+        );
+        assert_eq!(operation.raw["tradesInfo"]["trades"][0]["quantity"], "10");
+        assert!(operation.trades.is_empty());
+    }
+    #[test]
+    fn each_missing_trade_field_rejects_the_whole_row() {
+        let required_fields = ["num", "date", "quantity", "price"];
+        for missing in required_fields {
+            let mut trade = serde_json::json!({
+                "num": "trade-1",
+                "date": "2026-08-21T11:12:13Z",
+                "quantity": "10",
+                "price": {"units": "12", "nano": 0, "currency": "rub"}
+            });
+            trade.as_object_mut().expect("trade object").remove(missing);
+            let body = serde_json::json!({
+                "hasNext": false,
+                "items": [{
+                    "cursor": "cursor-1",
+                    "brokerAccountId": "account-1",
+                    "id": "operation-1",
+                    "date": "2026-08-20T10:11:12Z",
+                    "type": "OPERATION_TYPE_BUY",
+                    "state": "OPERATION_STATE_EXECUTED",
+                    "tradesInfo": {"trades": [trade]}
+                }]
+            })
+            .to_string();
+            let operation = parse_operations(&body)
+                .expect("response parses")
+                .pop()
+                .expect("one operation");
+
+            assert!(operation.rejection.is_some(), "missing {missing} accepted");
+            assert_eq!(
+                operation.raw["tradesInfo"]["trades"][0][missing],
+                serde_json::Value::Null
+            );
+            assert!(operation.trades.is_empty());
+        }
+    }
+    #[test]
+    fn absent_accrued_interest_is_unknown() {
+        let operation = parse_operations(&operation_json(Some("OPERATION_STATE_EXECUTED")))
+            .expect("response parses")
+            .pop()
+            .expect("one operation");
+        assert_eq!(operation.accrued_interest, None);
+    }
+
+    #[test]
+    fn parses_accrued_interest_with_empty_currency_as_absent() {
+        let body = r#"{
+            "hasNext": false,
+            "items": [{
+                "cursor": "cursor-1",
+                "brokerAccountId": "account-1",
+                "id": "operation-1",
+                "date": "2026-08-20T10:11:12Z",
+                "type": "OPERATION_TYPE_BUY",
+                "state": "OPERATION_STATE_EXECUTED",
+                "accruedInt": {"units": "0", "nano": 0, "currency": ""}
+            }]
+        }"#;
+        let operation = parse_operations(body)
+            .expect("response parses")
+            .pop()
+            .expect("one operation");
+        assert_eq!(operation.accrued_interest, None);
+    }
+
+    #[test]
+    fn parses_accrued_interest_zero_with_a_real_currency() {
+        let body = r#"{
+            "hasNext": false,
+            "items": [{
+                "cursor": "cursor-1",
+                "brokerAccountId": "account-1",
+                "id": "operation-1",
+                "date": "2026-08-20T10:11:12Z",
+                "type": "OPERATION_TYPE_BUY",
+                "state": "OPERATION_STATE_EXECUTED",
+                "accruedInt": {"units": "0", "nano": 0, "currency": "rub"}
+            }]
+        }"#;
+        let operation = parse_operations(body)
+            .expect("response parses")
+            .pop()
+            .expect("one operation");
+        let accrued = operation.accrued_interest.expect("known zero");
+        assert_eq!(accrued.amount.raw(), 0);
+        assert_eq!(accrued.currency, iaam_core::money::CurrencyCode::Rub);
+    }
 }

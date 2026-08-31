@@ -87,6 +87,61 @@ E3.4.8 и E3.4.14 добавили сверку запланированных �
 непокрытого журналом интервала. Сведение владения к паре «владел /
 не владел» превратило бы каждую такую выплату в ложную тревогу.
 
+## E3.4: a T-Invest execution becomes a fact
+
+The T-Invest channel stopped treating a broker order as a trade. What it
+records now, and what it refuses to record, has already reached owners as
+facts and as quarantine rows, so none of it can be redefined without
+reinterpreting the journal.
+
+| Requirement | Where implemented |
+|---|---|
+| The channel's own order state is a typed contract, not a string compared in passing | `iaam_broker::tinkoff::ChannelOrderState`, with `Unrecognised(String)` for a state the contract does not name |
+| Only an executed order becomes a fact; every other state becomes one quarantine row rather than silence or an aborted batch | the state gate in `adapt_operations`, between `dictionary.kind_of` and `operation_to_submitted` |
+| One fill is one fact: quantity, price and moment come from the fill, not from the order that carried it | one `SubmittedOperation` per element of `trades_info.trades` |
+| Custody is the position's identifier, never the account's | `positionUid` on the trading row; a row without one is quarantined naming the field |
+| A security leg whose custody equals the account is a defect of past imports, not an old but valid shape | the whole history is read through `Date::MAX`, and the account's import is refused before any append (repair: iaam-y3a2) |
+| A securities transfer is not cash, and its direction is part of its meaning | `ChannelOperationKind::{SecuritiesTransferIn, SecuritiesTransferOut}`, dictionary codes `securities_transfer_in` and `securities_transfer_out` |
+| A reported accrued interest of zero is a value; only a charged fee treats zero as absent | `accrued_interest_money` against `fee_money` in `iaam_ingest::operation` |
+| An order's reported payment is checked against the exact total of its fills, and the remainder is allocated by a stated rule rather than by the adapter | `rules::trade_allocation::{check_order_completeness, allocate_minor}` |
+| The channel's arithmetic is the core's decision, not the shell's convenience | `money::{sum_quantities, gross_for_fill}` beside their siblings; the adapter calls each once and composes nothing |
+
+Schema version 14 carries this: migration
+`0014_securities_transfer_kinds.sql` rewrites the dictionary rows already
+recorded for `OPERATION_TYPE_INPUT_SECURITIES` and
+`OPERATION_TYPE_OUTPUT_SECURITIES`, which until now meant a movement of
+money. The rewrite is the migration this section is about — a dictionary
+row is an owner's decision about meaning, and the old meaning was wrong
+rather than merely coarse.
+
+The refusal deserves its own note. Re-importing is not repair: an old
+fact carries account-derived custody inside its `OperationKind`, so a
+re-imported one differs by content fingerprint, arrives as `Fresh`, and
+is inserted beside the old one — double-counting the position. Until the
+reversal exists, refusing the account's import is the only answer that
+does not corrupt the journal, and it is deliberately wider than the
+requested interval: an owner re-importing a suspicious month must not be
+told the rest of the history is sound.
+
+Cannot change without a migration:
+
+- The state gate's verdict — which channel states produce a fact. Owners
+  have already been shown quarantine rows naming the state, and widening
+  the gate would silently turn a reported non-fact into a fact.
+- One-fact-per-fill and the identity built from the fill. Collapsing
+  fills back onto the order would change source-operation identity for
+  every trade already recorded.
+- Custody as the position's identifier, and the defect predicate that
+  detects the account-derived shape. The predicate is the shape itself,
+  not the parser version and not the source channel: a fact from this
+  branch is `tinkoff-api/3` and still defective, and a persisted
+  `SourceId` names an access record that may since have been revoked.
+- The meaning and the codes of `securities_transfer_in` and
+  `securities_transfer_out` — they are already in `broker_operation_kinds`.
+- Accrued interest accepting a reported zero. Restoring the rejection
+  would retroactively unrecord trades that reported no coupon.
+
+
 ## Что менять нельзя без миграции
 
 - Состав и семантику `EventDates` — от них зависит налоговый период.

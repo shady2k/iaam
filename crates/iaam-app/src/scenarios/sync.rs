@@ -7,10 +7,11 @@ use crate::AppServices;
 use crate::error::AppError;
 use crate::ports::{BrokerChannel, Principal, Recorded};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::InstrumentId;
-use iaam_core::ids::{AccountId, EventId, OwnerId};
+use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId};
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_http::HttpRequest;
@@ -67,12 +68,36 @@ pub async fn sync_broker(
         .await
         .map_err(broker_error)?;
     let channel = broker.channel();
-    let mut known = known_records(
-        &services
-            .store
-            .load_events_through(principal.owner, to)
-            .await?,
-    );
+    // Deduplication belongs to the requested interval; it must not treat later facts
+    // as part of this sync.
+    let bounded_events = services
+        .store
+        .load_events_through(principal.owner, to)
+        .await?;
+    // The refusal predicate belongs to the account's entire history, including facts
+    // outside the interval being imported.
+    let all_events = services
+        .store
+        .load_events_through(principal.owner, Date::MAX)
+        .await?;
+    let affected = affected_trade_count(&all_events, account);
+    if affected > 0 {
+        return Err(AppError::Conflict {
+            what: format!(
+                "broker synchronisation refused for account {}: {affected} trade event(s) carry account-derived custody; run repair iaam-y3a2 before synchronising",
+                account.inner()
+            ),
+        });
+    }
+    // A gateway may filter by order date while the fact uses its trade date.
+    // Keep the fact, but do not assert completeness for an interval it falls outside.
+    let has_out_of_interval_trade = parsed.accepted.iter().any(|operation| {
+        operation
+            .dates
+            .trade
+            .is_some_and(|trade| trade < from || trade > to)
+    });
+    let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
     let mut possible_duplicates = 0;
@@ -131,7 +156,7 @@ pub async fn sync_broker(
     // A rejected row proves that the response is not a complete export.
     // The operations above are still saved, but the control balance cannot be
     // recorded alongside an incomplete interval.
-    if !parsed.quarantined.is_empty() {
+    if !parsed.quarantined.is_empty() || has_out_of_interval_trade {
         return Ok(SyncOutcome {
             recorded,
             duplicates,
@@ -209,6 +234,21 @@ fn known_records(events: &[Event]) -> Vec<KnownRecord> {
         .iter()
         .map(|event| known_record(event, event.id))
         .collect()
+}
+fn affected_trade_count(events: &[Event], account: AccountId) -> usize {
+    let account_custody = CustodyId(account.inner());
+    events
+        .iter()
+        .filter(|event| {
+            event.account == account
+                && matches!(&event.kind, EventKind::Trade { .. })
+                && event.legs.iter().any(|leg| {
+                    leg.account == account
+                        && leg.quantity.is_some()
+                        && leg.custody == Some(account_custody)
+                })
+        })
+        .count()
 }
 
 fn known_record(event: &Event, event_id: EventId) -> KnownRecord {

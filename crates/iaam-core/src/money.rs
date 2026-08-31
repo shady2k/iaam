@@ -110,6 +110,12 @@ impl Quantity {
         Self(Dec::zero())
     }
 }
+/// Sum security quantities without allowing decimal overflow to wrap.
+pub fn sum_quantities(items: &[Quantity]) -> Result<Quantity, NumericError> {
+    items.iter().try_fold(Quantity::zero(), |total, item| {
+        Ok(Quantity(total.0.checked_add(item.0)?))
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MoneyError {
@@ -330,6 +336,12 @@ impl CalcMoney {
     pub fn checked_mul(self, factor: Dec) -> Result<Self, MoneyError> {
         Ok(Self::new(self.value.checked_mul(factor)?, self.currency))
     }
+}
+
+/// Calculate one fill's exact gross before the source-fact rounding boundary.
+pub fn gross_for_fill(price: CalcMoney, quantity: Quantity) -> Result<CalcMoney, MoneyError> {
+    let product = price.checked_mul(quantity.0)?;
+    Ok(CalcMoney::new(product.value(), product.currency()))
 }
 
 /// Calculated **per-unit** monetary value, not a posted amount.
@@ -741,5 +753,35 @@ mod tests {
         let e = m.to_exact().unwrap();
         assert_eq!(e.numerator(), -576_460_752_303_423_488);
         assert_eq!(e.denominator(), 625);
+    }
+    #[test]
+    fn sum_quantities_accumulates_every_quantity() {
+        let quantities = [Quantity(dec("1.25")), Quantity(dec("2.75"))];
+        assert_eq!(sum_quantities(&quantities).unwrap(), Quantity(dec("4")));
+    }
+
+    #[test]
+    fn sum_quantities_refuses_decimal_overflow() {
+        let quantities = [
+            Quantity(Dec::new(Decimal::MAX)),
+            Quantity(Dec::new(Decimal::MAX)),
+        ];
+        assert_eq!(sum_quantities(&quantities), Err(NumericError::Overflow));
+    }
+
+    #[test]
+    fn gross_for_fill_multiplies_before_rounding() {
+        let price = CalcMoney::new(dec("12.3456"), CurrencyCode::Rub);
+        let gross = gross_for_fill(price, Quantity(dec("10"))).unwrap();
+        assert_eq!(gross, CalcMoney::new(dec("123.456"), CurrencyCode::Rub));
+    }
+
+    #[test]
+    fn gross_for_fill_refuses_decimal_overflow() {
+        let price = CalcMoney::new(dec("79228162514264337593543950335"), CurrencyCode::Rub);
+        assert_eq!(
+            gross_for_fill(price, Quantity(dec("2"))),
+            Err(MoneyError::Numeric(NumericError::Overflow))
+        );
     }
 }

@@ -5,11 +5,17 @@
 
 use std::error::Error;
 
-use iaam_broker::tinkoff::{ParseError, TINKOFF_PARSER_VERSION, parse_operations, parse_portfolio};
+use iaam_broker::tinkoff::{
+    ParseError, TINKOFF_PARSER_VERSION, parse_operations as parse_operations_page, parse_portfolio,
+};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
+
+fn parse_operations(body: &str) -> Result<Vec<iaam_broker::tinkoff::ChannelOperation>, ParseError> {
+    parse_operations_page(body).map(|page| page.operations)
+}
 use time::macros::time;
 
 fn dec(text: &str) -> Dec {

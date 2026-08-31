@@ -1,10 +1,12 @@
 //! Account completeness status over an interval, by dimension (§10.3).
 
 use iaam_core::event::Event;
+use iaam_core::event::EventValidationError;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
-use iaam_core::ids::{AccountId, OwnerId};
-use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
+use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
+use iaam_core::reconciliation::check::ClaimOutcome;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use time::macros::date;
@@ -40,6 +42,29 @@ struct Sections {
     closing: i64,
     debit: i64,
     credit: i64,
+}
+
+#[derive(Clone, Copy)]
+struct AssertionScope {
+    owner: OwnerId,
+    account: AccountId,
+    period: AssertionPeriod,
+}
+
+fn channel_with_document(channel: &TestChannel, document: &str) -> TestChannel {
+    TestChannel {
+        source: channel.source,
+        parser: channel.parser.clone(),
+        document: support::document_hash(document),
+    }
+}
+
+fn channel_with_parser(channel: &TestChannel, parser: &str) -> TestChannel {
+    TestChannel {
+        source: channel.source,
+        parser: iaam_core::event::provenance::ParserVersion(parser.to_owned()),
+        document: channel.document.clone(),
+    }
 }
 
 /// Complete set of control sections for a single document: opening balance,
@@ -87,6 +112,352 @@ fn full_sections(
         )
     })
     .collect()
+}
+
+fn position_section(
+    channel: &TestChannel,
+    owner: OwnerId,
+    account: AccountId,
+    period: AssertionPeriod,
+    instrument: InstrumentId,
+    custody: CustodyId,
+) -> Event {
+    event_on(
+        channel,
+        Posting {
+            owner,
+            account,
+            day: period.to,
+            sequence: 20,
+        },
+        EventKind::ControlAssertion {
+            period,
+            claim: ControlClaim::PositionQuantity {
+                instrument,
+                custody,
+                quantity: Quantity::zero(),
+                at: BalancePoint::Closing,
+            },
+        },
+        vec![],
+    )
+}
+
+fn full_sections_with_position(
+    channel: &TestChannel,
+    scope: AssertionScope,
+    sections: Sections,
+    instrument: InstrumentId,
+    custody: CustodyId,
+) -> Vec<Event> {
+    let mut events = full_sections(channel, scope.owner, scope.account, scope.period, sections);
+    events.push(position_section(
+        channel,
+        scope.owner,
+        scope.account,
+        scope.period,
+        instrument,
+        custody,
+    ));
+    events
+}
+
+fn coverage_gap(
+    channel: &TestChannel,
+    scope: AssertionScope,
+    dimensions: impl IntoIterator<Item = Dimension>,
+    refused: u32,
+    legs: Vec<Leg>,
+) -> Event {
+    event_on(
+        channel,
+        Posting {
+            owner: scope.owner,
+            account: scope.account,
+            day: scope.period.to,
+            sequence: 30,
+        },
+        EventKind::ImportCoverageGap {
+            period: scope.period,
+            dimensions: dimensions.into_iter().collect(),
+            refused,
+        },
+        legs,
+    )
+}
+
+fn seeded_journal() -> (
+    OwnerId,
+    AccountId,
+    InstrumentId,
+    CustodyId,
+    TestChannel,
+    Vec<Event>,
+) {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let first_channel = TestChannel::new("tinkoff-api/1", "first");
+    let second_channel = TestChannel::new("tinkoff-xlsx/1", "second");
+    let mut events = vec![deposit(&first_channel, owner, account, 100_000)];
+    for channel in [&first_channel, &second_channel] {
+        events.extend(full_sections_with_position(
+            channel,
+            AssertionScope {
+                owner,
+                account,
+                period: march(),
+            },
+            Sections {
+                opening: 0,
+                closing: 100_000,
+                debit: 100_000,
+                credit: 0,
+            },
+            instrument,
+            custody,
+        ));
+    }
+    (owner, account, instrument, custody, first_channel, events)
+}
+
+#[test]
+fn a_matching_coverage_gap_withholds_cash_independent_confirmation() {
+    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    events.push(coverage_gap(
+        &channel_with_document(&first_channel, "gap"),
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    assert_ne!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        DimensionStatus::AcceptedIndependent
+    );
+}
+
+#[test]
+fn a_coverage_gap_does_not_withhold_a_dimension_it_does_not_name() {
+    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    events.push(coverage_gap(
+        &channel_with_document(&first_channel, "gap"),
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Positions),
+        DimensionStatus::AcceptedIndependent
+    );
+}
+
+#[test]
+fn a_gap_from_another_source_or_parser_leaves_the_group_intact() {
+    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    let different_source = TestChannel::new("tinkoff-api/1", "different-source");
+    let different_parser = channel_with_parser(&first_channel, "other-parser/1");
+    events.push(coverage_gap(
+        &different_source,
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    ));
+    events.push(coverage_gap(
+        &different_parser,
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        DimensionStatus::AcceptedIndependent
+    );
+}
+
+#[test]
+fn a_later_group_without_a_gap_can_restore_independent_confirmation() {
+    let (owner, account, instrument, custody, first_channel, mut events) = seeded_journal();
+    let later_channel = TestChannel::new("later-parser/1", "later");
+    events.extend(full_sections_with_position(
+        &later_channel,
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        Sections {
+            opening: 0,
+            closing: 100_000,
+            debit: 100_000,
+            credit: 0,
+        },
+        instrument,
+        custody,
+    ));
+    events.push(coverage_gap(
+        &channel_with_document(&first_channel, "gap"),
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        DimensionStatus::AcceptedIndependent
+    );
+}
+
+#[test]
+fn a_gap_does_not_change_matched_or_discrepant_claim_outcomes() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let channel = TestChannel::new("tinkoff-api/1", "claims");
+    let mut events = vec![deposit(&channel, owner, account, 100_000)];
+    events.extend(full_sections(
+        &channel,
+        owner,
+        account,
+        march(),
+        Sections {
+            opening: 0,
+            closing: 99_999,
+            debit: 100_000,
+            credit: 0,
+        },
+    ));
+    events.push(coverage_gap(
+        &channel_with_document(&channel, "gap"),
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    let status = ledger
+        .statuses()
+        .next()
+        .expect("the assertion group has a status");
+    assert!(
+        status
+            .outcomes()
+            .iter()
+            .any(|check| matches!(check.outcome, ClaimOutcome::Matched)),
+        "the matched outcome remains matched"
+    );
+    assert!(
+        status
+            .outcomes()
+            .iter()
+            .any(|check| matches!(check.outcome, ClaimOutcome::Discrepant(_))),
+        "the discrepant outcome remains discrepant"
+    );
+}
+
+#[test]
+fn a_coverage_gap_requires_dimensions_and_no_legs() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let channel = TestChannel::new("tinkoff-api/1", "invalid-gap");
+
+    let empty = coverage_gap(
+        &channel,
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [],
+        1,
+        vec![],
+    );
+    assert!(matches!(
+        empty.validate_structure(),
+        Err(EventValidationError::EmptySet {
+            kind: "import_coverage_gap",
+            field: "dimensions",
+        })
+    ));
+
+    let with_leg = coverage_gap(
+        &channel,
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![Leg::cash(account, rub(1))],
+    );
+    assert!(matches!(
+        with_leg.validate_structure(),
+        Err(EventValidationError::LegCount {
+            kind: "import_coverage_gap",
+            expected: "no legs",
+            found: 1
+        })
+    ));
+
+    let inverted = coverage_gap(
+        &channel,
+        AssertionScope {
+            owner,
+            account,
+            period: AssertionPeriod {
+                from: date!(2026 - 03 - 31),
+                to: date!(2026 - 03 - 01),
+            },
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    );
+    assert!(matches!(
+        inverted.validate_structure(),
+        Err(EventValidationError::NonPositive {
+            kind: "import_coverage_gap",
+            field: "period",
+            ..
+        })
+    ));
 }
 
 #[test]

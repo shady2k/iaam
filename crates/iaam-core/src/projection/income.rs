@@ -157,7 +157,8 @@ impl IncomeLedger {
             | EventKind::OpeningPosition { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
-            | EventKind::ControlAssertion { .. } => Ok(()),
+            | EventKind::ControlAssertion { .. }
+            | EventKind::ImportCoverageGap { .. } => Ok(()),
             EventKind::CorporateAction { action } => {
                 self.apply_corporate_action(event, action);
                 Ok(())

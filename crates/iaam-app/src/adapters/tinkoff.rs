@@ -4,7 +4,7 @@
 //! the body, quarantines rejected rows, and binds stable
 //! port types.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 
 use async_trait::async_trait;
@@ -19,8 +19,7 @@ use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::reconciliation::claim::ControlClaim;
-use iaam_core::reconciliation::evidence::SourceChannel;
+use iaam_core::reconciliation::{Dimension, evidence::SourceChannel};
 use iaam_core::rules::trade_allocation::{
     allocate_minor as core_allocate_minor, check_order_completeness,
 };
@@ -30,7 +29,9 @@ use iaam_ingest::operation::{OperationDates, OperationKind};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::ports::{BrokerChannel, BrokerError, ParsedOperations, Quarantined};
+use crate::ports::{
+    BrokerChannel, BrokerError, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Quarantined,
+};
 
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
@@ -87,13 +88,13 @@ impl BrokerChannel for TinkoffChannel {
         &self,
         account: AccountId,
         _at: time::Date,
-    ) -> Result<Vec<ControlClaim>, BrokerError> {
+    ) -> Result<PortfolioSnapshot, BrokerError> {
         let body = self
             .client
             .get_portfolio(&account.inner().to_string())
             .await
             .map_err(tinkoff_error)?;
-        parse_portfolio(&body).map_err(parse_error)
+        adapt_portfolio(&body)
     }
 
     fn channel(&self) -> SourceChannel {
@@ -107,6 +108,15 @@ impl BrokerChannel for TinkoffChannel {
     fn identity_scope(&self) -> IdentityScope {
         IdentityScope::Account
     }
+}
+
+fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
+    parse_portfolio(body)
+        .map(|claims| PortfolioSnapshot {
+            as_of: PortfolioAsOf::Current,
+            claims,
+        })
+        .map_err(parse_error)
 }
 
 async fn fetch_operation_pages<F, Fut>(
@@ -144,6 +154,36 @@ where
     )))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowRefusal {
+    /// A property of the row: it was read, and no fact can be built from it.
+    Row {
+        reason: String,
+        dimensions: BTreeSet<Dimension>,
+    },
+    /// The adapter reached a state its own branching should have excluded.
+    Adapter(String),
+}
+
+impl RowRefusal {
+    fn with_dimensions(self, dimensions: BTreeSet<Dimension>) -> Self {
+        match self {
+            Self::Row { reason, .. } => Self::Row { reason, dimensions },
+            Self::Adapter(detail) => Self::Adapter(detail),
+        }
+    }
+
+    fn into_broker_error(self) -> BrokerError {
+        match self {
+            Self::Row { reason, .. } => unparsable(reason),
+            Self::Adapter(detail) => BrokerError::Adapter {
+                broker: BROKER.to_owned(),
+                detail,
+            },
+        }
+    }
+}
+
 fn adapt_operations(
     account: AccountId,
     operations: Vec<ChannelOperation>,
@@ -159,47 +199,123 @@ fn adapt_operations(
     }
     let mut accepted = Vec::new();
     let mut quarantined = Vec::new();
-    for operation in operations {
+    for mut operation in operations {
+        // Take the payload before moving the operation into conversion; no later stage reads it.
+        let raw = std::mem::take(&mut operation.raw);
+        let kind = dictionary.kind_of(&operation.source_kind);
         if let Some(rejection) = operation.rejection.as_ref() {
+            let dimensions = if operation.source_kind.is_empty() {
+                all_dimensions()
+            } else {
+                dimensions_for_kind(&kind)
+            };
             quarantined.push(Quarantined {
-                raw: operation.raw,
+                raw,
                 reason: format!("{rejection:?}: {rejection}"),
+                dimensions,
             });
             continue;
         }
 
-        let kind = dictionary.kind_of(&operation.source_kind);
         if let Some(reason) = securities_transfer_reason(&kind) {
             quarantined.push(Quarantined {
-                raw: operation.raw,
+                raw,
                 reason: reason.to_owned(),
+                dimensions: dimensions_for_kind(&kind),
             });
             continue;
         }
         if let Some(reason) = order_state_reason(&kind, &operation.state) {
             quarantined.push(Quarantined {
-                raw: operation.raw,
+                raw,
                 reason,
+                dimensions: if matches!(
+                    kind,
+                    ChannelOperationKind::Buy | ChannelOperationKind::Sell
+                ) {
+                    cash_positions()
+                } else {
+                    dimensions_for_kind(&kind)
+                },
             });
             continue;
         }
         if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
             if let Some(reason) = trade_row_reason(&operation, &kind) {
                 quarantined.push(Quarantined {
-                    raw: operation.raw,
+                    raw,
                     reason,
+                    dimensions: cash_positions(),
                 });
                 continue;
             }
-            accepted.extend(trade_operations(account, operation, kind)?);
+            let dimensions = dimensions_for_kind(&kind);
+            match trade_operations(account, operation, kind)
+                .map_err(|error| error.with_dimensions(dimensions))
+            {
+                Ok(operations) => accepted.extend(operations),
+                Err(RowRefusal::Row { reason, dimensions }) => quarantined.push(Quarantined {
+                    raw,
+                    reason,
+                    dimensions,
+                }),
+                Err(error @ RowRefusal::Adapter(_)) => {
+                    return Err(error.into_broker_error());
+                }
+            }
         } else {
-            accepted.push(operation_to_submitted(account, operation, kind)?);
+            let dimensions = dimensions_for_kind(&kind);
+            match operation_to_submitted(account, operation, kind)
+                .map_err(|error| error.with_dimensions(dimensions))
+            {
+                Ok(operation) => accepted.push(operation),
+                Err(RowRefusal::Row { reason, dimensions }) => quarantined.push(Quarantined {
+                    raw,
+                    reason,
+                    dimensions,
+                }),
+                Err(error @ RowRefusal::Adapter(_)) => {
+                    return Err(error.into_broker_error());
+                }
+            }
         }
     }
     Ok(ParsedOperations {
         accepted,
         quarantined,
     })
+}
+
+fn all_dimensions() -> BTreeSet<Dimension> {
+    Dimension::all().into_iter().collect()
+}
+
+fn cash_positions() -> BTreeSet<Dimension> {
+    [Dimension::Cash, Dimension::Positions]
+        .into_iter()
+        .collect()
+}
+
+fn dimensions_for_kind(kind: &ChannelOperationKind) -> BTreeSet<Dimension> {
+    match kind {
+        ChannelOperationKind::Buy | ChannelOperationKind::Sell => cash_positions(),
+        ChannelOperationKind::Dividend | ChannelOperationKind::Coupon => {
+            [Dimension::Cash, Dimension::Income].into_iter().collect()
+        }
+        ChannelOperationKind::Commission
+        | ChannelOperationKind::Deposit
+        | ChannelOperationKind::Withdrawal
+        | ChannelOperationKind::Transfer
+        | ChannelOperationKind::BondAmortisation => [Dimension::Cash].into_iter().collect(),
+        ChannelOperationKind::BondRedemption => cash_positions(),
+        ChannelOperationKind::SecuritiesTransferIn
+        | ChannelOperationKind::SecuritiesTransferOut => {
+            [Dimension::Positions, Dimension::TaxBasis]
+                .into_iter()
+                .collect()
+        }
+        ChannelOperationKind::Other(_) => all_dimensions(),
+    }
 }
 
 fn securities_transfer_reason(kind: &ChannelOperationKind) -> Option<&'static str> {
@@ -242,14 +358,14 @@ fn operation_to_submitted(
     account: AccountId,
     operation: ChannelOperation,
     kind: ChannelOperationKind,
-) -> Result<SubmittedOperation, BrokerError> {
+) -> Result<SubmittedOperation, RowRefusal> {
     if let Some(rejection) = operation.rejection.as_ref() {
-        return Err(unparsable(format!("row rejected: {rejection}")));
+        return Err(row_unparsable(format!("row rejected: {rejection}")));
     }
     let kind = match kind {
         ChannelOperationKind::Buy | ChannelOperationKind::Sell => {
-            return Err(unparsable(
-                "trading operations must be expanded from their execution trades",
+            return Err(RowRefusal::Adapter(
+                "trading operations must be expanded from their execution trades".to_owned(),
             ));
         }
         // A coupon and a dividend must not be collapsed into a single receipt: the journal
@@ -263,7 +379,9 @@ fn operation_to_submitted(
                 // The outer pattern has already narrowed the possibilities. This branch is unreachable
                 // and must fail loudly, rather than substitute a dividend.
                 other => {
-                    return Err(unparsable(format!("income kind mismatch: {other:?}")));
+                    return Err(RowRefusal::Adapter(format!(
+                        "income kind mismatch: {other:?}"
+                    )));
                 }
             };
             OperationKind::Income {
@@ -296,17 +414,20 @@ fn operation_to_submitted(
             }
         }
         ChannelOperationKind::SecuritiesTransferIn => {
-            return Err(unparsable(
+            return Err(row_unparsable(
                 "inbound securities transfer: securities moved without a cash movement",
             ));
         }
         ChannelOperationKind::SecuritiesTransferOut => {
-            return Err(unparsable(
+            return Err(row_unparsable(
                 "outbound securities transfer: securities moved without a cash movement",
             ));
         }
         ChannelOperationKind::Transfer => {
-            return Err(unparsable("transfer does not contain a recipient account"));
+            return Err(RowRefusal::Row {
+                reason: "transfer does not contain a recipient account".to_owned(),
+                dimensions: BTreeSet::new(),
+            });
         }
         // Amortisation and redemption are corporate actions, not
         // owner operations: they have their own representation and endpoint
@@ -316,19 +437,21 @@ fn operation_to_submitted(
         // location; without them the fact cannot be constructed, and substituting
         // a guess would record something that never happened in the append-only journal.
         ChannelOperationKind::BondAmortisation => {
-            return Err(unparsable(
+            return Err(row_unparsable(
                 "bond amortisation: the channel does not report the returned face value per unit \
                  or custody location — the fact is entered via the journal endpoint",
             ));
         }
         ChannelOperationKind::BondRedemption => {
-            return Err(unparsable(
+            return Err(row_unparsable(
                 "bond redemption: the channel does not report the returned face value per unit \
                  or custody location — the fact is entered via the journal endpoint",
             ));
         }
         ChannelOperationKind::Other(kind) => {
-            return Err(unparsable(format!("unsupported operation kind: {kind}")));
+            return Err(row_unparsable(format!(
+                "unsupported operation kind: {kind}"
+            )));
         }
     };
 
@@ -484,7 +607,12 @@ fn trade_operations(
     account: AccountId,
     operation: ChannelOperation,
     kind: ChannelOperationKind,
-) -> Result<Vec<SubmittedOperation>, BrokerError> {
+) -> Result<Vec<SubmittedOperation>, RowRefusal> {
+    if !matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
+        return Err(RowRefusal::Adapter(
+            "trading conversion received a non-trade operation kind".to_owned(),
+        ));
+    }
     if operation.trades.is_empty() {
         return Ok(Vec::new());
     }
@@ -517,7 +645,7 @@ fn trade_operations(
         .map(|((trade, commission), accrued)| {
             let gross_exact = iaam_core::money::gross_for_fill(trade.price, trade.quantity)
                 .map_err(|error| {
-                    unparsable(format!("trade {} gross overflow: {error}", trade.num))
+                    row_unparsable(format!("trade {} gross overflow: {error}", trade.num))
                 })?;
             let gross = CalcMoney::new(
                 Dec::new(gross_exact.value().inner().abs()),
@@ -526,7 +654,7 @@ fn trade_operations(
             let gross_minor = gross
                 .rounded_minor()
                 .map_err(|error| {
-                    unparsable(format!(
+                    row_unparsable(format!(
                         "trade {} gross cannot be rounded: {error}",
                         trade.num
                     ))
@@ -584,24 +712,24 @@ fn trade_operations(
 fn posted_commission(
     commission: Option<CalcMoney>,
     currency: CurrencyCode,
-) -> Result<Option<i64>, BrokerError> {
+) -> Result<Option<i64>, RowRefusal> {
     let Some(commission) = commission else {
         return Ok(None);
     };
     let magnitude = CalcMoney::new(Dec::new(commission.value().inner().abs()), currency)
         .rounded_minor()
-        .map_err(|error| unparsable(format!("commission cannot be rounded: {error}")))?
+        .map_err(|error| row_unparsable(format!("commission cannot be rounded: {error}")))?
         .raw();
     magnitude
         .checked_abs()
         .map(Some)
-        .ok_or_else(|| unparsable("commission magnitude is not representable"))
+        .ok_or_else(|| row_unparsable("commission magnitude is not representable"))
 }
 
 fn allocate_minor(
     total: i64,
     trades: &[iaam_broker::tinkoff::ChannelTrade],
-) -> Result<Vec<i64>, BrokerError> {
+) -> Result<Vec<i64>, RowRefusal> {
     let mut order: Vec<usize> = (0..trades.len()).collect();
     order.sort_by(|left, right| {
         trades[*left]
@@ -614,7 +742,7 @@ fn allocate_minor(
         .map(|index| trades[*index].quantity)
         .collect::<Vec<_>>();
     let allocations = core_allocate_minor(PostedMinor::new(total), &weights)
-        .map_err(|error| unparsable(error.to_string()))?;
+        .map_err(|error| row_unparsable(error.to_string()))?;
     let mut result = vec![0; trades.len()];
     for (position, index) in order.into_iter().enumerate() {
         result[index] = allocations[position].raw();
@@ -650,37 +778,38 @@ fn escape_component(value: &str) -> String {
 fn required_money(
     money: Option<ChannelMoney>,
     field: &'static str,
-) -> Result<(i64, CurrencyCode), BrokerError> {
-    let money = money.ok_or_else(|| unparsable(format!("operation does not contain {field}")))?;
+) -> Result<(i64, CurrencyCode), RowRefusal> {
+    let money =
+        money.ok_or_else(|| row_unparsable(format!("operation does not contain {field}")))?;
     Ok((money_amount(money, field)?, money.currency))
 }
 
-fn money_amount(money: ChannelMoney, field: &'static str) -> Result<i64, BrokerError> {
+fn money_amount(money: ChannelMoney, field: &'static str) -> Result<i64, RowRefusal> {
     money
         .magnitude()
         .map(|amount| amount.raw())
-        .ok_or_else(|| unparsable(format!("field {field} does not have a positive magnitude")))
+        .ok_or_else(|| row_unparsable(format!("field {field} does not have a positive magnitude")))
 }
 
-fn required_instrument(operation: &ChannelOperation) -> Result<InstrumentId, BrokerError> {
+fn required_instrument(operation: &ChannelOperation) -> Result<InstrumentId, RowRefusal> {
     let value = operation
         .instrument_uid
         .as_deref()
-        .ok_or_else(|| unparsable("trading operation does not contain instrumentUid"))?;
+        .ok_or_else(|| row_unparsable("trading operation does not contain instrumentUid"))?;
     parse_instrument(value)
 }
 
-fn required_custody(operation: &ChannelOperation) -> Result<CustodyId, BrokerError> {
+fn required_custody(operation: &ChannelOperation) -> Result<CustodyId, RowRefusal> {
     let value = operation
         .position_uid
         .as_deref()
-        .ok_or_else(|| unparsable("trading operation does not contain positionUid"))?;
+        .ok_or_else(|| row_unparsable("trading operation does not contain positionUid"))?;
     Uuid::parse_str(value)
         .map(CustodyId)
-        .map_err(|_| unparsable(format!("positionUid is not a UUID: {value}")))
+        .map_err(|_| row_unparsable(format!("positionUid is not a UUID: {value}")))
 }
 
-fn optional_instrument(operation: &ChannelOperation) -> Result<Option<InstrumentId>, BrokerError> {
+fn optional_instrument(operation: &ChannelOperation) -> Result<Option<InstrumentId>, RowRefusal> {
     operation
         .instrument_uid
         .as_deref()
@@ -688,10 +817,10 @@ fn optional_instrument(operation: &ChannelOperation) -> Result<Option<Instrument
         .transpose()
 }
 
-fn parse_instrument(value: &str) -> Result<InstrumentId, BrokerError> {
+fn parse_instrument(value: &str) -> Result<InstrumentId, RowRefusal> {
     Uuid::parse_str(value)
         .map(InstrumentId)
-        .map_err(|_| unparsable(format!("instrumentUid is not a UUID: {value}")))
+        .map_err(|_| row_unparsable(format!("instrumentUid is not a UUID: {value}")))
 }
 
 fn rfc3339_midnight(date: time::Date) -> String {
@@ -734,6 +863,13 @@ fn unparsable(detail: impl Into<String>) -> BrokerError {
     }
 }
 
+fn row_unparsable(detail: impl Into<String>) -> RowRefusal {
+    RowRefusal::Row {
+        reason: detail.into(),
+        dimensions: BTreeSet::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use iaam_broker::tinkoff::{
@@ -743,7 +879,7 @@ mod tests {
     use iaam_core::event::kind::{EventKind, IncomeKind};
     use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
     use iaam_core::projection::{ProjectionContext, project};
-    use iaam_core::reconciliation::claim::ControlClaim;
+    use iaam_core::reconciliation::{Dimension, claim::ControlClaim};
     use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 
     fn parse_operations(
@@ -755,8 +891,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        GetOperationsByCursorRequest, Quarantined, adapt_operations, fetch_operation_pages,
-        operation_to_submitted, order_state_reason, rfc3339_operation_end,
+        BrokerError, GetOperationsByCursorRequest, PortfolioAsOf, Quarantined, RowRefusal,
+        adapt_operations, adapt_portfolio, fetch_operation_pages, operation_to_submitted,
+        order_state_reason, rfc3339_operation_end, trade_operations,
     };
     use iaam_broker::operation_kind::OperationKindDictionary;
 
@@ -835,14 +972,16 @@ mod tests {
             let account = AccountId(Uuid::from_u128(1));
             let error = operation_to_submitted(account, operation, kind.clone())
                 .expect_err("a corporate action cannot be constructed through the channel");
-            let text = error.to_string();
+            let RowRefusal::Row { reason, .. } = error else {
+                panic!("corporate action should be a row refusal");
+            };
             assert!(
-                text.contains("returned face value per unit"),
-                "error does not identify what is missing: {text}"
+                reason.contains("returned face value per unit"),
+                "error does not identify what is missing: {reason}"
             );
             assert!(
-                text.contains("journal endpoint"),
-                "error does not identify where the fact is entered: {text}"
+                reason.contains("journal endpoint"),
+                "error does not identify where the fact is entered: {reason}"
             );
         }
     }
@@ -866,11 +1005,75 @@ mod tests {
             ),
             ("OPERATION_TYPE_OUTPUT", "withdrawal"),
             ("OPERATION_TYPE_TRANSFER", "transfer"),
+            ("OPERATION_TYPE_BOND_AMORTISATION", "bond_amortisation"),
         ]);
         assert!(unreadable.is_empty(), "{unreadable:?}");
         dictionary
     }
 
+    #[test]
+    fn a_row_refusal_is_quarantined_without_aborting_other_operations() {
+        for source_kind in [
+            "OPERATION_TYPE_TRANSFER",
+            "OPERATION_TYPE_BOND_AMORTISATION",
+            "OPERATION_TYPE_UNKNOWN",
+        ] {
+            let mut operations =
+                parse_operations(&income_operation("OPERATION_TYPE_INPUT")).expect("parsing");
+            operations.extend(parse_operations(&income_operation(source_kind)).expect("parsing"));
+            let parsed = adapt_operations(AccountId(Uuid::from_u128(1)), operations, &dictionary())
+                .expect("row refusal must not abort the batch");
+
+            assert_eq!(parsed.accepted.len(), 1);
+            assert_eq!(parsed.quarantined.len(), 1);
+            assert!(
+                parsed.quarantined[0].reason.contains(match source_kind {
+                    "OPERATION_TYPE_TRANSFER" => "transfer does not contain a recipient account",
+                    "OPERATION_TYPE_BOND_AMORTISATION" => "returned face value per unit",
+                    _ => "unsupported operation kind: OPERATION_TYPE_UNKNOWN",
+                }),
+                "row refusal reason: {}",
+                parsed.quarantined[0].reason
+            );
+            let expected = match source_kind {
+                "OPERATION_TYPE_TRANSFER" | "OPERATION_TYPE_BOND_AMORTISATION" => {
+                    [Dimension::Cash].into_iter().collect()
+                }
+                _ => Dimension::all().into_iter().collect(),
+            };
+            assert_eq!(parsed.quarantined[0].dimensions, expected);
+        }
+    }
+
+    #[test]
+    fn an_adapter_defect_stays_loud_instead_of_becoming_a_quarantine_row() {
+        let operation = parse_operations(&income_operation("OPERATION_TYPE_BUY"))
+            .expect("parsing")
+            .into_iter()
+            .next()
+            .expect("one operation");
+        let error = operation_to_submitted(
+            AccountId(Uuid::from_u128(1)),
+            operation.clone(),
+            iaam_broker::operation_kind::ChannelOperationKind::Buy,
+        )
+        .expect_err("the direct conversion must reject the impossible branch");
+        let RowRefusal::Adapter(detail) = error else {
+            panic!("the impossible branch must be typed as an adapter defect");
+        };
+        assert!(matches!(
+            RowRefusal::Adapter(detail).into_broker_error(),
+            BrokerError::Adapter { broker, detail }
+                if broker == "tinkoff" && detail.contains("trading operations")
+        ));
+        let error = trade_operations(
+            AccountId(Uuid::from_u128(1)),
+            operation,
+            iaam_broker::operation_kind::ChannelOperationKind::Deposit,
+        )
+        .expect_err("the trade conversion must reject the impossible branch");
+        assert!(matches!(error, RowRefusal::Adapter(_)));
+    }
     fn income_kind_of(operation_type: &str) -> Option<IncomeKind> {
         let operations = parse_operations(&income_operation(operation_type)).expect("parsing");
         let account = AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888));
@@ -942,7 +1145,23 @@ mod tests {
             .ok_or("rejected commission disappeared from quarantine")?;
         assert!(rejected.reason.contains("NonRepresentableFraction"));
         assert_eq!(rejected.raw["payment"]["nano"], -135065000);
+        assert_eq!(rejected.dimensions, [Dimension::Cash].into_iter().collect());
         Ok(())
+    }
+
+    #[test]
+    fn a_whole_row_parse_refusal_taints_every_dimension() {
+        let operations = parse_operations(r#"{"hasNext":false,"items":[null]}"#)
+            .expect("whole-row parse refusal");
+        assert!(operations[0].source_kind.is_empty());
+        let parsed = adapt_operations(AccountId(Uuid::from_u128(1)), operations, &dictionary())
+            .expect("whole-row refusal is quarantined");
+
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            Dimension::all().into_iter().collect()
+        );
     }
     #[test]
     fn a_trade_uses_the_recorded_position_uid_as_custody() {
@@ -997,11 +1216,17 @@ mod tests {
             assert_eq!(parsed.quarantined.len(), 1);
             assert!(parsed.quarantined[0].reason.contains("positionUid"));
             assert!(!parsed.quarantined[0].reason.contains("account"));
+            assert_eq!(
+                parsed.quarantined[0].dimensions,
+                [Dimension::Cash, Dimension::Positions]
+                    .into_iter()
+                    .collect()
+            );
         }
     }
 
     #[test]
-    fn an_executed_transfer_keeps_its_existing_error() {
+    fn an_executed_transfer_is_quarantined_with_its_existing_reason() {
         let operations = parse_operations(&income_operation_with_state(
             "OPERATION_TYPE_TRANSFER",
             "OPERATION_STATE_EXECUTED",
@@ -1009,12 +1234,18 @@ mod tests {
         .expect("parsing");
         let account = AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888));
 
-        let error =
-            adapt_operations(account, operations, &dictionary()).expect_err("transfer is refused");
+        let parsed =
+            adapt_operations(account, operations, &dictionary()).expect("transfer is quarantined");
+        assert_eq!(parsed.accepted.len(), 0);
+        assert_eq!(parsed.quarantined.len(), 1);
         assert!(
-            error
-                .to_string()
+            parsed.quarantined[0]
+                .reason
                 .contains("transfer does not contain a recipient account")
+        );
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Cash].into_iter().collect()
         );
     }
 
@@ -1029,6 +1260,12 @@ mod tests {
         assert_eq!(parsed.quarantined.len(), 1);
         assert!(parsed.quarantined[0].reason.contains("securities"));
         assert!(parsed.quarantined[0].reason.contains("inbound"));
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Positions, Dimension::TaxBasis]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
@@ -1042,6 +1279,12 @@ mod tests {
         assert_eq!(parsed.quarantined.len(), 1);
         assert!(parsed.quarantined[0].reason.contains("securities"));
         assert!(parsed.quarantined[0].reason.contains("outbound"));
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Positions, Dimension::TaxBasis]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
@@ -1064,6 +1307,12 @@ mod tests {
         ));
         assert_eq!(parsed.quarantined.len(), 1);
         assert!(parsed.quarantined[0].reason.contains("securities"));
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Positions, Dimension::TaxBasis]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
@@ -1097,7 +1346,53 @@ mod tests {
                 .reason
                 .contains("OPERATION_STATE_CANCELED")
         );
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Cash, Dimension::Income].into_iter().collect()
+        );
     }
+    #[test]
+    fn a_cancelled_dividend_taints_cash_and_income() {
+        let operations = parse_operations(&income_operation_with_state(
+            "OPERATION_TYPE_DIVIDEND",
+            "OPERATION_STATE_CANCELED",
+        ))
+        .expect("parsing");
+        let parsed = adapt_operations(
+            AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            operations,
+            &dictionary(),
+        )
+        .expect("adaptation");
+
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Cash, Dimension::Income].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_unknown_kind_taints_all_dimensions() {
+        let operations = parse_operations(&income_operation_with_state(
+            "OPERATION_TYPE_UNKNOWN",
+            "OPERATION_STATE_CANCELED",
+        ))
+        .expect("parsing");
+        let parsed = adapt_operations(
+            AccountId(Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888)),
+            operations,
+            &dictionary(),
+        )
+        .expect("adaptation");
+
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            Dimension::all().into_iter().collect()
+        );
+    }
+
     #[test]
     fn a_deposit_placeholder_trade_is_ignored_and_becomes_a_fact() {
         let body = r#"{
@@ -1684,6 +1979,16 @@ mod tests {
         });
 
         assert_eq!(trade_custody, claim_custody);
+    }
+
+    #[test]
+    fn t_invest_portfolio_answers_with_current_date_semantics() {
+        let snapshot = adapt_portfolio(include_str!(
+            "../../../../tests/fixtures/api/tinkoff-portfolio.json"
+        ))
+        .expect("portfolio adaptation");
+
+        assert_eq!(snapshot.as_of, PortfolioAsOf::Current);
     }
 
     #[test]

@@ -5,18 +5,17 @@
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::{BrokerChannel, Principal, Recorded};
+use crate::ports::{BrokerChannel, PortfolioAsOf, Principal, Recorded};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::InstrumentId;
 use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId};
-use iaam_core::reconciliation::claim::ControlClaim;
-use iaam_core::reconciliation::evidence::SourceChannel;
+use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::SourceChannel};
 use iaam_http::HttpRequest;
 use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, KnownRecord};
-use iaam_ingest::operation::NormalizationContext;
+use iaam_ingest::operation::{NormalizationContext, OperationKind};
 use iaam_ingest::{Verdict, normalize};
 use iaam_market::cbr::key_rate::key_rate_request;
 use iaam_market::cbr::{daily_request, dynamic_request};
@@ -28,8 +27,25 @@ use iaam_store::market::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use time::Date;
 use time::OffsetDateTime;
+
+/// Why no control assertion was recorded, when none was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionsWithheld {
+    /// The current portfolio does not describe any day in the requested interval.
+    PortfolioDescribesAnotherDay { as_of: Date },
+}
+
+impl AssertionsWithheld {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::PortfolioDescribesAnotherDay { .. } => "portfolio_describes_another_day",
+        }
+    }
+}
 
 /// Result of synchronising one channel for one interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +54,7 @@ pub struct SyncOutcome {
     pub duplicates: usize,
     pub possible_duplicates: usize,
     pub assertions: usize,
+    pub assertions_withheld: Option<AssertionsWithheld>,
 }
 
 /// Retrieves the broker's operations and portfolio and records new facts.
@@ -101,6 +118,11 @@ pub async fn sync_broker(
     let mut recorded = Vec::new();
     let mut duplicates = 0;
     let mut possible_duplicates = 0;
+    let mut refusal_dimensions: Vec<BTreeSet<Dimension>> = parsed
+        .quarantined
+        .iter()
+        .map(|row| row.dimensions.clone())
+        .collect();
 
     for operation in parsed.accepted {
         let context = DocumentContext {
@@ -111,18 +133,20 @@ pub async fn sync_broker(
             identity_scope: broker.identity_scope(),
         };
         let key = dedup::choose_key(&operation, &context);
-        let normalized = normalize(
+        let normalized = match normalize(
             &operation,
             NormalizationContext {
                 owner: principal.owner,
                 source: channel.source,
             },
-        )
-        .map_err(|rejection| AppError::Invalid {
-            field: rejection.field,
-            expected: rejection.expected,
-            actual: rejection.actual,
-        })?;
+        ) {
+            Ok(normalized) => normalized,
+            Err(rejection) => {
+                refusal_dimensions.push(operation_dimensions(&operation.kind));
+                recorded.push(Verdict::Rejected { rejection });
+                continue;
+            }
+        };
         let event = with_channel_provenance(normalized.event, &channel);
         let decision = dedup::assess(key.as_ref(), event.provenance.raw_hash(), &context, &known);
         let possible_duplicate = match &decision {
@@ -153,24 +177,85 @@ pub async fn sync_broker(
         recorded.push(verdict);
     }
 
-    // A rejected row proves that the response is not a complete export.
-    // The operations above are still saved, but the control balance cannot be
-    // recorded alongside an incomplete interval.
-    if !parsed.quarantined.is_empty() || has_out_of_interval_trade {
+    // A refused row is reported whatever else happens to this response: its
+    // reason names what is missing, and it reaches the owner nowhere else.
+    recorded.extend(parsed.quarantined.iter().map(|row| Verdict::Quarantined {
+        reason: row.reason.clone(),
+    }));
+    let refused = u32::try_from(refusal_dimensions.len()).map_err(|_| AppError::Invalid {
+        field: "refused".to_owned(),
+        expected: "at most u32::MAX rows".to_owned(),
+        actual: refusal_dimensions.len().to_string(),
+    })?;
+    let gap_dimensions: BTreeSet<Dimension> = refusal_dimensions
+        .iter()
+        .flat_map(|dimensions| dimensions.iter().copied())
+        .collect();
+    if !gap_dimensions.is_empty() {
+        let gap = coverage_gap_event(
+            AssertionTarget {
+                owner: principal.owner,
+                account,
+                from,
+                to,
+            },
+            gap_dimensions,
+            refused,
+            &channel,
+        );
+        let key = gap.idempotency_key.clone();
+        if let Some(existing) = known.iter().find_map(|record| {
+            (record.idempotency_key.as_deref() == key.as_deref()).then_some(record.event)
+        }) {
+            duplicates += 1;
+            recorded.push(Verdict::Duplicate { existing });
+        } else {
+            let result = services
+                .store
+                .append_events(vec![gap.clone()], broker.identity_scope())
+                .await?;
+            let verdict = verdict_from_recorded(&result, &mut duplicates);
+            if let Some(event_id) = event_id_from_verdict(&verdict) {
+                known.push(known_record(&gap, event_id));
+            }
+            recorded.push(verdict);
+        }
+    }
+    // An out-of-interval trade remains its own early-return condition; refusals
+    // only add the coverage gap above and do not suppress the portfolio answer.
+    if has_out_of_interval_trade {
         return Ok(SyncOutcome {
             recorded,
             duplicates,
             possible_duplicates,
             assertions: 0,
+            assertions_withheld: None,
         });
     }
 
-    let claims = broker
+    let snapshot = broker
         .fetch_portfolio(account, to)
         .await
         .map_err(broker_error)?;
+    let assertions_withheld = match snapshot.as_of {
+        PortfolioAsOf::Requested => None,
+        PortfolioAsOf::Current => {
+            let as_of = services.clock.today();
+            (as_of != to).then_some(AssertionsWithheld::PortfolioDescribesAnotherDay { as_of })
+        }
+    };
+    if assertions_withheld.is_some() {
+        return Ok(SyncOutcome {
+            recorded,
+            duplicates,
+            possible_duplicates,
+            assertions: 0,
+            assertions_withheld,
+        });
+    }
+
     let mut assertions = 0;
-    for (index, claim) in claims.into_iter().enumerate() {
+    for (index, claim) in snapshot.claims.into_iter().enumerate() {
         let event = assertion_event(
             AssertionTarget {
                 owner: principal.owner,
@@ -209,6 +294,7 @@ pub async fn sync_broker(
         duplicates,
         possible_duplicates,
         assertions,
+        assertions_withheld: None,
     })
 }
 
@@ -227,6 +313,71 @@ fn with_channel_provenance(mut event: Event, channel: &SourceChannel) -> Event {
     }
     event.provenance = provenance;
     event
+}
+fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> {
+    match kind {
+        OperationKind::Buy { .. } | OperationKind::Sell { .. } => {
+            [Dimension::Cash, Dimension::Positions]
+                .into_iter()
+                .collect()
+        }
+        OperationKind::Income { .. } => [Dimension::Cash, Dimension::Income].into_iter().collect(),
+        OperationKind::Deposit { .. }
+        | OperationKind::Withdrawal { .. }
+        | OperationKind::Transfer { .. }
+        | OperationKind::Fee { .. }
+        | OperationKind::OpeningCash { .. } => [Dimension::Cash].into_iter().collect(),
+        OperationKind::OpeningPosition { .. } => [Dimension::Positions].into_iter().collect(),
+        // Valuation changes no control dimension, so refusing it cannot taint
+        // cash, positions, income, or tax-basis assertions.
+        OperationKind::Valuation { .. } => BTreeSet::new(),
+    }
+}
+
+fn coverage_gap_event(
+    target: AssertionTarget,
+    dimensions: BTreeSet<Dimension>,
+    refused: u32,
+    channel: &SourceChannel,
+) -> Event {
+    let AssertionTarget {
+        owner,
+        account,
+        from,
+        to,
+    } = target;
+    // Correlation deliberately uses the channel's source and parser version
+    // in provenance, while omitting document because each assertion is a
+    // separate singleton document group.
+    let identity = format!(
+        "sync-coverage-gap/{account:?}/{from}/{to}/{:?}/{:?}/{dimensions:?}/{refused}",
+        channel.source, channel.parser_version
+    );
+    let digest = Sha256::digest(identity.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let raw_hash = RawHash::parse(&hex)
+        .unwrap_or_else(|| unreachable!("hexadecimal SHA-256 is always a valid RawHash"));
+    Event {
+        id: EventId::new_random(),
+        schema_version: SCHEMA_VERSION,
+        owner,
+        account,
+        kind: EventKind::ImportCoverageGap {
+            period: iaam_core::reconciliation::claim::AssertionPeriod { from, to },
+            dimensions,
+            refused,
+        },
+        dates: EventDates::for_cash(CashPostedDate(to)),
+        order: EffectiveOrder::new(to, 0),
+        legs: Vec::new(),
+        provenance: Provenance::new(channel.source, raw_hash, channel.parser_version.clone()),
+        relation: Relation::None,
+        confidence: Confidence::Known,
+        idempotency_key: Some(identity),
+    }
 }
 
 fn known_records(events: &[Event]) -> Vec<KnownRecord> {
@@ -294,7 +445,8 @@ fn event_id_from_verdict(verdict: &Verdict) -> Option<EventId> {
         | Verdict::NeedsReconciliation { .. }
         | Verdict::NeedsClassification { .. }
         | Verdict::Unsupported { .. }
-        | Verdict::Rejected { .. } => None,
+        | Verdict::Rejected { .. }
+        | Verdict::Quarantined { .. } => None,
     }
 }
 

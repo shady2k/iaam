@@ -18,6 +18,7 @@ use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId, TransferId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, ControlClaim};
 use iaam_core::rules::lot_disposal::{Lot, LotId};
 use iaam_core::valuation::PriceQuality;
@@ -166,6 +167,15 @@ fn every_kind() -> Vec<Event> {
             vec![],
         ),
         envelope(
+            EventKind::ImportCoverageGap {
+                period: AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+                    .expect("interval"),
+                dimensions: [Dimension::Cash].into_iter().collect(),
+                refused: 3,
+            },
+            vec![],
+        ),
+        envelope(
             EventKind::CorporateAction {
                 action: CorporateAction::PartialRedemption {
                     instrument,
@@ -263,7 +273,7 @@ fn every_kind() -> Vec<Event> {
 /// The list is pinned manually and checked against the samples: without this check, the test
 /// would still call itself «every kind» without covering every kind. This has already
 /// happened — `control_assertion` was missing from the samples.
-const EVERY_DISCRIMINANT: [&str; 12] = [
+const EVERY_DISCRIMINANT: [&str; 13] = [
     "trade",
     "cash_in",
     "cash_out",
@@ -274,6 +284,7 @@ const EVERY_DISCRIMINANT: [&str; 12] = [
     "opening_cash",
     "valuation",
     "control_assertion",
+    "import_coverage_gap",
     "corporate_action",
     "offer_exercise",
 ];
@@ -293,6 +304,7 @@ fn is_known(kind: &EventKind) -> bool {
         | EventKind::OpeningCash { .. }
         | EventKind::Valuation { .. }
         | EventKind::ControlAssertion { .. }
+        | EventKind::ImportCoverageGap { .. }
         | EventKind::CorporateAction { .. }
         | EventKind::OfferExercise { .. } => true,
     }

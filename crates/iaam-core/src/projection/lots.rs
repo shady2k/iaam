@@ -709,7 +709,8 @@ impl LotBook {
             | EventKind::Fee { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
-            | EventKind::ControlAssertion { .. } => Ok(()),
+            | EventKind::ControlAssertion { .. }
+            | EventKind::ImportCoverageGap { .. } => Ok(()),
             EventKind::Income {
                 instrument: Some(instrument),
                 gross,

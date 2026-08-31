@@ -20,9 +20,9 @@ use time::Date;
 /// channels as it has rows—and no basis requiring
 /// multiple sections of the same document will work (§10.3).
 pub struct TestChannel {
-    source: SourceId,
-    parser: ParserVersion,
-    document: RawHash,
+    pub(crate) source: SourceId,
+    pub(crate) parser: ParserVersion,
+    pub(crate) document: RawHash,
 }
 
 impl TestChannel {
@@ -35,7 +35,6 @@ impl TestChannel {
             document: document_hash(document),
         }
     }
-
     fn provenance(&self) -> Provenance {
         Provenance::new(self.source, self.document.clone(), self.parser.clone())
     }

@@ -5,6 +5,8 @@
 //! respective stages — adding a variant must break the build wherever
 //! handling is incomplete.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use super::corporate_action::CorporateAction;
@@ -12,6 +14,7 @@ use super::offer::OfferExerciseAction;
 use crate::ids::{AccountId, InstrumentId, TransferId};
 use crate::money::{CalcMoney, CurrencyCode, Money, Quantity};
 use crate::numeric::decimal::Dec;
+use crate::reconciliation::Dimension;
 use crate::reconciliation::claim::{AssertionPeriod, ControlClaim};
 use crate::valuation::PriceQuality;
 
@@ -219,6 +222,20 @@ pub enum EventKind {
         period: AssertionPeriod,
         claim: ControlClaim,
     },
+    /// An import attempt refused rows, so it cannot confirm on its own the
+    /// dimensions those rows would have moved.
+    ///
+    /// It is not a statement about the interval: the same operations may already
+    /// be in the journal from another channel, and a later attempt that refuses
+    /// nothing carries no gap. It is a statement about this attempt.
+    ImportCoverageGap {
+        period: AssertionPeriod,
+        /// What this attempt cannot confirm. Never empty—a gap that taints
+        /// nothing is not a fact.
+        dimensions: BTreeSet<Dimension>,
+        /// How many rows were refused. Carried for the owner, not for the rule.
+        refused: u32,
+    },
     /// Corporate action on a security: amortization, redemption,
     /// replacement (§4.7).
     ///
@@ -262,6 +279,7 @@ impl EventKind {
             Self::OpeningCash { .. } => "opening_cash",
             Self::Valuation { .. } => "valuation",
             Self::ControlAssertion { .. } => "control_assertion",
+            Self::ImportCoverageGap { .. } => "import_coverage_gap",
             Self::CorporateAction { .. } => "corporate_action",
             Self::OfferExercise { .. } => "offer_exercise",
         }
@@ -288,6 +306,7 @@ impl EventKind {
             | Self::OpeningPosition { .. }
             | Self::OpeningCash { .. }
             | Self::Valuation { .. }
+            | Self::ImportCoverageGap { .. }
             | Self::ControlAssertion { .. }
             // Money does not enter the contour from outside: the security is already inside, and
             // amortization returns invested capital rather than bringing in new money.

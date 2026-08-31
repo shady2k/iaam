@@ -141,6 +141,68 @@ Cannot change without a migration:
 - Accrued interest accepting a reported zero. Restoring the rejection
   would retroactively unrecord trades that reported no coupon.
 
+## E3.4, continued: a per-row refusal is not a response-wide verdict
+
+One row's property was being applied to a whole response, and one import
+attempt's shortfall to a whole interval. The verdicts and the facts below have
+already reached owners, so none of them can be redefined without
+reinterpreting the journal.
+
+| Requirement | Where implemented |
+|---|---|
+| A channel says what its portfolio answer describes rather than accepting a date it will ignore | `ports::PortfolioAsOf::{Requested, Current}` in `PortfolioSnapshot` |
+| A portfolio dated outside the requested interval becomes no assertion, and the refusal is named rather than reported as a zero | `sync::AssertionsWithheld::PortfolioDescribesAnotherDay` |
+| A row that cannot become a fact is quarantined and named, and the batch continues | `Verdict::Quarantined { reason }`, code `quarantined` |
+| A refusal of the row is a different thing from a defect of the adapter, and the difference is observable | `RowRefusal::{Row, Adapter}` against `BrokerError::Adapter` |
+| An import attempt that refused rows cannot itself confirm the dimensions those rows would have moved | `EventKind::ImportCoverageGap { period, dimensions, refused }` |
+| The gap disqualifies the attempt, not the interval | the subtraction in `reconciliation::confirmed_dimensions` and in each ground, with no change to `raise`, `merge_status` or `with_external_evidence` |
+| A gap is correlated by account, period, source and parser version, deliberately without the document | `reconciliation::tainted_dimensions` |
+| Which dimensions a refused kind cannot confirm | the classification in `adapters::tinkoff` and `sync::operation_dimensions` |
+
+Schema version 7 carries the new variant.
+
+The correlation deserves its own note, because the obvious version of it does
+not work and fails silently. `collect_groups` builds a group's channel with
+the event's raw hash as its `document`, and `assertion_event` gives every
+claim a synthetic hash derived from an identity string containing the claim
+itself. Every API claim is therefore already a singleton group, and a gap
+matched to a group by `SourceChannel` equality would match nothing at all —
+while every test asserting that a gap was written would still pass.
+
+The choice of mechanism was made against a cheaper one and the cheaper one is
+wrong. An interval-wide confidence cap is bypassable, because `raise` is a
+monotonic maximum and both `merge_status` and `with_external_evidence` apply
+after the status is built; it has no recovery, because the journal is
+append-only and a fact meaning "this interval had refused rows" would poison
+the interval for ever; and it asserts something false, because a refused row
+does not prove the journal is incomplete — the same operation may already be
+present from a broker report. Withholding the attempt's evidence avoids the first
+and the third: a claim's outcome stays truthful and no status is capped, so
+another channel or another interval raises confidence with no special case.
+
+Recovery is narrower than it first appears, and the limit is worth stating.
+The correlation is by channel, not by attempt, so a gap withholds that
+channel's evidence for that interval permanently. Re-running the same import
+cleanly does not lift it — and cannot, because the assertion idempotency key
+is fixed by account, interval, source and claim, so a repeat records no new
+group to recover into. Confirmation for such an interval comes from a
+different channel or a different interval. Making recovery by the same
+channel possible needs an attempt identity the journal does not yet carry.
+
+Cannot change without a migration:
+
+- The meaning of `ImportCoverageGap` and its correlation rule. Gaps already
+  recorded decide what evidence past intervals have, and a rule that matched
+  differently would silently re-decide them.
+- The requirement that a gap name at least one dimension. An empty gap would
+  be a fact asserting nothing, and `validate_structure` refuses it.
+- The classification of a refusal into dimensions. Narrowing it later would
+  retroactively raise confidence that was withheld; widening it would withdraw
+  confirmation already reported to the owner.
+- The code `quarantined` and what it means: the row was read and no fact was
+  recorded from it. It is neither `unsupported`, whose monetary effect **is**
+  preserved, nor `rejected`, which carries a structured rejection of a row
+  that could not be parsed.
 
 ## Что менять нельзя без миграции
 

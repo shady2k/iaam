@@ -94,6 +94,11 @@ pub enum EventValidationError {
         posted: i64,
         exact: i64,
     },
+    #[error("for {kind} the set {field} must name at least one element")]
+    EmptySet {
+        kind: &'static str,
+        field: &'static str,
+    },
     #[error("for {kind} value {field} must be positive, got {value}")]
     NonPositive {
         kind: &'static str,
@@ -161,7 +166,8 @@ pub struct Event {
 /// Version 6 adds optional basis-only trade fee fields; both default to absent
 /// so older journal facts remain readable, while the schema number still
 /// distinguishes software that understands the new fact.
-pub const SCHEMA_VERSION: u32 = 6;
+/// Version 7 adds [`EventKind::ImportCoverageGap`].
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.
@@ -270,6 +276,11 @@ impl Event {
             EventKind::ControlAssertion { period, claim } => {
                 self.validate_control_assertion(name, *period, *claim)
             }
+            EventKind::ImportCoverageGap {
+                period,
+                dimensions,
+                refused,
+            } => self.validate_import_coverage_gap(name, *period, dimensions, *refused),
             EventKind::CorporateAction { action } => self.validate_corporate_action(name, action),
             EventKind::OfferExercise { action } => self.validate_offer_exercise(name, action),
         }
@@ -712,6 +723,44 @@ impl Event {
                 kind: name,
                 field,
                 value: value.to_string(),
+            });
+        }
+        if self.legs.is_empty() {
+            Ok(())
+        } else {
+            Err(EventValidationError::LegCount {
+                kind: name,
+                expected: "no legs",
+                found: self.legs.len(),
+            })
+        }
+    }
+
+    fn validate_import_coverage_gap(
+        &self,
+        name: &'static str,
+        period: crate::reconciliation::claim::AssertionPeriod,
+        dimensions: &std::collections::BTreeSet<crate::reconciliation::Dimension>,
+        refused: u32,
+    ) -> Result<(), EventValidationError> {
+        if !period.is_well_formed() {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "period",
+                value: format!("{} .. {}", period.from, period.to),
+            });
+        }
+        if refused < 1 {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "refused",
+                value: refused.to_string(),
+            });
+        }
+        if dimensions.is_empty() {
+            return Err(EventValidationError::EmptySet {
+                kind: name,
+                field: "dimensions",
             });
         }
         if self.legs.is_empty() {
@@ -2555,6 +2604,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn an_import_coverage_gap_requires_at_least_one_refused_row() {
+        let account = AccountId::new_random();
+        let period = crate::reconciliation::claim::AssertionPeriod::between(
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .expect("well-formed period");
+        let event = event(
+            EventKind::ImportCoverageGap {
+                period,
+                dimensions: [crate::reconciliation::Dimension::Cash]
+                    .into_iter()
+                    .collect(),
+                refused: 0,
+            },
+            Vec::new(),
+            account,
+        );
+
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::NonPositive {
+                field: "refused",
+                value,
+                ..
+            }) if value == "0"
+        ));
+    }
+
     // --- General shape rules ---
 
     #[test]
@@ -2749,7 +2828,8 @@ mod tests {
         //        `EventKind::OfferExercise`, and `Income` gained a kind (§4.7).
         // 4 → 5: `EffectiveOrder` gained an optional source time.
         // 5 → 6: `Trade` gained optional basis-only fee fields.
-        assert_eq!(SCHEMA_VERSION, 6);
+        // 6 → 7: added `EventKind::ImportCoverageGap` (§10.3).
+        assert_eq!(SCHEMA_VERSION, 7);
     }
 
     #[test]

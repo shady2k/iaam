@@ -217,6 +217,11 @@ impl ReconciliationLedger {
         exceptions: &crate::perimeter::PerimeterExceptions,
     ) -> Result<Self, ObserveError> {
         let groups = collect_groups(events);
+        let gaps = collect_coverage_gaps(events);
+        let tainted: Vec<BTreeSet<Dimension>> = groups
+            .iter()
+            .map(|group| tainted_dimensions(group, &gaps))
+            .collect();
 
         // Step 1: reconcile each group against its projection.
         let mut checked: Vec<Vec<ClaimCheck>> = Vec::with_capacity(groups.len());
@@ -243,15 +248,15 @@ impl ReconciliationLedger {
         let mut evidence: Vec<(AccountId, AssertionPeriod, Evidence)> = Vec::new();
         for (index, outcomes) in checked.iter().enumerate() {
             let group = &groups[index];
-            if let Some(item) = ground_five(group, outcomes) {
+            if let Some(item) = ground_five(group, outcomes, &tainted[index]) {
                 evidence.push((group.account, group.period, item));
             }
-            if let Some((period, item)) = ground_one(group, outcomes, &groups) {
+            if let Some((period, item)) = ground_one(index, outcomes, &groups, &tainted) {
                 evidence.push((group.account, period, item));
             }
         }
-        evidence.extend(ground_two(&groups));
-        evidence.extend(ground_three(&groups, &checked));
+        evidence.extend(ground_two(&groups, &tainted));
+        evidence.extend(ground_three(&groups, &checked, &tainted));
 
         // Step 3: statuses.
         let mut statuses: Vec<ReconciliationStatus> = Vec::new();
@@ -371,13 +376,63 @@ fn collect_groups(events: &[Event]) -> Vec<StatementGroup> {
     groups
 }
 
+#[derive(Debug, Clone)]
+struct CoverageGap {
+    account: AccountId,
+    period: AssertionPeriod,
+    source: crate::ids::SourceId,
+    parser_version: crate::event::provenance::ParserVersion,
+    dimensions: BTreeSet<Dimension>,
+}
+
+fn collect_coverage_gaps(events: &[Event]) -> Vec<CoverageGap> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let EventKind::ImportCoverageGap {
+                period, dimensions, ..
+            } = &event.kind
+            else {
+                return None;
+            };
+            Some(CoverageGap {
+                account: event.account,
+                period: *period,
+                source: event.provenance.source(),
+                parser_version: event.provenance.parser_version().clone(),
+                dimensions: dimensions.clone(),
+            })
+        })
+        .collect()
+}
+
+fn tainted_dimensions(group: &StatementGroup, gaps: &[CoverageGap]) -> BTreeSet<Dimension> {
+    let mut tainted = BTreeSet::new();
+    for gap in gaps {
+        // Correlate an attempt by (account, period, source, parser version), deliberately
+        // omitting document: each assertion claim can carry a distinct document hash.
+        if gap.account == group.account
+            && gap.period == group.period
+            && gap.source == group.channel.source
+            && gap.parser_version == group.channel.parser_version
+        {
+            tainted.extend(&gap.dimensions);
+        }
+    }
+    tainted
+}
+
 /// Evidence 5: separate control sections of the same document reconciled
 /// simultaneously.
 ///
 /// Both the balance and the turnover amount are required: they are calculated differently,
 /// and having both match provides an independent equation. A single reconciled
 /// balance only confirms itself and is not evidence.
-fn ground_five(group: &StatementGroup, outcomes: &[ClaimCheck]) -> Option<Evidence> {
+fn ground_five(
+    group: &StatementGroup,
+    outcomes: &[ClaimCheck],
+    tainted: &BTreeSet<Dimension>,
+) -> Option<Evidence> {
     if outcomes.is_empty() || !outcomes.iter().all(|check| check.outcome.confirms()) {
         return None;
     }
@@ -398,8 +453,9 @@ fn ground_five(group: &StatementGroup, outcomes: &[ClaimCheck]) -> Option<Eviden
     if !has_balance || !has_flow {
         return None;
     }
-    let dimensions: BTreeSet<Dimension> =
+    let mut dimensions: BTreeSet<Dimension> =
         group.claims.iter().map(ControlClaim::dimension).collect();
+    dimensions.retain(|dimension| !tainted.contains(dimension));
     Evidence::from_match(
         Ground::SeparateSectionsAgree,
         group.channel.clone(),
@@ -415,11 +471,13 @@ fn ground_five(group: &StatementGroup, outcomes: &[ClaimCheck]) -> Option<Eviden
 /// the current period would mean counting confirmation of data that it
 /// does not yet contain.
 fn ground_one(
-    group: &StatementGroup,
+    group_index: usize,
     outcomes: &[ClaimCheck],
     groups: &[StatementGroup],
+    tainted: &[BTreeSet<Dimension>],
 ) -> Option<(AssertionPeriod, Evidence)> {
-    let opening_matched: BTreeSet<Dimension> = outcomes
+    let group = &groups[group_index];
+    let mut opening_matched: BTreeSet<Dimension> = outcomes
         .iter()
         .filter(|check| {
             check.outcome.confirms()
@@ -439,10 +497,14 @@ fn ground_one(
     if opening_matched.is_empty() {
         return None;
     }
-    let prior = groups
+    let (prior_index, prior) = groups
         .iter()
-        .filter(|other| other.account == group.account && other.period.to < group.period.from)
-        .max_by_key(|other| other.period.to)?;
+        .enumerate()
+        .filter(|(_, other)| other.account == group.account && other.period.to < group.period.from)
+        .max_by_key(|(_, other)| other.period.to)?;
+    opening_matched.retain(|dimension| {
+        !tainted[group_index].contains(dimension) && !tainted[prior_index].contains(dimension)
+    });
     let evidence = Evidence::from_match(
         Ground::OpeningMatchesPriorClosing,
         group.channel.clone(),
@@ -457,10 +519,13 @@ fn ground_one(
 ///
 /// Two **source assertions** are compared, not an assertion with
 /// a projection: this checks continuity between the documents themselves.
-fn ground_two(groups: &[StatementGroup]) -> Vec<(AccountId, AssertionPeriod, Evidence)> {
+fn ground_two(
+    groups: &[StatementGroup],
+    tainted: &[BTreeSet<Dimension>],
+) -> Vec<(AccountId, AssertionPeriod, Evidence)> {
     let mut found = Vec::new();
-    for earlier in groups {
-        for later in groups {
+    for (earlier_index, earlier) in groups.iter().enumerate() {
+        for (later_index, later) in groups.iter().enumerate() {
             if earlier.account != later.account || later.period.from <= earlier.period.to {
                 continue;
             }
@@ -472,6 +537,14 @@ fn ground_two(groups: &[StatementGroup]) -> Vec<(AccountId, AssertionPeriod, Evi
                     }
                 }
             }
+            dimensions.retain(|dimension| {
+                !tainted
+                    .get(earlier_index)
+                    .is_some_and(|items| items.contains(dimension))
+                    && !tainted
+                        .get(later_index)
+                        .is_some_and(|items| items.contains(dimension))
+            });
             if let Some(evidence) = Evidence::from_match(
                 Ground::ContinuityBetweenStatements,
                 later.channel.clone(),
@@ -526,6 +599,7 @@ fn continuous(closing: ControlClaim, opening: ControlClaim) -> bool {
 fn ground_three(
     groups: &[StatementGroup],
     checked: &[Vec<ClaimCheck>],
+    tainted: &[BTreeSet<Dimension>],
 ) -> Vec<(AccountId, AssertionPeriod, Evidence)> {
     let mut found = Vec::new();
     for (left_index, left_outcomes) in checked.iter().enumerate() {
@@ -539,10 +613,11 @@ fn ground_three(
             {
                 continue;
             }
-            let confirmed: BTreeSet<Dimension> = confirmed_dimensions(left_outcomes)
-                .intersection(&confirmed_dimensions(right_outcomes))
-                .copied()
-                .collect();
+            let confirmed: BTreeSet<Dimension> =
+                confirmed_dimensions(left_outcomes, &tainted[left_index])
+                    .intersection(&confirmed_dimensions(right_outcomes, &tainted[right_index]))
+                    .copied()
+                    .collect();
             if let Some(evidence) = Evidence::from_match(
                 Ground::BrokerApiAgreesWithStatement,
                 right.channel.clone(),
@@ -558,7 +633,10 @@ fn ground_three(
 
 /// Dimensions for which at least something in the group reconciled and nothing
 /// was discrepant.
-fn confirmed_dimensions(outcomes: &[ClaimCheck]) -> BTreeSet<Dimension> {
+fn confirmed_dimensions(
+    outcomes: &[ClaimCheck],
+    tainted: &BTreeSet<Dimension>,
+) -> BTreeSet<Dimension> {
     let mut confirmed = BTreeSet::new();
     let mut broken = BTreeSet::new();
     for check in outcomes {
@@ -575,7 +653,7 @@ fn confirmed_dimensions(outcomes: &[ClaimCheck]) -> BTreeSet<Dimension> {
             ClaimOutcome::NotComparable { .. } | ClaimOutcome::Excepted { .. } => {}
         }
     }
-    confirmed.retain(|dimension| !broken.contains(dimension));
+    confirmed.retain(|dimension| !broken.contains(dimension) && !tainted.contains(dimension));
     confirmed
 }
 
@@ -820,7 +898,10 @@ mod internals {
         earlier.account = account;
         later.account = account;
 
-        let found = ground_two(&[earlier.clone(), later.clone()]);
+        let found = ground_two(
+            &[earlier.clone(), later.clone()],
+            &[BTreeSet::new(), BTreeSet::new()],
+        );
         assert_eq!(
             found.len(),
             1,
@@ -829,7 +910,13 @@ mod internals {
         assert_eq!(found[0].1, march(), "the earlier period is confirmed");
 
         // The same document overlaid on itself provides no evidence.
-        assert!(ground_two(&[earlier.clone(), earlier]).is_empty());
+        assert!(
+            ground_two(
+                &[earlier.clone(), earlier],
+                &[BTreeSet::new(), BTreeSet::new()],
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -845,7 +932,7 @@ mod internals {
             vec![cash(100_000, BalancePoint::Opening)],
         );
         assert!(
-            ground_two(&[earlier, later]).is_empty(),
+            ground_two(&[earlier, later], &[BTreeSet::new(), BTreeSet::new()]).is_empty(),
             "different accounts have no continuity"
         );
     }
@@ -1192,7 +1279,13 @@ mod internals {
             }),
         }];
         assert!(
-            ground_one(&current, &unmatched_opening, &groups).is_none(),
+            ground_one(
+                1,
+                &unmatched_opening,
+                &groups,
+                &[BTreeSet::new(), BTreeSet::new()],
+            )
+            .is_none(),
             "a mismatched opening balance confirms nothing"
         );
 
@@ -1201,7 +1294,13 @@ mod internals {
             outcome: ClaimOutcome::Matched,
         }];
         assert!(
-            ground_one(&current, &matched_closing, &groups).is_none(),
+            ground_one(
+                1,
+                &matched_closing,
+                &groups,
+                &[BTreeSet::new(), BTreeSet::new()],
+            )
+            .is_none(),
             "the closing balance concerns its own period, not the previous one"
         );
     }
@@ -1232,7 +1331,13 @@ mod internals {
             outcome: ClaimOutcome::Matched,
         }];
         assert!(
-            ground_one(&current, &outcomes, &[overlapping, current.clone()]).is_none(),
+            ground_one(
+                1,
+                &outcomes,
+                &[overlapping, current.clone()],
+                &[BTreeSet::new(), BTreeSet::new()],
+            )
+            .is_none(),
             "a touching statement is not considered previous"
         );
     }
@@ -1247,6 +1352,7 @@ mod internals {
             claim: cash(100_000, BalancePoint::Closing),
             outcome: ClaimOutcome::Matched,
         }];
+        let no_taint = [BTreeSet::new(), BTreeSet::new()];
 
         let mut left = group(
             march(),
@@ -1261,7 +1367,8 @@ mod internals {
         assert!(
             ground_three(
                 &[left.clone(), other_period],
-                &[matched.clone(), matched.clone()]
+                &[matched.clone(), matched.clone()],
+                &no_taint,
             )
             .is_empty(),
             "confirmation for another period is not evidence"
@@ -1272,24 +1379,25 @@ mod internals {
         assert!(
             ground_three(
                 &[left.clone(), other_account],
-                &[matched.clone(), matched.clone()]
+                &[matched.clone(), matched.clone()],
+                &no_taint,
             )
             .is_empty(),
             "confirmation for another account is not evidence"
         );
 
         // The same account and period, but the channel is NOT independent.
-        let mut same_channel = StatementGroup {
+        let same_channel = StatementGroup {
             account,
             period: march(),
             channel: left.channel.clone(),
             claims: vec![cash(100_000, BalancePoint::Closing)],
         };
-        same_channel.account = account;
         assert!(
             ground_three(
                 &[left.clone(), same_channel],
-                &[matched.clone(), matched.clone()]
+                &[matched.clone(), matched.clone()],
+                &no_taint,
             )
             .is_empty(),
             "the same channel does not provide independence"
@@ -1298,7 +1406,7 @@ mod internals {
         // All three conditions are satisfied—evidence exists.
         let mut independent = group(march(), "api/1", vec![cash(100_000, BalancePoint::Closing)]);
         independent.account = account;
-        let found = ground_three(&[left, independent], &[matched.clone(), matched]);
+        let found = ground_three(&[left, independent], &[matched.clone(), matched], &no_taint);
         assert_eq!(found.len(), 1, "independent channel for the same period");
         assert_eq!(found[0].1, march());
     }
@@ -1321,7 +1429,13 @@ mod internals {
         }];
 
         assert!(
-            ground_one(&current, &outcomes, std::slice::from_ref(&current)).is_none(),
+            ground_one(
+                0,
+                &outcomes,
+                std::slice::from_ref(&current),
+                &[BTreeSet::new()],
+            )
+            .is_none(),
             "an account cannot be its own previous statement"
         );
 
@@ -1331,8 +1445,13 @@ mod internals {
             vec![cash(100_000, BalancePoint::Closing)],
         );
         prior.account = account;
-        let found = ground_one(&current, &outcomes, &[prior, current.clone()])
-            .expect("previous statement found");
+        let found = ground_one(
+            1,
+            &outcomes,
+            &[prior, current.clone()],
+            &[BTreeSet::new(), BTreeSet::new()],
+        )
+        .expect("previous statement found");
         assert_eq!(found.0, march(), "the previous period is confirmed");
 
         // A mismatched opening balance provides no evidence.
@@ -1342,7 +1461,7 @@ mod internals {
                 reason: check::NotComparable::NoJournalCoverage,
             },
         }];
-        assert!(ground_one(&current, &broken, &[current.clone()]).is_none());
+        assert!(ground_one(0, &broken, &[current.clone()], &[BTreeSet::new()],).is_none());
     }
 }
 

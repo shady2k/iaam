@@ -271,6 +271,7 @@ pub const fn classification_of(event: &Event) -> Option<Classification> {
         | EventKind::OpeningCash { .. }
         | EventKind::Valuation { .. }
         | EventKind::ControlAssertion { .. }
+        | EventKind::ImportCoverageGap { .. }
         // Corporate action and tender offer are facts, not decisions
         // of the owner, and are not subject to recalculation by rules. `Income` here
         // would be a plausible silent error: amortization is a

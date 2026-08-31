@@ -5,6 +5,7 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
 use iaam_core::projection::Snapshot;
+use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
@@ -530,6 +531,8 @@ pub enum BrokerError {
     Unreachable { broker: String, detail: String },
     #[error("response from broker {broker} could not be parsed: {detail}")]
     Unparsable { broker: String, detail: String },
+    #[error("the {broker} adapter reached a state it excludes: {detail}")]
+    Adapter { broker: String, detail: String },
 }
 
 /// A channel operation that cannot be accepted into the journal.
@@ -541,6 +544,7 @@ pub enum BrokerError {
 pub struct Quarantined {
     pub raw: Value,
     pub reason: String,
+    pub dimensions: std::collections::BTreeSet<Dimension>,
 }
 
 /// Result of retrieving a page of broker-channel operations.
@@ -551,6 +555,27 @@ pub struct Quarantined {
 pub struct ParsedOperations {
     pub accepted: Vec<SubmittedOperation>,
     pub quarantined: Vec<Quarantined>,
+}
+
+/// What a channel's portfolio answer describes.
+///
+/// A channel that can only report its present holdings must say so rather
+/// than accept a date it will ignore: the caller records the answer as a
+/// fact, and a fact dated by the question rather than by the answer is
+/// false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortfolioAsOf {
+    /// The channel answered for the date that was requested.
+    Requested,
+    /// The channel reports its current portfolio, whatever was requested.
+    Current,
+}
+
+/// Portfolio claims together with the date semantics of the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortfolioSnapshot {
+    pub as_of: PortfolioAsOf,
+    pub claims: Vec<ControlClaim>,
 }
 
 /// Broker channel: a second way to obtain the same data.
@@ -574,7 +599,7 @@ pub trait BrokerChannel: Send + Sync {
         to: Date,
     ) -> Result<ParsedOperations, BrokerError>;
 
-    /// Control values as at a date: balances and quantities.
+    /// Portfolio claims for the requested account and their date semantics.
     ///
     /// Returns the source's assertions, not a calculation: the values calculated
     /// from the journal are subsequently reconciled against them.
@@ -582,7 +607,7 @@ pub trait BrokerChannel: Send + Sync {
         &self,
         account: AccountId,
         at: Date,
-    ) -> Result<Vec<ControlClaim>, BrokerError>;
+    ) -> Result<PortfolioSnapshot, BrokerError>;
 
     /// Exactly how the data was obtained. The parser version and absence
     /// of a document are what the channel's independence is derived from.

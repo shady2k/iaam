@@ -90,7 +90,8 @@ pub fn active_instruments(events: &[Event]) -> Result<BTreeSet<InstrumentId>, Nu
             | EventKind::Fee { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
-            | EventKind::ControlAssertion { .. } => Vec::new(),
+            | EventKind::ControlAssertion { .. }
+            | EventKind::ImportCoverageGap { .. } => Vec::new(),
         };
         for (instrument, delta) in deltas {
             let current = quantities.entry(instrument).or_insert_with(Dec::zero);

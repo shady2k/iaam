@@ -703,6 +703,10 @@ impl VerdictDto {
                 actual: Some(rejection.actual.clone()),
                 ..base
             },
+            Verdict::Quarantined { reason } => Self {
+                detail: Some(reason.clone()),
+                ..base
+            },
         }
     }
 }

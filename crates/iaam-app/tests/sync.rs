@@ -575,6 +575,184 @@ async fn partial_operations_do_not_create_control_assertions() {
 }
 
 #[tokio::test]
+async fn a_transfer_refusal_becomes_a_quarantined_verdict_without_losing_other_rows() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let first = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    let mut second = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    second.source_operation_id = Some("TRADE-MARCH-2".to_owned());
+    let mut broker = api(account, SourceId::new_random(), first);
+    broker.operations = Ok(ParsedOperations {
+        accepted: vec![
+            broker.operations.as_ref().expect("operations").accepted[0].clone(),
+            second,
+        ],
+        quarantined: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::Value::Null,
+            reason: "transfer does not contain a recipient account".to_owned(),
+        }],
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("partial transfer sync: {error}"));
+
+    assert_eq!(outcome.recorded.len(), 3);
+    assert!(outcome.recorded.iter().any(|verdict| {
+        matches!(
+            verdict,
+            Verdict::Quarantined { reason }
+                if reason == "transfer does not contain a recipient account"
+        )
+    }));
+    assert_eq!(load_all(&services, owner).await.len(), 2);
+}
+
+#[tokio::test]
+async fn bond_amortisation_and_unknown_rows_become_quarantined_verdicts() {
+    for reason in [
+        "bond amortisation: the channel does not report the returned face value per unit",
+        "unsupported operation kind: OPERATION_TYPE_UNKNOWN",
+    ] {
+        let services = services();
+        let owner = OwnerId::new_random();
+        let account = AccountId::new_random();
+        let broker_operation = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+        let mut broker = api(account, SourceId::new_random(), broker_operation);
+        broker.operations = Ok(ParsedOperations {
+            accepted: broker
+                .operations
+                .as_ref()
+                .expect("operations")
+                .accepted
+                .clone(),
+            quarantined: vec![iaam_app::ports::Quarantined {
+                raw: serde_json::Value::Null,
+                reason: reason.to_owned(),
+            }],
+        });
+
+        let outcome = sync_broker(
+            &services,
+            &principal(owner),
+            &broker,
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("partial corporate action sync: {error}"));
+
+        assert!(outcome.recorded.iter().any(|verdict| {
+            matches!(verdict, Verdict::Quarantined { reason: actual } if actual == reason)
+        }));
+        assert_eq!(load_all(&services, owner).await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_normalisation_rejection_stops_one_row_and_records_the_other_rows() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let valid = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    let mut invalid = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    invalid.dates = OperationDates::default();
+    invalid.source_operation_id = Some("INVALID-MARCH-1".to_owned());
+    let mut broker = api(account, SourceId::new_random(), valid.clone());
+    broker.operations = Ok(ParsedOperations {
+        accepted: vec![valid, invalid],
+        quarantined: Vec::new(),
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("normalisation rejection sync: {error}"));
+
+    assert!(outcome.recorded.iter().any(|verdict| {
+        matches!(
+            verdict,
+            Verdict::Rejected { rejection } if rejection.field == "dates"
+        )
+    }));
+    assert_eq!(load_all(&services, owner).await.len(), 2);
+}
+
+#[tokio::test]
+async fn existing_quarantine_reasons_reach_the_owner_as_row_verdicts() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let mut broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+    broker.operations = Ok(ParsedOperations {
+        accepted: broker
+            .operations
+            .as_ref()
+            .expect("operations")
+            .accepted
+            .clone(),
+        quarantined: [
+            "order state OPERATION_STATE_CANCELED: non-trade operation is refused for lack of evidence that money moved",
+            "inbound securities transfer: securities moved without a cash movement",
+            "trading operation does not contain positionUid",
+        ]
+        .into_iter()
+        .map(|reason| iaam_app::ports::Quarantined {
+            raw: serde_json::Value::Null,
+            reason: reason.to_owned(),
+        })
+        .collect(),
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("existing quarantine sync: {error}"));
+
+    let reasons: Vec<&str> = outcome
+        .recorded
+        .iter()
+        .filter_map(|verdict| match verdict {
+            Verdict::Quarantined { reason } => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            "order state OPERATION_STATE_CANCELED: non-trade operation is refused for lack of evidence that money moved",
+            "inbound securities transfer: securities moved without a cash movement",
+            "trading operation does not contain positionUid",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn one_broker_failure_does_not_poison_another_sync() {
     let services = services();
     let owner = OwnerId::new_random();

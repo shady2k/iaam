@@ -530,6 +530,8 @@ pub enum BrokerError {
     Unreachable { broker: String, detail: String },
     #[error("response from broker {broker} could not be parsed: {detail}")]
     Unparsable { broker: String, detail: String },
+    #[error("the {broker} adapter reached a state it excludes: {detail}")]
+    Adapter { broker: String, detail: String },
 }
 
 /// A channel operation that cannot be accepted into the journal.

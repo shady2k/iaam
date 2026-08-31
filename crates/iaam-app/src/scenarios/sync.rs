@@ -128,18 +128,19 @@ pub async fn sync_broker(
             identity_scope: broker.identity_scope(),
         };
         let key = dedup::choose_key(&operation, &context);
-        let normalized = normalize(
+        let normalized = match normalize(
             &operation,
             NormalizationContext {
                 owner: principal.owner,
                 source: channel.source,
             },
-        )
-        .map_err(|rejection| AppError::Invalid {
-            field: rejection.field,
-            expected: rejection.expected,
-            actual: rejection.actual,
-        })?;
+        ) {
+            Ok(normalized) => normalized,
+            Err(rejection) => {
+                recorded.push(Verdict::Rejected { rejection });
+                continue;
+            }
+        };
         let event = with_channel_provenance(normalized.event, &channel);
         let decision = dedup::assess(key.as_ref(), event.provenance.raw_hash(), &context, &known);
         let possible_duplicate = match &decision {
@@ -170,6 +171,11 @@ pub async fn sync_broker(
         recorded.push(verdict);
     }
 
+    // A refused row is reported whatever else happens to this response: its
+    // reason names what is missing, and it reaches the owner nowhere else.
+    recorded.extend(parsed.quarantined.iter().map(|row| Verdict::Quarantined {
+        reason: row.reason.clone(),
+    }));
     // A rejected row proves that the response is not a complete export.
     // The operations above are still saved, but the control balance cannot be
     // recorded alongside an incomplete interval.
@@ -331,7 +337,8 @@ fn event_id_from_verdict(verdict: &Verdict) -> Option<EventId> {
         | Verdict::NeedsReconciliation { .. }
         | Verdict::NeedsClassification { .. }
         | Verdict::Unsupported { .. }
-        | Verdict::Rejected { .. } => None,
+        | Verdict::Rejected { .. }
+        | Verdict::Quarantined { .. } => None,
     }
 }
 

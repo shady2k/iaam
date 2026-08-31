@@ -10,10 +10,11 @@
 //! the database, and seeding from here does not touch existing rows. Otherwise
 //! the owner's decision would be cancelled on every access setup.
 //!
-//! The contents reproduce the former `match` in `parse.rs` (commit 5320fb0)
-//! word for word. A missing synonym here is a code that would silently become
-//! unknown after migration, and imports would stop parsing what they parsed
-//! yesterday.
+//! Most entries reproduce the former `match` in `parse.rs` (commit 5320fb0)
+//! word for word. The two securities-transfer entries intentionally do not:
+//! those codes are securities movements, not cash deposits or withdrawals.
+//! A missing synonym here is a code that would silently become unknown after
+//! migration, and imports would stop parsing what they parsed yesterday.
 //!
 //! Amortisation and redemption are intentionally absent: the contract
 //! declares their codes (`OPERATION_TYPE_BOND_REPAYMENT`,
@@ -48,12 +49,15 @@ pub const TINKOFF_OPERATION_KINDS: &[(&str, &str)] = &[
     ("OPERATION_TYPE_ADVICE_FEE", "commission"),
     ("OPERATION_TYPE_OVER_COM", "commission"),
     ("OPERATION_TYPE_INPUT", "deposit"),
-    ("OPERATION_TYPE_INPUT_SECURITIES", "deposit"),
+    ("OPERATION_TYPE_INPUT_SECURITIES", "securities_transfer_in"),
     ("OPERATION_TYPE_INPUT_SWIFT", "deposit"),
     ("OPERATION_TYPE_INPUT_ACQUIRING", "deposit"),
     ("OPERATION_TYPE_INP_MULTI", "deposit"),
     ("OPERATION_TYPE_OUTPUT", "withdrawal"),
-    ("OPERATION_TYPE_OUTPUT_SECURITIES", "withdrawal"),
+    (
+        "OPERATION_TYPE_OUTPUT_SECURITIES",
+        "securities_transfer_out",
+    ),
     ("OPERATION_TYPE_OUTPUT_SWIFT", "withdrawal"),
     ("OPERATION_TYPE_OUTPUT_ACQUIRING", "withdrawal"),
     ("OPERATION_TYPE_OUT_MULTI", "withdrawal"),
@@ -112,6 +116,23 @@ mod tests {
             ),
         ] {
             assert_eq!(dictionary.kind_of(code), expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn securities_transfers_are_not_seeded_as_cash() {
+        for (source_kind, expected) in [
+            ("OPERATION_TYPE_INPUT_SECURITIES", "securities_transfer_in"),
+            (
+                "OPERATION_TYPE_OUTPUT_SECURITIES",
+                "securities_transfer_out",
+            ),
+        ] {
+            let kind = TINKOFF_OPERATION_KINDS
+                .iter()
+                .find(|(code, _)| *code == source_kind)
+                .map(|(_, kind)| *kind);
+            assert_eq!(kind, Some(expected), "{source_kind}");
         }
     }
 }

@@ -352,7 +352,7 @@ fn build(
                 CalcMoney::new(Dec::new(value.value().inner().abs()), value.currency())
             });
             let basis_fee = basis_fee_money(basis_fee_exact, *currency)?;
-            let accrued = fee_money(*accrued_interest_minor, *currency)?;
+            let accrued = accrued_interest_money(*accrued_interest_minor, *currency)?;
             let mut settlement = gross.amount().raw();
             settlement += accrued.map_or(0, |value| value.amount().raw());
             settlement += fee.map_or(0, |value| value.amount().raw());
@@ -389,7 +389,7 @@ fn build(
                 CalcMoney::new(Dec::new(value.value().inner().abs()), value.currency())
             });
             let basis_fee = basis_fee_money(basis_fee_exact, *currency)?;
-            let accrued = fee_money(*accrued_interest_minor, *currency)?;
+            let accrued = accrued_interest_money(*accrued_interest_minor, *currency)?;
             let mut settlement = gross.amount().raw();
             settlement += accrued.map_or(0, |value| value.amount().raw());
             settlement -= fee.map_or(0, |value| value.amount().raw());
@@ -507,6 +507,22 @@ fn fee_money(value: Option<i64>, currency: CurrencyCode) -> Result<Option<Money>
     match value {
         None => Ok(None),
         Some(minor) => Ok(Some(money(positive(minor, "fee", currency)?, currency))),
+    }
+}
+
+/// Accrued interest accepts a reported zero, unlike a charged fee.
+fn accrued_interest_money(
+    value: Option<i64>,
+    currency: CurrencyCode,
+) -> Result<Option<Money>, Rejection> {
+    match value {
+        None => Ok(None),
+        Some(minor) if minor >= 0 => Ok(Some(money(minor, currency))),
+        Some(minor) => Err(Rejection {
+            field: "accrued_interest".into(),
+            expected: "non-negative value".into(),
+            actual: money(minor, currency).to_calc_dec().inner().to_string(),
+        }),
     }
 }
 

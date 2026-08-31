@@ -194,6 +194,36 @@ async fn load(services: &AppServices, owner: OwnerId) -> Vec<Event> {
         .unwrap_or_else(|error| panic!("load events: {error}"))
 }
 
+async fn load_all(services: &AppServices, owner: OwnerId) -> Vec<Event> {
+    services
+        .store
+        .load_events_through(owner, Date::MAX)
+        .await
+        .unwrap_or_else(|error| panic!("load all events: {error}"))
+}
+
+fn seeded_trade(
+    owner: OwnerId,
+    account: AccountId,
+    instrument: InstrumentId,
+    custody: CustodyId,
+    day: Date,
+) -> Event {
+    let mut operation = trade(account, instrument, custody);
+    operation.dates.trade = Some(day);
+    operation.dates.settled = Some(day);
+    operation.dates.cash_posted = Some(day);
+    iaam_ingest::normalize(
+        &operation,
+        iaam_ingest::operation::NormalizationContext {
+            owner,
+            source: SourceId::new_random(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("seed trade: {error:?}"))
+    .event
+}
+
 #[tokio::test]
 async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
     let services = services();
@@ -579,4 +609,187 @@ async fn one_broker_failure_does_not_poison_another_sync() {
     .unwrap_or_else(|error| panic!("good sync: {error}"));
     assert_eq!(outcome.assertions, 1);
     assert_eq!(load(&services, owner).await.len(), 2);
+}
+
+#[tokio::test]
+async fn sync_refuses_account_with_account_derived_trade_custody() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let old = seeded_trade(
+        owner,
+        account,
+        instrument,
+        CustodyId(account.inner()),
+        date!(2026 - 03 - 15),
+    );
+    services
+        .store
+        .append_events(vec![old], IdentityScope::Source)
+        .await
+        .unwrap_or_else(|error| panic!("seed old trade: {error}"));
+    let broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, instrument, CustodyId::new_random()),
+    );
+
+    let error = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("affected account must be refused");
+
+    let text = error.to_string();
+    assert!(text.contains("1"), "refusal must name the count: {text}");
+    assert!(
+        text.contains("iaam-y3a2"),
+        "refusal must name the repair task: {text}"
+    );
+    assert_eq!(load_all(&services, owner).await.len(), 1);
+}
+
+#[tokio::test]
+async fn sync_allows_account_with_only_position_derived_trade_custody() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("position-derived sync: {error}"));
+
+    assert_eq!(outcome.assertions, 1);
+    assert_eq!(load_all(&services, owner).await.len(), 2);
+}
+
+#[tokio::test]
+async fn sync_refusal_is_scoped_to_the_affected_account() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let affected = AccountId::new_random();
+    let unaffected = AccountId::new_random();
+    let old = seeded_trade(
+        owner,
+        affected,
+        InstrumentId::new_random(),
+        CustodyId(affected.inner()),
+        date!(2026 - 03 - 15),
+    );
+    services
+        .store
+        .append_events(vec![old], IdentityScope::Source)
+        .await
+        .unwrap_or_else(|error| panic!("seed affected trade: {error}"));
+    let mut unaffected_operation = trade(
+        unaffected,
+        InstrumentId::new_random(),
+        CustodyId::new_random(),
+    );
+    unaffected_operation.source_operation_id = Some("UNAFF-MARCH-1".to_owned());
+    let broker = api(unaffected, SourceId::new_random(), unaffected_operation);
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        unaffected,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("unaffected account sync: {error}"));
+
+    assert_eq!(outcome.assertions, 1);
+    assert_eq!(load_all(&services, owner).await.len(), 3);
+}
+
+#[tokio::test]
+async fn sync_refuses_account_derived_trade_after_requested_interval() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let old = seeded_trade(
+        owner,
+        account,
+        InstrumentId::new_random(),
+        CustodyId(account.inner()),
+        date!(2026 - 04 - 15),
+    );
+    services
+        .store
+        .append_events(vec![old], IdentityScope::Source)
+        .await
+        .unwrap_or_else(|error| panic!("seed later trade: {error}"));
+    let broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+
+    let error = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("later affected trade must still refuse sync");
+
+    assert!(error.to_string().contains("1"));
+    assert_eq!(load_all(&services, owner).await.len(), 1);
+}
+
+#[tokio::test]
+async fn out_of_interval_trade_fact_is_recorded_without_a_control_assertion() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let mut operation = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    operation.dates.trade = Some(date!(2026 - 04 - 02));
+    let broker = api(account, SourceId::new_random(), operation);
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("the fact remains recordable");
+
+    assert_eq!(outcome.assertions, 0);
+    let events = load_all(&services, owner).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Trade { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
+    );
 }

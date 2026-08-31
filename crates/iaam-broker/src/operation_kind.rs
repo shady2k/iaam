@@ -29,8 +29,12 @@ pub enum ChannelOperationKind {
     Commission,
     /// Account deposit.
     Deposit,
-    /// Withdrawal of money or securities.
+    /// Withdrawal of money.
     Withdrawal,
+    /// Securities arriving from another depository are not cash.
+    SecuritiesTransferIn,
+    /// Securities leaving for another depository are not cash.
+    SecuritiesTransferOut,
     /// Transfer between accounts or custodians.
     Transfer,
     /// Bond amortisation: outstanding principal decreases, cash arrives,
@@ -67,6 +71,8 @@ impl ChannelOperationKind {
             Self::Commission => Some("commission"),
             Self::Deposit => Some("deposit"),
             Self::Withdrawal => Some("withdrawal"),
+            Self::SecuritiesTransferIn => Some("securities_transfer_in"),
+            Self::SecuritiesTransferOut => Some("securities_transfer_out"),
             Self::Transfer => Some("transfer"),
             Self::BondAmortisation => Some("bond_amortisation"),
             Self::BondRedemption => Some("bond_redemption"),
@@ -90,6 +96,8 @@ impl ChannelOperationKind {
             "commission" => Some(Self::Commission),
             "deposit" => Some(Self::Deposit),
             "withdrawal" => Some(Self::Withdrawal),
+            "securities_transfer_in" => Some(Self::SecuritiesTransferIn),
+            "securities_transfer_out" => Some(Self::SecuritiesTransferOut),
             "transfer" => Some(Self::Transfer),
             "bond_amortisation" => Some(Self::BondAmortisation),
             "bond_redemption" => Some(Self::BondRedemption),
@@ -193,5 +201,27 @@ pub fn seed_for(broker: &str) -> Option<(&'static str, &'static [(&'static str, 
             crate::finam::dictionary_seed::FINAM_OPERATION_KINDS,
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChannelOperationKind;
+
+    #[test]
+    fn securities_transfer_kinds_round_trip_through_dictionary_names() {
+        for (kind, name) in [
+            (
+                ChannelOperationKind::SecuritiesTransferIn,
+                "securities_transfer_in",
+            ),
+            (
+                ChannelOperationKind::SecuritiesTransferOut,
+                "securities_transfer_out",
+            ),
+        ] {
+            assert_eq!(kind.code(), Some(name));
+            assert_eq!(ChannelOperationKind::parse(name), Some(kind));
+        }
     }
 }

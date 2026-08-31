@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,6 +16,7 @@ use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_ingest::dedup::DedupLevel;
@@ -172,8 +174,61 @@ fn report_cash_assertion(owner: OwnerId, account: AccountId, source: SourceId) -
         idempotency_key: Some("report-cash-march".to_owned()),
     }
 }
+fn report_position_assertion(
+    owner: OwnerId,
+    account: AccountId,
+    source: SourceId,
+    instrument: InstrumentId,
+    custody: CustodyId,
+) -> Event {
+    let period = AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+        .unwrap_or_else(|| panic!("March period"));
+    Event {
+        id: EventId::new_random(),
+        schema_version: SCHEMA_VERSION,
+        owner,
+        account,
+        kind: EventKind::ControlAssertion {
+            period,
+            claim: ControlClaim::PositionQuantity {
+                instrument,
+                custody,
+                quantity: iaam_core::money::Quantity(Dec::one()),
+                at: BalancePoint::Closing,
+            },
+        },
+        dates: EventDates::for_cash(CashPostedDate(period.to)),
+        order: EffectiveOrder::new(period.to, 3),
+        legs: Vec::new(),
+        provenance: Provenance::new(
+            source,
+            iaam_core::event::provenance::RawHash::parse(&"b".repeat(64))
+                .unwrap_or_else(|| panic!("report hash")),
+            ParserVersion("finam-xlsx/1".to_owned()),
+        ),
+        relation: Relation::None,
+        confidence: Confidence::Known,
+        idempotency_key: Some("report-position-march".to_owned()),
+    }
+}
 
 fn api(_account: AccountId, source: SourceId, operation: SubmittedOperation) -> FakeBroker {
+    api_with_claims(
+        source,
+        operation,
+        vec![ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(-10_000),
+            at: BalancePoint::Closing,
+        }],
+    )
+}
+
+fn api_with_claims(
+    source: SourceId,
+    operation: SubmittedOperation,
+    claims: Vec<ControlClaim>,
+) -> FakeBroker {
     FakeBroker {
         source: SourceChannel {
             source,
@@ -187,13 +242,12 @@ fn api(_account: AccountId, source: SourceId, operation: SubmittedOperation) -> 
         }),
         portfolio: Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
-            claims: vec![ControlClaim::CashBalance {
-                currency: CurrencyCode::Rub,
-                amount: PostedMinor::new(-10_000),
-                at: BalancePoint::Closing,
-            }],
+            claims,
         }),
     }
+}
+fn dimensions(values: &[Dimension]) -> BTreeSet<Dimension> {
+    values.iter().copied().collect()
 }
 
 async fn load(services: &AppServices, owner: OwnerId) -> Vec<Event> {
@@ -343,6 +397,11 @@ async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
             .count(),
         1
     );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ImportCoverageGap { .. }))
+    );
 
     let ledger = iaam_core::reconciliation::ReconciliationLedger::build(&events)
         .unwrap_or_else(|error| panic!("ledger: {error}"));
@@ -353,6 +412,277 @@ async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
             iaam_core::reconciliation::Dimension::Cash,
         ),
         iaam_core::reconciliation::DimensionStatus::AcceptedIndependent,
+    );
+}
+
+#[tokio::test]
+async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let operation = trade(account, instrument, custody);
+    let report_source = SourceId::new_random();
+    let existing = report_trade_event(owner, &operation, report_source);
+    services
+        .store
+        .append_events(
+            vec![
+                existing,
+                report_cash_assertion(owner, account, report_source),
+                report_position_assertion(owner, account, report_source, instrument, custody),
+            ],
+            IdentityScope::Source,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed report: {error}"));
+
+    let api_source = SourceId::new_random();
+    let mut broker = api_with_claims(
+        api_source,
+        operation,
+        vec![
+            ControlClaim::CashBalance {
+                currency: CurrencyCode::Rub,
+                amount: PostedMinor::new(-10_000),
+                at: BalancePoint::Closing,
+            },
+            ControlClaim::PositionQuantity {
+                instrument,
+                custody,
+                quantity: iaam_core::money::Quantity(Dec::one()),
+                at: BalancePoint::Closing,
+            },
+        ],
+    );
+    broker.operations = Ok(ParsedOperations {
+        accepted: broker
+            .operations
+            .as_ref()
+            .expect("operations")
+            .accepted
+            .clone(),
+        quarantined: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::json!({"commission": "too precise"}),
+            reason: "commission cannot be represented".to_owned(),
+            dimensions: dimensions(&[Dimension::Cash]),
+        }],
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    assert_eq!(outcome.assertions, 2);
+    let events = load_all(&services, owner).await;
+    let gap = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ImportCoverageGap {
+                period,
+                dimensions,
+                refused,
+            } => Some((event, period, dimensions, refused)),
+            _ => None,
+        })
+        .expect("coverage gap");
+    assert_eq!(gap.1.from, date!(2026 - 03 - 01));
+    assert_eq!(gap.1.to, date!(2026 - 03 - 31));
+    assert_eq!(gap.2, &dimensions(&[Dimension::Cash]));
+    assert_eq!(*gap.3, 1);
+    assert_eq!(gap.0.provenance.source(), api_source);
+    assert_eq!(gap.0.provenance.parser_version().0, "finam-api/1");
+
+    let ledger = iaam_core::reconciliation::ReconciliationLedger::build(&events)
+        .unwrap_or_else(|error| panic!("ledger: {error}"));
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Positions,),
+        iaam_core::reconciliation::DimensionStatus::AcceptedIndependent
+    );
+    assert_ne!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        iaam_core::reconciliation::DimensionStatus::AcceptedIndependent
+    );
+}
+
+#[tokio::test]
+async fn repeating_refused_sync_appends_one_coverage_gap() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let operation = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    let mut broker = api(account, SourceId::new_random(), operation);
+    broker.operations = Ok(ParsedOperations {
+        accepted: broker
+            .operations
+            .as_ref()
+            .expect("operations")
+            .accepted
+            .clone(),
+        quarantined: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::Value::Null,
+            reason: "commission cannot be represented".to_owned(),
+            dimensions: dimensions(&[Dimension::Cash]),
+        }],
+    });
+
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first refused sync: {error}"));
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("second refused sync: {error}"));
+
+    assert_eq!(first.assertions, 1);
+    assert_eq!(second.assertions, 0);
+    assert_eq!(
+        load_all(&services, owner)
+            .await
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::ImportCoverageGap { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let operation = trade(account, instrument, custody);
+    let report_source = SourceId::new_random();
+    services
+        .store
+        .append_events(
+            vec![
+                report_trade_event(owner, &operation, report_source),
+                report_cash_assertion(owner, account, report_source),
+                report_position_assertion(owner, account, report_source, instrument, custody),
+            ],
+            IdentityScope::Source,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed report: {error}"));
+
+    let api_source = SourceId::new_random();
+    let mut broker = api_with_claims(
+        api_source,
+        operation,
+        vec![
+            ControlClaim::CashBalance {
+                currency: CurrencyCode::Rub,
+                amount: PostedMinor::new(-10_000),
+                at: BalancePoint::Closing,
+            },
+            ControlClaim::PositionQuantity {
+                instrument,
+                custody,
+                quantity: iaam_core::money::Quantity(Dec::one()),
+                at: BalancePoint::Closing,
+            },
+        ],
+    );
+    broker.operations = Ok(ParsedOperations {
+        accepted: broker
+            .operations
+            .as_ref()
+            .expect("operations")
+            .accepted
+            .clone(),
+        quarantined: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::Value::Null,
+            reason: "commission cannot be represented".to_owned(),
+            dimensions: dimensions(&[Dimension::Cash]),
+        }],
+    });
+
+    sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+    let first_events = load_all(&services, owner).await;
+    let first_ledger = iaam_core::reconciliation::ReconciliationLedger::build(&first_events)
+        .unwrap_or_else(|error| panic!("first ledger: {error}"));
+    assert_eq!(
+        first_ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Positions),
+        iaam_core::reconciliation::DimensionStatus::AcceptedIndependent
+    );
+
+    broker.operations = Ok(ParsedOperations {
+        accepted: broker
+            .operations
+            .as_ref()
+            .expect("operations")
+            .accepted
+            .clone(),
+        quarantined: vec![
+            iaam_app::ports::Quarantined {
+                raw: serde_json::Value::Null,
+                reason: "commission cannot be represented".to_owned(),
+                dimensions: dimensions(&[Dimension::Cash]),
+            },
+            iaam_app::ports::Quarantined {
+                raw: serde_json::Value::Null,
+                reason: "inbound securities transfer".to_owned(),
+                dimensions: dimensions(&[Dimension::Positions, Dimension::TaxBasis]),
+            },
+        ],
+    });
+    sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("widening sync: {error}"));
+
+    let events = load_all(&services, owner).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::ImportCoverageGap { .. }))
+            .count(),
+        2
+    );
+    let ledger = iaam_core::reconciliation::ReconciliationLedger::build(&events)
+        .unwrap_or_else(|error| panic!("widened ledger: {error}"));
+    assert_ne!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Positions),
+        iaam_core::reconciliation::DimensionStatus::AcceptedIndependent
     );
 }
 
@@ -540,7 +870,7 @@ async fn repeating_sync_is_idempotent_for_operations_and_assertions() {
 }
 
 #[tokio::test]
-async fn partial_operations_do_not_create_control_assertions() {
+async fn partial_operations_record_control_assertion_and_coverage_gap() {
     let services = services();
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -556,6 +886,7 @@ async fn partial_operations_do_not_create_control_assertions() {
         quarantined: vec![iaam_app::ports::Quarantined {
             raw: serde_json::json!({"row": "bad"}),
             reason: "incomplete export".to_owned(),
+            dimensions: dimensions(&[Dimension::Cash]),
         }],
     });
 
@@ -570,8 +901,8 @@ async fn partial_operations_do_not_create_control_assertions() {
     .await
     .unwrap_or_else(|error| panic!("partial sync: {error}"));
 
-    assert_eq!(outcome.assertions, 0);
-    assert_eq!(load(&services, owner).await.len(), 1);
+    assert_eq!(outcome.assertions, 1);
+    assert_eq!(load(&services, owner).await.len(), 3);
 }
 
 #[tokio::test]
@@ -591,6 +922,7 @@ async fn a_transfer_refusal_becomes_a_quarantined_verdict_without_losing_other_r
         quarantined: vec![iaam_app::ports::Quarantined {
             raw: serde_json::Value::Null,
             reason: "transfer does not contain a recipient account".to_owned(),
+            dimensions: dimensions(&[Dimension::Cash]),
         }],
     });
 
@@ -605,7 +937,7 @@ async fn a_transfer_refusal_becomes_a_quarantined_verdict_without_losing_other_r
     .await
     .unwrap_or_else(|error| panic!("partial transfer sync: {error}"));
 
-    assert_eq!(outcome.recorded.len(), 3);
+    assert_eq!(outcome.recorded.len(), 5);
     assert!(outcome.recorded.iter().any(|verdict| {
         matches!(
             verdict,
@@ -613,7 +945,7 @@ async fn a_transfer_refusal_becomes_a_quarantined_verdict_without_losing_other_r
                 if reason == "transfer does not contain a recipient account"
         )
     }));
-    assert_eq!(load_all(&services, owner).await.len(), 2);
+    assert_eq!(load_all(&services, owner).await.len(), 4);
 }
 
 #[tokio::test]
@@ -637,6 +969,11 @@ async fn bond_amortisation_and_unknown_rows_become_quarantined_verdicts() {
             quarantined: vec![iaam_app::ports::Quarantined {
                 raw: serde_json::Value::Null,
                 reason: reason.to_owned(),
+                dimensions: if reason.starts_with("bond amortisation") {
+                    dimensions(&[Dimension::Cash])
+                } else {
+                    dimensions(&Dimension::all())
+                },
             }],
         });
 
@@ -654,7 +991,7 @@ async fn bond_amortisation_and_unknown_rows_become_quarantined_verdicts() {
         assert!(outcome.recorded.iter().any(|verdict| {
             matches!(verdict, Verdict::Quarantined { reason: actual } if actual == reason)
         }));
-        assert_eq!(load_all(&services, owner).await.len(), 1);
+        assert_eq!(load_all(&services, owner).await.len(), 3);
     }
 }
 
@@ -690,7 +1027,20 @@ async fn a_normalisation_rejection_stops_one_row_and_records_the_other_rows() {
             Verdict::Rejected { rejection } if rejection.field == "dates"
         )
     }));
-    assert_eq!(load_all(&services, owner).await.len(), 2);
+    assert_eq!(outcome.assertions, 1);
+    let gap_dimensions = load_all(&services, owner)
+        .await
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::ImportCoverageGap { dimensions, .. } => Some(dimensions),
+            _ => None,
+        })
+        .expect("normalisation rejection coverage gap");
+    assert_eq!(
+        gap_dimensions,
+        dimensions(&[Dimension::Cash, Dimension::Positions])
+    );
+    assert_eq!(load_all(&services, owner).await.len(), 3);
 }
 
 #[tokio::test]
@@ -719,6 +1069,13 @@ async fn existing_quarantine_reasons_reach_the_owner_as_row_verdicts() {
         .map(|reason| iaam_app::ports::Quarantined {
             raw: serde_json::Value::Null,
             reason: reason.to_owned(),
+            dimensions: if reason.starts_with("order state")
+                || reason.starts_with("trading operation")
+            {
+                dimensions(&[Dimension::Cash, Dimension::Positions])
+            } else {
+                dimensions(&[Dimension::Positions, Dimension::TaxBasis])
+            },
         })
         .collect(),
     });

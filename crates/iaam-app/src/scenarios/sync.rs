@@ -12,11 +12,10 @@ use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::InstrumentId;
 use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId};
-use iaam_core::reconciliation::claim::ControlClaim;
-use iaam_core::reconciliation::evidence::SourceChannel;
+use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::SourceChannel};
 use iaam_http::HttpRequest;
 use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, KnownRecord};
-use iaam_ingest::operation::NormalizationContext;
+use iaam_ingest::operation::{NormalizationContext, OperationKind};
 use iaam_ingest::{Verdict, normalize};
 use iaam_market::cbr::key_rate::key_rate_request;
 use iaam_market::cbr::{daily_request, dynamic_request};
@@ -28,6 +27,7 @@ use iaam_store::market::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use time::Date;
 use time::OffsetDateTime;
 
@@ -118,6 +118,11 @@ pub async fn sync_broker(
     let mut recorded = Vec::new();
     let mut duplicates = 0;
     let mut possible_duplicates = 0;
+    let mut refusal_dimensions: Vec<BTreeSet<Dimension>> = parsed
+        .quarantined
+        .iter()
+        .map(|row| row.dimensions.clone())
+        .collect();
 
     for operation in parsed.accepted {
         let context = DocumentContext {
@@ -137,6 +142,7 @@ pub async fn sync_broker(
         ) {
             Ok(normalized) => normalized,
             Err(rejection) => {
+                refusal_dimensions.push(operation_dimensions(&operation.kind));
                 recorded.push(Verdict::Rejected { rejection });
                 continue;
             }
@@ -176,10 +182,48 @@ pub async fn sync_broker(
     recorded.extend(parsed.quarantined.iter().map(|row| Verdict::Quarantined {
         reason: row.reason.clone(),
     }));
-    // A rejected row proves that the response is not a complete export.
-    // The operations above are still saved, but the control balance cannot be
-    // recorded alongside an incomplete interval.
-    if !parsed.quarantined.is_empty() || has_out_of_interval_trade {
+    let refused = u32::try_from(refusal_dimensions.len()).map_err(|_| AppError::Invalid {
+        field: "refused".to_owned(),
+        expected: "at most u32::MAX rows".to_owned(),
+        actual: refusal_dimensions.len().to_string(),
+    })?;
+    let gap_dimensions: BTreeSet<Dimension> = refusal_dimensions
+        .iter()
+        .flat_map(|dimensions| dimensions.iter().copied())
+        .collect();
+    if !gap_dimensions.is_empty() {
+        let gap = coverage_gap_event(
+            AssertionTarget {
+                owner: principal.owner,
+                account,
+                from,
+                to,
+            },
+            gap_dimensions,
+            refused,
+            &channel,
+        );
+        let key = gap.idempotency_key.clone();
+        if let Some(existing) = known.iter().find_map(|record| {
+            (record.idempotency_key.as_deref() == key.as_deref()).then_some(record.event)
+        }) {
+            duplicates += 1;
+            recorded.push(Verdict::Duplicate { existing });
+        } else {
+            let result = services
+                .store
+                .append_events(vec![gap.clone()], broker.identity_scope())
+                .await?;
+            let verdict = verdict_from_recorded(&result, &mut duplicates);
+            if let Some(event_id) = event_id_from_verdict(&verdict) {
+                known.push(known_record(&gap, event_id));
+            }
+            recorded.push(verdict);
+        }
+    }
+    // An out-of-interval trade remains its own early-return condition; refusals
+    // only add the coverage gap above and do not suppress the portfolio answer.
+    if has_out_of_interval_trade {
         return Ok(SyncOutcome {
             recorded,
             duplicates,
@@ -270,6 +314,71 @@ fn with_channel_provenance(mut event: Event, channel: &SourceChannel) -> Event {
     }
     event.provenance = provenance;
     event
+}
+fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> {
+    match kind {
+        OperationKind::Buy { .. } | OperationKind::Sell { .. } => {
+            [Dimension::Cash, Dimension::Positions]
+                .into_iter()
+                .collect()
+        }
+        OperationKind::Income { .. } => [Dimension::Cash, Dimension::Income].into_iter().collect(),
+        OperationKind::Deposit { .. }
+        | OperationKind::Withdrawal { .. }
+        | OperationKind::Transfer { .. }
+        | OperationKind::Fee { .. }
+        | OperationKind::OpeningCash { .. } => [Dimension::Cash].into_iter().collect(),
+        OperationKind::OpeningPosition { .. } => [Dimension::Positions].into_iter().collect(),
+        // Valuation changes no control dimension, so refusing it cannot taint
+        // cash, positions, income, or tax-basis assertions.
+        OperationKind::Valuation { .. } => BTreeSet::new(),
+    }
+}
+
+fn coverage_gap_event(
+    target: AssertionTarget,
+    dimensions: BTreeSet<Dimension>,
+    refused: u32,
+    channel: &SourceChannel,
+) -> Event {
+    let AssertionTarget {
+        owner,
+        account,
+        from,
+        to,
+    } = target;
+    // Correlation deliberately uses the channel's source and parser version
+    // in provenance, while omitting document because each assertion is a
+    // separate singleton document group.
+    let identity = format!(
+        "sync-coverage-gap/{account:?}/{from}/{to}/{:?}/{:?}/{dimensions:?}/{refused}",
+        channel.source, channel.parser_version
+    );
+    let digest = Sha256::digest(identity.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let raw_hash = RawHash::parse(&hex)
+        .unwrap_or_else(|| unreachable!("hexadecimal SHA-256 is always a valid RawHash"));
+    Event {
+        id: EventId::new_random(),
+        schema_version: SCHEMA_VERSION,
+        owner,
+        account,
+        kind: EventKind::ImportCoverageGap {
+            period: iaam_core::reconciliation::claim::AssertionPeriod { from, to },
+            dimensions,
+            refused,
+        },
+        dates: EventDates::for_cash(CashPostedDate(to)),
+        order: EffectiveOrder::new(to, 0),
+        legs: Vec::new(),
+        provenance: Provenance::new(channel.source, raw_hash, channel.parser_version.clone()),
+        relation: Relation::None,
+        confidence: Confidence::Known,
+        idempotency_key: Some(identity),
+    }
 }
 
 fn known_records(events: &[Event]) -> Vec<KnownRecord> {

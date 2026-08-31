@@ -4,7 +4,7 @@
 //! the body, quarantines rejected rows, and binds stable
 //! port types.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::reconciliation::evidence::SourceChannel;
+use iaam_core::reconciliation::{Dimension, evidence::SourceChannel};
 use iaam_core::rules::trade_allocation::{
     allocate_minor as core_allocate_minor, check_order_completeness,
 };
@@ -157,15 +157,25 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RowRefusal {
     /// A property of the row: it was read, and no fact can be built from it.
-    Row(String),
+    Row {
+        reason: String,
+        dimensions: BTreeSet<Dimension>,
+    },
     /// The adapter reached a state its own branching should have excluded.
     Adapter(String),
 }
 
 impl RowRefusal {
+    fn with_dimensions(self, dimensions: BTreeSet<Dimension>) -> Self {
+        match self {
+            Self::Row { reason, .. } => Self::Row { reason, dimensions },
+            Self::Adapter(detail) => Self::Adapter(detail),
+        }
+    }
+
     fn into_broker_error(self) -> BrokerError {
         match self {
-            Self::Row(detail) => unparsable(detail),
+            Self::Row { reason, .. } => unparsable(reason),
             Self::Adapter(detail) => BrokerError::Adapter {
                 broker: BROKER.to_owned(),
                 detail,
@@ -192,42 +202,71 @@ fn adapt_operations(
     for mut operation in operations {
         // Take the payload before moving the operation into conversion; no later stage reads it.
         let raw = std::mem::take(&mut operation.raw);
+        let kind = dictionary.kind_of(&operation.source_kind);
         if let Some(rejection) = operation.rejection.as_ref() {
+            let dimensions = if operation.source_kind.is_empty() {
+                all_dimensions()
+            } else {
+                dimensions_for_kind(&kind)
+            };
             quarantined.push(Quarantined {
                 raw,
                 reason: format!("{rejection:?}: {rejection}"),
+                dimensions,
             });
             continue;
         }
 
-        let kind = dictionary.kind_of(&operation.source_kind);
         if let Some(reason) = securities_transfer_reason(&kind) {
             quarantined.push(Quarantined {
                 raw,
                 reason: reason.to_owned(),
+                dimensions: dimensions_for_kind(&kind),
             });
             continue;
         }
         if let Some(reason) = order_state_reason(&kind, &operation.state) {
-            quarantined.push(Quarantined { raw, reason });
+            quarantined.push(Quarantined {
+                raw,
+                reason,
+                dimensions: cash_positions(),
+            });
             continue;
         }
         if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
             if let Some(reason) = trade_row_reason(&operation, &kind) {
-                quarantined.push(Quarantined { raw, reason });
+                quarantined.push(Quarantined {
+                    raw,
+                    reason,
+                    dimensions: cash_positions(),
+                });
                 continue;
             }
-            match trade_operations(account, operation, kind) {
+            let dimensions = dimensions_for_kind(&kind);
+            match trade_operations(account, operation, kind)
+                .map_err(|error| error.with_dimensions(dimensions))
+            {
                 Ok(operations) => accepted.extend(operations),
-                Err(RowRefusal::Row(reason)) => quarantined.push(Quarantined { raw, reason }),
+                Err(RowRefusal::Row { reason, dimensions }) => quarantined.push(Quarantined {
+                    raw,
+                    reason,
+                    dimensions,
+                }),
                 Err(error @ RowRefusal::Adapter(_)) => {
                     return Err(error.into_broker_error());
                 }
             }
         } else {
-            match operation_to_submitted(account, operation, kind) {
+            let dimensions = dimensions_for_kind(&kind);
+            match operation_to_submitted(account, operation, kind)
+                .map_err(|error| error.with_dimensions(dimensions))
+            {
                 Ok(operation) => accepted.push(operation),
-                Err(RowRefusal::Row(reason)) => quarantined.push(Quarantined { raw, reason }),
+                Err(RowRefusal::Row { reason, dimensions }) => quarantined.push(Quarantined {
+                    raw,
+                    reason,
+                    dimensions,
+                }),
                 Err(error @ RowRefusal::Adapter(_)) => {
                     return Err(error.into_broker_error());
                 }
@@ -238,6 +277,38 @@ fn adapt_operations(
         accepted,
         quarantined,
     })
+}
+
+fn all_dimensions() -> BTreeSet<Dimension> {
+    Dimension::all().into_iter().collect()
+}
+
+fn cash_positions() -> BTreeSet<Dimension> {
+    [Dimension::Cash, Dimension::Positions]
+        .into_iter()
+        .collect()
+}
+
+fn dimensions_for_kind(kind: &ChannelOperationKind) -> BTreeSet<Dimension> {
+    match kind {
+        ChannelOperationKind::Buy | ChannelOperationKind::Sell => cash_positions(),
+        ChannelOperationKind::Dividend | ChannelOperationKind::Coupon => {
+            [Dimension::Cash, Dimension::Income].into_iter().collect()
+        }
+        ChannelOperationKind::Commission
+        | ChannelOperationKind::Deposit
+        | ChannelOperationKind::Withdrawal
+        | ChannelOperationKind::Transfer
+        | ChannelOperationKind::BondAmortisation => [Dimension::Cash].into_iter().collect(),
+        ChannelOperationKind::BondRedemption => cash_positions(),
+        ChannelOperationKind::SecuritiesTransferIn
+        | ChannelOperationKind::SecuritiesTransferOut => {
+            [Dimension::Positions, Dimension::TaxBasis]
+                .into_iter()
+                .collect()
+        }
+        ChannelOperationKind::Other(_) => all_dimensions(),
+    }
 }
 
 fn securities_transfer_reason(kind: &ChannelOperationKind) -> Option<&'static str> {
@@ -346,9 +417,10 @@ fn operation_to_submitted(
             ));
         }
         ChannelOperationKind::Transfer => {
-            return Err(RowRefusal::Row(
-                "transfer does not contain a recipient account".to_owned(),
-            ));
+            return Err(RowRefusal::Row {
+                reason: "transfer does not contain a recipient account".to_owned(),
+                dimensions: BTreeSet::new(),
+            });
         }
         // Amortisation and redemption are corporate actions, not
         // owner operations: they have their own representation and endpoint
@@ -785,7 +857,10 @@ fn unparsable(detail: impl Into<String>) -> BrokerError {
 }
 
 fn row_unparsable(detail: impl Into<String>) -> RowRefusal {
-    RowRefusal::Row(detail.into())
+    RowRefusal::Row {
+        reason: detail.into(),
+        dimensions: BTreeSet::new(),
+    }
 }
 
 #[cfg(test)]
@@ -797,7 +872,7 @@ mod tests {
     use iaam_core::event::kind::{EventKind, IncomeKind};
     use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
     use iaam_core::projection::{ProjectionContext, project};
-    use iaam_core::reconciliation::claim::ControlClaim;
+    use iaam_core::reconciliation::{Dimension, claim::ControlClaim};
     use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 
     fn parse_operations(
@@ -890,7 +965,7 @@ mod tests {
             let account = AccountId(Uuid::from_u128(1));
             let error = operation_to_submitted(account, operation, kind.clone())
                 .expect_err("a corporate action cannot be constructed through the channel");
-            let RowRefusal::Row(reason) = error else {
+            let RowRefusal::Row { reason, .. } = error else {
                 panic!("corporate action should be a row refusal");
             };
             assert!(
@@ -953,6 +1028,13 @@ mod tests {
                 "row refusal reason: {}",
                 parsed.quarantined[0].reason
             );
+            let expected = match source_kind {
+                "OPERATION_TYPE_TRANSFER" | "OPERATION_TYPE_BOND_AMORTISATION" => {
+                    [Dimension::Cash].into_iter().collect()
+                }
+                _ => Dimension::all().into_iter().collect(),
+            };
+            assert_eq!(parsed.quarantined[0].dimensions, expected);
         }
     }
 
@@ -1056,7 +1138,23 @@ mod tests {
             .ok_or("rejected commission disappeared from quarantine")?;
         assert!(rejected.reason.contains("NonRepresentableFraction"));
         assert_eq!(rejected.raw["payment"]["nano"], -135065000);
+        assert_eq!(rejected.dimensions, [Dimension::Cash].into_iter().collect());
         Ok(())
+    }
+
+    #[test]
+    fn a_whole_row_parse_refusal_taints_every_dimension() {
+        let operations = parse_operations(r#"{"hasNext":false,"items":[null]}"#)
+            .expect("whole-row parse refusal");
+        assert!(operations[0].source_kind.is_empty());
+        let parsed = adapt_operations(AccountId(Uuid::from_u128(1)), operations, &dictionary())
+            .expect("whole-row refusal is quarantined");
+
+        assert_eq!(parsed.quarantined.len(), 1);
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            Dimension::all().into_iter().collect()
+        );
     }
     #[test]
     fn a_trade_uses_the_recorded_position_uid_as_custody() {
@@ -1111,6 +1209,12 @@ mod tests {
             assert_eq!(parsed.quarantined.len(), 1);
             assert!(parsed.quarantined[0].reason.contains("positionUid"));
             assert!(!parsed.quarantined[0].reason.contains("account"));
+            assert_eq!(
+                parsed.quarantined[0].dimensions,
+                [Dimension::Cash, Dimension::Positions]
+                    .into_iter()
+                    .collect()
+            );
         }
     }
 
@@ -1132,6 +1236,10 @@ mod tests {
                 .reason
                 .contains("transfer does not contain a recipient account")
         );
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Cash].into_iter().collect()
+        );
     }
 
     #[test]
@@ -1145,6 +1253,12 @@ mod tests {
         assert_eq!(parsed.quarantined.len(), 1);
         assert!(parsed.quarantined[0].reason.contains("securities"));
         assert!(parsed.quarantined[0].reason.contains("inbound"));
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Positions, Dimension::TaxBasis]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
@@ -1158,6 +1272,12 @@ mod tests {
         assert_eq!(parsed.quarantined.len(), 1);
         assert!(parsed.quarantined[0].reason.contains("securities"));
         assert!(parsed.quarantined[0].reason.contains("outbound"));
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Positions, Dimension::TaxBasis]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
@@ -1180,6 +1300,12 @@ mod tests {
         ));
         assert_eq!(parsed.quarantined.len(), 1);
         assert!(parsed.quarantined[0].reason.contains("securities"));
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Positions, Dimension::TaxBasis]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
@@ -1212,6 +1338,12 @@ mod tests {
             parsed.quarantined[0]
                 .reason
                 .contains("OPERATION_STATE_CANCELED")
+        );
+        assert_eq!(
+            parsed.quarantined[0].dimensions,
+            [Dimension::Cash, Dimension::Positions]
+                .into_iter()
+                .collect()
         );
     }
     #[test]

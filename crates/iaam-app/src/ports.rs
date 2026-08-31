@@ -5,6 +5,7 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
 use iaam_core::projection::Snapshot;
+use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
@@ -543,6 +544,7 @@ pub enum BrokerError {
 pub struct Quarantined {
     pub raw: Value,
     pub reason: String,
+    pub dimensions: std::collections::BTreeSet<Dimension>,
 }
 
 /// Result of retrieving a page of broker-channel operations.

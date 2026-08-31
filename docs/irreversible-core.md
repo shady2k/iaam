@@ -183,12 +183,22 @@ another channel or another interval raises confidence with no special case.
 
 Recovery is narrower than it first appears, and the limit is worth stating.
 The correlation is by channel, not by attempt, so a gap withholds that
-channel's evidence for that interval permanently. Re-running the same import
-cleanly does not lift it — and cannot, because the assertion idempotency key
-is fixed by account, interval, source and claim, so a repeat records no new
-group to recover into. Confirmation for such an interval comes from a
-different channel or a different interval. Making recovery by the same
+channel's evidence for that interval until the channel itself changes.
+A corrected parser does recover: the assertion idempotency key carries the
+parser version, so a new parser version records a fresh assertion group that
+the old version's gap does not taint. Re-running the same import cleanly with
+the *same* parser version does not lift the gap and cannot, because that repeat
+records no new group to recover into. Confirmation in that case comes from a
+different channel or a different interval. Making recovery by an unchanged
 channel possible needs an attempt identity the journal does not yet carry.
+
+The assertion's idempotency key and its document are deliberately two different
+strings, and collapsing them back into one would be a silent regression. The
+document is the synthetic hash `collect_groups` reads as `SourceChannel.document`,
+and independence is a conjunction: both the parser version and the document must
+differ. A key that carried the parser version into the document would make a mere
+reparse independent of the parse it corrects, and confirm a dimension on evidence
+that does not exist.
 
 Cannot change without a migration:
 

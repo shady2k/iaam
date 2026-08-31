@@ -838,6 +838,58 @@ async fn mixed_sync_counts_possible_duplicates_separately_from_duplicates() {
 }
 
 #[tokio::test]
+async fn corrected_parser_records_new_assertion_while_document_hash_stays_parser_independent() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let operation = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    let mut broker = api(account, SourceId::new_random(), operation);
+
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+
+    broker.source.parser_version = ParserVersion("finam-api/2".to_owned());
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("corrected parser sync: {error}"));
+
+    assert_eq!(first.assertions, 1);
+    assert_eq!(second.assertions, 1);
+    assert_eq!(second.duplicates, 1);
+    assert!(matches!(
+        second.recorded.last(),
+        Some(Verdict::Provisional { .. })
+    ));
+
+    let events = load_all(&services, owner).await;
+    let assertions: Vec<&Event> = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
+        .collect();
+    assert_eq!(assertions.len(), 2);
+    assert_eq!(
+        assertions[0].provenance.raw_hash(),
+        assertions[1].provenance.raw_hash(),
+        "reparsing changes the parser version, not the source document"
+    );
+}
+
+#[tokio::test]
 async fn repeating_sync_is_idempotent_for_operations_and_assertions() {
     let services = services();
     let owner = OwnerId::new_random();

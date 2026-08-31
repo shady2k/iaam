@@ -486,10 +486,16 @@ fn assertion_event(
         from,
         to,
     } = target;
+    // Keep this identity parser-independent for the document hash. A channel
+    // is independent only when both its parser version and document differ;
+    // including the parser version here would falsely make a reparse independent.
     let identity = format!(
         "sync-assertion/{account:?}/{from}/{to}/{:?}/{:?}",
         channel.source, claim
     );
+    // The idempotency key adds the parser version to distinguish corrected
+    // parses, while the document hash above stays unchanged for that reparse.
+    let idempotency_key = format!("{identity}/{:?}", channel.parser_version);
     let digest = Sha256::digest(identity.as_bytes());
     let hex = digest
         .iter()
@@ -516,7 +522,7 @@ fn assertion_event(
         ),
         relation: Relation::None,
         confidence: Confidence::Known,
-        idempotency_key: Some(identity),
+        idempotency_key: Some(idempotency_key),
     }
 }
 /// A specific source and manual run series.

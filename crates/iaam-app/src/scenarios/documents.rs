@@ -291,9 +291,7 @@ async fn append_control_assertions(
         })
         .collect();
     if !events.is_empty() {
-        let _ = services
-            .store
-            .append_events(events, IdentityScope::Source)
+        let _ = crate::scenarios::ingest::append_checked(services, events, IdentityScope::Source)
             .await?;
     }
     Ok(())

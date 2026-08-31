@@ -161,6 +161,33 @@ pub async fn submit_candidates(
     Ok(verdicts)
 }
 
+/// Convert a structural validation failure into the row rejection shared by all inputs.
+pub fn structural_rejection(event: &Event, field: &'static str) -> Option<Rejection> {
+    event.validate_structure().err().map(|error| Rejection {
+        field: field.to_owned(),
+        expected: "event shape matching its type".into(),
+        actual: error.to_string(),
+    })
+}
+
+/// Validate every event before making one append-only journal write.
+pub async fn append_checked(
+    services: &AppServices,
+    events: Vec<Event>,
+    scope: IdentityScope,
+) -> Result<Vec<Recorded>, AppError> {
+    for (index, event) in events.iter().enumerate() {
+        if let Some(rejection) = structural_rejection(event, "event") {
+            return Err(AppError::Invalid {
+                field: format!("event[{index}]"),
+                expected: rejection.expected,
+                actual: rejection.actual,
+            });
+        }
+    }
+    services.store.append_events(events, scope).await
+}
+
 /// Write one candidate and report the outcome.
 ///
 /// Structural core validation happens before writing: the journal is append-only,
@@ -170,20 +197,11 @@ pub async fn record_candidate(
     event: Event,
     field: &'static str,
 ) -> Result<Verdict, AppError> {
-    if let Err(error) = event.validate_structure() {
-        return Ok(Verdict::Rejected {
-            rejection: Rejection {
-                field: field.to_owned(),
-                expected: "event shape matching its type".into(),
-                actual: error.to_string(),
-            },
-        });
+    if let Some(rejection) = structural_rejection(&event, field) {
+        return Ok(Verdict::Rejected { rejection });
     }
 
-    let recorded = services
-        .store
-        .append_events(vec![event], IdentityScope::Source)
-        .await?;
+    let recorded = append_checked(services, vec![event], IdentityScope::Source).await?;
     Ok(match recorded.first() {
         Some(Recorded::Inserted { id }) => Verdict::Provisional { event: *id },
         Some(Recorded::Duplicate { existing }) => Verdict::Duplicate {

@@ -4,10 +4,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
+use iaam_app::error::AppError;
 use iaam_app::ports::{
     BrokerChannel, BrokerError, Clock, ParsedOperations, PortfolioAsOf, PortfolioSnapshot,
     Principal, Scope,
 };
+use iaam_app::scenarios::ingest::append_checked;
 use iaam_app::sync::{AssertionsWithheld, sync_broker};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
@@ -1041,6 +1043,113 @@ async fn a_normalisation_rejection_stops_one_row_and_records_the_other_rows() {
         dimensions(&[Dimension::Cash, Dimension::Positions])
     );
     assert_eq!(load_all(&services, owner).await.len(), 3);
+}
+
+#[tokio::test]
+async fn a_structural_rejection_stops_one_operation_and_records_its_dimensions() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let mut invalid = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    let OperationKind::Buy { quantity, .. } = &mut invalid.kind else {
+        panic!("trade fixture must be a buy");
+    };
+    *quantity = Dec::zero();
+    let mut broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+    broker.operations = Ok(ParsedOperations {
+        accepted: vec![invalid],
+        quarantined: Vec::new(),
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("structural rejection sync: {error}"));
+
+    assert!(outcome.recorded.iter().any(|verdict| {
+        matches!(
+            verdict,
+            Verdict::Rejected { rejection }
+                if rejection.field == "operation"
+                    && rejection.expected == "event shape matching its type"
+        )
+    }));
+    let events = load_all(&services, owner).await;
+    let gap_dimensions = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ImportCoverageGap { dimensions, .. } => Some(dimensions),
+            _ => None,
+        })
+        .expect("structural rejection coverage gap");
+    assert_eq!(
+        gap_dimensions,
+        &dimensions(&[Dimension::Cash, Dimension::Positions])
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Trade { .. }))
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn append_checked_rejects_a_batch_before_any_event_is_written() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let mut invalid_operation = trade(account, instrument, custody);
+    let OperationKind::Buy { quantity, .. } = &mut invalid_operation.kind else {
+        panic!("trade fixture must be a buy");
+    };
+    *quantity = Dec::zero();
+    let invalid = iaam_ingest::normalize(
+        &invalid_operation,
+        iaam_ingest::operation::NormalizationContext {
+            owner,
+            source: SourceId::new_random(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("invalid fixture normalisation: {error:?}"))
+    .event;
+    let valid = iaam_ingest::normalize(
+        &trade(account, instrument, custody),
+        iaam_ingest::operation::NormalizationContext {
+            owner,
+            source: SourceId::new_random(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("valid fixture normalisation: {error:?}"))
+    .event;
+
+    let error = append_checked(&services, vec![invalid, valid], IdentityScope::Source)
+        .await
+        .expect_err("invalid batch must be refused");
+    assert!(matches!(
+        error,
+        AppError::Invalid {
+            field,
+            expected,
+            actual,
+        } if field == "event[0]"
+            && expected == "event shape matching its type"
+            && actual.contains("quantity")
+    ));
+    assert!(load_all(&services, owner).await.is_empty());
 }
 
 #[tokio::test]

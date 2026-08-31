@@ -130,10 +130,7 @@ pub async fn record_owner_balance(
             )),
         })
         .collect();
-    services
-        .store
-        .append_events(events, IdentityScope::Source)
-        .await
+    crate::scenarios::ingest::append_checked(services, events, IdentityScope::Source).await
 }
 
 #[cfg(test)]

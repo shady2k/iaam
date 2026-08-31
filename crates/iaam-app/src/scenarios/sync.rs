@@ -148,6 +148,12 @@ pub async fn sync_broker(
             }
         };
         let event = with_channel_provenance(normalized.event, &channel);
+        if let Some(rejection) = crate::scenarios::ingest::structural_rejection(&event, "operation")
+        {
+            refusal_dimensions.push(operation_dimensions(&operation.kind));
+            recorded.push(Verdict::Rejected { rejection });
+            continue;
+        }
         let decision = dedup::assess(key.as_ref(), event.provenance.raw_hash(), &context, &known);
         let possible_duplicate = match &decision {
             DedupDecision::PossibleDuplicate { of, level } => Some((*of, *level)),
@@ -159,10 +165,12 @@ pub async fn sync_broker(
             continue;
         }
 
-        let result = services
-            .store
-            .append_events(vec![event.clone()], broker.identity_scope())
-            .await?;
+        let result = crate::scenarios::ingest::append_checked(
+            services,
+            vec![event.clone()],
+            broker.identity_scope(),
+        )
+        .await?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         let verdict = match (possible_duplicate, event_id_from_verdict(&verdict)) {
             (Some((of, level)), Some(event)) => {
@@ -210,10 +218,12 @@ pub async fn sync_broker(
             duplicates += 1;
             recorded.push(Verdict::Duplicate { existing });
         } else {
-            let result = services
-                .store
-                .append_events(vec![gap.clone()], broker.identity_scope())
-                .await?;
+            let result = crate::scenarios::ingest::append_checked(
+                services,
+                vec![gap.clone()],
+                broker.identity_scope(),
+            )
+            .await?;
             let verdict = verdict_from_recorded(&result, &mut duplicates);
             if let Some(event_id) = event_id_from_verdict(&verdict) {
                 known.push(known_record(&gap, event_id));
@@ -275,10 +285,12 @@ pub async fn sync_broker(
             recorded.push(Verdict::Duplicate { existing });
             continue;
         }
-        let result = services
-            .store
-            .append_events(vec![event.clone()], broker.identity_scope())
-            .await?;
+        let result = crate::scenarios::ingest::append_checked(
+            services,
+            vec![event.clone()],
+            broker.identity_scope(),
+        )
+        .await?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         if matches!(verdict, Verdict::Provisional { .. }) {
             assertions += 1;

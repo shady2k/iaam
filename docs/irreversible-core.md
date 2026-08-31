@@ -153,6 +153,7 @@ reinterpreting the journal.
 | A channel says what its portfolio answer describes rather than accepting a date it will ignore | `ports::PortfolioAsOf::{Requested, Current}` in `PortfolioSnapshot` |
 | A portfolio dated outside the requested interval becomes no assertion, and the refusal is named rather than reported as a zero | `sync::AssertionsWithheld::PortfolioDescribesAnotherDay` |
 | A row that cannot become a fact is quarantined and named, and the batch continues | `Verdict::Quarantined { reason }`, code `quarantined` |
+| A row whose event fails structural validation is refused and counted into the coverage gap | `scenarios::ingest::structural_rejection` in `sync::sync_broker` |
 | A refusal of the row is a different thing from a defect of the adapter, and the difference is observable | `RowRefusal::{Row, Adapter}` against `BrokerError::Adapter` |
 | An import attempt that refused rows cannot itself confirm the dimensions those rows would have moved | `EventKind::ImportCoverageGap { period, dimensions, refused }` |
 | The gap disqualifies the attempt, not the interval | the subtraction in `reconciliation::confirmed_dimensions` and in each ground, with no change to `raise`, `merge_status` or `with_external_evidence` |

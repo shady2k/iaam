@@ -11,6 +11,7 @@ use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
 use iaam_store::bundle::ImportOutcome;
 use iaam_store::reference::AccountRecord;
@@ -61,10 +62,10 @@ fn populated() -> (SqliteStore, OwnerId, AccountId, ContourId) {
         )
         .unwrap();
     store
-        .append_event(&deposit(owner, account, 1, 100_000))
+        .append_event(&deposit(owner, account, 1, 100_000), IdentityScope::Source)
         .unwrap();
     store
-        .append_event(&deposit(owner, account, 2, 250_000))
+        .append_event(&deposit(owner, account, 2, 250_000), IdentityScope::Source)
         .unwrap();
     (store, owner, account, contour)
 }
@@ -463,7 +464,7 @@ fn a_bundle_round_trip_keeps_the_new_facts() {
     let (source, owner, account, _) = populated();
     let facts = every_new_fact(owner, account);
     for event in &facts {
-        source.append_event(event).unwrap();
+        source.append_event(event, IdentityScope::Source).unwrap();
     }
 
     let bundle = source.export_bundle(owner).unwrap();

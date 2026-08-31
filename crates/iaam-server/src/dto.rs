@@ -472,6 +472,7 @@ impl OperationDto {
                 cash_posted: self.dates.cash_posted,
                 paid: self.dates.paid,
             },
+            source_time: None,
             idempotency_key: self.idempotency_key.clone(),
             source_operation_id: self.source_operation_id.clone(),
         })
@@ -510,6 +511,7 @@ impl OperationDto {
                 quantity: Dec::new(decimal(quantity, "quantity")?),
                 gross_minor: minor(amount, *currency, "amount")?,
                 fee_minor: optional_minor(fee.as_ref(), *currency, "fee")?,
+                basis_fee: None,
                 accrued_interest_minor: optional_minor(
                     accrued_interest.as_ref(),
                     *currency,
@@ -531,6 +533,7 @@ impl OperationDto {
                 quantity: Dec::new(decimal(quantity, "quantity")?),
                 gross_minor: minor(amount, *currency, "amount")?,
                 fee_minor: optional_minor(fee.as_ref(), *currency, "fee")?,
+                basis_fee: None,
                 accrued_interest_minor: optional_minor(
                     accrued_interest.as_ref(),
                     *currency,
@@ -611,6 +614,12 @@ pub struct VerdictDto {
     pub verdict: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<Uuid>,
+    /// Existing event resembling a newly recorded possible duplicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub of_event_id: Option<Uuid>,
+    /// Deduplication hierarchy level that produced the possible-duplicate hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -635,6 +644,8 @@ impl VerdictDto {
             row,
             verdict: verdict.code().to_owned(),
             event_id: None,
+            of_event_id: None,
+            level: None,
             field: None,
             expected: None,
             actual: None,
@@ -649,6 +660,12 @@ impl VerdictDto {
             },
             Verdict::Provisional { event } => Self {
                 event_id: Some(event.inner()),
+                ..base
+            },
+            Verdict::PossibleDuplicate { event, of, level } => Self {
+                event_id: Some(event.inner()),
+                of_event_id: Some(of.inner()),
+                level: Some(level.number()),
                 ..base
             },
             Verdict::Discrepancy {
@@ -2617,6 +2634,20 @@ mod tests {
         let duplicate = VerdictDto::from_domain(2, &Verdict::Duplicate { existing: event });
         assert_eq!(duplicate.event_id, Some(event.inner()));
 
+        let possible_event = EventId::new_random();
+        let possible = VerdictDto::from_domain(
+            3,
+            &Verdict::PossibleDuplicate {
+                event: possible_event,
+                of: event,
+                level: iaam_app::ingest::dedup::DedupLevel::Probabilistic,
+            },
+        );
+        assert_eq!(possible.verdict, "possible_duplicate");
+        assert_eq!(possible.event_id, Some(possible_event.inner()));
+        assert_eq!(possible.of_event_id, Some(event.inner()));
+        assert_eq!(possible.level, Some(5));
+
         let needs = VerdictDto::from_domain(
             3,
             &Verdict::NeedsClassification {
@@ -3139,6 +3170,7 @@ pub struct BrokerSyncRequest {
 pub struct SyncOutcomeDto {
     pub recorded: Vec<VerdictDto>,
     pub duplicates: usize,
+    pub possible_duplicates: usize,
     pub assertions: usize,
 }
 
@@ -3153,6 +3185,7 @@ impl SyncOutcomeDto {
                 .map(|(row, verdict)| VerdictDto::from_domain(row + 1, verdict))
                 .collect(),
             duplicates: outcome.duplicates,
+            possible_duplicates: outcome.possible_duplicates,
             assertions: outcome.assertions,
         }
     }

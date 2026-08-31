@@ -16,6 +16,7 @@ use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::FxSource;
 use iaam_http::HttpRequest;
+use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
@@ -172,6 +173,7 @@ async fn seed_report_position(
             cash_posted: Some(date!(2026 - 08 - 01)),
             paid: None,
         },
+        source_time: None,
         idempotency_key: None,
         source_operation_id: None,
     };
@@ -186,7 +188,7 @@ async fn seed_report_position(
     .event;
     services
         .store
-        .append_events(vec![event])
+        .append_events(vec![event], IdentityScope::Source)
         .await
         .expect("event");
 }

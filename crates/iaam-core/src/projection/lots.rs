@@ -512,6 +512,7 @@ struct TradeFacts {
     quantity: Quantity,
     gross: Money,
     fee: Option<Money>,
+    basis_fee: Option<Money>,
     accrued_interest: Option<Money>,
 }
 
@@ -647,7 +648,9 @@ impl LotBook {
                 quantity,
                 gross,
                 fee,
+                basis_fee,
                 accrued_interest,
+                ..
             } => self.apply_trade(
                 event,
                 TradeFacts {
@@ -656,6 +659,7 @@ impl LotBook {
                     quantity: *quantity,
                     gross: *gross,
                     fee: *fee,
+                    basis_fee: *basis_fee,
                     accrued_interest: *accrued_interest,
                 },
                 settlement,
@@ -745,8 +749,8 @@ impl LotBook {
         }
     }
 
-    /// Acquisition cost includes commission and **excludes accrued coupon interest**:
-    /// accrued coupon interest is returned through the coupon, not through the sale,
+    /// Acquisition cost includes commission and any basis-only fee, and **excludes accrued coupon
+    /// interest**: accrued coupon interest is returned through the coupon, not through the sale,
     /// so it is not part of the security's cost (§7.2). The tax
     /// basis under Art. 214.1 is calculated differently and will appear in E5 —
     /// which is why it is versioned by the rule.
@@ -763,6 +767,7 @@ impl LotBook {
             quantity,
             gross,
             fee,
+            basis_fee,
             accrued_interest,
         } = trade;
         let key = LotKey {
@@ -774,6 +779,10 @@ impl LotBook {
                 let basis = match fee {
                     Some(f) => gross.try_add(f)?,
                     None => gross,
+                };
+                let basis = match basis_fee {
+                    Some(f) => basis.try_add(f)?,
+                    None => basis,
                 };
                 let entry = self.entries.entry(key).or_default();
                 entry.acquired_basis = Some(match entry.acquired_basis {
@@ -804,6 +813,10 @@ impl LotBook {
                 let proceeds = match fee {
                     Some(f) => gross.try_sub(f)?,
                     None => gross,
+                };
+                let proceeds = match basis_fee {
+                    Some(f) => proceeds.try_sub(f)?,
+                    None => proceeds,
                 };
                 self.dispose(
                     event,
@@ -1250,7 +1263,7 @@ mod tests {
     use crate::event::test_support::event_with;
     use crate::ids::CustodyId;
     use crate::money::PerUnitAmount;
-    use crate::money::{CurrencyCode, PostedMinor};
+    use crate::money::{CalcMoney, CurrencyCode, PostedMinor};
     use crate::numeric::decimal::Dec;
     use crate::rules::RuleRegistry;
     use rust_decimal::Decimal;
@@ -1766,6 +1779,8 @@ mod tests {
                 gross: rub(trade.gross),
                 fee: Some(fee),
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(trade.account, settlement),
@@ -1799,6 +1814,8 @@ mod tests {
                 gross: rub(trade.gross),
                 fee: Some(fee),
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(trade.account, settlement),
@@ -1841,6 +1858,34 @@ mod tests {
         assert_eq!(entry.lots()[0].cost_basis, rub(1_010_000));
         assert_eq!(entry.lots()[0].acquisition_basis, Some(rub(1_010_000)));
         assert_eq!(entry.quantity().unwrap(), qty(100));
+    }
+
+    #[test]
+    fn a_basis_only_fee_increases_acquisition_basis_without_changing_cash() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut event = buy(&trade, 1);
+        match &mut event.kind {
+            EventKind::Trade {
+                basis_fee,
+                basis_fee_exact,
+                ..
+            } => {
+                *basis_fee = Some(rub(14));
+                *basis_fee_exact = Some(CalcMoney::new(dec("-0.135065"), CurrencyCode::Rub));
+            }
+            other => panic!("expected a trade, got {other:?}"),
+        }
+
+        assert_eq!(
+            event.cash_effect(CurrencyCode::Rub).unwrap(),
+            rub(-(trade.gross + 10_000))
+        );
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&event, &rules).unwrap();
+        let entry = book.entry(&key(&trade)).unwrap();
+        assert_eq!(entry.acquired_basis(), Some(rub(1_010_014)));
+        assert_eq!(entry.lots()[0].cost_basis, rub(1_010_014));
     }
 
     #[test]

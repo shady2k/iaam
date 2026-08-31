@@ -250,6 +250,7 @@ fn finam_report_preserves_rows_operations_period_controls_and_repo_quarantine() 
                 fee_minor,
                 accrued_interest_minor,
                 currency,
+                ..
             } => {
                 assert_eq!((*actual_instrument, *actual_custody), (instrument, custody));
                 assert_eq!(
@@ -278,6 +279,7 @@ fn finam_report_preserves_rows_operations_period_controls_and_repo_quarantine() 
                 fee_minor,
                 accrued_interest_minor,
                 currency,
+                ..
             } => {
                 assert_eq!((*actual_instrument, *actual_custody), (instrument, custody));
                 assert_eq!(

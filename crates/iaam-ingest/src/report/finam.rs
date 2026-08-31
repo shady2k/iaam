@@ -172,6 +172,7 @@ fn parse_trades(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
                     quantity,
                     gross_minor,
                     fee_minor,
+                    basis_fee: None,
                     accrued_interest_minor,
                     currency,
                 }
@@ -182,6 +183,7 @@ fn parse_trades(sheet: &Sheet, directory: &Directory, rows: &mut Vec<LocatedRow>
                     quantity,
                     gross_minor,
                     fee_minor,
+                    basis_fee: None,
                     accrued_interest_minor,
                     currency,
                 }
@@ -662,6 +664,7 @@ fn operation(
             cash_posted: cash_date,
             ..OperationDates::default()
         },
+        source_time: None,
         idempotency_key: None,
         source_operation_id: source_id.map(str::to_owned),
     }

@@ -7,8 +7,8 @@ use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, EventId, InstrumentId};
 use iaam_core::money::CurrencyCode;
 use iaam_ingest::dedup::{
-    DedupDecision, DedupKey, DedupLevel, DocumentContext, KnownRecord, assess, canonical_form,
-    choose_key, fingerprint,
+    DedupDecision, DedupKey, DedupLevel, DocumentContext, IdentityScope, KnownRecord, assess,
+    canonical_form, choose_key, fingerprint,
 };
 use iaam_ingest::{OperationDates, OperationKind, SubmittedOperation};
 use time::macros::date;
@@ -29,32 +29,38 @@ fn deposit(account: AccountId, minor: i64) -> SubmittedOperation {
             cash_posted: Some(date!(2026 - 04 - 01)),
             ..OperationDates::default()
         },
+        source_time: None,
         idempotency_key: None,
         source_operation_id: None,
     }
 }
 
 /// Document row: both the document and locator are known.
-fn from_row(document: &RawHash, row: u64) -> DocumentContext {
+fn from_row(account: AccountId, document: &RawHash, row: u64) -> DocumentContext {
     DocumentContext {
+        account,
         document: Some(document.clone()),
         sheet: Some("Сделки".to_owned()),
         row: Some(row),
+        identity_scope: IdentityScope::Source,
     }
 }
 
 /// Channel without a file: broker API.
-fn from_stream() -> DocumentContext {
+fn from_stream(account: AccountId) -> DocumentContext {
     DocumentContext {
+        account,
         document: None,
         sheet: None,
         row: None,
+        identity_scope: IdentityScope::Source,
     }
 }
 
 fn recorded(operation: &SubmittedOperation, context: &DocumentContext) -> KnownRecord {
     KnownRecord {
         event: EventId::new_random(),
+        account: operation.account,
         source_operation_id: operation.source_operation_id.clone(),
         idempotency_key: operation.idempotency_key.clone(),
         fingerprint: fingerprint(operation),
@@ -76,7 +82,7 @@ fn the_strongest_available_key_wins() {
     let document = hash("a");
 
     assert_eq!(
-        choose_key(&operation, &from_row(&document, 7)),
+        choose_key(&operation, &from_row(operation.account, &document, 7)),
         Some(DedupKey::SourceOperationId("OP-4417".to_owned()))
     );
 }
@@ -87,7 +93,7 @@ fn the_client_key_is_taken_when_the_source_names_nothing() {
     operation.idempotency_key = Some("client-1".to_owned());
 
     assert_eq!(
-        choose_key(&operation, &from_stream()),
+        choose_key(&operation, &from_stream(operation.account)),
         Some(DedupKey::IdempotencyKey("client-1".to_owned()))
     );
 }
@@ -100,7 +106,7 @@ fn the_row_locator_outranks_a_bare_fingerprint() {
     let document = hash("b");
 
     assert_eq!(
-        choose_key(&operation, &from_row(&document, 7)),
+        choose_key(&operation, &from_row(operation.account, &document, 7)),
         Some(DedupKey::DocumentRow {
             document,
             sheet: Some("Сделки".to_owned()),
@@ -116,9 +122,11 @@ fn a_channel_without_a_row_number_falls_back_to_the_fingerprint() {
     let operation = deposit(AccountId::new_random(), 100_000);
     let document = hash("c");
     let context = DocumentContext {
+        account: operation.account,
         document: Some(document.clone()),
         sheet: None,
         row: None,
+        identity_scope: IdentityScope::Source,
     };
 
     assert_eq!(
@@ -135,7 +143,10 @@ fn a_submission_that_nothing_identifies_has_no_key() {
     // A channel without a file or identifiers: there is no hard key, and
     // one must not be invented—the probabilistic level remains.
     let operation = deposit(AccountId::new_random(), 100_000);
-    assert_eq!(choose_key(&operation, &from_stream()), None);
+    assert_eq!(
+        choose_key(&operation, &from_stream(operation.account)),
+        None
+    );
 }
 
 #[test]
@@ -146,12 +157,12 @@ fn two_identical_purchases_on_one_day_are_not_a_duplicate() {
     let account = AccountId::new_random();
     let document = hash("d");
     let first = deposit(account, 100_000);
-    let first_context = from_row(&document, 7);
+    let first_context = from_row(account, &document, 7);
     let known = vec![recorded(&first, &first_context)];
 
     // Same operation, but a different row of the same document.
     let second = deposit(account, 100_000);
-    let second_context = from_row(&document, 8);
+    let second_context = from_row(account, &document, 8);
     let key = choose_key(&second, &second_context);
 
     assert_eq!(
@@ -170,12 +181,17 @@ fn reloading_the_same_document_duplicates_every_row() {
     let rows = [7_u64, 8, 9];
     let known: Vec<KnownRecord> = rows
         .iter()
-        .map(|row| recorded(&deposit(account, 100_000), &from_row(&document, *row)))
+        .map(|row| {
+            recorded(
+                &deposit(account, 100_000),
+                &from_row(account, &document, *row),
+            )
+        })
         .collect();
 
     for row in rows {
         let operation = deposit(account, 100_000);
-        let context = from_row(&document, row);
+        let context = from_row(account, &document, row);
         let key = choose_key(&operation, &context);
         let decision = assess(key.as_ref(), &fingerprint(&operation), &context, &known);
         let DedupDecision::Duplicate { key, .. } = decision else {
@@ -191,10 +207,10 @@ fn the_same_fingerprint_across_documents_is_only_a_hint() {
     // identical operation. Show it, do not delete it.
     let account = AccountId::new_random();
     let earlier = deposit(account, 100_000);
-    let known = vec![recorded(&earlier, &from_row(&hash("a"), 7))];
+    let known = vec![recorded(&earlier, &from_row(account, &hash("a"), 7))];
 
     let later = deposit(account, 100_000);
-    let context = from_row(&hash("b"), 3);
+    let context = from_row(account, &hash("b"), 3);
     let key = choose_key(&later, &context);
     let decision = assess(key.as_ref(), &fingerprint(&later), &context, &known);
 
@@ -213,9 +229,9 @@ fn a_possible_duplicate_is_still_recorded() {
     // (§10.6): the decision must differ from `Duplicate` precisely in that
     // it does not cancel the record.
     let account = AccountId::new_random();
-    let known = vec![recorded(&deposit(account, 100_000), &from_stream())];
+    let known = vec![recorded(&deposit(account, 100_000), &from_stream(account))];
     let operation = deposit(account, 100_000);
-    let context = from_row(&hash("f"), 1);
+    let context = from_row(account, &hash("f"), 1);
     let key = choose_key(&operation, &context);
 
     let decision = assess(key.as_ref(), &fingerprint(&operation), &context, &known);
@@ -239,9 +255,9 @@ fn two_identical_submissions_from_a_stream_are_a_hint() {
     // there is no document showing two rows. Silently treating this as
     // `Fresh` would double the position, and §10.6 requires showing it.
     let account = AccountId::new_random();
-    let known = vec![recorded(&deposit(account, 100_000), &from_stream())];
+    let known = vec![recorded(&deposit(account, 100_000), &from_stream(account))];
     let repeat = deposit(account, 100_000);
-    let context = from_stream();
+    let context = from_stream(account);
 
     assert_eq!(
         assess(
@@ -262,7 +278,7 @@ fn the_client_key_catches_a_resubmission_without_a_document() {
     let account = AccountId::new_random();
     let mut operation = deposit(account, 100_000);
     operation.idempotency_key = Some("client-1".to_owned());
-    let context = from_stream();
+    let context = from_stream(account);
     let known = vec![recorded(&operation, &context)];
 
     // A repeat with the same key but a different amount: the client repeated the request,
@@ -286,11 +302,11 @@ fn repeated_source_wins_locator_and_becomes_duplicate() {
     let document = hash("1");
     let mut first = deposit(account, 100_000);
     first.source_operation_id = Some("OP-4417".to_owned());
-    let known = vec![recorded(&first, &from_row(&document, 7))];
+    let known = vec![recorded(&first, &from_row(account, &document, 7))];
 
     let mut repeat = deposit(account, 999_000);
     repeat.source_operation_id = Some("OP-4417".to_owned());
-    let context = from_row(&document, 8);
+    let context = from_row(account, &document, 8);
     let key = choose_key(&repeat, &context);
 
     assert_eq!(
@@ -307,11 +323,11 @@ fn different_source_identifiers_do_not_merge() {
     let account = AccountId::new_random();
     let mut first = deposit(account, 100_000);
     first.source_operation_id = Some("OP-1".to_owned());
-    let known = vec![recorded(&first, &from_stream())];
+    let known = vec![recorded(&first, &from_stream(account))];
 
     let mut incoming = deposit(account, 100_001);
     incoming.source_operation_id = Some("OP-2".to_owned());
-    let context = from_stream();
+    let context = from_stream(account);
     let key = choose_key(&incoming, &context);
 
     assert_eq!(
@@ -321,13 +337,116 @@ fn different_source_identifiers_do_not_merge() {
 }
 
 #[test]
+fn account_scope_allows_reused_source_identifier_across_accounts() {
+    let first_account = AccountId::new_random();
+    let second_account = AccountId::new_random();
+    let mut first = deposit(first_account, 100_000);
+    first.source_operation_id = Some("OP-ACCOUNT-1".to_owned());
+    let context = DocumentContext {
+        account: second_account,
+        document: None,
+        sheet: None,
+        row: None,
+        identity_scope: IdentityScope::Account,
+    };
+    let known = vec![recorded(&first, &context)];
+
+    let mut incoming = deposit(second_account, 100_000);
+    incoming.source_operation_id = Some("OP-ACCOUNT-1".to_owned());
+    let key = choose_key(&incoming, &context);
+
+    assert_eq!(
+        assess(key.as_ref(), &fingerprint(&incoming), &context, &known),
+        DedupDecision::Fresh
+    );
+}
+
+#[test]
+fn account_scope_repeats_same_account_source_identifier_as_duplicate() {
+    let account = AccountId::new_random();
+    let mut first = deposit(account, 100_000);
+    first.source_operation_id = Some("OP-ACCOUNT-2".to_owned());
+    let context = DocumentContext {
+        account,
+        document: None,
+        sheet: None,
+        row: None,
+        identity_scope: IdentityScope::Account,
+    };
+    let known = vec![recorded(&first, &context)];
+
+    let mut incoming = deposit(account, 999_000);
+    incoming.source_operation_id = Some("OP-ACCOUNT-2".to_owned());
+    let key = choose_key(&incoming, &context);
+
+    assert!(matches!(
+        assess(key.as_ref(), &fingerprint(&incoming), &context, &known),
+        DedupDecision::Duplicate {
+            key: DedupKey::SourceOperationId(id),
+            existing,
+        } if id == "OP-ACCOUNT-2" && existing == known[0].event
+    ));
+}
+
+#[test]
+fn source_scope_reused_identifier_across_accounts_remains_duplicate() {
+    let first_account = AccountId::new_random();
+    let second_account = AccountId::new_random();
+    let mut first = deposit(first_account, 100_000);
+    first.source_operation_id = Some("OP-SOURCE-1".to_owned());
+    let context = DocumentContext {
+        account: second_account,
+        document: None,
+        sheet: None,
+        row: None,
+        identity_scope: IdentityScope::Source,
+    };
+    let known = vec![recorded(&first, &context)];
+
+    let mut incoming = deposit(second_account, 100_000);
+    incoming.source_operation_id = Some("OP-SOURCE-1".to_owned());
+    let key = choose_key(&incoming, &context);
+
+    assert!(matches!(
+        assess(key.as_ref(), &fingerprint(&incoming), &context, &known),
+        DedupDecision::Duplicate { existing, .. } if existing == known[0].event
+    ));
+}
+
+#[test]
+fn source_scope_repeated_identifier_same_account_remains_duplicate() {
+    let account = AccountId::new_random();
+    let mut first = deposit(account, 100_000);
+    first.source_operation_id = Some("OP-SOURCE-2".to_owned());
+    let context = DocumentContext {
+        account,
+        document: None,
+        sheet: None,
+        row: None,
+        identity_scope: IdentityScope::Source,
+    };
+    let known = vec![recorded(&first, &context)];
+
+    let mut incoming = deposit(account, 999_000);
+    incoming.source_operation_id = Some("OP-SOURCE-2".to_owned());
+    let key = choose_key(&incoming, &context);
+
+    assert!(matches!(
+        assess(key.as_ref(), &fingerprint(&incoming), &context, &known),
+        DedupDecision::Duplicate { existing, .. } if existing == known[0].event
+    ));
+}
+
+#[test]
 fn same_document_and_fingerprint_become_duplicate() {
     let account = AccountId::new_random();
     let document = hash("2");
     let context = DocumentContext {
+        account,
         document: Some(document.clone()),
         sheet: None,
         row: None,
+        identity_scope: IdentityScope::Source,
     };
     let first = deposit(account, 100_000);
     let known = vec![recorded(&first, &context)];
@@ -351,9 +470,11 @@ fn same_document_with_different_fingerprint_enters_journal() {
     let account = AccountId::new_random();
     let document = hash("3");
     let context = DocumentContext {
+        account,
         document: Some(document),
         sheet: None,
         row: None,
+        identity_scope: IdentityScope::Source,
     };
     let known = vec![recorded(&deposit(account, 100_000), &context)];
     let incoming = deposit(account, 100_001);
@@ -369,14 +490,18 @@ fn same_document_with_different_fingerprint_enters_journal() {
 fn different_document_with_same_fingerprint_remains_a_hint() {
     let account = AccountId::new_random();
     let known_context = DocumentContext {
+        account,
         document: Some(hash("4")),
         sheet: None,
         row: None,
+        identity_scope: IdentityScope::Source,
     };
     let incoming_context = DocumentContext {
+        account,
         document: Some(hash("5")),
         sheet: None,
         row: None,
+        identity_scope: IdentityScope::Source,
     };
     let first = deposit(account, 100_000);
     let known = vec![recorded(&first, &known_context)];
@@ -400,8 +525,8 @@ fn different_document_with_same_fingerprint_remains_a_hint() {
 #[test]
 fn owner_hint_contains_fifth_level() {
     let account = AccountId::new_random();
-    let known_context = from_row(&hash("6"), 7);
-    let incoming_context = from_row(&hash("7"), 8);
+    let known_context = from_row(account, &hash("6"), 7);
+    let incoming_context = from_row(account, &hash("7"), 8);
     let first = deposit(account, 100_000);
     let known = vec![recorded(&first, &known_context)];
     let incoming = deposit(account, 100_000);

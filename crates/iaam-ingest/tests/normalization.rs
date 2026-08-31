@@ -5,7 +5,7 @@
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
 use iaam_core::ids::EventId;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
-use iaam_core::money::{CurrencyCode, PostedMinor};
+use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::PriceQuality;
 use iaam_ingest::operation::NormalizationContext;
@@ -31,6 +31,7 @@ fn submit(kind: OperationKind) -> SubmittedOperation {
             trade: Some(date!(2026 - 04 - 01)),
             ..OperationDates::default()
         },
+        source_time: None,
         idempotency_key: None,
         source_operation_id: None,
     }
@@ -61,6 +62,7 @@ fn all_kinds() -> Vec<OperationKind> {
             gross_minor: 900_000,
             fee_minor: Some(1_500),
             accrued_interest_minor: Some(700),
+            basis_fee: None,
             currency: CurrencyCode::Rub,
         },
         OperationKind::Sell {
@@ -70,6 +72,7 @@ fn all_kinds() -> Vec<OperationKind> {
             gross_minor: 950_000,
             fee_minor: Some(1_500),
             accrued_interest_minor: Some(300),
+            basis_fee: None,
             currency: CurrencyCode::Rub,
         },
         OperationKind::Income {
@@ -127,6 +130,7 @@ fn a_purchase_settles_for_body_plus_accrued_plus_fee() {
         gross_minor: 900_000,
         fee_minor: Some(1_500),
         accrued_interest_minor: Some(700),
+        basis_fee: None,
         currency: CurrencyCode::Rub,
     });
     let event = normalize(&operation, context()).unwrap().event;
@@ -147,6 +151,7 @@ fn a_sale_settles_for_body_plus_accrued_minus_fee() {
         fee_minor: Some(1_500),
         accrued_interest_minor: Some(300),
         currency: CurrencyCode::Rub,
+        basis_fee: None,
     });
     let event = normalize(&operation, context()).unwrap().event;
     let cash = event
@@ -155,6 +160,51 @@ fn a_sale_settles_for_body_plus_accrued_minus_fee() {
     assert_eq!(cash.amount(), PostedMinor::new(948_800));
     match event.kind {
         EventKind::Trade { side, .. } => assert_eq!(side, TradeSide::Sell),
+        other => panic!("expected a trade, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_basis_fee_is_rounded_and_retained_without_changing_cash_settlement() {
+    let exact = CalcMoney::new(
+        Dec::new(Decimal::from_str_exact("-0.135065").expect("exact commission")),
+        CurrencyCode::Rub,
+    );
+    let expected_exact = CalcMoney::new(
+        Dec::new(Decimal::from_str_exact("0.135065").expect("positive exact commission")),
+        CurrencyCode::Rub,
+    );
+    let operation = submit(OperationKind::Buy {
+        instrument: InstrumentId::new_random(),
+        custody: CustodyId::new_random(),
+        quantity: Dec::one(),
+        gross_minor: 27_013,
+        fee_minor: None,
+        accrued_interest_minor: None,
+        basis_fee: Some(exact),
+        currency: CurrencyCode::Rub,
+    });
+
+    let event = normalize(&operation, context()).unwrap().event;
+    event
+        .validate_structure()
+        .expect("negative source commission becomes a valid positive basis fee");
+    assert_eq!(
+        event.cash_effect(CurrencyCode::Rub).unwrap().amount(),
+        PostedMinor::new(-27_013)
+    );
+    match event.kind {
+        EventKind::Trade {
+            basis_fee,
+            basis_fee_exact,
+            ..
+        } => {
+            assert_eq!(
+                basis_fee.map(|fee| fee.amount()),
+                Some(PostedMinor::new(14))
+            );
+            assert_eq!(basis_fee_exact, Some(expected_exact));
+        }
         other => panic!("expected a trade, got {other:?}"),
     }
 }

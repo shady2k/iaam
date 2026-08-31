@@ -7,13 +7,14 @@ use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
 use iaam_store::events::Appended;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use time::macros::date;
+use time::macros::{date, time};
 
 struct TempDatabase {
     path: PathBuf,
@@ -81,7 +82,7 @@ fn an_event_survives_a_write_and_a_read() {
     let ctx = Ctx::new();
     let event = ctx.deposit(1, 100_000);
     assert_eq!(
-        store.append_event(&event).unwrap(),
+        store.append_event(&event, IdentityScope::Source).unwrap(),
         Appended::Inserted { id: event.id }
     );
     let loaded = store.load_events(ctx.owner).unwrap();
@@ -95,7 +96,7 @@ fn the_journal_is_append_only_at_the_database_level() {
     let store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let event = ctx.deposit(1, 100_000);
-    store.append_event(&event).unwrap();
+    store.append_event(&event, IdentityScope::Source).unwrap();
 
     let update = store
         .connection()
@@ -117,12 +118,56 @@ fn the_same_idempotency_key_returns_the_first_event() {
     let mut second = ctx.deposit(2, 555_000);
     second.idempotency_key = Some("import-42".into());
 
-    store.append_event(&first).unwrap();
+    store.append_event(&first, IdentityScope::Source).unwrap();
     assert_eq!(
-        store.append_event(&second).unwrap(),
+        store.append_event(&second, IdentityScope::Source).unwrap(),
         Appended::Duplicate { existing: first.id }
     );
     assert_eq!(store.load_events(ctx.owner).unwrap().len(), 1);
+}
+
+#[test]
+fn account_scope_allows_reused_source_operation_across_accounts() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    let mut first = ctx.deposit(1, 100_000);
+    first.provenance = Provenance::new(
+        ctx.source,
+        RawHash::parse(&"7".repeat(64)).unwrap(),
+        ParserVersion("broker/1".into()),
+    )
+    .with_source_operation_id("OP-ACCOUNT");
+    let mut second = ctx.deposit(2, 100_000);
+    second.account = AccountId::new_random();
+    second.provenance = first.provenance.clone();
+
+    assert_eq!(
+        store.append_event(&first, IdentityScope::Account).unwrap(),
+        Appended::Inserted { id: first.id }
+    );
+    assert_eq!(
+        store.append_event(&second, IdentityScope::Account).unwrap(),
+        Appended::Inserted { id: second.id }
+    );
+
+    let mut repeat = second.clone();
+    repeat.id = EventId::new_random();
+    assert_eq!(
+        store.append_event(&repeat, IdentityScope::Account).unwrap(),
+        Appended::Duplicate {
+            existing: second.id
+        }
+    );
+
+    let mut source_scoped = second;
+    source_scoped.id = EventId::new_random();
+    assert!(matches!(
+        store
+            .append_event(&source_scoped, IdentityScope::Source)
+            .unwrap(),
+        Appended::Duplicate { .. }
+    ));
+    assert_eq!(store.load_events(ctx.owner).unwrap().len(), 2);
 }
 
 #[test]
@@ -139,9 +184,9 @@ fn the_same_source_operation_is_not_recorded_twice() {
     let mut second = ctx.deposit(2, 100_000);
     second.provenance = first.provenance.clone();
 
-    store.append_event(&first).unwrap();
+    store.append_event(&first, IdentityScope::Source).unwrap();
     assert_eq!(
-        store.append_event(&second).unwrap(),
+        store.append_event(&second, IdentityScope::Source).unwrap(),
         Appended::Duplicate { existing: first.id }
     );
 }
@@ -152,8 +197,12 @@ fn two_identical_purchases_on_the_same_day_are_both_recorded() {
     // operations on the same day are a valid situation (§10.6, §15.9).
     let store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
-    store.append_event(&ctx.deposit(1, 100_000)).unwrap();
-    store.append_event(&ctx.deposit(2, 100_000)).unwrap();
+    store
+        .append_event(&ctx.deposit(1, 100_000), IdentityScope::Source)
+        .unwrap();
+    store
+        .append_event(&ctx.deposit(2, 100_000), IdentityScope::Source)
+        .unwrap();
     assert_eq!(store.load_events(ctx.owner).unwrap().len(), 2);
 }
 
@@ -164,13 +213,64 @@ fn a_slice_through_a_date_excludes_later_events() {
     let early = ctx.deposit(1, 100_000);
     let mut late = ctx.deposit(2, 200_000);
     late.order = EffectiveOrder::new(date!(2026 - 03 - 01), 2);
-    store.append_event(&early).unwrap();
-    store.append_event(&late).unwrap();
+    store.append_event(&early, IdentityScope::Source).unwrap();
+    store.append_event(&late, IdentityScope::Source).unwrap();
 
     let slice = store
         .load_events_through(ctx.owner, date!(2026 - 02 - 15))
         .unwrap();
     assert_eq!(slice, vec![early]);
+}
+
+#[test]
+fn source_time_orders_events_before_sequence_and_untimed_events() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    let day = date!(2026 - 02 - 01);
+
+    let mut untimed = ctx.deposit(1, 100_000);
+    untimed.order = EffectiveOrder::new(day, 1);
+    let mut late = ctx.deposit(2, 200_000);
+    late.order = EffectiveOrder::with_source_time(day, time!(12:00:00), 2);
+    let mut early = ctx.deposit(3, 300_000);
+    early.order = EffectiveOrder::with_source_time(day, time!(09:00:00), 3);
+
+    store.append_event(&untimed, IdentityScope::Source).unwrap();
+    store.append_event(&late, IdentityScope::Source).unwrap();
+    store.append_event(&early, IdentityScope::Source).unwrap();
+
+    let loaded = store.load_events(ctx.owner).unwrap();
+    assert_eq!(loaded[0].order, early.order);
+    assert_eq!(loaded[1].order, late.order);
+    assert_eq!(loaded[2].order, untimed.order);
+}
+
+#[test]
+fn equal_source_times_use_the_raw_hash_before_sequence() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    let day = date!(2026 - 02 - 01);
+    let mut first = ctx.deposit(1, 100_000);
+    first.order = EffectiveOrder::with_source_time(day, time!(09:00:00), 2);
+    first.provenance = Provenance::new(
+        ctx.source,
+        RawHash::parse(&"a".repeat(64)).unwrap(),
+        ParserVersion("manual/1".into()),
+    );
+    let mut second = ctx.deposit(2, 200_000);
+    second.order = EffectiveOrder::with_source_time(day, time!(09:00:00), 1);
+    second.provenance = Provenance::new(
+        ctx.source,
+        RawHash::parse(&"b".repeat(64)).unwrap(),
+        ParserVersion("manual/1".into()),
+    );
+
+    store.append_event(&second, IdentityScope::Source).unwrap();
+    store.append_event(&first, IdentityScope::Source).unwrap();
+
+    let loaded = store.load_events(ctx.owner).unwrap();
+    assert_eq!(loaded[0].provenance.raw_hash().as_str(), "a".repeat(64));
+    assert_eq!(loaded[1].provenance.raw_hash().as_str(), "b".repeat(64));
 }
 
 #[test]
@@ -194,10 +294,10 @@ fn the_store_assigns_the_sequence_and_does_not_take_it_from_the_caller() {
     let ctx = Ctx::new();
 
     let first = store
-        .append_event_in_order(&ctx.deposit(1, 100_000))
+        .append_event_in_order(&ctx.deposit(1, 100_000), IdentityScope::Source)
         .unwrap();
     let second = store
-        .append_event_in_order(&ctx.deposit(1, 50_000))
+        .append_event_in_order(&ctx.deposit(1, 50_000), IdentityScope::Source)
         .unwrap();
     assert!(matches!(first, Appended::Inserted { .. }));
     assert!(matches!(second, Appended::Inserted { .. }));
@@ -228,7 +328,7 @@ fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
         let mut store = first_store;
         first_barrier.wait();
         store
-            .append_event_in_order(&first_event)
+            .append_event_in_order(&first_event, IdentityScope::Source)
             .map_err(|error| error.to_string())
     });
 
@@ -238,7 +338,7 @@ fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
         let mut store = second_store;
         second_barrier.wait();
         store
-            .append_event_in_order(&second_event)
+            .append_event_in_order(&second_event, IdentityScope::Source)
             .map_err(|error| error.to_string())
     });
 

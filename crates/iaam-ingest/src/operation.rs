@@ -8,7 +8,7 @@ use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
-use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
+use iaam_core::money::{CalcMoney, CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::PriceQuality;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,8 @@ pub enum OperationKind {
         quantity: Dec,
         gross_minor: i64,
         fee_minor: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis_fee: Option<CalcMoney>,
         accrued_interest_minor: Option<i64>,
         currency: CurrencyCode,
     },
@@ -74,6 +76,8 @@ pub enum OperationKind {
         quantity: Dec,
         gross_minor: i64,
         fee_minor: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis_fee: Option<CalcMoney>,
         accrued_interest_minor: Option<i64>,
         currency: CurrencyCode,
     },
@@ -125,6 +129,12 @@ pub struct SubmittedOperation {
     pub account: AccountId,
     pub kind: OperationKind,
     pub dates: OperationDates,
+    /// Time-of-day reported by the source, if it names a moment.
+    ///
+    /// This is separate from the operation dates: a source can give a
+    /// calendar date without asserting a moment (§4.9).
+    #[serde(default)]
+    pub source_time: Option<time::Time>,
     /// Client idempotency key (§10.6).
     pub idempotency_key: Option<String>,
     /// Operation identifier in the source, if present.
@@ -179,7 +189,10 @@ pub fn normalize(
             kind,
             dates,
             // Temporary number: storage assigns the final one.
-            order: EffectiveOrder::new(day, 1),
+            order: operation.source_time.map_or_else(
+                || EffectiveOrder::new(day, 1),
+                |time| EffectiveOrder::with_source_time(day, time, 1),
+            ),
             legs,
             provenance: {
                 let base = Provenance::new(
@@ -329,11 +342,16 @@ fn build(
             quantity,
             gross_minor,
             fee_minor,
+            basis_fee,
             accrued_interest_minor,
             currency,
         } => {
             let gross = money(positive(*gross_minor, "amount", *currency)?, *currency);
             let fee = fee_money(*fee_minor, *currency)?;
+            let basis_fee_exact = basis_fee.map(|value| {
+                CalcMoney::new(Dec::new(value.value().inner().abs()), value.currency())
+            });
+            let basis_fee = basis_fee_money(basis_fee_exact, *currency)?;
             let accrued = fee_money(*accrued_interest_minor, *currency)?;
             let mut settlement = gross.amount().raw();
             settlement += accrued.map_or(0, |value| value.amount().raw());
@@ -345,6 +363,8 @@ fn build(
                     quantity: Quantity(*quantity),
                     gross,
                     fee,
+                    basis_fee,
+                    basis_fee_exact,
                     accrued_interest: accrued,
                 },
                 vec![
@@ -359,11 +379,16 @@ fn build(
             quantity,
             gross_minor,
             fee_minor,
+            basis_fee,
             accrued_interest_minor,
             currency,
         } => {
             let gross = money(positive(*gross_minor, "amount", *currency)?, *currency);
             let fee = fee_money(*fee_minor, *currency)?;
+            let basis_fee_exact = basis_fee.map(|value| {
+                CalcMoney::new(Dec::new(value.value().inner().abs()), value.currency())
+            });
+            let basis_fee = basis_fee_money(basis_fee_exact, *currency)?;
             let accrued = fee_money(*accrued_interest_minor, *currency)?;
             let mut settlement = gross.amount().raw();
             settlement += accrued.map_or(0, |value| value.amount().raw());
@@ -380,6 +405,8 @@ fn build(
                     quantity: Quantity(*quantity),
                     gross,
                     fee,
+                    basis_fee,
+                    basis_fee_exact,
                     accrued_interest: accrued,
                 },
                 vec![
@@ -481,4 +508,31 @@ fn fee_money(value: Option<i64>, currency: CurrencyCode) -> Result<Option<Money>
         None => Ok(None),
         Some(minor) => Ok(Some(money(positive(minor, "fee", currency)?, currency))),
     }
+}
+
+/// Convert a calculated source commission to the posted basis value.
+///
+/// The exact value remains on the event beside this rounded value. This is
+/// distinct from settlement `fee_minor`: a basis-only fee never changes cash.
+fn basis_fee_money(
+    value: Option<CalcMoney>,
+    currency: CurrencyCode,
+) -> Result<Option<Money>, Rejection> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.currency() != currency {
+        return Err(Rejection {
+            field: "basis_fee".into(),
+            expected: format!("currency {}", currency.code()),
+            actual: value.currency().code().to_owned(),
+        });
+    }
+    let magnitude = CalcMoney::new(Dec::new(value.value().inner().abs()), currency);
+    let amount = magnitude.rounded_minor().map_err(|error| Rejection {
+        field: "basis_fee".into(),
+        expected: "representable rounded amount".into(),
+        actual: error.to_string(),
+    })?;
+    Ok(Some(money(amount.raw(), currency)))
 }

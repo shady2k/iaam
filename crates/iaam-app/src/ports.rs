@@ -10,6 +10,7 @@ use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
 use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
+use iaam_ingest::dedup::IdentityScope;
 use iaam_store::documents::BrokerCode;
 use serde_json::Value;
 use std::sync::Arc;
@@ -181,7 +182,11 @@ pub trait Store: Send + Sync {
     ///
     /// The store assigns the order in the same transaction as the insertion:
     /// separate «get the next number» and «insert» operations create a race (§4.8).
-    async fn append_events(&self, events: Vec<Event>) -> Result<Vec<Recorded>, AppError>;
+    async fn append_events(
+        &self,
+        events: Vec<Event>,
+        identity_scope: IdentityScope,
+    ) -> Result<Vec<Recorded>, AppError>;
     async fn load_events_through(
         &self,
         owner: OwnerId,
@@ -581,6 +586,8 @@ pub trait BrokerChannel: Send + Sync {
 
     /// Exactly how the data was obtained. The parser version and absence
     /// of a document are what the channel's independence is derived from.
+    /// Scope guaranteed for source operation identifiers from this channel.
+    fn identity_scope(&self) -> IdentityScope;
     fn channel(&self) -> SourceChannel;
 }
 

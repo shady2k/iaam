@@ -224,7 +224,7 @@ pub fn assess(
             .ok_or(PerimeterError::EventWithoutDate { event: event.id })?;
         ordered.push((date, event));
     }
-    ordered.sort_by_key(|(date, event)| (*date, event.order));
+    ordered.sort_by(|(_, left), (_, right)| crate::event::compare_for_replay(left, right));
 
     // Detect credit across the whole journal up front: margin interest may be
     // charged after the deficit closes, but still belongs to that deficit.

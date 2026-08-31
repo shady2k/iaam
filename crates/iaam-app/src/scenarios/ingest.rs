@@ -3,6 +3,7 @@
 use iaam_core::event::Event;
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::ids::SourceId;
+use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{
     JournalEventEnrichment, JournalFact, Rejection, SubmittedJournalEvent, SubmittedOperation,
@@ -179,7 +180,10 @@ pub async fn record_candidate(
         });
     }
 
-    let recorded = services.store.append_events(vec![event]).await?;
+    let recorded = services
+        .store
+        .append_events(vec![event], IdentityScope::Source)
+        .await?;
     Ok(match recorded.first() {
         Some(Recorded::Inserted { id }) => Verdict::Provisional { event: *id },
         Some(Recorded::Duplicate { existing }) => Verdict::Duplicate {

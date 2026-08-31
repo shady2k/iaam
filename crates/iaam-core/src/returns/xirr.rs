@@ -363,6 +363,8 @@ mod tests {
                     quantity: qty(10),
                     gross: rub(1_000),
                     fee: None,
+                    basis_fee: None,
+                    basis_fee_exact: None,
                     accrued_interest: None,
                 },
                 vec![
@@ -380,6 +382,8 @@ mod tests {
                     quantity: qty(10),
                     gross: rub(1_000),
                     fee: None,
+                    basis_fee: None,
+                    basis_fee_exact: None,
                     accrued_interest: None,
                 },
                 vec![
@@ -396,6 +400,8 @@ mod tests {
                     instrument,
                     quantity: qty(10),
                     gross: rub(1_000),
+                    basis_fee: None,
+                    basis_fee_exact: None,
                     fee: None,
                     accrued_interest: None,
                 },

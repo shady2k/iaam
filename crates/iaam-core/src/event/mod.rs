@@ -83,6 +83,17 @@ pub enum EventValidationError {
         kind: &'static str,
         field: &'static str,
     },
+    #[error("for {kind} basis_fee and basis_fee_exact must be present together")]
+    BasisFeePresenceMismatch { kind: &'static str },
+    #[error(
+        "for {kind} basis_fee amount {posted} does not match \
+         basis_fee_exact rounded amount {exact}"
+    )]
+    BasisFeeAmountMismatch {
+        kind: &'static str,
+        posted: i64,
+        exact: i64,
+    },
     #[error("for {kind} value {field} must be positive, got {value}")]
     NonPositive {
         kind: &'static str,
@@ -145,15 +156,40 @@ pub struct Event {
 /// [`EventKind::Valuation`]; version 3 differs from version 2
 /// by the added variant [`EventKind::ControlAssertion`]; version 4 —
 /// by variants [`EventKind::CorporateAction`] and
-/// [`EventKind::OfferExercise`], and by the income kind in
-/// [`EventKind::Income`] (§4.7). Previously recorded facts from older versions
-/// are read unchanged — the new variants simply do not
-/// occur in them, and `Income` without a kind is read as «kind was not asserted»,
-/// — but software that knows only version 3 cannot parse a corporate
-/// action and therefore must not pretend that it did. Keeping
-/// the old number would mean that one version denotes two
-/// incompatible schemas (§4.1).
-pub const SCHEMA_VERSION: u32 = 4;
+/// [`EventKind::OfferExercise`], and by the income kind in `Income`.
+/// Version 5 adds the optional source time inside [`EffectiveOrder`].
+/// Version 6 adds optional basis-only trade fee fields; both default to absent
+/// so older journal facts remain readable, while the schema number still
+/// distinguishes software that understands the new fact.
+pub const SCHEMA_VERSION: u32 = 6;
+
+/// Compare events for replay, preserving source-time semantics and making
+/// equal-time imports independent of their insertion order.
+pub(crate) fn compare_for_replay(left: &Event, right: &Event) -> std::cmp::Ordering {
+    left.order
+        .date()
+        .cmp(&right.order.date())
+        .then_with(
+            || match (left.order.source_time(), right.order.source_time()) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+        )
+        .then_with(|| {
+            if left.order.source_time().is_some() {
+                left.provenance
+                    .raw_hash()
+                    .as_str()
+                    .cmp(right.provenance.raw_hash().as_str())
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .then_with(|| left.order.sequence().cmp(&right.order.sequence()))
+        .then_with(|| left.id.cmp(&right.id))
+}
 
 impl Event {
     /// Total monetary effect of all legs in the specified currency.
@@ -209,6 +245,9 @@ impl Event {
                 gross,
                 fee,
                 accrued_interest,
+                basis_fee,
+                basis_fee_exact,
+                ..
             } => self.validate_trade(
                 name,
                 *side,
@@ -218,6 +257,8 @@ impl Event {
                     gross: *gross,
                     fee: *fee,
                     accrued_interest: *accrued_interest,
+                    basis_fee: *basis_fee,
+                    basis_fee_exact: *basis_fee_exact,
                 },
             ),
             EventKind::OpeningPosition {
@@ -330,6 +371,11 @@ impl Event {
     /// invariant will stop the report, but the recorded fact can only be fixed
     /// by reversal: the input gate must reject
     /// the contradiction, not preserve it (§4.3, §4.8).
+    ///
+    /// A basis fee is retained both as the posted minor-unit amount and as its exact
+    /// source value. Requiring the exact value to round half away from zero to the
+    /// posted amount proves the journal cannot preserve two contradictory basis
+    /// amounts that later lot accounting would interpret differently.
     fn validate_trade(
         &self,
         name: &'static str,
@@ -342,9 +388,48 @@ impl Event {
             gross,
             fee,
             accrued_interest,
+            basis_fee,
+            basis_fee_exact,
         } = declared;
         require_positive(name, "gross", gross.amount().raw())?;
         require_positive_quantity(name, "quantity", quantity)?;
+        if let Some(basis_fee) = basis_fee {
+            require_positive(name, "basis_fee", basis_fee.amount().raw())?;
+            if basis_fee.currency() != gross.currency() {
+                return Err(EventValidationError::Money(MoneyError::CurrencyMismatch {
+                    left: basis_fee.currency(),
+                    right: gross.currency(),
+                }));
+            }
+        }
+        if let Some(basis_fee_exact) = basis_fee_exact {
+            if basis_fee_exact.currency() != gross.currency() {
+                return Err(EventValidationError::Money(MoneyError::CurrencyMismatch {
+                    left: basis_fee_exact.currency(),
+                    right: gross.currency(),
+                }));
+            }
+        }
+        match (basis_fee, basis_fee_exact) {
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(EventValidationError::BasisFeePresenceMismatch { kind: name });
+            }
+            (Some(basis_fee), Some(basis_fee_exact)) => {
+                // Both fields are one source fact: the posted amount and its exact
+                // audit value. Requiring the exact value to round to the posted
+                // value proves the journal cannot preserve two contradictory basis
+                // amounts that later lot accounting would interpret differently.
+                let exact_rounded = basis_fee_exact.rounded_minor()?;
+                if exact_rounded != basis_fee.amount() {
+                    return Err(EventValidationError::BasisFeeAmountMismatch {
+                        kind: name,
+                        posted: basis_fee.amount().raw(),
+                        exact: exact_rounded.raw(),
+                    });
+                }
+            }
+        }
 
         let cash = self.cash_legs();
         let cash_money = single_leg_money(name, &cash, "exactly one monetary leg")?;
@@ -781,6 +866,8 @@ struct TradeDeclaration {
     gross: Money,
     fee: Option<Money>,
     accrued_interest: Option<Money>,
+    basis_fee: Option<Money>,
+    basis_fee_exact: Option<crate::money::CalcMoney>,
 }
 
 fn require_positive(
@@ -978,7 +1065,7 @@ mod tests {
     use super::*;
     use crate::dates::CashPostedDate;
     use crate::ids::{CustodyId, InstrumentId, SourceId, TransferId};
-    use crate::money::{PostedMinor, Quantity};
+    use crate::money::{CalcMoney, PostedMinor, Quantity};
     use time::macros::date;
 
     // Amounts are written in minimal units as one number: grouping
@@ -1017,6 +1104,39 @@ mod tests {
         Quantity(crate::numeric::decimal::Dec::new(
             rust_decimal::Decimal::from(units),
         ))
+    }
+
+    fn calc_rub(mantissa: i64, scale: u32) -> CalcMoney {
+        CalcMoney::new(
+            crate::numeric::decimal::Dec::new(rust_decimal::Decimal::new(mantissa, scale)),
+            CurrencyCode::Rub,
+        )
+    }
+
+    fn basis_trade(
+        basis_fee: Option<Money>,
+        basis_fee_exact: Option<CalcMoney>,
+        cash: Money,
+    ) -> Event {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        event(
+            EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument,
+                quantity: qty(100),
+                gross: rub(5_000_000),
+                fee: Some(rub(3_500)),
+                accrued_interest: Some(rub(120_000)),
+                basis_fee,
+                basis_fee_exact,
+            },
+            vec![
+                Leg::cash(account, cash),
+                security_leg(account, instrument, qty(100)),
+            ],
+            account,
+        )
     }
 
     // --- shape of new facts (§4.7, §3.5) ---
@@ -2031,6 +2151,8 @@ mod tests {
             gross: rub(5_000_000),
             fee: Some(rub(3_500)),
             accrued_interest: None,
+            basis_fee: None,
+            basis_fee_exact: None,
         };
         // A purchase must debit cash: −50 035,00.
         let wrong = event(
@@ -2070,6 +2192,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: Some(rub(120_000)),
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(-5_123_500)),
@@ -2093,6 +2217,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: Some(rub(120_000)),
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(5_116_500)),
@@ -2117,6 +2243,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: Some(rub(120_000)),
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(-5_120_000)),
@@ -2134,6 +2262,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(5_000_000)),
@@ -2158,6 +2288,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(-4_996_500)),
@@ -2182,6 +2314,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(4_996_500)),
@@ -2190,6 +2324,86 @@ mod tests {
             acc,
         );
         assert!(sell.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn negative_basis_fee_is_rejected_by_field() {
+        let ev = basis_trade(
+            Some(rub(-3_500)),
+            Some(calc_rub(-3_500, 2)),
+            rub(-5_123_500),
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::NonPositive { field, .. }) if field == "basis_fee"
+        ));
+    }
+
+    #[test]
+    fn basis_fee_and_exact_must_use_gross_currency() {
+        let foreign_posted = basis_trade(
+            Some(usd(3_500)),
+            Some(CalcMoney::new(
+                crate::numeric::decimal::Dec::new(rust_decimal::Decimal::new(3_500, 2)),
+                CurrencyCode::Usd,
+            )),
+            rub(-5_123_500),
+        );
+        assert!(matches!(
+            foreign_posted.validate_structure(),
+            Err(EventValidationError::Money(
+                MoneyError::CurrencyMismatch { .. }
+            ))
+        ));
+
+        let foreign_exact = basis_trade(
+            Some(rub(3_500)),
+            Some(CalcMoney::new(
+                crate::numeric::decimal::Dec::new(rust_decimal::Decimal::new(3_500, 2)),
+                CurrencyCode::Usd,
+            )),
+            rub(-5_123_500),
+        );
+        assert!(matches!(
+            foreign_exact.validate_structure(),
+            Err(EventValidationError::Money(
+                MoneyError::CurrencyMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn basis_fee_fields_must_be_present_together() {
+        let only_posted = basis_trade(Some(rub(3_500)), None, rub(-5_123_500));
+        assert!(matches!(
+            only_posted.validate_structure(),
+            Err(EventValidationError::BasisFeePresenceMismatch { .. })
+        ));
+
+        let only_exact = basis_trade(None, Some(calc_rub(3_500, 2)), rub(-5_123_500));
+        assert!(matches!(
+            only_exact.validate_structure(),
+            Err(EventValidationError::BasisFeePresenceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn basis_fee_exact_must_round_to_the_posted_amount() {
+        let ev = basis_trade(Some(rub(3_500)), Some(calc_rub(3_501, 2)), rub(-5_123_500));
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::BasisFeeAmountMismatch {
+                posted: 3_500,
+                exact: 3_501,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn valid_basis_fee_does_not_change_cash_settlement() {
+        let ev = basis_trade(Some(rub(3_501)), Some(calc_rub(35_005, 3)), rub(-5_123_500));
+        assert!(ev.validate_structure().is_ok());
     }
 
     #[test]
@@ -2203,6 +2417,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![Leg::cash(acc, rub(-5_000_000))],
             acc,
@@ -2225,6 +2441,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(-5_000_000)),
@@ -2251,6 +2469,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![security_leg(acc, instrument, qty(100))],
             acc,
@@ -2433,6 +2653,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: Some(rub(3_500)),
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(-5_000_000)),
@@ -2525,7 +2747,9 @@ mod tests {
         // 2 → 3: added `EventKind::ControlAssertion` (§10.3).
         // 3 → 4: added `EventKind::CorporateAction` and
         //        `EventKind::OfferExercise`, and `Income` gained a kind (§4.7).
-        assert_eq!(SCHEMA_VERSION, 4);
+        // 4 → 5: `EffectiveOrder` gained an optional source time.
+        // 5 → 6: `Trade` gained optional basis-only fee fields.
+        assert_eq!(SCHEMA_VERSION, 6);
     }
 
     #[test]
@@ -2560,6 +2784,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![Leg::cash(acc, rub(-5_000_000)), leg],
             acc,
@@ -2619,6 +2845,8 @@ mod tests {
                 gross: rub(0),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(0)),
@@ -2677,6 +2905,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(stranger, rub(-5_000_000)),
@@ -2741,6 +2971,8 @@ mod tests {
                 gross: rub(5_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(acc, rub(5_000_000)),

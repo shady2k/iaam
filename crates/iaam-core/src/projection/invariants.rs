@@ -241,6 +241,8 @@ mod tests {
                     quantity: qty(100),
                     gross: rub(900_000),
                     fee: None,
+                    basis_fee: None,
+                    basis_fee_exact: None,
                     accrued_interest: None,
                 },
                 vec![
@@ -300,6 +302,8 @@ mod tests {
                     quantity: qty(100),
                     gross: rub(1_000_000),
                     fee: None,
+                    basis_fee: None,
+                    basis_fee_exact: None,
                     accrued_interest: None,
                 },
                 vec![
@@ -317,6 +321,8 @@ mod tests {
                     quantity: qty(40),
                     gross: rub(500_000),
                     fee: None,
+                    basis_fee: None,
+                    basis_fee_exact: None,
                     accrued_interest: None,
                 },
                 vec![
@@ -405,6 +411,8 @@ mod tests {
                 gross: rub(1_000_000),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(account, rub(-1_000_000)),

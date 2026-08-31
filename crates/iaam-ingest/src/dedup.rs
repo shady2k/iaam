@@ -29,7 +29,7 @@
 
 use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, EventId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::journal_event::{JournalFact, SubmittedJournalEvent};
@@ -42,7 +42,7 @@ use crate::operation::{OperationDates, OperationKind, SubmittedOperation};
 const CANONICAL_VERSION: u8 = 1;
 
 /// Hierarchy level §10.6 at which the decision was made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DedupLevel {
     SourceOperationId,
     IdempotencyKey,
@@ -110,15 +110,20 @@ impl DedupKey {
     }
 }
 
-/// Where the row came from.
+pub use iaam_core::reconciliation::evidence::IdentityScope;
+
+/// Where the row came from and which account supplied it.
 ///
 /// `document: None` — a channel without a file: a broker API response is a stream,
-/// not a document, and `None` means exactly that “there was no file.”
+/// not a document, and `None` means exactly that “there was no file.” The account
+/// is still required because some channels scope their source identifiers to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentContext {
+    pub account: AccountId,
     pub document: Option<RawHash>,
     pub sheet: Option<String>,
     pub row: Option<u64>,
+    pub identity_scope: IdentityScope,
 }
 
 /// An already recorded fact against which comparison is made.
@@ -128,6 +133,7 @@ pub struct DocumentContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownRecord {
     pub event: EventId,
+    pub account: AccountId,
     pub source_operation_id: Option<String>,
     pub idempotency_key: Option<String>,
     pub fingerprint: RawHash,
@@ -207,7 +213,9 @@ pub fn assess(
     known: &[KnownRecord],
 ) -> DedupDecision {
     if let Some(key) = key
-        && let Some(existing) = known.iter().find(|record| matches_key(record, key))
+        && let Some(existing) = known
+            .iter()
+            .find(|record| matches_key(record, key, context))
     {
         return DedupDecision::Duplicate {
             key: key.clone(),
@@ -243,9 +251,15 @@ fn same_document(record: &KnownRecord, context: &DocumentContext) -> bool {
 ///
 /// Exhaustive `match`: a new key type must break the build here,
 /// rather than silently stopping duplicate detection.
-fn matches_key(record: &KnownRecord, key: &DedupKey) -> bool {
+fn matches_key(record: &KnownRecord, key: &DedupKey, context: &DocumentContext) -> bool {
     match key {
-        DedupKey::SourceOperationId(id) => record.source_operation_id.as_deref() == Some(id),
+        DedupKey::SourceOperationId(id) => {
+            record.source_operation_id.as_deref() == Some(id)
+                && match context.identity_scope {
+                    IdentityScope::Source => true,
+                    IdentityScope::Account => record.account == context.account,
+                }
+        }
         DedupKey::IdempotencyKey(value) => record.idempotency_key.as_deref() == Some(value),
         DedupKey::NormalizedFingerprint {
             document,

@@ -3,6 +3,7 @@
 use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::{Event, Relation};
 use iaam_core::ids::{EventId, OwnerId};
+use iaam_core::reconciliation::evidence::IdentityScope;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -25,8 +26,12 @@ impl SqliteStore {
     ///
     /// Used where the sequence is defined externally and cannot be changed:
     /// importing an archived bundle and restoring from an archive.
-    pub fn append_event(&self, event: &Event) -> Result<Appended, StoreError> {
-        if let Some(existing) = find_duplicate(&self.conn, event)? {
+    pub fn append_event(
+        &self,
+        event: &Event,
+        identity_scope: IdentityScope,
+    ) -> Result<Appended, StoreError> {
+        if let Some(existing) = find_duplicate(&self.conn, event, identity_scope)? {
             return Ok(Appended::Duplicate { existing });
         }
         insert_event(&self.conn, event)?;
@@ -43,11 +48,15 @@ impl SqliteStore {
     /// closes the race between processes as well, while the unique index
     /// `(owner, effective_date, sequence)` turns any remaining gap
     /// into an error instead of silently reordering entries.
-    pub fn append_event_in_order(&mut self, event: &Event) -> Result<Appended, StoreError> {
+    pub fn append_event_in_order(
+        &mut self,
+        event: &Event,
+        identity_scope: IdentityScope,
+    ) -> Result<Appended, StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = find_duplicate(&transaction, event)? {
+        if let Some(existing) = find_duplicate(&transaction, event, identity_scope)? {
             return Ok(Appended::Duplicate { existing });
         }
         let day = event.order.date();
@@ -57,7 +66,16 @@ impl SqliteStore {
             |row| row.get(0),
         )?;
         let stamped = Event {
-            order: EffectiveOrder::new(day, used.map_or(1, |value| value.saturating_add(1))),
+            order: event.order.source_time().map_or_else(
+                || EffectiveOrder::new(day, used.map_or(1, |value| value.saturating_add(1))),
+                |source_time| {
+                    EffectiveOrder::with_source_time(
+                        day,
+                        source_time,
+                        used.map_or(1, |value| value.saturating_add(1)),
+                    )
+                },
+            ),
             ..event.clone()
         };
         insert_event(&transaction, &stamped)?;
@@ -68,12 +86,19 @@ impl SqliteStore {
     /// The owner's entire log in `EffectiveOrder`.
     ///
     /// The database defines the order, but the projection still sorts the slice itself:
-    /// the core need not trust the order received from outside (§4.8).
+    /// the core need not trust the order received from outside (§4.8). Known source times
+    /// sort before untimed events, and raw hashes make equal source times reproducible.
     pub fn load_events(&self, owner: OwnerId) -> Result<Vec<Event>, StoreError> {
         self.query_events(
             "SELECT id, payload FROM events
              WHERE owner = ?1
-             ORDER BY effective_date, sequence, id",
+             ORDER BY effective_date,
+                      source_time IS NULL,
+                      CASE WHEN source_time IS NULL THEN sequence ELSE 0 END,
+                      source_time,
+                      CASE WHEN source_time IS NULL THEN '' ELSE raw_hash END,
+                      sequence,
+                      id",
             params![owner.inner().to_string()],
         )
     }
@@ -88,7 +113,13 @@ impl SqliteStore {
         self.query_events(
             "SELECT id, payload FROM events
              WHERE owner = ?1 AND effective_date <= ?2
-             ORDER BY effective_date, sequence, id",
+             ORDER BY effective_date,
+                      source_time IS NULL,
+                      CASE WHEN source_time IS NULL THEN sequence ELSE 0 END,
+                      source_time,
+                      CASE WHEN source_time IS NULL THEN '' ELSE raw_hash END,
+                      sequence,
+                      id",
             params![owner.inner().to_string(), through.to_string()],
         )
     }
@@ -126,13 +157,14 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
     let recorded_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"));
+    let source_time = event.order.source_time().map(format_source_time);
 
     conn.execute(
         "INSERT INTO events (
-             id, schema_version, owner, account, kind, effective_date, sequence,
+             id, schema_version, owner, account, kind, effective_date, sequence, source_time,
              relation_kind, relation_target, source, source_operation_id,
              idempotency_key, raw_hash, payload, recorded_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             event.id.inner().to_string(),
             event.schema_version,
@@ -141,6 +173,7 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
             event.kind.discriminant(),
             event.order.date().to_string(),
             event.order.sequence(),
+            source_time,
             relation_kind,
             relation_target,
             event.provenance.source().inner().to_string(),
@@ -154,6 +187,11 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
     Ok(())
 }
 
+fn format_source_time(time: time::Time) -> String {
+    let (hour, minute, second, nanosecond) = time.as_hms_nano();
+    format!("{hour:02}:{minute:02}:{second:02}.{nanosecond:09}")
+}
+
 /// Find a duplicate by keys from strongest to weakest (§10.6).
 ///
 /// The natural key “account + date + amount” is intentionally absent here:
@@ -162,17 +200,31 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
 pub(crate) fn find_duplicate(
     conn: &Connection,
     event: &Event,
+    identity_scope: IdentityScope,
 ) -> Result<Option<EventId>, StoreError> {
     if let Some(operation) = event.provenance.source_operation_id() {
-        let found = lookup(
-            conn,
-            "SELECT id FROM events WHERE owner = ?1 AND source = ?2 AND source_operation_id = ?3",
-            params![
-                event.owner.inner().to_string(),
-                event.provenance.source().inner().to_string(),
-                operation
-            ],
-        )?;
+        let found = match identity_scope {
+            IdentityScope::Source => lookup(
+                conn,
+                "SELECT id FROM events WHERE owner = ?1 AND source = ?2 AND source_operation_id = ?3",
+                params![
+                    event.owner.inner().to_string(),
+                    event.provenance.source().inner().to_string(),
+                    operation
+                ],
+            )?,
+            IdentityScope::Account => lookup(
+                conn,
+                "SELECT id FROM events
+                 WHERE owner = ?1 AND source = ?2 AND account = ?3 AND source_operation_id = ?4",
+                params![
+                    event.owner.inner().to_string(),
+                    event.provenance.source().inner().to_string(),
+                    event.account.inner().to_string(),
+                    operation
+                ],
+            )?,
+        };
         if found.is_some() {
             return Ok(found);
         }

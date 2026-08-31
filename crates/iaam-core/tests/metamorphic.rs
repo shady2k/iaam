@@ -101,6 +101,8 @@ impl Ledger {
                 gross: rub(gross),
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(account, rub(-gross)),

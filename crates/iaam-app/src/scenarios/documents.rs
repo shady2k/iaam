@@ -9,6 +9,7 @@ use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_ingest::Verdict;
 use iaam_ingest::csv_source::{Directory, ParsedRow};
+use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{NormalizationContext, normalize};
 use iaam_ingest::report::finam::FinamParser;
 use iaam_ingest::report::tinkoff::TinkoffParser;
@@ -290,7 +291,10 @@ async fn append_control_assertions(
         })
         .collect();
     if !events.is_empty() {
-        let _ = services.store.append_events(events).await?;
+        let _ = services
+            .store
+            .append_events(events, IdentityScope::Source)
+            .await?;
     }
     Ok(())
 }

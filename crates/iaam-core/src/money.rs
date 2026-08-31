@@ -280,6 +280,26 @@ impl CalcMoney {
         self.currency
     }
 
+    /// Round a source fact to posted minor units, retaining the exact value separately.
+    ///
+    /// This is the explicit source-fact path from calculated to posted mode:
+    /// the caller stores both this rounded value and the original `CalcMoney`, so
+    /// the rounding is auditable rather than an unrecorded recalculation.
+    pub fn rounded_minor(self) -> Result<PostedMinor, MoneyError> {
+        let rounded = self
+            .value
+            .checked_round_to_scale(self.currency.minor_units())?;
+        let factor = Decimal::from(10_i64.pow(self.currency.minor_units()));
+        let scaled = rounded
+            .inner()
+            .checked_mul(factor)
+            .ok_or(NumericError::Overflow)?
+            .normalize();
+        i64::try_from(scaled.mantissa())
+            .map(PostedMinor::new)
+            .map_err(|_| MoneyError::Numeric(NumericError::Overflow))
+    }
+
     fn require_same_currency(self, other: Self) -> Result<(), MoneyError> {
         if self.currency == other.currency {
             Ok(())

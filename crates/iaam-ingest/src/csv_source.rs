@@ -282,6 +282,7 @@ fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperati
             cash_posted: Some(date),
             ..OperationDates::default()
         },
+        source_time: None,
         idempotency_key: row.idempotency_key.clone(),
         source_operation_id: None,
     })
@@ -411,6 +412,7 @@ fn build_trade(
             quantity,
             gross_minor,
             fee_minor,
+            basis_fee: None,
             accrued_interest_minor,
             currency,
         })
@@ -421,6 +423,7 @@ fn build_trade(
             quantity,
             gross_minor,
             fee_minor,
+            basis_fee: None,
             accrued_interest_minor,
             currency,
         })

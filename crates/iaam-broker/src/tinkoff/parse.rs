@@ -4,17 +4,17 @@ use iaam_core::event::provenance::ParserVersion;
 // `finam::ChannelOperationKind` continue to mean the same type:
 // channel names remain familiar while the type behind them is shared.
 pub use crate::operation_kind::ChannelOperationKind;
-use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
+use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor, Quantity};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
-use time::{Date, OffsetDateTime};
+use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/1";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/2";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -76,6 +76,8 @@ impl ChannelMoney {
 pub struct ChannelOperation {
     /// Order date from the gateway timestamp.
     pub date: Option<Date>,
+    /// Time from the first source trade, if the order carries trade details.
+    pub source_time: Option<Time>,
     /// Account named by the gateway.
     pub broker_account_id: String,
     /// Source operation identifier.
@@ -102,7 +104,7 @@ pub struct ChannelOperation {
     /// Price of one unit.
     pub price: Option<ChannelMoney>,
     /// Operation commission.
-    pub commission: Option<ChannelMoney>,
+    pub commission: Option<CalcMoney>,
     /// Stable key for the first deduplication stage.
     pub deduplication_key: String,
     /// Version of this exact parser code.
@@ -223,6 +225,7 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         required_or_reject(item.broker_account_id, "brokerAccountId", &mut rejection);
     let cursor = required_or_reject(item.cursor, "cursor", &mut rejection);
     let date = date_or_reject(item.date, "date", &mut rejection);
+    let source_time = source_time_or_reject(item.trades_info, &mut rejection);
     let operation_type = required_or_reject(item.operation_type, "type", &mut rejection);
     let state = required_or_reject(item.state, "state", &mut rejection);
     let quantity = keep_or_reject(
@@ -241,11 +244,12 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         &mut rejection,
     );
     let commission = keep_or_reject(
-        parse_optional_money(item.commission.as_ref(), "commission"),
+        parse_optional_calc_money(item.commission.as_ref(), "commission"),
         &mut rejection,
     );
     ChannelOperation {
         date,
+        source_time,
         broker_account_id: broker_account_id.clone(),
         operation_id: operation_id.clone(),
         parent_operation_id: nonempty(item.parent_operation_id),
@@ -268,6 +272,7 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
 fn rejected_operation(raw: Value, reason: ParseError) -> ChannelOperation {
     ChannelOperation {
         date: None,
+        source_time: None,
         broker_account_id: String::new(),
         operation_id: String::new(),
         parent_operation_id: None,
@@ -379,6 +384,41 @@ fn parse_optional_money(
     parse_money(value, field).map(Some)
 }
 
+fn parse_optional_calc_money(
+    value: Option<&RawMoneyValue>,
+    field: &'static str,
+) -> Result<Option<CalcMoney>, ParseError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.currency.as_deref() == Some("")
+        && value.units.as_deref() == Some("0")
+        && value.nano == 0
+    {
+        return Ok(None);
+    }
+    parse_calc_money(value, field).map(Some)
+}
+
+fn parse_calc_money(value: &RawMoneyValue, field: &'static str) -> Result<CalcMoney, ParseError> {
+    let currency = parse_currency(
+        value
+            .currency
+            .as_deref()
+            .ok_or(ParseError::MissingField { field: "currency" })?,
+    )?;
+    let text = decimal_text(
+        &RawQuotation {
+            units: value.units.clone(),
+            nano: value.nano,
+        },
+        field,
+    )?;
+    let decimal = serde_json::from_value(Value::String(text))
+        .map_err(|_| ParseError::NumericOverflow { field })?;
+    Ok(CalcMoney::new(decimal, currency))
+}
+
 fn parse_quantity(value: &RawQuotation, field: &'static str) -> Result<Quantity, ParseError> {
     let text = decimal_text(value, field)?;
     serde_json::from_value(Value::String(text)).map_err(|_| ParseError::InvalidField {
@@ -462,10 +502,28 @@ fn parse_currency(value: &str) -> Result<CurrencyCode, ParseError> {
     }
 }
 
+fn parse_timestamp(value: &str, field: &'static str) -> Result<OffsetDateTime, ParseError> {
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ParseError::InvalidTimestamp { field })
+}
+
 fn parse_date(value: &str, field: &'static str) -> Result<Date, ParseError> {
-    OffsetDateTime::parse(value, &Rfc3339)
-        .map(|timestamp| timestamp.date())
-        .map_err(|_| ParseError::InvalidTimestamp { field })
+    parse_timestamp(value, field).map(|timestamp| timestamp.date())
+}
+
+fn source_time_or_reject(
+    trades_info: Option<RawTradesInfo>,
+    rejection: &mut Option<ParseError>,
+) -> Option<Time> {
+    let trade = trades_info
+        .and_then(|info| info.trades)
+        .and_then(|trades| trades.into_iter().next())?;
+    keep_or_reject(
+        required(trade.date, "tradesInfo.trades[0].date").and_then(|value| {
+            parse_timestamp(&value, "tradesInfo.trades[0].date")
+                .map(|timestamp| Some(timestamp.to_offset(UtcOffset::UTC).time()))
+        }),
+        rejection,
+    )
 }
 
 fn required(value: Option<String>, field: &'static str) -> Result<String, ParseError> {
@@ -510,6 +568,18 @@ struct RawOperation {
     price: Option<RawMoneyValue>,
     commission: Option<RawMoneyValue>,
     quantity: Option<String>,
+    #[serde(rename = "tradesInfo")]
+    trades_info: Option<RawTradesInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTradesInfo {
+    trades: Option<Vec<RawTrade>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTrade {
+    date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -92,6 +92,8 @@ impl World {
                 gross,
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(account, rub(-gross_minor)),
@@ -112,6 +114,8 @@ impl World {
                 gross,
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(account, gross),

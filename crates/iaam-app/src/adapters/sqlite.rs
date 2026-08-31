@@ -18,6 +18,7 @@ use iaam_core::ids::{AccountId, ClassificationRuleId, InstrumentId, OwnerId, Sou
 use iaam_core::instrument::AliasNamespace;
 use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
+use iaam_ingest::dedup::IdentityScope;
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
@@ -194,11 +195,17 @@ const fn scope_to_store(scope: Scope) -> TokenScope {
 
 #[async_trait]
 impl Store for SqliteAdapter {
-    async fn append_events(&self, events: Vec<Event>) -> Result<Vec<Recorded>, AppError> {
+    async fn append_events(
+        &self,
+        events: Vec<Event>,
+        identity_scope: IdentityScope,
+    ) -> Result<Vec<Recorded>, AppError> {
         self.blocking(move |store| {
             let mut recorded = Vec::with_capacity(events.len());
             for event in &events {
-                let outcome = store.append_event_in_order(event).map_err(store_error)?;
+                let outcome = store
+                    .append_event_in_order(event, identity_scope)
+                    .map_err(store_error)?;
                 recorded.push(match outcome {
                     Appended::Inserted { id } => Recorded::Inserted { id },
                     Appended::Duplicate { existing } => Recorded::Duplicate { existing },

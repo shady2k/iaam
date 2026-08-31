@@ -343,6 +343,8 @@ impl Journal {
                 gross,
                 fee: None,
                 accrued_interest: None,
+                basis_fee: None,
+                basis_fee_exact: None,
             },
             vec![
                 Leg::cash(self.account, gross.checked_negate().unwrap()),

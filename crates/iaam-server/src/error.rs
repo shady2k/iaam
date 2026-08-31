@@ -185,6 +185,9 @@ impl From<AppError> for ApiFailure {
             // code is returned externally, with details in the log.
             | AppError::Reconciliation(_)
             | AppError::Perimeter(_)
+            // A journal whose correction links do not resolve is unusable for the
+            // same reason, and it is our defect rather than the request's.
+            | AppError::Correction(_)
             // The scheduler failed while listing active documents: this is a
             // server failure, not a request error.
             | AppError::Schedule(_)

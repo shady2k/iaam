@@ -289,6 +289,19 @@ fn seeded_trade(
     .unwrap_or_else(|error| panic!("seed trade: {error:?}"))
     .event
 }
+fn reversal(owner: OwnerId, target: &Event, target_id: EventId) -> Event {
+    let mut reversal = target.clone();
+    reversal.id = EventId::new_random();
+    reversal.owner = owner;
+    reversal.relation = Relation::Reversal { target: target_id };
+    reversal.provenance = Provenance::new(
+        SourceId::new_random(),
+        iaam_core::event::provenance::RawHash::parse(&"c".repeat(64))
+            .unwrap_or_else(|| panic!("reversal hash")),
+        ParserVersion("repair/1".to_owned()),
+    );
+    reversal
+}
 
 #[tokio::test]
 async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
@@ -1363,6 +1376,150 @@ async fn sync_refuses_account_with_account_derived_trade_custody() {
         "refusal must name the repair task: {text}"
     );
     assert_eq!(load_all(&services, owner).await.len(), 1);
+}
+
+#[tokio::test]
+async fn sync_allows_account_when_all_affected_trades_are_reversed() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let first = seeded_trade(
+        owner,
+        account,
+        InstrumentId::new_random(),
+        CustodyId(account.inner()),
+        date!(2026 - 03 - 15),
+    );
+    let second = seeded_trade(
+        owner,
+        account,
+        InstrumentId::new_random(),
+        CustodyId(account.inner()),
+        date!(2026 - 03 - 16),
+    );
+    let first_reversal = reversal(owner, &first, first.id);
+    let second_reversal = reversal(owner, &second, second.id);
+    services
+        .store
+        .append_events(
+            vec![first, second, first_reversal, second_reversal],
+            IdentityScope::Source,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed reversed trades: {error}"));
+    let broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("reversed account sync: {error}"));
+
+    assert_eq!(outcome.assertions, 1);
+}
+
+#[tokio::test]
+async fn sync_refusal_counts_only_unreversed_affected_trades() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let first = seeded_trade(
+        owner,
+        account,
+        InstrumentId::new_random(),
+        CustodyId(account.inner()),
+        date!(2026 - 03 - 15),
+    );
+    let second = seeded_trade(
+        owner,
+        account,
+        InstrumentId::new_random(),
+        CustodyId(account.inner()),
+        date!(2026 - 03 - 16),
+    );
+    let first_reversal = reversal(owner, &first, first.id);
+    services
+        .store
+        .append_events(vec![first, second, first_reversal], IdentityScope::Source)
+        .await
+        .unwrap_or_else(|error| panic!("seed partially reversed trades: {error}"));
+    let broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+
+    let error = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("unreversed affected account must be refused");
+
+    assert!(
+        error
+            .to_string()
+            .contains("1 trade event(s) carry account-derived custody"),
+        "refusal must count only unreversed trades: {error}"
+    );
+}
+
+#[tokio::test]
+async fn sync_returns_an_error_when_corrections_do_not_resolve() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let affected = seeded_trade(
+        owner,
+        account,
+        InstrumentId::new_random(),
+        CustodyId(account.inner()),
+        date!(2026 - 03 - 15),
+    );
+    let dangling = reversal(owner, &affected, EventId::new_random());
+    services
+        .store
+        .append_events(vec![affected, dangling], IdentityScope::Source)
+        .await
+        .unwrap_or_else(|error| panic!("seed dangling correction: {error}"));
+    let broker = api(
+        account,
+        SourceId::new_random(),
+        trade(account, InstrumentId::new_random(), CustodyId::new_random()),
+    );
+
+    let error = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("invalid corrections must not lift the refusal");
+
+    // Not AppError::Reconciliation: a journal whose own correction links are
+    // inconsistent is not an inability to verify data, and naming it so would send
+    // an investigator to the reconciliation register instead of the journal.
+    assert!(matches!(error, AppError::Correction(_)));
+    assert!(
+        error.to_string().contains("references non-existent"),
+        "correction error must surface to the caller: {error}"
+    );
 }
 
 #[tokio::test]

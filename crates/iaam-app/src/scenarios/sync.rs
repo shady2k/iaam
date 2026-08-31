@@ -7,6 +7,7 @@ use crate::AppServices;
 use crate::error::AppError;
 use crate::ports::{BrokerChannel, PortfolioAsOf, Principal, Recorded};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
@@ -97,7 +98,7 @@ pub async fn sync_broker(
         .store
         .load_events_through(principal.owner, Date::MAX)
         .await?;
-    let affected = affected_trade_count(&all_events, account);
+    let affected = affected_trade_count(&all_events, account)?;
     if affected > 0 {
         return Err(AppError::Conflict {
             what: format!(
@@ -398,10 +399,11 @@ fn known_records(events: &[Event]) -> Vec<KnownRecord> {
         .map(|event| known_record(event, event.id))
         .collect()
 }
-fn affected_trade_count(events: &[Event], account: AccountId) -> usize {
+fn affected_trade_count(events: &[Event], account: AccountId) -> Result<usize, AppError> {
     let account_custody = CustodyId(account.inner());
-    events
-        .iter()
+    let effective = resolve(events).map_err(AppError::Correction)?;
+    Ok(effective
+        .into_iter()
         .filter(|event| {
             event.account == account
                 && matches!(&event.kind, EventKind::Trade { .. })
@@ -411,7 +413,7 @@ fn affected_trade_count(events: &[Event], account: AccountId) -> usize {
                         && leg.custody == Some(account_custody)
                 })
         })
-        .count()
+        .count())
 }
 
 fn known_record(event: &Event, event_id: EventId) -> KnownRecord {

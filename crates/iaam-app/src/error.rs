@@ -4,6 +4,7 @@
 //! into the report as a quality block; an invariant violation aborts the report and goes
 //! into the log with a correlation identifier.
 
+use iaam_core::event::correction::CorrectionError;
 use iaam_core::perimeter::PerimeterError;
 use iaam_core::projection::ProjectionError;
 use iaam_core::projection::active_instruments::ActiveInstrumentsError;
@@ -47,6 +48,14 @@ pub enum AppError {
     Reconciliation(#[source] ObserveError),
     #[error("perimeter not assessed: {0}")]
     Perimeter(#[source] PerimeterError),
+    /// The journal's corrections do not resolve: a reversal or replacement points at
+    /// an event the slice does not contain, or one event is corrected twice. Separate
+    /// from `Reconciliation`, because that names an inability to verify data, while
+    /// this names a journal whose own links are inconsistent — and reporting it as
+    /// «reconciliation not built» would send an investigator to the reconciliation
+    /// register instead of the corrections in the journal.
+    #[error("journal corrections do not resolve: {0}")]
+    Correction(#[source] CorrectionError),
     /// The capability is not enabled by configuration, not broken: encryption
     /// of access to the broker without a key. Separate from `Store`, because
     /// these are different causes for an external agent: one is fixed by configuring
@@ -113,6 +122,7 @@ impl AppError {
             Self::Reconciliation(_) => "reconciliation_failed",
             Self::Schedule(_) => "schedule_not_built",
             Self::Perimeter(_) => "perimeter_assessment_failed",
+            Self::Correction(_) => "corrections_do_not_resolve",
             Self::NotConfigured { .. } => "not_configured",
             Self::Random(_) => "random_unavailable",
             Self::Conflict { .. } => "already_exists",

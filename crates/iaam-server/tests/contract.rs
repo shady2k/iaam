@@ -793,13 +793,15 @@ async fn health_is_public_and_reports_versions() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Version 6: version 4 added CorporateAction, OfferExercise and the income
+    // Version 7: version 4 added CorporateAction, OfferExercise and the income
     // type (§4.7); version 5 added the source time inside EffectiveOrder;
-    // version 6 added the basis-only trade fee. One version cannot denote two
-    // schemas (§4.1). An external agent reads this number to determine whether
-    // it can parse the response, so it is fixed here rather than derived from
-    // the code — a silent bump would tell that agent nothing had changed.
-    assert_eq!(body["schema_version"], 6);
+    // version 6 added the basis-only trade fee; version 7 added
+    // ImportCoverageGap for refused import dimensions. One version cannot
+    // denote two schemas (§4.1). An external agent reads this number to
+    // determine whether it can parse the response, so it is fixed here rather
+    // than derived from the code — a silent bump would tell that agent nothing
+    // had changed.
+    assert_eq!(body["schema_version"], 7);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version

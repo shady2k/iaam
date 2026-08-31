@@ -178,6 +178,7 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         | EventKind::OpeningCash { .. }
         | EventKind::Valuation { .. }
         | EventKind::ControlAssertion { .. }
+        | EventKind::ImportCoverageGap { .. }
         // A corporate action and an offer do not become classification
         // subjects. Returning them as inflows would mean asking
         // the owner «this inflow — is it income?» about amortisation and recording

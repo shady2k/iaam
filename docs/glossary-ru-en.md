@@ -90,6 +90,7 @@ is how you match a term in them to the code.
 | невычислимо | not computable | the `NotComputable` type |
 | неизвестно | unknown | never render as zero |
 | разрыв | gap | `BasisGap`, `AllocationGap` |
+| разрыв покрытия | coverage gap | `ImportCoverageGap`; refused rows leave named dimensions unconfirmed |
 | сверка | reconciliation | |
 | расхождение | discrepancy | |
 | материальная проблема | material issue | |

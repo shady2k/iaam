@@ -10,5 +10,6 @@ pub mod schedule;
 
 pub mod broker_dictionary;
 pub mod classification;
+pub mod custody_repair;
 pub mod documents;
 pub mod reconciliation;

@@ -400,20 +400,21 @@ fn known_records(events: &[Event]) -> Vec<KnownRecord> {
         .collect()
 }
 fn affected_trade_count(events: &[Event], account: AccountId) -> Result<usize, AppError> {
-    let account_custody = CustodyId(account.inner());
     let effective = resolve(events).map_err(AppError::Correction)?;
     Ok(effective
         .into_iter()
-        .filter(|event| {
-            event.account == account
-                && matches!(&event.kind, EventKind::Trade { .. })
-                && event.legs.iter().any(|leg| {
-                    leg.account == account
-                        && leg.quantity.is_some()
-                        && leg.custody == Some(account_custody)
-                })
-        })
+        .filter(|event| is_affected_trade(event, account))
         .count())
+}
+
+/// T4's custody defect: an effective trade carries the account identifier as custody.
+pub(crate) fn is_affected_trade(event: &Event, account: AccountId) -> bool {
+    let account_custody = CustodyId(account.inner());
+    event.account == account
+        && matches!(&event.kind, EventKind::Trade { .. })
+        && event.legs.iter().any(|leg| {
+            leg.account == account && leg.quantity.is_some() && leg.custody == Some(account_custody)
+        })
 }
 
 fn known_record(event: &Event, event_id: EventId) -> KnownRecord {

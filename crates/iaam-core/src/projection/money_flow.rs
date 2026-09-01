@@ -269,32 +269,26 @@ impl MoneyFlow {
         Ok(window.covers(on))
     }
 
-    #[must_use]
     pub fn came_in(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.came_in, currency, "came_in")
     }
 
-    #[must_use]
     pub fn went_out(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.went_out, currency, "went_out")
     }
 
-    #[must_use]
     pub fn earned_by_capital(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.earned_by_capital, currency, "earned_by_capital")
     }
 
-    #[must_use]
     pub fn moved_into_assets(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.moved_into_assets, currency, "moved_into_assets")
     }
 
-    #[must_use]
     pub fn fees(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.fees, currency, "fees")
     }
 
-    #[must_use]
     pub fn taxes(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.taxes, currency, "taxes")
     }
@@ -303,18 +297,15 @@ impl MoneyFlow {
     ///
     /// The ledger is signed so each account's identity closes; this accessor is
     /// one-sided for the reader and reports how much moved between accounts.
-    #[must_use]
     pub fn internal_transfers(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total_positive(&self.internal_transfers, currency, "internal_transfers")
     }
 
-    #[must_use]
     pub fn cash_delta(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.cash_delta, currency, "cash_delta")
     }
 
     /// The currencies present in any quantity or cash delta.
-    #[must_use]
     pub fn currencies(&self) -> impl Iterator<Item = CurrencyCode> + '_ {
         let mut currencies = BTreeSet::new();
         for ledger in self.ledgers() {
@@ -340,7 +331,6 @@ impl MoneyFlow {
     }
 
     /// The contour-wide residual in a currency.
-    #[must_use]
     pub fn residual(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         let total = self
             .accounts()
@@ -355,7 +345,6 @@ impl MoneyFlow {
     /// Reported separately from `residual` on purpose. Two accounts wrong in
     /// opposite directions sum to zero, and a report that showed only the total
     /// would call that success while being wrong twice.
-    #[must_use]
     pub fn residuals_by_account(&self) -> Result<Vec<(AccountId, Money)>, MoneyFlowError> {
         let currencies: Vec<_> = self.currencies().collect();
         let mut rows = Vec::new();

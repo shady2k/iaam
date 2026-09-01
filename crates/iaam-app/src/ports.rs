@@ -362,6 +362,14 @@ pub struct CategoryRuleView {
     pub retired_at: Option<String>,
     pub replaces: Option<CategoryRuleId>,
 }
+/// A category rule to create or amend through the category port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryRuleUpsert {
+    pub matcher: String,
+    pub category: CategoryId,
+    pub valid_from: Option<Date>,
+    pub valid_to: Option<Date>,
+}
 
 /// Port for the owner's living category reference and rules.
 #[async_trait]
@@ -384,10 +392,7 @@ pub trait CategoryStore: Send + Sync {
     async fn create_category_rule(
         &self,
         owner: OwnerId,
-        matcher: String,
-        category: CategoryId,
-        valid_from: Option<Date>,
-        valid_to: Option<Date>,
+        rule: CategoryRuleUpsert,
         replaces: Option<CategoryRuleId>,
     ) -> Result<CategoryRuleView, AppError>;
     async fn retire_category_rule(
@@ -782,10 +787,7 @@ impl CategoryStore for UnavailableCategoryStore {
     async fn create_category_rule(
         &self,
         _owner: OwnerId,
-        _matcher: String,
-        _category: CategoryId,
-        _valid_from: Option<Date>,
-        _valid_to: Option<Date>,
+        _rule: CategoryRuleUpsert,
         _replaces: Option<CategoryRuleId>,
     ) -> Result<CategoryRuleView, AppError> {
         Err(AppError::NotConfigured {

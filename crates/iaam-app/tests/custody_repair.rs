@@ -123,6 +123,7 @@ fn affected_trade(owner: OwnerId, account: AccountId, instrument: InstrumentId) 
         source_time: None,
         idempotency_key: None,
         source_operation_id: Some(format!("old-{instrument:?}")),
+        source_category: None,
     };
     normalize(
         &operation,

@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use crate::error::AppError;
 use crate::ports::{
     AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
-    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleView, CategoryStore,
+    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView,
+    CategoryStore,
     CategoryView, ClassificationRuleStore, ClassificationRuleView, CustodyView,
     InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal, Recorded, Scope,
     SoleOwner, Store, TokenAdmin, TokenView,
@@ -926,22 +927,19 @@ impl CategoryStore for SqliteAdapter {
     async fn create_category_rule(
         &self,
         owner: OwnerId,
-        matcher: String,
-        category: CategoryId,
-        valid_from: Option<Date>,
-        valid_to: Option<Date>,
+        rule: CategoryRuleUpsert,
         replaces: Option<CategoryRuleId>,
     ) -> Result<CategoryRuleView, AppError> {
         self.blocking(move |store| {
-            let rule = NewCategoryRule {
-                matcher_json: matcher,
-                category: category.inner(),
-                valid_from,
-                valid_to,
+            let store_rule = NewCategoryRule {
+                matcher_json: rule.matcher,
+                category: rule.category.inner(),
+                valid_from: rule.valid_from,
+                valid_to: rule.valid_to,
             };
             let row = match replaces {
-                Some(previous) => store.amend_category_rule(owner, previous, rule),
-                None => store.insert_category_rule(owner, rule, None),
+                Some(previous) => store.amend_category_rule(owner, previous, store_rule),
+                None => store.insert_category_rule(owner, store_rule, None),
             }
             .map_err(category_store_error)?;
             Ok(category_rule_view(row))

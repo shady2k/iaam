@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::{CategoryRuleView, CategoryView, Principal};
+use crate::ports::{CategoryRuleUpsert, CategoryRuleView, CategoryView, Principal};
 
 #[derive(Debug, Clone)]
 pub struct CategoryRuleInput {
@@ -127,16 +127,15 @@ pub async fn create_category_rule(
         });
     }
 
+    let rule = CategoryRuleUpsert {
+        matcher: matcher_json(&input.matcher)?,
+        category: input.category,
+        valid_from: input.interval.from,
+        valid_to: input.interval.to,
+    };
     services
         .categories
-        .create_category_rule(
-            principal.owner,
-            matcher_json(&input.matcher)?,
-            input.category,
-            input.interval.from,
-            input.interval.to,
-            input.replaces,
-        )
+        .create_category_rule(principal.owner, rule, input.replaces)
         .await
 }
 

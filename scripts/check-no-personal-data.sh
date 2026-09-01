@@ -31,7 +31,12 @@ err() { echo "PRIVACY: $*" >&2; fail=1; }
 # statement is not, and the two are told apart by where they live, because
 # nothing in the bytes distinguishes them.
 DATA_SUFFIXES='\.(csv|tsv|db|sqlite3?|xlsx?|xls|zip|ofx|qif|pdf)$'
-ALLOWED_DATA_DIRS='^(tests/fixtures/|crates/[^/]+/tests/fixtures/|docs/)'
+# A skill's fixtures belong to the skill: check-fixtures.sh freezes what lives
+# under tests/fixtures/ and demands a Rust test name it, which a Python
+# importer's sample cannot satisfy. The location is the whitelist, exactly as it
+# is for the others — a real export dropped here would be a deliberate act, not
+# an accident.
+ALLOWED_DATA_DIRS='^(tests/fixtures/|crates/[^/]+/tests/fixtures/|\.claude/skills/[^/]+/fixtures/|docs/)'
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   if ! printf '%s\n' "$path" | grep -qE "$ALLOWED_DATA_DIRS"; then

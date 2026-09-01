@@ -1,0 +1,54 @@
+{
+  "rows_in_file": 13,
+  "submitted": 10,
+  "dropped_second_leg": 1,
+  "skipped_outside_contour": 2,
+  "own_transfers": 1,
+  "unmatched_legs": 0,
+  "unaccounted": 0,
+  "rejected": 0,
+  "operations": [
+    {
+      "kind": "withdrawal",
+      "amount": "100.00",
+      "ordinal": 1
+    },
+    {
+      "kind": "withdrawal",
+      "amount": "42.00"
+    },
+    {
+      "kind": "withdrawal",
+      "amount": "100.00",
+      "ordinal": 2
+    },
+    {
+      "kind": "transfer",
+      "amount": "5000.00"
+    },
+    {
+      "kind": "withdrawal",
+      "amount": "700.00"
+    },
+    {
+      "kind": "deposit",
+      "amount": "12000.00"
+    },
+    {
+      "kind": "income",
+      "amount": "12.34"
+    },
+    {
+      "kind": "income",
+      "amount": "350.00"
+    },
+    {
+      "kind": "transfer",
+      "amount": "2000.00"
+    },
+    {
+      "kind": "refund",
+      "amount": "80.00"
+    }
+  ]
+}

@@ -116,8 +116,15 @@ prerequisites for a useful August rather than nice-to-haves. They are listed in
 
 ### 2. What a skill holds, and what it must never hold
 
+An import skill is **checked into this repository**. What an institution prints
+in its export is public knowledge — anyone with an account at that bank sees the
+same columns — so it belongs with the software that reads it, and a second bank
+is then a second skill rather than a change to a crate. What passes through the
+skill at run time is a different matter entirely, and §2.1 and the "never holds"
+list below draw that line.
+
 **Holds** — everything that is true about the institution and false about the
-owner:
+person whose accounts these are:
 
 - the column mapping: which column is the date, the amount, the description,
   the institution's own category;
@@ -128,9 +135,10 @@ owner:
   leg**; submitting both double-counts it, so the skill submits one and drops
   the other by an explicit rule, not by luck of ordering.
 
-**Never holds** — anything that identifies the owner or his money: account
-UUIDs, account names, balances, counterparty names, amounts, or the export
-itself. Accounts are resolved through `GET /v1/accounts` at run time (I3). A
+**Never holds** — anything that identifies a person or their money: account
+UUIDs, account names, balances, counterparty names, amounts, or a row of any
+real export. The file is public the moment it is pushed, and a value published
+in a commit outlives the commit that removes it. Accounts are resolved through `GET /v1/accounts` at run time (I3). A
 skill is checked into the repository; the owner's data is not.
 
 ### 2.1 The perimeter is an input, not skill knowledge

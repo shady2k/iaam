@@ -28,7 +28,3 @@ __pycache__/
 
 # Отчёт покрытия: артефакт `make coverage`, а не исходник.
 lcov.info
-
-# Personal, per-institution import skills. Bank knowledge is not shipped
-# with the public software: it lives in the operator's own skills directory.
-.claude/skills/

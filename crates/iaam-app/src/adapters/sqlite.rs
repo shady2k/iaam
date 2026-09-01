@@ -11,8 +11,7 @@ use crate::error::AppError;
 use crate::ports::{
     AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
     BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView,
-    CategoryStore,
-    CategoryView, ClassificationRuleStore, ClassificationRuleView, CustodyView,
+    CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView, CustodyView,
     InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal, Recorded, Scope,
     SoleOwner, Store, TokenAdmin, TokenView,
 };

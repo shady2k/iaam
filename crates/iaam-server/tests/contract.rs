@@ -4323,3 +4323,76 @@ async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
     assert_eq!(repeated["already_reversed"], 1);
     assert_eq!(repeated["written"], 0);
 }
+#[tokio::test]
+async fn the_same_declared_source_yields_the_same_source_id() {
+    let (harness, path) = harness_on_disk();
+    let account = harness.account.inner();
+    let body = json!({
+        "source_label": "paste",
+        "source": { "account": account, "channel": "paste" },
+        "operations": [{
+            "account": account,
+            "type": "withdrawal",
+            "amount": "123.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" }
+        }]
+    });
+
+    let (first, _) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, _) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(second, StatusCode::OK);
+
+    let sources = distinct_source_ids(&path, &harness.owner_token);
+    assert_eq!(sources.len(), 1, "expected one source, got {sources:?}");
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn an_empty_channel_is_rejected() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    for channel in ["", "x23456789012345678901234567890123"] {
+        let (status, body) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "source_label": "paste",
+                    "source": { "account": account, "channel": channel },
+                    "operations": []
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["field"], "source.channel");
+    }
+}
+
+fn distinct_source_ids(path: &std::path::Path, token: &str) -> std::collections::BTreeSet<SourceId> {
+    let store = SqliteStore::open(path).expect("second connection");
+    let owner = store
+        .find_token(&hash_token(token))
+        .expect("owner token")
+        .expect("owner token record")
+        .owner;
+    store
+        .load_events(owner)
+        .expect("owner events")
+        .into_iter()
+        .map(|event| event.provenance.source())
+        .collect()
+}

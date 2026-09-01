@@ -598,11 +598,26 @@ impl OperationDto {
     }
 }
 
+/// The source the caller declares for this batch.
+///
+/// Without it the server mints a random source per request, and nothing
+/// deduplicates across requests: a corrected re-submission would add a second
+/// set of rows rather than replace the first (spec §6).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeclaredSourceDto {
+    /// Account the rows belong to.
+    pub account: Uuid,
+    /// How the rows arrived: `file`, `paste`, `manual`.
+    pub channel: String,
+}
+
 /// Intake request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitOperationsRequest {
     /// Source label: manual input, a specific agent, a specific file.
     pub source_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<DeclaredSourceDto>,
     pub operations: Vec<OperationDto>,
 }
 

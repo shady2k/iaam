@@ -1216,7 +1216,29 @@ pub async fn ingest_operations(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let source = SourceId::new_random();
+    let source = match &request.source {
+        Some(declared) => {
+            let channel = declared.channel.trim();
+            if channel.is_empty() || channel.len() > 32 {
+                return Err(ApiFailure::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    ApiError {
+                        code: "invalid_request".into(),
+                        message: "channel must be 1..=32 characters".into(),
+                        field: Some("source.channel".into()),
+                        expected: Some(
+                            "a short channel name such as file, paste or manual".into(),
+                        ),
+                        actual: Some(declared.channel.clone()),
+                        correlation_id: None,
+                    },
+                ));
+            }
+            SourceId::declared(principal.owner, AccountId(declared.account), channel)
+        }
+        // No declaration: today's behaviour, so existing callers keep working.
+        None => SourceId::new_random(),
+    };
 
     // Parsing the DTO yields a verdict for each row: one unrecognised operation
     // does not invalidate the others (§10.1).

@@ -1,8 +1,14 @@
 //! Scenarios for the owner's category reference and assignment rules.
 
-use iaam_core::category::{CategoryAssignment, CategoryInterval, CategoryMatcher, CategoryRule, CategorySubject};
+use std::collections::BTreeMap;
+
+use iaam_core::category::{
+    CategoryAssignment, CategoryInterval, CategoryMatcher, CategoryRule, CategorySubject,
+};
 use iaam_core::event::Event;
+use iaam_core::event::kind::EventKind;
 use iaam_core::ids::{CategoryGroupId, CategoryId, CategoryRuleId};
+use iaam_core::money::Money;
 use iaam_core::projection::money_flow::CategoryIndex;
 use serde_json::{Value, json};
 
@@ -16,6 +22,29 @@ pub struct CategoryRuleInput {
     pub category: CategoryId,
     pub interval: CategoryInterval,
     pub replaces: Option<CategoryRuleId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryRuleImpact {
+    pub rows: u64,
+    /// By month, oldest first: what moved, and between which categories.
+    pub months: Vec<MonthlyImpact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonthlyImpact {
+    /// First day of the month.
+    pub month: time::Date,
+    pub moved: Vec<CategoryMove>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryMove {
+    /// `None` means the row was not previously decomposed.
+    pub from: Option<CategoryId>,
+    pub to: CategoryId,
+    pub amount: Money,
+    pub rows: u64,
 }
 
 pub async fn create_group(
@@ -94,6 +123,7 @@ pub async fn create_category_rule(
             actual: format!("{:?}", input.interval),
         });
     }
+
     services
         .categories
         .create_category_rule(
@@ -115,6 +145,120 @@ pub async fn list_category_rules(
         .categories
         .list_category_rules(principal.owner)
         .await
+}
+
+pub async fn preview_category_rule(
+    services: &AppServices,
+    principal: &Principal,
+    proposed: &CategoryRule,
+) -> Result<CategoryRuleImpact, AppError> {
+    let active_rules = services
+        .categories
+        .list_category_rules(principal.owner)
+        .await?
+        .into_iter()
+        .filter(|rule| rule.retired_at.is_none())
+        .map(domain_rule)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let current = LoadedCategoryIndex {
+        rules: active_rules.clone(),
+        versions: Vec::new(),
+    };
+    let mut proposed_rules = active_rules;
+    proposed_rules.push(proposed.clone());
+    let proposed_index = LoadedCategoryIndex {
+        rules: proposed_rules,
+        versions: Vec::new(),
+    };
+
+    let events = services
+        .store
+        .load_events_through(principal.owner, time::Date::MAX)
+        .await?;
+    let mut grouped = BTreeMap::<
+        (time::Date, Option<CategoryId>, CategoryId, iaam_core::money::CurrencyCode),
+        (Money, u64),
+    >::new();
+    let mut rows = 0_u64;
+
+    for event in events {
+        if !matches!(event.kind, EventKind::CashOut { .. }) {
+            continue;
+        }
+
+        let previous = match current.assignment(&event) {
+            CategoryAssignment::Assigned { category, .. } => Some(category),
+            CategoryAssignment::NotDecomposed => None,
+        };
+        let CategoryAssignment::Assigned { category: next, .. } =
+            proposed_index.assignment(&event)
+        else {
+            continue;
+        };
+        if previous == Some(next) {
+            continue;
+        }
+
+        let on = event.dates.effective_date().ok_or_else(|| AppError::Invalid {
+            field: "event.date".to_owned(),
+            expected: "an effective date".to_owned(),
+            actual: event.id.0.to_string(),
+        })?;
+        let month = time::Date::from_calendar_date(on.year(), on.month(), 1).map_err(|error| {
+            AppError::Invalid {
+                field: "event.date".to_owned(),
+                expected: "a valid calendar date".to_owned(),
+                actual: error.to_string(),
+            }
+        })?;
+        let EventKind::CashOut { amount } = event.kind else {
+            unreachable!("cash-out kind was checked above");
+        };
+        let amount = amount
+            .checked_negate()
+            .map_err(|error| AppError::Store(format!("negate category preview amount: {error}")))?;
+        let key = (month, previous, next, amount.currency());
+        let entry = grouped
+            .entry(key)
+            .or_insert((Money::zero(amount.currency()), 0));
+        entry.0 = entry
+            .0
+            .try_add(amount)
+            .map_err(|error| AppError::Store(format!("sum category preview amount: {error}")))?;
+        entry.1 = entry
+            .1
+            .checked_add(1)
+            .ok_or_else(|| AppError::Store("category preview row count overflow".to_owned()))?;
+        rows = rows
+            .checked_add(1)
+            .ok_or_else(|| AppError::Store("category preview row count overflow".to_owned()))?;
+    }
+
+    let mut months: Vec<MonthlyImpact> = Vec::new();
+    for ((month, from, to, _currency), (amount, moved_rows)) in grouped {
+        match months.last_mut() {
+            Some(existing) if existing.month == month => {
+                existing.moved.push(CategoryMove {
+                    from,
+                    to,
+                    amount,
+                    rows: moved_rows,
+                });
+            }
+            _ => months.push(MonthlyImpact {
+                month,
+                moved: vec![CategoryMove {
+                    from,
+                    to,
+                    amount,
+                    rows: moved_rows,
+                }],
+            }),
+        }
+    }
+
+    Ok(CategoryRuleImpact { rows, months })
 }
 
 pub async fn retire_category_rule(

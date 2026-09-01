@@ -5,12 +5,13 @@ use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
 use iaam_app::ports::{AccountView, Clock, Principal, Scope};
 use iaam_app::scenarios::categories::{
-    CategoryRuleInput, create_category, create_category_rule, create_group, retire_group,
+    CategoryRuleInput, create_category, create_category_rule, create_group, preview_category_rule,
+    retire_group,
 };
 use iaam_app::scenarios::reports::{MoneyFlowQuery, money_flow};
-use iaam_core::category::{CategoryInterval, CategoryMatcher};
+use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRule};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{AccountId, CategoryId, CategoryGroupId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, CategoryId, CategoryGroupId, CategoryRuleId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind};
@@ -281,4 +282,115 @@ async fn a_category_cannot_be_created_under_a_retired_group() {
         error,
         AppError::Invalid { ref field, .. } if field == "group"
     ));
+}
+
+#[tokio::test]
+async fn a_preview_reports_what_would_move_and_writes_nothing() {
+    let ctx = harness();
+    let account = ctx.account("Card").await;
+    ctx.submit_outflow(account, 1_000, "2026-07-05", Some("Пекарни"))
+        .await;
+    ctx.submit_outflow(account, 2_000, "2026-07-12", Some("Пекарни"))
+        .await;
+    ctx.submit_outflow(account, 3_000, "2026-08-05", Some("Пекарни"))
+        .await;
+
+    let group = ctx.create_group("Usual Expenses").await;
+    let existing = ctx.create_category(group, "Продукты").await;
+    ctx.create_rule_on_source_category("Супермаркеты", existing, None, None)
+        .await;
+    let proposed_category = ctx.create_category(group, "Кафе").await;
+    let proposed = CategoryRule {
+        id: CategoryRuleId::new_random(),
+        version: 2,
+        interval: CategoryInterval {
+            from: None,
+            to: None,
+        },
+        matcher: CategoryMatcher::SourceCategory {
+            value: "Пекарни".to_owned(),
+        },
+        category: proposed_category,
+    };
+
+    let before = ctx
+        .services
+        .categories
+        .list_category_rules(ctx.principal.owner)
+        .await
+        .expect("rules")
+        .len();
+    let impact = preview_category_rule(&ctx.services, &ctx.principal, &proposed)
+        .await
+        .expect("preview");
+    let after = ctx
+        .services
+        .categories
+        .list_category_rules(ctx.principal.owner)
+        .await
+        .expect("rules")
+        .len();
+
+    assert_eq!(before, after, "a preview must not write a rule");
+    assert_eq!(impact.rows, 3);
+    assert_eq!(impact.months.len(), 2);
+    assert_eq!(impact.months[0].month, date!(2026 - 07 - 01));
+    assert_eq!(impact.months[1].month, date!(2026 - 08 - 01));
+    assert_eq!(impact.months[0].moved.len(), 1);
+    assert_eq!(impact.months[0].moved[0].from, None);
+    assert_eq!(impact.months[0].moved[0].to, proposed_category);
+    assert_eq!(impact.months[0].moved[0].amount, Money::new(PostedMinor::new(3_000), CurrencyCode::Rub));
+    assert_eq!(impact.months[0].moved[0].rows, 2);
+    assert_eq!(impact.months[1].moved.len(), 1);
+    assert_eq!(impact.months[1].moved[0].from, None);
+    assert_eq!(impact.months[1].moved[0].to, proposed_category);
+    assert_eq!(impact.months[1].moved[0].amount, Money::new(PostedMinor::new(3_000), CurrencyCode::Rub));
+    assert_eq!(impact.months[1].moved[0].rows, 1);
+}
+
+#[tokio::test]
+async fn a_preview_with_no_changes_is_empty() {
+    let ctx = harness();
+    let account = ctx.account("Card").await;
+    ctx.submit_outflow(account, 1_000, "2026-08-05", Some("Супермаркеты"))
+        .await;
+    let group = ctx.create_group("Usual Expenses").await;
+    let category = ctx.create_category(group, "Продукты").await;
+    ctx.create_rule_on_source_category("Супермаркеты", category, None, None)
+        .await;
+
+    let proposed = CategoryRule {
+        id: CategoryRuleId::new_random(),
+        version: 2,
+        interval: CategoryInterval {
+            from: None,
+            to: None,
+        },
+        matcher: CategoryMatcher::SourceCategory {
+            value: "Супермаркеты".to_owned(),
+        },
+        category,
+    };
+
+    let before = ctx
+        .services
+        .categories
+        .list_category_rules(ctx.principal.owner)
+        .await
+        .expect("rules")
+        .len();
+    let impact = preview_category_rule(&ctx.services, &ctx.principal, &proposed)
+        .await
+        .expect("preview");
+    let after = ctx
+        .services
+        .categories
+        .list_category_rules(ctx.principal.owner)
+        .await
+        .expect("rules")
+        .len();
+
+    assert_eq!(before, after);
+    assert_eq!(impact.rows, 0);
+    assert!(impact.months.is_empty());
 }

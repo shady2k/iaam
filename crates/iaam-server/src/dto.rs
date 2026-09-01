@@ -13,10 +13,10 @@ use std::fmt;
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
-use iaam_app::scenarios::reports::{AccountBalanceRow, MoneyFlowReport};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, ClassificationRuleView, IssuedToken, Scope, TokenView,
 };
+use iaam_app::scenarios::reports::{AccountBalanceRow, MoneyFlowReport};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -24,6 +24,8 @@ use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindo
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::projection::money_flow::MoneyFlowError;
+use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
 use iaam_core::returns::zero_reinvestment::{
     BondScenarioResult, IrrLabel, LifetimeCohortMetric, ProspectiveMetric, ZeroReinvestmentMetrics,
 };
@@ -32,8 +34,6 @@ use iaam_core::returns::{
     ExecutabilityShares, LiquidationEstimate, MaterialIssue, NotComputable, PositionCoverage,
     ReturnsReport, UncoveredPosition,
 };
-use iaam_core::projection::money_flow::MoneyFlowError;
-use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
 use iaam_core::rules::{ExpectedPosting, PostingKind};
 use iaam_core::valuation::{
     PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, QuotationBasis,
@@ -1937,8 +1937,18 @@ impl MoneyFlowReportDto {
             .map(|currency| {
                 Ok(MoneyFlowCurrencyDto {
                     currency: CurrencyDto::from_domain(currency),
-                    came_in: report.flow.came_in(currency)?.to_calc_dec().inner().to_string(),
-                    went_out: report.flow.went_out(currency)?.to_calc_dec().inner().to_string(),
+                    came_in: report
+                        .flow
+                        .came_in(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                    went_out: report
+                        .flow
+                        .went_out(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
                     earned_by_capital: report
                         .flow
                         .earned_by_capital(currency)?
@@ -1951,8 +1961,18 @@ impl MoneyFlowReportDto {
                         .to_calc_dec()
                         .inner()
                         .to_string(),
-                    fees: report.flow.fees(currency)?.to_calc_dec().inner().to_string(),
-                    taxes: report.flow.taxes(currency)?.to_calc_dec().inner().to_string(),
+                    fees: report
+                        .flow
+                        .fees(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                    taxes: report
+                        .flow
+                        .taxes(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
                     internal_transfers: report
                         .flow
                         .internal_transfers(currency)?

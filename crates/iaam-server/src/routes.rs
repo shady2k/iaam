@@ -22,7 +22,9 @@ use iaam_app::scenarios::market_reference::{
     list_market_key_rate as read_market_key_rate, list_market_prices as read_market_prices,
 };
 use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, statuses};
-use iaam_app::scenarios::reports::{MoneyFlowQuery, account_balances, money_flow, ReturnsQuery, returns};
+use iaam_app::scenarios::reports::{
+    MoneyFlowQuery, ReturnsQuery, account_balances, money_flow, returns,
+};
 use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
     sync_market_with_services as run_market_sync,
@@ -48,14 +50,13 @@ use crate::ServerState;
 use crate::dto::{
     AccountBalanceDto, AccountDto, AddBrokerAccessRequest, BrokerAccessDto,
     BrokerAccessUpdateRequest, BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest,
-    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
-    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest,
-    CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest,
-    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
-    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto,
-    MarketSourceDto, MarketSyncRequest, MoneyFlowReportDto, OwnerBalanceRequest,
-    QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams, ReconciliationStatusDto,
-    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
+    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
+    EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
+    MarketKeyRateDto, MarketPriceDto, MarketSourceDto, MarketSyncRequest, MoneyFlowReportDto,
+    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
+    ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
     SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
     VerdictDto,
 };
@@ -1228,9 +1229,7 @@ pub async fn ingest_operations(
                         code: "invalid_request".into(),
                         message: "channel must be 1..=32 characters".into(),
                         field: Some("source.channel".into()),
-                        expected: Some(
-                            "a short channel name such as file, paste or manual".into(),
-                        ),
+                        expected: Some("a short channel name such as file, paste or manual".into()),
                         actual: Some(declared.channel.clone()),
                         correlation_id: None,
                     },
@@ -1404,8 +1403,7 @@ pub async fn flow_report(
         to: parse_query_date("to", &params.to)?,
     };
     let report = money_flow(&state.services, &principal, &query).await?;
-    let dto = MoneyFlowReportDto::from_domain(&report)
-        .map_err(iaam_app::error::AppError::from)?;
+    let dto = MoneyFlowReportDto::from_domain(&report).map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
 }
 

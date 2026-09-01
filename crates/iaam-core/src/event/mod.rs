@@ -1927,7 +1927,10 @@ mod tests {
                 amount: rub(-130_000),
                 origin: TaxOrigin::SelfPaid,
             },
-            vec![Leg::tax(account, rub(-65_000)), Leg::tax(account, rub(-65_000))],
+            vec![
+                Leg::tax(account, rub(-65_000)),
+                Leg::tax(account, rub(-65_000)),
+            ],
             account,
         );
         assert!(matches!(

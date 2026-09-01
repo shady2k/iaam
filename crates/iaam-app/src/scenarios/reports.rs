@@ -15,8 +15,8 @@ use iaam_core::projection::balances::{Balances, PositionKey};
 use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
-use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
 use iaam_core::reconciliation::claim::AssertionPeriod;
+use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue};
@@ -181,9 +181,8 @@ pub async fn account_balances(
             .iter_cash()
             .filter_map(|(owner_account, money)| (owner_account == account).then_some(money))
             .collect();
-        let reconciliation = crate::scenarios::reconciliation::statuses_for_account(
-            &ledger, account, period,
-        );
+        let reconciliation =
+            crate::scenarios::reconciliation::statuses_for_account(&ledger, account, period);
         let positions = balances
             .iter_positions()
             .filter_map(|(key, quantity)| (key.account == account).then_some((*key, quantity)))

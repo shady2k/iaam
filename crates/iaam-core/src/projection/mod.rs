@@ -10,10 +10,10 @@
 pub mod active_instruments;
 pub mod balances;
 pub mod flows;
-pub mod money_flow;
 pub mod income;
 pub mod invariants;
 pub mod lots;
+pub mod money_flow;
 pub mod offers;
 pub mod ownership;
 pub mod state;

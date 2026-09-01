@@ -7,8 +7,8 @@
 use iaam_core::event::correction::CorrectionError;
 use iaam_core::perimeter::PerimeterError;
 use iaam_core::projection::ProjectionError;
-use iaam_core::projection::money_flow::MoneyFlowError;
 use iaam_core::projection::active_instruments::ActiveInstrumentsError;
+use iaam_core::projection::money_flow::MoneyFlowError;
 use iaam_core::reconciliation::observed::ObserveError;
 use thiserror::Error;
 use uuid::Uuid;

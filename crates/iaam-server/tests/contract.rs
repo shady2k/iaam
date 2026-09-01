@@ -4382,7 +4382,10 @@ async fn an_empty_channel_is_rejected() {
     }
 }
 
-fn distinct_source_ids(path: &std::path::Path, token: &str) -> std::collections::BTreeSet<SourceId> {
+fn distinct_source_ids(
+    path: &std::path::Path,
+    token: &str,
+) -> std::collections::BTreeSet<SourceId> {
     let store = SqliteStore::open(path).expect("second connection");
     let owner = store
         .find_token(&hash_token(token))
@@ -4409,9 +4412,7 @@ async fn flow_report_exposes_all_quantities_and_residual() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{contour_response}");
-    let contour_id = contour_response["contour"]
-        .as_str()
-        .expect("contour id");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
     let operations = json!({
         "source_label": "manual entry",
         "operations": [
@@ -4443,9 +4444,7 @@ async fn flow_report_exposes_all_quantities_and_residual() {
     let (status, body) = call(
         &harness.router,
         get(
-            &format!(
-                "/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"
-            ),
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
             Some(&harness.owner_token),
         ),
     )
@@ -4490,16 +4489,12 @@ async fn flow_report_rejects_a_reversed_interval() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{contour_response}");
-    let contour_id = contour_response["contour"]
-        .as_str()
-        .expect("contour id");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
 
     let (status, body) = call(
         &harness.router,
         get(
-            &format!(
-                "/v1/reports/flow?contour={contour_id}&from=2026-08-31&to=2026-08-01"
-            ),
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-31&to=2026-08-01"),
             Some(&harness.owner_token),
         ),
     )
@@ -4521,9 +4516,7 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{contour_response}");
-    let contour_id = contour_response["contour"]
-        .as_str()
-        .expect("contour id");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
     let operations = json!({
         "source_label": "manual entry",
         "operations": [
@@ -4570,8 +4563,14 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
     assert_eq!(row["account"], harness.account.inner().to_string());
     assert_eq!(row["cash"][0]["currency"], "RUB");
     assert_eq!(row["cash"][0]["amount"], "3000.00");
-    assert_eq!(row["positions"][0]["instrument"], harness.instrument.inner().to_string());
-    assert_eq!(row["positions"][0]["custody"], harness.custody.inner().to_string());
+    assert_eq!(
+        row["positions"][0]["instrument"],
+        harness.instrument.inner().to_string()
+    );
+    assert_eq!(
+        row["positions"][0]["custody"],
+        harness.custody.inner().to_string()
+    );
     assert_eq!(row["positions"][0]["quantity"], "10");
     assert!(row["reconciliation"].is_array());
     assert!(row.get("total").is_none());
@@ -4601,9 +4600,7 @@ async fn flow_report_names_an_unexplained_account() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{contour_response}");
-    let contour_id = contour_response["contour"]
-        .as_str()
-        .expect("contour id");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
     let operations = json!({
         "source_label": "manual entry",
         "operations": [{
@@ -4625,16 +4622,17 @@ async fn flow_report_names_an_unexplained_account() {
     let (status, body) = call(
         &harness.router,
         get(
-            &format!(
-                "/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"
-            ),
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
             Some(&harness.owner_token),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["currencies"][0]["residual"], "500.00");
-    assert_eq!(body["unexplained"][0]["account"], harness.account.inner().to_string());
+    assert_eq!(
+        body["unexplained"][0]["account"],
+        harness.account.inner().to_string()
+    );
     assert_eq!(body["unexplained"][0]["currency"], "RUB");
     assert_eq!(body["unexplained"][0]["amount"], "500.00");
 }
@@ -4675,10 +4673,7 @@ async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
     match &event.kind {
         EventKind::Tax { amount, origin } => {
             assert_eq!(amount.amount().raw(), -130_000);
-            assert_eq!(
-                *origin,
-                iaam_core::event::kind::TaxOrigin::SelfPaid
-            );
+            assert_eq!(*origin, iaam_core::event::kind::TaxOrigin::SelfPaid);
         }
         other => panic!("expected a tax event, got {other:?}"),
     }

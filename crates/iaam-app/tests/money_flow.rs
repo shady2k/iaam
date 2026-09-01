@@ -62,11 +62,7 @@ async fn account(services: &AppServices, owner: OwnerId, title: &str) -> Account
     id
 }
 
-async fn contour(
-    services: &AppServices,
-    owner: OwnerId,
-    accounts: &[AccountId],
-) -> ContourId {
+async fn contour(services: &AppServices, owner: OwnerId, accounts: &[AccountId]) -> ContourId {
     let id = ContourId::new_random();
     let definition = ContourDefinition::new(id, ContourVersion(1), accounts.iter().copied());
     services
@@ -82,11 +78,7 @@ async fn contour(
     id
 }
 
-async fn append_operation(
-    services: &AppServices,
-    owner: OwnerId,
-    operation: SubmittedOperation,
-) {
+async fn append_operation(services: &AppServices, owner: OwnerId, operation: SubmittedOperation) {
     let event = normalize(
         &operation,
         iaam_ingest::operation::NormalizationContext {
@@ -180,9 +172,33 @@ async fn a_month_of_a_card_reports_what_came_in_and_what_went_out() {
     .unwrap_or_else(|error| panic!("report: {error}"));
 
     assert_eq!(report.version, ContourVersion(1));
-    assert_eq!(report.flow.came_in(CurrencyCode::Rub).unwrap().amount().raw(), 300_000);
-    assert_eq!(report.flow.went_out(CurrencyCode::Rub).unwrap().amount().raw(), 120_000);
-    assert_eq!(report.flow.residual(CurrencyCode::Rub).unwrap().amount().raw(), 0);
+    assert_eq!(
+        report
+            .flow
+            .came_in(CurrencyCode::Rub)
+            .unwrap()
+            .amount()
+            .raw(),
+        300_000
+    );
+    assert_eq!(
+        report
+            .flow
+            .went_out(CurrencyCode::Rub)
+            .unwrap()
+            .amount()
+            .raw(),
+        120_000
+    );
+    assert_eq!(
+        report
+            .flow
+            .residual(CurrencyCode::Rub)
+            .unwrap()
+            .amount()
+            .raw(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -284,5 +300,8 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
     assert_eq!(card_row.cash.len(), 1);
     assert_eq!(card_row.cash[0].amount().raw(), 300_000);
     assert_eq!(card_row.positions.len(), 1);
-    assert_eq!(card_row.positions[0].1, iaam_core::money::Quantity(Dec::one()));
+    assert_eq!(
+        card_row.positions[0].1,
+        iaam_core::money::Quantity(Dec::one())
+    );
 }

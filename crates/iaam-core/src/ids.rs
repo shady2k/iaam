@@ -68,8 +68,7 @@ typed_id!(
 
 /// Namespace for declared sources. A fixed UUID, so the derivation is stable
 /// across builds and machines.
-const DECLARED_SOURCE_NAMESPACE: uuid::Uuid =
-    uuid::uuid!("6f2b1c4e-6f8a-5a1d-9d0e-2c7f4a3b8e11");
+const DECLARED_SOURCE_NAMESPACE: uuid::Uuid = uuid::uuid!("6f2b1c4e-6f8a-5a1d-9d0e-2c7f4a3b8e11");
 
 impl SourceId {
     /// A source identity the caller declares rather than one we mint.
@@ -169,7 +168,9 @@ mod tests {
         // Version 5, not version 4: a declared source and a random one occupy
         // disjoint spaces, so they cannot be confused by accident.
         assert_eq!(
-            SourceId::declared(owner, account, "file").inner().get_version_num(),
+            SourceId::declared(owner, account, "file")
+                .inner()
+                .get_version_num(),
             5
         );
         assert_eq!(SourceId::new_random().inner().get_version_num(), 4);

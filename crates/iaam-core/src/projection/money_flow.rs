@@ -107,7 +107,13 @@ impl MoneyFlow {
             let Some(money) = leg.cash_effect() else {
                 continue;
             };
-            add(&mut self.cash_delta, leg.account, money, "cash_delta", event.id)?;
+            add(
+                &mut self.cash_delta,
+                leg.account,
+                money,
+                "cash_delta",
+                event.id,
+            )?;
 
             match leg.kind {
                 LegKind::Fee => {
@@ -143,7 +149,13 @@ impl MoneyFlow {
                     }
                     EventKind::CashOut { .. } => {
                         let amount = negated(money, "went_out", event.id)?;
-                        add(&mut self.went_out, leg.account, amount, "went_out", event.id)?;
+                        add(
+                            &mut self.went_out,
+                            leg.account,
+                            amount,
+                            "went_out",
+                            event.id,
+                        )?;
                     }
                     EventKind::CashTransfer { .. } => match flow_class {
                         FlowClass::Internal => {
@@ -160,7 +172,13 @@ impl MoneyFlow {
                         }
                         FlowClass::ExternalOut { .. } => {
                             let amount = negated(money, "went_out", event.id)?;
-                            add(&mut self.went_out, leg.account, amount, "went_out", event.id)?;
+                            add(
+                                &mut self.went_out,
+                                leg.account,
+                                amount,
+                                "went_out",
+                                event.id,
+                            )?;
                         }
                         FlowClass::Irrelevant => {
                             // Irrelevant transfers are rejected by event_belongs.
@@ -313,8 +331,7 @@ impl MoneyFlow {
                 .get(&(account, currency))
                 .map_or(0, |amount| i128::from(amount.raw()))
         };
-        let explained = at(&self.came_in) - at(&self.went_out)
-            + at(&self.earned_by_capital)
+        let explained = at(&self.came_in) - at(&self.went_out) + at(&self.earned_by_capital)
             - at(&self.moved_into_assets)
             - at(&self.fees)
             - at(&self.taxes)
@@ -400,11 +417,7 @@ fn add(
     Ok(())
 }
 
-fn negated(
-    money: Money,
-    quantity: &'static str,
-    event: EventId,
-) -> Result<Money, MoneyFlowError> {
+fn negated(money: Money, quantity: &'static str, event: EventId) -> Result<Money, MoneyFlowError> {
     let amount = money
         .amount()
         .checked_neg()
@@ -436,18 +449,16 @@ fn total_filtered(
 ) -> Result<Money, MoneyFlowError> {
     let amount = ledger
         .iter()
-        .filter(|((_, item_currency), amount)| {
-            *item_currency == currency && include(amount.raw())
-        })
+        .filter(|((_, item_currency), amount)| *item_currency == currency && include(amount.raw()))
         .map(|(_, amount)| i128::from(amount.raw()))
         .sum::<i128>();
     Ok(Money::new(narrow(amount, quantity)?, currency))
 }
 
 fn narrow(amount: i128, quantity: &'static str) -> Result<PostedMinor, MoneyFlowError> {
-    i64::try_from(amount).map(PostedMinor::new).map_err(|_| {
-        MoneyFlowError::AggregateOverflow { quantity }
-    })
+    i64::try_from(amount)
+        .map(PostedMinor::new)
+        .map_err(|_| MoneyFlowError::AggregateOverflow { quantity })
 }
 
 #[cfg(test)]
@@ -457,8 +468,8 @@ mod tests {
     use crate::event::Event;
     use crate::event::corporate_action::CorporateAction;
     use crate::event::kind::{EventKind, TaxOrigin, TradeSide};
-    use crate::event::offer::{OfferExerciseAction, OfferSubmissionId};
     use crate::event::leg::Leg;
+    use crate::event::offer::{OfferExerciseAction, OfferSubmissionId};
     use crate::event::test_support::event_with;
     use crate::ids::{AccountId, InstrumentId, TransferId};
     use crate::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
@@ -508,7 +519,10 @@ mod tests {
                     to: deposit,
                     amount: rub(480_000),
                 },
-                vec![Leg::cash(card, rub(-480_000)), Leg::cash(deposit, rub(480_000))],
+                vec![
+                    Leg::cash(card, rub(-480_000)),
+                    Leg::cash(deposit, rub(480_000)),
+                ],
                 date!(2026 - 08 - 10),
             ),
             &contour,
@@ -518,10 +532,17 @@ mod tests {
 
         assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
         assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(0));
-        assert_eq!(value(flow.internal_transfers(CurrencyCode::Rub)), rub(480_000));
+        assert_eq!(
+            value(flow.internal_transfers(CurrencyCode::Rub)),
+            rub(480_000)
+        );
         assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(0));
         assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
-        assert!(flow.residuals_by_account().expect("aggregate fits").is_empty());
+        assert!(
+            flow.residuals_by_account()
+                .expect("aggregate fits")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -545,7 +566,10 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(value(flow.earned_by_capital(CurrencyCode::Rub)), rub(31_000));
+        assert_eq!(
+            value(flow.earned_by_capital(CurrencyCode::Rub)),
+            rub(31_000)
+        );
         assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
         assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(31_000));
         assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
@@ -570,7 +594,10 @@ mod tests {
                     basis_fee_exact: None,
                     accrued_interest: None,
                 },
-                vec![Leg::cash(broker, rub(-100_000)), Leg::fee(broker, rub(-350))],
+                vec![
+                    Leg::cash(broker, rub(-100_000)),
+                    Leg::fee(broker, rub(-350)),
+                ],
                 date!(2026 - 08 - 20),
             ),
             &contour,
@@ -578,7 +605,10 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(value(flow.moved_into_assets(CurrencyCode::Rub)), rub(100_000));
+        assert_eq!(
+            value(flow.moved_into_assets(CurrencyCode::Rub)),
+            rub(100_000)
+        );
         assert_eq!(value(flow.fees(CurrencyCode::Rub)), rub(350));
         assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(-100_350));
         assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
@@ -617,12 +647,16 @@ mod tests {
         let mut flow = MoneyFlow::new();
         for (kind, legs, on) in [
             (
-                EventKind::CashIn { amount: rub(300_000) },
+                EventKind::CashIn {
+                    amount: rub(300_000),
+                },
                 vec![Leg::cash(card, rub(300_000))],
                 date!(2026 - 08 - 05),
             ),
             (
-                EventKind::CashOut { amount: rub(-120_000) },
+                EventKind::CashOut {
+                    amount: rub(-120_000),
+                },
                 vec![Leg::cash(card, rub(-120_000))],
                 date!(2026 - 08 - 12),
             ),
@@ -718,7 +752,10 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(value(flow.moved_into_assets(CurrencyCode::Rub)), rub(-100_000));
+        assert_eq!(
+            value(flow.moved_into_assets(CurrencyCode::Rub)),
+            rub(-100_000)
+        );
         assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 
@@ -750,7 +787,10 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(value(flow.moved_into_assets(CurrencyCode::Rub)), rub(-100_000));
+        assert_eq!(
+            value(flow.moved_into_assets(CurrencyCode::Rub)),
+            rub(-100_000)
+        );
         assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 
@@ -826,7 +866,9 @@ mod tests {
 
         assert!(matches!(
             flow.came_in(CurrencyCode::Rub),
-            Err(MoneyFlowError::AggregateOverflow { quantity: "came_in" })
+            Err(MoneyFlowError::AggregateOverflow {
+                quantity: "came_in"
+            })
         ));
     }
 
@@ -839,7 +881,9 @@ mod tests {
         let mut flow = MoneyFlow::new();
         flow.apply(
             &event(
-                EventKind::CashIn { amount: rub(300_000) },
+                EventKind::CashIn {
+                    amount: rub(300_000),
+                },
                 vec![Leg::cash(card, rub(300_000))],
                 date!(2026 - 08 - 05),
             ),

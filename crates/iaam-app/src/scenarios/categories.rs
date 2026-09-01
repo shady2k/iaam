@@ -1,9 +1,8 @@
 //! Scenarios for the owner's category reference and assignment rules.
 
-use std::collections::BTreeMap;
-
 use iaam_core::category::{
-    CategoryAssignment, CategoryInterval, CategoryMatcher, CategoryRule, CategorySubject,
+    assign_with_proposed, group_category_impacts, CategoryAssignment, CategoryImpactRow,
+    CategoryInterval, CategoryMatcher, CategoryRule, CategoryRuleProposal, CategorySubject,
 };
 use iaam_core::event::Event;
 use iaam_core::event::kind::EventKind;
@@ -152,7 +151,7 @@ pub async fn list_category_rules(
 pub async fn preview_category_rule(
     services: &AppServices,
     principal: &Principal,
-    proposed: &CategoryRule,
+    proposed: &CategoryRuleProposal,
 ) -> Result<CategoryRuleImpact, AppError> {
     let active_rules = services
         .categories
@@ -166,28 +165,19 @@ pub async fn preview_category_rule(
     let current = LoadedCategoryIndex {
         rules: active_rules.clone(),
         versions: Vec::new(),
+        proposed: None,
     };
-    let mut proposed_rules = active_rules;
-    proposed_rules.push(proposed.clone());
     let proposed_index = LoadedCategoryIndex {
-        rules: proposed_rules,
+        rules: active_rules,
         versions: Vec::new(),
+        proposed: Some(proposed.clone()),
     };
 
     let events = services
         .store
         .load_events_through(principal.owner, time::Date::MAX)
         .await?;
-    let mut grouped = BTreeMap::<
-        (
-            time::Date,
-            Option<CategoryId>,
-            CategoryId,
-            iaam_core::money::CurrencyCode,
-        ),
-        (Money, u64),
-    >::new();
-    let mut rows = 0_u64;
+    let mut moved = Vec::new();
 
     for event in events {
         if !matches!(event.kind, EventKind::CashOut { .. }) {
@@ -224,50 +214,36 @@ pub async fn preview_category_rule(
         let EventKind::CashOut { amount } = event.kind else {
             unreachable!("cash-out kind was checked above");
         };
-        let amount = amount
-            .checked_negate()
-            .map_err(|error| AppError::Store(format!("negate category preview amount: {error}")))?;
-        let key = (month, previous, next, amount.currency());
-        let entry = grouped
-            .entry(key)
-            .or_insert((Money::zero(amount.currency()), 0));
-        entry.0 = entry
-            .0
-            .try_add(amount)
-            .map_err(|error| AppError::Store(format!("sum category preview amount: {error}")))?;
-        entry.1 = entry
-            .1
-            .checked_add(1)
-            .ok_or_else(|| AppError::Store("category preview row count overflow".to_owned()))?;
-        rows = rows
-            .checked_add(1)
-            .ok_or_else(|| AppError::Store("category preview row count overflow".to_owned()))?;
+        moved.push(CategoryImpactRow {
+            month,
+            from: previous,
+            to: next,
+            amount,
+        });
     }
 
-    let mut months: Vec<MonthlyImpact> = Vec::new();
-    for ((month, from, to, _currency), (amount, moved_rows)) in grouped {
-        match months.last_mut() {
-            Some(existing) if existing.month == month => {
-                existing.moved.push(CategoryMove {
-                    from,
-                    to,
-                    amount,
-                    rows: moved_rows,
-                });
-            }
-            _ => months.push(MonthlyImpact {
-                month,
-                moved: vec![CategoryMove {
-                    from,
-                    to,
-                    amount,
-                    rows: moved_rows,
-                }],
-            }),
-        }
-    }
-
-    Ok(CategoryRuleImpact { rows, months })
+    let grouped = group_category_impacts(moved)
+        .map_err(|error| AppError::Store(format!("aggregate category preview: {error}")))?;
+    Ok(CategoryRuleImpact {
+        rows: grouped.rows,
+        months: grouped
+            .months
+            .into_iter()
+            .map(|month| MonthlyImpact {
+                month: month.month,
+                moved: month
+                    .moved
+                    .into_iter()
+                    .map(|movement| CategoryMove {
+                        from: movement.from,
+                        to: movement.to,
+                        amount: movement.amount,
+                        rows: movement.rows,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
 }
 
 pub async fn retire_category_rule(
@@ -284,6 +260,7 @@ pub async fn retire_category_rule(
 pub(crate) struct LoadedCategoryIndex {
     rules: Vec<CategoryRule>,
     versions: Vec<u32>,
+    proposed: Option<CategoryRuleProposal>,
 }
 
 impl LoadedCategoryIndex {
@@ -301,7 +278,10 @@ impl CategoryIndex for LoadedCategoryIndex {
             description: None,
             on: event.order.date(),
         };
-        iaam_core::category::assign(&subject, &self.rules)
+        match self.proposed.as_ref() {
+            Some(proposed) => assign_with_proposed(&subject, &self.rules, proposed),
+            None => iaam_core::category::assign(&subject, &self.rules),
+        }
     }
 }
 
@@ -322,6 +302,7 @@ pub(crate) async fn load_index(
     Ok(LoadedCategoryIndex {
         rules: active,
         versions,
+        proposed: None,
     })
 }
 

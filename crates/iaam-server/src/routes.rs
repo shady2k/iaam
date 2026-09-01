@@ -33,7 +33,7 @@ use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
     sync_market_with_services as run_market_sync,
 };
-use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRule};
+use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{
     AccountId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, OwnerId, SourceId,
@@ -658,22 +658,11 @@ pub async fn preview_category_rule_route(
 ) -> Result<Json<CategoryRuleImpactDto>, ApiFailure> {
     require_admin(&principal)?;
     let matcher = parse_category_matcher(request.matcher)?;
-    let current = list_category_rules(&state.services, &principal).await?;
-    let version = current
-        .iter()
-        .map(|rule| rule.version)
-        .max()
-        .unwrap_or_default()
-        .checked_add(1)
-        .ok_or_else(|| {
-            invalid_field("version", "a representable rule version", "overflow".into())
-        })?;
     let impact = preview_category_rule(
         &state.services,
         &principal,
-        &CategoryRule {
+        &CategoryRuleProposal {
             id: CategoryRuleId::new_random(),
-            version,
             interval: CategoryInterval {
                 from: request.valid_from,
                 to: request.valid_to,

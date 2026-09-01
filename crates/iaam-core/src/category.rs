@@ -17,9 +17,13 @@
 //! hold forever misclassifies half of history. Instrument aliases already solve
 //! exactly this, with the reasoning at `crates/iaam-ingest/src/csv_source.rs:47`.
 
+use std::collections::BTreeMap;
+
+use thiserror::Error;
 use time::Date;
 
 use crate::ids::{CategoryId, CategoryRuleId};
+use crate::money::{CurrencyCode, Money, MoneyError};
 
 /// The inclusive validity interval of a category rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +100,56 @@ pub struct CategoryRule {
     pub category: CategoryId,
 }
 
+/// A category rule being evaluated before it is persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryRuleProposal {
+    pub id: CategoryRuleId,
+    pub interval: CategoryInterval,
+    pub matcher: CategoryMatcher,
+    pub category: CategoryId,
+}
+
+/// One outflow whose category assignment changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryImpactRow {
+    pub month: Date,
+    pub from: Option<CategoryId>,
+    pub to: CategoryId,
+    /// The cash-out amount, which is negative and will be negated for reporting.
+    pub amount: Money,
+}
+
+/// A grouped category movement for one month and category pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryImpactMove {
+    pub from: Option<CategoryId>,
+    pub to: CategoryId,
+    pub amount: Money,
+    pub rows: u64,
+}
+
+/// Category movements grouped by month.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryImpactMonth {
+    pub month: Date,
+    pub moved: Vec<CategoryImpactMove>,
+}
+
+/// The complete grouped result of a category-rule preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryImpact {
+    pub rows: u64,
+    pub months: Vec<CategoryImpactMonth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CategoryImpactError {
+    #[error("money arithmetic failed: {0}")]
+    Money(#[from] MoneyError),
+    #[error("category preview row count overflow")]
+    CountOverflow,
+}
+
 /// The result of deriving an owner's category for a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoryAssignment {
@@ -116,10 +170,7 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
         .filter(|rule| rule.matcher.matches(subject))
         .max_by_key(|rule| rule.version);
     if let Some(rule) = row_rule {
-        return CategoryAssignment::Assigned {
-            category: rule.category,
-            basis: CategoryBasis::Row { rule: rule.id },
-        };
+        return assignment_for_rule(rule);
     }
 
     let source_rule = rules
@@ -129,10 +180,7 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
         .filter(|rule| rule.matcher.matches(subject))
         .max_by_key(|rule| rule.version);
     if let Some(rule) = source_rule {
-        return CategoryAssignment::Assigned {
-            category: rule.category,
-            basis: CategoryBasis::SourceCategory { rule: rule.id },
-        };
+        return assignment_for_rule(rule);
     }
 
     let description_rule = rules
@@ -142,13 +190,117 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
         .filter(|rule| rule.matcher.matches(subject))
         .max_by_key(|rule| rule.version);
     if let Some(rule) = description_rule {
-        return CategoryAssignment::Assigned {
-            category: rule.category,
-            basis: CategoryBasis::Description { rule: rule.id },
-        };
+        return assignment_for_rule(rule);
     }
 
     CategoryAssignment::NotDecomposed
+}
+
+/// Assign using a not-yet-persisted proposal as the newest rule of its kind.
+pub fn assign_with_proposed(
+    subject: &CategorySubject<'_>,
+    rules: &[CategoryRule],
+    proposed: &CategoryRuleProposal,
+) -> CategoryAssignment {
+    let current = assign(subject, rules);
+    if !proposed.interval.covers(subject.on) || !proposed.matcher.matches(subject) {
+        return current;
+    }
+
+    match (&proposed.matcher, current) {
+        (CategoryMatcher::Row { .. }, _) => proposal_assignment(proposed),
+        (CategoryMatcher::SourceCategory { .. }, CategoryAssignment::Assigned {
+            basis: CategoryBasis::Row { .. },
+            ..
+        })
+        | (CategoryMatcher::DescriptionContains { .. }, CategoryAssignment::Assigned {
+            basis: CategoryBasis::Row { .. } | CategoryBasis::SourceCategory { .. },
+            ..
+        }) => current,
+        _ => proposal_assignment(proposed),
+    }
+}
+
+fn assignment_for_rule(rule: &CategoryRule) -> CategoryAssignment {
+    CategoryAssignment::Assigned {
+        category: rule.category,
+        basis: match &rule.matcher {
+            CategoryMatcher::Row { .. } => CategoryBasis::Row { rule: rule.id },
+            CategoryMatcher::SourceCategory { .. } => {
+                CategoryBasis::SourceCategory { rule: rule.id }
+            }
+            CategoryMatcher::DescriptionContains { .. } => {
+                CategoryBasis::Description { rule: rule.id }
+            }
+        },
+    }
+}
+
+fn proposal_assignment(proposed: &CategoryRuleProposal) -> CategoryAssignment {
+    CategoryAssignment::Assigned {
+        category: proposed.category,
+        basis: match &proposed.matcher {
+            CategoryMatcher::Row { .. } => CategoryBasis::Row { rule: proposed.id },
+            CategoryMatcher::SourceCategory { .. } => {
+                CategoryBasis::SourceCategory { rule: proposed.id }
+            }
+            CategoryMatcher::DescriptionContains { .. } => {
+                CategoryBasis::Description { rule: proposed.id }
+            }
+        },
+    }
+}
+
+/// Group changed category assignments by month and category pair.
+pub fn group_category_impacts(
+    rows: impl IntoIterator<Item = CategoryImpactRow>,
+) -> Result<CategoryImpact, CategoryImpactError> {
+    let mut grouped = BTreeMap::<
+        (Date, Option<CategoryId>, CategoryId, CurrencyCode),
+        (Money, u64),
+    >::new();
+    let mut total_rows = 0_u64;
+
+    for row in rows {
+        let amount = row.amount.checked_negate()?;
+        let key = (row.month, row.from, row.to, amount.currency());
+        let entry = grouped
+            .entry(key)
+            .or_insert((Money::zero(amount.currency()), 0));
+        entry.0 = entry.0.try_add(amount)?;
+        entry.1 = entry.1.checked_add(1).ok_or(CategoryImpactError::CountOverflow)?;
+        total_rows = total_rows
+            .checked_add(1)
+            .ok_or(CategoryImpactError::CountOverflow)?;
+    }
+
+    let mut months: Vec<CategoryImpactMonth> = Vec::new();
+    for ((month, from, to, _currency), (amount, rows)) in grouped {
+        match months.last_mut() {
+            Some(existing) if existing.month == month => {
+                existing.moved.push(CategoryImpactMove {
+                    from,
+                    to,
+                    amount,
+                    rows,
+                });
+            }
+            _ => months.push(CategoryImpactMonth {
+                month,
+                moved: vec![CategoryImpactMove {
+                    from,
+                    to,
+                    amount,
+                    rows,
+                }],
+            }),
+        }
+    }
+
+    Ok(CategoryImpact {
+        rows: total_rows,
+        months,
+    })
 }
 
 #[cfg(test)]
@@ -156,10 +308,12 @@ mod tests {
     use time::{Date, macros::date};
 
     use crate::ids::{CategoryId, CategoryRuleId};
+    use crate::money::{CurrencyCode, Money, PostedMinor};
 
     use super::{
-        CategoryAssignment, CategoryBasis, CategoryInterval, CategoryMatcher, CategoryRule,
-        CategorySubject, assign,
+        assign, assign_with_proposed, group_category_impacts, CategoryAssignment, CategoryBasis,
+        CategoryImpactRow, CategoryInterval, CategoryMatcher, CategoryRule, CategoryRuleProposal,
+        CategorySubject,
     };
 
     fn rule(
@@ -396,4 +550,90 @@ mod tests {
                 if category == CategoryId(uuid::Uuid::from_u128(new))
         ));
     }
+
+    #[test]
+    fn a_proposal_is_newest_without_a_fabricated_version() {
+        let proposal_id = CategoryRuleId(uuid::Uuid::from_u128(3));
+        let rules = vec![rule(
+            1,
+            1,
+            CategoryMatcher::SourceCategory {
+                value: "Пекарни".into(),
+            },
+            None,
+            None,
+            10,
+        )];
+        let proposal = CategoryRuleProposal {
+            id: proposal_id,
+            interval: CategoryInterval {
+                from: None,
+                to: None,
+            },
+            matcher: CategoryMatcher::SourceCategory {
+                value: "Пекарни".into(),
+            },
+            category: CategoryId(uuid::Uuid::from_u128(20)),
+        };
+        let subject = CategorySubject {
+            row_key: None,
+            source_category: Some("Пекарни"),
+            counterparty: None,
+            description: None,
+            on: date!(2026 - 08 - 01),
+        };
+
+        let first = assign_with_proposed(&subject, &rules, &proposal);
+        let second = assign_with_proposed(&subject, &rules, &proposal);
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            CategoryAssignment::Assigned {
+                category: CategoryId(uuid::Uuid::from_u128(20)),
+                basis: CategoryBasis::SourceCategory { rule: proposal_id },
+            }
+        );
+    }
+
+    #[test]
+    fn category_impacts_negate_and_group_amounts_and_counts() {
+        let from = None;
+        let to = CategoryId(uuid::Uuid::from_u128(20));
+        let grouped = group_category_impacts([
+            CategoryImpactRow {
+                month: date!(2026 - 07 - 01),
+                from,
+                to,
+                amount: Money::new(PostedMinor::new(-1_000), CurrencyCode::Rub),
+            },
+            CategoryImpactRow {
+                month: date!(2026 - 07 - 01),
+                from,
+                to,
+                amount: Money::new(PostedMinor::new(-2_000), CurrencyCode::Rub),
+            },
+            CategoryImpactRow {
+                month: date!(2026 - 08 - 01),
+                from,
+                to,
+                amount: Money::new(PostedMinor::new(-3_000), CurrencyCode::Rub),
+            },
+        ])
+        .expect("group impacts");
+
+        assert_eq!(grouped.rows, 3);
+        assert_eq!(grouped.months.len(), 2);
+        assert_eq!(grouped.months[0].month, date!(2026 - 07 - 01));
+        assert_eq!(grouped.months[0].moved[0].rows, 2);
+        assert_eq!(
+            grouped.months[0].moved[0].amount,
+            Money::new(PostedMinor::new(3_000), CurrencyCode::Rub)
+        );
+        assert_eq!(grouped.months[1].moved[0].rows, 1);
+        assert_eq!(
+            grouped.months[1].moved[0].amount,
+            Money::new(PostedMinor::new(3_000), CurrencyCode::Rub)
+        );
+    }
+
 }

@@ -9,7 +9,7 @@ use iaam_app::scenarios::categories::{
     retire_group,
 };
 use iaam_app::scenarios::reports::{MoneyFlowQuery, money_flow};
-use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRule};
+use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, CategoryGroupId, CategoryId, CategoryRuleId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
@@ -290,9 +290,8 @@ async fn a_preview_reports_what_would_move_and_writes_nothing() {
     ctx.create_rule_on_source_category("Супермаркеты", existing, None, None)
         .await;
     let proposed_category = ctx.create_category(group, "Кафе").await;
-    let proposed = CategoryRule {
+    let proposed = CategoryRuleProposal {
         id: CategoryRuleId::new_random(),
-        version: 2,
         interval: CategoryInterval {
             from: None,
             to: None,
@@ -355,9 +354,8 @@ async fn a_preview_with_no_changes_is_empty() {
     ctx.create_rule_on_source_category("Супермаркеты", category, None, None)
         .await;
 
-    let proposed = CategoryRule {
+    let proposed = CategoryRuleProposal {
         id: CategoryRuleId::new_random(),
-        version: 2,
         interval: CategoryInterval {
             from: None,
             to: None,

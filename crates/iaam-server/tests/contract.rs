@@ -4396,3 +4396,245 @@ fn distinct_source_ids(path: &std::path::Path, token: &str) -> std::collections:
         .map(|event| event.provenance.source())
         .collect()
 }
+#[tokio::test]
+async fn flow_report_exposes_all_quantities_and_residual() {
+    let harness = harness();
+    let contour = json!({
+        "title": "August flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "deposit",
+                "amount": "3000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "flow-deposit"
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "1200.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-12" },
+                "idempotency_key": "flow-withdrawal"
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["contour"], contour_id);
+    assert_eq!(body["contour_version"], 1);
+    let currencies = body["currencies"].as_array().expect("currencies");
+    assert_eq!(currencies.len(), 1);
+    let rub = &currencies[0];
+    assert_eq!(rub["currency"], "RUB");
+    assert_eq!(rub["came_in"], "3000.00");
+    assert_eq!(rub["went_out"], "1200.00");
+    assert_eq!(rub["cash_delta"], "1800.00");
+    assert_eq!(rub["residual"], "0.00");
+    for field in [
+        "came_in",
+        "went_out",
+        "earned_by_capital",
+        "moved_into_assets",
+        "fees",
+        "taxes",
+        "internal_transfers",
+        "cash_delta",
+        "residual",
+    ] {
+        assert!(rub.get(field).is_some(), "missing quantity {field}: {rub}");
+    }
+    assert_eq!(body["unexplained"], json!([]));
+}
+
+#[tokio::test]
+async fn flow_report_rejects_a_reversed_interval() {
+    let harness = harness();
+    let contour = json!({
+        "title": "August flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("contour id");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/flow?contour={contour_id}&from=2026-08-31&to=2026-08-01"
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "period");
+}
+
+#[tokio::test]
+async fn balances_keep_cash_and_positions_as_separate_fields() {
+    let harness = harness();
+    let contour = json!({
+        "title": "August balances",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "deposit",
+                "amount": "3000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "balance-deposit"
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "opening_position",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "cost_basis": "1000.00",
+                "currency": "RUB",
+                "dates": { "trade": "2026-01-01" },
+                "idempotency_key": "balance-position"
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body.as_array().expect("balance rows");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["account"], harness.account.inner().to_string());
+    assert_eq!(row["cash"][0]["currency"], "RUB");
+    assert_eq!(row["cash"][0]["amount"], "3000.00");
+    assert_eq!(row["positions"][0]["instrument"], harness.instrument.inner().to_string());
+    assert_eq!(row["positions"][0]["custody"], harness.custody.inner().to_string());
+    assert_eq!(row["positions"][0]["quantity"], "10");
+    assert!(row["reconciliation"].is_array());
+    assert!(row.get("total").is_none());
+}
+
+#[tokio::test]
+async fn flow_and_balances_reports_require_authentication() {
+    let harness = harness();
+    for path in [
+        "/v1/reports/flow?contour=00000000-0000-0000-0000-000000000000&from=2026-08-01&to=2026-08-31",
+        "/v1/reports/balances?contour=00000000-0000-0000-0000-000000000000&as_of=2026-08-31",
+    ] {
+        let (status, body) = call(&harness.router, get(path, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+    }
+}
+#[tokio::test]
+async fn flow_report_names_an_unexplained_account() {
+    let harness = harness();
+    let contour = json!({
+        "title": "Opening balance flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "opening_cash",
+            "amount": "500.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "idempotency_key": "opening-cash"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["currencies"][0]["residual"], "500.00");
+    assert_eq!(body["unexplained"][0]["account"], harness.account.inner().to_string());
+    assert_eq!(body["unexplained"][0]["currency"], "RUB");
+    assert_eq!(body["unexplained"][0]["amount"], "500.00");
+}

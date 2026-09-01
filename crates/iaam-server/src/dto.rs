@@ -13,6 +13,7 @@ use std::fmt;
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
+use iaam_app::scenarios::reports::{AccountBalanceRow, MoneyFlowReport};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, ClassificationRuleView, IssuedToken, Scope, TokenView,
 };
@@ -31,6 +32,8 @@ use iaam_core::returns::{
     ExecutabilityShares, LiquidationEstimate, MaterialIssue, NotComputable, PositionCoverage,
     ReturnsReport, UncoveredPosition,
 };
+use iaam_core::projection::money_flow::MoneyFlowError;
+use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
 use iaam_core::rules::{ExpectedPosting, PostingKind};
 use iaam_core::valuation::{
     PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, QuotationBasis,
@@ -1854,6 +1857,201 @@ fn issue(value: &MaterialIssue) -> String {
             quantity.0.inner(),
             date
         ),
+    }
+}
+
+/// Cash movement report over an inclusive interval.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MoneyFlowReportDto {
+    pub contour: Uuid,
+    pub contour_version: u32,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub to: Date,
+    pub currencies: Vec<MoneyFlowCurrencyDto>,
+    /// Accounts whose own cash change the six quantities do not explain.
+    pub unexplained: Vec<AccountResidualDto>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AccountResidualDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    pub amount: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MoneyFlowCurrencyDto {
+    pub currency: CurrencyDto,
+    pub came_in: String,
+    pub went_out: String,
+    pub earned_by_capital: String,
+    pub moved_into_assets: String,
+    pub fees: String,
+    pub taxes: String,
+    pub internal_transfers: String,
+    pub cash_delta: String,
+    pub residual: String,
+}
+
+impl MoneyFlowReportDto {
+    pub fn from_domain(report: &MoneyFlowReport) -> Result<Self, MoneyFlowError> {
+        let currencies = report
+            .flow
+            .currencies()
+            .map(|currency| {
+                Ok(MoneyFlowCurrencyDto {
+                    currency: CurrencyDto::from_domain(currency),
+                    came_in: report.flow.came_in(currency)?.to_calc_dec().inner().to_string(),
+                    went_out: report.flow.went_out(currency)?.to_calc_dec().inner().to_string(),
+                    earned_by_capital: report
+                        .flow
+                        .earned_by_capital(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                    moved_into_assets: report
+                        .flow
+                        .moved_into_assets(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                    fees: report.flow.fees(currency)?.to_calc_dec().inner().to_string(),
+                    taxes: report.flow.taxes(currency)?.to_calc_dec().inner().to_string(),
+                    internal_transfers: report
+                        .flow
+                        .internal_transfers(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                    cash_delta: report
+                        .flow
+                        .cash_delta(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                    residual: report
+                        .flow
+                        .residual(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, MoneyFlowError>>()?;
+        let unexplained = report
+            .flow
+            .residuals_by_account()?
+            .into_iter()
+            .map(|(account, money)| AccountResidualDto {
+                account: account.inner(),
+                currency: CurrencyDto::from_domain(money.currency()),
+                amount: money.to_calc_dec().inner().to_string(),
+            })
+            .collect();
+        Ok(Self {
+            contour: report.contour.0,
+            contour_version: report.version.0,
+            from: report.from,
+            to: report.to,
+            currencies,
+            unexplained,
+        })
+    }
+}
+
+/// Cash and positions for one contour account.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AccountBalanceDto {
+    pub account: Uuid,
+    pub cash: Vec<BalanceCashDto>,
+    pub reconciliation: Vec<ReconciliationStatusDto>,
+    pub positions: Vec<PositionQuantityDto>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BalanceCashDto {
+    pub currency: CurrencyDto,
+    pub amount: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PositionQuantityDto {
+    pub instrument: Uuid,
+    pub custody: Option<Uuid>,
+    pub quantity: String,
+}
+
+impl AccountBalanceDto {
+    pub fn from_domain(row: &AccountBalanceRow) -> Self {
+        Self {
+            account: row.account.inner(),
+            cash: row
+                .cash
+                .iter()
+                .map(|money| BalanceCashDto {
+                    currency: CurrencyDto::from_domain(money.currency()),
+                    amount: money.to_calc_dec().inner().to_string(),
+                })
+                .collect(),
+            reconciliation: row
+                .reconciliation
+                .iter()
+                .map(ReconciliationStatusDto::from_domain)
+                .collect(),
+            positions: row
+                .positions
+                .iter()
+                .map(|(key, quantity)| PositionQuantityDto {
+                    instrument: key.instrument.inner(),
+                    custody: key.custody.map(|custody| custody.inner()),
+                    quantity: quantity.0.inner().to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl ReconciliationStatusDto {
+    pub(crate) fn from_domain(status: &ReconciliationStatus) -> Self {
+        Self {
+            account: status.account().inner(),
+            from: status.period().from,
+            to: status.period().to,
+            dimensions: Dimension::all()
+                .into_iter()
+                .map(|dimension| DimensionStatusDto {
+                    dimension: dimension.code().to_owned(),
+                    status: status.dimension(dimension).code().to_owned(),
+                })
+                .collect(),
+            evidence: status
+                .evidence()
+                .iter()
+                .map(|evidence| EvidenceDto {
+                    ground: evidence.ground().code().to_owned(),
+                    level: evidence.level().code().to_owned(),
+                    dimensions: evidence
+                        .dimensions()
+                        .into_iter()
+                        .map(|dimension| dimension.code().to_owned())
+                        .collect(),
+                    confirming_parser: evidence.confirming().parser_version.0.clone(),
+                    confirmed_parser: evidence.confirmed().parser_version.0.clone(),
+                })
+                .collect(),
+            outcomes: status
+                .outcomes()
+                .iter()
+                .map(|outcome| ClaimOutcomeDto {
+                    claim: outcome.claim.discriminant().to_owned(),
+                    outcome: outcome.outcome.code().to_owned(),
+                })
+                .collect(),
+        }
     }
 }
 

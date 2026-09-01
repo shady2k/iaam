@@ -146,6 +146,8 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
             routes::returns_report,
             routes::returns_report_with_rates
         ))
+        .routes(routes!(routes::flow_report))
+        .routes(routes!(routes::balances_report))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,

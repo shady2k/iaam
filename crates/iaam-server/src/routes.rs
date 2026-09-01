@@ -22,7 +22,7 @@ use iaam_app::scenarios::market_reference::{
     list_market_key_rate as read_market_key_rate, list_market_prices as read_market_prices,
 };
 use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, statuses};
-use iaam_app::scenarios::reports::{ReturnsQuery, returns};
+use iaam_app::scenarios::reports::{MoneyFlowQuery, account_balances, money_flow, ReturnsQuery, returns};
 use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
     sync_market_with_services as run_market_sync,
@@ -46,16 +46,18 @@ use zeroize::Zeroizing;
 
 use crate::ServerState;
 use crate::dto::{
-    AccountDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerAccessUpdateRequest,
-    BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
-    ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
-    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
-    CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
-    EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
-    MarketKeyRateDto, MarketPriceDto, MarketSourceDto, MarketSyncRequest, OwnerBalanceRequest,
+    AccountBalanceDto, AccountDto, AddBrokerAccessRequest, BrokerAccessDto,
+    BrokerAccessUpdateRequest, BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest,
+    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
+    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest,
+    CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest,
+    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
+    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto,
+    MarketSourceDto, MarketSyncRequest, MoneyFlowReportDto, OwnerBalanceRequest,
     QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams, ReconciliationStatusDto,
-    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -1361,6 +1363,94 @@ pub async fn ingest_csv(
     }
     verdicts.sort_by_key(|verdict| verdict.row);
     Ok(Json(verdicts))
+}
+
+/// Money flow report parameters.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct MoneyFlowParams {
+    /// Scope identifier.
+    pub contour: Uuid,
+    /// Scope composition version. By default — the latest.
+    #[serde(default)]
+    pub contour_version: Option<u32>,
+    /// Inclusive start, ISO-8601.
+    pub from: String,
+    /// Inclusive end, ISO-8601.
+    pub to: String,
+}
+
+/// The flow of money over an interval.
+#[utoipa::path(
+    get,
+    path = "/v1/reports/flow",
+    params(MoneyFlowParams),
+    responses(
+        (status = 200, description = "Flow of money over the interval", body = MoneyFlowReportDto),
+        (status = 404, description = "Scope not found", body = ApiError),
+        (status = 422, description = "Invalid interval", body = ApiError),
+        (status = 500, description = "Money flow could not be built", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn flow_report(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Query(params): Query<MoneyFlowParams>,
+) -> Result<Json<MoneyFlowReportDto>, ApiFailure> {
+    let query = MoneyFlowQuery {
+        contour: ContourId(params.contour),
+        contour_version: params.contour_version.map(ContourVersion),
+        from: parse_query_date("from", &params.from)?,
+        to: parse_query_date("to", &params.to)?,
+    };
+    let report = money_flow(&state.services, &principal, &query).await?;
+    let dto = MoneyFlowReportDto::from_domain(&report)
+        .map_err(iaam_app::error::AppError::from)?;
+    Ok(Json(dto))
+}
+
+/// Account balances at a date.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct BalancesParams {
+    /// Scope identifier.
+    pub contour: Uuid,
+    /// Scope composition version. By default — the latest.
+    #[serde(default)]
+    pub contour_version: Option<u32>,
+    /// Report date in YYYY-MM-DD format.
+    pub as_of: String,
+}
+
+/// Cash and positions by contour account.
+#[utoipa::path(
+    get,
+    path = "/v1/reports/balances",
+    params(BalancesParams),
+    responses(
+        (status = 200, description = "Cash and positions by account", body = [AccountBalanceDto]),
+        (status = 404, description = "Scope not found", body = ApiError),
+        (status = 422, description = "Invalid report date", body = ApiError),
+        (status = 500, description = "Balances could not be built", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn balances_report(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Query(params): Query<BalancesParams>,
+) -> Result<Json<Vec<AccountBalanceDto>>, ApiFailure> {
+    let as_of = parse_query_date("as_of", &params.as_of)?;
+    let rows = account_balances(
+        &state.services,
+        &principal,
+        ContourId(params.contour),
+        params.contour_version.map(ContourVersion),
+        as_of,
+    )
+    .await?;
+    Ok(Json(
+        rows.iter().map(AccountBalanceDto::from_domain).collect(),
+    ))
 }
 
 /// Returns report parameters.

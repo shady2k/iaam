@@ -603,6 +603,140 @@ mod tests {
     }
 
     #[test]
+    fn proposals_respect_interval_and_existing_higher_precedence() {
+        let row_category = CategoryId(uuid::Uuid::from_u128(10));
+        let source_category = CategoryId(uuid::Uuid::from_u128(20));
+        let description_category = CategoryId(uuid::Uuid::from_u128(30));
+        let subject = CategorySubject {
+            row_key: Some("row-1"),
+            source_category: Some("Supermarkets"),
+            counterparty: None,
+            description: Some("Corner shop"),
+            on: date!(2026 - 08 - 01),
+        };
+        let row_rule = rule(
+            1,
+            1,
+            CategoryMatcher::Row {
+                key: "row-1".into(),
+            },
+            None,
+            None,
+            10,
+        );
+        let source_proposal = CategoryRuleProposal {
+            id: CategoryRuleId(uuid::Uuid::from_u128(2)),
+            interval: CategoryInterval {
+                from: None,
+                to: None,
+            },
+            matcher: CategoryMatcher::SourceCategory {
+                value: "Supermarkets".into(),
+            },
+            category: source_category,
+        };
+        assert_eq!(
+            assign_with_proposed(&subject, &[row_rule], &source_proposal),
+            CategoryAssignment::Assigned {
+                category: row_category,
+                basis: CategoryBasis::Row {
+                    rule: CategoryRuleId(uuid::Uuid::from_u128(1)),
+                },
+            }
+        );
+
+        let outside_interval = CategoryRuleProposal {
+            id: CategoryRuleId(uuid::Uuid::from_u128(3)),
+            interval: CategoryInterval {
+                from: Some(date!(2027 - 01 - 01)),
+                to: None,
+            },
+            matcher: CategoryMatcher::DescriptionContains {
+                text: "shop".into(),
+            },
+            category: description_category,
+        };
+        assert_eq!(
+            assign_with_proposed(&subject, &[], &outside_interval),
+            CategoryAssignment::NotDecomposed
+        );
+    }
+
+    #[test]
+    fn proposals_assign_row_and_description_matchers() {
+        let subject = CategorySubject {
+            row_key: Some("row-1"),
+            source_category: None,
+            counterparty: Some("Cafe"),
+            description: None,
+            on: date!(2026 - 08 - 01),
+        };
+        for (id, matcher, category, basis) in [
+            (
+                1,
+                CategoryMatcher::Row {
+                    key: "row-1".into(),
+                },
+                10,
+                CategoryBasis::Row {
+                    rule: CategoryRuleId(uuid::Uuid::from_u128(1)),
+                },
+            ),
+            (
+                2,
+                CategoryMatcher::DescriptionContains {
+                    text: "cafe".into(),
+                },
+                20,
+                CategoryBasis::Description {
+                    rule: CategoryRuleId(uuid::Uuid::from_u128(2)),
+                },
+            ),
+        ] {
+            let proposal = CategoryRuleProposal {
+                id: CategoryRuleId(uuid::Uuid::from_u128(id)),
+                interval: CategoryInterval {
+                    from: None,
+                    to: None,
+                },
+                matcher,
+                category: CategoryId(uuid::Uuid::from_u128(category)),
+            };
+            assert_eq!(
+                assign_with_proposed(&subject, &[], &proposal),
+                CategoryAssignment::Assigned {
+                    category: CategoryId(uuid::Uuid::from_u128(category)),
+                    basis,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn category_impacts_keep_distinct_moves_in_one_month() {
+        let grouped = group_category_impacts([
+            CategoryImpactRow {
+                month: date!(2026 - 08 - 01),
+                from: None,
+                to: CategoryId(uuid::Uuid::from_u128(1)),
+                amount: Money::new(PostedMinor::new(-1_000), CurrencyCode::Rub),
+            },
+            CategoryImpactRow {
+                month: date!(2026 - 08 - 01),
+                from: None,
+                to: CategoryId(uuid::Uuid::from_u128(2)),
+                amount: Money::new(PostedMinor::new(-2_000), CurrencyCode::Rub),
+            },
+        ])
+        .expect("group impacts");
+
+        assert_eq!(grouped.rows, 2);
+        assert_eq!(grouped.months.len(), 1);
+        assert_eq!(grouped.months[0].moved.len(), 2);
+        assert_eq!(grouped.months[0].moved[1].rows, 1);
+    }
+
+    #[test]
     fn category_impacts_negate_and_group_amounts_and_counts() {
         let from = None;
         let to = CategoryId(uuid::Uuid::from_u128(20));

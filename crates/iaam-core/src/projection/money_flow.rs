@@ -1158,6 +1158,110 @@ mod tests {
     }
 
     #[test]
+    fn external_outflow_transfers_are_undecomposed_and_not_resolved() {
+        let card = AccountId::new_random();
+        let outside = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let category = CategoryId(uuid::Uuid::from_u128(10));
+        let mut flow = MoneyFlow::new();
+        flow.apply(
+            &transfer(card, outside, rub(7_500)),
+            &contour,
+            august(),
+            &AlwaysIndex(category),
+        )
+        .expect("applies");
+
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(7_500));
+        assert!(
+            flow.went_out_by_category(CurrencyCode::Rub)
+                .expect("aggregate fits")
+                .is_empty()
+        );
+        assert_eq!(
+            flow.not_decomposed(CurrencyCode::Rub)
+                .expect("aggregate fits"),
+            (1, rub(7_500))
+        );
+    }
+
+    #[test]
+    fn category_totals_skip_other_currencies_and_zeroed_groups() {
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let category = CategoryId(uuid::Uuid::from_u128(10));
+        let mut flow = MoneyFlow::new();
+        for amount in [rub(-5_000), rub(5_000)] {
+            flow.apply(
+                &outflow(card, "same", amount),
+                &contour,
+                august(),
+                &AlwaysIndex(category),
+            )
+            .expect("applies");
+        }
+        let usd = Money::new(PostedMinor::new(-2_000), CurrencyCode::Usd);
+        flow.apply(
+            &outflow(card, "usd", usd),
+            &contour,
+            august(),
+            &AlwaysIndex(category),
+        )
+        .expect("applies");
+
+        assert!(
+            flow.went_out_by_category(CurrencyCode::Rub)
+                .expect("aggregate fits")
+                .is_empty()
+        );
+        assert_eq!(
+            flow.went_out_by_category(CurrencyCode::Usd)
+                .expect("aggregate fits"),
+            vec![(category, Money::new(PostedMinor::new(2_000), CurrencyCode::Usd))]
+        );
+    }
+
+    #[test]
+    fn no_categories_keeps_an_outflow_in_the_undecomposed_bucket() {
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let mut flow = MoneyFlow::new();
+        flow.apply(&outflow(card, "row-1", rub(-9_000)), &contour, august(), &NoCategories)
+            .expect("applies");
+
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(9_000));
+        assert_eq!(
+            flow.not_decomposed(CurrencyCode::Rub)
+                .expect("aggregate fits"),
+            (1, rub(9_000))
+        );
+    }
+
+    #[test]
+    fn undecomposed_count_overflow_is_reported_without_panicking() {
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let mut flow = MoneyFlow::new();
+        flow.not_decomposed
+            .0
+            .insert(CurrencyCode::Rub, u64::MAX);
+
+        let error = flow
+            .apply(&outflow(card, "row-1", rub(-1)), &contour, august(), &NoCategories)
+            .expect_err("count overflow must be reported");
+        assert_eq!(
+            error,
+            MoneyFlowError::AggregateOverflow {
+                quantity: "not_decomposed_count"
+            }
+        );
+    }
+
+    #[test]
     fn two_currencies_never_mix() {
         let card = AccountId::new_random();
         let contour =

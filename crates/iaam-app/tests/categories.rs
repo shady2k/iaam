@@ -6,7 +6,7 @@ use iaam_app::error::AppError;
 use iaam_app::ports::{AccountView, Clock, Principal, Scope};
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, preview_category_rule,
-    retire_group,
+    retire_category, retire_category_rule, retire_group,
 };
 use iaam_app::scenarios::reports::{MoneyFlowQuery, money_flow};
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
@@ -387,4 +387,122 @@ async fn a_preview_with_no_changes_is_empty() {
     assert_eq!(before, after);
     assert_eq!(impact.rows, 0);
     assert!(impact.months.is_empty());
+}
+
+#[tokio::test]
+async fn category_rule_creation_rejects_reversed_intervals_and_accepts_each_matcher() {
+    let ctx = harness();
+    let group = ctx.create_group("Usual Expenses").await;
+    let category = ctx.create_category(group, "Food").await;
+    let reversed = create_category_rule(
+        &ctx.services,
+        &ctx.principal,
+        CategoryRuleInput {
+            matcher: CategoryMatcher::Row {
+                key: "row-1".to_owned(),
+            },
+            category,
+            interval: CategoryInterval {
+                from: Some(date!(2026 - 08 - 31)),
+                to: Some(date!(2026 - 08 - 01)),
+            },
+            replaces: None,
+        },
+    )
+    .await
+    .expect_err("reversed interval must be rejected");
+    assert!(matches!(
+        reversed,
+        AppError::Invalid { ref field, .. } if field == "interval"
+    ));
+
+    for matcher in [
+        CategoryMatcher::Row {
+            key: "row-1".to_owned(),
+        },
+        CategoryMatcher::SourceCategory {
+            value: "Supermarkets".to_owned(),
+        },
+        CategoryMatcher::DescriptionContains {
+            text: "cafe".to_owned(),
+        },
+    ] {
+        create_category_rule(
+            &ctx.services,
+            &ctx.principal,
+            CategoryRuleInput {
+                matcher,
+                category,
+                interval: CategoryInterval {
+                    from: None,
+                    to: None,
+                },
+                replaces: None,
+            },
+        )
+        .await
+        .expect("each matcher is serialisable and accepted");
+    }
+
+    let rules = ctx
+        .services
+        .categories
+        .list_category_rules(ctx.principal.owner)
+        .await
+        .expect("rules");
+    assert_eq!(rules.len(), 3);
+}
+
+#[tokio::test]
+async fn category_creation_and_rule_retirement_preserve_actionable_errors() {
+    let ctx = harness();
+    let missing = create_category(
+        &ctx.services,
+        &ctx.principal,
+        CategoryGroupId::new_random(),
+        "Food",
+    )
+    .await
+    .expect_err("missing group must be refused");
+    assert!(matches!(missing, AppError::NotFound { what: "category group", .. }));
+
+    let group = ctx.create_group("Usual Expenses").await;
+    let category = ctx.create_category(group, "Food").await;
+    let rule = create_category_rule(
+        &ctx.services,
+        &ctx.principal,
+        CategoryRuleInput {
+            matcher: CategoryMatcher::Row {
+                key: "row-1".to_owned(),
+            },
+            category,
+            interval: CategoryInterval {
+                from: None,
+                to: None,
+            },
+            replaces: None,
+        },
+    )
+    .await
+    .expect("rule");
+
+    retire_category_rule(&ctx.services, &ctx.principal, rule.id)
+        .await
+        .expect("rule retires");
+    let second = retire_category_rule(&ctx.services, &ctx.principal, rule.id)
+        .await
+        .expect_err("retired rule cannot be retired twice");
+    assert!(matches!(second, AppError::NotFound { what: "active category rule", .. }));
+
+    let category = create_category(
+        &ctx.services,
+        &ctx.principal,
+        group,
+        "Cafe",
+    )
+    .await
+    .expect("second category");
+    retire_category(&ctx.services, &ctx.principal, category)
+        .await
+        .expect("category retires");
 }

@@ -199,11 +199,24 @@ fn harness_on_disk() -> (Harness, std::path::PathBuf) {
 }
 
 fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account: AccountId) {
-    let period = iaam_core::reconciliation::claim::AssertionPeriod::between(
+    add_reconciliation_assertion_for_period(
+        path,
+        owner,
+        account,
         date!(2025 - 01 - 01),
         date!(2025 - 01 - 31),
-    )
-    .expect("period");
+    );
+}
+
+fn add_reconciliation_assertion_for_period(
+    path: &std::path::Path,
+    owner: OwnerId,
+    account: AccountId,
+    from: Date,
+    to: Date,
+) {
+    let period =
+        iaam_core::reconciliation::claim::AssertionPeriod::between(from, to).expect("period");
     let source = SourceId::new_random();
     let event = iaam_core::event::Event {
         id: iaam_core::ids::EventId::new_random(),
@@ -793,15 +806,18 @@ async fn health_is_public_and_reports_versions() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Version 8: version 4 added CorporateAction, OfferExercise and the income
+    // Version 9: version 4 added CorporateAction, OfferExercise and the income
     // type (§4.7); version 5 added the source time inside EffectiveOrder;
     // version 6 added the basis-only trade fee; version 7 added
     // ImportCoverageGap for refused import dimensions; version 8 made that gap
-    // carry the rows it refused. One version cannot denote two schemas (§4.1).
-    // An external agent reads this number to determine whether it can parse the
-    // response, so it is fixed here rather than derived from the code — a
-    // silent bump would tell that agent nothing had changed.
-    assert_eq!(body["schema_version"], 8);
+    // carry the rows it refused; version 9 added Tax, so that a tax stops being
+    // indistinguishable from ordinary spending. One version cannot denote two
+    // schemas (§4.1). An external agent reads this number to determine whether
+    // it can parse the response, so it is fixed here rather than derived from
+    // the code — a silent bump would tell that agent nothing had changed, and a
+    // silent omission would tell it nothing had changed when a new event kind
+    // appeared.
+    assert_eq!(body["schema_version"], 9);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version
@@ -896,7 +912,7 @@ async fn a_read_only_token_may_not_submit_operations() {
 }
 
 #[tokio::test]
-async fn an_invalid_amount_is_reported_as_422_with_field_expected_actual() {
+async fn an_invalid_amount_is_reported_as_a_200_row_verdict_with_field_expected_actual() {
     let harness = harness();
     let body = json!({
         "source_label": "test",
@@ -4322,4 +4338,479 @@ async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
     assert_eq!(repeated["affected_trades"], 0);
     assert_eq!(repeated["already_reversed"], 1);
     assert_eq!(repeated["written"], 0);
+}
+#[tokio::test]
+async fn the_same_declared_source_yields_the_same_source_id() {
+    let (harness, path) = harness_on_disk();
+    let account = harness.account.inner();
+    let body = json!({
+        "source_label": "paste",
+        "source": { "account": account, "channel": "paste" },
+        "operations": [{
+            "account": account,
+            "type": "withdrawal",
+            "amount": "123.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" }
+        }]
+    });
+
+    let (first, _) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, _) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(second, StatusCode::OK);
+
+    let sources = distinct_source_ids(&path, &harness.owner_token);
+    assert_eq!(sources.len(), 1, "expected one source, got {sources:?}");
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn an_empty_channel_is_rejected() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    for channel in ["", "x23456789012345678901234567890123"] {
+        let (status, body) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "source_label": "paste",
+                    "source": { "account": account, "channel": channel },
+                    "operations": []
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["field"], "source.channel");
+    }
+}
+
+fn distinct_source_ids(
+    path: &std::path::Path,
+    token: &str,
+) -> std::collections::BTreeSet<SourceId> {
+    let store = SqliteStore::open(path).expect("second connection");
+    let owner = store
+        .find_token(&hash_token(token))
+        .expect("owner token")
+        .expect("owner token record")
+        .owner;
+    store
+        .load_events(owner)
+        .expect("owner events")
+        .into_iter()
+        .map(|event| event.provenance.source())
+        .collect()
+}
+#[tokio::test]
+async fn flow_report_exposes_all_quantities_and_residual() {
+    let harness = harness();
+    let contour = json!({
+        "title": "August flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "deposit",
+                "amount": "3000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "flow-deposit"
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "1200.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-12" },
+                "idempotency_key": "flow-withdrawal"
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["contour"], contour_id);
+    assert_eq!(body["contour_version"], 1);
+    let currencies = body["currencies"].as_array().expect("currencies");
+    assert_eq!(currencies.len(), 1);
+    let rub = &currencies[0];
+    assert_eq!(rub["currency"], "RUB");
+    assert_eq!(rub["came_in"], "3000.00");
+    assert_eq!(rub["went_out"], "1200.00");
+    assert_eq!(rub["cash_delta"], "1800.00");
+    assert_eq!(rub["residual"], "0.00");
+    for field in [
+        "came_in",
+        "went_out",
+        "earned_by_capital",
+        "moved_into_assets",
+        "fees",
+        "taxes",
+        "internal_transfers",
+        "cash_delta",
+        "residual",
+    ] {
+        assert!(rub.get(field).is_some(), "missing quantity {field}: {rub}");
+    }
+    assert_eq!(body["unexplained"], json!([]));
+}
+
+#[tokio::test]
+async fn flow_report_rejects_a_reversed_interval() {
+    let harness = harness();
+    let contour = json!({
+        "title": "August flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-31&to=2026-08-01"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "period");
+}
+
+#[tokio::test]
+async fn balances_keep_cash_and_positions_as_separate_fields() {
+    let harness = harness();
+    let contour = json!({
+        "title": "August balances",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "deposit",
+                "amount": "3000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "balance-deposit"
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "opening_position",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "cost_basis": "1000.00",
+                "currency": "RUB",
+                "dates": { "trade": "2026-01-01" },
+                "idempotency_key": "balance-position"
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body.as_array().expect("balance rows");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["account"], harness.account.inner().to_string());
+    assert_eq!(row["cash"][0]["currency"], "RUB");
+    assert_eq!(row["cash"][0]["amount"], "3000.00");
+    assert_eq!(
+        row["positions"][0]["instrument"],
+        harness.instrument.inner().to_string()
+    );
+    assert_eq!(
+        row["positions"][0]["custody"],
+        harness.custody.inner().to_string()
+    );
+    assert_eq!(row["positions"][0]["quantity"], "10");
+    assert!(row["reconciliation"].is_array());
+    assert!(row.get("total").is_none());
+}
+
+#[tokio::test]
+async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
+    let (harness, path) = harness_on_disk();
+    let unstated_account = AccountId::new_random();
+    SqliteStore::open(&path)
+        .expect("second connection")
+        .upsert_account(&AccountRecord {
+            id: unstated_account,
+            owner: harness.owner,
+            title: "Unstated".into(),
+            institution: None,
+        })
+        .expect("unstated account");
+    add_reconciliation_assertion_for_period(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2026 - 08 - 01),
+        date!(2026 - 08 - 31),
+    );
+
+    let contour = json!({
+        "title": "August balances with reconciliation",
+        "accounts": [harness.account.inner(), unstated_account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body.as_array().expect("balance rows");
+    assert_eq!(rows.len(), 2);
+    let reconciled_id = harness.account.inner().to_string();
+    let unstated_id = unstated_account.inner().to_string();
+    let reconciled = rows
+        .iter()
+        .find(|row| row["account"].as_str() == Some(reconciled_id.as_str()))
+        .expect("reconciled account row");
+    let unstated = rows
+        .iter()
+        .find(|row| row["account"].as_str() == Some(unstated_id.as_str()))
+        .expect("unstated account row");
+
+    assert_eq!(
+        reconciled["reconciliation"],
+        json!([{
+            "account": reconciled_id,
+            "from": "2026-08-01",
+            "to": "2026-08-31",
+            "dimensions": [
+                { "dimension": "cash", "status": "provisional" },
+                { "dimension": "positions", "status": "provisional" },
+                { "dimension": "tax_basis", "status": "provisional" },
+                { "dimension": "income", "status": "provisional" },
+            ],
+            "evidence": [],
+            "outcomes": [{ "claim": "cash_balance", "outcome": "not_comparable" }],
+        }])
+    );
+    assert_eq!(unstated["reconciliation"], json!([]));
+
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn flow_and_balances_reports_require_authentication() {
+    let harness = harness();
+    for path in [
+        "/v1/reports/flow?contour=00000000-0000-0000-0000-000000000000&from=2026-08-01&to=2026-08-31",
+        "/v1/reports/balances?contour=00000000-0000-0000-0000-000000000000&as_of=2026-08-31",
+    ] {
+        let (status, body) = call(&harness.router, get(path, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+    }
+}
+#[tokio::test]
+async fn flow_report_names_an_unexplained_account() {
+    let harness = harness();
+    let contour = json!({
+        "title": "Opening balance flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "opening_cash",
+            "amount": "500.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "idempotency_key": "opening-cash"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["currencies"][0]["residual"], "500.00");
+    assert_eq!(
+        body["unexplained"][0]["account"],
+        harness.account.inner().to_string()
+    );
+    assert_eq!(body["unexplained"][0]["currency"], "RUB");
+    assert_eq!(body["unexplained"][0]["amount"], "500.00");
+}
+
+#[tokio::test]
+async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
+    let (harness, path) = harness_on_disk();
+    let body = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "tax",
+            "amount": "1300.00",
+            "currency": "RUB",
+            "origin": "self_paid",
+            "dates": { "cash_posted": "2026-08-25" },
+            "idempotency_key": "tax-leg",
+        }],
+    });
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events
+        .into_iter()
+        .find(|event| matches!(&event.kind, EventKind::Tax { .. }))
+        .expect("stored tax event");
+
+    match &event.kind {
+        EventKind::Tax { amount, origin } => {
+            assert_eq!(amount.amount().raw(), -130_000);
+            assert_eq!(*origin, iaam_core::event::kind::TaxOrigin::SelfPaid);
+        }
+        other => panic!("expected a tax event, got {other:?}"),
+    }
+
+    let tax_legs: Vec<_> = event
+        .legs
+        .iter()
+        .filter(|leg| leg.kind == iaam_core::event::leg::LegKind::Tax)
+        .collect();
+    assert_eq!(tax_legs.len(), 1);
+    let leg = tax_legs[0];
+    assert_eq!(leg.account, harness.account);
+    let money = leg.money.expect("tax leg amount");
+    assert_eq!(money.amount().raw(), -130_000);
+    assert_eq!(money.currency(), CurrencyCode::Rub);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn tax_amounts_are_rejected_per_row_when_not_positive() {
+    let harness = harness();
+    for (row, amount) in ["0.00", "-1.00"].into_iter().enumerate() {
+        let body = json!({
+            "source_label": "manual entry",
+            "operations": [{
+                "account": harness.account.inner(),
+                "type": "tax",
+                "amount": amount,
+                "currency": "RUB",
+                "origin": "withheld_at_source",
+                "dates": { "cash_posted": "2026-08-25" },
+                "idempotency_key": format!("tax-rejected-{row}"),
+            }],
+        });
+
+        let (status, response) = call(
+            &harness.router,
+            post("/v1/ingest/operations", &harness.owner_token, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response[0]["verdict"], "rejected", "{response}");
+        assert_eq!(response[0]["field"], "amount", "{response}");
+    }
 }

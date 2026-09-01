@@ -8,6 +8,7 @@ use iaam_core::event::correction::CorrectionError;
 use iaam_core::perimeter::PerimeterError;
 use iaam_core::projection::ProjectionError;
 use iaam_core::projection::active_instruments::ActiveInstrumentsError;
+use iaam_core::projection::money_flow::MoneyFlowError;
 use iaam_core::reconciliation::observed::ObserveError;
 use thiserror::Error;
 use uuid::Uuid;
@@ -40,10 +41,12 @@ pub enum AppError {
     DirectoryInvariant { correlation: Uuid, detail: String },
     #[error("projection not built: {0}")]
     Projection(#[source] ProjectionError),
+    #[error("money flow not built: {0}")]
+    MoneyFlow(#[from] MoneyFlowError),
     /// A journal slice is unsuitable for reconciliation: an undated event,
     /// a balance overflow. Separate from `Projection`, because
-    /// these are different causes for an external agent: one means an invalid slice,
-    /// the other — an inability to verify the data.
+    /// these are different causes for an external agent: one means an invalid
+    /// slice, the other — an inability to verify the data.
     #[error("reconciliation not built: {0}")]
     Reconciliation(#[source] ObserveError),
     #[error("perimeter not assessed: {0}")]
@@ -119,6 +122,7 @@ impl AppError {
             Self::Invariant { .. } => "invariant_violated",
             Self::DirectoryInvariant { .. } => "directory_invariant_violated",
             Self::Projection(_) => "projection_failed",
+            Self::MoneyFlow(_) => "money_flow_failed",
             Self::Reconciliation(_) => "reconciliation_failed",
             Self::Schedule(_) => "schedule_not_built",
             Self::Perimeter(_) => "perimeter_assessment_failed",

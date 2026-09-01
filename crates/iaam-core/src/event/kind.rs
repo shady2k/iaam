@@ -182,6 +182,13 @@ pub enum EventKind {
     },
     /// Fee not tied to a trade.
     Fee { amount: Money, origin: FeeOrigin },
+    /// Tax, whether withheld at source or paid by the owner.
+    ///
+    /// Modelled on `Fee`: a cost borne by the contour rather than money
+    /// crossing its boundary. Without a fact of its own, a self-paid tax is
+    /// indistinguishable from ordinary spending, and discretionary spending is
+    /// overstated by exactly the tax bill (spec §2).
+    Tax { amount: Money, origin: TaxOrigin },
     /// Reconstructed position for an account with no history (§10.7).
     OpeningPosition {
         instrument: InstrumentId,
@@ -266,6 +273,15 @@ pub enum FeeOrigin {
     Other,
 }
 
+/// Tax payment origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaxOrigin {
+    /// Withheld by the payer before the money arrived.
+    WithheldAtSource,
+    /// Paid by the owner: property, transport, a filed return.
+    SelfPaid,
+}
+
 impl EventKind {
     /// Short machine-readable name. Used in the API and storage.
     ///
@@ -280,6 +296,7 @@ impl EventKind {
             Self::CashTransfer { .. } => "cash_transfer",
             Self::Income { .. } => "income",
             Self::Fee { .. } => "fee",
+            Self::Tax { .. } => "tax",
             Self::OpeningPosition { .. } => "opening_position",
             Self::OpeningCash { .. } => "opening_cash",
             Self::Valuation { .. } => "valuation",
@@ -308,6 +325,7 @@ impl EventKind {
             Self::Trade { .. }
             | Self::Income { .. }
             | Self::Fee { .. }
+            | Self::Tax { .. }
             | Self::OpeningPosition { .. }
             | Self::OpeningCash { .. }
             | Self::Valuation { .. }

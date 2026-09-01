@@ -49,7 +49,15 @@ pub async fn statuses(
         .load_events_through(principal.owner, period.to)
         .await?;
     let ledger = ReconciliationLedger::build(&events)?;
-    Ok(ledger
+    Ok(statuses_for_account(&ledger, account, period))
+}
+
+pub(super) fn statuses_for_account(
+    ledger: &ReconciliationLedger,
+    account: AccountId,
+    period: AssertionPeriod,
+) -> Vec<ReconciliationStatus> {
+    ledger
         .statuses()
         .filter(|status| {
             status.account() == account
@@ -57,7 +65,7 @@ pub async fn statuses(
                 && period.from <= status.period().to
         })
         .cloned()
-        .collect())
+        .collect()
 }
 
 /// Records only the owner's cash and position assertions.

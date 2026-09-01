@@ -66,6 +66,33 @@ typed_id!(
     ClassificationRuleId
 );
 
+/// Namespace for declared sources. A fixed UUID, so the derivation is stable
+/// across builds and machines.
+const DECLARED_SOURCE_NAMESPACE: uuid::Uuid = uuid::uuid!("6f2b1c4e-6f8a-5a1d-9d0e-2c7f4a3b8e11");
+
+impl SourceId {
+    /// A source identity the caller declares rather than one we mint.
+    ///
+    /// Minting a random source per request means nothing deduplicates across
+    /// requests: re-sending a corrected batch creates a second set of rows
+    /// instead of replacing the first. The identity is therefore derived from
+    /// the triple that actually names the source — the owner, the account, and
+    /// the channel the rows arrived through.
+    ///
+    /// The channel is part of the key on purpose. A file export and a page
+    /// paste of the same account are two channels; collapsing them into one
+    /// source would make a pasted row deduplicate against an exported one
+    /// instead of confirming it, and the two could never be told apart.
+    #[must_use]
+    pub fn declared(owner: OwnerId, account: AccountId, channel: &str) -> Self {
+        let name = format!("{}/{}/{}", owner.inner(), account.inner(), channel);
+        Self(uuid::Uuid::new_v5(
+            &DECLARED_SOURCE_NAMESPACE,
+            name.as_bytes(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +120,59 @@ mod tests {
         let a = AccountId::new_random();
         let b = AccountId::new_random();
         assert_ne!(a, b, "two random identifiers are equal");
+    }
+
+    #[test]
+    fn a_declared_source_is_stable_across_calls() {
+        let owner = OwnerId(uuid::Uuid::from_u128(1));
+        let account = AccountId(uuid::Uuid::from_u128(2));
+        assert_eq!(
+            SourceId::declared(owner, account, "file"),
+            SourceId::declared(owner, account, "file")
+        );
+    }
+
+    #[test]
+    fn a_declared_source_separates_channels_of_one_account() {
+        let owner = OwnerId(uuid::Uuid::from_u128(1));
+        let account = AccountId(uuid::Uuid::from_u128(2));
+        // Two channels of the same account must stay distinct source identities,
+        // or a pasted row would deduplicate against an exported one instead of
+        // confirming it (spec §6).
+        assert_ne!(
+            SourceId::declared(owner, account, "file"),
+            SourceId::declared(owner, account, "paste")
+        );
+    }
+
+    #[test]
+    fn a_declared_source_separates_accounts_and_owners() {
+        let owner = OwnerId(uuid::Uuid::from_u128(1));
+        let other_owner = OwnerId(uuid::Uuid::from_u128(9));
+        let account = AccountId(uuid::Uuid::from_u128(2));
+        let other_account = AccountId(uuid::Uuid::from_u128(3));
+        assert_ne!(
+            SourceId::declared(owner, account, "file"),
+            SourceId::declared(owner, other_account, "file")
+        );
+        assert_ne!(
+            SourceId::declared(owner, account, "file"),
+            SourceId::declared(other_owner, account, "file")
+        );
+    }
+
+    #[test]
+    fn a_declared_source_is_never_a_random_one() {
+        let owner = OwnerId(uuid::Uuid::from_u128(1));
+        let account = AccountId(uuid::Uuid::from_u128(2));
+        // Version 5, not version 4: a declared source and a random one occupy
+        // disjoint spaces, so they cannot be confused by accident.
+        assert_eq!(
+            SourceId::declared(owner, account, "file")
+                .inner()
+                .get_version_num(),
+            5
+        );
+        assert_eq!(SourceId::new_random().inner().get_version_num(), 4);
     }
 }

@@ -707,6 +707,7 @@ impl LotBook {
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
             | EventKind::Fee { .. }
+            | EventKind::Tax { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. }

@@ -3,7 +3,9 @@
 use iaam_core::dates::{
     CashPostedDate, EffectiveOrder, EventDates, PaidDate, SettledDate, TradeDate,
 };
-use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TradeSide};
+use iaam_core::event::kind::{
+    EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TaxOrigin, TradeSide,
+};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
@@ -94,6 +96,11 @@ pub enum OperationKind {
         amount_minor: i64,
         currency: CurrencyCode,
         origin: FeeOrigin,
+    },
+    Tax {
+        amount_minor: i64,
+        currency: CurrencyCode,
+        origin: TaxOrigin,
     },
     OpeningCash {
         amount_minor: i64,
@@ -443,6 +450,20 @@ fn build(
                     origin: *origin,
                 },
                 vec![Leg::fee(account, amount)],
+            ))
+        }
+        OperationKind::Tax {
+            amount_minor,
+            currency,
+            origin,
+        } => {
+            let amount = money(-positive(*amount_minor, "amount", *currency)?, *currency);
+            Ok((
+                EventKind::Tax {
+                    amount,
+                    origin: *origin,
+                },
+                vec![Leg::tax(account, amount)],
             ))
         }
         OperationKind::OpeningCash {

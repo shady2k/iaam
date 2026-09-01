@@ -344,10 +344,12 @@ fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> {
                 .collect()
         }
         OperationKind::Income { .. } => [Dimension::Cash, Dimension::Income].into_iter().collect(),
+        // Tax payments move cash without changing any position's basis; use Cash, not TaxBasis.
         OperationKind::Deposit { .. }
         | OperationKind::Withdrawal { .. }
         | OperationKind::Transfer { .. }
         | OperationKind::Fee { .. }
+        | OperationKind::Tax { .. }
         | OperationKind::OpeningCash { .. } => [Dimension::Cash].into_iter().collect(),
         OperationKind::OpeningPosition { .. } => [Dimension::Positions].into_iter().collect(),
         // Valuation changes no control dimension, so refusing it cannot taint

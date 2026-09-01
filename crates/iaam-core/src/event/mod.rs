@@ -182,7 +182,7 @@ pub struct Event {
 /// [`EventKind::ImportRowResolution`]: a coverage gap now says WHICH rows are
 /// missing, and a row is disposed of by an explicit fact rather than inferred
 /// from the presence of an event.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.
@@ -256,6 +256,7 @@ impl Event {
                 self.expect_single_cash(name, *gross, Sign::Positive)
             }
             EventKind::Fee { amount, .. } => self.validate_fee(name, *amount),
+            EventKind::Tax { amount, .. } => self.validate_tax(name, *amount),
             EventKind::CashTransfer {
                 from, to, amount, ..
             } => self.validate_transfer(name, *from, *to, *amount),
@@ -335,6 +336,29 @@ impl Event {
     ) -> Result<(), EventValidationError> {
         let fee_legs = self.legs_of_kind(LegKind::Fee);
         let money = single_leg_money(name, &fee_legs, "exactly one fee leg")?;
+        if money.amount().raw() >= 0 {
+            return Err(EventValidationError::WrongSign {
+                kind: name,
+                amount: money.amount().raw(),
+                currency: money.currency(),
+            });
+        }
+        require_equal(name, money, declared)
+    }
+
+    /// Tax: exactly one negative tax leg, equal to the declared amount.
+    ///
+    /// Deliberately a separate function from `validate_fee` rather than a
+    /// shared one parameterised by leg kind: the two shapes are equal today by
+    /// coincidence, and a shared body would silently impose one's future
+    /// conditions on the other.
+    fn validate_tax(
+        &self,
+        name: &'static str,
+        declared: Money,
+    ) -> Result<(), EventValidationError> {
+        let tax_legs = self.legs_of_kind(LegKind::Tax);
+        let money = single_leg_money(name, &tax_legs, "exactly one tax leg")?;
         if money.amount().raw() >= 0 {
             return Err(EventValidationError::WrongSign {
                 kind: name,
@@ -1160,7 +1184,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::kind::{FeeOrigin, TradeSide};
+    use super::kind::{FeeOrigin, TaxOrigin, TradeSide};
     use super::provenance::{ParserVersion, RawHash};
     use super::source_row::{RefusedRow, RowName, SourceRowKey};
     use super::*;
@@ -1845,6 +1869,87 @@ mod tests {
             doubled.validate_structure(),
             Err(EventValidationError::LegCount { found: 2, .. })
         ));
+    }
+
+    // --- Tax ---
+
+    fn tax_event(amount: Money, leg: Money) -> Event {
+        let account = AccountId::new_random();
+        event(
+            EventKind::Tax {
+                amount,
+                origin: TaxOrigin::SelfPaid,
+            },
+            vec![Leg::tax(account, leg)],
+            account,
+        )
+    }
+
+    #[test]
+    fn a_tax_matches_its_single_negative_leg() {
+        let event = tax_event(rub(-130_000), rub(-130_000));
+        assert!(event.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn a_tax_positive_leg_is_rejected() {
+        // A tax that increases the balance is not a tax. Taking the absolute
+        // value here is how a refund silently becomes a charge.
+        let event = tax_event(rub(130_000), rub(130_000));
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::WrongSign { .. })
+        ));
+    }
+
+    #[test]
+    fn a_tax_without_a_tax_leg_is_rejected() {
+        let account = AccountId::new_random();
+        let event = event(
+            EventKind::Tax {
+                amount: rub(-130_000),
+                origin: TaxOrigin::WithheldAtSource,
+            },
+            vec![Leg::cash(account, rub(-130_000))],
+            account,
+        );
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::LegCount { .. })
+        ));
+    }
+
+    #[test]
+    fn a_tax_with_two_tax_legs_is_rejected() {
+        let account = AccountId::new_random();
+        let event = event(
+            EventKind::Tax {
+                amount: rub(-130_000),
+                origin: TaxOrigin::SelfPaid,
+            },
+            vec![
+                Leg::tax(account, rub(-65_000)),
+                Leg::tax(account, rub(-65_000)),
+            ],
+            account,
+        );
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::LegCount { found: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn a_tax_names_itself_and_stays_within_the_account() {
+        let kind = EventKind::Tax {
+            amount: rub(-1),
+            origin: TaxOrigin::SelfPaid,
+        };
+        assert_eq!(kind.discriminant(), "tax");
+        // WithinAccount, exactly like Fee: a tax is a cost borne by the
+        // contour, not money crossing its boundary. Calling it an external
+        // outflow would understate contributions in the returns path.
+        assert_eq!(kind.flow_endpoints(), kind::FlowEndpoints::WithinAccount);
     }
 
     // --- External cash ---
@@ -2991,7 +3096,15 @@ mod tests {
         // 6 → 7: added `EventKind::ImportCoverageGap` (§10.3).
         // 7 → 8: `ImportCoverageGap` gained `rows`; added
         //        `EventKind::ImportRowResolution` (§10.3).
-        assert_eq!(SCHEMA_VERSION, 8);
+        // 8 → 9: added `EventKind::Tax`, so that a tax stops being
+        //        indistinguishable from ordinary spending in the flow report.
+        //        Older facts stay readable: the version guard in
+        //        `iaam-app/src/scenarios/ingest.rs` refuses a mismatched
+        //        version only on the WRITE path, and nothing on the read path
+        //        compares against the current version. The `< 8` allowance in
+        //        `validate_import_coverage_gap` above is a historical threshold
+        //        and is deliberately left alone.
+        assert_eq!(SCHEMA_VERSION, 9);
     }
 
     #[test]

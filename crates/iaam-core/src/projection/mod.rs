@@ -13,6 +13,7 @@ pub mod flows;
 pub mod income;
 pub mod invariants;
 pub mod lots;
+pub mod money_flow;
 pub mod offers;
 pub mod ownership;
 pub mod state;

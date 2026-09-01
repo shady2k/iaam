@@ -102,6 +102,7 @@ pub fn active_instruments(
             | EventKind::CashTransfer { .. }
             | EventKind::Income { .. }
             | EventKind::Fee { .. }
+            | EventKind::Tax { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. }

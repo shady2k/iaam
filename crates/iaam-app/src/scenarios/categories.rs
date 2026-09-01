@@ -64,7 +64,10 @@ pub async fn retire_group(
     principal: &Principal,
     group: CategoryGroupId,
 ) -> Result<(), AppError> {
-    services.categories.retire_group(principal.owner, group).await
+    services
+        .categories
+        .retire_group(principal.owner, group)
+        .await
 }
 
 pub async fn list_categories(
@@ -177,7 +180,12 @@ pub async fn preview_category_rule(
         .load_events_through(principal.owner, time::Date::MAX)
         .await?;
     let mut grouped = BTreeMap::<
-        (time::Date, Option<CategoryId>, CategoryId, iaam_core::money::CurrencyCode),
+        (
+            time::Date,
+            Option<CategoryId>,
+            CategoryId,
+            iaam_core::money::CurrencyCode,
+        ),
         (Money, u64),
     >::new();
     let mut rows = 0_u64;
@@ -191,8 +199,7 @@ pub async fn preview_category_rule(
             CategoryAssignment::Assigned { category, .. } => Some(category),
             CategoryAssignment::NotDecomposed => None,
         };
-        let CategoryAssignment::Assigned { category: next, .. } =
-            proposed_index.assignment(&event)
+        let CategoryAssignment::Assigned { category: next, .. } = proposed_index.assignment(&event)
         else {
             continue;
         };
@@ -200,11 +207,14 @@ pub async fn preview_category_rule(
             continue;
         }
 
-        let on = event.dates.effective_date().ok_or_else(|| AppError::Invalid {
-            field: "event.date".to_owned(),
-            expected: "an effective date".to_owned(),
-            actual: event.id.0.to_string(),
-        })?;
+        let on = event
+            .dates
+            .effective_date()
+            .ok_or_else(|| AppError::Invalid {
+                field: "event.date".to_owned(),
+                expected: "an effective date".to_owned(),
+                actual: event.id.0.to_string(),
+            })?;
         let month = time::Date::from_calendar_date(on.year(), on.month(), 1).map_err(|error| {
             AppError::Invalid {
                 field: "event.date".to_owned(),
@@ -360,10 +370,7 @@ fn parse_matcher(raw: &str) -> Result<CategoryMatcher, AppError> {
             value: value.to_owned(),
         });
     }
-    if let Some(text) = object
-        .get("description_contains")
-        .and_then(Value::as_str)
-    {
+    if let Some(text) = object.get("description_contains").and_then(Value::as_str) {
         return Ok(CategoryMatcher::DescriptionContains {
             text: text.to_owned(),
         });

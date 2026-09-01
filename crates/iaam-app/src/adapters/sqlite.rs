@@ -7,6 +7,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::error::AppError;
+use crate::ports::{
+    AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
+    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleView, CategoryStore,
+    CategoryView, ClassificationRuleStore, ClassificationRuleView, CustodyView,
+    InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal, Recorded, Scope,
+    SoleOwner, Store, TokenAdmin, TokenView,
+};
+use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
@@ -32,15 +41,6 @@ use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
 use uuid::Uuid;
 use zeroize::Zeroizing;
-use crate::error::AppError;
-use crate::ports::{
-    AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
-    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleView, CategoryStore,
-    CategoryView, ClassificationRuleStore, ClassificationRuleView, CustodyView,
-    InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal, Recorded, Scope,
-    SoleOwner, Store, TokenAdmin, TokenView,
-};
-use crate::tokens::{hash_token, secret_hex};
 
 /// Connection behind a mutex: `rusqlite::Connection` is not `Sync`, and a
 /// single-user database has only one writer. A pool will be added when there is
@@ -817,11 +817,7 @@ fn category_store_error(error: iaam_store::StoreError) -> AppError {
     }
 }
 
-fn category_group_view(
-    id: Uuid,
-    title: String,
-    retired_at: Option<String>,
-) -> CategoryGroupView {
+fn category_group_view(id: Uuid, title: String, retired_at: Option<String>) -> CategoryGroupView {
     CategoryGroupView {
         id: CategoryGroupId(id),
         title,
@@ -916,10 +912,7 @@ impl CategoryStore for SqliteAdapter {
         .await
     }
 
-    async fn list_category_rules(
-        &self,
-        owner: OwnerId,
-    ) -> Result<Vec<CategoryRuleView>, AppError> {
+    async fn list_category_rules(&self, owner: OwnerId) -> Result<Vec<CategoryRuleView>, AppError> {
         self.blocking(move |store| {
             store
                 .list_category_rules(owner)

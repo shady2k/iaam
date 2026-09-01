@@ -46,7 +46,6 @@ pub struct CategoryRuleRow {
     pub replaces: Option<CategoryRuleId>,
 }
 
-
 impl SqliteStore {
     /// Add a category group and return its stable identifier.
     pub fn insert_category_group(
@@ -170,10 +169,7 @@ impl SqliteStore {
 
     /// List every category rule owned by the portfolio owner, including retired
     /// rows, in version order.
-    pub fn list_category_rules(
-        &self,
-        owner: OwnerId,
-    ) -> Result<Vec<CategoryRuleRow>, StoreError> {
+    pub fn list_category_rules(&self, owner: OwnerId) -> Result<Vec<CategoryRuleRow>, StoreError> {
         let mut statement = self.conn.prepare(
             "SELECT id, version, matcher, category, valid_from, valid_to,
                     created_at, retired_at, replaces
@@ -248,11 +244,7 @@ impl SqliteStore {
     }
 
     /// Retire a category group without deleting its historical row.
-    pub fn retire_category_group(
-        &mut self,
-        owner: OwnerId,
-        id: Uuid,
-    ) -> Result<(), StoreError> {
+    pub fn retire_category_group(&mut self, owner: OwnerId, id: Uuid) -> Result<(), StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

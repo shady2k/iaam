@@ -5055,10 +5055,7 @@ async fn flow_report_exposes_category_decomposition_residual_and_rule_versions()
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["category_rule_versions"], json!([1]));
     let rub = &body["currencies"][0];
-    assert_eq!(
-        rub["went_out_by_category"][0]["category"],
-        category_id
-    );
+    assert_eq!(rub["went_out_by_category"][0]["category"], category_id);
     assert_eq!(rub["went_out_by_category"][0]["amount"], "1200.00");
     assert_eq!(rub["not_decomposed"]["count"], 1);
     assert_eq!(rub["not_decomposed"]["amount"], "500.00");
@@ -5072,14 +5069,8 @@ async fn categories_and_category_rules_require_authentication() {
     let harness = harness();
     let requests = [
         call(&harness.router, get("/v1/categories", None)),
-        call(
-            &harness.router,
-            post_public("/v1/categories", &json!({})),
-        ),
-        call(
-            &harness.router,
-            get("/v1/category-rules", None),
-        ),
+        call(&harness.router, post_public("/v1/categories", &json!({}))),
+        call(&harness.router, get("/v1/category-rules", None)),
         call(
             &harness.router,
             post_public("/v1/category-rules", &json!({})),

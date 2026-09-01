@@ -282,7 +282,10 @@ fn category_rule_intervals_and_open_ends_round_trip() {
 
     let listed = store.list_category_rules(owner).expect("rules");
     assert_eq!(listed.len(), 2);
-    assert_eq!(listed[0].matcher_json, r#"{"DescriptionContains": {"text": "ЛАВКА"}}"#);
+    assert_eq!(
+        listed[0].matcher_json,
+        r#"{"DescriptionContains": {"text": "ЛАВКА"}}"#
+    );
     assert_eq!(listed[0].valid_from, Some(date!(2024 - 01 - 01)));
     assert_eq!(listed[0].valid_to, None);
     assert_eq!(listed[1].valid_from, None);
@@ -303,9 +306,7 @@ fn a_retired_category_rule_is_still_listed_and_flagged() {
         .insert_category_rule(owner, r#"{"Row":{"key":"row-3"}}"#, food, None, None, None)
         .expect("rule");
 
-    store
-        .retire_category_rule(owner, rule.id)
-        .expect("retired");
+    store.retire_category_rule(owner, rule.id).expect("retired");
     let listed = store.list_category_rules(owner).expect("rules");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, CategoryRuleId(rule.id.inner()));

@@ -153,13 +153,13 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
 
 #[cfg(test)]
 mod tests {
-    use time::{macros::date, Date};
+    use time::{Date, macros::date};
 
     use crate::ids::{CategoryId, CategoryRuleId};
 
     use super::{
-        assign, CategoryAssignment, CategoryBasis, CategoryInterval, CategoryMatcher,
-        CategoryRule, CategorySubject,
+        CategoryAssignment, CategoryBasis, CategoryInterval, CategoryMatcher, CategoryRule,
+        CategorySubject, assign,
     };
 
     fn rule(
@@ -396,5 +396,4 @@ mod tests {
                 if category == CategoryId(uuid::Uuid::from_u128(new))
         ));
     }
-
 }

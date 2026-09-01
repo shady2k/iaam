@@ -15,8 +15,8 @@ use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
 use iaam_app::scenarios::categories::{
-    CategoryRuleInput, create_category, create_category_rule, list_categories,
-    list_category_rules, preview_category_rule, retire_category,
+    CategoryRuleInput, create_category, create_category_rule, list_categories, list_category_rules,
+    preview_category_rule, retire_category,
 };
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
@@ -56,12 +56,12 @@ use zeroize::Zeroizing;
 use crate::ServerState;
 use crate::dto::{
     AccountBalanceDto, AccountDto, AddBrokerAccessRequest, BrokerAccessDto,
-    BrokerAccessUpdateRequest, BrokerSyncRequest, CategoryDto, CategoryRuleDto,
-    CategoryRuleImpactDto, CategoryRuleRequest, CategoryRequest, ClaimOutcomeDto,
-    ClaimRequest, ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
-    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
-    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto,
-    DocumentParams, EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
+    BrokerAccessUpdateRequest, BrokerSyncRequest, CategoryDto, CategoryRequest, CategoryRuleDto,
+    CategoryRuleImpactDto, CategoryRuleRequest, ClaimOutcomeDto, ClaimRequest,
+    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
+    EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
     MarketKeyRateDto, MarketPriceDto, MarketSourceDto, MarketSyncRequest, MoneyFlowReportDto,
     OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
     ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
@@ -521,10 +521,7 @@ pub async fn list_category_reference(
     require_admin(&principal)?;
     let categories = list_categories(&state.services, &principal).await?;
     Ok(Json(
-        categories
-            .into_iter()
-            .map(CategoryDto::from_port)
-            .collect(),
+        categories.into_iter().map(CategoryDto::from_port).collect(),
     ))
 }
 
@@ -604,10 +601,7 @@ pub async fn list_category_rules_route(
     require_admin(&principal)?;
     let rules = list_category_rules(&state.services, &principal).await?;
     Ok(Json(
-        rules
-            .into_iter()
-            .map(CategoryRuleDto::from_port)
-            .collect(),
+        rules.into_iter().map(CategoryRuleDto::from_port).collect(),
     ))
 }
 
@@ -672,11 +666,7 @@ pub async fn preview_category_rule_route(
         .unwrap_or_default()
         .checked_add(1)
         .ok_or_else(|| {
-            invalid_field(
-                "version",
-                "a representable rule version",
-                "overflow".into(),
-            )
+            invalid_field("version", "a representable rule version", "overflow".into())
         })?;
     let impact = preview_category_rule(
         &state.services,
@@ -695,7 +685,6 @@ pub async fn preview_category_rule_route(
     .await?;
     Ok(Json(CategoryRuleImpactDto::from_domain(impact)))
 }
-
 
 /// Synchronise one broker channel over an interval.
 #[utoipa::path(
@@ -1920,23 +1909,33 @@ fn parse_category_matcher(value: serde_json::Value) -> Result<CategoryMatcher, A
         });
     }
 
-    let (kind, payload) = ["Row", "row", "row_key", "SourceCategory", "source_category",
-        "DescriptionContains", "description_contains"]
-        .iter()
-        .find_map(|key| object.get(*key).map(|payload| (*key, payload)))
-        .ok_or_else(|| {
-            invalid_field(
-                "matcher",
-                "row, source_category or description_contains",
-                value.to_string(),
-            )
-        })?;
-    let text = matcher_text(payload, match kind {
-        "Row" | "row" | "row_key" => "key",
-        "SourceCategory" | "source_category" => "value",
-        "DescriptionContains" | "description_contains" => "text",
-        _ => unreachable!("matcher key was selected above"),
+    let (kind, payload) = [
+        "Row",
+        "row",
+        "row_key",
+        "SourceCategory",
+        "source_category",
+        "DescriptionContains",
+        "description_contains",
+    ]
+    .iter()
+    .find_map(|key| object.get(*key).map(|payload| (*key, payload)))
+    .ok_or_else(|| {
+        invalid_field(
+            "matcher",
+            "row, source_category or description_contains",
+            value.to_string(),
+        )
     })?;
+    let text = matcher_text(
+        payload,
+        match kind {
+            "Row" | "row" | "row_key" => "key",
+            "SourceCategory" | "source_category" => "value",
+            "DescriptionContains" | "description_contains" => "text",
+            _ => unreachable!("matcher key was selected above"),
+        },
+    )?;
     Ok(match kind {
         "Row" | "row" | "row_key" => CategoryMatcher::Row { key: text },
         "SourceCategory" | "source_category" => CategoryMatcher::SourceCategory { value: text },

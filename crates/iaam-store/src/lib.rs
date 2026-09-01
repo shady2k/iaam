@@ -11,9 +11,9 @@ pub mod market;
 pub mod market_source_codes;
 
 pub mod bundle;
+pub mod categories;
 pub mod documents;
 pub mod events;
-pub mod categories;
 pub mod reference;
 pub mod rules;
 pub mod schedule;

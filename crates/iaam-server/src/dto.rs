@@ -17,9 +17,9 @@ use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CategoryRuleView, CategoryView, ClassificationRuleView,
     IssuedToken, Scope, TokenView,
 };
-use iaam_core::bond::offer::OfferChoice;
-use iaam_app::scenarios::categories::{CategoryRuleImpact, CategoryMove, MonthlyImpact};
+use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::reports::{AccountBalanceRow, MoneyFlowReport};
+use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};

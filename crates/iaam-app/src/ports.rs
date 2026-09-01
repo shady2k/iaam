@@ -380,10 +380,7 @@ pub trait CategoryStore: Send + Sync {
         title: String,
     ) -> Result<CategoryView, AppError>;
     async fn retire_category(&self, owner: OwnerId, id: CategoryId) -> Result<(), AppError>;
-    async fn list_category_rules(
-        &self,
-        owner: OwnerId,
-    ) -> Result<Vec<CategoryRuleView>, AppError>;
+    async fn list_category_rules(&self, owner: OwnerId) -> Result<Vec<CategoryRuleView>, AppError>;
     async fn create_category_rule(
         &self,
         owner: OwnerId,
@@ -751,21 +748,15 @@ impl CategoryStore for UnavailableCategoryStore {
         _owner: OwnerId,
         _title: String,
     ) -> Result<CategoryGroupView, AppError> {
-        Err(AppError::NotConfigured {
-            what: "categories",
-        })
+        Err(AppError::NotConfigured { what: "categories" })
     }
 
     async fn retire_group(&self, _owner: OwnerId, _id: CategoryGroupId) -> Result<(), AppError> {
-        Err(AppError::NotConfigured {
-            what: "categories",
-        })
+        Err(AppError::NotConfigured { what: "categories" })
     }
 
     async fn list_categories(&self, _owner: OwnerId) -> Result<Vec<CategoryView>, AppError> {
-        Err(AppError::NotConfigured {
-            what: "categories",
-        })
+        Err(AppError::NotConfigured { what: "categories" })
     }
 
     async fn create_category(
@@ -774,15 +765,11 @@ impl CategoryStore for UnavailableCategoryStore {
         _group: CategoryGroupId,
         _title: String,
     ) -> Result<CategoryView, AppError> {
-        Err(AppError::NotConfigured {
-            what: "categories",
-        })
+        Err(AppError::NotConfigured { what: "categories" })
     }
 
     async fn retire_category(&self, _owner: OwnerId, _id: CategoryId) -> Result<(), AppError> {
-        Err(AppError::NotConfigured {
-            what: "categories",
-        })
+        Err(AppError::NotConfigured { what: "categories" })
     }
 
     async fn list_category_rules(

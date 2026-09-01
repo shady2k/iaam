@@ -28,8 +28,8 @@ use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
-use crate::AppServices;
 use super::categories::load_index;
+use crate::AppServices;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::Principal;

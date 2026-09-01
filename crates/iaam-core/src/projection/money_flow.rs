@@ -23,8 +23,8 @@ use crate::contour::{ContourDefinition, FlowClass, classify};
 use crate::event::Event;
 use crate::event::kind::EventKind;
 use crate::event::leg::LegKind;
-use crate::ids::{AccountId, EventId};
 use crate::ids::CategoryId;
+use crate::ids::{AccountId, EventId};
 use crate::money::{CurrencyCode, Money, PostedMinor};
 
 /// The interval a report covers, inclusive at both ends.
@@ -132,7 +132,6 @@ impl MoneyFlow {
             None
         };
         let mut not_decomposed_currencies = BTreeSet::new();
-
 
         for leg in &event.legs {
             if !contour.contains(leg.account) {
@@ -367,10 +366,7 @@ impl MoneyFlow {
     }
 
     /// Returns the number and amount of outflow rows without a category.
-    pub fn not_decomposed(
-        &self,
-        currency: CurrencyCode,
-    ) -> Result<(u64, Money), MoneyFlowError> {
+    pub fn not_decomposed(&self, currency: CurrencyCode) -> Result<(u64, Money), MoneyFlowError> {
         let count = self
             .not_decomposed
             .0
@@ -544,9 +540,11 @@ fn add_not_decomposed(
     )?;
     if seen_currencies.insert(money.currency()) {
         let count = decomposition.0.entry(money.currency()).or_default();
-        *count = count.checked_add(1).ok_or(MoneyFlowError::AggregateOverflow {
-            quantity: "not_decomposed_count",
-        })?;
+        *count = count
+            .checked_add(1)
+            .ok_or(MoneyFlowError::AggregateOverflow {
+                quantity: "not_decomposed_count",
+            })?;
     }
     Ok(())
 }
@@ -655,7 +653,9 @@ mod tests {
             self.0
                 .iter()
                 .find(|(key, _)| event.provenance.source_operation_id() == Some(*key))
-                .map_or(CategoryAssignment::NotDecomposed, |(_, assignment)| *assignment)
+                .map_or(CategoryAssignment::NotDecomposed, |(_, assignment)| {
+                    *assignment
+                })
         }
     }
 
@@ -678,9 +678,7 @@ mod tests {
             vec![Leg::cash(account, amount)],
             date!(2026 - 08 - 01),
         );
-        event.provenance = event
-            .provenance
-            .with_source_operation_id(row.to_owned());
+        event.provenance = event.provenance.with_source_operation_id(row.to_owned());
         event
     }
 
@@ -695,10 +693,7 @@ mod tests {
             vec![
                 Leg::cash(
                     from,
-                    Money::new(
-                        PostedMinor::new(-amount.amount().raw()),
-                        amount.currency(),
-                    ),
+                    Money::new(PostedMinor::new(-amount.amount().raw()), amount.currency()),
                 ),
                 Leg::cash(to, amount),
             ],
@@ -732,9 +727,7 @@ mod tests {
                 .expect("applies");
         }
 
-        let by_category = flow
-            .went_out_by_category(CurrencyCode::Rub)
-            .expect("fits");
+        let by_category = flow.went_out_by_category(CurrencyCode::Rub).expect("fits");
         let (count, undecomposed) = flow.not_decomposed(CurrencyCode::Rub).expect("fits");
         let decomposed: i64 = by_category
             .iter()

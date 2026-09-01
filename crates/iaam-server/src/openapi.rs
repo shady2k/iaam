@@ -10,11 +10,11 @@ use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 
 use crate::dto::{
-    AccountDto, AccountBalanceDto, AccountResidualDto, AddBrokerAccessRequest, AmountDto,
+    AccountBalanceDto, AccountDto, AccountResidualDto, AddBrokerAccessRequest, AmountDto,
     BasisCertaintyDto, BasisTransferRuleDto, BondPositionMetricsDto, BondScenarioResultDto,
     BrokerAccessDto, BrokerAccessUpdateRequest, BrokerEnvironmentDto, BrokerSyncRequest,
-    CalcMoneyDto, CategoryAmountDto, CategoryDto, CategoryMoveDto, CategoryRuleDto,
-    CategoryRuleImpactDto, CategoryRuleRequest, CategoryRequest, CertaintyDto, ClaimOutcomeDto,
+    CalcMoneyDto, CategoryAmountDto, CategoryDto, CategoryMoveDto, CategoryRequest,
+    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, CertaintyDto, ClaimOutcomeDto,
     ClaimRequest, ClassificationRuleDto, ClassificationRuleRequest, ComputedCalcMoneyDto,
     ComputedDto, ComputedLifetimeCohortMetricsDto, ComputedZeroReinvestmentMetricsDto,
     ContourVersionDto, CorporateActionDto, CreateAccountRequest, CreateContourVersionRequest,
@@ -30,8 +30,8 @@ use crate::dto::{
     PriceFreshnessDto, PriceOriginDto, PriceProvenanceDto, PriceQualityDto, PriceSelectionDto,
     ProspectiveMetricDto, QuotationBasisDto, QuotationBasisStatusDto, RateDto,
     ReconciliationStatusDto, ReturnsReportDto, SelectedPriceDto, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TristateDto,
-    UncoveredPositionDto, VerdictDto, ZeroReinvestmentMetricsDto,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TristateDto, UncoveredPositionDto,
+    VerdictDto, ZeroReinvestmentMetricsDto,
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;

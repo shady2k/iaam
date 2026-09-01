@@ -11,7 +11,7 @@ use iaam_app::scenarios::categories::{
 use iaam_app::scenarios::reports::{MoneyFlowQuery, money_flow};
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRule};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{AccountId, CategoryId, CategoryGroupId, CategoryRuleId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, CategoryGroupId, CategoryId, CategoryRuleId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind};
@@ -182,8 +182,7 @@ async fn august_card(ctx: &Ctx) -> (AccountId, ContourId) {
     let contour = ctx.contour(&[card]).await;
     ctx.submit_outflow(card, 30_000, "2026-08-05", Some("Супермаркеты"))
         .await;
-    ctx.submit_outflow(card, 12_000, "2026-08-12", None)
-        .await;
+    ctx.submit_outflow(card, 12_000, "2026-08-12", None).await;
     (card, contour)
 }
 
@@ -220,10 +219,7 @@ async fn the_flow_report_decomposes_by_the_owners_rules() {
             Money::new(PostedMinor::new(30_000), CurrencyCode::Rub)
         )]
     );
-    let (rows, amount) = report
-        .flow
-        .not_decomposed(CurrencyCode::Rub)
-        .expect("fits");
+    let (rows, amount) = report.flow.not_decomposed(CurrencyCode::Rub).expect("fits");
     assert_eq!(rows, 1);
     assert_eq!(amount.amount().raw(), 12_000);
     assert_eq!(report.category_rule_versions, vec![1]);
@@ -235,13 +231,8 @@ async fn a_rule_outside_the_month_does_not_touch_it() {
     let (_card, contour) = august_card(&ctx).await;
     let group = ctx.create_group("Usual Expenses").await;
     let food = ctx.create_category(group, "Продукты").await;
-    ctx.create_rule_on_source_category(
-        "Супермаркеты",
-        food,
-        None,
-        Some(date!(2026 - 07 - 31)),
-    )
-    .await;
+    ctx.create_rule_on_source_category("Супермаркеты", food, None, Some(date!(2026 - 07 - 31)))
+        .await;
 
     let report = money_flow(
         &ctx.services,
@@ -256,15 +247,14 @@ async fn a_rule_outside_the_month_does_not_touch_it() {
     .await
     .expect("report");
 
-    assert!(report
-        .flow
-        .went_out_by_category(CurrencyCode::Rub)
-        .expect("fits")
-        .is_empty());
-    let (rows, amount) = report
-        .flow
-        .not_decomposed(CurrencyCode::Rub)
-        .expect("fits");
+    assert!(
+        report
+            .flow
+            .went_out_by_category(CurrencyCode::Rub)
+            .expect("fits")
+            .is_empty()
+    );
+    let (rows, amount) = report.flow.not_decomposed(CurrencyCode::Rub).expect("fits");
     assert_eq!(rows, 2);
     assert_eq!(amount.amount().raw(), 42_000);
 }
@@ -339,12 +329,18 @@ async fn a_preview_reports_what_would_move_and_writes_nothing() {
     assert_eq!(impact.months[0].moved.len(), 1);
     assert_eq!(impact.months[0].moved[0].from, None);
     assert_eq!(impact.months[0].moved[0].to, proposed_category);
-    assert_eq!(impact.months[0].moved[0].amount, Money::new(PostedMinor::new(3_000), CurrencyCode::Rub));
+    assert_eq!(
+        impact.months[0].moved[0].amount,
+        Money::new(PostedMinor::new(3_000), CurrencyCode::Rub)
+    );
     assert_eq!(impact.months[0].moved[0].rows, 2);
     assert_eq!(impact.months[1].moved.len(), 1);
     assert_eq!(impact.months[1].moved[0].from, None);
     assert_eq!(impact.months[1].moved[0].to, proposed_category);
-    assert_eq!(impact.months[1].moved[0].amount, Money::new(PostedMinor::new(3_000), CurrencyCode::Rub));
+    assert_eq!(
+        impact.months[1].moved[0].amount,
+        Money::new(PostedMinor::new(3_000), CurrencyCode::Rub)
+    );
     assert_eq!(impact.months[1].moved[0].rows, 1);
 }
 

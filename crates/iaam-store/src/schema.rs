@@ -44,10 +44,7 @@ const MIGRATIONS: [(u32, &str); 15] = [
         14,
         include_str!("../migrations/0014_securities_transfer_kinds.sql"),
     ),
-    (
-        15,
-        include_str!("../migrations/0015_categories.sql"),
-    ),
+    (15, include_str!("../migrations/0015_categories.sql")),
 ];
 
 /// Apply missing migrations.

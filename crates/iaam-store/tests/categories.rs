@@ -5,6 +5,7 @@
 
 use iaam_core::ids::{CategoryRuleId, OwnerId};
 use iaam_store::SqliteStore;
+use iaam_store::categories::NewCategoryRule;
 use time::macros::date;
 
 #[test]
@@ -161,20 +162,24 @@ fn two_rules_cannot_share_a_version_number() {
     let first = store
         .insert_category_rule(
             owner,
-            r#"{"SourceCategory":{"value":"Супермаркеты"}}"#,
-            food,
-            None,
-            None,
+            NewCategoryRule {
+                matcher_json: r#"{"SourceCategory":{"value":"Супермаркеты"}}"#.to_owned(),
+                category: food,
+                valid_from: None,
+                valid_to: None,
+            },
             None,
         )
         .expect("first");
     let second = store
         .insert_category_rule(
             owner,
-            r#"{"DescriptionContains":{"text":"ЛАВКА"}}"#,
-            food,
-            None,
-            None,
+            NewCategoryRule {
+                matcher_json: r#"{"DescriptionContains":{"text":"ЛАВКА"}}"#.to_owned(),
+                category: food,
+                valid_from: None,
+                valid_to: None,
+            },
             None,
         )
         .expect("second");
@@ -197,10 +202,12 @@ fn an_amended_rule_retires_the_old_row_and_points_at_it() {
     let first = store
         .insert_category_rule(
             owner,
-            r#"{"SourceCategory":{"value":"Супермаркеты"}}"#,
-            food,
-            None,
-            None,
+            NewCategoryRule {
+                matcher_json: r#"{"SourceCategory":{"value":"Супермаркеты"}}"#.to_owned(),
+                category: food,
+                valid_from: None,
+                valid_to: None,
+            },
             None,
         )
         .expect("first");
@@ -209,10 +216,12 @@ fn an_amended_rule_retires_the_old_row_and_points_at_it() {
         .amend_category_rule(
             owner,
             first.id,
-            r#"{"SourceCategory":{"value":"Супермаркет"}}"#,
-            food,
-            Some(date!(2026 - 01 - 01)),
-            None,
+            NewCategoryRule {
+                matcher_json: r#"{"SourceCategory":{"value":"Супермаркет"}}"#.to_owned(),
+                category: food,
+                valid_from: Some(date!(2026 - 01 - 01)),
+                valid_to: None,
+            },
         )
         .expect("second");
     assert_eq!(second.replaces, Some(first.id));
@@ -234,12 +243,30 @@ fn an_amendment_rolls_back_retirement_if_the_new_rule_cannot_be_written() {
         .insert_category(owner, group, "Food")
         .expect("category");
     let first = store
-        .insert_category_rule(owner, r#"{"Row":{"key":"row-1"}}"#, food, None, None, None)
+        .insert_category_rule(
+            owner,
+            NewCategoryRule {
+                matcher_json: r#"{"Row":{"key":"row-1"}}"#.to_owned(),
+                category: food,
+                valid_from: None,
+                valid_to: None,
+            },
+            None,
+        )
         .expect("first");
 
     assert!(
         store
-            .amend_category_rule(owner, first.id, "{not-json", food, None, None)
+            .amend_category_rule(
+                owner,
+                first.id,
+                NewCategoryRule {
+                    matcher_json: "{not-json".to_owned(),
+                    category: food,
+                    valid_from: None,
+                    valid_to: None,
+                },
+            )
             .is_err()
     );
 
@@ -262,20 +289,24 @@ fn category_rule_intervals_and_open_ends_round_trip() {
     store
         .insert_category_rule(
             owner,
-            r#"{"DescriptionContains": {"text": "ЛАВКА"}}"#,
-            food,
-            Some(date!(2024 - 01 - 01)),
-            None,
+            NewCategoryRule {
+                matcher_json: r#"{"DescriptionContains": {"text": "ЛАВКА"}}"#.to_owned(),
+                category: food,
+                valid_from: Some(date!(2024 - 01 - 01)),
+                valid_to: None,
+            },
             None,
         )
         .expect("open-ended rule");
     store
         .insert_category_rule(
             owner,
-            r#"{"Row":{"key":"row-2"}}"#,
-            food,
-            None,
-            Some(date!(2025 - 12 - 31)),
+            NewCategoryRule {
+                matcher_json: r#"{"Row":{"key":"row-2"}}"#.to_owned(),
+                category: food,
+                valid_from: None,
+                valid_to: Some(date!(2025 - 12 - 31)),
+            },
             None,
         )
         .expect("open-start rule");
@@ -303,7 +334,16 @@ fn a_retired_category_rule_is_still_listed_and_flagged() {
         .insert_category(owner, group, "Food")
         .expect("category");
     let rule = store
-        .insert_category_rule(owner, r#"{"Row":{"key":"row-3"}}"#, food, None, None, None)
+        .insert_category_rule(
+            owner,
+            NewCategoryRule {
+                matcher_json: r#"{"Row":{"key":"row-3"}}"#.to_owned(),
+                category: food,
+                valid_from: None,
+                valid_to: None,
+            },
+            None,
+        )
         .expect("rule");
 
     store.retire_category_rule(owner, rule.id).expect("retired");

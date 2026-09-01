@@ -45,6 +45,14 @@ pub struct CategoryRuleRow {
     pub retired_at: Option<String>,
     pub replaces: Option<CategoryRuleId>,
 }
+/// A category rule to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCategoryRule {
+    pub matcher_json: String,
+    pub category: Uuid,
+    pub valid_from: Option<Date>,
+    pub valid_to: Option<Date>,
+}
 
 impl SqliteStore {
     /// Add a category group and return its stable identifier.
@@ -114,24 +122,13 @@ impl SqliteStore {
     pub fn insert_category_rule(
         &mut self,
         owner: OwnerId,
-        matcher_json: &str,
-        category: Uuid,
-        valid_from: Option<Date>,
-        valid_to: Option<Date>,
+        rule: NewCategoryRule,
         replaces: Option<CategoryRuleId>,
     ) -> Result<CategoryRuleRow, StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let stored = write_category_rule(
-            &transaction,
-            owner,
-            matcher_json,
-            category,
-            valid_from,
-            valid_to,
-            replaces,
-        )?;
+        let stored = write_category_rule(&transaction, owner, rule, replaces)?;
         transaction.commit()?;
         Ok(stored)
     }
@@ -145,24 +142,13 @@ impl SqliteStore {
         &mut self,
         owner: OwnerId,
         previous: CategoryRuleId,
-        matcher_json: &str,
-        category: Uuid,
-        valid_from: Option<Date>,
-        valid_to: Option<Date>,
+        rule: NewCategoryRule,
     ) -> Result<CategoryRuleRow, StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         retire_category_rule_row(&transaction, owner, previous)?;
-        let stored = write_category_rule(
-            &transaction,
-            owner,
-            matcher_json,
-            category,
-            valid_from,
-            valid_to,
-            Some(previous),
-        )?;
+        let stored = write_category_rule(&transaction, owner, rule, Some(previous))?;
         transaction.commit()?;
         Ok(stored)
     }
@@ -321,24 +307,21 @@ impl SqliteStore {
 fn write_category_rule(
     conn: &Connection,
     owner: OwnerId,
-    matcher_json: &str,
-    category: Uuid,
-    valid_from: Option<Date>,
-    valid_to: Option<Date>,
+    rule: NewCategoryRule,
     replaces: Option<CategoryRuleId>,
 ) -> Result<CategoryRuleRow, StoreError> {
-    check_json(matcher_json)?;
+    check_json(&rule.matcher_json)?;
     let category_exists: Option<()> = conn
         .query_row(
             "SELECT 1 FROM categories WHERE id = ?1 AND owner = ?2",
-            params![category.to_string(), owner.inner().to_string()],
+            params![rule.category.to_string(), owner.inner().to_string()],
             |_| Ok(()),
         )
         .optional()?;
     if category_exists.is_none() {
         return Err(StoreError::NotFound {
             what: "category",
-            id: category.to_string(),
+            id: rule.category.to_string(),
         });
     }
 
@@ -351,10 +334,10 @@ fn write_category_rule(
         id: CategoryRuleId::new_random(),
         owner,
         version: used.map_or(1, |value| value.saturating_add(1)),
-        matcher_json: matcher_json.to_owned(),
-        category: CategoryId(category),
-        valid_from,
-        valid_to,
+        matcher_json: rule.matcher_json,
+        category: CategoryId(rule.category),
+        valid_from: rule.valid_from,
+        valid_to: rule.valid_to,
         created_at: now(),
         retired_at: None,
         replaces,

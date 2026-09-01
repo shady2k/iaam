@@ -34,6 +34,7 @@ use iaam_ingest::dedup::IdentityScope;
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
+use iaam_store::categories::NewCategoryRule;
 use iaam_store::documents::BrokerCode;
 use iaam_store::events::Appended;
 use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
@@ -932,23 +933,15 @@ impl CategoryStore for SqliteAdapter {
         replaces: Option<CategoryRuleId>,
     ) -> Result<CategoryRuleView, AppError> {
         self.blocking(move |store| {
+            let rule = NewCategoryRule {
+                matcher_json: matcher,
+                category: category.inner(),
+                valid_from,
+                valid_to,
+            };
             let row = match replaces {
-                Some(previous) => store.amend_category_rule(
-                    owner,
-                    previous,
-                    &matcher,
-                    category.inner(),
-                    valid_from,
-                    valid_to,
-                ),
-                None => store.insert_category_rule(
-                    owner,
-                    &matcher,
-                    category.inner(),
-                    valid_from,
-                    valid_to,
-                    None,
-                ),
+                Some(previous) => store.amend_category_rule(owner, previous, rule),
+                None => store.insert_category_rule(owner, rule, None),
             }
             .map_err(category_store_error)?;
             Ok(category_rule_view(row))

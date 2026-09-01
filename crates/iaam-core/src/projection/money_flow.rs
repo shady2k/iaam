@@ -86,6 +86,20 @@ pub trait CategoryIndex {
     fn assignment(&self, event: &Event) -> CategoryAssignment;
 }
 
+/// An index that assigns nothing.
+///
+/// Not a stopgap: this is the honest state of a contour whose owner has written
+/// no category rules yet. Every outflow lands in `not_decomposed`, and the
+/// report says so rather than inventing a bucket.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoCategories;
+
+impl CategoryIndex for NoCategories {
+    fn assignment(&self, _event: &Event) -> CategoryAssignment {
+        CategoryAssignment::NotDecomposed
+    }
+}
+
 impl MoneyFlow {
     #[must_use]
     pub fn new() -> Self {

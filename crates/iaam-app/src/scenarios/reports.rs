@@ -12,7 +12,7 @@ use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::balances::{Balances, PositionKey};
-use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
+use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::claim::AssertionPeriod;
@@ -126,8 +126,12 @@ pub async fn money_flow(
         to: query.to,
     };
     let mut flow = MoneyFlow::new();
+    // No category rules are loaded yet; task T6 replaces this with the owner's
+    // own index. Until then every outflow is reported as not decomposed, which
+    // is the truth about a contour whose owner has written no rules.
+    let categories = NoCategories;
     for event in &events {
-        flow.apply(event, &definition, window)?;
+        flow.apply(event, &definition, window, &categories)?;
     }
     Ok(MoneyFlowReport {
         contour: query.contour,

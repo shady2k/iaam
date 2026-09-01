@@ -5,6 +5,7 @@
 //! See §3.1 of the specification.
 
 pub mod bond;
+pub mod category;
 pub mod contour;
 pub mod dates;
 pub mod event;

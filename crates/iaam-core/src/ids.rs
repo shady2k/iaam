@@ -65,6 +65,18 @@ typed_id!(
     /// owner creates, edits, and retires.
     ClassificationRuleId
 );
+typed_id!(
+    /// Owner category group.
+    CategoryGroupId
+);
+typed_id!(
+    /// Owner category.
+    CategoryId
+);
+typed_id!(
+    /// Owner category assignment rule.
+    CategoryRuleId
+);
 
 /// Namespace for declared sources. A fixed UUID, so the derivation is stable
 /// across builds and machines.

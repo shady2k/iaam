@@ -57,6 +57,32 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
 
+## Active Agent Profile: team-maintainer
+
+**This repository opts in to the team-maintainer profile.** That is the explicit
+opt-in the managed Beads block above asks for, and it overrides the
+"Conservative (default)" line inside it.
+
+Agents working here may, without asking first:
+
+- close beads and run the quality gates;
+- `git commit`;
+- `git push`;
+- `bd dolt push`.
+
+This section lives **outside** the managed block on purpose: the block carries a
+generated hash and is rewritten by the beads tooling, so an opt-in edited into it
+would be silently lost on the next regeneration.
+
+What still holds:
+
+- A current instruction wins. If the user says "do not commit" or "do not push"
+  in this session, that beats this section.
+- Authority to commit is not authority to commit anything: branch first when the
+  change does not belong on the default branch, and never commit work you have
+  not read.
+- If a push or sync fails, stop and report the exact command and its error rather
+  than working around it.
 
 ## Build & Test
 

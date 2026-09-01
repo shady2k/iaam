@@ -100,6 +100,35 @@ _Add a brief overview of your project architecture_
 
 ## Conventions & Patterns
 
+### The owner's data never enters the repository
+
+**Nothing that identifies the owner or his money is committed.** Not in code,
+not in tests, not in fixtures, not in specs, plans, ADRs, skill documentation or
+commit messages.
+
+That means, concretely: no account name or number, no card number, no
+counterparty name, no merchant he actually paid, no balance, and no amount taken
+from a real statement. Not even as an illustration in prose, and not even in
+`.internal/`, which is tracked like everything else.
+
+Two rules follow, and they are the ones that get broken:
+
+- **A fixture is invented.** Test data is written from scratch — `Main`,
+  `Savings`, `Shop One` — never trimmed down from a real export. A file derived
+  from real rows carries real rows.
+- **A worked example is described by its shape, not its value.** "A counterparty
+  who is in fact the owner's own account at another bank" belongs in a design;
+  the name and the sum do not. The design point is always the shape.
+
+Where a real value is genuinely needed to run something — an account map, a
+counterparty map, a database path — it is **an input supplied at run time**,
+living outside the repository, and the code reads it from a file or the API.
+This is why the import skills take `--account-map` rather than knowing anything.
+
+Before committing, scan the staged diff for these. `git diff --cached` and a
+grep for names and amounts costs seconds; a value committed once stays in the
+history whether or not a later commit removes it.
+
 ### Language
 
 **Everything you write is in English: code and documents alike.**

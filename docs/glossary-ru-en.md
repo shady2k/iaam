@@ -82,6 +82,18 @@ is how you match a term in them to the code.
 | координата знания | knowledge coordinate | |
 | на дату | as of | |
 
+## Input and import
+
+| Russian | English | Note |
+|---|---|---|
+| выгрузка (банка) | bank export | the file or page the institution hands the owner |
+| канал | channel | `SourceChannel`; how a fact reached us, not who stated it |
+| объявленный источник | declared source | `SourceId::declared(owner, account, channel)` |
+| маппинг колонок | column mapping | which export column feeds which field |
+| ключ строки | row key | the stable identity that makes a re-import idempotent |
+| нога (перевода) | leg | one of the two rows an internal transfer produces |
+| скилл импорта | import skill | per-institution knowledge held as an agent skill, never as code |
+
 ## Refusals and quality
 
 | Russian | English | Note |

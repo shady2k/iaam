@@ -162,7 +162,7 @@ fn invalid_outcome(actual: &str) -> AppError {
 
 fn subject(event: &Event) -> Option<ClassificationSubject> {
     let (counterparty, movement) = match event.kind {
-        EventKind::CashIn { .. } | EventKind::Income { .. } => {
+        EventKind::CashIn { .. } | EventKind::Income { .. } | EventKind::Refund { .. } => {
             (Counterparty::Unknown, Movement::In)
         }
         EventKind::CashOut { .. } | EventKind::Fee { .. } => (Counterparty::Unknown, Movement::Out),

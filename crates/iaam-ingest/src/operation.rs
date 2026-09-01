@@ -56,6 +56,11 @@ pub enum OperationKind {
         amount_minor: i64,
         currency: CurrencyCode,
     },
+    /// Money a counterparty returned, reversing an earlier outflow.
+    Refund {
+        amount_minor: i64,
+        currency: CurrencyCode,
+    },
     Transfer {
         to: AccountId,
         amount_minor: i64,
@@ -149,6 +154,9 @@ pub struct SubmittedOperation {
     /// Category assigned by the source, retained verbatim for later rule matching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    /// Description or counterparty printed by the source, retained verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// An event ready to be written plus a fingerprint of the raw record.
@@ -214,8 +222,12 @@ pub fn normalize(
                     Some(id) => base.with_source_operation_id(id),
                     None => base,
                 };
-                match operation.source_category.as_deref() {
+                let base = match operation.source_category.as_deref() {
                     Some(category) => base.with_source_category(category),
+                    None => base,
+                };
+                match operation.description.as_deref() {
+                    Some(description) => base.with_description(description),
                     None => base,
                 }
             },
@@ -319,6 +331,16 @@ fn build(
             let amount = money(-positive(*amount_minor, "amount", *currency)?, *currency);
             Ok((
                 EventKind::CashOut { amount },
+                vec![Leg::cash(account, amount)],
+            ))
+        }
+        OperationKind::Refund {
+            amount_minor,
+            currency,
+        } => {
+            let amount = money(positive(*amount_minor, "amount", *currency)?, *currency);
+            Ok((
+                EventKind::Refund { amount },
                 vec![Leg::cash(account, amount)],
             ))
         }

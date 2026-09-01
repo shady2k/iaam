@@ -115,6 +115,7 @@ impl Ctx {
             idempotency_key: None,
             source_operation_id: None,
             source_category: source_category.map(str::to_owned),
+            description: None,
         };
         let event = normalize(
             &operation,
@@ -133,7 +134,7 @@ impl Ctx {
     }
 
     async fn create_group(&self, title: &str) -> CategoryGroupId {
-        create_group(&self.services, &self.principal, title)
+        create_group(&self.services, &self.principal, title, false)
             .await
             .unwrap_or_else(|error| panic!("create group: {error}"))
     }

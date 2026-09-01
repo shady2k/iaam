@@ -119,7 +119,7 @@ pub enum TradeSide {
 /// There is intentionally no `Other` variant: a catch-all on which no
 /// decision can be based is indistinguishable from not knowing, while §4.9 requires
 /// that unknown state to be explicit — `None` expresses it in the field itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum IncomeKind {
     /// Bond coupon.
     Coupon,
@@ -154,6 +154,17 @@ pub enum EventKind {
     CashIn { amount: Money },
     /// Money left the contour.
     CashOut { amount: Money },
+    /// A counterparty returned money, reversing an earlier outflow.
+    ///
+    /// Not `CashIn`. Money does cross the boundary inward, and
+    /// [`Self::flow_endpoints`] says so, but a household report that counts a
+    /// refund as income reports earnings nobody earned: a returned appliance
+    /// would appear as tens of thousands arriving. The money-flow projection
+    /// therefore reads the same event from the other angle and **subtracts it
+    /// from what went out**, in the category it was spent in — exactly the
+    /// distinction already drawn for [`Self::Income`], which is a flow within
+    /// the contour for returns and earnings for the household.
+    Refund { amount: Money },
     /// Money moved between accounts.
     ///
     /// **Both accounts are stored in the event itself.** Classification relative
@@ -293,6 +304,7 @@ impl EventKind {
             Self::Trade { .. } => "trade",
             Self::CashIn { .. } => "cash_in",
             Self::CashOut { .. } => "cash_out",
+            Self::Refund { .. } => "refund",
             Self::CashTransfer { .. } => "cash_transfer",
             Self::Income { .. } => "income",
             Self::Fee { .. } => "fee",
@@ -318,6 +330,11 @@ impl EventKind {
         match self {
             Self::CashIn { .. } => FlowEndpoints::InboundFromOutside,
             Self::CashOut { .. } => FlowEndpoints::OutboundToOutside,
+            // Money genuinely entered from outside, and a returns calculation
+            // must see the flow. What it is *called* differs by report: the
+            // household one subtracts it from spending instead of adding it to
+            // income.
+            Self::Refund { .. } => FlowEndpoints::InboundFromOutside,
             Self::CashTransfer { from, to, .. } => FlowEndpoints::BetweenAccounts {
                 from: *from,
                 to: *to,

@@ -33,6 +33,7 @@ fn deposit(account: AccountId, minor: i64) -> SubmittedOperation {
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        description: None,
     }
 }
 

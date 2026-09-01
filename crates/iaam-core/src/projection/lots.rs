@@ -704,6 +704,7 @@ impl LotBook {
                 )
             }
             EventKind::CashIn { .. }
+            | EventKind::Refund { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
             | EventKind::Fee { .. }

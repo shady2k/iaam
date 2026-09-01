@@ -137,6 +137,7 @@ impl BrokerChannel for PopulatedChannel {
                 idempotency_key: Some("sync-row-1".to_owned()),
                 source_operation_id: Some("broker-row-1".to_owned()),
                 source_category: None,
+                description: None,
             }],
             quarantined: Vec::new(),
         })
@@ -811,18 +812,22 @@ async fn health_is_public_and_reports_versions() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Version 9: version 4 added CorporateAction, OfferExercise and the income
+    // Version 11: version 4 added CorporateAction, OfferExercise and the income
     // type (§4.7); version 5 added the source time inside EffectiveOrder;
     // version 6 added the basis-only trade fee; version 7 added
     // ImportCoverageGap for refused import dimensions; version 8 made that gap
     // carry the rows it refused; version 9 added Tax, so that a tax stops being
-    // indistinguishable from ordinary spending. One version cannot denote two
-    // schemas (§4.1). An external agent reads this number to determine whether
-    // it can parse the response, so it is fixed here rather than derived from
-    // the code — a silent bump would tell that agent nothing had changed, and a
-    // silent omission would tell it nothing had changed when a new event kind
+    // indistinguishable from ordinary spending; version 10 added the source
+    // description inside Provenance, without which a rule on the description
+    // can match nothing; version 11 added Refund, so that money a counterparty
+    // returns reverses spending instead of being reported as income nobody
+    // earned. One version cannot denote two schemas (§4.1). An
+    // external agent reads this number to determine whether it can parse the
+    // response, so it is fixed here rather than derived from the code — a
+    // silent bump would tell that agent nothing had changed, and a silent
+    // omission would tell it nothing had changed when a new event kind
     // appeared.
-    assert_eq!(body["schema_version"], 9);
+    assert_eq!(body["schema_version"], 11);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version
@@ -4860,6 +4865,83 @@ async fn tax_amounts_are_rejected_per_row_when_not_positive() {
 }
 
 #[tokio::test]
+async fn a_category_group_can_be_created_and_then_holds_a_category() {
+    let (harness, _path) = harness_on_disk();
+
+    let (status, group) = call(
+        &harness.router,
+        post(
+            "/v1/category-groups",
+            &harness.owner_token,
+            &json!({"title": "Usual Expenses"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{group}");
+    let group_id = group["id"].as_str().expect("group id").to_owned();
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/category-groups", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed.as_array().expect("group list").len(), 1);
+
+    // The point of the route: the group it returns is usable straight away.
+    let (status, category) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group_id, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{category}");
+}
+
+#[tokio::test]
+async fn a_category_group_without_a_title_is_refused_by_field() {
+    let (harness, _path) = harness_on_disk();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/category-groups",
+            &harness.owner_token,
+            &json!({"title": "   "}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "title", "{body}");
+}
+
+#[tokio::test]
+async fn a_read_only_token_may_not_touch_category_groups_at_all() {
+    let harness = harness();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/category-groups",
+            &harness.readonly_token,
+            &json!({"title": "Usual Expenses"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/category-groups", Some(&harness.readonly_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
 async fn categories_can_be_retired_without_disappearing() {
     let (harness, path) = harness_on_disk();
     let mut store = SqliteStore::open(&path).expect("second connection");
@@ -4993,6 +5075,136 @@ async fn category_rule_preview_does_not_write_and_rules_are_listed() {
     .await;
     assert_eq!(status, StatusCode::OK, "{after}");
     assert_eq!(after.as_array().expect("rule list").len(), before_count);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_row_rule_pins_a_row_whose_source_named_no_identifier() {
+    // The Row matcher is the owner's hand-made decision about one specific row
+    // and outranks every blanket rule. It keys off the source's own identifier,
+    // which a card statement never states — so without the fallback to the
+    // client's idempotency key the strongest precedence level is unreachable
+    // for exactly the imports that need it.
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (_, category) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Gifts"}),
+        ),
+    )
+    .await;
+    let category_id = category["id"].as_str().expect("category id").to_owned();
+
+    let account = harness.account;
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "test",
+                "source": {"account": account, "channel": "file"},
+                "operations": [{
+                    "account": account,
+                    "type": "withdrawal",
+                    "amount": "999.00",
+                    "currency": "RUB",
+                    "dates": {"cash_posted": "2026-08-28"},
+                    "idempotency_key": "tbank/file/deadbeef/1"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_ne!(verdicts[0]["verdict"], "rejected", "{verdicts}");
+
+    let (status, impact) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules/preview",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"kind": "row", "value": {"key": "tbank/file/deadbeef/1"}},
+                "category": category_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{impact}");
+    assert_eq!(impact["rows"], 1, "{impact}");
+}
+
+#[tokio::test]
+async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate() {
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (_, category) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Groceries"}),
+        ),
+    )
+    .await;
+    let category_id = category["id"].as_str().expect("category id").to_owned();
+
+    let account = harness.account;
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "test",
+                "source": {"account": account, "channel": "paste"},
+                "operations": [{
+                    "account": account,
+                    "type": "withdrawal",
+                    "amount": "123.45",
+                    "currency": "RUB",
+                    "dates": {"cash_posted": "2026-08-31"},
+                    "idempotency_key": "row-1",
+                    "source_category": "Супермаркеты",
+                    "description": "Corner Shop"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    // Not "accepted": an account with no independent confirmation yields
+    // "provisional", and that is the system working as designed. This test is
+    // about the description rule, so it pins only that the row was taken.
+    assert_ne!(verdicts[0]["verdict"], "rejected", "{verdicts}");
+
+    // Case-insensitive substring, per category.rs:78.
+    let (status, impact) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules/preview",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"kind": "description_contains", "value": {"text": "corner shop"}},
+                "category": category_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{impact}");
+    assert_eq!(impact["rows"], 1, "{impact}");
 
     drop(harness);
     let _ = std::fs::remove_file(path);

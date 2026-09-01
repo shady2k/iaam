@@ -376,6 +376,12 @@ pub enum OperationKindDto {
         amount: String,
         currency: CurrencyDto,
     },
+    /// Money a counterparty returned. It reverses spending rather than adding
+    /// to income: a returned purchase must not appear as money arriving.
+    Refund {
+        amount: String,
+        currency: CurrencyDto,
+    },
     Transfer {
         to_account: Uuid,
         amount: String,
@@ -460,6 +466,8 @@ pub struct OperationDto {
     pub source_operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 fn decimal(value: &str, field: &str) -> Result<Decimal, Rejection> {
@@ -506,6 +514,7 @@ impl OperationDto {
             idempotency_key: self.idempotency_key.clone(),
             source_operation_id: self.source_operation_id.clone(),
             source_category: self.source_category.clone(),
+            description: self.description.clone(),
         })
     }
 
@@ -516,6 +525,10 @@ impl OperationDto {
                 currency: currency.to_domain(),
             },
             OperationKindDto::Withdrawal { amount, currency } => OperationKind::Withdrawal {
+                amount_minor: minor(amount, *currency, "amount")?,
+                currency: currency.to_domain(),
+            },
+            OperationKindDto::Refund { amount, currency } => OperationKind::Refund {
                 amount_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
             },
@@ -1934,7 +1947,28 @@ pub struct MoneyFlowCurrencyDto {
     pub cash_delta: String,
     pub residual: String,
     pub went_out_by_category: Vec<CategoryAmountDto>,
+    /// What the capital earned, split by what produced it. Sums to
+    /// `earned_by_capital`: the same amounts along another axis, never a second
+    /// set of figures.
+    pub earned_by_capital_by_source: Vec<EarningSourceAmountDto>,
     pub not_decomposed: NotDecomposedDto,
+}
+
+/// One source of earnings and what it produced over the interval.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EarningSourceAmountDto {
+    /// Which account produced it. For a deposit or a savings account this is
+    /// the asset itself.
+    pub account: Uuid,
+    /// Which security produced it, where one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instrument: Option<Uuid>,
+    /// Which income category the owner's rules put it in — cashback, interest
+    /// on a balance, a coupon. Absent means no rule covers it: an undecomposed
+    /// earning is its own line, never folded into a bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<Uuid>,
+    pub amount: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1961,6 +1995,17 @@ impl MoneyFlowReportDto {
                     .into_iter()
                     .map(|(category, amount)| CategoryAmountDto {
                         category: category.inner(),
+                        amount: amount.to_calc_dec().inner().to_string(),
+                    })
+                    .collect();
+                let earned_by_capital_by_source = report
+                    .flow
+                    .earned_by_capital_by_source(currency)?
+                    .into_iter()
+                    .map(|(source, amount)| EarningSourceAmountDto {
+                        account: source.account.inner(),
+                        instrument: source.instrument.map(|id| id.inner()),
+                        category: source.category.map(|category| category.inner()),
                         amount: amount.to_calc_dec().inner().to_string(),
                     })
                     .collect();
@@ -2022,6 +2067,7 @@ impl MoneyFlowReportDto {
                         .inner()
                         .to_string(),
                     went_out_by_category,
+                    earned_by_capital_by_source,
                     not_decomposed: NotDecomposedDto {
                         count,
                         amount: amount.to_calc_dec().inner().to_string(),
@@ -2928,6 +2974,7 @@ mod tests {
             idempotency_key: None,
             source_operation_id: None,
             source_category: None,
+            description: None,
         }
     }
 
@@ -3496,6 +3543,26 @@ impl CategoryRuleDto {
             replaces: rule.replaces.map(|id| id.inner()),
         }
     }
+}
+
+/// A new category group.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CategoryGroupRequest {
+    pub title: String,
+    /// Whether the group holds income categories. Income is the same list with
+    /// a flag, not a second mechanism: cashback and interest on a balance are
+    /// the owner's categories exactly as groceries are.
+    #[serde(default)]
+    pub is_income: bool,
+}
+
+/// A category group, active or retired.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryGroupDto {
+    pub id: Uuid,
+    pub title: String,
+    pub retired_at: Option<String>,
+    pub is_income: bool,
 }
 
 /// Request to create a category under an existing group.

@@ -15,8 +15,8 @@ use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
 use iaam_app::scenarios::categories::{
-    CategoryRuleInput, create_category, create_category_rule, list_categories, list_category_rules,
-    preview_category_rule, retire_category,
+    CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
+    list_category_rules, list_groups, preview_category_rule, retire_category,
 };
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
@@ -56,9 +56,10 @@ use zeroize::Zeroizing;
 use crate::ServerState;
 use crate::dto::{
     AccountBalanceDto, AccountDto, AddBrokerAccessRequest, BrokerAccessDto,
-    BrokerAccessUpdateRequest, BrokerSyncRequest, CategoryDto, CategoryRequest, CategoryRuleDto,
-    CategoryRuleImpactDto, CategoryRuleRequest, ClaimOutcomeDto, ClaimRequest,
-    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
+    BrokerAccessUpdateRequest, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
+    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
+    CategoryRuleRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
+    ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
     EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
@@ -504,6 +505,68 @@ pub async fn delete_classification_rule(
     retire_rule(&state.services, &principal, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+/// Active and retired owner category groups.
+#[utoipa::path(
+    get,
+    path = "/v1/category-groups",
+    responses(
+        (status = 200, description = "Owner category groups", body = Vec<CategoryGroupDto>),
+        (status = 403, description = "Owner only", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_category_groups(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<CategoryGroupDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let groups = list_groups(&state.services, &principal).await?;
+    Ok(Json(
+        groups
+            .into_iter()
+            .map(|group| CategoryGroupDto {
+                id: group.id.inner(),
+                title: group.title,
+                retired_at: group.retired_at,
+                is_income: group.is_income,
+            })
+            .collect(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/category-groups",
+    request_body = CategoryGroupRequest,
+    responses(
+        (status = 201, description = "Category group added", body = CategoryGroupDto),
+        (status = 403, description = "Owner only", body = ApiError),
+        (status = 422, description = "Invalid category group", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_category_group_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CategoryGroupRequest>,
+) -> Result<(StatusCode, Json<CategoryGroupDto>), ApiFailure> {
+    require_admin(&principal)?;
+    let title = request.title.trim();
+    if title.is_empty() {
+        return Err(invalid_field("title", "a non-empty title", request.title));
+    }
+    let id = create_group(&state.services, &principal, title, request.is_income).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CategoryGroupDto {
+            id: id.inner(),
+            title: title.to_owned(),
+            retired_at: None,
+            is_income: request.is_income,
+        }),
+    ))
+}
+
 /// Active and retired owner categories.
 #[utoipa::path(
     get,

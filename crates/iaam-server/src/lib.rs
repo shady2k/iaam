@@ -137,6 +137,10 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
         ))
         .routes(routes!(routes::delete_classification_rule))
         .routes(routes!(
+            routes::list_category_groups,
+            routes::create_category_group_route
+        ))
+        .routes(routes!(
             routes::list_category_reference,
             routes::create_category_route
         ))

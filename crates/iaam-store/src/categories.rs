@@ -19,6 +19,8 @@ pub struct CategoryGroupRow {
     pub owner: OwnerId,
     pub title: String,
     pub retired_at: Option<String>,
+    /// Whether the group holds income categories rather than spending ones.
+    pub is_income: bool,
 }
 
 /// A category belonging to exactly one category group.
@@ -61,13 +63,61 @@ impl SqliteStore {
         owner: OwnerId,
         title: &str,
     ) -> Result<Uuid, StoreError> {
+        self.insert_category_group_of_kind(owner, title, false)
+    }
+
+    /// Insert a group, stating whether it holds income categories.
+    ///
+    /// Income is the same list with a flag rather than a second mechanism, so
+    /// this is one column and not a parallel table.
+    pub fn insert_category_group_of_kind(
+        &mut self,
+        owner: OwnerId,
+        title: &str,
+        is_income: bool,
+    ) -> Result<Uuid, StoreError> {
         let id = Uuid::new_v4();
         self.conn.execute(
-            "INSERT INTO category_groups (id, owner, title, created_at, retired_at)
-             VALUES (?1, ?2, ?3, ?4, NULL)",
-            params![id.to_string(), owner.inner().to_string(), title, now()],
+            "INSERT INTO category_groups (id, owner, title, created_at, retired_at, is_income)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![
+                id.to_string(),
+                owner.inner().to_string(),
+                title,
+                now(),
+                i64::from(is_income)
+            ],
         )?;
         Ok(id)
+    }
+    /// List every category group owned by the portfolio owner, including retired rows.
+    pub fn list_groups(&self, owner: OwnerId) -> Result<Vec<CategoryGroupRow>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, title, retired_at, is_income
+             FROM category_groups
+             WHERE owner = ?1
+             ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut groups = Vec::new();
+        for row in rows {
+            let (id, title, retired_at, is_income) = row?;
+            groups.push(CategoryGroupRow {
+                id: parse_uuid(&id, "category group")?,
+                owner,
+                title,
+                retired_at,
+                is_income: is_income != 0,
+            });
+        }
+        Ok(groups)
     }
 
     /// Add a category to one of the owner's groups.

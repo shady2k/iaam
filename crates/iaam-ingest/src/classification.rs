@@ -263,7 +263,9 @@ fn question_for(subject: &ClassificationSubject) -> Question {
 pub const fn classification_of(event: &Event) -> Option<Classification> {
     match event.kind {
         EventKind::CashTransfer { to, .. } => Some(Classification::InternalTransfer { to }),
-        EventKind::CashIn { .. } | EventKind::CashOut { .. } => Some(Classification::ExternalFlow),
+        EventKind::CashIn { .. } | EventKind::CashOut { .. } | EventKind::Refund { .. } => {
+            Some(Classification::ExternalFlow)
+        }
         EventKind::Fee { origin, .. } => Some(Classification::Fee { origin }),
         EventKind::Tax { .. } => None,
         EventKind::Income { .. } => Some(Classification::Income),

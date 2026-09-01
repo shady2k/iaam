@@ -98,6 +98,7 @@ pub fn active_instruments(
                 } => vec![(*instrument, negated(quantity.0)?)],
             },
             EventKind::CashIn { .. }
+            | EventKind::Refund { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
             | EventKind::Income { .. }

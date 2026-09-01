@@ -338,6 +338,8 @@ pub struct CategoryGroupView {
     pub id: CategoryGroupId,
     pub title: String,
     pub retired_at: Option<String>,
+    /// Whether the group holds income categories rather than spending ones.
+    pub is_income: bool,
 }
 
 /// A category shown to its owner.
@@ -378,7 +380,9 @@ pub trait CategoryStore: Send + Sync {
         &self,
         owner: OwnerId,
         title: String,
+        is_income: bool,
     ) -> Result<CategoryGroupView, AppError>;
+    async fn list_groups(&self, owner: OwnerId) -> Result<Vec<CategoryGroupView>, AppError>;
     async fn retire_group(&self, owner: OwnerId, id: CategoryGroupId) -> Result<(), AppError>;
     async fn list_categories(&self, owner: OwnerId) -> Result<Vec<CategoryView>, AppError>;
     async fn create_category(
@@ -752,7 +756,11 @@ impl CategoryStore for UnavailableCategoryStore {
         &self,
         _owner: OwnerId,
         _title: String,
+        _is_income: bool,
     ) -> Result<CategoryGroupView, AppError> {
+        Err(AppError::NotConfigured { what: "categories" })
+    }
+    async fn list_groups(&self, _owner: OwnerId) -> Result<Vec<CategoryGroupView>, AppError> {
         Err(AppError::NotConfigured { what: "categories" })
     }
 

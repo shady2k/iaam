@@ -35,6 +35,7 @@ fn submit(kind: OperationKind) -> SubmittedOperation {
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        description: None,
     }
 }
 

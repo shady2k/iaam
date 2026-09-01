@@ -110,6 +110,10 @@ fn every_kind() -> Vec<Event> {
             vec![Leg::cash(account, rub(-1))],
         ),
         envelope(
+            EventKind::Refund { amount: rub(1) },
+            vec![Leg::cash(account, rub(1))],
+        ),
+        envelope(
             EventKind::CashTransfer {
                 transfer_id: TransferId::new_random(),
                 from: account,
@@ -304,10 +308,11 @@ fn every_kind() -> Vec<Event> {
 /// The list is pinned manually and checked against the samples: without this check, the test
 /// would still call itself «every kind» without covering every kind. This has already
 /// happened — `control_assertion` was missing from the samples.
-const EVERY_DISCRIMINANT: [&str; 14] = [
+const EVERY_DISCRIMINANT: [&str; 15] = [
     "trade",
     "cash_in",
     "cash_out",
+    "refund",
     "cash_transfer",
     "income",
     "fee",
@@ -329,6 +334,7 @@ fn is_known(kind: &EventKind) -> bool {
         EventKind::Trade { .. }
         | EventKind::CashIn { .. }
         | EventKind::CashOut { .. }
+        | EventKind::Refund { .. }
         | EventKind::CashTransfer { .. }
         | EventKind::Income { .. }
         | EventKind::Fee { .. }

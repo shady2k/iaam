@@ -1,0 +1,12 @@
+-- Income is not a second mechanism: it is the same two-level category list with
+-- a flag, which is how Actual Budget models it and how the owner already keeps
+-- his own list — one group named for income, holding cashback, interest on a
+-- balance, coupons and dividends.
+--
+-- The flag lives on the group rather than on each category so that the answer
+-- cannot disagree with itself: a category is income because of where it sits.
+--
+-- Existing groups predate the flag and are spending groups, which is what the
+-- default states. Backfilling anything else would invent a decision the owner
+-- never made.
+ALTER TABLE category_groups ADD COLUMN is_income INTEGER NOT NULL DEFAULT 0;

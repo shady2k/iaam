@@ -182,7 +182,15 @@ pub struct Event {
 /// [`EventKind::ImportRowResolution`]: a coverage gap now says WHICH rows are
 /// missing, and a row is disposed of by an explicit fact rather than inferred
 /// from the presence of an event.
-pub const SCHEMA_VERSION: u32 = 9;
+/// Version 9 adds the variant [`EventKind::Tax`]: a self-paid tax is a fact of
+/// its own rather than an unnamed outflow.
+/// Version 10 adds the optional source description inside [`Provenance`]. It
+/// defaults to absent, so facts already in the journal stay readable, while
+/// the number still distinguishes software that understands the new field.
+/// Version 11 adds the variant [`EventKind::Refund`]: money a counterparty
+/// returns reverses spending, and reading it as an arrival reports income
+/// nobody earned.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.
@@ -251,6 +259,7 @@ impl Event {
         match &self.kind {
             EventKind::CashIn { amount } => self.expect_single_cash(name, *amount, Sign::Positive),
             EventKind::CashOut { amount } => self.expect_single_cash(name, *amount, Sign::Negative),
+            EventKind::Refund { amount } => self.expect_single_cash(name, *amount, Sign::Positive),
             EventKind::OpeningCash { amount } => self.expect_single_cash(name, *amount, Sign::Any),
             EventKind::Income { gross, .. } => {
                 self.expect_single_cash(name, *gross, Sign::Positive)
@@ -3104,7 +3113,13 @@ mod tests {
         //        compares against the current version. The `< 8` allowance in
         //        `validate_import_coverage_gap` above is a historical threshold
         //        and is deliberately left alone.
-        assert_eq!(SCHEMA_VERSION, 9);
+        // 9 → 10: added the optional source description in `Provenance`.
+        //        Older facts stay readable because the field defaults to absent.
+        // 10 → 11: added the variant `EventKind::Refund`. Older facts stay
+        //        readable — no existing variant changed shape — and the number
+        //        tells software that does not know the variant that it cannot
+        //        interpret every fact it may now meet.
+        assert_eq!(SCHEMA_VERSION, 11);
     }
 
     #[test]

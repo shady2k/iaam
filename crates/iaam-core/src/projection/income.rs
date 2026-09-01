@@ -151,6 +151,7 @@ impl IncomeLedger {
             // on a bond.
             EventKind::Trade { .. }
             | EventKind::CashIn { .. }
+            | EventKind::Refund { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
             | EventKind::Fee { .. }
@@ -300,8 +301,8 @@ impl IncomeLedger {
                     },
                 );
             }
-            // Dividends and deposit interest do not appear in the bond schedule:
-            // there is nothing to confirm with them.
+            // Dividends, deposit interest and cashback do not appear in the
+            // bond schedule: there is nothing to confirm with them.
             Some(IncomeKind::Dividend | IncomeKind::DepositInterest) => {}
             None => self.mark(key, IncomeGap::IncomeKindUnknown),
         }

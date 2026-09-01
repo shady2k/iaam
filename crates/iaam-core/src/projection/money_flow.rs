@@ -24,7 +24,7 @@ use crate::event::Event;
 use crate::event::kind::EventKind;
 use crate::event::leg::LegKind;
 use crate::ids::CategoryId;
-use crate::ids::{AccountId, EventId};
+use crate::ids::{AccountId, EventId, InstrumentId};
 use crate::money::{CurrencyCode, Money, PostedMinor};
 
 /// The interval a report covers, inclusive at both ends.
@@ -67,8 +67,35 @@ pub struct MoneyFlow {
     internal_transfers: Ledger,
     cash_delta: Ledger,
     went_out_by_category: CategoryLedger,
+    earned_by_capital_by_source: EarningLedger,
     not_decomposed: (BTreeMap<CurrencyCode, u64>, Ledger),
 }
+
+/// What produced an earning.
+///
+/// The account answers "which deposit or which card", the instrument "which
+/// security", and the category "what sort of income" — cashback, interest, a
+/// coupon. Three axes rather than one, because no single label answers "which
+/// asset brought what" for both a savings account and a bond: for cash-like
+/// assets the account **is** the asset, and for securities the instrument is.
+///
+/// The sort is a **category**, not an enum in the code. Cashback and interest
+/// on a balance are the owner's vocabulary, they change over the years, and the
+/// design already decided that a category is derived from versioned rules
+/// rather than written onto an event. Putting them in `IncomeKind` would freeze
+/// the owner's list into the schema and make renaming one a journal migration.
+/// `IncomeKind` stays what it is for: whether a payment is a bond coupon, which
+/// the schedule reconciliation needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EarningSource {
+    pub account: AccountId,
+    pub instrument: Option<InstrumentId>,
+    /// `None` where no rule covers the row. Not a bucket: an undecomposed
+    /// earning is shown as its own line, exactly as an undecomposed outflow is.
+    pub category: Option<CategoryId>,
+}
+
+type EarningLedger = BTreeMap<(EarningSource, CurrencyCode), PostedMinor>;
 
 /// Amounts kept per account **and** per currency.
 ///
@@ -126,7 +153,16 @@ impl MoneyFlow {
         if !self.event_belongs(event, contour, window, flow_class)? {
             return Ok(());
         }
-        let category_assignment = if matches!(&event.kind, EventKind::CashOut { .. }) {
+        // Every event whose money the report decomposes needs its category, not
+        // just spending: a refund is subtracted from the category it was spent
+        // in, and an earning is reported under the owner's own income category
+        // — cashback, interest on a balance — exactly as an outflow is reported
+        // under his spending one. Asking only for CashOut left both silently
+        // uncategorised while the rules that covered them existed and matched.
+        let category_assignment = if matches!(
+            &event.kind,
+            EventKind::CashOut { .. } | EventKind::Refund { .. } | EventKind::Income { .. }
+        ) {
             Some(categories.assignment(event))
         } else {
             None
@@ -168,7 +204,7 @@ impl MoneyFlow {
                             event.id,
                         )?;
                     }
-                    EventKind::Income { .. } => {
+                    EventKind::Income { instrument, .. } => {
                         add(
                             &mut self.earned_by_capital,
                             leg.account,
@@ -176,9 +212,68 @@ impl MoneyFlow {
                             "earned_by_capital",
                             event.id,
                         )?;
+                        // The same amount, kept a second time against what
+                        // produced it. Without this the report can say how much
+                        // the capital earned and not which part of it earned
+                        // anything, which is the question a household asks next.
+                        let source = EarningSource {
+                            account: leg.account,
+                            instrument: *instrument,
+                            category: match category_assignment {
+                                Some(CategoryAssignment::Assigned { category, .. }) => {
+                                    Some(category)
+                                }
+                                Some(CategoryAssignment::NotDecomposed) | None => None,
+                            },
+                        };
+                        let slot = self
+                            .earned_by_capital_by_source
+                            .entry((source, money.currency()))
+                            .or_insert_with(|| PostedMinor::new(0));
+                        *slot =
+                            slot.checked_add(money.amount())
+                                .ok_or(MoneyFlowError::Overflow {
+                                    quantity: "earned_by_capital_by_source",
+                                    event: event.id,
+                                })?;
                     }
                     EventKind::CashIn { .. } => {
                         add(&mut self.came_in, leg.account, money, "came_in", event.id)?;
+                    }
+                    // A refund reverses spending; it is not income. Its cash leg
+                    // is positive, so it is subtracted from what went out and
+                    // from the category the money was spent in — a month where
+                    // a purchase is returned shows neither the purchase nor an
+                    // earning. Adding it to `came_in` instead would report
+                    // money arriving that nobody sent.
+                    EventKind::Refund { .. } => {
+                        let amount = negated(money, "went_out", event.id)?;
+                        add(
+                            &mut self.went_out,
+                            leg.account,
+                            amount,
+                            "went_out",
+                            event.id,
+                        )?;
+                        match category_assignment {
+                            Some(CategoryAssignment::Assigned { category, .. }) => {
+                                add_category(
+                                    &mut self.went_out_by_category,
+                                    category,
+                                    amount,
+                                    event.id,
+                                )?;
+                            }
+                            Some(CategoryAssignment::NotDecomposed) | None => {
+                                add_not_decomposed(
+                                    &mut self.not_decomposed,
+                                    &mut not_decomposed_currencies,
+                                    leg.account,
+                                    amount,
+                                    event.id,
+                                )?;
+                            }
+                        }
                     }
                     EventKind::CashOut { .. } => {
                         let amount = negated(money, "went_out", event.id)?;
@@ -291,6 +386,7 @@ impl MoneyFlow {
                     }
                     EventKind::Trade { .. }
                     | EventKind::CashIn { .. }
+                    | EventKind::Refund { .. }
                     | EventKind::CashOut { .. }
                     | EventKind::CashTransfer { .. }
                     | EventKind::Income { .. }
@@ -379,6 +475,38 @@ impl MoneyFlow {
 
     pub fn earned_by_capital(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.earned_by_capital, currency, "earned_by_capital")
+    }
+
+    /// What the capital earned, split by what produced it.
+    ///
+    /// Sums to [`Self::earned_by_capital`] for the same currency: the same
+    /// amounts read along another axis, never a second set of figures.
+    pub fn earned_by_capital_by_source(
+        &self,
+        currency: CurrencyCode,
+    ) -> Result<Vec<(EarningSource, Money)>, MoneyFlowError> {
+        let mut totals = BTreeMap::<EarningSource, i128>::new();
+        for ((source, item_currency), amount) in &self.earned_by_capital_by_source {
+            if *item_currency != currency {
+                continue;
+            }
+            let total = totals.entry(*source).or_default();
+            *total = total.checked_add(i128::from(amount.raw())).ok_or(
+                MoneyFlowError::AggregateOverflow {
+                    quantity: "earned_by_capital_by_source",
+                },
+            )?;
+        }
+        totals
+            .into_iter()
+            .filter(|(_, amount)| *amount != 0)
+            .map(|(source, amount)| {
+                Ok((
+                    source,
+                    Money::new(narrow(amount, "earned_by_capital_by_source")?, currency),
+                ))
+            })
+            .collect()
     }
 
     pub fn moved_into_assets(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
@@ -948,6 +1076,225 @@ mod tests {
         assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(300_000));
         assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(120_000));
         assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(180_000));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
+    }
+
+    #[test]
+    fn earnings_are_split_by_what_produced_them_and_still_sum_to_the_total() {
+        // "How much did the capital earn" is one number; "which asset brought
+        // what" is the question asked immediately after, and one label cannot
+        // answer it for both a savings account and a card programme. The split
+        // is the same money along another axis, so it must sum back exactly.
+        let deposit = AccountId::new_random();
+        let card = AccountId::new_random();
+        let contour = ContourDefinition::new(
+            ContourId::new_random(),
+            ContourVersion(1),
+            vec![deposit, card],
+        );
+        let mut flow = MoneyFlow::new();
+        for (account, amount, on) in [
+            (deposit, 6_000, date!(2026 - 08 - 27)),
+            (deposit, 1_000, date!(2026 - 08 - 07)),
+            (card, 3_500, date!(2026 - 08 - 25)),
+        ] {
+            flow.apply(
+                &event(
+                    EventKind::Income {
+                        instrument: None,
+                        gross: rub(amount),
+                        kind: None,
+                    },
+                    vec![Leg::cash(account, rub(amount))],
+                    on,
+                ),
+                &contour,
+                august(),
+                &(),
+            )
+            .expect("applies");
+        }
+
+        let split = flow
+            .earned_by_capital_by_source(CurrencyCode::Rub)
+            .expect("split");
+        // Two sources, not three: the two payments on one account are one
+        // source. No rules exist here, so neither carries a category — and an
+        // undecomposed earning is its own line rather than a bucket.
+        assert_eq!(split.len(), 2);
+        let from_deposit = split
+            .iter()
+            .find(|(source, _)| source.account == deposit)
+            .expect("deposit");
+        assert_eq!(from_deposit.1, rub(7_000));
+        assert!(from_deposit.0.category.is_none());
+        let from_card = split
+            .iter()
+            .find(|(source, _)| source.account == card)
+            .expect("card");
+        assert_eq!(from_card.1, rub(3_500));
+
+        let summed: i64 = split.iter().map(|(_, amount)| amount.amount().raw()).sum();
+        assert_eq!(
+            summed,
+            value(flow.earned_by_capital(CurrencyCode::Rub))
+                .amount()
+                .raw()
+        );
+    }
+
+    /// A category index that answers with one category for every event, so a
+    /// test can tell "no rule matched" apart from "the projection never asked".
+    struct AlwaysCategory(CategoryId);
+
+    impl CategoryIndex for AlwaysCategory {
+        fn assignment(&self, _event: &Event) -> CategoryAssignment {
+            CategoryAssignment::Assigned {
+                category: self.0,
+                basis: crate::category::CategoryBasis::SourceCategory {
+                    rule: crate::ids::CategoryRuleId::new_random(),
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn an_earning_is_reported_under_the_owners_income_category() {
+        // Income is decomposed by the same rules as spending: cashback and
+        // interest on a balance are the owner's categories. Asking for a
+        // category only on the way out left every earning uncategorised while
+        // the matching rule existed.
+        let savings = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![savings]);
+        let category = CategoryId::new_random();
+        let mut flow = MoneyFlow::new();
+        flow.apply(
+            &event(
+                EventKind::Income {
+                    instrument: None,
+                    gross: rub(1_200),
+                    kind: None,
+                },
+                vec![Leg::cash(savings, rub(1_200))],
+                date!(2026 - 08 - 07),
+            ),
+            &contour,
+            august(),
+            &AlwaysCategory(category),
+        )
+        .expect("applies");
+
+        let split = flow
+            .earned_by_capital_by_source(CurrencyCode::Rub)
+            .expect("split");
+        assert_eq!(split.len(), 1);
+        assert_eq!(split[0].0.category, Some(category));
+        assert_eq!(split[0].1, rub(1_200));
+    }
+
+    #[test]
+    fn a_refund_is_subtracted_from_the_category_it_was_spent_in() {
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let category = CategoryId::new_random();
+        let mut flow = MoneyFlow::new();
+        for (kind, amount, on) in [
+            (
+                EventKind::CashOut {
+                    amount: rub(-4_000),
+                },
+                rub(-4_000),
+                date!(2026 - 08 - 04),
+            ),
+            (
+                EventKind::Refund { amount: rub(1_500) },
+                rub(1_500),
+                date!(2026 - 08 - 18),
+            ),
+        ] {
+            flow.apply(
+                &event(kind, vec![Leg::cash(card, amount)], on),
+                &contour,
+                august(),
+                &AlwaysCategory(category),
+            )
+            .expect("applies");
+        }
+
+        let by_category = flow
+            .went_out_by_category(CurrencyCode::Rub)
+            .expect("categories");
+        assert_eq!(by_category, vec![(category, rub(2_500))]);
+        let (count, amount) = flow
+            .not_decomposed(CurrencyCode::Rub)
+            .expect("undecomposed");
+        assert_eq!((count, amount), (0, rub(0)));
+    }
+
+    #[test]
+    fn a_refund_reduces_what_went_out_and_is_never_income() {
+        // A purchase and its return in the same month leave nothing spent and
+        // nothing earned. Reading the return as an arrival would report income
+        // nobody earned — the whole reason Refund is a kind of its own.
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let mut flow = MoneyFlow::new();
+        for (kind, legs, on) in [
+            (
+                EventKind::CashOut {
+                    amount: rub(-80_000),
+                },
+                vec![Leg::cash(card, rub(-80_000))],
+                date!(2026 - 08 - 12),
+            ),
+            (
+                EventKind::Refund {
+                    amount: rub(80_000),
+                },
+                vec![Leg::cash(card, rub(80_000))],
+                date!(2026 - 08 - 20),
+            ),
+        ] {
+            flow.apply(&event(kind, legs, on), &contour, august(), &())
+                .expect("applies");
+        }
+
+        assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
+    }
+
+    #[test]
+    fn a_partial_refund_leaves_the_difference_as_what_was_spent() {
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let mut flow = MoneyFlow::new();
+        for (kind, legs, on) in [
+            (
+                EventKind::CashOut {
+                    amount: rub(-5_000),
+                },
+                vec![Leg::cash(card, rub(-5_000))],
+                date!(2026 - 08 - 03),
+            ),
+            (
+                EventKind::Refund { amount: rub(2_000) },
+                vec![Leg::cash(card, rub(2_000))],
+                date!(2026 - 08 - 09),
+            ),
+        ] {
+            flow.apply(&event(kind, legs, on), &contour, august(), &())
+                .expect("applies");
+        }
+
+        assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(3_000));
+        assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(-3_000));
         assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 

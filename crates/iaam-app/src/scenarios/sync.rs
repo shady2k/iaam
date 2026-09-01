@@ -347,6 +347,7 @@ fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> {
         // Tax payments move cash without changing any position's basis; use Cash, not TaxBasis.
         OperationKind::Deposit { .. }
         | OperationKind::Withdrawal { .. }
+        | OperationKind::Refund { .. }
         | OperationKind::Transfer { .. }
         | OperationKind::Fee { .. }
         | OperationKind::Tax { .. }

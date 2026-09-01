@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::{CategoryRuleUpsert, CategoryRuleView, CategoryView, Principal};
+use crate::ports::{
+    CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryView, Principal,
+};
 
 #[derive(Debug, Clone)]
 pub struct CategoryRuleInput {
@@ -50,10 +52,11 @@ pub async fn create_group(
     services: &AppServices,
     principal: &Principal,
     title: &str,
+    is_income: bool,
 ) -> Result<CategoryGroupId, AppError> {
     services
         .categories
-        .create_group(principal.owner, title.to_owned())
+        .create_group(principal.owner, title.to_owned(), is_income)
         .await
         .map(|group| group.id)
 }
@@ -74,6 +77,13 @@ pub async fn list_categories(
     principal: &Principal,
 ) -> Result<Vec<CategoryView>, AppError> {
     services.categories.list_categories(principal.owner).await
+}
+
+pub async fn list_groups(
+    services: &AppServices,
+    principal: &Principal,
+) -> Result<Vec<CategoryGroupView>, AppError> {
+    services.categories.list_groups(principal.owner).await
 }
 
 pub async fn create_category(
@@ -271,11 +281,25 @@ impl LoadedCategoryIndex {
 
 impl CategoryIndex for LoadedCategoryIndex {
     fn assignment(&self, event: &Event) -> CategoryAssignment {
+        // The source's own identifier when it stated one; otherwise the key the
+        // client supplied. Without the fallback a source that names no
+        // identifier — a card statement, typically — cannot be corrected row by
+        // row at all, and the strongest precedence level is dead for exactly
+        // the imports that need it most. Provenance is untouched: it still
+        // records that the source named nothing.
+        let row_key = event
+            .provenance
+            .source_operation_id()
+            .or(event.idempotency_key.as_deref());
         let subject = CategorySubject {
-            row_key: event.provenance.source_operation_id(),
+            row_key,
             source_category: event.provenance.source_category(),
-            counterparty: None,
-            description: None,
+            // The two were hard-wired to None, which made every
+            // DescriptionContains rule dead on arrival. The source states one
+            // string; it fills both roles until a source that separates them
+            // arrives.
+            counterparty: event.provenance.description(),
+            description: event.provenance.description(),
             on: event.order.date(),
         };
         match self.proposed.as_ref() {

@@ -66,6 +66,18 @@ pub struct Provenance {
     /// already recorded do not carry this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_category: Option<String>,
+    /// The description or counterparty the source printed on the row.
+    ///
+    /// Evidence about what the source said, exactly like `source_category`
+    /// beside it, and never rewritten. It is what a description rule matches
+    /// when the source's own category is too coarse to separate two different
+    /// meanings — a bank filing both a transfer to one's own account and a
+    /// utility payment under one word.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     row: Option<RowLocator>,
 }
 
@@ -82,6 +94,7 @@ impl Provenance {
             parser_version,
             source_operation_id: None,
             source_category: None,
+            description: None,
             row: None,
         }
     }
@@ -95,6 +108,12 @@ impl Provenance {
     #[must_use]
     pub fn with_source_category(mut self, category: impl Into<String>) -> Self {
         self.source_category = Some(category.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
 
@@ -129,6 +148,11 @@ impl Provenance {
     #[must_use]
     pub fn source_category(&self) -> Option<&str> {
         self.source_category.as_deref()
+    }
+
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     #[must_use]
@@ -225,5 +249,28 @@ mod tests {
         )
         .with_row(row.clone());
         assert_eq!(p.row(), Some(&row));
+    }
+    #[test]
+    fn a_description_is_kept_and_read_back() {
+        let provenance = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_description("Corner Shop");
+
+        assert_eq!(provenance.description(), Some("Corner Shop"));
+    }
+
+    #[test]
+    fn provenance_recorded_before_the_description_existed_still_reads() {
+        // The journal is append-only: a fact written under an older schema must
+        // stay readable, or the field cannot be added at all.
+        let stored = r#"{"source":"00000000-0000-0000-0000-000000000000",
+        "raw_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "parser_version":"test"}"#;
+        let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
+
+        assert_eq!(provenance.description(), None);
     }
 }

@@ -77,6 +77,7 @@ async fn seed_position(
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        description: None,
     };
     let event = normalize(
         &operation,

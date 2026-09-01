@@ -818,11 +818,17 @@ fn category_store_error(error: iaam_store::StoreError) -> AppError {
     }
 }
 
-fn category_group_view(id: Uuid, title: String, retired_at: Option<String>) -> CategoryGroupView {
+fn category_group_view(
+    id: Uuid,
+    title: String,
+    retired_at: Option<String>,
+    is_income: bool,
+) -> CategoryGroupView {
     CategoryGroupView {
         id: CategoryGroupId(id),
         title,
         retired_at,
+        is_income,
     }
 }
 
@@ -855,12 +861,28 @@ impl CategoryStore for SqliteAdapter {
         &self,
         owner: OwnerId,
         title: String,
+        is_income: bool,
     ) -> Result<CategoryGroupView, AppError> {
         self.blocking(move |store| {
             let id = store
-                .insert_category_group(owner, &title)
+                .insert_category_group_of_kind(owner, &title, is_income)
                 .map_err(category_store_error)?;
-            Ok(category_group_view(id, title, None))
+            Ok(category_group_view(id, title, None, is_income))
+        })
+        .await
+    }
+    async fn list_groups(&self, owner: OwnerId) -> Result<Vec<CategoryGroupView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .list_groups(owner)
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| {
+                            category_group_view(row.id, row.title, row.retired_at, row.is_income)
+                        })
+                        .collect()
+                })
+                .map_err(category_store_error)
         })
         .await
     }

@@ -125,9 +125,21 @@ counterparty map, a database path — it is **an input supplied at run time**,
 living outside the repository, and the code reads it from a file or the API.
 This is why the import skills take `--account-map` rather than knowing anything.
 
-Before committing, scan the staged diff for these. `git diff --cached` and a
-grep for names and amounts costs seconds; a value committed once stays in the
-history whether or not a later commit removes it.
+**The agent does not hold the operator's data at all.** Not his statements, not
+his budget export, not his database. He runs the import skills himself against
+his own files; the agent writes the tools and reads only what he chooses to
+paste. This is the founding design's "ИИ — внешний клиент", and it is the only
+control that does not depend on anyone remembering a rule.
+
+`make privacy` enforces the part a rule cannot: no data file outside the
+synthetic-fixture directories, and no statement-shaped amount in a line the
+change adds. It checks shapes, never values, so it needs no list of anybody's
+accounts — an earlier draft kept such a list and had to assemble it from the
+operator's own exports, which made the guard the leak it was meant to prevent.
+
+`make hooks` installs the same check as `pre-commit`, because a value refused
+before it enters a commit costs a keystroke and one caught afterwards costs a
+history rewrite. This project has paid the second price once.
 
 ### Language
 

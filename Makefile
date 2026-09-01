@@ -37,7 +37,7 @@ help: ## List targets
 # --- Quality gates -----------------------------------------------------
 
 .PHONY: check
-check: fmt lint arch fixtures deps test doc-test ## Everything that avoids the network and completes within minutes
+check: fmt lint arch privacy fixtures deps test doc-test ## Everything that avoids the network and completes within minutes
 
 .PHONY: fmt
 fmt: ## Format (check)
@@ -54,6 +54,14 @@ lint: ## Lints
 .PHONY: arch
 arch: ## Dependency direction, f64, and async in the core
 	$(RUN) ./scripts/check-architecture.sh
+
+.PHONY: hooks
+hooks: ## Install the git hooks, including the privacy guard
+	./scripts/install-hooks.sh
+
+.PHONY: privacy
+privacy: ## No personal data in the tree (shapes only; needs no configuration)
+	$(RUN) ./scripts/check-no-personal-data.sh $(BASE)
 
 .PHONY: fixtures
 fixtures: ## Frozen reference data and dead fixtures

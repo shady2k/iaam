@@ -182,7 +182,7 @@ pub struct Event {
 /// [`EventKind::ImportRowResolution`]: a coverage gap now says WHICH rows are
 /// missing, and a row is disposed of by an explicit fact rather than inferred
 /// from the presence of an event.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.

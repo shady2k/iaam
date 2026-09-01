@@ -235,6 +235,11 @@ pub enum EventKind {
         dimensions: BTreeSet<Dimension>,
         /// How many rows were refused. Carried for the owner, not for the rule.
         refused: u32,
+        /// The rows themselves. Empty only in records written before schema 8:
+        /// such a gap taints its whole `dimensions` and is never lifted
+        /// automatically, because it cannot say what is missing.
+        #[serde(default)]
+        rows: Vec<crate::event::source_row::RefusedRow>,
     },
     /// Corporate action on a security: amortization, redemption,
     /// replacement (§4.7).

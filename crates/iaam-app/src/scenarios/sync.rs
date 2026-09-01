@@ -382,6 +382,7 @@ fn coverage_gap_event(
             period: iaam_core::reconciliation::claim::AssertionPeriod { from, to },
             dimensions,
             refused,
+            rows: Vec::new(),
         },
         dates: EventDates::for_cash(CashPostedDate(to)),
         order: EffectiveOrder::new(to, 0),

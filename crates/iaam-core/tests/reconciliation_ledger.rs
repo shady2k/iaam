@@ -1,9 +1,11 @@
 //! Account completeness status over an interval, by dimension (§10.3).
+use std::collections::BTreeSet;
 
 use iaam_core::event::Event;
 use iaam_core::event::EventValidationError;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
+use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::reconciliation::check::ClaimOutcome;
@@ -169,6 +171,7 @@ fn coverage_gap(
     refused: u32,
     legs: Vec<Leg>,
 ) -> Event {
+    let dimensions: BTreeSet<Dimension> = dimensions.into_iter().collect();
     event_on(
         channel,
         Posting {
@@ -179,8 +182,17 @@ fn coverage_gap(
         },
         EventKind::ImportCoverageGap {
             period: scope.period,
-            dimensions: dimensions.into_iter().collect(),
+            dimensions: dimensions.clone(),
             refused,
+            rows: (0..refused)
+                .map(|index| RefusedRow {
+                    key: SourceRowKey {
+                        source: channel.source,
+                        row: RowName::Given(format!("row-{index}")),
+                    },
+                    dimensions: dimensions.clone(),
+                })
+                .collect(),
         },
         legs,
     )

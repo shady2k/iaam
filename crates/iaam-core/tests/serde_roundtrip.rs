@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates, TradeDate};
 use iaam_core::event::allocation::{AllocationGap, BasisAllocation};
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
-use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TaxOrigin, TradeSide};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
@@ -132,6 +132,13 @@ fn every_kind() -> Vec<Event> {
                 origin: FeeOrigin::MarginInterest,
             },
             vec![Leg::fee(account, rub(-99))],
+        ),
+        envelope(
+            EventKind::Tax {
+                amount: rub(-17),
+                origin: TaxOrigin::WithheldAtSource,
+            },
+            vec![Leg::tax(account, rub(-17))],
         ),
         envelope(
             EventKind::OpeningPosition {
@@ -297,13 +304,14 @@ fn every_kind() -> Vec<Event> {
 /// The list is pinned manually and checked against the samples: without this check, the test
 /// would still call itself «every kind» without covering every kind. This has already
 /// happened — `control_assertion` was missing from the samples.
-const EVERY_DISCRIMINANT: [&str; 13] = [
+const EVERY_DISCRIMINANT: [&str; 14] = [
     "trade",
     "cash_in",
     "cash_out",
     "cash_transfer",
     "income",
     "fee",
+    "tax",
     "opening_position",
     "opening_cash",
     "valuation",
@@ -324,6 +332,7 @@ fn is_known(kind: &EventKind) -> bool {
         | EventKind::CashTransfer { .. }
         | EventKind::Income { .. }
         | EventKind::Fee { .. }
+        | EventKind::Tax { .. }
         | EventKind::OpeningPosition { .. }
         | EventKind::OpeningCash { .. }
         | EventKind::Valuation { .. }

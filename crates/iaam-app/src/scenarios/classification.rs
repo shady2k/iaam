@@ -185,6 +185,8 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         // their answer as a rule: a return of their own capital (§6.5)
         // would forever be counted as income. This is also why
         // `classification_of` returns `None` for them.
+        // A tax already identifies its own fact and is not a rule-classified expense.
+        | EventKind::Tax { .. }
         | EventKind::CorporateAction { .. }
         | EventKind::OfferExercise { .. } => return None,
     };

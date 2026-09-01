@@ -154,6 +154,7 @@ impl IncomeLedger {
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
             | EventKind::Fee { .. }
+            | EventKind::Tax { .. }
             | EventKind::OpeningPosition { .. }
             | EventKind::OpeningCash { .. }
             | EventKind::Valuation { .. }

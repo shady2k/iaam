@@ -265,6 +265,7 @@ pub const fn classification_of(event: &Event) -> Option<Classification> {
         EventKind::CashTransfer { to, .. } => Some(Classification::InternalTransfer { to }),
         EventKind::CashIn { .. } | EventKind::CashOut { .. } => Some(Classification::ExternalFlow),
         EventKind::Fee { origin, .. } => Some(Classification::Fee { origin }),
+        EventKind::Tax { .. } => None,
         EventKind::Income { .. } => Some(Classification::Income),
         EventKind::Trade { .. }
         | EventKind::OpeningPosition { .. }

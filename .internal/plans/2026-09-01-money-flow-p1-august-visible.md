@@ -223,7 +223,7 @@ git commit -m "feat(core): a source can be declared, so a resubmitted batch does
 **Files:**
 - Modify: `crates/iaam-server/src/dto.rs` (`SubmitOperationsRequest`)
 - Modify: `crates/iaam-server/src/routes.rs:1219` (`ingest_operations`)
-- Test: `crates/iaam-server/tests/` — add to the existing ingest integration test file; if none matches, create `crates/iaam-server/tests/declared_source.rs`
+- Test: `crates/iaam-server/tests/contract.rs` — append to the existing file. There is no `common` module and no second test file; the crate keeps one contract test with its helpers at the top.
 
 **Interfaces:**
 - Consumes: `SourceId::declared` from Task 1.
@@ -240,23 +240,31 @@ git commit -m "feat(core): a source can be declared, so a resubmitted batch does
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/iaam-server/tests/declared_source.rs`. Follow the harness used by
-the neighbouring integration tests in `crates/iaam-server/tests/` — read one of
-them first and reuse its server-and-token setup helper verbatim rather than
-inventing a second one.
+Append to `crates/iaam-server/tests/contract.rs`, using the helpers already at
+the top of that file: `unclaimed_harness()` (returns `(Router, String)` — the
+router and an owner token), `post(path, token, &body)`, `get(path, token)` and
+`call(&router, request)`. Read
+`the_stage_one_question_is_answered_end_to_end` (around line 1018) first: it is
+the closest existing shape, and it shows how an account is created and an
+operation submitted through the API.
 
 ```rust
-//! A declared source is stable across submissions.
-
-mod common; // reuse the existing harness module; if the neighbouring tests use
-            // a different name, use theirs.
-
 #[tokio::test]
 async fn the_same_declared_source_yields_the_same_source_id() {
-    let ctx = common::owner_server().await;
-    let account = ctx.create_account("Card").await;
+    let (router, token) = unclaimed_harness().await;
+    let (status, account) = call(
+        &router,
+        post(
+            "/v1/accounts",
+            &token,
+            &json!({ "title": "Card" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let account = account["id"].as_str().expect("account id").to_owned();
 
-    let body = serde_json::json!({
+    let body = json!({
         "source": { "account": account, "channel": "paste" },
         "operations": [{
             "account": account,
@@ -265,37 +273,60 @@ async fn the_same_declared_source_yields_the_same_source_id() {
         }]
     });
 
-    let first = ctx.post_json("/v1/ingest/operations", &body).await;
-    assert_eq!(first.status(), 200);
-    let second = ctx.post_json("/v1/ingest/operations", &body).await;
-    assert_eq!(second.status(), 200);
+    let (first, _) = call(&router, post("/v1/ingest/operations", &token, &body)).await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, _) = call(&router, post("/v1/ingest/operations", &token, &body)).await;
+    assert_eq!(second, StatusCode::OK);
 
     // The second submission must land on the same source, so the store sees a
-    // repeat rather than a new origin.
-    let sources = ctx.distinct_source_ids().await;
+    // repeat rather than a new origin. A random source per request is what
+    // makes a corrected re-submission duplicate instead of replace.
+    let sources = distinct_source_ids(&router, &token).await;
     assert_eq!(sources.len(), 1, "expected one source, got {sources:?}");
 }
 
 #[tokio::test]
 async fn an_empty_channel_is_rejected() {
-    let ctx = common::owner_server().await;
-    let account = ctx.create_account("Card").await;
-    let body = serde_json::json!({
-        "source": { "account": account, "channel": "" },
-        "operations": []
-    });
-    let response = ctx.post_json("/v1/ingest/operations", &body).await;
-    assert_eq!(response.status(), 422);
+    let (router, token) = unclaimed_harness().await;
+    let (status, account) = call(
+        &router,
+        post("/v1/accounts", &token, &json!({ "title": "Card" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let account = account["id"].as_str().expect("account id").to_owned();
+
+    let (status, body) = call(
+        &router,
+        post(
+            "/v1/ingest/operations",
+            &token,
+            &json!({
+                "source": { "account": account, "channel": "" },
+                "operations": []
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["field"], "source.channel");
 }
 ```
 
-If the existing harness has no `distinct_source_ids` helper, add one that
-queries the events table for `DISTINCT source` for the owner — one small helper
-in the harness module, not a new abstraction.
+The exact request bodies for creating an account and submitting an operation
+must match what the DTOs actually accept — read `crates/iaam-server/src/dto.rs`
+and the existing test at line 1018 rather than trusting the shapes above
+verbatim; they show intent, and the field names are yours to confirm.
+
+`distinct_source_ids` does not exist yet. Add it as a small helper beside the
+other helpers in `contract.rs`, reading the events the harness store holds for
+the owner and collecting their `source` values into a `BTreeSet`. Follow how
+`add_reconciliation_assertion` (line 201) reaches the store. One helper, not a
+new abstraction.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p iaam-server --test declared_source`
+Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract the_same_declared_source an_empty_channel`
 Expected: FAIL — `unknown field "source"` from the request deserializer, or a
 compile error on the missing helper.
 
@@ -354,7 +385,7 @@ In `crates/iaam-server/src/routes.rs`, replace the line
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p iaam-server --test declared_source`
+Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract the_same_declared_source an_empty_channel`
 Expected: PASS, 2 tests.
 
 - [ ] **Step 5: Check the crate compiles**
@@ -365,7 +396,7 @@ Expected: no errors.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/iaam-server/src/dto.rs crates/iaam-server/src/routes.rs crates/iaam-server/tests/declared_source.rs
+git add crates/iaam-server/src/dto.rs crates/iaam-server/src/routes.rs crates/iaam-server/tests/contract.rs
 git commit -m "feat(server): the ingest route accepts a declared source (iaam-5jhq)"
 ```
 
@@ -1534,7 +1565,7 @@ git commit -m "feat(app): the money flow and account balance scenarios"
 - Modify: `crates/iaam-server/src/dto.rs`
 - Modify: `crates/iaam-server/src/routes.rs`
 - Modify: `crates/iaam-server/src/lib.rs` (route registration)
-- Test: `crates/iaam-server/tests/flow_report.rs` (new)
+- Test: `crates/iaam-server/tests/contract.rs` — append to the existing file, using its `unclaimed_harness()` / `post` / `get` / `call` helpers. There is no `common` module and no second test file.
 
 **Interfaces:**
 - Consumes: `money_flow`, `account_balances`, `MoneyFlowQuery` from Task 6.
@@ -1594,12 +1625,14 @@ pub struct AccountBalanceDto {
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/iaam-server/tests/flow_report.rs`, reusing the harness module the
-neighbouring server tests use:
+Append to `crates/iaam-server/tests/contract.rs`. The sketch below uses a
+`ctx` object for brevity; translate it to the file's real helpers —
+`unclaimed_harness()`, `post`, `get`, `call` — the way the other tests there do.
+Note that `contract.rs` already has
+`every_documented_path_answers_something_other_than_404`, which will start
+covering the two new paths automatically once they are registered.
 
 ```rust
-mod common;
-
 #[tokio::test]
 async fn the_flow_report_names_its_residual() {
     let ctx = common::owner_server().await;
@@ -1664,7 +1697,7 @@ crate — read it before asserting `"3000.00"`, and use its format.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p iaam-server --test flow_report`
+Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract flow_report balances`
 Expected: FAIL — 404 on both paths.
 
 - [ ] **Step 3: Write the implementation**
@@ -1733,21 +1766,25 @@ returns routes:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p iaam-server --test flow_report`
+Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract flow_report balances`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Check the crate compiles and the spec lists both paths**
 
-Run: `cargo check -p iaam-server && cargo test -p iaam-server openapi`
-Expected: no errors; the OpenAPI snapshot test, if the crate has one, now
-includes `/v1/reports/flow` and `/v1/reports/balances`. If it is a frozen
-fixture under `tests/fixtures/`, stop and escalate — that path is policy-gated
-and needs its own approved commit.
+Run: `direnv exec $WORKTREE cargo check -p iaam-server && direnv exec $WORKTREE cargo test -p iaam-server --test contract every_documented_path`
+Expected: no errors, and `every_documented_path_answers_something_other_than_404`
+passes with the two new paths included.
+
+`crates/iaam-server/tests/snapshots/contract__the_report_shape_is_frozen_by_a_snapshot.snap`
+freezes the **returns** report shape. This task must not change it: the new
+routes are additions, and a diff in that snapshot means something in the returns
+DTOs moved. If it does change, stop and escalate rather than accepting the new
+snapshot.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/iaam-server/src/dto.rs crates/iaam-server/src/routes.rs crates/iaam-server/src/lib.rs crates/iaam-server/tests/flow_report.rs
+git add crates/iaam-server/src/dto.rs crates/iaam-server/src/routes.rs crates/iaam-server/src/lib.rs crates/iaam-server/tests/contract.rs
 git commit -m "feat(server): the flow and balances reports"
 ```
 

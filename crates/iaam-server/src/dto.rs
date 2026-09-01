@@ -456,6 +456,8 @@ pub struct OperationDto {
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_category: Option<String>,
 }
 
 fn decimal(value: &str, field: &str) -> Result<Decimal, Rejection> {
@@ -501,6 +503,7 @@ impl OperationDto {
             source_time: None,
             idempotency_key: self.idempotency_key.clone(),
             source_operation_id: self.source_operation_id.clone(),
+            source_category: self.source_category.clone(),
         })
     }
 
@@ -2891,6 +2894,7 @@ mod tests {
             dates: OperationDatesDto::default(),
             idempotency_key: None,
             source_operation_id: None,
+            source_category: None,
         }
     }
 

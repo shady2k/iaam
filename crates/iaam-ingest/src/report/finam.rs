@@ -667,6 +667,7 @@ fn operation(
         source_time: None,
         idempotency_key: None,
         source_operation_id: source_id.map(str::to_owned),
+        source_category: None,
     }
 }
 

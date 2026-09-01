@@ -285,6 +285,8 @@ fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperati
         source_time: None,
         idempotency_key: row.idempotency_key.clone(),
         source_operation_id: None,
+        // The category column arrives with the mapping importer.
+        source_category: None,
     })
 }
 

@@ -133,6 +133,7 @@ impl BrokerChannel for PopulatedChannel {
                 source_time: None,
                 idempotency_key: Some("sync-row-1".to_owned()),
                 source_operation_id: Some("broker-row-1".to_owned()),
+                source_category: None,
             }],
             quarantined: Vec::new(),
         })
@@ -4370,6 +4371,45 @@ async fn the_same_declared_source_yields_the_same_source_id() {
 
     let sources = distinct_source_ids(&path, &harness.owner_token);
     assert_eq!(sources.len(), 1, "expected one source, got {sources:?}");
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn source_category_survives_api_and_store_round_trip() {
+    let (harness, path) = harness_on_disk();
+    let body = json!({
+        "source_label": "paste",
+        "source": { "account": harness.account.inner(), "channel": "paste" },
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "withdrawal",
+            "amount": "1200.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "source_category": "Супермаркеты",
+        }]
+    });
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events.into_iter().next().expect("stored event");
+    assert_eq!(
+        event.provenance.source_category(),
+        Some("Супермаркеты"),
+        "source category is stored verbatim"
+    );
+
     drop(harness);
     let _ = std::fs::remove_file(path);
 }

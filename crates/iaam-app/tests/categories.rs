@@ -1,0 +1,284 @@
+use std::sync::Arc;
+
+use iaam_app::AppServices;
+use iaam_app::adapters::sqlite::SqliteAdapter;
+use iaam_app::error::AppError;
+use iaam_app::ports::{AccountView, Clock, Principal, Scope};
+use iaam_app::scenarios::categories::{
+    CategoryRuleInput, create_category, create_category_rule, create_group, retire_group,
+};
+use iaam_app::scenarios::reports::{MoneyFlowQuery, money_flow};
+use iaam_core::category::{CategoryInterval, CategoryMatcher};
+use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::ids::{AccountId, CategoryId, CategoryGroupId, OwnerId, SourceId};
+use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_ingest::dedup::IdentityScope;
+use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::{SubmittedOperation, normalize};
+use iaam_store::SqliteStore;
+use time::Date;
+use time::macros::date;
+use uuid::Uuid;
+
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn today(&self) -> Date {
+        date!(2026 - 08 - 31)
+    }
+}
+
+struct Ctx {
+    services: AppServices,
+    principal: Principal,
+}
+
+fn harness() -> Ctx {
+    let adapter = Arc::new(SqliteAdapter::new(
+        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}")),
+    ));
+    let mut services = AppServices::new(
+        adapter.clone(),
+        adapter.clone(),
+        adapter.clone(),
+        adapter.clone(),
+        Arc::new(FixedClock),
+    );
+    services.categories = adapter.clone();
+    let owner = OwnerId::new_random();
+    Ctx {
+        services,
+        principal: Principal {
+            token_id: Uuid::new_v4(),
+            owner,
+            scope: Scope::Owner,
+        },
+    }
+}
+
+impl Ctx {
+    async fn account(&self, title: &str) -> AccountId {
+        let id = AccountId::new_random();
+        self.services
+            .store
+            .upsert_account(
+                self.principal.owner,
+                AccountView {
+                    id,
+                    title: title.to_owned(),
+                    institution: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("insert account: {error}"));
+        id
+    }
+
+    async fn contour(&self, accounts: &[AccountId]) -> ContourId {
+        let id = ContourId::new_random();
+        self.services
+            .store
+            .insert_contour_version(
+                self.principal.owner,
+                ContourDefinition::new(id, ContourVersion(1), accounts.iter().copied()),
+                "test contour".to_owned(),
+                accounts.to_vec(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("insert contour: {error}"));
+        id
+    }
+
+    async fn submit_outflow(
+        &self,
+        account: AccountId,
+        amount: i64,
+        on: &str,
+        source_category: Option<&str>,
+    ) {
+        let day = Date::parse(on, &time::format_description::well_known::Iso8601::DATE)
+            .unwrap_or_else(|error| panic!("parse date: {error}"));
+        let operation = SubmittedOperation {
+            account,
+            kind: OperationKind::Withdrawal {
+                amount_minor: amount,
+                currency: CurrencyCode::Rub,
+            },
+            dates: OperationDates {
+                trade: Some(day),
+                settled: Some(day),
+                cash_posted: Some(day),
+                paid: None,
+            },
+            source_time: None,
+            idempotency_key: None,
+            source_operation_id: None,
+            source_category: source_category.map(str::to_owned),
+        };
+        let event = normalize(
+            &operation,
+            iaam_ingest::operation::NormalizationContext {
+                owner: self.principal.owner,
+                source: SourceId::new_random(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("normalize operation: {error:?}"))
+        .event;
+        self.services
+            .store
+            .append_events(vec![event], IdentityScope::Source)
+            .await
+            .unwrap_or_else(|error| panic!("append operation: {error}"));
+    }
+
+    async fn create_group(&self, title: &str) -> CategoryGroupId {
+        create_group(&self.services, &self.principal, title)
+            .await
+            .unwrap_or_else(|error| panic!("create group: {error}"))
+    }
+
+    async fn retire_group(&self, group: CategoryGroupId) {
+        retire_group(&self.services, &self.principal, group)
+            .await
+            .unwrap_or_else(|error| panic!("retire group: {error}"));
+    }
+
+    async fn create_category(&self, group: CategoryGroupId, title: &str) -> CategoryId {
+        create_category(&self.services, &self.principal, group, title)
+            .await
+            .unwrap_or_else(|error| panic!("create category: {error}"))
+    }
+
+    async fn create_rule_on_source_category(
+        &self,
+        source_category: &str,
+        category: CategoryId,
+        valid_from: Option<Date>,
+        valid_to: Option<Date>,
+    ) {
+        create_category_rule(
+            &self.services,
+            &self.principal,
+            CategoryRuleInput {
+                matcher: CategoryMatcher::SourceCategory {
+                    value: source_category.to_owned(),
+                },
+                category,
+                interval: CategoryInterval {
+                    from: valid_from,
+                    to: valid_to,
+                },
+                replaces: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create category rule: {error}"));
+    }
+}
+
+async fn august_card(ctx: &Ctx) -> (AccountId, ContourId) {
+    let card = ctx.account("Card").await;
+    let contour = ctx.contour(&[card]).await;
+    ctx.submit_outflow(card, 30_000, "2026-08-05", Some("Супермаркеты"))
+        .await;
+    ctx.submit_outflow(card, 12_000, "2026-08-12", None)
+        .await;
+    (card, contour)
+}
+
+#[tokio::test]
+async fn the_flow_report_decomposes_by_the_owners_rules() {
+    let ctx = harness();
+    let (_card, contour) = august_card(&ctx).await;
+    let group = ctx.create_group("Usual Expenses").await;
+    let food = ctx.create_category(group, "Продукты").await;
+    ctx.create_rule_on_source_category("Супермаркеты", food, None, None)
+        .await;
+
+    let report = money_flow(
+        &ctx.services,
+        &ctx.principal,
+        &MoneyFlowQuery {
+            contour,
+            contour_version: None,
+            from: date!(2026 - 08 - 01),
+            to: date!(2026 - 08 - 31),
+        },
+    )
+    .await
+    .expect("report");
+
+    let by_category = report
+        .flow
+        .went_out_by_category(CurrencyCode::Rub)
+        .expect("fits");
+    assert_eq!(
+        by_category,
+        vec![(
+            food,
+            Money::new(PostedMinor::new(30_000), CurrencyCode::Rub)
+        )]
+    );
+    let (rows, amount) = report
+        .flow
+        .not_decomposed(CurrencyCode::Rub)
+        .expect("fits");
+    assert_eq!(rows, 1);
+    assert_eq!(amount.amount().raw(), 12_000);
+    assert_eq!(report.category_rule_versions, vec![1]);
+}
+
+#[tokio::test]
+async fn a_rule_outside_the_month_does_not_touch_it() {
+    let ctx = harness();
+    let (_card, contour) = august_card(&ctx).await;
+    let group = ctx.create_group("Usual Expenses").await;
+    let food = ctx.create_category(group, "Продукты").await;
+    ctx.create_rule_on_source_category(
+        "Супермаркеты",
+        food,
+        None,
+        Some(date!(2026 - 07 - 31)),
+    )
+    .await;
+
+    let report = money_flow(
+        &ctx.services,
+        &ctx.principal,
+        &MoneyFlowQuery {
+            contour,
+            contour_version: None,
+            from: date!(2026 - 08 - 01),
+            to: date!(2026 - 08 - 31),
+        },
+    )
+    .await
+    .expect("report");
+
+    assert!(report
+        .flow
+        .went_out_by_category(CurrencyCode::Rub)
+        .expect("fits")
+        .is_empty());
+    let (rows, amount) = report
+        .flow
+        .not_decomposed(CurrencyCode::Rub)
+        .expect("fits");
+    assert_eq!(rows, 2);
+    assert_eq!(amount.amount().raw(), 42_000);
+}
+
+#[tokio::test]
+async fn a_category_cannot_be_created_under_a_retired_group() {
+    let ctx = harness();
+    let group = ctx.create_group("Usual Expenses").await;
+    ctx.retire_group(group).await;
+
+    let error = create_category(&ctx.services, &ctx.principal, group, "Продукты")
+        .await
+        .expect_err("refused");
+    assert!(matches!(
+        error,
+        AppError::Invalid { ref field, .. } if field == "group"
+    ));
+}

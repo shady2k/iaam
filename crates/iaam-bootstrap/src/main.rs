@@ -237,6 +237,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tokens,
         clock: Arc::new(SystemClock),
         channels,
+        categories: adapter.clone(),
         rules,
         http,
         broker_dictionary,

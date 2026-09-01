@@ -342,6 +342,7 @@ fn harness_with_factory(
         clock: Arc::new(FixedClock(date!(2026 - 01 - 01))),
         channels,
         rules,
+        categories: adapter.clone(),
         http: Arc::new(UnavailableOutboundHttp),
         broker_dictionary,
         market_store: market_store.clone(),

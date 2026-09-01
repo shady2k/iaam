@@ -14,7 +14,10 @@ use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
-use iaam_core::ids::{AccountId, ClassificationRuleId, InstrumentId, OwnerId, SourceId};
+use iaam_core::ids::{
+    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, InstrumentId,
+    OwnerId, SourceId,
+};
 use iaam_core::instrument::AliasNamespace;
 use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
@@ -29,11 +32,11 @@ use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
 use uuid::Uuid;
 use zeroize::Zeroizing;
-
 use crate::error::AppError;
 use crate::ports::{
     AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
-    BrokerEnvironment, BrokerVault, ClassificationRuleStore, ClassificationRuleView, CustodyView,
+    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleView, CategoryStore,
+    CategoryView, ClassificationRuleStore, ClassificationRuleView, CustodyView,
     InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal, Recorded, Scope,
     SoleOwner, Store, TokenAdmin, TokenView,
 };
@@ -796,6 +799,179 @@ impl ClassificationRuleStore for SqliteAdapter {
                     },
                     other => store_error(other),
                 })
+        })
+        .await
+    }
+}
+
+fn category_store_error(error: iaam_store::StoreError) -> AppError {
+    match error {
+        iaam_store::StoreError::CategoryGroupRetired { id } => {
+            AppError::CategoryGroupRetired { id }
+        }
+        iaam_store::StoreError::NotFound { what, id } => AppError::NotFound { what, id },
+        iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
+            what: what.to_owned(),
+        },
+        other => store_error(other),
+    }
+}
+
+fn category_group_view(
+    id: Uuid,
+    title: String,
+    retired_at: Option<String>,
+) -> CategoryGroupView {
+    CategoryGroupView {
+        id: CategoryGroupId(id),
+        title,
+        retired_at,
+    }
+}
+
+fn category_view(row: iaam_store::categories::CategoryRow) -> CategoryView {
+    CategoryView {
+        id: CategoryId(row.id),
+        group: CategoryGroupId(row.group_id),
+        title: row.title,
+        retired_at: row.retired_at,
+    }
+}
+
+fn category_rule_view(row: iaam_store::categories::CategoryRuleRow) -> CategoryRuleView {
+    CategoryRuleView {
+        id: row.id,
+        version: row.version,
+        matcher: row.matcher_json,
+        category: row.category,
+        valid_from: row.valid_from,
+        valid_to: row.valid_to,
+        created_at: row.created_at,
+        retired_at: row.retired_at,
+        replaces: row.replaces,
+    }
+}
+
+#[async_trait]
+impl CategoryStore for SqliteAdapter {
+    async fn create_group(
+        &self,
+        owner: OwnerId,
+        title: String,
+    ) -> Result<CategoryGroupView, AppError> {
+        self.blocking(move |store| {
+            let id = store
+                .insert_category_group(owner, &title)
+                .map_err(category_store_error)?;
+            Ok(category_group_view(id, title, None))
+        })
+        .await
+    }
+
+    async fn retire_group(&self, owner: OwnerId, id: CategoryGroupId) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .retire_category_group(owner, id.inner())
+                .map_err(category_store_error)
+        })
+        .await
+    }
+
+    async fn list_categories(&self, owner: OwnerId) -> Result<Vec<CategoryView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .list_categories(owner)
+                .map(|rows| rows.into_iter().map(category_view).collect())
+                .map_err(category_store_error)
+        })
+        .await
+    }
+
+    async fn create_category(
+        &self,
+        owner: OwnerId,
+        group: CategoryGroupId,
+        title: String,
+    ) -> Result<CategoryView, AppError> {
+        self.blocking(move |store| {
+            let id = store
+                .insert_category(owner, group.inner(), &title)
+                .map_err(category_store_error)?;
+            Ok(CategoryView {
+                id: CategoryId(id),
+                group,
+                title,
+                retired_at: None,
+            })
+        })
+        .await
+    }
+
+    async fn retire_category(&self, owner: OwnerId, id: CategoryId) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .retire_category(owner, id.inner())
+                .map_err(category_store_error)
+        })
+        .await
+    }
+
+    async fn list_category_rules(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<CategoryRuleView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .list_category_rules(owner)
+                .map(|rows| rows.into_iter().map(category_rule_view).collect())
+                .map_err(category_store_error)
+        })
+        .await
+    }
+
+    async fn create_category_rule(
+        &self,
+        owner: OwnerId,
+        matcher: String,
+        category: CategoryId,
+        valid_from: Option<Date>,
+        valid_to: Option<Date>,
+        replaces: Option<CategoryRuleId>,
+    ) -> Result<CategoryRuleView, AppError> {
+        self.blocking(move |store| {
+            let row = match replaces {
+                Some(previous) => store.amend_category_rule(
+                    owner,
+                    previous,
+                    &matcher,
+                    category.inner(),
+                    valid_from,
+                    valid_to,
+                ),
+                None => store.insert_category_rule(
+                    owner,
+                    &matcher,
+                    category.inner(),
+                    valid_from,
+                    valid_to,
+                    None,
+                ),
+            }
+            .map_err(category_store_error)?;
+            Ok(category_rule_view(row))
+        })
+        .await
+    }
+
+    async fn retire_category_rule(
+        &self,
+        owner: OwnerId,
+        id: CategoryRuleId,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .retire_category_rule(owner, id)
+                .map_err(category_store_error)
         })
         .await
     }

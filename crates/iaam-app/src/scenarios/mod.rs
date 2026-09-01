@@ -5,6 +5,7 @@
 
 pub mod ingest;
 pub mod market_reference;
+pub mod categories;
 pub mod reports;
 pub mod schedule;
 

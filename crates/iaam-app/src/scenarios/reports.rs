@@ -12,7 +12,7 @@ use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::balances::{Balances, PositionKey};
-use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
+use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::claim::AssertionPeriod;
@@ -29,6 +29,7 @@ use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::AppServices;
+use super::categories::load_index;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::Principal;
@@ -59,6 +60,8 @@ pub struct MoneyFlowReport {
     pub version: ContourVersion,
     pub from: Date,
     pub to: Date,
+    /// The active owner rule versions used to derive the decomposition.
+    pub category_rule_versions: Vec<u32>,
     pub flow: MoneyFlow,
 }
 
@@ -117,6 +120,8 @@ pub async fn money_flow(
     }
     let (version, definition) =
         resolve_contour(services, principal, query.contour, query.contour_version).await?;
+    let categories = load_index(services, principal).await?;
+    let category_rule_versions = categories.versions().to_vec();
     let events = services
         .store
         .load_events_through(principal.owner, query.to)
@@ -126,10 +131,6 @@ pub async fn money_flow(
         to: query.to,
     };
     let mut flow = MoneyFlow::new();
-    // No category rules are loaded yet; task T6 replaces this with the owner's
-    // own index. Until then every outflow is reported as not decomposed, which
-    // is the truth about a contour whose owner has written no rules.
-    let categories = NoCategories;
     for event in &events {
         flow.apply(event, &definition, window, &categories)?;
     }
@@ -138,6 +139,7 @@ pub async fn money_flow(
         version,
         from: query.from,
         to: query.to,
+        category_rule_versions,
         flow,
     })
 }

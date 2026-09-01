@@ -73,18 +73,26 @@ impl SqliteStore {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let group_exists: Option<()> = transaction
+        let group_retired: Option<Option<String>> = transaction
             .query_row(
-                "SELECT 1 FROM category_groups WHERE id = ?1 AND owner = ?2",
+                "SELECT retired_at FROM category_groups WHERE id = ?1 AND owner = ?2",
                 params![group_id.to_string(), owner.inner().to_string()],
-                |_| Ok(()),
+                |row| row.get(0),
             )
             .optional()?;
-        if group_exists.is_none() {
-            return Err(StoreError::NotFound {
-                what: "category group",
-                id: group_id.to_string(),
-            });
+        match group_retired {
+            None => {
+                return Err(StoreError::NotFound {
+                    what: "category group",
+                    id: group_id.to_string(),
+                });
+            }
+            Some(Some(_)) => {
+                return Err(StoreError::CategoryGroupRetired {
+                    id: group_id.to_string(),
+                });
+            }
+            Some(None) => {}
         }
 
         let id = Uuid::new_v4();
@@ -235,6 +243,30 @@ impl SqliteStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         retire_category_rule_row(&transaction, owner, id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Retire a category group without deleting its historical row.
+    pub fn retire_category_group(
+        &mut self,
+        owner: OwnerId,
+        id: Uuid,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE category_groups SET retired_at = ?3
+             WHERE owner = ?1 AND id = ?2 AND retired_at IS NULL",
+            params![owner.inner().to_string(), id.to_string(), now()],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                what: "active category group",
+                id: id.to_string(),
+            });
+        }
         transaction.commit()?;
         Ok(())
     }

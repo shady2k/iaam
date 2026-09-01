@@ -19,7 +19,7 @@ use iaam_app::ports::{
 };
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
-use iaam_core::event::kind::{FeeOrigin, IncomeKind};
+use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
@@ -158,6 +158,24 @@ impl FeeOriginDto {
             Self::AccountMaintenance => FeeOrigin::AccountMaintenance,
             Self::MarginInterest => FeeOrigin::MarginInterest,
             Self::Other => FeeOrigin::Other,
+        }
+    }
+}
+
+/// Transport tax provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaxOriginDto {
+    WithheldAtSource,
+    SelfPaid,
+}
+
+impl TaxOriginDto {
+    #[must_use]
+    pub const fn to_domain(self) -> TaxOrigin {
+        match self {
+            Self::WithheldAtSource => TaxOrigin::WithheldAtSource,
+            Self::SelfPaid => TaxOrigin::SelfPaid,
         }
     }
 }
@@ -399,6 +417,11 @@ pub enum OperationKindDto {
         currency: CurrencyDto,
         origin: FeeOriginDto,
     },
+    Tax {
+        amount: String,
+        currency: CurrencyDto,
+        origin: TaxOriginDto,
+    },
     OpeningCash {
         amount: String,
         currency: CurrencyDto,
@@ -560,6 +583,15 @@ impl OperationDto {
                 currency,
                 origin,
             } => OperationKind::Fee {
+                amount_minor: minor(amount, *currency, "amount")?,
+                currency: currency.to_domain(),
+                origin: origin.to_domain(),
+            },
+            OperationKindDto::Tax {
+                amount,
+                currency,
+                origin,
+            } => OperationKind::Tax {
                 amount_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
                 origin: origin.to_domain(),

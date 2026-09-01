@@ -896,7 +896,7 @@ async fn a_read_only_token_may_not_submit_operations() {
 }
 
 #[tokio::test]
-async fn an_invalid_amount_is_reported_as_422_with_field_expected_actual() {
+async fn an_invalid_amount_is_reported_as_a_200_row_verdict_with_field_expected_actual() {
     let harness = harness();
     let body = json!({
         "source_label": "test",
@@ -4637,4 +4637,92 @@ async fn flow_report_names_an_unexplained_account() {
     assert_eq!(body["unexplained"][0]["account"], harness.account.inner().to_string());
     assert_eq!(body["unexplained"][0]["currency"], "RUB");
     assert_eq!(body["unexplained"][0]["amount"], "500.00");
+}
+
+#[tokio::test]
+async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
+    let (harness, path) = harness_on_disk();
+    let body = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "tax",
+            "amount": "1300.00",
+            "currency": "RUB",
+            "origin": "self_paid",
+            "dates": { "cash_posted": "2026-08-25" },
+            "idempotency_key": "tax-leg",
+        }],
+    });
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events
+        .into_iter()
+        .find(|event| matches!(&event.kind, EventKind::Tax { .. }))
+        .expect("stored tax event");
+
+    match &event.kind {
+        EventKind::Tax { amount, origin } => {
+            assert_eq!(amount.amount().raw(), -130_000);
+            assert_eq!(
+                *origin,
+                iaam_core::event::kind::TaxOrigin::SelfPaid
+            );
+        }
+        other => panic!("expected a tax event, got {other:?}"),
+    }
+
+    let tax_legs: Vec<_> = event
+        .legs
+        .iter()
+        .filter(|leg| leg.kind == iaam_core::event::leg::LegKind::Tax)
+        .collect();
+    assert_eq!(tax_legs.len(), 1);
+    let leg = tax_legs[0];
+    assert_eq!(leg.account, harness.account);
+    let money = leg.money.expect("tax leg amount");
+    assert_eq!(money.amount().raw(), -130_000);
+    assert_eq!(money.currency(), CurrencyCode::Rub);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn tax_amounts_are_rejected_per_row_when_not_positive() {
+    let harness = harness();
+    for (row, amount) in ["0.00", "-1.00"].into_iter().enumerate() {
+        let body = json!({
+            "source_label": "manual entry",
+            "operations": [{
+                "account": harness.account.inner(),
+                "type": "tax",
+                "amount": amount,
+                "currency": "RUB",
+                "origin": "withheld_at_source",
+                "dates": { "cash_posted": "2026-08-25" },
+                "idempotency_key": format!("tax-rejected-{row}"),
+            }],
+        });
+
+        let (status, response) = call(
+            &harness.router,
+            post("/v1/ingest/operations", &harness.owner_token, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response[0]["verdict"], "rejected", "{response}");
+        assert_eq!(response[0]["field"], "amount", "{response}");
+    }
 }

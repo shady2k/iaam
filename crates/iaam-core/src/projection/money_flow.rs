@@ -49,6 +49,8 @@ pub enum MoneyFlowError {
         quantity: &'static str,
         event: EventId,
     },
+    #[error("overflow while aggregating {quantity}")]
+    AggregateOverflow { quantity: &'static str },
 }
 
 /// Seven quantities and the cash they claim to explain.
@@ -84,6 +86,9 @@ impl MoneyFlow {
     /// it, so the two can never drift apart. The explanatory quantities are
     /// accumulated from the event kind and the leg kind. Their disagreement is
     /// what `residual` reports.
+    ///
+    /// This operation is not atomic: on `Err`, the projection may be partially
+    /// updated and must be discarded rather than read.
     pub fn apply(
         &mut self,
         event: &Event,
@@ -113,8 +118,8 @@ impl MoneyFlow {
                     let amount = negated(money, "taxes", event.id)?;
                     add(&mut self.taxes, leg.account, amount, "taxes", event.id)?;
                 }
-                LegKind::Cash => match (&event.kind, flow_class) {
-                    (EventKind::Trade { .. }, _) => {
+                LegKind::Cash => match &event.kind {
+                    EventKind::Trade { .. } => {
                         let amount = negated(money, "moved_into_assets", event.id)?;
                         add(
                             &mut self.moved_into_assets,
@@ -124,7 +129,7 @@ impl MoneyFlow {
                             event.id,
                         )?;
                     }
-                    (EventKind::Income { .. }, _) => {
+                    EventKind::Income { .. } => {
                         add(
                             &mut self.earned_by_capital,
                             leg.account,
@@ -133,15 +138,15 @@ impl MoneyFlow {
                             event.id,
                         )?;
                     }
-                    (EventKind::CashIn { .. }, _) => {
+                    EventKind::CashIn { .. } => {
                         add(&mut self.came_in, leg.account, money, "came_in", event.id)?;
                     }
-                    (EventKind::CashOut { .. }, _) => {
+                    EventKind::CashOut { .. } => {
                         let amount = negated(money, "went_out", event.id)?;
                         add(&mut self.went_out, leg.account, amount, "went_out", event.id)?;
                     }
-                    (EventKind::CashTransfer { .. }, FlowClass::Internal) => {
-                        if money.amount().raw() > 0 {
+                    EventKind::CashTransfer { .. } => match flow_class {
+                        FlowClass::Internal => {
                             add(
                                 &mut self.internal_transfers,
                                 leg.account,
@@ -150,17 +155,78 @@ impl MoneyFlow {
                                 event.id,
                             )?;
                         }
+                        FlowClass::ExternalIn { .. } => {
+                            add(&mut self.came_in, leg.account, money, "came_in", event.id)?;
+                        }
+                        FlowClass::ExternalOut { .. } => {
+                            let amount = negated(money, "went_out", event.id)?;
+                            add(&mut self.went_out, leg.account, amount, "went_out", event.id)?;
+                        }
+                        FlowClass::Irrelevant => {
+                            // Irrelevant transfers are rejected by event_belongs.
+                        }
+                    },
+                    EventKind::Fee { .. } => {
+                        // A fee's monetary leg is LegKind::Fee, not LegKind::Cash.
                     }
-                    (EventKind::CashTransfer { .. }, FlowClass::ExternalIn { .. }) => {
-                        add(&mut self.came_in, leg.account, money, "came_in", event.id)?;
+                    EventKind::Tax { .. } => {
+                        // A tax's monetary leg is LegKind::Tax, not LegKind::Cash.
                     }
-                    (EventKind::CashTransfer { .. }, FlowClass::ExternalOut { .. }) => {
-                        let amount = negated(money, "went_out", event.id)?;
-                        add(&mut self.went_out, leg.account, amount, "went_out", event.id)?;
+                    EventKind::OpeningPosition { .. } => {
+                        // An opening position establishes state, not a cash flow.
                     }
-                    _ => {}
+                    EventKind::OpeningCash { .. } => {
+                        // Opening cash is a starting point, not a flow.
+                    }
+                    EventKind::Valuation { .. } => {
+                        // A valuation changes no cash.
+                    }
+                    EventKind::ControlAssertion { .. } => {
+                        // A control assertion records evidence, not a cash flow.
+                    }
+                    EventKind::ImportCoverageGap { .. } => {
+                        // A coverage gap records missing evidence, not a cash flow.
+                    }
+                    EventKind::CorporateAction { .. } | EventKind::OfferExercise { .. } => {
+                        let amount = negated(money, "moved_into_assets", event.id)?;
+                        add(
+                            &mut self.moved_into_assets,
+                            leg.account,
+                            amount,
+                            "moved_into_assets",
+                            event.id,
+                        )?;
+                    }
                 },
-                _ => {}
+                LegKind::SecurityQuantity => {
+                    // Security quantities have no cash effect.
+                }
+                LegKind::Principal => match &event.kind {
+                    EventKind::CorporateAction { .. } | EventKind::OfferExercise { .. } => {
+                        let amount = negated(money, "moved_into_assets", event.id)?;
+                        add(
+                            &mut self.moved_into_assets,
+                            leg.account,
+                            amount,
+                            "moved_into_assets",
+                            event.id,
+                        )?;
+                    }
+                    EventKind::Trade { .. }
+                    | EventKind::CashIn { .. }
+                    | EventKind::CashOut { .. }
+                    | EventKind::CashTransfer { .. }
+                    | EventKind::Income { .. }
+                    | EventKind::Fee { .. }
+                    | EventKind::Tax { .. }
+                    | EventKind::OpeningPosition { .. }
+                    | EventKind::OpeningCash { .. }
+                    | EventKind::Valuation { .. }
+                    | EventKind::ControlAssertion { .. }
+                    | EventKind::ImportCoverageGap { .. } => {
+                        // Principal cash belongs to asset events only.
+                    }
+                },
             }
         }
         Ok(())
@@ -186,43 +252,47 @@ impl MoneyFlow {
     }
 
     #[must_use]
-    pub fn came_in(&self, currency: CurrencyCode) -> Money {
-        total(&self.came_in, currency)
+    pub fn came_in(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.came_in, currency, "came_in")
     }
 
     #[must_use]
-    pub fn went_out(&self, currency: CurrencyCode) -> Money {
-        total(&self.went_out, currency)
+    pub fn went_out(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.went_out, currency, "went_out")
     }
 
     #[must_use]
-    pub fn earned_by_capital(&self, currency: CurrencyCode) -> Money {
-        total(&self.earned_by_capital, currency)
+    pub fn earned_by_capital(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.earned_by_capital, currency, "earned_by_capital")
     }
 
     #[must_use]
-    pub fn moved_into_assets(&self, currency: CurrencyCode) -> Money {
-        total(&self.moved_into_assets, currency)
+    pub fn moved_into_assets(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.moved_into_assets, currency, "moved_into_assets")
     }
 
     #[must_use]
-    pub fn fees(&self, currency: CurrencyCode) -> Money {
-        total(&self.fees, currency)
+    pub fn fees(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.fees, currency, "fees")
     }
 
     #[must_use]
-    pub fn taxes(&self, currency: CurrencyCode) -> Money {
-        total(&self.taxes, currency)
+    pub fn taxes(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.taxes, currency, "taxes")
+    }
+
+    /// Returns the amount moved, using only positive signed ledger entries.
+    ///
+    /// The ledger is signed so each account's identity closes; this accessor is
+    /// one-sided for the reader and reports how much moved between accounts.
+    #[must_use]
+    pub fn internal_transfers(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total_positive(&self.internal_transfers, currency, "internal_transfers")
     }
 
     #[must_use]
-    pub fn internal_transfers(&self, currency: CurrencyCode) -> Money {
-        total(&self.internal_transfers, currency)
-    }
-
-    #[must_use]
-    pub fn cash_delta(&self, currency: CurrencyCode) -> Money {
-        total(&self.cash_delta, currency)
+    pub fn cash_delta(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.cash_delta, currency, "cash_delta")
     }
 
     /// The currencies present in any quantity or cash delta.
@@ -235,39 +305,32 @@ impl MoneyFlow {
         currencies.into_iter()
     }
 
-    /// The cash the six quantities fail to explain, for one account.
-    ///
-    /// Zero means the report closes there. Non-zero is a defect and is shown as
-    /// one: a report that quietly absorbs its residual is how
-    /// `Saved <redacted>` came to mean nothing.
+    /// The cash the seven quantities fail to explain, for one account.
     #[must_use]
-    fn residual_of(&self, account: AccountId, currency: CurrencyCode) -> i64 {
+    fn residual_of(&self, account: AccountId, currency: CurrencyCode) -> i128 {
         let at = |ledger: &Ledger| {
             ledger
                 .get(&(account, currency))
-                .map_or(0, |amount| amount.raw())
+                .map_or(0, |amount| i128::from(amount.raw()))
         };
-        let explained = at(&self.came_in)
-            .checked_sub(at(&self.went_out))
-            .and_then(|amount| amount.checked_add(at(&self.earned_by_capital)))
-            .and_then(|amount| amount.checked_sub(at(&self.moved_into_assets)))
-            .and_then(|amount| amount.checked_sub(at(&self.fees)))
-            .and_then(|amount| amount.checked_sub(at(&self.taxes)))
-            .expect("money-flow residual arithmetic overflow");
-        at(&self.cash_delta)
-            .checked_sub(explained)
-            .expect("money-flow residual arithmetic overflow")
+        let explained = at(&self.came_in) - at(&self.went_out)
+            + at(&self.earned_by_capital)
+            - at(&self.moved_into_assets)
+            - at(&self.fees)
+            - at(&self.taxes)
+            + at(&self.internal_transfers);
+        at(&self.cash_delta) - explained
     }
 
     /// The contour-wide residual in a currency.
     #[must_use]
-    pub fn residual(&self, currency: CurrencyCode) -> Money {
-        let total = self.accounts().into_iter().fold(0i64, |total, account| {
-            total
-                .checked_add(self.residual_of(account, currency))
-                .expect("money-flow residual arithmetic overflow")
-        });
-        Money::new(PostedMinor::new(total), currency)
+    pub fn residual(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        let total = self
+            .accounts()
+            .into_iter()
+            .map(|account| self.residual_of(account, currency))
+            .sum::<i128>();
+        Ok(Money::new(narrow(total, "residual")?, currency))
     }
 
     /// Every account that does not close, with what it owes.
@@ -276,17 +339,21 @@ impl MoneyFlow {
     /// opposite directions sum to zero, and a report that showed only the total
     /// would call that success while being wrong twice.
     #[must_use]
-    pub fn residuals_by_account(&self) -> Vec<(AccountId, Money)> {
+    pub fn residuals_by_account(&self) -> Result<Vec<(AccountId, Money)>, MoneyFlowError> {
+        let currencies: Vec<_> = self.currencies().collect();
         let mut rows = Vec::new();
         for account in self.accounts() {
-            for currency in self.currencies() {
-                let residual = self.residual_of(account, currency);
+            for currency in &currencies {
+                let residual = self.residual_of(account, *currency);
                 if residual != 0 {
-                    rows.push((account, Money::new(PostedMinor::new(residual), currency)));
+                    rows.push((
+                        account,
+                        Money::new(narrow(residual, "residuals_by_account")?, *currency),
+                    ));
                 }
             }
         }
-        rows
+        Ok(rows)
     }
 
     fn accounts(&self) -> BTreeSet<AccountId> {
@@ -345,16 +412,42 @@ fn negated(
     Ok(Money::new(amount, money.currency()))
 }
 
-fn total(ledger: &Ledger, currency: CurrencyCode) -> Money {
+fn total(
+    ledger: &Ledger,
+    currency: CurrencyCode,
+    quantity: &'static str,
+) -> Result<Money, MoneyFlowError> {
+    total_filtered(ledger, currency, quantity, |amount| amount != 0)
+}
+
+fn total_positive(
+    ledger: &Ledger,
+    currency: CurrencyCode,
+    quantity: &'static str,
+) -> Result<Money, MoneyFlowError> {
+    total_filtered(ledger, currency, quantity, |amount| amount > 0)
+}
+
+fn total_filtered(
+    ledger: &Ledger,
+    currency: CurrencyCode,
+    quantity: &'static str,
+    include: impl Fn(i64) -> bool,
+) -> Result<Money, MoneyFlowError> {
     let amount = ledger
         .iter()
-        .filter(|((_, item_currency), _)| *item_currency == currency)
-        .fold(PostedMinor::new(0), |total, (_, amount)| {
-            total
-                .checked_add(*amount)
-                .expect("money-flow total arithmetic overflow")
-        });
-    Money::new(amount, currency)
+        .filter(|((_, item_currency), amount)| {
+            *item_currency == currency && include(amount.raw())
+        })
+        .map(|(_, amount)| i128::from(amount.raw()))
+        .sum::<i128>();
+    Ok(Money::new(narrow(amount, quantity)?, currency))
+}
+
+fn narrow(amount: i128, quantity: &'static str) -> Result<PostedMinor, MoneyFlowError> {
+    i64::try_from(amount).map(PostedMinor::new).map_err(|_| {
+        MoneyFlowError::AggregateOverflow { quantity }
+    })
 }
 
 #[cfg(test)]
@@ -362,15 +455,21 @@ mod tests {
     use super::*;
     use crate::contour::{ContourDefinition, ContourId, ContourVersion};
     use crate::event::Event;
+    use crate::event::corporate_action::CorporateAction;
     use crate::event::kind::{EventKind, TaxOrigin, TradeSide};
+    use crate::event::offer::{OfferExerciseAction, OfferSubmissionId};
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
     use crate::ids::{AccountId, InstrumentId, TransferId};
-    use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
+    use crate::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
+    use crate::numeric::decimal::Dec;
     use time::{Date, macros::date};
 
     fn rub(minor: i64) -> Money {
         Money::new(PostedMinor::new(minor), CurrencyCode::Rub)
+    }
+    fn value(result: Result<Money, MoneyFlowError>) -> Money {
+        result.expect("aggregate fits")
     }
 
     fn august() -> DateWindow {
@@ -417,11 +516,12 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(flow.came_in(CurrencyCode::Rub), rub(0));
-        assert_eq!(flow.went_out(CurrencyCode::Rub), rub(0));
-        assert_eq!(flow.internal_transfers(CurrencyCode::Rub), rub(480_000));
-        assert_eq!(flow.cash_delta(CurrencyCode::Rub), rub(0));
-        assert_eq!(flow.residual(CurrencyCode::Rub), rub(0));
+        assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.internal_transfers(CurrencyCode::Rub)), rub(480_000));
+        assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
+        assert!(flow.residuals_by_account().expect("aggregate fits").is_empty());
     }
 
     #[test]
@@ -445,10 +545,10 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(flow.earned_by_capital(CurrencyCode::Rub), rub(31_000));
-        assert_eq!(flow.came_in(CurrencyCode::Rub), rub(0));
-        assert_eq!(flow.cash_delta(CurrencyCode::Rub), rub(31_000));
-        assert_eq!(flow.residual(CurrencyCode::Rub), rub(0));
+        assert_eq!(value(flow.earned_by_capital(CurrencyCode::Rub)), rub(31_000));
+        assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(31_000));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 
     #[test]
@@ -478,10 +578,10 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(flow.moved_into_assets(CurrencyCode::Rub), rub(100_000));
-        assert_eq!(flow.fees(CurrencyCode::Rub), rub(350));
-        assert_eq!(flow.cash_delta(CurrencyCode::Rub), rub(-100_350));
-        assert_eq!(flow.residual(CurrencyCode::Rub), rub(0));
+        assert_eq!(value(flow.moved_into_assets(CurrencyCode::Rub)), rub(100_000));
+        assert_eq!(value(flow.fees(CurrencyCode::Rub)), rub(350));
+        assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(-100_350));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 
     #[test]
@@ -504,9 +604,9 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(flow.taxes(CurrencyCode::Rub), rub(13_000));
-        assert_eq!(flow.went_out(CurrencyCode::Rub), rub(0));
-        assert_eq!(flow.residual(CurrencyCode::Rub), rub(0));
+        assert_eq!(value(flow.taxes(CurrencyCode::Rub)), rub(13_000));
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 
     #[test]
@@ -531,10 +631,10 @@ mod tests {
                 .expect("applies");
         }
 
-        assert_eq!(flow.came_in(CurrencyCode::Rub), rub(300_000));
-        assert_eq!(flow.went_out(CurrencyCode::Rub), rub(120_000));
-        assert_eq!(flow.cash_delta(CurrencyCode::Rub), rub(180_000));
-        assert_eq!(flow.residual(CurrencyCode::Rub), rub(0));
+        assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(300_000));
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(120_000));
+        assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(180_000));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 
     #[test]
@@ -553,7 +653,7 @@ mod tests {
             august(),
         )
         .expect("applies");
-        assert_eq!(flow.came_in(CurrencyCode::Rub), rub(0));
+        assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
         assert_eq!(flow.currencies().count(), 0);
     }
 
@@ -580,9 +680,154 @@ mod tests {
             .expect("applies");
         }
 
-        assert_eq!(flow.residual(CurrencyCode::Rub), rub(0));
-        let named = flow.residuals_by_account();
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
+        let named = flow.residuals_by_account().expect("aggregate fits");
         assert_eq!(named.len(), 2, "both accounts must be named: {named:?}");
+    }
+
+    #[test]
+    fn asset_redemption_cash_is_not_an_unexplained_residual() {
+        let broker = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![broker]);
+        let mut flow = MoneyFlow::new();
+        flow.apply(
+            &event(
+                EventKind::CorporateAction {
+                    action: CorporateAction::PartialRedemption {
+                        instrument,
+                        custody: crate::ids::CustodyId::new_random(),
+                        quantity: Quantity::zero(),
+                        principal_returned_per_unit: PerUnitAmount::new(
+                            Dec::one(),
+                            CurrencyCode::Rub,
+                        ),
+                        compensation: rub(100_000),
+                        effective_date: date!(2026 - 08 - 18),
+                        record_date: None,
+                        grounds: None,
+                        basis_allocation: Default::default(),
+                    },
+                },
+                vec![Leg::principal(broker, instrument, rub(100_000))],
+                date!(2026 - 08 - 18),
+            ),
+            &contour,
+            august(),
+        )
+        .expect("applies");
+
+        assert_eq!(value(flow.moved_into_assets(CurrencyCode::Rub)), rub(-100_000));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
+    }
+
+    #[test]
+    fn settled_offer_cash_is_not_an_unexplained_residual() {
+        let broker = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![broker]);
+        let mut flow = MoneyFlow::new();
+        flow.apply(
+            &event(
+                EventKind::OfferExercise {
+                    action: OfferExerciseAction::Settled {
+                        submission: OfferSubmissionId::new_random(),
+                        instrument,
+                        custody: crate::ids::CustodyId::new_random(),
+                        quantity: Quantity::zero(),
+                        gross: rub(100_000),
+                        fee: None,
+                        accrued_interest: None,
+                    },
+                },
+                vec![Leg::cash(broker, rub(100_000))],
+                date!(2026 - 08 - 19),
+            ),
+            &contour,
+            august(),
+        )
+        .expect("applies");
+
+        assert_eq!(value(flow.moved_into_assets(CurrencyCode::Rub)), rub(-100_000));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
+    }
+
+    #[test]
+    fn aggregate_residual_arithmetic_is_checked_without_panicking() {
+        let broker = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![broker]);
+        let mut flow = MoneyFlow::new();
+        for (kind, legs, on) in [
+            (
+                EventKind::Trade {
+                    side: TradeSide::Buy,
+                    instrument: InstrumentId::new_random(),
+                    quantity: Quantity::zero(),
+                    gross: rub(-i64::MAX),
+                    fee: None,
+                    basis_fee: None,
+                    basis_fee_exact: None,
+                    accrued_interest: None,
+                },
+                vec![Leg::cash(broker, rub(-i64::MAX))],
+                date!(2026 - 08 - 05),
+            ),
+            (
+                EventKind::CashIn {
+                    amount: rub(i64::MAX),
+                },
+                vec![Leg::cash(broker, rub(i64::MAX))],
+                date!(2026 - 08 - 06),
+            ),
+            (
+                EventKind::Income {
+                    instrument: None,
+                    gross: rub(i64::MAX),
+                    kind: None,
+                },
+                vec![Leg::cash(broker, rub(i64::MAX))],
+                date!(2026 - 08 - 07),
+            ),
+        ] {
+            flow.apply(&event(kind, legs, on), &contour, august())
+                .expect("applies");
+        }
+
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
+    }
+
+    #[test]
+    fn aggregate_quantity_overflow_is_reported() {
+        let first = AccountId::new_random();
+        let second = AccountId::new_random();
+        let contour = ContourDefinition::new(
+            ContourId::new_random(),
+            ContourVersion(1),
+            vec![first, second],
+        );
+        let mut flow = MoneyFlow::new();
+        for account in [first, second] {
+            flow.apply(
+                &event(
+                    EventKind::CashIn {
+                        amount: rub(i64::MAX),
+                    },
+                    vec![Leg::cash(account, rub(i64::MAX))],
+                    date!(2026 - 08 - 05),
+                ),
+                &contour,
+                august(),
+            )
+            .expect("applies");
+        }
+
+        assert!(matches!(
+            flow.came_in(CurrencyCode::Rub),
+            Err(MoneyFlowError::AggregateOverflow { quantity: "came_in" })
+        ));
     }
 
     #[test]
@@ -613,8 +858,8 @@ mod tests {
         )
         .expect("applies");
 
-        assert_eq!(flow.came_in(CurrencyCode::Rub), rub(300_000));
-        assert_eq!(flow.came_in(CurrencyCode::Usd), usd);
+        assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(300_000));
+        assert_eq!(value(flow.came_in(CurrencyCode::Usd)), usd);
         assert_eq!(flow.currencies().count(), 2);
     }
 }

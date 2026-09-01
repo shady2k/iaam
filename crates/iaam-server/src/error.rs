@@ -118,6 +118,17 @@ impl From<AppError> for ApiFailure {
                     correlation_id: None,
                 },
             ),
+            AppError::CategoryGroupRetired { ref id } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiError {
+                    code: "invalid_request".into(),
+                    message: error.to_string(),
+                    field: Some("group".into()),
+                    expected: Some("an active category group".into()),
+                    actual: Some(id.clone()),
+                    correlation_id: None,
+                },
+            ),
             // An active record already exists: retrying the request will not replace it,
             // and a `500` would send the owner looking for a fault instead of revoking
             // the old record.

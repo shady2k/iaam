@@ -17,6 +17,8 @@ use uuid::Uuid;
 pub enum AppError {
     #[error("store unavailable: {0}")]
     Store(String),
+    #[error("category group {id} is retired")]
+    CategoryGroupRetired { id: String },
     #[error("not found: {what} {id}")]
     NotFound { what: &'static str, id: String },
     #[error("request is invalid: field {field}, expected {expected}, received {actual}")]
@@ -117,6 +119,7 @@ impl AppError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Store(_) => "store_unavailable",
+            Self::CategoryGroupRetired { .. } => "category_group_retired",
             Self::NotFound { .. } => "not_found",
             Self::Invalid { .. } => "invalid_request",
             Self::Invariant { .. } => "invariant_violated",

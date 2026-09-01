@@ -146,6 +146,9 @@ pub struct SubmittedOperation {
     pub idempotency_key: Option<String>,
     /// Operation identifier in the source, if present.
     pub source_operation_id: Option<String>,
+    /// Category assigned by the source, retained verbatim for later rule matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_category: Option<String>,
 }
 
 /// An event ready to be written plus a fingerprint of the raw record.
@@ -207,8 +210,12 @@ pub fn normalize(
                     raw_hash,
                     ParserVersion(PARSER_VERSION.to_owned()),
                 );
-                match operation.source_operation_id.as_deref() {
+                let base = match operation.source_operation_id.as_deref() {
                     Some(id) => base.with_source_operation_id(id),
+                    None => base,
+                };
+                match operation.source_category.as_deref() {
+                    Some(category) => base.with_source_category(category),
                     None => base,
                 }
             },

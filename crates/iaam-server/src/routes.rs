@@ -14,6 +14,10 @@ use iaam_app::AppServices;
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
+use iaam_app::scenarios::categories::{
+    CategoryRuleInput, create_category, create_category_rule, list_categories, list_category_rules,
+    preview_category_rule, retire_category,
+};
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
@@ -29,8 +33,11 @@ use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
     sync_market_with_services as run_market_sync,
 };
+use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
+use iaam_core::ids::{
+    AccountId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, OwnerId, SourceId,
+};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -49,7 +56,8 @@ use zeroize::Zeroizing;
 use crate::ServerState;
 use crate::dto::{
     AccountBalanceDto, AccountDto, AddBrokerAccessRequest, BrokerAccessDto,
-    BrokerAccessUpdateRequest, BrokerSyncRequest, ClaimOutcomeDto, ClaimRequest,
+    BrokerAccessUpdateRequest, BrokerSyncRequest, CategoryDto, CategoryRequest, CategoryRuleDto,
+    CategoryRuleImpactDto, CategoryRuleRequest, ClaimOutcomeDto, ClaimRequest,
     ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
@@ -495,6 +503,176 @@ pub async fn delete_classification_rule(
     require_admin(&principal)?;
     retire_rule(&state.services, &principal, id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+/// Active and retired owner categories.
+#[utoipa::path(
+    get,
+    path = "/v1/categories",
+    responses(
+        (status = 200, description = "Owner category history", body = Vec<CategoryDto>),
+        (status = 403, description = "Owner only", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_category_reference(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<CategoryDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let categories = list_categories(&state.services, &principal).await?;
+    Ok(Json(
+        categories.into_iter().map(CategoryDto::from_port).collect(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/categories",
+    request_body = CategoryRequest,
+    responses(
+        (status = 201, description = "Category added", body = CategoryDto),
+        (status = 403, description = "Owner only", body = ApiError),
+        (status = 404, description = "Category group not found", body = ApiError),
+        (status = 422, description = "Invalid category", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_category_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CategoryRequest>,
+) -> Result<(StatusCode, Json<CategoryDto>), ApiFailure> {
+    require_admin(&principal)?;
+    let category = create_category(
+        &state.services,
+        &principal,
+        iaam_core::ids::CategoryGroupId(request.group),
+        &request.title,
+    )
+    .await?;
+    let categories = list_categories(&state.services, &principal).await?;
+    let category = categories
+        .into_iter()
+        .find(|item| item.id == category)
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiError::simple("category_missing", "created category could not be loaded"),
+            )
+        })?;
+    Ok((StatusCode::CREATED, Json(CategoryDto::from_port(category))))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/categories/{id}",
+    params(("id" = Uuid, Path, description = "Category identifier")),
+    responses(
+        (status = 204, description = "Category retired"),
+        (status = 403, description = "Owner only", body = ApiError),
+        (status = 404, description = "Category not found", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn delete_category(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiFailure> {
+    require_admin(&principal)?;
+    retire_category(&state.services, &principal, CategoryId(id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Active and retired owner category rules.
+#[utoipa::path(
+    get,
+    path = "/v1/category-rules",
+    responses(
+        (status = 200, description = "Category rule history", body = Vec<CategoryRuleDto>),
+        (status = 403, description = "Owner only", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_category_rules_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<CategoryRuleDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let rules = list_category_rules(&state.services, &principal).await?;
+    Ok(Json(
+        rules.into_iter().map(CategoryRuleDto::from_port).collect(),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/category-rules",
+    request_body = CategoryRuleRequest,
+    responses(
+        (status = 201, description = "Category rule added", body = CategoryRuleDto),
+        (status = 403, description = "Owner only", body = ApiError),
+        (status = 422, description = "Invalid category rule", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_category_rule_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CategoryRuleRequest>,
+) -> Result<(StatusCode, Json<CategoryRuleDto>), ApiFailure> {
+    require_admin(&principal)?;
+    let matcher = parse_category_matcher(request.matcher)?;
+    let rule = create_category_rule(
+        &state.services,
+        &principal,
+        CategoryRuleInput {
+            matcher,
+            category: CategoryId(request.category),
+            interval: CategoryInterval {
+                from: request.valid_from,
+                to: request.valid_to,
+            },
+            replaces: request.replaces.map(CategoryRuleId),
+        },
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(CategoryRuleDto::from_port(rule))))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/category-rules/preview",
+    request_body = CategoryRuleRequest,
+    responses(
+        (status = 200, description = "Category rule impact", body = CategoryRuleImpactDto),
+        (status = 403, description = "Owner only", body = ApiError),
+        (status = 422, description = "Invalid category rule", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn preview_category_rule_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<CategoryRuleRequest>,
+) -> Result<Json<CategoryRuleImpactDto>, ApiFailure> {
+    require_admin(&principal)?;
+    let matcher = parse_category_matcher(request.matcher)?;
+    let impact = preview_category_rule(
+        &state.services,
+        &principal,
+        &CategoryRuleProposal {
+            id: CategoryRuleId::new_random(),
+            interval: CategoryInterval {
+                from: request.valid_from,
+                to: request.valid_to,
+            },
+            matcher,
+            category: CategoryId(request.category),
+        },
+    )
+    .await?;
+    Ok(Json(CategoryRuleImpactDto::from_domain(impact)))
 }
 
 /// Synchronise one broker channel over an interval.
@@ -1684,6 +1862,95 @@ fn market_key_rate_dto(
     }
 }
 
+fn parse_category_matcher(value: serde_json::Value) -> Result<CategoryMatcher, ApiFailure> {
+    if let Some(raw) = value.as_str() {
+        let parsed = serde_json::from_str(raw)
+            .map_err(|_| invalid_field("matcher", "a category matcher object", raw.to_owned()))?;
+        return parse_category_matcher(parsed);
+    }
+    let Some(object) = value.as_object() else {
+        return Err(invalid_field(
+            "matcher",
+            "a category matcher object",
+            value.to_string(),
+        ));
+    };
+
+    if let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) {
+        let payload = object.get("value").unwrap_or(&serde_json::Value::Null);
+        return Ok(match kind {
+            "row" => CategoryMatcher::Row {
+                key: matcher_text(payload, "key")?,
+            },
+            "source_category" => CategoryMatcher::SourceCategory {
+                value: matcher_text(payload, "value")?,
+            },
+            "description_contains" => CategoryMatcher::DescriptionContains {
+                text: matcher_text(payload, "text")?,
+            },
+            _ => {
+                return Err(invalid_field(
+                    "matcher.kind",
+                    "row, source_category or description_contains",
+                    kind.to_owned(),
+                ));
+            }
+        });
+    }
+
+    let (kind, payload) = [
+        "Row",
+        "row",
+        "row_key",
+        "SourceCategory",
+        "source_category",
+        "DescriptionContains",
+        "description_contains",
+    ]
+    .iter()
+    .find_map(|key| object.get(*key).map(|payload| (*key, payload)))
+    .ok_or_else(|| {
+        invalid_field(
+            "matcher",
+            "row, source_category or description_contains",
+            value.to_string(),
+        )
+    })?;
+    let text = matcher_text(
+        payload,
+        match kind {
+            "Row" | "row" | "row_key" => "key",
+            "SourceCategory" | "source_category" => "value",
+            "DescriptionContains" | "description_contains" => "text",
+            _ => unreachable!("matcher key was selected above"),
+        },
+    )?;
+    Ok(match kind {
+        "Row" | "row" | "row_key" => CategoryMatcher::Row { key: text },
+        "SourceCategory" | "source_category" => CategoryMatcher::SourceCategory { value: text },
+        "DescriptionContains" | "description_contains" => {
+            CategoryMatcher::DescriptionContains { text }
+        }
+        _ => unreachable!("matcher key was selected above"),
+    })
+}
+
+fn matcher_text(value: &serde_json::Value, field: &str) -> Result<String, ApiFailure> {
+    value
+        .as_str()
+        .or_else(|| value.get(field).and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("value").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            invalid_field(
+                "matcher",
+                "a category matcher with a string value",
+                value.to_string(),
+            )
+        })
+}
 fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure> {
     Date::parse(
         value,

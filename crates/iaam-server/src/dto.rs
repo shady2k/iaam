@@ -14,8 +14,10 @@ use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
-    BrokerAccessView, BrokerEnvironment, ClassificationRuleView, IssuedToken, Scope, TokenView,
+    BrokerAccessView, BrokerEnvironment, CategoryRuleView, CategoryView, ClassificationRuleView,
+    IssuedToken, Scope, TokenView,
 };
+use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::reports::{AccountBalanceRow, MoneyFlowReport};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
@@ -456,6 +458,8 @@ pub struct OperationDto {
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_category: Option<String>,
 }
 
 fn decimal(value: &str, field: &str) -> Result<Decimal, Rejection> {
@@ -501,6 +505,7 @@ impl OperationDto {
             source_time: None,
             idempotency_key: self.idempotency_key.clone(),
             source_operation_id: self.source_operation_id.clone(),
+            source_category: self.source_category.clone(),
         })
     }
 
@@ -1903,6 +1908,7 @@ pub struct MoneyFlowReportDto {
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub to: Date,
+    pub category_rule_versions: Vec<u32>,
     pub currencies: Vec<MoneyFlowCurrencyDto>,
     /// Accounts whose own cash change the six quantities do not explain.
     pub unexplained: Vec<AccountResidualDto>,
@@ -1927,6 +1933,20 @@ pub struct MoneyFlowCurrencyDto {
     pub internal_transfers: String,
     pub cash_delta: String,
     pub residual: String,
+    pub went_out_by_category: Vec<CategoryAmountDto>,
+    pub not_decomposed: NotDecomposedDto,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryAmountDto {
+    pub category: Uuid,
+    pub amount: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NotDecomposedDto {
+    pub count: u64,
+    pub amount: String,
 }
 
 impl MoneyFlowReportDto {
@@ -1935,6 +1955,16 @@ impl MoneyFlowReportDto {
             .flow
             .currencies()
             .map(|currency| {
+                let went_out_by_category = report
+                    .flow
+                    .went_out_by_category(currency)?
+                    .into_iter()
+                    .map(|(category, amount)| CategoryAmountDto {
+                        category: category.inner(),
+                        amount: amount.to_calc_dec().inner().to_string(),
+                    })
+                    .collect();
+                let (count, amount) = report.flow.not_decomposed(currency)?;
                 Ok(MoneyFlowCurrencyDto {
                     currency: CurrencyDto::from_domain(currency),
                     came_in: report
@@ -1991,6 +2021,11 @@ impl MoneyFlowReportDto {
                         .to_calc_dec()
                         .inner()
                         .to_string(),
+                    went_out_by_category,
+                    not_decomposed: NotDecomposedDto {
+                        count,
+                        amount: amount.to_calc_dec().inner().to_string(),
+                    },
                 })
             })
             .collect::<Result<Vec<_>, MoneyFlowError>>()?;
@@ -2009,6 +2044,7 @@ impl MoneyFlowReportDto {
             contour_version: report.version.0,
             from: report.from,
             to: report.to,
+            category_rule_versions: report.category_rule_versions.clone(),
             currencies,
             unexplained,
         })
@@ -2891,6 +2927,7 @@ mod tests {
             dates: OperationDatesDto::default(),
             idempotency_key: None,
             source_operation_id: None,
+            source_category: None,
         }
     }
 
@@ -3403,6 +3440,146 @@ pub struct ReconciliationStatusDto {
     pub dimensions: Vec<DimensionStatusDto>,
     pub evidence: Vec<EvidenceDto>,
     pub outcomes: Vec<ClaimOutcomeDto>,
+}
+
+/// Owner category in the living reference list.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryDto {
+    pub id: Uuid,
+    pub group: Uuid,
+    pub title: String,
+    pub retired_at: Option<String>,
+}
+
+impl CategoryDto {
+    #[must_use]
+    pub fn from_port(category: CategoryView) -> Self {
+        Self {
+            id: category.id.inner(),
+            group: category.group.inner(),
+            title: category.title,
+            retired_at: category.retired_at,
+        }
+    }
+}
+
+/// Owner category rule.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryRuleDto {
+    pub id: Uuid,
+    pub version: u32,
+    pub matcher: String,
+    pub category: Uuid,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub valid_from: Option<Date>,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub valid_to: Option<Date>,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub replaces: Option<Uuid>,
+}
+
+impl CategoryRuleDto {
+    #[must_use]
+    pub fn from_port(rule: CategoryRuleView) -> Self {
+        Self {
+            id: rule.id.inner(),
+            version: rule.version,
+            matcher: rule.matcher,
+            category: rule.category.inner(),
+            valid_from: rule.valid_from,
+            valid_to: rule.valid_to,
+            created_at: rule.created_at,
+            retired_at: rule.retired_at,
+            replaces: rule.replaces.map(|id| id.inner()),
+        }
+    }
+}
+
+/// Request to create a category under an existing group.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CategoryRequest {
+    pub group: Uuid,
+    pub title: String,
+}
+
+/// Category matcher and validity interval for a new rule.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CategoryRuleRequest {
+    /// Matcher object. Its accepted forms mirror the stored category matcher.
+    pub matcher: serde_json::Value,
+    pub category: Uuid,
+    #[serde(default, with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub valid_from: Option<Date>,
+    #[serde(default, with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub valid_to: Option<Date>,
+    #[serde(default)]
+    pub replaces: Option<Uuid>,
+}
+
+/// The rows and monthly movements caused by a proposed category rule.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryRuleImpactDto {
+    pub rows: u64,
+    pub months: Vec<MonthlyImpactDto>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MonthlyImpactDto {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub month: Date,
+    pub moved: Vec<CategoryMoveDto>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryMoveDto {
+    pub from: Option<Uuid>,
+    pub to: Uuid,
+    pub amount: String,
+    pub rows: u64,
+}
+
+impl CategoryRuleImpactDto {
+    #[must_use]
+    pub fn from_domain(impact: CategoryRuleImpact) -> Self {
+        Self {
+            rows: impact.rows,
+            months: impact
+                .months
+                .into_iter()
+                .map(MonthlyImpactDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+impl MonthlyImpactDto {
+    fn from_domain(month: MonthlyImpact) -> Self {
+        Self {
+            month: month.month,
+            moved: month
+                .moved
+                .into_iter()
+                .map(CategoryMoveDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+impl CategoryMoveDto {
+    fn from_domain(movement: CategoryMove) -> Self {
+        Self {
+            from: movement.from.map(|id| id.inner()),
+            to: movement.to.inner(),
+            amount: movement.amount.to_calc_dec().inner().to_string(),
+            rows: movement.rows,
+        }
+    }
 }
 
 /// Cash balance stated by the owner.

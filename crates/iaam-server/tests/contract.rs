@@ -12,9 +12,11 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
+use iaam_app::error::AppError;
 use iaam_app::ingest::dedup::IdentityScope;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
@@ -45,6 +47,7 @@ use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable};
 use iaam_server::auth::hash_token;
 use iaam_server::dto::{ReturnsReportDto, VerdictDto};
+use iaam_server::error::ApiFailure;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::market::AccruedInterestRow;
@@ -133,6 +136,7 @@ impl BrokerChannel for PopulatedChannel {
                 source_time: None,
                 idempotency_key: Some("sync-row-1".to_owned()),
                 source_operation_id: Some("broker-row-1".to_owned()),
+                source_category: None,
             }],
             quarantined: Vec::new(),
         })
@@ -335,12 +339,13 @@ fn harness_with_factory(
     let broker_dictionary: Arc<dyn iaam_app::ports::BrokerDictionary> = adapter.clone();
     let services = Arc::new(AppServices {
         store: adapter.clone(),
-        directory: adapter,
+        directory: adapter.clone(),
         broker,
         tokens,
         clock: Arc::new(FixedClock(date!(2026 - 01 - 01))),
         channels,
         rules,
+        categories: adapter.clone(),
         http: Arc::new(UnavailableOutboundHttp),
         broker_dictionary,
         market_store: market_store.clone(),
@@ -4375,6 +4380,45 @@ async fn the_same_declared_source_yields_the_same_source_id() {
 }
 
 #[tokio::test]
+async fn source_category_survives_api_and_store_round_trip() {
+    let (harness, path) = harness_on_disk();
+    let body = json!({
+        "source_label": "paste",
+        "source": { "account": harness.account.inner(), "channel": "paste" },
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "withdrawal",
+            "amount": "1200.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "source_category": "Супермаркеты",
+        }]
+    });
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events.into_iter().next().expect("stored event");
+    assert_eq!(
+        event.provenance.source_category(),
+        Some("Супермаркеты"),
+        "source category is stored verbatim"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn an_empty_channel_is_rejected() {
     let harness = harness();
     let account = harness.account.inner();
@@ -4813,4 +4857,479 @@ async fn tax_amounts_are_rejected_per_row_when_not_positive() {
         assert_eq!(response[0]["verdict"], "rejected", "{response}");
         assert_eq!(response[0]["field"], "amount", "{response}");
     }
+}
+
+#[tokio::test]
+async fn categories_can_be_retired_without_disappearing() {
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let category_id = created["id"].as_str().expect("category id");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/categories", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed.as_array().expect("category list").len(), 1);
+
+    let (status, body) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/categories/{category_id}"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/categories", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed.as_array().expect("category list").len(), 1);
+    assert!(listed[0]["retired_at"].is_string(), "{listed}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn category_rule_preview_does_not_write_and_rules_are_listed() {
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (status, category) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{category}");
+    let category_id = category["id"].as_str().expect("category id");
+    let rule_body = json!({
+        "matcher": {"SourceCategory": {"value": "Supermarkets"}},
+        "category": category_id,
+    });
+
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/category-rules", &harness.owner_token, &rule_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["version"], 1);
+
+    let (status, before) = call(
+        &harness.router,
+        get("/v1/category-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    let before_count = before.as_array().expect("rule list").len();
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "withdrawal",
+            "amount": "500.00",
+            "currency": "RUB",
+            "dates": {"cash_posted": "2026-08-06"},
+            "source_category": "Other",
+            "idempotency_key": "preview-other",
+        }],
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, impact) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules/preview",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"SourceCategory": {"value": "Other"}},
+                "category": category_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{impact}");
+    assert_eq!(impact["rows"], 1);
+    assert_eq!(impact["months"][0]["month"], "2026-08-01");
+    assert_eq!(impact["months"][0]["moved"][0]["from"], Value::Null);
+    assert_eq!(impact["months"][0]["moved"][0]["to"], category_id);
+    assert_eq!(impact["months"][0]["moved"][0]["amount"], "500.00");
+    assert_eq!(impact["months"][0]["moved"][0]["rows"], 1);
+
+    let (status, after) = call(
+        &harness.router,
+        get("/v1/category-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after.as_array().expect("rule list").len(), before_count);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn flow_report_exposes_category_decomposition_residual_and_rule_versions() {
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (status, category) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{category}");
+    let category_id = category["id"].as_str().expect("category id");
+    let (status, created_rule) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"SourceCategory": {"value": "Supermarkets"}},
+                "category": category_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created_rule}");
+
+    let contour = json!({
+        "title": "August flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "1200.00",
+                "currency": "RUB",
+                "dates": {"cash_posted": "2026-08-05"},
+                "source_category": "Supermarkets",
+                "idempotency_key": "food",
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "500.00",
+                "currency": "RUB",
+                "dates": {"cash_posted": "2026-08-06"},
+                "source_category": "Other",
+                "idempotency_key": "other",
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["category_rule_versions"], json!([1]));
+    let rub = &body["currencies"][0];
+    assert_eq!(rub["went_out_by_category"][0]["category"], category_id);
+    assert_eq!(rub["went_out_by_category"][0]["amount"], "1200.00");
+    assert_eq!(rub["not_decomposed"]["count"], 1);
+    assert_eq!(rub["not_decomposed"]["amount"], "500.00");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn category_routes_cover_matcher_forms_and_reference_refusals() {
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": Uuid::new_v4(), "title": "Missing"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "not_found");
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let category = created["id"].as_str().expect("category id");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/categories", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed[0]["id"], category);
+    assert_eq!(listed[0]["group"], group.to_string());
+    assert_eq!(listed[0]["title"], "Food");
+
+    let (status, body) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/categories/{}", Uuid::new_v4()),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "not_found");
+
+    let matcher_forms = [
+        json!(r#"{"row":"row-1"}"#),
+        json!({"kind": "row", "value": "row-2"}),
+        json!({"kind": "source_category", "value": "Supermarkets"}),
+        json!({"kind": "description_contains", "value": "cafe"}),
+        json!({"description_contains": "bakery"}),
+    ];
+    for (index, matcher) in matcher_forms.into_iter().enumerate() {
+        let (status, body) = call(
+            &harness.router,
+            post(
+                "/v1/category-rules",
+                &harness.owner_token,
+                &json!({"matcher": matcher, "category": category}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "matcher {index}: {body}");
+        assert_eq!(body["category"], category);
+        assert_eq!(body["version"], index + 1);
+    }
+
+    for (matcher, field, expected) in [
+        (json!(42), "matcher", "a category matcher object"),
+        (
+            json!(r#"{not-json"#),
+            "matcher",
+            "a category matcher object",
+        ),
+        (
+            json!({}),
+            "matcher",
+            "row, source_category or description_contains",
+        ),
+        (
+            json!({"kind": "unknown", "value": "x"}),
+            "matcher.kind",
+            "row, source_category or description_contains",
+        ),
+        (
+            json!({"kind": "row", "value": {"not": "text"}}),
+            "matcher",
+            "a category matcher with a string value",
+        ),
+    ] {
+        let (status, body) = call(
+            &harness.router,
+            post(
+                "/v1/category-rules",
+                &harness.owner_token,
+                &json!({"matcher": matcher, "category": category}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["field"], field);
+        assert_eq!(body["expected"], expected);
+    }
+
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/category-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert_eq!(rules.as_array().expect("rule list").len(), 5);
+    let (status, impact) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules/preview",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"kind": "source_category", "value": "unused"},
+                "category": category,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{impact}");
+    assert_eq!(impact["rows"], 0);
+
+    for raw in ["not-json", "[]"] {
+        store
+            .connection()
+            .execute(
+                "UPDATE category_rules SET matcher = ?1 WHERE version = 1",
+                [raw],
+            )
+            .expect("corrupt matcher");
+        let (status, body) = call(
+            &harness.router,
+            post(
+                "/v1/category-rules/preview",
+                &harness.owner_token,
+                &json!({
+                    "matcher": {"kind": "source_category", "value": "x"},
+                    "category": category,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["field"], "matcher");
+        assert_eq!(body["expected"], "a category matcher object");
+    }
+
+    store
+        .connection()
+        .execute(
+            "UPDATE category_rules SET matcher = ?1 WHERE version = 1",
+            [r#"{"unknown":"value"}"#],
+        )
+        .expect("corrupt matcher");
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules/preview",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"kind": "source_category", "value": "x"},
+                "category": category,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["field"], "matcher");
+    assert_eq!(
+        body["expected"],
+        "row, source_category, or description_contains"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn categories_and_category_rules_require_authentication() {
+    let harness = harness();
+    let requests = [
+        call(&harness.router, get("/v1/categories", None)),
+        call(&harness.router, post_public("/v1/categories", &json!({}))),
+        call(&harness.router, get("/v1/category-rules", None)),
+        call(
+            &harness.router,
+            post_public("/v1/category-rules", &json!({})),
+        ),
+        call(
+            &harness.router,
+            post_public("/v1/category-rules/preview", &json!({})),
+        ),
+    ];
+    for request in requests {
+        let (status, body) = request.await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["code"], "unauthorized", "{body}");
+    }
+    let request = Request::builder()
+        .uri("/v1/categories/00000000-0000-0000-0000-000000000000")
+        .method("DELETE")
+        .body(Body::empty())
+        .expect("request");
+    let (status, body) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["code"], "unauthorized", "{body}");
+}
+
+#[tokio::test]
+async fn retired_category_group_failure_has_actionable_response_fields() {
+    let response = ApiFailure::from(AppError::CategoryGroupRetired {
+        id: "group-42".to_owned(),
+    })
+    .into_response();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("JSON response");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["field"], "group");
+    assert_eq!(body["expected"], "an active category group");
+    assert_eq!(body["actual"], "group-42");
 }

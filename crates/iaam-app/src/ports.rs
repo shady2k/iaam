@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
-use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
+use iaam_core::ids::{
+    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, OwnerId,
+};
 use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::ControlClaim;
@@ -328,6 +330,76 @@ pub struct BrokerAccessView {
     pub scope: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
+}
+
+/// A category group shown to its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryGroupView {
+    pub id: CategoryGroupId,
+    pub title: String,
+    pub retired_at: Option<String>,
+}
+
+/// A category shown to its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryView {
+    pub id: CategoryId,
+    pub group: CategoryGroupId,
+    pub title: String,
+    pub retired_at: Option<String>,
+}
+
+/// A stored category rule shown to its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryRuleView {
+    pub id: CategoryRuleId,
+    pub version: u32,
+    pub matcher: String,
+    pub category: CategoryId,
+    pub valid_from: Option<Date>,
+    pub valid_to: Option<Date>,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub replaces: Option<CategoryRuleId>,
+}
+/// A category rule to create or amend through the category port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryRuleUpsert {
+    pub matcher: String,
+    pub category: CategoryId,
+    pub valid_from: Option<Date>,
+    pub valid_to: Option<Date>,
+}
+
+/// Port for the owner's living category reference and rules.
+#[async_trait]
+pub trait CategoryStore: Send + Sync {
+    async fn create_group(
+        &self,
+        owner: OwnerId,
+        title: String,
+    ) -> Result<CategoryGroupView, AppError>;
+    async fn retire_group(&self, owner: OwnerId, id: CategoryGroupId) -> Result<(), AppError>;
+    async fn list_categories(&self, owner: OwnerId) -> Result<Vec<CategoryView>, AppError>;
+    async fn create_category(
+        &self,
+        owner: OwnerId,
+        group: CategoryGroupId,
+        title: String,
+    ) -> Result<CategoryView, AppError>;
+    async fn retire_category(&self, owner: OwnerId, id: CategoryId) -> Result<(), AppError>;
+    async fn list_category_rules(&self, owner: OwnerId) -> Result<Vec<CategoryRuleView>, AppError>;
+    async fn create_category_rule(
+        &self,
+        owner: OwnerId,
+        rule: CategoryRuleUpsert,
+        replaces: Option<CategoryRuleId>,
+    ) -> Result<CategoryRuleView, AppError>;
+    async fn retire_category_rule(
+        &self,
+        owner: OwnerId,
+        id: CategoryRuleId,
+    ) -> Result<(), AppError>;
 }
 
 /// A stored rule in a form the transport can return.
@@ -667,6 +739,69 @@ impl ClassificationRuleStore for UnavailableClassificationRuleStore {
     async fn retire_rule(&self, _owner: OwnerId, _id: uuid::Uuid) -> Result<(), AppError> {
         Err(AppError::NotConfigured {
             what: "classification rules",
+        })
+    }
+}
+
+/// Explicit category-port stub for builds without a category store.
+pub struct UnavailableCategoryStore;
+
+#[async_trait]
+impl CategoryStore for UnavailableCategoryStore {
+    async fn create_group(
+        &self,
+        _owner: OwnerId,
+        _title: String,
+    ) -> Result<CategoryGroupView, AppError> {
+        Err(AppError::NotConfigured { what: "categories" })
+    }
+
+    async fn retire_group(&self, _owner: OwnerId, _id: CategoryGroupId) -> Result<(), AppError> {
+        Err(AppError::NotConfigured { what: "categories" })
+    }
+
+    async fn list_categories(&self, _owner: OwnerId) -> Result<Vec<CategoryView>, AppError> {
+        Err(AppError::NotConfigured { what: "categories" })
+    }
+
+    async fn create_category(
+        &self,
+        _owner: OwnerId,
+        _group: CategoryGroupId,
+        _title: String,
+    ) -> Result<CategoryView, AppError> {
+        Err(AppError::NotConfigured { what: "categories" })
+    }
+
+    async fn retire_category(&self, _owner: OwnerId, _id: CategoryId) -> Result<(), AppError> {
+        Err(AppError::NotConfigured { what: "categories" })
+    }
+
+    async fn list_category_rules(
+        &self,
+        _owner: OwnerId,
+    ) -> Result<Vec<CategoryRuleView>, AppError> {
+        Ok(Vec::new())
+    }
+
+    async fn create_category_rule(
+        &self,
+        _owner: OwnerId,
+        _rule: CategoryRuleUpsert,
+        _replaces: Option<CategoryRuleId>,
+    ) -> Result<CategoryRuleView, AppError> {
+        Err(AppError::NotConfigured {
+            what: "category rules",
+        })
+    }
+
+    async fn retire_category_rule(
+        &self,
+        _owner: OwnerId,
+        _id: CategoryRuleId,
+    ) -> Result<(), AppError> {
+        Err(AppError::NotConfigured {
+            what: "category rules",
         })
     }
 }

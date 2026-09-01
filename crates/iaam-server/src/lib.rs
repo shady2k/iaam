@@ -136,6 +136,14 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
             routes::create_classification_rule
         ))
         .routes(routes!(routes::delete_classification_rule))
+        .routes(routes!(
+            routes::list_category_reference,
+            routes::create_category_route
+        ))
+        .routes(routes!(routes::delete_category))
+        .routes(routes!(routes::list_category_rules_route))
+        .routes(routes!(routes::create_category_rule_route))
+        .routes(routes!(routes::preview_category_rule_route))
         .routes(routes!(routes::sync_broker))
         .routes(routes!(routes::sync_market))
         .routes(routes!(routes::list_market_key_rate))

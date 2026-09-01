@@ -3,6 +3,7 @@
 //! There is not a single line of money arithmetic here. Every number
 //! appearing in the API response comes from `iaam-core` (§3.1, §13).
 
+pub mod categories;
 pub mod ingest;
 pub mod market_reference;
 pub mod reports;

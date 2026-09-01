@@ -232,11 +232,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tokens: Arc<dyn TokenAdmin> = adapter.clone();
     let services = Arc::new(AppServices {
         store: adapter.clone(),
-        directory: adapter,
+        directory: adapter.clone(),
         broker,
         tokens,
         clock: Arc::new(SystemClock),
         channels,
+        categories: adapter,
         rules,
         http,
         broker_dictionary,

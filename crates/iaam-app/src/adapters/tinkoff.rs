@@ -465,6 +465,7 @@ fn operation_to_submitted(
         source_time: operation.source_time,
         idempotency_key: Some(operation.deduplication_key),
         source_operation_id: Some(operation.operation_id),
+        source_category: None,
     })
 }
 
@@ -704,6 +705,7 @@ fn trade_operations(
                     escape_component(&operation.operation_id),
                     escape_component(&trade.num)
                 )),
+                source_category: None,
             })
         })
         .collect()

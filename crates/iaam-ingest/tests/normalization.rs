@@ -34,6 +34,7 @@ fn submit(kind: OperationKind) -> SubmittedOperation {
         source_time: None,
         idempotency_key: None,
         source_operation_id: None,
+        source_category: None,
     }
 }
 
@@ -362,4 +363,28 @@ fn a_zero_amount_is_rejected_just_like_a_negative_one() {
         rejection.actual, "0.00",
         "amount is printed in the same units sent by the client"
     );
+}
+
+#[test]
+fn the_sources_own_category_survives_normalisation_verbatim() {
+    let mut operation = submit(OperationKind::Withdrawal {
+        amount_minor: 120_000,
+        currency: CurrencyCode::Rub,
+    });
+    // The source's word, with its capital letter and its spacing. A rule maps
+    // it to the owner's category by exact value; normalising it here would
+    // silently stop that rule matching.
+    operation.source_category = Some("Супермаркеты".to_owned());
+    let event = normalize(&operation, context()).expect("normalises").event;
+    assert_eq!(event.provenance.source_category(), Some("Супермаркеты"));
+}
+
+#[test]
+fn an_operation_without_a_source_category_carries_none() {
+    let operation = submit(OperationKind::Withdrawal {
+        amount_minor: 120_000,
+        currency: CurrencyCode::Rub,
+    });
+    let event = normalize(&operation, context()).expect("normalises").event;
+    assert_eq!(event.provenance.source_category(), None);
 }

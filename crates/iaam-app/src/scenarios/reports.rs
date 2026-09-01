@@ -28,6 +28,7 @@ use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
+use super::categories::load_index;
 use crate::AppServices;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
@@ -59,6 +60,8 @@ pub struct MoneyFlowReport {
     pub version: ContourVersion,
     pub from: Date,
     pub to: Date,
+    /// The active owner rule versions used to derive the decomposition.
+    pub category_rule_versions: Vec<u32>,
     pub flow: MoneyFlow,
 }
 
@@ -117,6 +120,8 @@ pub async fn money_flow(
     }
     let (version, definition) =
         resolve_contour(services, principal, query.contour, query.contour_version).await?;
+    let categories = load_index(services, principal).await?;
+    let category_rule_versions = categories.versions().to_vec();
     let events = services
         .store
         .load_events_through(principal.owner, query.to)
@@ -127,13 +132,14 @@ pub async fn money_flow(
     };
     let mut flow = MoneyFlow::new();
     for event in &events {
-        flow.apply(event, &definition, window)?;
+        flow.apply(event, &definition, window, &categories)?;
     }
     Ok(MoneyFlowReport {
         contour: query.contour,
         version,
         from: query.from,
         to: query.to,
+        category_rule_versions,
         flow,
     })
 }

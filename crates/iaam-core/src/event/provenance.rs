@@ -54,6 +54,18 @@ pub struct Provenance {
     raw_hash: RawHash,
     parser_version: ParserVersion,
     source_operation_id: Option<String>,
+    /// The category the source itself assigned to the row.
+    ///
+    /// Retained separately from any owner category and never rewritten. It is
+    /// evidence about what the source said, not a decision: a bank calling a
+    /// subscription "Развлечения" is a hint the owner may map or override, and
+    /// storing it as the owner's own category would let the bank decide what
+    /// his spending was.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_category: Option<String>,
     row: Option<RowLocator>,
 }
 
@@ -69,6 +81,7 @@ impl Provenance {
             raw_hash,
             parser_version,
             source_operation_id: None,
+            source_category: None,
             row: None,
         }
     }
@@ -76,6 +89,12 @@ impl Provenance {
     #[must_use]
     pub fn with_source_operation_id(mut self, id: impl Into<String>) -> Self {
         self.source_operation_id = Some(id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_category(mut self, category: impl Into<String>) -> Self {
+        self.source_category = Some(category.into());
         self
     }
 
@@ -105,6 +124,11 @@ impl Provenance {
     #[must_use]
     pub fn source_operation_id(&self) -> Option<&str> {
         self.source_operation_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn source_category(&self) -> Option<&str> {
+        self.source_category.as_deref()
     }
 
     #[must_use]

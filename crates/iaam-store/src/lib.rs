@@ -11,6 +11,7 @@ pub mod market;
 pub mod market_source_codes;
 
 pub mod bundle;
+pub mod categories;
 pub mod documents;
 pub mod events;
 pub mod reference;
@@ -79,6 +80,8 @@ pub enum StoreError {
     /// this is the owner's response, not a failure: the text “UNIQUE
     #[error("{what} already exists: revoke the active one first")]
     AlreadyExists { what: &'static str },
+    #[error("category group {id} is retired")]
+    CategoryGroupRetired { id: String },
     #[error("invalid value for {field}: {value}")]
     InvalidValue { field: &'static str, value: String },
     #[error("a synchronization run is already in progress for {source_id}/{dataset}/{series_key}")]

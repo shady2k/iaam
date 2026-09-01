@@ -37,9 +37,10 @@ use std::sync::Arc;
 
 use iaam_store::market::MarketStore;
 use ports::{
-    BrokerChannelFactory, BrokerDictionary, BrokerVault, ClassificationRuleStore, Clock,
-    InstrumentDirectory, OutboundHttp, Store, TokenAdmin, UnavailableBrokerChannelFactory,
-    UnavailableBrokerDictionary, UnavailableClassificationRuleStore, UnavailableOutboundHttp,
+    BrokerChannelFactory, BrokerDictionary, BrokerVault, CategoryStore, ClassificationRuleStore,
+    Clock, InstrumentDirectory, OutboundHttp, Store, TokenAdmin, UnavailableBrokerChannelFactory,
+    UnavailableBrokerDictionary, UnavailableCategoryStore, UnavailableClassificationRuleStore,
+    UnavailableOutboundHttp,
 };
 
 /// Assembled dependencies. The composition root creates one instance;
@@ -57,6 +58,8 @@ pub struct AppServices {
     pub clock: Arc<dyn Clock>,
     /// Broker channel creation. Secrets remain inside the adapter.
     pub channels: Arc<dyn BrokerChannelFactory>,
+    /// Owner category reference and assignment rules.
+    pub categories: Arc<dyn CategoryStore>,
     /// Historical classification rules.
     pub rules: Arc<dyn ClassificationRuleStore>,
     /// Outbound HTTP. Without an adapter, manual execution returns 503.
@@ -88,6 +91,7 @@ impl AppServices {
             directory,
             broker,
             tokens,
+            categories: Arc::new(UnavailableCategoryStore),
             clock,
             channels: Arc::new(UnavailableBrokerChannelFactory),
             rules: Arc::new(UnavailableClassificationRuleStore),

@@ -89,6 +89,7 @@ journal correction. No task in this plan appends an event.
 | `crates/iaam-ingest/src/operation.rs` | `SubmittedOperation` gains `source_category` |
 | `crates/iaam-core/src/event/provenance.rs` | provenance carries the source's category verbatim |
 | `crates/iaam-store/migrations/0015_categories.sql` | **new** — groups, categories, category rules |
+| `crates/iaam-store/src/schema.rs` | registers migration 0015 and raises `SCHEMA_VERSION` to 15 |
 | `crates/iaam-core/src/category.rs` | **new** — `CategoryId`, `CategoryRule`, interval, `assign` |
 | `crates/iaam-store/src/categories.rs` | **new** — reference and rule persistence |
 | `crates/iaam-app/src/ports.rs` | `CategoryStore` port |
@@ -228,6 +229,11 @@ git commit -m "feat(core,ingest,server): the source's own category survives inge
 
 **Files:**
 - Create: `crates/iaam-store/migrations/0015_categories.sql`
+- Modify: `crates/iaam-store/src/schema.rs` — **a migration file does nothing
+  until it is registered here.** Add the `(15, include_str!(...))` entry and
+  raise `pub const SCHEMA_VERSION` from 14 to 15. This is the store's own schema
+  version and is unrelated to the event `SCHEMA_VERSION` in `iaam-core`; do not
+  confuse them, and do not touch the latter.
 - Create: `crates/iaam-store/src/categories.rs`
 - Modify: `crates/iaam-store/src/lib.rs` (module declaration)
 - Test: `crates/iaam-store/tests/` — new `categories.rs`, following a neighbouring store test

@@ -10,6 +10,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::InstrumentId;
 use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId};
@@ -119,10 +120,19 @@ pub async fn sync_broker(
     let mut recorded = Vec::new();
     let mut duplicates = 0;
     let mut possible_duplicates = 0;
-    let mut refusal_dimensions: Vec<BTreeSet<Dimension>> = parsed
+    // Every refused row is named. A row the source identified is keyed by that
+    // identifier; one it did not is keyed by a fingerprint of its raw payload,
+    // which a later import of the same unchanged row reproduces exactly.
+    let mut refusals: Vec<RefusedRow> = parsed
         .quarantined
         .iter()
-        .map(|row| row.dimensions.clone())
+        .map(|row| RefusedRow {
+            key: SourceRowKey {
+                source: channel.source,
+                row: fingerprint_of(&row.raw),
+            },
+            dimensions: row.dimensions.clone(),
+        })
         .collect();
 
     for operation in parsed.accepted {
@@ -143,7 +153,7 @@ pub async fn sync_broker(
         ) {
             Ok(normalized) => normalized,
             Err(rejection) => {
-                refusal_dimensions.push(operation_dimensions(&operation.kind));
+                refusals.push(refused_row(&operation, channel.source));
                 recorded.push(Verdict::Rejected { rejection });
                 continue;
             }
@@ -151,7 +161,7 @@ pub async fn sync_broker(
         let event = with_channel_provenance(normalized.event, &channel);
         if let Some(rejection) = crate::scenarios::ingest::structural_rejection(&event, "operation")
         {
-            refusal_dimensions.push(operation_dimensions(&operation.kind));
+            refusals.push(refused_row(&operation, channel.source));
             recorded.push(Verdict::Rejected { rejection });
             continue;
         }
@@ -191,14 +201,14 @@ pub async fn sync_broker(
     recorded.extend(parsed.quarantined.iter().map(|row| Verdict::Quarantined {
         reason: row.reason.clone(),
     }));
-    let refused = u32::try_from(refusal_dimensions.len()).map_err(|_| AppError::Invalid {
+    u32::try_from(refusals.len()).map_err(|_| AppError::Invalid {
         field: "refused".to_owned(),
         expected: "at most u32::MAX rows".to_owned(),
-        actual: refusal_dimensions.len().to_string(),
+        actual: refusals.len().to_string(),
     })?;
-    let gap_dimensions: BTreeSet<Dimension> = refusal_dimensions
+    let gap_dimensions: BTreeSet<Dimension> = refusals
         .iter()
-        .flat_map(|dimensions| dimensions.iter().copied())
+        .flat_map(|row| row.dimensions.iter().copied())
         .collect();
     if !gap_dimensions.is_empty() {
         let gap = coverage_gap_event(
@@ -208,8 +218,7 @@ pub async fn sync_broker(
                 from,
                 to,
             },
-            gap_dimensions,
-            refused,
+            refusals,
             &channel,
         );
         let key = gap.idempotency_key.clone();
@@ -347,10 +356,45 @@ fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> {
     }
 }
 
+/// Fingerprint of a raw source row, for a row the source did not identify.
+///
+/// Deliberately over the canonical JSON of the payload rather than its Debug
+/// rendering: this string is persisted inside a coverage gap and compared by a
+/// later import, so a formatting change between compiler versions must not
+/// silently make it a different row.
+fn fingerprint_of(raw: &serde_json::Value) -> RowName {
+    let canonical = serde_json::to_string(raw).unwrap_or_else(|_| raw.to_string());
+    let digest = Sha256::digest(canonical.as_bytes());
+    RowName::Fingerprint(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// A refusal of an operation that reached normalisation.
+///
+/// The source's own identifier is preferred; an operation that carries none is
+/// fingerprinted over its serialised form, which is stable for the same input.
+fn refused_row(
+    operation: &iaam_ingest::operation::SubmittedOperation,
+    source: iaam_core::ids::SourceId,
+) -> RefusedRow {
+    let row = match operation.source_operation_id.as_deref() {
+        Some(id) if !id.is_empty() => RowName::Given(id.to_owned()),
+        // An empty identifier is not an identifier.
+        _ => {
+            let canonical = serde_json::to_string(operation)
+                .unwrap_or_else(|_| format!("{:?}", operation.dates));
+            let digest = Sha256::digest(canonical.as_bytes());
+            RowName::Fingerprint(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
+    };
+    RefusedRow {
+        key: SourceRowKey { source, row },
+        dimensions: operation_dimensions(&operation.kind),
+    }
+}
+
 fn coverage_gap_event(
     target: AssertionTarget,
-    dimensions: BTreeSet<Dimension>,
-    refused: u32,
+    rows: Vec<RefusedRow>,
     channel: &SourceChannel,
 ) -> Event {
     let AssertionTarget {
@@ -359,6 +403,14 @@ fn coverage_gap_event(
         from,
         to,
     } = target;
+    // Derived, never passed in: structural validation requires the union to
+    // equal `dimensions` and the count to equal `refused`, and two sources of
+    // truth for the same numbers would eventually disagree.
+    let dimensions: BTreeSet<Dimension> = rows
+        .iter()
+        .flat_map(|row| row.dimensions.iter().copied())
+        .collect();
+    let refused = u32::try_from(rows.len()).unwrap_or(u32::MAX);
     // Correlation deliberately uses the channel's source and parser version
     // in provenance, while omitting document because each assertion is a
     // separate singleton document group.
@@ -382,6 +434,7 @@ fn coverage_gap_event(
             period: iaam_core::reconciliation::claim::AssertionPeriod { from, to },
             dimensions,
             refused,
+            rows,
         },
         dates: EventDates::for_cash(CashPostedDate(to)),
         order: EffectiveOrder::new(to, 0),

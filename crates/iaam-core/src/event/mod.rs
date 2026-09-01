@@ -8,6 +8,7 @@ pub mod leg;
 pub mod legs;
 pub mod offer;
 pub mod provenance;
+pub mod source_row;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -99,6 +100,16 @@ pub enum EventValidationError {
         kind: &'static str,
         field: &'static str,
     },
+    #[error(
+        "for {kind} {field} must equal the union of refused row dimensions: \
+         expected {expected}, actual {actual}"
+    )]
+    DimensionsMismatch {
+        kind: &'static str,
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
     #[error("for {kind} value {field} must be positive, got {value}")]
     NonPositive {
         kind: &'static str,
@@ -167,7 +178,11 @@ pub struct Event {
 /// so older journal facts remain readable, while the schema number still
 /// distinguishes software that understands the new fact.
 /// Version 7 adds [`EventKind::ImportCoverageGap`].
-pub const SCHEMA_VERSION: u32 = 7;
+/// Version 8 adds the refused rows inside that variant and the variant
+/// [`EventKind::ImportRowResolution`]: a coverage gap now says WHICH rows are
+/// missing, and a row is disposed of by an explicit fact rather than inferred
+/// from the presence of an event.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.
@@ -280,7 +295,8 @@ impl Event {
                 period,
                 dimensions,
                 refused,
-            } => self.validate_import_coverage_gap(name, *period, dimensions, *refused),
+                rows,
+            } => self.validate_import_coverage_gap(name, *period, dimensions, *refused, rows),
             EventKind::CorporateAction { action } => self.validate_corporate_action(name, action),
             EventKind::OfferExercise { action } => self.validate_offer_exercise(name, action),
         }
@@ -742,6 +758,7 @@ impl Event {
         period: crate::reconciliation::claim::AssertionPeriod,
         dimensions: &std::collections::BTreeSet<crate::reconciliation::Dimension>,
         refused: u32,
+        rows: &[crate::event::source_row::RefusedRow],
     ) -> Result<(), EventValidationError> {
         if !period.is_well_formed() {
             return Err(EventValidationError::NonPositive {
@@ -763,15 +780,49 @@ impl Event {
                 field: "dimensions",
             });
         }
-        if self.legs.is_empty() {
-            Ok(())
-        } else {
-            Err(EventValidationError::LegCount {
+        if !self.legs.is_empty() {
+            return Err(EventValidationError::LegCount {
                 kind: name,
                 expected: "no legs",
                 found: self.legs.len(),
-            })
+            });
         }
+
+        // Schema-aware on purpose. `validate_structure` runs on the READ path
+        // too: the projection re-checks every effective event because the core
+        // does not trust storage it did not write (crates/iaam-core/src/
+        // projection/invariants.rs). Refusing an empty `rows` outright would
+        // make every report fail on a journal that holds a gap written before
+        // schema 8.
+        if self.schema_version < 8 {
+            return Ok(());
+        }
+        if rows.is_empty() {
+            return Err(EventValidationError::EmptySet {
+                kind: name,
+                field: "rows",
+            });
+        }
+        if rows.len() != refused as usize {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "refused",
+                value: format!("{refused} declared, {} rows listed", rows.len()),
+            });
+        }
+        let union: std::collections::BTreeSet<crate::reconciliation::Dimension> = rows
+            .iter()
+            .flat_map(|row| row.dimensions.iter().copied())
+            .collect();
+        if &union != dimensions {
+            return Err(EventValidationError::DimensionsMismatch {
+                kind: name,
+                field: "rows",
+                expected: format!("{dimensions:?}"),
+                actual: format!("{union:?}"),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1111,10 +1162,12 @@ pub(crate) mod test_support {
 mod tests {
     use super::kind::{FeeOrigin, TradeSide};
     use super::provenance::{ParserVersion, RawHash};
+    use super::source_row::{RefusedRow, RowName, SourceRowKey};
     use super::*;
     use crate::dates::CashPostedDate;
     use crate::ids::{CustodyId, InstrumentId, SourceId, TransferId};
     use crate::money::{CalcMoney, PostedMinor, Quantity};
+    use crate::reconciliation::Dimension;
     use time::macros::date;
 
     // Amounts are written in minimal units as one number: grouping
@@ -1146,6 +1199,20 @@ mod tests {
             relation: Relation::None,
             confidence: Confidence::Known,
             idempotency_key: None,
+        }
+    }
+    fn march_period() -> crate::reconciliation::claim::AssertionPeriod {
+        crate::reconciliation::claim::AssertionPeriod::between(
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .expect("well-formed period")
+    }
+
+    fn row_key(name: &str) -> SourceRowKey {
+        SourceRowKey {
+            source: SourceId::new_random(),
+            row: RowName::Given(name.to_owned()),
         }
     }
 
@@ -2605,6 +2672,98 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_eight_gap_whose_rows_do_not_cover_its_dimensions_is_rejected() {
+        let mut event = test_support::sample_event(1);
+        event.schema_version = 8;
+        event.legs = Vec::new();
+        event.kind = EventKind::ImportCoverageGap {
+            period: march_period(),
+            dimensions: [Dimension::Cash, Dimension::Positions]
+                .into_iter()
+                .collect(),
+            refused: 1,
+            rows: vec![RefusedRow {
+                key: row_key("OP-1"),
+                dimensions: [Dimension::Cash].into_iter().collect(),
+            }],
+        };
+        assert!(event.validate_structure().is_err());
+    }
+
+    #[test]
+    fn a_schema_eight_gap_whose_row_count_disagrees_with_refused_is_rejected() {
+        let mut event = test_support::sample_event(1);
+        event.schema_version = 8;
+        event.legs = Vec::new();
+        event.kind = EventKind::ImportCoverageGap {
+            period: march_period(),
+            dimensions: [Dimension::Cash].into_iter().collect(),
+            refused: 2,
+            rows: vec![RefusedRow {
+                key: row_key("OP-1"),
+                dimensions: [Dimension::Cash].into_iter().collect(),
+            }],
+        };
+        assert!(event.validate_structure().is_err());
+    }
+
+    #[test]
+    fn a_legacy_gap_without_rows_still_validates() {
+        let mut event = test_support::sample_event(1);
+        event.schema_version = 7;
+        event.legs = Vec::new();
+        event.kind = EventKind::ImportCoverageGap {
+            period: march_period(),
+            dimensions: [Dimension::Cash].into_iter().collect(),
+            refused: 1,
+            rows: Vec::new(),
+        };
+        assert!(event.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn a_schema_eight_gap_without_rows_is_rejected() {
+        let mut event = test_support::sample_event(1);
+        event.schema_version = 8;
+        event.legs = Vec::new();
+        event.kind = EventKind::ImportCoverageGap {
+            period: march_period(),
+            dimensions: [Dimension::Cash].into_iter().collect(),
+            refused: 1,
+            rows: Vec::new(),
+        };
+        assert!(event.validate_structure().is_err());
+    }
+
+    #[test]
+    fn a_legacy_gap_without_rows_still_deserialises() {
+        let mut event = test_support::sample_event(1);
+        event.schema_version = 7;
+        event.legs = Vec::new();
+        event.kind = EventKind::ImportCoverageGap {
+            period: march_period(),
+            dimensions: [Dimension::Cash].into_iter().collect(),
+            refused: 1,
+            rows: vec![RefusedRow {
+                key: row_key("OP-1"),
+                dimensions: [Dimension::Cash].into_iter().collect(),
+            }],
+        };
+        let mut value = serde_json::to_value(event).unwrap();
+        value["kind"]["ImportCoverageGap"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rows");
+
+        let deserialised: Event = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            deserialised.kind,
+            EventKind::ImportCoverageGap { ref rows, .. } if rows.is_empty()
+        ));
+        assert!(deserialised.validate_structure().is_ok());
+    }
+
+    #[test]
     fn an_import_coverage_gap_requires_at_least_one_refused_row() {
         let account = AccountId::new_random();
         let period = crate::reconciliation::claim::AssertionPeriod::between(
@@ -2619,6 +2778,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 refused: 0,
+                rows: Vec::new(),
             },
             Vec::new(),
             account,
@@ -2829,7 +2989,9 @@ mod tests {
         // 4 → 5: `EffectiveOrder` gained an optional source time.
         // 5 → 6: `Trade` gained optional basis-only fee fields.
         // 6 → 7: added `EventKind::ImportCoverageGap` (§10.3).
-        assert_eq!(SCHEMA_VERSION, 7);
+        // 7 → 8: `ImportCoverageGap` gained `rows`; added
+        //        `EventKind::ImportRowResolution` (§10.3).
+        assert_eq!(SCHEMA_VERSION, 8);
     }
 
     #[test]

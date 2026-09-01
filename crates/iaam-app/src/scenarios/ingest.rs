@@ -1,6 +1,6 @@
 //! Operation ingestion.
 
-use iaam_core::event::Event;
+use iaam_core::event::{Event, SCHEMA_VERSION};
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::ids::SourceId;
 use iaam_ingest::dedup::IdentityScope;
@@ -177,6 +177,17 @@ pub async fn append_checked(
     scope: IdentityScope,
 ) -> Result<Vec<Recorded>, AppError> {
     for (index, event) in events.iter().enumerate() {
+        // A newly written event may not claim a version other than the one this
+        // build produces. Without this, the schema-aware allowance in
+        // `validate_import_coverage_gap` becomes a way to write a gap that names
+        // no rows and can never be lifted.
+        if event.schema_version != SCHEMA_VERSION {
+            return Err(AppError::Invalid {
+                field: format!("event[{index}].schema_version"),
+                expected: SCHEMA_VERSION.to_string(),
+                actual: event.schema_version.to_string(),
+            });
+        }
         if let Some(rejection) = structural_rejection(event, "event") {
             return Err(AppError::Invalid {
                 field: format!("event[{index}]"),

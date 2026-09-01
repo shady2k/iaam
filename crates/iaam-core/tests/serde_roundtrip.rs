@@ -12,6 +12,7 @@ use iaam_core::event::allocation::{AllocationGap, BasisAllocation};
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
 use iaam_core::event::leg::Leg;
+use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RowLocator};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
@@ -172,6 +173,29 @@ fn every_kind() -> Vec<Event> {
                     .expect("interval"),
                 dimensions: [Dimension::Cash].into_iter().collect(),
                 refused: 3,
+                rows: vec![
+                    RefusedRow {
+                        key: SourceRowKey {
+                            source: SourceId::new_random(),
+                            row: RowName::Given("OP-1".to_owned()),
+                        },
+                        dimensions: [Dimension::Cash].into_iter().collect(),
+                    },
+                    RefusedRow {
+                        key: SourceRowKey {
+                            source: SourceId::new_random(),
+                            row: RowName::Given("OP-2".to_owned()),
+                        },
+                        dimensions: [Dimension::Cash].into_iter().collect(),
+                    },
+                    RefusedRow {
+                        key: SourceRowKey {
+                            source: SourceId::new_random(),
+                            row: RowName::Given("OP-3".to_owned()),
+                        },
+                        dimensions: [Dimension::Cash].into_iter().collect(),
+                    },
+                ],
             },
             vec![],
         ),

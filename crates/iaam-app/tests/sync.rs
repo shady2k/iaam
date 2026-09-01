@@ -505,6 +505,7 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
                 period,
                 dimensions,
                 refused,
+                ..
             } => Some((event, period, dimensions, refused)),
             _ => None,
         })
@@ -1168,6 +1169,38 @@ async fn a_structural_rejection_stops_one_operation_and_records_its_dimensions()
             .count(),
         0
     );
+}
+
+#[tokio::test]
+async fn an_event_claiming_an_older_schema_version_is_refused_on_write() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let mut event = iaam_ingest::normalize(
+        &trade(account, instrument, custody),
+        iaam_ingest::operation::NormalizationContext {
+            owner,
+            source: SourceId::new_random(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("valid fixture normalisation: {error:?}"))
+    .event;
+    event.schema_version = 7;
+
+    let error = append_checked(&services, vec![event], IdentityScope::Source)
+        .await
+        .expect_err("older schema version must be refused");
+    assert!(matches!(
+        error,
+        AppError::Invalid {
+            field,
+            expected,
+            actual,
+        } if field == "event[0].schema_version" && expected == "8" && actual == "7"
+    ));
+    assert!(load_all(&services, owner).await.is_empty());
 }
 
 #[tokio::test]

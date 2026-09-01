@@ -603,7 +603,7 @@ git commit -m "feat(core): a tax is a fact of its own, not an unnamed outflow"
 
 **Files:**
 - Modify: `crates/iaam-ingest/src/operation.rs`
-- Test: `crates/iaam-ingest/src/operation.rs` (existing `mod tests`)
+- Test: `crates/iaam-ingest/tests/normalization.rs` — the crate has **no** `mod tests` in `operation.rs`; operation building is tested through the public `normalize` entry point in that integration test.
 
 **Interfaces:**
 - Consumes: `EventKind::Tax` and `TaxOrigin` from Task 3.
@@ -618,55 +618,71 @@ git commit -m "feat(core): a tax is a fact of its own, not an unnamed outflow"
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `mod tests` in `crates/iaam-ingest/src/operation.rs`:
+`build` is private and `operation.rs` has no unit-test module. The seam is
+tested through the public `normalize` entry point in
+`crates/iaam-ingest/tests/normalization.rs`, whose header says why: "ingestion
+builds the legs, and the core defines their shape". Use that file's existing
+helpers — `context()` and `submit(kind)` — and add the new kind to `all_kinds()`
+so the existing
+`every_operation_kind_produces_a_structurally_valid_event` covers it too.
 
 ```rust
-    #[test]
-    fn a_submitted_tax_becomes_one_negative_tax_leg() {
-        let account = AccountId::new_random();
-        let operation = SubmittedOperation {
-            account,
-            kind: OperationKind::Tax {
-                amount_minor: 130_000,
-                currency: CurrencyCode::Rub,
-                origin: TaxOrigin::SelfPaid,
-            },
-            ..sample_operation(account)
-        };
-        let (kind, legs) = build(&operation, &operation.kind).expect("tax builds");
-        assert!(matches!(kind, EventKind::Tax { .. }));
-        assert_eq!(legs.len(), 1);
-        assert_eq!(legs[0].kind, LegKind::Tax);
-        assert_eq!(legs[0].money.expect("money").amount().raw(), -130_000);
-    }
-
-    #[test]
-    fn a_non_positive_tax_is_rejected() {
-        // The client sends a magnitude; the sign is ours to set. A client that
-        // sends -130_000 believing it helps must be told, not silently obeyed.
-        let account = AccountId::new_random();
-        for amount in [0_i64, -1] {
-            let operation = SubmittedOperation {
-                account,
-                kind: OperationKind::Tax {
-                    amount_minor: amount,
-                    currency: CurrencyCode::Rub,
-                    origin: TaxOrigin::SelfPaid,
-                },
-                ..sample_operation(account)
-            };
-            let rejection = build(&operation, &operation.kind).expect_err("rejected");
-            assert_eq!(rejection.field, "amount");
+#[test]
+fn a_submitted_tax_becomes_one_negative_tax_leg() {
+    let operation = submit(OperationKind::Tax {
+        amount_minor: 130_000,
+        currency: CurrencyCode::Rub,
+        origin: TaxOrigin::SelfPaid,
+    });
+    let event = normalize(&operation, context())
+        .expect("tax normalizes")
+        .event;
+    event.validate_structure().expect("valid shape");
+    match event.kind {
+        EventKind::Tax { amount, origin } => {
+            // The client sent a magnitude; the sign is ours.
+            assert_eq!(amount.amount(), PostedMinor::new(-130_000));
+            assert_eq!(origin, TaxOrigin::SelfPaid);
         }
+        other => panic!("expected a tax, got {other:?}"),
     }
+    let cash = event
+        .cash_effect(CurrencyCode::Rub)
+        .expect("monetary effect");
+    assert_eq!(cash.amount(), PostedMinor::new(-130_000));
+}
+
+#[test]
+fn a_non_positive_tax_is_rejected() {
+    // A client that sends -130_000 believing it helps must be told, not
+    // silently obeyed: normalising the sign here would hide a caller's bug.
+    for amount in [0_i64, -1] {
+        let operation = submit(OperationKind::Tax {
+            amount_minor: amount,
+            currency: CurrencyCode::Rub,
+            origin: TaxOrigin::SelfPaid,
+        });
+        let rejection = normalize(&operation, context()).expect_err("rejected");
+        assert_eq!(rejection.field, "amount");
+    }
+}
 ```
 
-Use the module's existing helper for building a `SubmittedOperation` skeleton
-instead of `sample_operation` if it is named differently there.
+Add to `all_kinds()`, beside the existing `OperationKind::Fee` entry:
+
+```rust
+        OperationKind::Tax {
+            amount_minor: 13_000,
+            currency: CurrencyCode::Rub,
+            origin: TaxOrigin::SelfPaid,
+        },
+```
+
+and import `TaxOrigin` from `iaam_core::event::kind` at the top of the file.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p iaam-ingest operation::tests::a_submitted_tax`
+Run: `direnv exec $WORKTREE cargo test -p iaam-ingest --test normalization a_submitted_tax`
 Expected: FAIL, `no variant named `Tax``.
 
 - [ ] **Step 3: Write the implementation**
@@ -705,8 +721,8 @@ Import `TaxOrigin` from `iaam_core::event::kind` at the top of the file.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p iaam-ingest operation::tests::a_submitted_tax && cargo test -p iaam-ingest operation::tests::a_non_positive_tax`
-Expected: PASS, 2 tests.
+Run: `direnv exec $WORKTREE cargo test -p iaam-ingest --test normalization a_submitted_tax`, then the same with `a_non_positive_tax`, then with `every_operation_kind`.
+Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Check the crates compile**
 
@@ -718,7 +734,7 @@ assuming it.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/iaam-ingest/src/operation.rs
+git add crates/iaam-ingest/src/operation.rs crates/iaam-ingest/tests/normalization.rs
 git commit -m "feat(ingest): a tax can be submitted as an operation"
 ```
 

@@ -336,7 +336,7 @@ fn harness_with_factory(
     let broker_dictionary: Arc<dyn iaam_app::ports::BrokerDictionary> = adapter.clone();
     let services = Arc::new(AppServices {
         store: adapter.clone(),
-        directory: adapter,
+        directory: adapter.clone(),
         broker,
         tokens,
         clock: Arc::new(FixedClock(date!(2026 - 01 - 01))),
@@ -4854,4 +4854,250 @@ async fn tax_amounts_are_rejected_per_row_when_not_positive() {
         assert_eq!(response[0]["verdict"], "rejected", "{response}");
         assert_eq!(response[0]["field"], "amount", "{response}");
     }
+}
+
+#[tokio::test]
+async fn categories_can_be_retired_without_disappearing() {
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let category_id = created["id"].as_str().expect("category id");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/categories", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed.as_array().expect("category list").len(), 1);
+
+    let (status, body) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/categories/{category_id}"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/categories", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed.as_array().expect("category list").len(), 1);
+    assert!(listed[0]["retired_at"].is_string(), "{listed}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn category_rule_preview_does_not_write_and_rules_are_listed() {
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (status, category) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{category}");
+    let category_id = category["id"].as_str().expect("category id");
+    let rule_body = json!({
+        "matcher": {"SourceCategory": {"value": "Supermarkets"}},
+        "category": category_id,
+    });
+
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/category-rules", &harness.owner_token, &rule_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["version"], 1);
+
+    let (status, before) = call(
+        &harness.router,
+        get("/v1/category-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    let before_count = before.as_array().expect("rule list").len();
+
+    let (status, impact) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules/preview",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"SourceCategory": {"value": "Other"}},
+                "category": category_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{impact}");
+
+    let (status, after) = call(
+        &harness.router,
+        get("/v1/category-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after.as_array().expect("rule list").len(), before_count);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn flow_report_exposes_category_decomposition_residual_and_rule_versions() {
+    let (harness, path) = harness_on_disk();
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (status, category) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{category}");
+    let category_id = category["id"].as_str().expect("category id");
+    let (status, created_rule) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"SourceCategory": {"value": "Supermarkets"}},
+                "category": category_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created_rule}");
+
+    let contour = json!({
+        "title": "August flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "1200.00",
+                "currency": "RUB",
+                "dates": {"cash_posted": "2026-08-05"},
+                "source_category": "Supermarkets",
+                "idempotency_key": "food",
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "500.00",
+                "currency": "RUB",
+                "dates": {"cash_posted": "2026-08-06"},
+                "source_category": "Other",
+                "idempotency_key": "other",
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["category_rule_versions"], json!([1]));
+    let rub = &body["currencies"][0];
+    assert_eq!(
+        rub["went_out_by_category"][0]["category"],
+        category_id
+    );
+    assert_eq!(rub["went_out_by_category"][0]["amount"], "1200.00");
+    assert_eq!(rub["not_decomposed"]["count"], 1);
+    assert_eq!(rub["not_decomposed"]["amount"], "500.00");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn categories_and_category_rules_require_authentication() {
+    let harness = harness();
+    let requests = [
+        call(&harness.router, get("/v1/categories", None)),
+        call(
+            &harness.router,
+            post_public("/v1/categories", &json!({})),
+        ),
+        call(
+            &harness.router,
+            get("/v1/category-rules", None),
+        ),
+        call(
+            &harness.router,
+            post_public("/v1/category-rules", &json!({})),
+        ),
+        call(
+            &harness.router,
+            post_public("/v1/category-rules/preview", &json!({})),
+        ),
+    ];
+    for request in requests {
+        let (status, body) = request.await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+    let request = Request::builder()
+        .uri("/v1/categories/00000000-0000-0000-0000-000000000000")
+        .method("DELETE")
+        .body(Body::empty())
+        .expect("request");
+    let (status, body) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }

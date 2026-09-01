@@ -1,7 +1,7 @@
 //! Operation ingestion.
 
-use iaam_core::event::{Event, SCHEMA_VERSION};
 use iaam_core::event::corporate_action::CorporateAction;
+use iaam_core::event::{Event, SCHEMA_VERSION};
 use iaam_core::ids::SourceId;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;

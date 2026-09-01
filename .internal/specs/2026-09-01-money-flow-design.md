@@ -48,21 +48,22 @@ below breaks the cut into steps that each deliver something on their own.
 
 ## The evidence
 
-The owner's live Actual Budget, read from two screenshots:
+The owner's live Actual Budget, read from two screenshots. The figures
+themselves are his and are not reproduced here; what matters is their shape:
 
-- `All accounts <redacted>`, of which **`On budget` is only <redacted>** —
-  two cards. `Off budget` is <redacted>: investments, two deposits, three
-  broker accounts. Everything that is not a card is a dead balance the tool
-  cannot reason about.
-- Among the expense categories stands **`Переводы`**, <redacted> in March. A
-  transfer to the owner's own deposit is recorded as an expense, because the
-  deposit is off budget. Defect 4, mirrored: own saving looks like spending.
-- `Income <redacted> / Expenses −<redacted> / Saved <redacted>` for March.
-  Both sides are polluted by movements between the owner's own accounts, so the
-  headline number means nothing.
+- **`All accounts` is dominated by `Off budget`** — investments, two deposits
+  and three broker accounts — while `On budget` is two cards and barely a tenth
+  of the total. Everything that is not a card is a dead balance the tool cannot
+  reason about.
+- Among the expense categories stands **`Переводы`**. A transfer to the owner's
+  own deposit is recorded as an expense, because the deposit is off budget.
+  Defect 4, mirrored: own saving looks like spending.
+- The month's headline is `Income / Expenses / Saved`. **Both sides are polluted
+  by movements between the owner's own accounts**, so `Saved` — the number the
+  tool leads with — means nothing.
 - `Budgeted` is `0,00` in every row. Envelope budgeting is not used.
-- Categories are grouped (`Usual Expenses` → `Техника`, `Медицина`, `ИИ`,
-  `Маркетплейсы`, …), so two levels are used and are wanted here too.
+- Categories are grouped, and the groups hold ordinary spending labels, so two
+  levels are used and are wanted here too.
 
 The owner's own summary: the category view has been opened only a few times in
 years and says nothing. **That is a consequence, not a preference.** The sum the
@@ -198,7 +199,7 @@ is six quantities, one reference block, and a discrepancy:
 
 **A discrepancy is named, not hidden.** When the identity does not close, the
 report states the amount and the account it belongs to. That is what replaces
-the meaningless `Saved <redacted>`.
+the tool's meaningless `Saved`.
 
 **"И куда":** the outflow is decomposed by category, two levels, group and
 category. Rows the rules could not place are shown as **their own line, "not
@@ -289,7 +290,7 @@ existing, tested mechanism.
 They are never summed into a single figure. A broker account's value changes
 every second and there is nothing to reconcile it against; a cash balance is a
 number an institution states. Presenting them as one is exactly what produces
-`All accounts <redacted>` — a figure nobody checks. R3 and R10 exist so that
+the single `All accounts` total — a figure nobody checks. R3 and R10 exist so that
 this does not recur.
 
 **Currencies are kept apart**, converted to the report currency through the

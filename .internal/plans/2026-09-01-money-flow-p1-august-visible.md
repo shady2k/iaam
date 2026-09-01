@@ -1268,7 +1268,7 @@ requested currency, `currencies()` returning the union of all keys as a
     ///
     /// Zero means the report closes there. Non-zero is a defect and is shown as
     /// one: a report that quietly absorbs its residual is how
-    /// `Saved <redacted>` came to mean nothing.
+    /// the incumbent tool's `Saved` came to mean nothing.
     #[must_use]
     fn residual_of(&self, account: AccountId, currency: CurrencyCode) -> i64 {
         let at = |ledger: &Ledger| {

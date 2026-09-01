@@ -283,13 +283,22 @@ CREATE INDEX categories_by_owner ON categories (owner, retired_at);
 
 - [ ] **Step 2: Write the failing test**
 
-Create `crates/iaam-store/tests/categories.rs`, copying the setup of a
-neighbouring store test (read `crates/iaam-store/tests/migration_0013.rs` first).
+Create `crates/iaam-store/tests/categories.rs`. Read
+`crates/iaam-store/tests/rules.rs` first — it is the direct analogue, covering
+the classification-rule tables this task mirrors, and its opening line states the
+same reason retirement exists here: "The rule is never deleted: history has
+already been classified by it, and after deletion there would be nothing to
+explain it."
+
+The store opens with `SqliteStore::open_in_memory()`. This crate's tests **do**
+have a shared `mod common` (unlike the server crate) with
+`apply_migrations_through`, used by the `migration_*.rs` tests; you need it only
+if you test the migration itself.
 
 ```rust
 #[test]
 fn a_retired_category_is_still_listed_and_still_flagged() {
-    let store = open_temp_store();
+    let mut store = SqliteStore::open_in_memory().expect("in-memory store");
     let owner = OwnerId::new_random();
     let group = store.insert_category_group(owner, "Usual Expenses").expect("group");
     let food = store.insert_category(owner, group, "Продукты").expect("category");
@@ -651,7 +660,7 @@ Append to `crates/iaam-store/tests/categories.rs`:
 ```rust
 #[test]
 fn two_rules_cannot_share_a_version_number() {
-    let store = open_temp_store();
+    let mut store = SqliteStore::open_in_memory().expect("in-memory store");
     let owner = OwnerId::new_random();
     let group = store.insert_category_group(owner, "Usual Expenses").expect("group");
     let food = store.insert_category(owner, group, "Продукты").expect("category");
@@ -665,7 +674,7 @@ fn two_rules_cannot_share_a_version_number() {
 
 #[test]
 fn an_edited_rule_points_at_the_one_it_replaces() {
-    let store = open_temp_store();
+    let mut store = SqliteStore::open_in_memory().expect("in-memory store");
     let owner = OwnerId::new_random();
     let group = store.insert_category_group(owner, "Usual Expenses").expect("group");
     let food = store.insert_category(owner, group, "Продукты").expect("category");

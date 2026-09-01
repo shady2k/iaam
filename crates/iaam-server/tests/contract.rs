@@ -199,11 +199,24 @@ fn harness_on_disk() -> (Harness, std::path::PathBuf) {
 }
 
 fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account: AccountId) {
-    let period = iaam_core::reconciliation::claim::AssertionPeriod::between(
+    add_reconciliation_assertion_for_period(
+        path,
+        owner,
+        account,
         date!(2025 - 01 - 01),
         date!(2025 - 01 - 31),
-    )
-    .expect("period");
+    );
+}
+
+fn add_reconciliation_assertion_for_period(
+    path: &std::path::Path,
+    owner: OwnerId,
+    account: AccountId,
+    from: Date,
+    to: Date,
+) {
+    let period =
+        iaam_core::reconciliation::claim::AssertionPeriod::between(from, to).expect("period");
     let source = SourceId::new_random();
     let event = iaam_core::event::Event {
         id: iaam_core::ids::EventId::new_random(),
@@ -4577,6 +4590,83 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
     assert_eq!(row["positions"][0]["quantity"], "10");
     assert!(row["reconciliation"].is_array());
     assert!(row.get("total").is_none());
+}
+
+#[tokio::test]
+async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
+    let (harness, path) = harness_on_disk();
+    let unstated_account = AccountId::new_random();
+    SqliteStore::open(&path)
+        .expect("second connection")
+        .upsert_account(&AccountRecord {
+            id: unstated_account,
+            owner: harness.owner,
+            title: "Unstated".into(),
+            institution: None,
+        })
+        .expect("unstated account");
+    add_reconciliation_assertion_for_period(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2026 - 08 - 01),
+        date!(2026 - 08 - 31),
+    );
+
+    let contour = json!({
+        "title": "August balances with reconciliation",
+        "accounts": [harness.account.inner(), unstated_account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body.as_array().expect("balance rows");
+    assert_eq!(rows.len(), 2);
+    let reconciled_id = harness.account.inner().to_string();
+    let unstated_id = unstated_account.inner().to_string();
+    let reconciled = rows
+        .iter()
+        .find(|row| row["account"].as_str() == Some(reconciled_id.as_str()))
+        .expect("reconciled account row");
+    let unstated = rows
+        .iter()
+        .find(|row| row["account"].as_str() == Some(unstated_id.as_str()))
+        .expect("unstated account row");
+
+    assert_eq!(
+        reconciled["reconciliation"],
+        json!([{
+            "account": reconciled_id,
+            "from": "2026-08-01",
+            "to": "2026-08-31",
+            "dimensions": [
+                { "dimension": "cash", "status": "provisional" },
+                { "dimension": "positions", "status": "provisional" },
+                { "dimension": "tax_basis", "status": "provisional" },
+                { "dimension": "income", "status": "provisional" },
+            ],
+            "evidence": [],
+            "outcomes": [{ "claim": "cash_balance", "outcome": "not_comparable" }],
+        }])
+    );
+    assert_eq!(unstated["reconciliation"], json!([]));
+
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]

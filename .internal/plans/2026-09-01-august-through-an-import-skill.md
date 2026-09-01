@@ -940,9 +940,9 @@ def pair_legs(rows):
     because the bank posts them separately. Pairing on the exact time was tried
     against the real August export and matched 1 pair out of 53. Match instead
     on the equal absolute amount and the nearest time within a tight tolerance:
-    27 of 27 pairs, and no false pair, because a wider window would start
-    joining two genuinely separate transfers of the same round amount — August
-    has nine of 10 000 alone."""
+    every pair and no false pair, because a wider window would start joining two
+    genuinely separate transfers of the same round amount, of which a month can
+    hold several."""
     pairs, singles = [], []
     legs, others = [], []
     for row in rows:
@@ -1183,8 +1183,9 @@ only.
 **Acceptance Criteria:**
 - Every account of the spec's perimeter table exists, and the contour version
   lists exactly the in-contour ones.
-- The import summary accounts for all 221 rows: submitted + dropped second leg
-  + skipped outside contour + rejected = 221, with no unexplained remainder.
+- The import summary accounts for every row of the file: submitted + dropped second leg
+  + skipped outside contour + rejected equals the file's row count, with no
+  unexplained remainder.
 - Running the same import a second time submits the same rows and results in
   **zero** new events.
 - Nothing from the export is written into the repository.
@@ -1220,7 +1221,7 @@ python3 .claude/skills/tbank-csv-import/import.py \
   --account-map "$HOME/iaam-accounts.json" --dry-run
 ```
 
-Check the arithmetic against 221 before submitting anything. A row that is
+Check the arithmetic against the file's row count before submitting anything. A row that is
 neither submitted, dropped as a second leg, skipped as out-of-contour, nor
 rejected means the skill has a case it does not handle — fix the skill, do not
 hand-edit the data.
@@ -1374,15 +1375,14 @@ owner with the rule versions the report used.
 - **The description must not enter the deduplication fingerprint.**
   `crates/iaam-ingest/src/dedup.rs:289` deliberately hashes `{v, account, kind,
   dates}`.
-- **`Учёт в аналитике = Нет` is not a rule for skipping a row.** In the August
-  file it marks internal transfers, and also four ±1,00 authorisation pairs from
-  one merchant. The skill pairs and drops legs on its own evidence; using the
+- **`Учёт в аналитике = Нет` is not a rule for skipping a row.** In the export it was written against it marks internal transfers, and also a
+  merchant's one-unit authorisation checks and their refunds. The skill pairs and drops legs on its own evidence; using the
   bank's analytics flag as the criterion would delete real operations the day a
   bank changes its meaning.
 - **The two legs of a transfer do not share a timestamp.** They differ by about
-  a second. Measured on the real August export: pairing on the exact time
-  matched 1 pair of 53; nearest-time within 5 seconds matched 27 of 27. Widening
-  the window is the wrong repair — August contains nine separate transfers of
-  10 000, and a loose window would join two of them into one.
+  a second. Measured on a real export: pairing on the exact time matched almost
+  nothing; nearest-time within a few seconds matched every pair. Widening
+  the window is the wrong repair — a month can hold several separate transfers
+  of the same round amount, and a loose window would join two of them into one.
 - **Disk fills fast**: each worktree's `target/` is roughly 20 GB. Delete merged
   trees immediately.

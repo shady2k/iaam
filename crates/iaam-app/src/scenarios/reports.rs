@@ -5,15 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::kind::EventKind;
-use iaam_core::ids::InstrumentId;
+use iaam_core::ids::{AccountId, InstrumentId};
 use iaam_core::instrument::CurrencyRoles;
-use iaam_core::money::{CurrencyCode, PerUnitAmount};
+use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, Quantity};
 use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
+use iaam_core::projection::balances::{Balances, PositionKey};
+use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
-use iaam_core::reconciliation::ReconciliationLedger;
+use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue};
@@ -38,6 +40,154 @@ pub struct ReturnsQuery {
     pub report_currency: CurrencyCode,
     pub fx: FxTable,
     pub lot_rule: LotRuleVersion,
+}
+
+/// Money flow report request.
+#[derive(Debug, Clone, Copy)]
+pub struct MoneyFlowQuery {
+    pub contour: ContourId,
+    pub contour_version: Option<ContourVersion>,
+    pub from: Date,
+    pub to: Date,
+}
+
+/// Report of cash movement over an interval.
+#[derive(Debug, Clone)]
+pub struct MoneyFlowReport {
+    pub contour: ContourId,
+    pub version: ContourVersion,
+    pub from: Date,
+    pub to: Date,
+    pub flow: MoneyFlow,
+}
+
+/// Cash, reconciliation, and positions for one contour account.
+#[derive(Debug, Clone)]
+pub struct AccountBalanceRow {
+    pub account: iaam_core::ids::AccountId,
+    pub cash: Vec<Money>,
+    pub reconciliation: Vec<ReconciliationStatus>,
+    pub positions: Vec<(PositionKey, Quantity)>,
+}
+
+async fn resolve_contour(
+    services: &AppServices,
+    principal: &Principal,
+    contour: ContourId,
+    requested_version: Option<ContourVersion>,
+) -> Result<(ContourVersion, ContourDefinition), AppError> {
+    let version = match requested_version {
+        Some(version) => version,
+        None => services
+            .store
+            .latest_contour_version(principal.owner, contour)
+            .await?
+            .ok_or_else(|| AppError::NotFound {
+                what: "contour",
+                id: contour.0.to_string(),
+            })?,
+    };
+    let definition = services
+        .store
+        .load_contour(principal.owner, contour, version)
+        .await?
+        .ok_or_else(|| AppError::NotFound {
+            what: "contour_version",
+            id: format!("{}/{}", contour.0, version.0),
+        })?;
+    Ok((version, definition))
+}
+
+/// The flow of money over an interval.
+///
+/// The contour version is resolved exactly as `returns` resolves it, and is
+/// reported back so the result remains comparable after contour changes.
+pub async fn money_flow(
+    services: &AppServices,
+    principal: &Principal,
+    query: &MoneyFlowQuery,
+) -> Result<MoneyFlowReport, AppError> {
+    if query.to < query.from {
+        return Err(AppError::Invalid {
+            field: "period".into(),
+            expected: "from no later than to".into(),
+            actual: format!("{}..{}", query.from, query.to),
+        });
+    }
+    let (version, definition) =
+        resolve_contour(services, principal, query.contour, query.contour_version).await?;
+    let events = services
+        .store
+        .load_events_through(principal.owner, query.to)
+        .await?;
+    let window = DateWindow {
+        from: query.from,
+        to: query.to,
+    };
+    let mut flow = MoneyFlow::new();
+    for event in &events {
+        flow.apply(event, &definition, window)?;
+    }
+    Ok(MoneyFlowReport {
+        contour: query.contour,
+        version,
+        from: query.from,
+        to: query.to,
+        flow,
+    })
+}
+
+/// Cash balances, reconciliation statuses, and positions by contour account.
+pub async fn account_balances(
+    services: &AppServices,
+    principal: &Principal,
+    contour: ContourId,
+    contour_version: Option<ContourVersion>,
+    as_of: Date,
+) -> Result<Vec<AccountBalanceRow>, AppError> {
+    let (_version, definition) =
+        resolve_contour(services, principal, contour, contour_version).await?;
+    let events = services
+        .store
+        .load_events_through(principal.owner, as_of)
+        .await?;
+    let mut balances = Balances::new();
+    for event in &events {
+        balances
+            .apply(event)
+            .map_err(ProjectionError::from)
+            .map_err(AppError::from_projection)?;
+    }
+
+    let contour_accounts: Vec<AccountId> = services
+        .store
+        .list_accounts(principal.owner)
+        .await?
+        .into_iter()
+        .map(|account| account.id)
+        .filter(|account| definition.contains(*account))
+        .collect();
+    let mut rows = Vec::with_capacity(contour_accounts.len());
+    for account in contour_accounts {
+        let cash = balances
+            .iter_cash()
+            .filter_map(|(owner_account, money)| (owner_account == account).then_some(money))
+            .collect();
+        let reconciliation =
+            crate::scenarios::reconciliation::statuses(services, principal, account, as_of, as_of)
+                .await?;
+        let positions = balances
+            .iter_positions()
+            .filter_map(|(key, quantity)| (key.account == account).then_some((*key, quantity)))
+            .collect();
+        rows.push(AccountBalanceRow {
+            account,
+            cash,
+            reconciliation,
+            positions,
+        });
+    }
+    Ok(rows)
 }
 
 struct ReportInputs<'a> {

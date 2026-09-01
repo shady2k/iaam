@@ -180,6 +180,10 @@ impl From<AppError> for ApiFailure {
             }
             AppError::Store(_)
             | AppError::Projection(_)
+            // Money-flow arithmetic overflow makes the journal slice unusable:
+            // it is our defect, not the request's, so only the code goes out and
+            // the detail stays in the log.
+            | AppError::MoneyFlow(_)
             // Reconciliation and perimeter assessment fail for the same reason,
             // as projection: the journal slice is unusable. Only the
             // code is returned externally, with details in the log.

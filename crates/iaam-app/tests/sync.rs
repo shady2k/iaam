@@ -505,6 +505,7 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
                 period,
                 dimensions,
                 refused,
+                ..
             } => Some((event, period, dimensions, refused)),
             _ => None,
         })

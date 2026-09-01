@@ -3096,7 +3096,15 @@ mod tests {
         // 6 → 7: added `EventKind::ImportCoverageGap` (§10.3).
         // 7 → 8: `ImportCoverageGap` gained `rows`; added
         //        `EventKind::ImportRowResolution` (§10.3).
-        assert_eq!(SCHEMA_VERSION, 8);
+        // 8 → 9: added `EventKind::Tax`, so that a tax stops being
+        //        indistinguishable from ordinary spending in the flow report.
+        //        Older facts stay readable: the version guard in
+        //        `iaam-app/src/scenarios/ingest.rs` refuses a mismatched
+        //        version only on the WRITE path, and nothing on the read path
+        //        compares against the current version. The `< 8` allowance in
+        //        `validate_import_coverage_gap` above is a historical threshold
+        //        and is deliberately left alone.
+        assert_eq!(SCHEMA_VERSION, 9);
     }
 
     #[test]

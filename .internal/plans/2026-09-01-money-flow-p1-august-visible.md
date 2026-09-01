@@ -804,7 +804,8 @@ mod tests {
     use super::*;
     use crate::event::kind::{FeeOrigin, TaxOrigin, TradeSide};
     use crate::event::leg::Leg;
-    use crate::ids::{AccountId, EventId, InstrumentId, TransferId};
+    use crate::event::test_support::event_with;
+    use crate::ids::{AccountId, InstrumentId, TransferId};
     use crate::money::{CurrencyCode, PostedMinor, Quantity};
     use time::macros::date;
 
@@ -819,10 +820,16 @@ mod tests {
         }
     }
 
-    /// Builds an event dated inside August with the given kind and legs. Reuse
-    /// the crate's existing test constructor if one is already exported; this
-    /// helper exists only so the assertions below are readable.
-    fn event(kind: EventKind, legs: Vec<Leg>, on: Date) -> Event { /* see Step 3 note */ }
+    /// Builds an event dated inside August with the given kind and legs.
+    ///
+    /// Wraps the crate's existing constructor rather than rewriting the event
+    /// envelope: a hand-written envelope silently diverges from the real one,
+    /// and the test then tests the fixture instead of the code — the reason
+    /// `test_support` exists at all.
+    fn event(kind: EventKind, legs: Vec<Leg>, on: Date) -> Event {
+        let account = legs.first().expect("at least one leg").account;
+        crate::event::test_support::event_with(account, on, 1, kind, legs)
+    }
 
     #[test]
     fn an_internal_transfer_is_neither_income_nor_expense() {
@@ -1067,9 +1074,10 @@ mod tests {
 }
 ```
 
-Read `crates/iaam-core/src/projection/flows.rs`'s test module first: it already
-constructs `Event` values for exactly this kind of test. Reuse its constructor
-for `event` rather than writing a second one.
+Read `crates/iaam-core/src/projection/flows.rs`'s test module first (around
+line 203): it uses `crate::event::test_support::event_with(account, day,
+sequence, kind, legs)` for exactly this purpose, and its `rub` and `contour_of`
+helpers are the shape to copy.
 
 - [ ] **Step 2: Run the test to verify it fails**
 

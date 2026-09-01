@@ -1400,8 +1400,23 @@ pub async fn account_balances(services: &AppServices, principal: &Principal,
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/iaam-app/tests/money_flow.rs`. Read a neighbouring test under
-`crates/iaam-app/tests/` first and reuse its in-memory service harness verbatim.
+Create `crates/iaam-app/tests/money_flow.rs`. There is no shared harness module
+under `crates/iaam-app/tests/` — each file carries its own. Copy the pattern
+from `crates/iaam-app/tests/custody_repair.rs`, which is the closest fit: it has
+`FixedClock`, `principal(owner)`, `services(accesses)`, `append(services,
+events)` and `all_events(services, owner)`, and it builds events directly rather
+than through the HTTP layer.
+
+Two things that file does not show you and you will need:
+
+- the contour must exist in the store before `money_flow` can resolve it — write
+  it with `services.store.insert_contour_version(...)`, the same call
+  `create_contour_version` makes in `crates/iaam-server/src/routes.rs`;
+- operations are turned into events with `iaam_ingest::normalize`, as
+  `custody_repair.rs` does for its trades.
+
+The sketch below uses `ctx.` helpers for brevity. Translate them to that
+file's real shape; do not add a second harness abstraction.
 
 ```rust
 //! The money flow scenario over a real store.
@@ -1485,7 +1500,7 @@ async fn an_account_with_no_movements_still_appears() {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p iaam-app --test money_flow`
+Run: `direnv exec $WORKTREE cargo test -p iaam-app --test money_flow`
 Expected: FAIL — `money_flow` is not defined.
 
 - [ ] **Step 3: Write the implementation**
@@ -1568,7 +1583,7 @@ errors in `crates/iaam-app/src/error.rs`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p iaam-app --test money_flow`
+Run: `direnv exec $WORKTREE cargo test -p iaam-app --test money_flow`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Check the crate compiles**

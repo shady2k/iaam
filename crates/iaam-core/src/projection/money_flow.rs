@@ -18,11 +18,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::Date;
 
+use crate::category::CategoryAssignment;
 use crate::contour::{ContourDefinition, FlowClass, classify};
 use crate::event::Event;
 use crate::event::kind::EventKind;
 use crate::event::leg::LegKind;
 use crate::ids::{AccountId, EventId};
+use crate::ids::CategoryId;
 use crate::money::{CurrencyCode, Money, PostedMinor};
 
 /// The interval a report covers, inclusive at both ends.
@@ -64,6 +66,8 @@ pub struct MoneyFlow {
     taxes: Ledger,
     internal_transfers: Ledger,
     cash_delta: Ledger,
+    went_out_by_category: CategoryLedger,
+    not_decomposed: (BTreeMap<CurrencyCode, u64>, Ledger),
 }
 
 /// Amounts kept per account **and** per currency.
@@ -73,6 +77,14 @@ pub struct MoneyFlow {
 /// contour-wide zero built from one account short and another long is the
 /// worst possible report — it looks correct and is wrong twice.
 type Ledger = BTreeMap<(AccountId, CurrencyCode), PostedMinor>;
+
+type CategoryLedger = BTreeMap<(CategoryId, CurrencyCode), PostedMinor>;
+
+/// Resolves the owner's category for one journal event without coupling the
+/// projection to the category store.
+pub trait CategoryIndex {
+    fn assignment(&self, event: &Event) -> CategoryAssignment;
+}
 
 impl MoneyFlow {
     #[must_use]
@@ -94,11 +106,19 @@ impl MoneyFlow {
         event: &Event,
         contour: &ContourDefinition,
         window: DateWindow,
+        categories: &dyn CategoryIndex,
     ) -> Result<(), MoneyFlowError> {
         let flow_class = classify(contour, event);
         if !self.event_belongs(event, contour, window, flow_class)? {
             return Ok(());
         }
+        let category_assignment = if matches!(&event.kind, EventKind::CashOut { .. }) {
+            Some(categories.assignment(event))
+        } else {
+            None
+        };
+        let mut not_decomposed_currencies = BTreeSet::new();
+
 
         for leg in &event.legs {
             if !contour.contains(leg.account) {
@@ -156,6 +176,25 @@ impl MoneyFlow {
                             "went_out",
                             event.id,
                         )?;
+                        match category_assignment {
+                            Some(CategoryAssignment::Assigned { category, .. }) => {
+                                add_category(
+                                    &mut self.went_out_by_category,
+                                    category,
+                                    amount,
+                                    event.id,
+                                )?;
+                            }
+                            Some(CategoryAssignment::NotDecomposed) | None => {
+                                add_not_decomposed(
+                                    &mut self.not_decomposed,
+                                    &mut not_decomposed_currencies,
+                                    leg.account,
+                                    amount,
+                                    event.id,
+                                )?;
+                            }
+                        }
                     }
                     EventKind::CashTransfer { .. } => match flow_class {
                         FlowClass::Internal => {
@@ -177,6 +216,13 @@ impl MoneyFlow {
                                 leg.account,
                                 amount,
                                 "went_out",
+                                event.id,
+                            )?;
+                            add_not_decomposed(
+                                &mut self.not_decomposed,
+                                &mut not_decomposed_currencies,
+                                leg.account,
+                                amount,
                                 event.id,
                             )?;
                         }
@@ -275,6 +321,50 @@ impl MoneyFlow {
 
     pub fn went_out(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.went_out, currency, "went_out")
+    }
+
+    /// Returns the outflow grouped by the owner's category.
+    pub fn went_out_by_category(
+        &self,
+        currency: CurrencyCode,
+    ) -> Result<Vec<(CategoryId, Money)>, MoneyFlowError> {
+        let mut totals = BTreeMap::<CategoryId, i128>::new();
+        for ((category, item_currency), amount) in &self.went_out_by_category {
+            if *item_currency != currency {
+                continue;
+            }
+            let total = totals.entry(*category).or_default();
+            *total = total.checked_add(i128::from(amount.raw())).ok_or(
+                MoneyFlowError::AggregateOverflow {
+                    quantity: "went_out_by_category",
+                },
+            )?;
+        }
+        totals
+            .into_iter()
+            .filter(|(_, amount)| *amount != 0)
+            .map(|(category, amount)| {
+                Ok((
+                    category,
+                    Money::new(narrow(amount, "went_out_by_category")?, currency),
+                ))
+            })
+            .collect()
+    }
+
+    /// Returns the number and amount of outflow rows without a category.
+    pub fn not_decomposed(
+        &self,
+        currency: CurrencyCode,
+    ) -> Result<(u64, Money), MoneyFlowError> {
+        let count = self
+            .not_decomposed
+            .0
+            .get(&currency)
+            .copied()
+            .unwrap_or_default();
+        let amount = total(&self.not_decomposed.1, currency, "not_decomposed")?;
+        Ok((count, amount))
     }
 
     pub fn earned_by_capital(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
@@ -406,6 +496,47 @@ fn add(
     Ok(())
 }
 
+fn add_category(
+    ledger: &mut CategoryLedger,
+    category: CategoryId,
+    money: Money,
+    event: EventId,
+) -> Result<(), MoneyFlowError> {
+    let slot = ledger
+        .entry((category, money.currency()))
+        .or_insert_with(|| PostedMinor::new(0));
+    *slot = slot
+        .checked_add(money.amount())
+        .ok_or(MoneyFlowError::Overflow {
+            quantity: "went_out_by_category",
+            event,
+        })?;
+    Ok(())
+}
+
+fn add_not_decomposed(
+    decomposition: &mut (BTreeMap<CurrencyCode, u64>, Ledger),
+    seen_currencies: &mut BTreeSet<CurrencyCode>,
+    account: AccountId,
+    money: Money,
+    event: EventId,
+) -> Result<(), MoneyFlowError> {
+    add(
+        &mut decomposition.1,
+        account,
+        money,
+        "not_decomposed",
+        event,
+    )?;
+    if seen_currencies.insert(money.currency()) {
+        let count = decomposition.0.entry(money.currency()).or_default();
+        *count = count.checked_add(1).ok_or(MoneyFlowError::AggregateOverflow {
+            quantity: "not_decomposed_count",
+        })?;
+    }
+    Ok(())
+}
+
 fn negated(money: Money, quantity: &'static str, event: EventId) -> Result<Money, MoneyFlowError> {
     let amount = money
         .amount()
@@ -453,6 +584,7 @@ fn narrow(amount: i128, quantity: &'static str) -> Result<PostedMinor, MoneyFlow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::category::{CategoryAssignment, CategoryBasis};
     use crate::contour::{ContourDefinition, ContourId, ContourVersion};
     use crate::event::Event;
     use crate::event::corporate_action::CorporateAction;
@@ -460,7 +592,7 @@ mod tests {
     use crate::event::leg::Leg;
     use crate::event::offer::{OfferExerciseAction, OfferSubmissionId};
     use crate::event::test_support::event_with;
-    use crate::ids::{AccountId, InstrumentId, TransferId};
+    use crate::ids::{AccountId, CategoryId, CategoryRuleId, InstrumentId, TransferId};
     use crate::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
     use crate::numeric::decimal::Dec;
     use time::{Date, macros::date};
@@ -490,6 +622,154 @@ mod tests {
         event_with(account, on, 1, kind, legs)
     }
 
+    impl CategoryIndex for () {
+        fn assignment(&self, _event: &Event) -> CategoryAssignment {
+            CategoryAssignment::NotDecomposed
+        }
+    }
+
+    struct FixedIndex(Vec<(&'static str, CategoryAssignment)>);
+
+    impl FixedIndex {
+        fn new(rows: Vec<(&'static str, CategoryAssignment)>) -> Self {
+            Self(rows)
+        }
+    }
+
+    impl CategoryIndex for FixedIndex {
+        fn assignment(&self, event: &Event) -> CategoryAssignment {
+            self.0
+                .iter()
+                .find(|(key, _)| event.provenance.source_operation_id() == Some(*key))
+                .map_or(CategoryAssignment::NotDecomposed, |(_, assignment)| *assignment)
+        }
+    }
+
+    struct AlwaysIndex(CategoryId);
+
+    impl CategoryIndex for AlwaysIndex {
+        fn assignment(&self, _event: &Event) -> CategoryAssignment {
+            CategoryAssignment::Assigned {
+                category: self.0,
+                basis: CategoryBasis::SourceCategory {
+                    rule: CategoryRuleId(uuid::Uuid::from_u128(1)),
+                },
+            }
+        }
+    }
+
+    fn outflow(account: AccountId, row: &str, amount: Money) -> Event {
+        let mut event = event(
+            EventKind::CashOut { amount },
+            vec![Leg::cash(account, amount)],
+            date!(2026 - 08 - 01),
+        );
+        event.provenance = event
+            .provenance
+            .with_source_operation_id(row.to_owned());
+        event
+    }
+
+    fn transfer(from: AccountId, to: AccountId, amount: Money) -> Event {
+        event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from,
+                to,
+                amount,
+            },
+            vec![
+                Leg::cash(
+                    from,
+                    Money::new(
+                        PostedMinor::new(-amount.amount().raw()),
+                        amount.currency(),
+                    ),
+                ),
+                Leg::cash(to, amount),
+            ],
+            date!(2026 - 08 - 01),
+        )
+    }
+
+    #[test]
+    fn the_decomposition_sums_to_the_outflow_it_decomposes() {
+        // The decomposition's own identity. Without asserting it, a filtering
+        // bug drops a row from the breakdown while the headline stays right.
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let food = CategoryId(uuid::Uuid::from_u128(10));
+        let index = FixedIndex::new(vec![
+            (
+                "row-1",
+                CategoryAssignment::Assigned {
+                    category: food,
+                    basis: CategoryBasis::SourceCategory {
+                        rule: CategoryRuleId(uuid::Uuid::from_u128(1)),
+                    },
+                },
+            ),
+            ("row-2", CategoryAssignment::NotDecomposed),
+        ]);
+        let mut flow = MoneyFlow::new();
+        for (row, amount) in [("row-1", rub(-30_000)), ("row-2", rub(-12_000))] {
+            flow.apply(&outflow(card, row, amount), &contour, august(), &index)
+                .expect("applies");
+        }
+
+        let by_category = flow
+            .went_out_by_category(CurrencyCode::Rub)
+            .expect("fits");
+        let (count, undecomposed) = flow.not_decomposed(CurrencyCode::Rub).expect("fits");
+        let decomposed: i64 = by_category
+            .iter()
+            .map(|(_, money)| money.amount().raw())
+            .sum();
+
+        assert_eq!(count, 1);
+        assert_eq!(undecomposed.amount().raw(), 12_000);
+        assert_eq!(
+            decomposed + undecomposed.amount().raw(),
+            flow.went_out(CurrencyCode::Rub)
+                .expect("fits")
+                .amount()
+                .raw()
+        );
+    }
+
+    #[test]
+    fn an_internal_transfer_is_never_given_a_category() {
+        // Asking "what did I spend it on" of a transfer to one's own deposit
+        // is exactly what made transfers a spending category in Actual Budget.
+        let card = AccountId::new_random();
+        let deposit = AccountId::new_random();
+        let contour = ContourDefinition::new(
+            ContourId::new_random(),
+            ContourVersion(1),
+            vec![card, deposit],
+        );
+        let food = CategoryId(uuid::Uuid::from_u128(10));
+        let index = AlwaysIndex(food);
+        let mut flow = MoneyFlow::new();
+        flow.apply(
+            &transfer(card, deposit, rub(480_000)),
+            &contour,
+            august(),
+            &index,
+        )
+        .expect("applies");
+
+        assert!(
+            flow.went_out_by_category(CurrencyCode::Rub)
+                .expect("fits")
+                .is_empty()
+        );
+        let (count, amount) = flow.not_decomposed(CurrencyCode::Rub).expect("fits");
+        assert_eq!(count, 0);
+        assert_eq!(amount.amount().raw(), 0);
+    }
+
     #[test]
     fn an_internal_transfer_is_neither_income_nor_expense() {
         let card = AccountId::new_random();
@@ -516,6 +796,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
 
@@ -552,6 +833,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
 
@@ -591,6 +873,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
 
@@ -620,6 +903,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
 
@@ -650,7 +934,7 @@ mod tests {
                 date!(2026 - 08 - 12),
             ),
         ] {
-            flow.apply(&event(kind, legs, on), &contour, august())
+            flow.apply(&event(kind, legs, on), &contour, august(), &())
                 .expect("applies");
         }
 
@@ -674,6 +958,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
         assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
@@ -699,6 +984,7 @@ mod tests {
                 ),
                 &contour,
                 august(),
+                &(),
             )
             .expect("applies");
         }
@@ -738,6 +1024,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
 
@@ -773,6 +1060,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
 
@@ -821,7 +1109,7 @@ mod tests {
                 date!(2026 - 08 - 07),
             ),
         ] {
-            flow.apply(&event(kind, legs, on), &contour, august())
+            flow.apply(&event(kind, legs, on), &contour, august(), &())
                 .expect("applies");
         }
 
@@ -849,6 +1137,7 @@ mod tests {
                 ),
                 &contour,
                 august(),
+                &(),
             )
             .expect("applies");
         }
@@ -878,6 +1167,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
         flow.apply(
@@ -888,6 +1178,7 @@ mod tests {
             ),
             &contour,
             august(),
+            &(),
         )
         .expect("applies");
 

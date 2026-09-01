@@ -43,7 +43,9 @@ Budget migration, the web UI.
   skips those, so the mutation gate would not see it (§15.7; see the comment at
   `crates/iaam-core/src/event/provenance.rs:17`).
 - **Workers run targeted tests only.** `cargo test -p <crate> <filter>` and
-  `cargo check -p <crate>`. Do **not** run `make check`, the full suite,
+  `cargo check -p <crate>`. **`cargo test` takes one filter, not two** — a
+  second positional argument fails with `unexpected argument found`. Run each
+  filter in its own invocation. Do **not** run `make check`, the full suite,
   `cargo-mutants`, or any formatter — the orchestrator runs those once at the
   end of the epic.
 - **`cargo check -p <crate>` is mandatory before claiming a task done.** It is
@@ -326,7 +328,7 @@ new abstraction.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract the_same_declared_source an_empty_channel`
+Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract the_same_declared_source` then `... an_empty_channel`
 Expected: FAIL — `unknown field "source"` from the request deserializer, or a
 compile error on the missing helper.
 
@@ -385,7 +387,7 @@ In `crates/iaam-server/src/routes.rs`, replace the line
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract the_same_declared_source an_empty_channel`
+Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract the_same_declared_source` then `... an_empty_channel`
 Expected: PASS, 2 tests.
 
 - [ ] **Step 5: Check the crate compiles**
@@ -1697,7 +1699,7 @@ crate — read it before asserting `"3000.00"`, and use its format.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract flow_report balances`
+Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract flow_report` then `... balances`
 Expected: FAIL — 404 on both paths.
 
 - [ ] **Step 3: Write the implementation**
@@ -1766,7 +1768,7 @@ returns routes:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract flow_report balances`
+Run: `direnv exec $WORKTREE cargo test -p iaam-server --test contract flow_report` then `... balances`
 Expected: PASS, 3 tests.
 
 - [ ] **Step 5: Check the crate compiles and the spec lists both paths**

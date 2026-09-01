@@ -2,7 +2,7 @@
 //! structural validation. This is the seam where everything breaks:
 //! ingestion builds the legs, and the core defines their shape.
 
-use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TradeSide};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TaxOrigin, TradeSide};
 use iaam_core::ids::EventId;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
@@ -86,6 +86,11 @@ fn all_kinds() -> Vec<OperationKind> {
             currency: CurrencyCode::Rub,
             origin: FeeOrigin::Depositary,
         },
+        OperationKind::Tax {
+            amount_minor: 13_000,
+            currency: CurrencyCode::Rub,
+            origin: TaxOrigin::SelfPaid,
+        },
         OperationKind::OpeningCash {
             amount_minor: -5_000,
             currency: CurrencyCode::Rub,
@@ -117,6 +122,46 @@ fn every_operation_kind_produces_a_structurally_valid_event() {
             .event
             .validate_structure()
             .unwrap_or_else(|error| panic!("{kind:?} has an invalid shape: {error}"));
+    }
+}
+
+#[test]
+fn a_submitted_tax_becomes_one_negative_tax_leg() {
+    let operation = submit(OperationKind::Tax {
+        amount_minor: 130_000,
+        currency: CurrencyCode::Rub,
+        origin: TaxOrigin::SelfPaid,
+    });
+    let event = normalize(&operation, context())
+        .expect("tax normalizes")
+        .event;
+    event.validate_structure().expect("valid shape");
+    match &event.kind {
+        EventKind::Tax { amount, origin } => {
+            // The client sent a magnitude; the sign is ours.
+            assert_eq!(amount.amount(), PostedMinor::new(-130_000));
+            assert_eq!(*origin, TaxOrigin::SelfPaid);
+        }
+        other => panic!("expected a tax, got {other:?}"),
+    }
+    let cash = event
+        .cash_effect(CurrencyCode::Rub)
+        .expect("monetary effect");
+    assert_eq!(cash.amount(), PostedMinor::new(-130_000));
+}
+
+#[test]
+fn a_non_positive_tax_is_rejected() {
+    // A client that sends -130_000 believing it helps must be told, not
+    // silently obeyed: normalising the sign here would hide a caller's bug.
+    for amount in [0_i64, -1] {
+        let operation = submit(OperationKind::Tax {
+            amount_minor: amount,
+            currency: CurrencyCode::Rub,
+            origin: TaxOrigin::SelfPaid,
+        });
+        let rejection = normalize(&operation, context()).expect_err("rejected");
+        assert_eq!(rejection.field, "amount");
     }
 }
 

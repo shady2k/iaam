@@ -209,14 +209,20 @@ pub fn assign_with_proposed(
 
     match (&proposed.matcher, current) {
         (CategoryMatcher::Row { .. }, _) => proposal_assignment(proposed),
-        (CategoryMatcher::SourceCategory { .. }, CategoryAssignment::Assigned {
-            basis: CategoryBasis::Row { .. },
-            ..
-        })
-        | (CategoryMatcher::DescriptionContains { .. }, CategoryAssignment::Assigned {
-            basis: CategoryBasis::Row { .. } | CategoryBasis::SourceCategory { .. },
-            ..
-        }) => current,
+        (
+            CategoryMatcher::SourceCategory { .. },
+            CategoryAssignment::Assigned {
+                basis: CategoryBasis::Row { .. },
+                ..
+            },
+        )
+        | (
+            CategoryMatcher::DescriptionContains { .. },
+            CategoryAssignment::Assigned {
+                basis: CategoryBasis::Row { .. } | CategoryBasis::SourceCategory { .. },
+                ..
+            },
+        ) => current,
         _ => proposal_assignment(proposed),
     }
 }
@@ -255,10 +261,8 @@ fn proposal_assignment(proposed: &CategoryRuleProposal) -> CategoryAssignment {
 pub fn group_category_impacts(
     rows: impl IntoIterator<Item = CategoryImpactRow>,
 ) -> Result<CategoryImpact, CategoryImpactError> {
-    let mut grouped = BTreeMap::<
-        (Date, Option<CategoryId>, CategoryId, CurrencyCode),
-        (Money, u64),
-    >::new();
+    let mut grouped =
+        BTreeMap::<(Date, Option<CategoryId>, CategoryId, CurrencyCode), (Money, u64)>::new();
     let mut total_rows = 0_u64;
 
     for row in rows {
@@ -268,7 +272,10 @@ pub fn group_category_impacts(
             .entry(key)
             .or_insert((Money::zero(amount.currency()), 0));
         entry.0 = entry.0.try_add(amount)?;
-        entry.1 = entry.1.checked_add(1).ok_or(CategoryImpactError::CountOverflow)?;
+        entry.1 = entry
+            .1
+            .checked_add(1)
+            .ok_or(CategoryImpactError::CountOverflow)?;
         total_rows = total_rows
             .checked_add(1)
             .ok_or(CategoryImpactError::CountOverflow)?;
@@ -311,9 +318,9 @@ mod tests {
     use crate::money::{CurrencyCode, Money, PostedMinor};
 
     use super::{
-        assign, assign_with_proposed, group_category_impacts, CategoryAssignment, CategoryBasis,
-        CategoryImpactRow, CategoryInterval, CategoryMatcher, CategoryRule, CategoryRuleProposal,
-        CategorySubject,
+        CategoryAssignment, CategoryBasis, CategoryImpactRow, CategoryInterval, CategoryMatcher,
+        CategoryRule, CategoryRuleProposal, CategorySubject, assign, assign_with_proposed,
+        group_category_impacts,
     };
 
     fn rule(
@@ -635,5 +642,4 @@ mod tests {
             Money::new(PostedMinor::new(3_000), CurrencyCode::Rub)
         );
     }
-
 }

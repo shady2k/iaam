@@ -1,8 +1,8 @@
 //! Scenarios for the owner's category reference and assignment rules.
 
 use iaam_core::category::{
-    assign_with_proposed, group_category_impacts, CategoryAssignment, CategoryImpactRow,
-    CategoryInterval, CategoryMatcher, CategoryRule, CategoryRuleProposal, CategorySubject,
+    CategoryAssignment, CategoryImpactRow, CategoryInterval, CategoryMatcher, CategoryRule,
+    CategoryRuleProposal, CategorySubject, assign_with_proposed, group_category_impacts,
 };
 use iaam_core::event::Event;
 use iaam_core::event::kind::EventKind;

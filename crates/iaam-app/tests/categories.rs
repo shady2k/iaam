@@ -464,7 +464,13 @@ async fn category_creation_and_rule_retirement_preserve_actionable_errors() {
     )
     .await
     .expect_err("missing group must be refused");
-    assert!(matches!(missing, AppError::NotFound { what: "category group", .. }));
+    assert!(matches!(
+        missing,
+        AppError::NotFound {
+            what: "category group",
+            ..
+        }
+    ));
 
     let group = ctx.create_group("Usual Expenses").await;
     let category = ctx.create_category(group, "Food").await;
@@ -492,16 +498,17 @@ async fn category_creation_and_rule_retirement_preserve_actionable_errors() {
     let second = retire_category_rule(&ctx.services, &ctx.principal, rule.id)
         .await
         .expect_err("retired rule cannot be retired twice");
-    assert!(matches!(second, AppError::NotFound { what: "active category rule", .. }));
+    assert!(matches!(
+        second,
+        AppError::NotFound {
+            what: "active category rule",
+            ..
+        }
+    ));
 
-    let category = create_category(
-        &ctx.services,
-        &ctx.principal,
-        group,
-        "Cafe",
-    )
-    .await
-    .expect("second category");
+    let category = create_category(&ctx.services, &ctx.principal, group, "Cafe")
+        .await
+        .expect("second category");
     retire_category(&ctx.services, &ctx.principal, category)
         .await
         .expect("category retires");

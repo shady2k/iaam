@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::response::IntoResponse;
 use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
@@ -5135,7 +5135,10 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
 
     let (status, body) = call(
         &harness.router,
-        delete(&format!("/v1/categories/{}", Uuid::new_v4()), &harness.owner_token),
+        delete(
+            &format!("/v1/categories/{}", Uuid::new_v4()),
+            &harness.owner_token,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
@@ -5165,8 +5168,16 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
 
     for (matcher, field, expected) in [
         (json!(42), "matcher", "a category matcher object"),
-        (json!(r#"{not-json"#), "matcher", "a category matcher object"),
-        (json!({}), "matcher", "row, source_category or description_contains"),
+        (
+            json!(r#"{not-json"#),
+            "matcher",
+            "a category matcher object",
+        ),
+        (
+            json!({}),
+            "matcher",
+            "row, source_category or description_contains",
+        ),
         (
             json!({"kind": "unknown", "value": "x"}),
             "matcher.kind",
@@ -5263,7 +5274,10 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["code"], "invalid_request");
     assert_eq!(body["field"], "matcher");
-    assert_eq!(body["expected"], "row, source_category, or description_contains");
+    assert_eq!(
+        body["expected"],
+        "row, source_category, or description_contains"
+    );
 
     drop(harness);
     let _ = std::fs::remove_file(path);

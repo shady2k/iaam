@@ -1219,7 +1219,10 @@ mod tests {
         assert_eq!(
             flow.went_out_by_category(CurrencyCode::Usd)
                 .expect("aggregate fits"),
-            vec![(category, Money::new(PostedMinor::new(2_000), CurrencyCode::Usd))]
+            vec![(
+                category,
+                Money::new(PostedMinor::new(2_000), CurrencyCode::Usd)
+            )]
         );
     }
 
@@ -1229,8 +1232,13 @@ mod tests {
         let contour =
             ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
         let mut flow = MoneyFlow::new();
-        flow.apply(&outflow(card, "row-1", rub(-9_000)), &contour, august(), &NoCategories)
-            .expect("applies");
+        flow.apply(
+            &outflow(card, "row-1", rub(-9_000)),
+            &contour,
+            august(),
+            &NoCategories,
+        )
+        .expect("applies");
 
         assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(9_000));
         assert_eq!(
@@ -1246,12 +1254,15 @@ mod tests {
         let contour =
             ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
         let mut flow = MoneyFlow::new();
-        flow.not_decomposed
-            .0
-            .insert(CurrencyCode::Rub, u64::MAX);
+        flow.not_decomposed.0.insert(CurrencyCode::Rub, u64::MAX);
 
         let error = flow
-            .apply(&outflow(card, "row-1", rub(-1)), &contour, august(), &NoCategories)
+            .apply(
+                &outflow(card, "row-1", rub(-1)),
+                &contour,
+                august(),
+                &NoCategories,
+            )
             .expect_err("count overflow must be reported");
         assert_eq!(
             error,

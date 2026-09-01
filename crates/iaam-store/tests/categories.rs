@@ -493,10 +493,7 @@ fn malformed_category_rule_storage_is_rejected_with_the_bad_field() {
 
     store
         .connection()
-        .execute(
-            "UPDATE category_rules SET valid_from = 'not-a-date'",
-            [],
-        )
+        .execute("UPDATE category_rules SET valid_from = 'not-a-date'", [])
         .expect("corrupt date");
     let error = store
         .list_category_rules(owner)

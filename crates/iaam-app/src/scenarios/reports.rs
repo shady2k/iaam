@@ -16,6 +16,7 @@ use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
+use iaam_core::reconciliation::claim::AssertionPeriod;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue};
@@ -158,7 +159,14 @@ pub async fn account_balances(
             .map_err(ProjectionError::from)
             .map_err(AppError::from_projection)?;
     }
+    let ledger = ReconciliationLedger::build(&events)?;
+    let period = AssertionPeriod::between(as_of, as_of).ok_or_else(|| AppError::Invalid {
+        field: "period".into(),
+        expected: "from no later than to".into(),
+        actual: format!("{as_of}..{as_of}"),
+    })?;
 
+    // Accounts are never deleted, so this owner list equals contour membership.
     let contour_accounts: Vec<AccountId> = services
         .store
         .list_accounts(principal.owner)
@@ -173,9 +181,9 @@ pub async fn account_balances(
             .iter_cash()
             .filter_map(|(owner_account, money)| (owner_account == account).then_some(money))
             .collect();
-        let reconciliation =
-            crate::scenarios::reconciliation::statuses(services, principal, account, as_of, as_of)
-                .await?;
+        let reconciliation = crate::scenarios::reconciliation::statuses_for_account(
+            &ledger, account, period,
+        );
         let positions = balances
             .iter_positions()
             .filter_map(|(key, quantity)| (key.account == account).then_some((*key, quantity)))

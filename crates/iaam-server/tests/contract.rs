@@ -7227,6 +7227,152 @@ async fn a_clean_instance_carries_actions_present_and_empty() {
     assert_eq!(flow["actions"], json!([]), "{flow}");
 }
 
+/// `iaam-z7q6`. The undecomposed total is two unlike things, and the queue used to
+/// answer both with `blocked` — "no operation in this API is available for this
+/// item" — while category-rule creation sits in this same contract. Split at the
+/// source: the rows a rule can reach name that operation and the fields only the
+/// owner can supply, and the transfer says truthfully that no rule applies to it.
+#[tokio::test]
+async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
+    let harness = harness();
+    let (status, outside_account) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Outside the contour" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{outside_account}");
+    let outside = outside_account["id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "One account only",
+                "accounts": [harness.account.inner()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "12.00",
+                "currency": "RUB",
+                "dates": {"cash_posted": "2026-08-05"},
+                "idempotency_key": "unmatched-outflow",
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "transfer",
+                "to_account": outside,
+                "amount": "34.00",
+                "currency": "RUB",
+                "dates": {"cash_posted": "2026-08-06"},
+                "idempotency_key": "transfer-out",
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let actions = body["actions"].as_array().expect("actions");
+    let outflow = actions
+        .iter()
+        .find(|action| action["kind"] == "undecomposed_outflows")
+        .unwrap_or_else(|| panic!("a rule-remediable item: {body}"));
+    assert_eq!(outflow["state"], "needs_owner_input", "{outflow}");
+    assert_eq!(outflow["category"], "recommended", "{outflow}");
+    assert_eq!(outflow["required_scope"], "owner", "{outflow}");
+    let target = &outflow["target"];
+    assert_eq!(target["type"], "operation", "{outflow}");
+    assert_eq!(target["operationId"], "create_category_rule", "{outflow}");
+    assert_eq!(target["method"], "POST", "{outflow}");
+    assert_eq!(target["path"], "/v1/category-rules", "{outflow}");
+    assert!(
+        target["request"].get("preset").is_none(),
+        "a report window is not a rule's validity interval, and no matcher is \
+         derivable from this aggregate: {outflow}"
+    );
+    let missing: Vec<&str> = target["request"]["missing"]
+        .as_array()
+        .expect("missing inputs")
+        .iter()
+        .map(|input| input["pointer"].as_str().expect("pointer"))
+        .collect();
+    assert_eq!(missing, vec!["/matcher", "/category"], "{outflow}");
+    for input in target["request"]["missing"]
+        .as_array()
+        .expect("missing inputs")
+    {
+        assert_eq!(input["provided_by"], "owner", "{outflow}");
+    }
+
+    // The same invariant `/v1/actions` is held to, asserted here because this
+    // action reaches the owner through the report and not through that endpoint.
+    let spec = serde_json::to_value(&harness.api).expect("OpenAPI JSON");
+    let schema_name = target["requestSchema"]
+        .as_str()
+        .expect("request schema reference")
+        .strip_prefix("#/components/schemas/")
+        .expect("component schema reference");
+    for field in spec["components"]["schemas"][schema_name]["required"]
+        .as_array()
+        .expect("required request fields")
+    {
+        let pointer = format!("/{}", field.as_str().expect("field name"));
+        assert!(
+            missing.contains(&pointer.as_str()),
+            "{schema_name} requires {pointer} and the action does not advertise it: {outflow}"
+        );
+    }
+
+    let transfer = actions
+        .iter()
+        .find(|action| action["kind"] == "external_transfers_uncategorised")
+        .unwrap_or_else(|| panic!("a transfer item: {body}"));
+    assert_eq!(transfer["state"], "blocked", "{transfer}");
+    assert_eq!(transfer["category"], "informational", "{transfer}");
+    assert_eq!(transfer["target"], json!({"type": "none"}), "{transfer}");
+    assert!(transfer.get("required_scope").is_none(), "{transfer}");
+    assert!(
+        transfer["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("category rule cannot decompose"),
+        "{transfer}"
+    );
+    assert_ne!(outflow["id"], transfer["id"], "{body}");
+}
+
 /// Category alone leaves ties in generation order, which is not assertable. Two
 /// gaps of one category prove the second key is applied.
 #[tokio::test]

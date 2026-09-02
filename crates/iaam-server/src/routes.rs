@@ -80,6 +80,7 @@ use iaam_app::scenarios::documents::UploadedDocument;
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
+pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 
 /// The computed actions currently blocking or advancing owner setup.
 #[utoipa::path(
@@ -920,6 +921,7 @@ pub async fn list_category_rules_route(
 #[utoipa::path(
     post,
     path = "/v1/category-rules",
+    operation_id = CREATE_CATEGORY_RULE_OPERATION_ID,
     request_body = CategoryRuleRequest,
     responses(
         (status = 201, description = "Category rule added", body = CategoryRuleDto),

@@ -7,7 +7,8 @@ use crate::ports::{
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::source_row::RowName;
 use iaam_core::ids::{AccountId, OwnerId};
-use iaam_core::money::Money;
+use iaam_core::money::{CurrencyCode, Money};
+use iaam_core::projection::money_flow::UndecomposedCause;
 use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
@@ -24,6 +25,7 @@ pub enum ActionKind {
     IndependentConfirmationMissing,
     DiscrepancyUnresolved,
     UndecomposedOutflows,
+    ExternalTransfersUncategorised,
     UnexplainedResidual,
     PossibleDuplicateUndecided,
 }
@@ -41,6 +43,7 @@ impl ActionKind {
             Self::IndependentConfirmationMissing => "independent_confirmation_missing",
             Self::DiscrepancyUnresolved => "discrepancy_unresolved",
             Self::UndecomposedOutflows => "undecomposed_outflows",
+            Self::ExternalTransfersUncategorised => "external_transfers_uncategorised",
             Self::UnexplainedResidual => "unexplained_residual",
             Self::PossibleDuplicateUndecided => "possible_duplicate_undecided",
         }
@@ -106,6 +109,7 @@ pub enum OperationKey {
     CreateAccount,
     CreateContour,
     RecordOwnerBalance,
+    CreateCategoryRule,
 }
 impl OperationKey {
     /// The route operation identifier declared by the transport.
@@ -115,6 +119,7 @@ impl OperationKey {
             Self::CreateAccount => "create_account",
             Self::CreateContour => "create_contour_version",
             Self::RecordOwnerBalance => "record_owner_balance",
+            Self::CreateCategoryRule => "create_category_rule",
         }
     }
 }
@@ -427,26 +432,17 @@ pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
     for currency in report.flow.currencies() {
         let undecomposed = report
             .flow
-            .not_decomposed_by_account(currency)
+            .not_decomposed_by_account_and_cause(currency)
             .expect("money flow undecomposed breakdown");
-        for (account, count, amount) in undecomposed {
-            actions.push(blocked_action(
-                format!(
-                    "{}:{}:{}",
-                    ActionKind::UndecomposedOutflows.id(),
-                    account.inner(),
-                    currency.code()
-                ),
-                ActionKind::UndecomposedOutflows,
-                ActionCategory::Informational,
-                format!(
-                    "Account {} has {} undecomposed outflow rows totaling {} {}; the rows are not identified and no report operation can provide a rule.",
-                    account.inner(),
-                    count,
-                    amount.to_calc_dec().inner(),
-                    currency.code()
-                ),
-            ));
+        for (account, cause, count, amount) in undecomposed {
+            actions.push(match cause {
+                UndecomposedCause::NoRuleMatched => {
+                    undecomposed_outflows_action(account, currency, count, amount)
+                }
+                UndecomposedCause::ExternalTransfer => {
+                    external_transfers_action(account, currency, count, amount)
+                }
+            });
         }
     }
     for (account, amount) in report
@@ -473,6 +469,131 @@ pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
     }
     sort_actions(&mut actions);
     actions
+}
+
+/// The owner's remedy for outflow rows no category rule matched.
+///
+/// `NeedsOwnerInput` rather than `Blocked`, because `Blocked` means "no operation
+/// in this API is available for this item" and category-rule creation is in this
+/// same API. The earlier wording — no *report* operation can provide a rule — was
+/// true and irrelevant: the action catalogue resolves a target against the whole
+/// completed contract, not a report-local namespace, and owner-only is what
+/// `required_scope` says, not what `Blocked` says. `first_contour_action` is the
+/// precedent: the agent may not draw the boundary, and the action still names the
+/// owner-only operation and the inputs only he can supply.
+///
+/// `Recommended`, not `RequiredForGoal`. The distinction the control-assertion
+/// actions were promoted on is whether the absence makes the reported number mean
+/// something other than what it says: without an opening assertion the cash figure
+/// is a movement and not a balance, so the figure is wrong. Nothing here is wrong.
+/// `went_out` already counts these rows in full, the report names the undecomposed
+/// amount as its own line rather than hiding it in a bucket, and the identity still
+/// closes. What is missing is the breakdown by what the money was for — real quality
+/// work, and optional in the sense the category intends.
+///
+/// Nothing is preset. The rule request takes a matcher, a category and a validity
+/// interval, and this aggregate justifies none of them:
+///
+/// - The **interval** is not the report window. A window is where the owner
+///   happened to look; a category's meaning did not begin and end there, and
+///   presetting `valid_from`/`valid_to` from `from`/`to` would write that claim
+///   into his rules.
+/// - The **matcher** cannot be proposed from what the aggregate keeps — an
+///   account, a currency, a row count and a net amount, none of which are fields
+///   of the rule request. Proposing one would need the diagnostic to retain row
+///   keys or source descriptions, which it deliberately does not.
+/// - The **category** is the owner's judgement by the same rule that forbids
+///   inventing one anywhere else.
+fn undecomposed_outflows_action(
+    account: AccountId,
+    currency: CurrencyCode,
+    count: u64,
+    amount: Money,
+) -> Action {
+    Action::new(
+        ActionFacts {
+            id: format!(
+                "{}:{}:{}",
+                ActionKind::UndecomposedOutflows.id(),
+                account.inner(),
+                currency.code()
+            ),
+            kind: ActionKind::UndecomposedOutflows,
+            category: ActionCategory::Recommended,
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Owner),
+        },
+        format!(
+            "Account {} has {} outflow rows totaling {} {} that no category rule matched; \
+             create a rule that matches them and names what they were for. The rows are \
+             not identified here, so neither the matcher nor the category is proposed, \
+             and the interval a rule is valid over is not the interval of this report.",
+            account.inner(),
+            count,
+            amount.to_calc_dec().inner(),
+            currency.code()
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::CreateCategoryRule,
+            request: RequestPlan {
+                preset: BTreeMap::new(),
+                missing: vec![
+                    MissingInput {
+                        pointer: "/matcher".into(),
+                        provided_by: ProvidedBy::Owner,
+                        candidates: None,
+                    },
+                    MissingInput {
+                        pointer: "/category".into(),
+                        provided_by: ProvidedBy::Owner,
+                        candidates: None,
+                    },
+                ],
+            },
+        },
+    )
+    .expect("undecomposed outflows action has an operation target")
+}
+
+/// Transfers that left the contour and can never carry a category.
+///
+/// These sit in the same undecomposed total as the rows above and have no remedy
+/// in common with them. `MoneyFlow::apply` asks the category index only for
+/// `CashOut`, `Refund` and `Income`; a `CashTransfer` is never offered to it, so a
+/// rule matching this row would still assign nothing. Pointing the owner at rule
+/// creation here would be a falsehood, and pointing him there for a mixed account
+/// would be a half-truth about the transfer half — which is why the aggregate is
+/// split at its source rather than relabelled.
+///
+/// So `Blocked` is correct for exactly the reason it was wrong above: no operation
+/// in this API acts on this item. `Informational` follows — it is a fact, and the
+/// fact is worth emitting because without it the undecomposed total in the report
+/// has an unexplained remainder.
+fn external_transfers_action(
+    account: AccountId,
+    currency: CurrencyCode,
+    count: u64,
+    amount: Money,
+) -> Action {
+    blocked_action(
+        format!(
+            "{}:{}:{}",
+            ActionKind::ExternalTransfersUncategorised.id(),
+            account.inner(),
+            currency.code()
+        ),
+        ActionKind::ExternalTransfersUncategorised,
+        ActionCategory::Informational,
+        format!(
+            "Account {} has {} transfer rows totaling {} {} that left the contour and \
+             carry no category; a category rule cannot decompose them, because category \
+             assignment is never consulted for a transfer. Nothing in this API changes that.",
+            account.inner(),
+            count,
+            amount.to_calc_dec().inner(),
+            currency.code()
+        ),
+    )
 }
 
 /// Find an import-time possible duplicate that has no stored decision.
@@ -1576,10 +1697,31 @@ mod tests {
             .iter()
             .find(|action| action.kind() == ActionKind::UndecomposedOutflows)
             .expect("undecomposed diagnostic");
-        assert_eq!(undecomposed.category(), ActionCategory::Informational);
+        assert_eq!(undecomposed.category(), ActionCategory::Recommended);
         assert!(undecomposed.reason().contains(&account.inner().to_string()));
-        assert_eq!(undecomposed.state(), ActionState::Blocked);
-        assert_eq!(undecomposed.target(), &ActionTarget::None);
+        assert_eq!(undecomposed.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(undecomposed.required_scope(), Some(Scope::Owner));
+        let ActionTarget::Operation { operation, request } = undecomposed.target() else {
+            panic!("a rule-remediable outflow names the operation that remedies it");
+        };
+        assert_eq!(*operation, OperationKey::CreateCategoryRule);
+        assert!(
+            request.preset.is_empty(),
+            "nothing in this aggregate justifies a preset field: {:?}",
+            request.preset
+        );
+        let missing: Vec<&str> = request
+            .missing
+            .iter()
+            .map(|input| input.pointer.as_str())
+            .collect();
+        assert_eq!(missing, vec!["/matcher", "/category"]);
+        assert!(
+            request
+                .missing
+                .iter()
+                .all(|input| input.provided_by == ProvidedBy::Owner)
+        );
         let residual = actions
             .iter()
             .find(|action| action.kind() == ActionKind::UnexplainedResidual)
@@ -1815,6 +1957,73 @@ mod tests {
         flow_report(flow, &contour, period)
     }
 
+    /// A transfer that leaves the contour, on each named account.
+    ///
+    /// The counterparty is a fresh account outside the contour, which is what makes
+    /// `classify` call the transfer `ExternalOut`; the projection then records the
+    /// amount as undecomposed without ever asking the category index about it.
+    fn external_transfer_report(accounts: &[AccountId]) -> MoneyFlowReport {
+        let contour = ContourDefinition::new(
+            ContourId::new_random(),
+            ContourVersion(1),
+            accounts.to_vec(),
+        );
+        let period = DateWindow {
+            from: date!(2026 - 08 - 01),
+            to: date!(2026 - 08 - 31),
+        };
+        let mut flow = MoneyFlow::new();
+        for account in accounts {
+            apply_external_transfer(&mut flow, &contour, period, *account);
+        }
+        flow_report(flow, &contour, period)
+    }
+
+    /// One account holding both an unmatched outflow and a transfer out.
+    fn mixed_report(account: AccountId) -> MoneyFlowReport {
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let period = DateWindow {
+            from: date!(2026 - 08 - 01),
+            to: date!(2026 - 08 - 31),
+        };
+        let mut flow = MoneyFlow::new();
+        let outflow_amount = Money::new(PostedMinor::new(-700), CurrencyCode::Rub);
+        let mut outflow = diagnostic_event(
+            account,
+            EventKind::CashOut {
+                amount: outflow_amount,
+            },
+            date!(2026 - 08 - 03),
+        );
+        outflow.legs = vec![Leg::cash(account, outflow_amount)];
+        flow.apply(&outflow, &contour, period, &NoCategories)
+            .expect("outflow");
+        apply_external_transfer(&mut flow, &contour, period, account);
+        flow_report(flow, &contour, period)
+    }
+
+    fn apply_external_transfer(
+        flow: &mut MoneyFlow,
+        contour: &ContourDefinition,
+        period: DateWindow,
+        account: AccountId,
+    ) {
+        let amount = Money::new(PostedMinor::new(-1_100), CurrencyCode::Rub);
+        let mut transfer = diagnostic_event(
+            account,
+            EventKind::CashTransfer {
+                transfer_id: iaam_core::ids::TransferId::new_random(),
+                from: account,
+                to: AccountId::new_random(),
+                amount,
+            },
+            date!(2026 - 08 - 05),
+        );
+        transfer.legs = vec![Leg::cash(account, amount)];
+        flow.apply(&transfer, contour, period, &NoCategories)
+            .expect("external transfer");
+    }
+
     /// Every outflow carries a category and every account closes: the report has
     /// nothing left over to report.
     fn decomposed_report(account: AccountId) -> MoneyFlowReport {
@@ -1930,6 +2139,9 @@ mod tests {
         actions.extend(flow_diagnostics(&undecomposed_report(&[
             AccountId::new_random(),
         ])));
+        actions.extend(flow_diagnostics(&external_transfer_report(&[
+            AccountId::new_random(),
+        ])));
         actions.extend(verdict_diagnostics(&Verdict::PossibleDuplicate {
             event: EventId::new_random(),
             of: EventId::new_random(),
@@ -1940,8 +2152,16 @@ mod tests {
 
     /// The universal assertions are worthless over an empty set, so the exact set
     /// of kinds is asserted **first**: the sweep below then runs over something.
+    ///
+    /// The sweep used to assert that *every* diagnostic is blocked. That was the
+    /// defect, not the invariant: `Blocked` means no operation in this API acts on
+    /// the item, and a spending row nobody has categorised is remedied by an
+    /// operation this same API offers. What holds for every diagnostic is only the
+    /// agreement between the three fields, so that is what is asserted here — and
+    /// the split kinds are named individually below, so a future diagnostic cannot
+    /// quietly rejoin the blocked majority.
     #[test]
-    fn every_diagnostic_is_blocked_with_no_target_and_no_scope() {
+    fn every_diagnostic_states_its_availability_truthfully() {
         let actions = every_diagnostic();
 
         let kinds: BTreeSet<ActionKind> = actions.iter().map(Action::kind).collect();
@@ -1952,6 +2172,7 @@ mod tests {
                 ActionKind::IndependentConfirmationMissing,
                 ActionKind::DiscrepancyUnresolved,
                 ActionKind::UndecomposedOutflows,
+                ActionKind::ExternalTransfersUncategorised,
                 ActionKind::UnexplainedResidual,
                 ActionKind::PossibleDuplicateUndecided,
             ]),
@@ -1959,10 +2180,99 @@ mod tests {
         );
 
         for action in &actions {
-            assert_eq!(action.target(), &ActionTarget::None, "{}", action.id());
-            assert_eq!(action.state(), ActionState::Blocked, "{}", action.id());
-            assert_eq!(action.required_scope(), None, "{}", action.id());
+            if action.state() == ActionState::Blocked {
+                assert_eq!(action.target(), &ActionTarget::None, "{}", action.id());
+                assert_eq!(action.required_scope(), None, "{}", action.id());
+            } else {
+                assert_eq!(
+                    action.state(),
+                    ActionState::NeedsOwnerInput,
+                    "{}",
+                    action.id()
+                );
+                assert!(
+                    matches!(action.target(), ActionTarget::Operation { .. }),
+                    "{} is not blocked and must name the operation that answers it",
+                    action.id()
+                );
+                assert_eq!(
+                    action.required_scope(),
+                    Some(Scope::Owner),
+                    "{}",
+                    action.id()
+                );
+            }
         }
+
+        let blocked: BTreeSet<ActionKind> = actions
+            .iter()
+            .filter(|action| action.state() == ActionState::Blocked)
+            .map(|action| action.kind())
+            .collect();
+        assert!(blocked.contains(&ActionKind::ExternalTransfersUncategorised));
+        assert!(!blocked.contains(&ActionKind::UndecomposedOutflows));
+    }
+
+    /// An aggregate holding nothing but transfers out of the contour has no remedy
+    /// in this API, and the queue must not invent one: a category rule would never
+    /// be consulted for a transfer, so offering rule creation here would be false.
+    #[test]
+    fn a_transfer_only_aggregate_offers_no_rule() {
+        let account = AccountId::new_random();
+        let actions = flow_diagnostics(&external_transfer_report(&[account]));
+
+        assert!(
+            !actions
+                .iter()
+                .any(|action| action.kind() == ActionKind::UndecomposedOutflows),
+            "a transfer is not remediable by a category rule: {actions:?}"
+        );
+        let transfers = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::ExternalTransfersUncategorised)
+            .expect("external transfer diagnostic");
+        assert_eq!(transfers.state(), ActionState::Blocked);
+        assert_eq!(transfers.category(), ActionCategory::Informational);
+        assert_eq!(transfers.target(), &ActionTarget::None);
+        assert_eq!(transfers.required_scope(), None);
+        assert!(transfers.reason().contains(&account.inner().to_string()));
+        assert!(
+            transfers
+                .reason()
+                .contains("category rule cannot decompose"),
+            "{}",
+            transfers.reason()
+        );
+    }
+
+    /// The case the single aggregate could only answer with a half-truth: one
+    /// account holding both kinds of row gets both items, each naming its own
+    /// account and neither claiming the other's remedy.
+    #[test]
+    fn a_mixed_account_gets_a_remedy_for_the_rows_that_have_one() {
+        let account = AccountId::new_random();
+        let actions = flow_diagnostics(&mixed_report(account));
+
+        let outflows = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::UndecomposedOutflows)
+            .expect("rule-remediable diagnostic");
+        let transfers = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::ExternalTransfersUncategorised)
+            .expect("transfer diagnostic");
+
+        assert_ne!(outflows.id(), transfers.id());
+        assert_eq!(outflows.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(transfers.state(), ActionState::Blocked);
+        // 700 minor units of spending and 1100 of transfer, kept apart rather than
+        // reported as one 1800 aggregate pointed at a rule that reaches only 700.
+        assert!(outflows.reason().contains("7.00"), "{}", outflows.reason());
+        assert!(
+            transfers.reason().contains("11.00"),
+            "{}",
+            transfers.reason()
+        );
     }
 
     /// An agent deduplicates by `id`. Two accounts holding the same diagnostic

@@ -137,19 +137,21 @@ require-broker-key:
 
 .PHONY: run
 run: require-database ## Start service (IAAM_DATABASE=...)
-	$(RUN) cargo run -p iaam-bootstrap --release
+	$(RUN) cargo run -p iaam-bootstrap --release -- serve
 
-# Recovery path for a lost owner token. In an empty database it creates an owner;
-# in a nonempty database it issues a token to the existing owner. It prints the
-# token once — only the hash remains in the database.
+# Recovery path for a lost owner token: it issues a token to the existing sole
+# owner and prints it once — only the hash remains in the database. An empty
+# database has no owner to issue to; `iaam claim --label <label>` creates one,
+# and it is deliberately not a make target, because claiming an instance is an
+# act, not a build step (ADR-0003).
 .PHONY: owner-token
 owner-token: require-database ## Owner token from the console (IAAM_DATABASE=..., LABEL=...)
-	IAAM_ISSUE_OWNER_TOKEN="$(LABEL)" $(RUN) cargo run -p iaam-bootstrap --release
+	$(RUN) cargo run -p iaam-bootstrap --release -- token issue --label "$(LABEL)"
 
 .PHONY: broker-key
 broker-key: require-database require-broker-key ## Create a key for encrypting credentials
 	@install -d -m 700 "$(dir $(IAAM_BROKER_KEY_FILE))"
-	IAAM_GENERATE_BROKER_KEY=1 $(RUN) cargo run -p iaam-bootstrap --release
+	$(RUN) cargo run -p iaam-bootstrap --release -- broker key generate
 
 # The token is read from standard input: the process list is visible across the
 # machine, and shell history outlives the session.

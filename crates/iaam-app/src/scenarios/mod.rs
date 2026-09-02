@@ -5,6 +5,7 @@
 
 pub mod categories;
 pub mod ingest;
+pub mod journal;
 pub mod market_reference;
 pub mod reports;
 pub mod schedule;

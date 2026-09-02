@@ -81,6 +81,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::ingest_operations))
         .routes(routes!(routes::ingest_journal_events))
         .routes(routes!(routes::ingest_csv))
+        .routes(routes!(routes::list_journal_events))
         .routes(routes!(routes::upload_document))
         .routes(routes!(routes::reparse_document))
         .routes(routes!(routes::repair_custody))

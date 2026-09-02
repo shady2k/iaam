@@ -5009,3 +5009,265 @@ pub struct SubmitJournalEventsRequest {
     pub source_label: String,
     pub events: Vec<JournalEventDto>,
 }
+
+/// One page of the owner's journal.
+///
+/// The page carries `next` rather than a total count: counting the whole
+/// journal to answer "how many more" is work nobody asked for, while the
+/// position to resume from is what the caller actually needs.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct JournalPageDto {
+    pub rows: Vec<JournalEventReadDto>,
+    /// Pass back as `after` to read the next page. Absent means this was the
+    /// last page; it is not an empty string, which would read as "start again".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// A recorded journal event.
+///
+/// This is the fact as the journal holds it, not the operation that was
+/// submitted: ingest normalises an operation into an event and keeps only the
+/// event. A caller comparing this against what it posted is comparing two
+/// different shapes of the same fact.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct JournalEventReadDto {
+    /// The event's identity, the same value ingest returned as `event_id`.
+    pub event: Uuid,
+    pub account: Uuid,
+    /// The date the journal orders this event by.
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub effective_date: Date,
+    /// Order within `effective_date`. The pair names the row uniquely and is
+    /// what `next` encodes.
+    pub sequence: u32,
+    /// Time of day as the source stated it, when it stated one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_time: Option<String>,
+    /// Event family: `cash_in`, `cash_out`, `trade`, `income` and so on.
+    pub kind: String,
+    /// The semantic dates the fact carries. Distinct from `effective_date`,
+    /// which is the ordering date.
+    pub dates: JournalEventDatesDto,
+    /// The movement, leg by leg, exactly as recorded. Nothing here is summed:
+    /// a total would be a computed number, and this route computes none.
+    pub legs: Vec<JournalLegDto>,
+    pub relation: JournalRelationDto,
+    pub confidence: JournalConfidenceDto,
+    /// The client key supplied at ingest, if one was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Identity of the source this row arrived from. Derived from the owner,
+    /// the account and the channel when the caller declared a source, and
+    /// minted per request when it did not.
+    pub source: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_operation_id: Option<String>,
+    /// The category the source itself put on the row. Evidence about what the
+    /// source said, never the owner's own decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_category: Option<String>,
+    /// The description or counterparty the source printed on the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The semantic dates a journal event carries. Absent means unknown, which is
+/// not the same as a date equal to the ordering date.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+pub struct JournalEventDatesDto {
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub trade: Option<Date>,
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub settled: Option<Date>,
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub cash_posted: Option<Date>,
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub entitlement: Option<Date>,
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub paid: Option<Date>,
+    /// The tax year the event belongs to, when the fact states one of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tax_period: Option<i32>,
+}
+
+impl JournalEventDatesDto {
+    fn from_domain(dates: iaam_core::dates::EventDates) -> Self {
+        Self {
+            trade: dates.trade.map(|date| date.inner()),
+            settled: dates.settled.map(|date| date.inner()),
+            cash_posted: dates.cash_posted.map(|date| date.inner()),
+            entitlement: dates.entitlement.map(|date| date.inner()),
+            paid: dates.paid.map(|date| date.inner()),
+            tax_period: dates.tax_period_override.map(|period| period.0),
+        }
+    }
+}
+
+/// One movement leg of a journal event.
+///
+/// The sign is the direction: positive is into the named account or custody
+/// place, negative is out of it.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct JournalLegDto {
+    pub kind: JournalLegKindDto,
+    pub account: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instrument: Option<Uuid>,
+    /// The posted amount in major units, as recorded. Present on every leg
+    /// that moves money.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<CurrencyDto>,
+    /// The quantity moved, on a securities leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<String>,
+}
+
+impl JournalLegDto {
+    fn from_domain(leg: &iaam_core::event::leg::Leg) -> Self {
+        Self {
+            kind: JournalLegKindDto::from_domain(leg.kind),
+            account: leg.account.inner(),
+            custody: leg.custody.map(|custody| custody.inner()),
+            instrument: leg.instrument.map(|instrument| instrument.inner()),
+            amount: leg
+                .money
+                .map(|money| money.to_calc_dec().inner().to_string()),
+            currency: leg
+                .money
+                .map(|money| CurrencyDto::from_domain(money.currency())),
+            quantity: leg.quantity.map(|quantity| quantity.0.inner().to_string()),
+        }
+    }
+}
+
+/// What a leg moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalLegKindDto {
+    /// Cash in an account.
+    Cash,
+    /// Quantity of a security.
+    SecurityQuantity,
+    /// Outstanding principal being amortised.
+    Principal,
+    Fee,
+    Tax,
+}
+
+impl JournalLegKindDto {
+    const fn from_domain(kind: iaam_core::event::leg::LegKind) -> Self {
+        match kind {
+            iaam_core::event::leg::LegKind::Cash => Self::Cash,
+            iaam_core::event::leg::LegKind::SecurityQuantity => Self::SecurityQuantity,
+            iaam_core::event::leg::LegKind::Principal => Self::Principal,
+            iaam_core::event::leg::LegKind::Fee => Self::Fee,
+            iaam_core::event::leg::LegKind::Tax => Self::Tax,
+        }
+    }
+}
+
+/// Whether this event stands alone or corrects another.
+///
+/// A reader that cannot see this reads a retracted fact as a live one, which
+/// is the one misreading of a journal that changes every number derived from it.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+pub struct JournalRelationDto {
+    pub kind: JournalRelationKindDto,
+    /// The event corrected. Present exactly when `kind` is not `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<Uuid>,
+}
+
+impl JournalRelationDto {
+    const fn from_domain(relation: iaam_core::event::Relation) -> Self {
+        match relation {
+            iaam_core::event::Relation::None => Self {
+                kind: JournalRelationKindDto::None,
+                target: None,
+            },
+            iaam_core::event::Relation::Reversal { target } => Self {
+                kind: JournalRelationKindDto::Reversal,
+                target: Some(target.inner()),
+            },
+            iaam_core::event::Relation::Replacement { target } => Self {
+                kind: JournalRelationKindDto::Replacement,
+                target: Some(target.inner()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalRelationKindDto {
+    /// A standalone fact.
+    None,
+    /// Reverses the event named by `target`.
+    Reversal,
+    /// Replaces the event named by `target`. Always follows a reversal.
+    Replacement,
+}
+
+/// How far the recorded fact is confirmed by its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalConfidenceDto {
+    /// The source confirms the fact.
+    Known,
+    /// The value was reconstructed or estimated.
+    Estimated,
+    /// The value is unknown, and is not to be read as zero.
+    Unknown,
+}
+
+impl JournalConfidenceDto {
+    const fn from_domain(confidence: iaam_core::event::Confidence) -> Self {
+        match confidence {
+            iaam_core::event::Confidence::Known => Self::Known,
+            iaam_core::event::Confidence::Estimated => Self::Estimated,
+            iaam_core::event::Confidence::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl JournalEventReadDto {
+    #[must_use]
+    pub fn from_domain(view: &iaam_app::scenarios::journal::JournalEventView) -> Self {
+        Self {
+            event: view.event.inner(),
+            account: view.account.inner(),
+            effective_date: view.effective_date,
+            sequence: view.sequence,
+            source_time: view.source_time.map(format_source_time),
+            kind: view.kind.to_owned(),
+            dates: JournalEventDatesDto::from_domain(view.dates),
+            legs: view.legs.iter().map(JournalLegDto::from_domain).collect(),
+            relation: JournalRelationDto::from_domain(view.relation),
+            confidence: JournalConfidenceDto::from_domain(view.confidence),
+            idempotency_key: view.idempotency_key.clone(),
+            source: view.source.inner(),
+            source_operation_id: view.source_operation_id.clone(),
+            source_category: view.source_category.clone(),
+            description: view.description.clone(),
+        }
+    }
+}
+
+/// `HH:MM:SS`, the precision a source states a time of day to. The journal
+/// stores nanoseconds because its ordering needs them; a caller reading a row
+/// back does not.
+fn format_source_time(time: time::Time) -> String {
+    let (hour, minute, second) = time.as_hms();
+    format!("{hour:02}:{minute:02}:{second:02}")
+}

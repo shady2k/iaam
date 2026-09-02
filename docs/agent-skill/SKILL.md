@@ -51,13 +51,16 @@ of your own is the most expensive mistake that can be made here.
 The agent is not part of the system and has no access to its storage. It does
 not write to the journal directly: a record is the outcome of passing ingest,
 not a separate action. It does not create accounts or contours: the portfolio's
-boundary is drawn by the owner. And it does not hold the owner's statements —
-the owner loads them himself, and the agent sees exactly what the owner has
-shown it.
+boundary is drawn by the owner. It does not correct or retract what is already
+recorded — that is the owner's act, and his credential is what the system will
+accept for it. And it does not hold the owner's statements — the owner loads
+them himself, and the agent sees exactly what the owner has shown it.
 
 From this follows the thing that is easiest to violate out of the best
 intentions: a missing value is asked of the owner, not filled in. A guess that
-has reached the journal is indistinguishable from a fact.
+has reached the journal is indistinguishable from a fact — every report will
+read it as one, and only the owner, who knows what actually happened, can
+retract it.
 
 ## What a contour is
 
@@ -116,6 +119,37 @@ confirmed. Agreement between two different channels raises the dimension's
 status to `accepted_independent`.
 
 Both channels write facts into one append-only journal.
+
+## A mistake is retracted, not erased
+
+Append-only does not mean irrevocable, and an agent that reads only the first
+half of that sentence will tell the owner his wrongly imported month cannot be
+undone. It can. **A correction is a new fact that retracts an earlier one.** The
+retracted fact stays in the journal — it is still true that it was once
+recorded, and how the picture changed is itself part of the record — and every
+report is computed from what is in force rather than from everything ever
+written. A replacement goes further: it retracts and states what should have
+stood instead.
+
+Three things follow, and each of them is a way an agent gets this wrong.
+
+**Correction is the owner's act.** Ask him; do not attempt it. The system will
+refuse an agent's credential for it, and that refusal is a limit of rights, not
+an absence of the capability. What the agent may properly do is find what went
+wrong, tell the owner exactly which facts are affected, and prepare the request
+for him to send.
+
+**Retracting does not free a repeat import.** Duplicate detection reads the
+whole journal, and a retracted fact is still in it, so re-importing the same
+rows with the mapping corrected returns `duplicate` and writes nothing. It is
+the replacement, not the reversal, that re-states a row where it belonged.
+Advising the owner to "just import it again" after a retraction wastes his
+afternoon.
+
+**Diagnose before proposing.** The journal can be read back per row, so the
+facts a correction would affect are knowable before anything is retracted rather
+than after. Name them to the owner. A correction proposed from a report's
+aggregate is a guess about which rows are wrong.
 
 **An assertion by the owner is not an independent source.** A balance he names
 is what is reconciled against, not a second proof: agreement gives
@@ -196,6 +230,29 @@ acquisition date there is nothing to draw the ownership boundary with, and
 postings on such a security land in `material_issues` as unverifiable instead
 of being checked. Ask the owner for the date if he remembers it; if he does
 not, leave "unknown" rather than substituting the start of the journal.
+
+## A cash figure is not a balance until something anchors it
+
+The journal begins when it begins. Before its first record the system knows
+nothing about what was on an account, so a cash figure it computes is the sum of
+the movements it has seen — a **movement from an unasserted start**, which is
+not a balance and must not be reported as one. Only an assertion by the owner
+about the state before the first movement anchors that sum; the answer says, for
+each account and currency, which of the two it is holding, and that mark is
+there whether the figure looks plausible or not.
+
+This is the trap: after a first import most of the figures look ordinary and one
+may look impossible. They are equally unfounded. The ordinary-looking ones
+merely passed a plausibility check the reader happened to have, and reporting
+them as balances while flagging only the strange one endorses four errors to
+catch one. Read the mark, not the number.
+
+A negative cash figure is reported as a fact and is never refused or hidden. It
+is not by itself an error: a margin account is legitimately negative, and a card
+can carry a technical overdraft. On an account where the owner would not expect
+one it is a sign to check — most often a sign of exactly the missing anchor
+above, since spending money that arrived before the journal began produces a
+negative sum out of nothing wrong.
 
 ## How to read the return report
 

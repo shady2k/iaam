@@ -48,7 +48,9 @@ impl Modify for BearerSecurity {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("opaque")
-                        .description(Some("Agent token. Issued and revoked by the owner (§14)."))
+                        .description(Some(
+                            "Bearer token issued at the console by `iaam claim --label <label>`; no API route issues one.",
+                        ))
                         .build(),
                 ),
             );

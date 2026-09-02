@@ -6,11 +6,15 @@
 //! after a proven violation of the identity (§15.2).
 
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, VARY, WWW_AUTHENTICATE};
 use axum::response::{IntoResponse, Response};
 use iaam_app::error::AppError;
 use serde::Serialize;
 use utoipa::ToSchema;
+
+const UNAUTHORIZED_BODY: &[u8] = br#"{"code":"unauthorized","message":"a token is issued at the console by iaam claim --label <label>; no API route issues one"}"#;
 
 /// Error response body.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -48,13 +52,20 @@ impl ApiError {
 
 /// Handler error.
 ///
-/// The body is in a `Box`: every handler returns `Result<T, ApiFailure>`,
-/// and `clippy::result_large_err` rightly objects to an error variant
-/// being 150 bytes in size on every successful path.
+/// Ordinary errors keep their structured body boxed so successful handler paths
+/// do not carry a large result variant. Authentication refusals use the static
+/// serialised body because the missing-header path is not rate-limited.
 #[derive(Debug)]
 pub struct ApiFailure {
     pub status: StatusCode,
-    pub body: Box<ApiError>,
+    body: ApiFailureBody,
+    challenge: &'static str,
+}
+
+#[derive(Debug)]
+enum ApiFailureBody {
+    Json(Box<ApiError>),
+    Static(&'static [u8]),
 }
 
 impl ApiFailure {
@@ -62,16 +73,37 @@ impl ApiFailure {
     pub fn new(status: StatusCode, body: ApiError) -> Self {
         Self {
             status,
-            body: Box::new(body),
+            body: ApiFailureBody::Json(Box::new(body)),
+            challenge: "",
         }
     }
 
+    /// Nothing was presented.
+    ///
+    /// The bare challenge is the correct one here: RFC 6750 `invalid_token`
+    /// describes a token that was supplied and refused, and there is no token
+    /// to describe.
     #[must_use]
     pub fn unauthorized() -> Self {
-        Self::new(
-            StatusCode::UNAUTHORIZED,
-            ApiError::simple("unauthorized", "a valid token is required"),
-        )
+        Self::refusal("Bearer")
+    }
+
+    /// A credential was presented and rejected.
+    #[must_use]
+    pub fn invalid_token() -> Self {
+        Self::refusal("Bearer error=\"invalid_token\"")
+    }
+
+    /// Both refusals carry the same body: which of the two occurred is the
+    /// caller's business, and telling a stranger whether a guessed token exists
+    /// is not something the body should do. The challenge differs because the
+    /// protocol requires it of the response, not of the explanation.
+    fn refusal(challenge: &'static str) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            body: ApiFailureBody::Static(UNAUTHORIZED_BODY),
+            challenge,
+        }
     }
 
     #[must_use]
@@ -96,7 +128,26 @@ impl ApiFailure {
 
 impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
-        (self.status, Json(*self.body)).into_response()
+        let mut response = match self.body {
+            ApiFailureBody::Json(body) => (self.status, Json(*body)).into_response(),
+            ApiFailureBody::Static(body) => Response::builder()
+                .status(self.status)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(Bytes::from_static(body)))
+                .expect("static error response is valid"),
+        };
+        if !self.challenge.is_empty() {
+            response
+                .headers_mut()
+                .insert(WWW_AUTHENTICATE, HeaderValue::from_static(self.challenge));
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+                .headers_mut()
+                .insert(VARY, HeaderValue::from_static("Authorization"));
+        }
+        response
     }
 }
 

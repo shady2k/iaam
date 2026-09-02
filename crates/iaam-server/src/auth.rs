@@ -67,7 +67,7 @@ pub async fn authenticate(
         // attempt would turn a stream of random strings into unbounded
         // database growth through the only unprotected path (§14).
         tracing::warn!(%route, "unknown token presented");
-        return Err(ApiFailure::unauthorized());
+        return Err(ApiFailure::invalid_token());
     };
 
     let _ = state

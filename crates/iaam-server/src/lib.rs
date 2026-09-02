@@ -116,6 +116,7 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
         ));
 
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(routes::api_catalog))
         .routes(routes!(routes::health))
         .merge(protected)
         .split_for_parts();

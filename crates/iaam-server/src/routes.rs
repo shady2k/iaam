@@ -6,9 +6,11 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::Response;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
@@ -1015,6 +1017,25 @@ pub async fn update_broker_access(
         )
         .await?;
     Ok(Json(BrokerAccessDto::from_domain(access)))
+}
+/// The standards discovery document for this API.
+pub const API_CATALOG_BODY: &[u8] = br#"{"linkset":[{"anchor":"/v1","service-desc":[{"href":"/v1/openapi.json","type":"application/json"}],"status":[{"href":"/v1/health","type":"application/json"}]}]}"#;
+
+#[utoipa::path(
+    get,
+    path = "/.well-known/api-catalog",
+    responses((
+        status = 200,
+        description = "API discovery links",
+        content_type = "application/linkset+json"
+    ))
+)]
+pub async fn api_catalog() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/linkset+json")
+        .body(Body::from(Bytes::from_static(API_CATALOG_BODY)))
+        .expect("static catalog response is valid")
 }
 
 /// Service status.

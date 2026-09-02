@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
@@ -263,63 +263,81 @@ fn harness_with(store: SqliteStore) -> Harness {
     harness_with_factory(store, None)
 }
 
+fn unprovisioned_harness() -> Harness {
+    harness_with_factory_and_provisioning(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        None,
+        false,
+    )
+}
+
 fn harness_with_factory(
     store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
 ) -> Harness {
+    harness_with_factory_and_provisioning(store, channel_factory, true)
+}
+
+fn harness_with_factory_and_provisioning(
+    store: SqliteStore,
+    channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
+    provisioned: bool,
+) -> Harness {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
 
-    store
-        .upsert_account(&AccountRecord {
-            id: account,
-            owner,
-            title: "Brokerage".into(),
-            institution: None,
-        })
-        .expect("account");
-
-    let owner_token = "owner-secret-token";
-    store
-        .insert_token(
-            &TokenRecord {
-                id: Uuid::new_v4(),
+    if provisioned {
+        store
+            .upsert_account(&AccountRecord {
+                id: account,
                 owner,
-                label: "owner".into(),
-                scope: TokenScope::Owner,
-                revoked: false,
-            },
-            &hash_token(owner_token),
-        )
-        .expect("owner token");
+                title: "Brokerage".into(),
+                institution: None,
+            })
+            .expect("account");
 
-    let agent_token = "agent-secret-token";
-    store
-        .insert_token(
-            &TokenRecord {
-                id: Uuid::new_v4(),
-                owner,
-                label: "agent".into(),
-                scope: TokenScope::Agent,
-                revoked: false,
-            },
-            &hash_token(agent_token),
-        )
-        .expect("agent token");
+        let owner_token = "owner-secret-token";
+        store
+            .insert_token(
+                &TokenRecord {
+                    id: Uuid::new_v4(),
+                    owner,
+                    label: "owner".into(),
+                    scope: TokenScope::Owner,
+                    revoked: false,
+                },
+                &hash_token(owner_token),
+            )
+            .expect("owner token");
 
-    let readonly_token = "read-only-token";
-    store
-        .insert_token(
-            &TokenRecord {
-                id: Uuid::new_v4(),
-                owner,
-                label: "read".into(),
-                scope: TokenScope::ReadOnly,
-                revoked: false,
-            },
-            &hash_token(readonly_token),
-        )
-        .expect("read token");
+        let agent_token = "agent-secret-token";
+        store
+            .insert_token(
+                &TokenRecord {
+                    id: Uuid::new_v4(),
+                    owner,
+                    label: "agent".into(),
+                    scope: TokenScope::Agent,
+                    revoked: false,
+                },
+                &hash_token(agent_token),
+            )
+            .expect("agent token");
+
+        let readonly_token = "read-only-token";
+        store
+            .insert_token(
+                &TokenRecord {
+                    id: Uuid::new_v4(),
+                    owner,
+                    label: "read".into(),
+                    scope: TokenScope::ReadOnly,
+                    revoked: false,
+                },
+                &hash_token(readonly_token),
+            )
+            .expect("read token");
+    }
 
     // The key is created directly from bytes, not from a file: a file in a temporary directory
     // would have to be deleted, and a test that failed before deletion would leave
@@ -360,9 +378,9 @@ fn harness_with_factory(
     Harness {
         router,
         api,
-        owner_token: owner_token.to_owned(),
-        agent_token: agent_token.to_owned(),
-        readonly_token: readonly_token.to_owned(),
+        owner_token: "owner-secret-token".to_owned(),
+        agent_token: "agent-secret-token".to_owned(),
+        readonly_token: "read-only-token".to_owned(),
         owner,
         account,
         instrument: InstrumentId::new_random(),
@@ -697,19 +715,26 @@ async fn seed_bond_market(harness: &Harness) {
         .expect("issue terms");
 }
 
-async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+async fn call_raw(router: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
     let response = router
         .clone()
         .oneshot(request)
         .await
         .expect("handler responded");
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = response
         .into_body()
         .collect()
         .await
         .expect("response body")
-        .to_bytes();
+        .to_bytes()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+async fn call(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+    let (status, _headers, bytes) = call_raw(router, request).await;
     let value = if bytes.is_empty() {
         Value::Null
     } else {
@@ -785,6 +810,50 @@ async fn health_is_public_and_reports_versions() {
 }
 
 #[tokio::test]
+async fn api_catalog_is_public_state_independent_and_route_complete() {
+    let provisioned = harness();
+    let unprovisioned = unprovisioned_harness();
+    assert!(
+        provisioned
+            .api
+            .paths
+            .paths
+            .contains_key("/.well-known/api-catalog"),
+        "the catalog route must be in the generated OpenAPI document"
+    );
+
+    let (provisioned_status, provisioned_headers, provisioned_body) =
+        call_raw(&provisioned.router, get("/.well-known/api-catalog", None)).await;
+    let (unprovisioned_status, unprovisioned_headers, unprovisioned_body) =
+        call_raw(&unprovisioned.router, get("/.well-known/api-catalog", None)).await;
+
+    assert_eq!(provisioned_status, StatusCode::OK);
+    assert_eq!(unprovisioned_status, StatusCode::OK);
+    assert_eq!(provisioned_headers, unprovisioned_headers);
+    assert_eq!(provisioned_body, unprovisioned_body);
+    assert_eq!(
+        provisioned_headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/linkset+json")
+    );
+    assert_eq!(
+        provisioned_body,
+        iaam_server::routes::API_CATALOG_BODY.to_vec()
+    );
+
+    let catalog: Value = serde_json::from_slice(&provisioned_body).expect("catalog JSON");
+    let linkset = catalog["linkset"].as_array().expect("linkset array");
+    for relation in ["service-desc", "status"] {
+        for link in linkset[0][relation].as_array().expect("link relation") {
+            let href = link["href"].as_str().expect("catalog href");
+            let (status, _, _) = call_raw(&provisioned.router, get(href, None)).await;
+            assert_eq!(status, StatusCode::OK, "{relation} href {href}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn every_documented_path_answers_something_other_than_404() {
     // A spec describing a non-existent route is an instruction
     // for the external agent to correct itself based on false guidance.
@@ -833,19 +902,59 @@ async fn every_documented_path_answers_something_other_than_404() {
 }
 
 #[tokio::test]
-async fn a_request_without_a_token_is_rejected() {
+async fn a_request_without_a_token_is_rejected_with_bare_bearer_challenge() {
     // Authentication from day one (§14).
     let harness = harness();
-    let (status, body) = call(&harness.router, get("/v1/accounts", None)).await;
+    let (status, headers, bytes) = call_raw(&harness.router, get("/v1/accounts", None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["code"], "unauthorized");
+    assert_eq!(
+        headers
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer")
+    );
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        headers.get("vary").and_then(|value| value.to_str().ok()),
+        Some("Authorization")
+    );
+    assert_eq!(
+        bytes,
+        br#"{"code":"unauthorized","message":"a token is issued at the console by iaam claim --label <label>; no API route issues one"}"#
+    );
 }
 
 #[tokio::test]
-async fn an_unknown_token_is_rejected() {
+async fn an_unknown_token_is_rejected_with_invalid_token_challenge() {
     let harness = harness();
-    let (status, _) = call(&harness.router, get("/v1/accounts", Some("someone else's"))).await;
+    let (status, headers, bytes) =
+        call_raw(&harness.router, get("/v1/accounts", Some("unknown-token"))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer error=\"invalid_token\"")
+    );
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        headers.get("vary").and_then(|value| value.to_str().ok()),
+        Some("Authorization")
+    );
+    assert_eq!(
+        bytes,
+        br#"{"code":"unauthorized","message":"a token is issued at the console by iaam claim --label <label>; no API route issues one"}"#
+    );
 }
 
 #[tokio::test]
@@ -1466,6 +1575,11 @@ async fn the_openapi_document_declares_bearer_security() {
         spec["components"]["securitySchemes"]["bearer"].is_object(),
         "the spec must describe the authentication scheme"
     );
+    let description = spec["components"]["securitySchemes"]["bearer"]["description"]
+        .as_str()
+        .expect("security scheme description");
+    assert!(description.contains("iaam claim --label <label>"));
+    assert!(description.contains("no API route issues one"));
 }
 
 #[tokio::test]

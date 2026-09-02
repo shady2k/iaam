@@ -8,3 +8,4 @@
 |---|---|---|---|---|
 | [0001](0001-razbor-otvetov-kanala-zhivet-v-brokere.md) | Разбор ответов брокерского API живёт в `iaam-broker` | 2026-08-25 | принято | `iaam-w07` |
 | [0002](0002-polnota-ocenki-i-ispolnimost-ceny-dve-osi.md) | Полнота оценки и исполнимость цены — две оси, а не одна | 2026-08-26 | принято | `iaam-46a` |
+| [0003](0003-the-owner-speaks-to-an-agent-and-a-cli-keeps-the-secrets.md) | Владелец говорит с агентом, а секреты держит CLI | 2026-09-02 | принято | `iaam-l5y9` |

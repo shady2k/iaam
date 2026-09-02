@@ -5,7 +5,8 @@
 //! document that lists them, and a hand-written list drifts away from the code
 //! that produces it. So the vocabularies here are **expanded from the domain**:
 //! `iaam_app::ingest::verdict_vocabulary!`,
-//! `iaam_core::not_computable_vocabulary!` and
+//! `iaam_core::not_computable_vocabulary!`,
+//! `iaam_core::negative_cash_classification_vocabulary!` and
 //! `iaam_core::data_quality_status_vocabulary!` each call a macro in this
 //! module with every variant, its wire code and the sentence explaining it, and
 //! that one list produces the Rust type, the conversion from the domain value
@@ -27,6 +28,7 @@ use utoipa::openapi::RefOr;
 use utoipa::openapi::schema::{ObjectBuilder, OneOfBuilder, Schema, SchemaType, Type};
 
 use iaam_app::ingest::Verdict;
+use iaam_core::perimeter::NegativeCashClassification;
 use iaam_core::returns::{DataQualityStatus, NotComputable};
 
 /// A schema that both enumerates a vocabulary and explains it.
@@ -145,6 +147,21 @@ macro_rules! define_not_computable_code_dto {
 
 iaam_core::not_computable_vocabulary!(define_not_computable_code_dto);
 
+macro_rules! define_negative_cash_classification_dto {
+    ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
+        vocabulary_enum! {
+            /// Why a cash balance is negative, and therefore whether §11 lets
+            /// the period's reports be calculated for the account (§11).
+            NegativeCashClassificationDto from NegativeCashClassification {
+                "How the negative cash balance is classified under §11. Only `temporary_settlement_deficit` leaves the period's tax and financial reports calculable for the account; the other two refuse them for that account and for no other. None of the three is a reason to hide the figure: a negative balance is stated by the answer either way."
+            }
+            $($variant => $code : $meaning),+
+        }
+    };
+}
+
+iaam_core::negative_cash_classification_vocabulary!(define_negative_cash_classification_dto);
+
 macro_rules! define_data_quality_status_dto {
     ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
         vocabulary_enum! {
@@ -233,5 +250,21 @@ mod tests {
             DataQualityStatusDto::from_domain(&status).code(),
             status.code()
         );
+
+        for classification in [
+            NegativeCashClassification::TemporarySettlementDeficit,
+            NegativeCashClassification::UnsupportedMarginLiability,
+            NegativeCashClassification::UnclassifiedNegativeCash,
+        ] {
+            assert_eq!(
+                NegativeCashClassificationDto::from_domain(&classification).code(),
+                classification.code()
+            );
+            assert_eq!(
+                serde_json::to_value(NegativeCashClassificationDto::from_domain(&classification))
+                    .expect("serialisation"),
+                serde_json::Value::String(classification.code().to_owned())
+            );
+        }
     }
 }

@@ -55,7 +55,8 @@ use utoipa::{IntoParams, PartialSchema, ToSchema};
 use uuid::Uuid;
 
 use crate::vocabulary::{
-    DataQualityStatusDto, NotComputableCodeDto, VerdictCodeDto, described_vocabulary,
+    DataQualityStatusDto, NegativeCashClassificationDto, NotComputableCodeDto, VerdictCodeDto,
+    described_vocabulary,
 };
 
 // Custom date format: the standard serialisation of `time::Date` is not
@@ -2262,17 +2263,42 @@ pub struct BalancesReportDto {
 }
 
 /// One account-and-currency carrying a negative cash balance at the report
-/// date.
+/// date, and the §11 span it is the tail of.
 ///
-/// Keyed the way a perimeter negative-cash span is keyed, so that when the
-/// perimeter assessment is wired in it becomes the source of these entries and
-/// adds its `from`, `resolved` and classification to them, rather than
-/// introducing a second notion of the same fact to reconcile with this one.
+/// Keyed the way a perimeter negative-cash span is keyed, and the assessment is
+/// now the source of the dates and the classification: the entry is one fact
+/// stated once, not two notions of negative cash to be reconciled with each
+/// other.
+///
+/// The classification is **not** a verdict on the number. Only
+/// `unsupported_margin_liability` and `unclassified_negative_cash` refuse the
+/// account's period reports, and even then the figure above is stated and the
+/// rest of the scope is calculated as usual — read `accounts[].period_reports`
+/// for that.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct NegativeCashDto {
     pub account: Uuid,
     pub currency: CurrencyDto,
     pub amount: String,
+    /// The date the balance first went negative in this currency and stayed so.
+    ///
+    /// Null only if the assessment produced no open span for this account and
+    /// currency, which the fold that produces both makes unreachable. It is
+    /// null rather than the entry being absent because a figure is never
+    /// withheld for want of an explanation.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub from: Option<Date>,
+    /// The date the balance returned to non-negative — always null here, and
+    /// that is the point: an entry exists because the balance is still negative
+    /// at the report date, so its span is still open. A closed span can appear
+    /// in `accounts[].period_reports_refused`, and there this field is dated.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub resolved: Option<Date>,
+    /// Why the balance is negative (§11). Null under the same unreachable
+    /// condition as `from`.
+    pub classification: Option<NegativeCashClassificationDto>,
 }
 
 /// Cash and positions for one contour account.
@@ -2282,6 +2308,43 @@ pub struct AccountBalanceDto {
     pub cash: Vec<BalanceCashDto>,
     pub reconciliation: Vec<ReconciliationStatusDto>,
     pub positions: Vec<PositionQuantityDto>,
+    /// `calculated` — nothing in §11 stops the period's tax and financial
+    /// reports for this account. `refused` — §11 stops them, and
+    /// `period_reports_refused` says why.
+    ///
+    /// The refusal is **this account's alone**: every other row in `accounts`
+    /// is calculated exactly as it would have been, which is what §11 requires.
+    /// It is also not a refusal of this row: `cash` and `positions` above are
+    /// observed facts and are stated either way, because the perimeter always
+    /// retains an observable cash effect and declines only to reconstruct
+    /// financing economics it does not support.
+    pub period_reports: String,
+    /// The spans that refuse this account's period reports. Always present;
+    /// empty exactly when `period_reports` is `calculated`.
+    ///
+    /// A span already closed at the report date can appear here: a deficit that
+    /// nothing explained still refuses the period it fell in, even though the
+    /// balance has since recovered and no `negative_cash` entry remains.
+    pub period_reports_refused: Vec<PerimeterRefusalDto>,
+}
+
+/// One §11 negative-cash span, as the reason an account's period reports are
+/// refused.
+///
+/// No account field: it is a property of the row it hangs on, and repeating it
+/// would invite a client to believe it could differ.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PerimeterRefusalDto {
+    pub currency: CurrencyDto,
+    /// The date the balance went negative.
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    /// The date it returned to non-negative; null while it is still open.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub resolved: Option<Date>,
+    pub classification: NegativeCashClassificationDto,
 }
 
 /// A cash figure and where its accumulation starts.
@@ -2317,10 +2380,15 @@ impl BalancesReportDto {
             negative_cash: report
                 .negative_cash
                 .iter()
-                .map(|(account, money)| NegativeCashDto {
-                    account: account.inner(),
-                    currency: CurrencyDto::from_domain(money.currency()),
-                    amount: money.to_calc_dec().inner().to_string(),
+                .map(|entry| NegativeCashDto {
+                    account: entry.account.inner(),
+                    currency: CurrencyDto::from_domain(entry.money.currency()),
+                    amount: entry.money.to_calc_dec().inner().to_string(),
+                    from: entry.span.map(|span| span.from),
+                    resolved: entry.span.and_then(|span| span.resolved),
+                    classification: entry.span.map(|span| {
+                        NegativeCashClassificationDto::from_domain(&span.classification)
+                    }),
                 })
                 .collect(),
         }
@@ -2352,6 +2420,20 @@ impl AccountBalanceDto {
                     instrument: key.instrument.inner(),
                     custody: key.custody.map(|custody| custody.inner()),
                     quantity: quantity.0.inner().to_string(),
+                })
+                .collect(),
+            period_reports: row.period_reports.code().to_owned(),
+            period_reports_refused: row
+                .period_reports
+                .refusals()
+                .iter()
+                .map(|span| PerimeterRefusalDto {
+                    currency: CurrencyDto::from_domain(span.currency),
+                    from: span.from,
+                    resolved: span.resolved,
+                    classification: NegativeCashClassificationDto::from_domain(
+                        &span.classification,
+                    ),
                 })
                 .collect(),
         }

@@ -32,16 +32,19 @@ use crate::dto::{
     MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowCurrencyDto, MoneyFlowReportDto,
     NegativeCashDto, NotDecomposedAccountDto, NotDecomposedDto, OfferChoiceDto,
     OpeningAssertionsDto, OperationDatesDto, OperationDto, OperationKindDto, OwnerBalanceRequest,
-    PositionCoverageDto, PostingKindDto, PriceFreshnessDto, PriceOriginDto, PriceProvenanceDto,
-    PriceQualityDto, PriceSelectionDto, ProspectiveMetricDto, QuotationBasisDto,
-    QuotationBasisStatusDto, RateDto, ReconciliationResponseDto, ReconciliationStatusDto,
-    RefusedRowDto, RequestPlanDto, ReturnsReportDto, RowNameDto, SelectedPriceDto,
-    SubmitCorrectionsRequest, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
-    TaintDto, TokenDto, TristateDto, UncoveredPositionDto, VerdictDto, ZeroReinvestmentMetricsDto,
+    PerimeterRefusalDto, PositionCoverageDto, PostingKindDto, PriceFreshnessDto, PriceOriginDto,
+    PriceProvenanceDto, PriceQualityDto, PriceSelectionDto, ProspectiveMetricDto,
+    QuotationBasisDto, QuotationBasisStatusDto, RateDto, ReconciliationResponseDto,
+    ReconciliationStatusDto, RefusedRowDto, RequestPlanDto, ReturnsReportDto, RowNameDto,
+    SelectedPriceDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
+    SubmitOperationsRequest, SyncOutcomeDto, TaintDto, TokenDto, TristateDto, UncoveredPositionDto,
+    VerdictDto, ZeroReinvestmentMetricsDto,
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
-use crate::vocabulary::{DataQualityStatusDto, NotComputableCodeDto, VerdictCodeDto};
+use crate::vocabulary::{
+    DataQualityStatusDto, NegativeCashClassificationDto, NotComputableCodeDto, VerdictCodeDto,
+};
 
 /// Authentication scheme. Declared separately: `utoipa` generates it
 /// from types, but the `Bearer` requirement cannot be expressed by a type.
@@ -88,6 +91,8 @@ impl Modify for BearerSecurity {
         BalanceCashDto,
         BalancesReportDto,
         NegativeCashDto,
+        PerimeterRefusalDto,
+        NegativeCashClassificationDto,
         AccountResidualDto,
         BrokerEnvironmentDto,
         ApiError,

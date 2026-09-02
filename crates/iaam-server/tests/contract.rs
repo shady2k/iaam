@@ -5656,15 +5656,245 @@ async fn a_negative_cash_balance_is_stated_by_the_answer_and_not_refused() {
     assert_eq!(overdrawn["cash"][0]["opening"], "unasserted", "{body}");
     assert_eq!(positive["cash"][0]["opening"], "unasserted", "{body}");
 
+    // The entry is the open §11 span seen with its amount: same key, plus the
+    // date it opened and what the perimeter makes of it. `resolved` is null
+    // because the balance is still negative at the report date.
     assert_eq!(
         body["negative_cash"],
         json!([{
             "account": overdrawn_id,
             "currency": "RUB",
             "amount": "-1500.00",
+            "from": "2026-08-06",
+            "resolved": null,
+            "classification": "unclassified_negative_cash",
         }]),
         "{body}"
     );
+
+    // An unexplained deficit refuses the period's reports for its own account
+    // (§11) — and for no other. The refusal does not take the figure away: the
+    // row above still carries `-1500.00`.
+    assert_eq!(overdrawn["period_reports"], "refused", "{body}");
+    assert_eq!(
+        overdrawn["period_reports_refused"],
+        json!([{
+            "currency": "RUB",
+            "from": "2026-08-06",
+            "resolved": null,
+            "classification": "unclassified_negative_cash",
+        }]),
+        "{body}"
+    );
+    assert_eq!(positive["period_reports"], "calculated", "{body}");
+    assert_eq!(positive["period_reports_refused"], json!([]), "{body}");
+}
+
+/// The defect this pins: §11 was implemented in full — three classifications,
+/// spans, and `blocks_period_reports` — and no request executed it, so the
+/// balances answer replied as if the perimeter did not exist.
+///
+/// The margin case is the one the perimeter exists for: the account carries
+/// financing from outside it, the system does not reconstruct that economics,
+/// and the period's reports are refused **for that account**. The second
+/// account is the other half of §11 and the half that is easy to lose: the
+/// remainder must still be calculated. A refusal that spread to the scope would
+/// let one unrecognised row disable the whole portfolio.
+#[tokio::test]
+async fn margin_financing_refuses_one_accounts_period_reports_and_no_others() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Unencumbered" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let healthy = created["id"].as_str().expect("account id").to_owned();
+    let margin = harness.account.inner().to_string();
+
+    let contour = json!({
+        "title": "Margin and not",
+        "accounts": [margin, healthy],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": margin,
+                "type": "deposit",
+                "amount": "1000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "margin-deposit"
+            },
+            {
+                "account": margin,
+                "type": "withdrawal",
+                "amount": "2500.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-06" },
+                "idempotency_key": "margin-withdrawal"
+            },
+            // The credit indicator. Without it the same deficit would be
+            // unclassified; with it the system knows it is financing it does
+            // not support.
+            {
+                "account": margin,
+                "type": "fee",
+                "amount": "40.00",
+                "currency": "RUB",
+                "origin": "margin_interest",
+                "dates": { "cash_posted": "2026-08-07" },
+                "idempotency_key": "margin-interest"
+            },
+            {
+                "account": healthy,
+                "type": "deposit",
+                "amount": "4200.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "healthy-deposit"
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    // A per-account exclusion inside a 200, not a 4xx for the request: the
+    // answer is calculable, and refusing all of it would refuse the accounts
+    // §11 says to keep calculating.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["accounts"].as_array().expect("balance rows");
+    let blocked = rows
+        .iter()
+        .find(|row| row["account"].as_str() == Some(margin.as_str()))
+        .expect("margin row");
+    let calculated = rows
+        .iter()
+        .find(|row| row["account"].as_str() == Some(healthy.as_str()))
+        .expect("healthy row");
+
+    assert_eq!(blocked["period_reports"], "refused", "{body}");
+    assert_eq!(
+        blocked["period_reports_refused"],
+        json!([{
+            "currency": "RUB",
+            "from": "2026-08-06",
+            "resolved": null,
+            "classification": "unsupported_margin_liability",
+        }]),
+        "{body}"
+    );
+    // The observable cash effect is retained: the perimeter declines to
+    // reconstruct the economics, not to state the figure.
+    assert_eq!(blocked["cash"][0]["amount"], "-1540.00", "{body}");
+
+    assert_eq!(calculated["period_reports"], "calculated", "{body}");
+    assert_eq!(calculated["period_reports_refused"], json!([]), "{body}");
+    assert_eq!(calculated["cash"][0]["amount"], "4200.00", "{body}");
+
+    assert_eq!(
+        body["negative_cash"],
+        json!([{
+            "account": margin,
+            "currency": "RUB",
+            "amount": "-1540.00",
+            "from": "2026-08-06",
+            "resolved": null,
+            "classification": "unsupported_margin_liability",
+        }]),
+        "{body}"
+    );
+}
+
+/// A deficit closed by settlement inside the permitted term is ordinary
+/// operation, and §11 says so in as many words. The period's reports go on
+/// being calculated, and the answer says `calculated` rather than staying
+/// silent — silence would be indistinguishable from an account nobody assessed.
+#[tokio::test]
+async fn a_temporary_settlement_deficit_does_not_refuse_the_period_reports() {
+    let harness = harness();
+    let account = harness.account.inner().to_string();
+    let contour = json!({
+        "title": "Settlement timing",
+        "accounts": [account],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": account,
+                "type": "withdrawal",
+                "amount": "2500.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-06" },
+                "idempotency_key": "deficit-withdrawal"
+            },
+            // Two days later, inside the default five-day window.
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "3000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-08" },
+                "idempotency_key": "deficit-settlement"
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = &body["accounts"][0];
+    assert_eq!(row["period_reports"], "calculated", "{body}");
+    assert_eq!(row["period_reports_refused"], json!([]), "{body}");
+    assert_eq!(row["cash"][0]["amount"], "500.00", "{body}");
+    // The span closed before the report date, so nothing is negative now.
+    assert_eq!(body["negative_cash"], json!([]), "{body}");
 }
 
 /// The queue asks for the opening point first and does not put the closing

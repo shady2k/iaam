@@ -254,6 +254,20 @@ one it is a sign to check — most often a sign of exactly the missing anchor
 above, since spending money that arrived before the journal began produces a
 negative sum out of nothing wrong.
 
+**Read the classification, not the sign.** A negative figure arrives with the
+dates it opened and closed on and with the system's reading of why: a temporary
+settlement deficit, which is ordinary and settles; financing from outside the
+perimeter, which the system knows it does not reconstruct; or unclassified,
+which means the reason is unknown and not that money is missing.
+
+The last two carry a consequence, and it is the one an agent misreports. For
+that account, and **only** that account, the period's tax and financial reports
+are refused: the system will not compute what it cannot ground. The balance is
+still there and still stated. So the refusal is about a calculation, not about
+the figure, and it is not about the rest of the portfolio — every other account
+in the scope is calculated as usual. Saying "the report failed" or "the balance
+is unavailable" describes neither.
+
 ## How to read the return report
 
 The report returns what was contributed and withdrawn over the whole history,

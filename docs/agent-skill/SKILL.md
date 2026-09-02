@@ -239,8 +239,16 @@ arrived yet, which is an ordinary state of a correct journal.
 
 The key rate, an FX rate and a price as of a date are served as reference
 facts: every row carries the value, the date or the interval's boundaries, the
-source, the observation moment, the quality and the completeness boundary. Such
-a row can be quoted to the owner verbatim.
+source, the observation moment and the quality. Such a row can be quoted to the
+owner verbatim.
+
+The **completeness boundary** is carried by the answer, not by a row, because it
+is one fact about the whole answer rather than a property each row could differ
+in. That is what lets an answer with no rows still say something: an empty series
+whose boundary is a date means the instance has this series and nothing to report
+in the interval you asked about, and an empty series whose boundary is absent
+means it holds nothing for the series at all. Those are different situations and
+must not be reported alike — the second is not evidence that no rate existed.
 
 Adding them up, recomputing them and deriving a return from them is not
 allowed. Any derived quantity is taken from the report whole — otherwise it

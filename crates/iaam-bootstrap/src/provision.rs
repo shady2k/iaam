@@ -8,6 +8,7 @@ use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::{BrokerAccessCiphertext, NewBrokerAccess, SoleOwner};
+use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::documents::BrokerCode;
 use thiserror::Error;
 use uuid::Uuid;
@@ -22,6 +23,10 @@ pub enum ProvisionError {
     NoOwner,
     #[error("multiple owners: choosing which one should receive access is impossible")]
     SeveralOwners,
+    #[error("active broker access not found")]
+    AccessNotFound,
+    #[error("broker {broker} has no known operation-type dictionary")]
+    UnknownDictionary { broker: String },
     #[error("access was not stored: {0}")]
     NotStored(#[from] iaam_store::StoreError),
     #[error("access could not be opened with the old key: {0}")]
@@ -50,6 +55,19 @@ pub fn add_broker_access(
         SoleOwner::None => return Err(ProvisionError::NoOwner),
         SoleOwner::Several => return Err(ProvisionError::SeveralOwners),
     };
+    let (dictionary, seed) =
+        iaam_broker::operation_kind::seed_for(broker.as_str()).ok_or_else(|| {
+            ProvisionError::UnknownDictionary {
+                broker: broker.as_str().to_owned(),
+            }
+        })?;
+    let entries: Vec<BrokerOperationKind> = seed
+        .iter()
+        .map(|(source_kind, kind)| BrokerOperationKind {
+            source_kind: (*source_kind).to_owned(),
+            kind: (*kind).to_owned(),
+        })
+        .collect();
 
     let sealed = seal(key, token);
     let access = NewBrokerAccess {
@@ -65,7 +83,40 @@ pub fn add_broker_access(
         nonce: sealed.nonce().to_vec(),
         ciphertext: sealed.ciphertext().to_vec(),
     };
-    store.insert_broker_access(&access)?;
+    store.insert_broker_access_with_operation_kinds(&access, dictionary, &entries)?;
+    Ok(access.id)
+}
+
+/// Replace the active broker credential without creating a second access record.
+///
+/// The record identity and history are preserved; only the encrypted token changes.
+/// The plaintext is sealed before storage is touched and is never returned or logged.
+pub fn replace_broker_access(
+    store: &mut SqliteStore,
+    key: &Key,
+    broker: &str,
+    environment: Environment,
+    token: &str,
+) -> Result<Uuid, ProvisionError> {
+    let broker = BrokerCode::parse(broker).ok_or(ProvisionError::BrokerNotNamed)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(ProvisionError::TokenEmpty);
+    }
+    let owner = match store.sole_token_owner()? {
+        SoleOwner::Single(owner) => owner,
+        SoleOwner::None => return Err(ProvisionError::NoOwner),
+        SoleOwner::Several => return Err(ProvisionError::SeveralOwners),
+    };
+    let access = store
+        .find_broker_access(owner, &broker, environment.code())?
+        .ok_or(ProvisionError::AccessNotFound)?;
+    let sealed = seal(key, token);
+    store.rotate_broker_access_ciphertexts(&[BrokerAccessCiphertext {
+        id: access.id,
+        nonce: sealed.nonce().to_vec(),
+        ciphertext: sealed.ciphertext().to_vec(),
+    }])?;
     Ok(access.id)
 }
 
@@ -156,6 +207,41 @@ mod tests {
     }
 
     #[test]
+    fn provisioning_an_access_fills_the_channel_dictionary() {
+        let (mut store, _) = store_with_owner();
+
+        add_broker_access(&mut store, &key(), "tinkoff", Environment::Sandbox, TOKEN).unwrap();
+
+        let broker = BrokerCode::parse("tinkoff").unwrap();
+        let dictionary = store.broker_operation_kinds(&broker).unwrap();
+        assert_eq!(
+            dictionary.get("OPERATION_TYPE_DIV_EXT").map(String::as_str),
+            Some("dividend")
+        );
+    }
+
+    #[test]
+    fn replacing_broker_access_updates_the_active_credential_in_place() {
+        let (mut store, owner) = store_with_owner();
+        let key = key();
+        let new_token = "t.replacement-token";
+        let id =
+            add_broker_access(&mut store, &key, "tinkoff", Environment::Sandbox, TOKEN).unwrap();
+        let before = store.broker_access_history(owner).unwrap();
+
+        let replaced =
+            replace_broker_access(&mut store, &key, "tinkoff", Environment::Sandbox, new_token)
+                .unwrap();
+
+        assert_eq!(replaced, id);
+        let history = store.broker_access_history(owner).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_ne!(history[0].ciphertext, before[0].ciphertext);
+        let sealed = SealedToken::of(history[0].nonce.clone(), history[0].ciphertext.clone());
+        assert_eq!(open(&key, &sealed).unwrap().expose(), new_token);
+    }
+
+    #[test]
     fn surrounding_whitespace_is_not_part_of_the_token() {
         // The token comes from standard input, so a trailing newline is
         // unavoidable. A broker would reject a header with extra whitespace,
@@ -198,6 +284,24 @@ mod tests {
             add_broker_access(&mut store, &key(), "  ", Environment::Sandbox, TOKEN),
             Err(ProvisionError::BrokerNotNamed)
         ));
+    }
+
+    #[test]
+    fn a_broker_without_a_known_dictionary_is_refused_before_storage() {
+        let (mut store, owner) = store_with_owner();
+
+        let error = add_broker_access(&mut store, &key(), "unknown", Environment::Sandbox, TOKEN)
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            ProvisionError::UnknownDictionary { broker } if broker == "unknown"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "broker unknown has no known operation-type dictionary"
+        );
+        assert!(store.broker_access_history(owner).unwrap().is_empty());
     }
 
     #[test]

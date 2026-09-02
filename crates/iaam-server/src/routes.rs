@@ -52,24 +52,22 @@ use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 use utoipa::IntoParams;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
     AccountBalanceDto, AccountCandidateDto, AccountDto, ActionDto, ActionTargetDto,
-    ActionsResponseDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerAccessUpdateRequest,
-    BrokerSyncRequest, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest,
-    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClaimOutcomeDto,
-    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
-    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
-    CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
-    EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
-    MarketKeyRateDto, MarketPriceDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
-    MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
-    ReconciliationParams, ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest,
-    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    ActionsResponseDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
+    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
+    CategoryRuleRequest, ClaimOutcomeDto, ClassificationRuleDto, ClassificationRuleRequest,
+    ContourVersionDto, CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest,
+    CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest,
+    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
+    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
+    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
+    QuotationBasisStatusDto, ReconciliationParams, ReconciliationStatusDto, RequestPlanDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -1077,38 +1075,6 @@ fn market_source(source: MarketSourceDto) -> MarketSource {
         MarketSourceDto::CbrKeyRate => MarketSource::CbrKeyRate,
     }
 }
-/// Rotate access without returning the submitted secret.
-#[utoipa::path(
-    put,
-    path = "/v1/brokers/{broker}/access",
-    params(("broker" = String, Path, description = "Broker code")),
-    request_body = BrokerAccessUpdateRequest,
-    responses(
-        (status = 200, description = "Access updated", body = BrokerAccessDto),
-        (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 503, description = "Access encryption is not configured", body = ApiError)
-    ),
-    security(("bearer" = []))
-)]
-pub async fn update_broker_access(
-    State(state): State<ServerState>,
-    Extension(principal): Extension<Principal>,
-    Path(broker): Path<String>,
-    Json(request): Json<BrokerAccessUpdateRequest>,
-) -> Result<Json<BrokerAccessDto>, ApiFailure> {
-    require_admin(&principal)?;
-    let access = state
-        .services
-        .broker
-        .add_access(
-            principal.owner,
-            broker,
-            request.environment.to_domain(),
-            Zeroizing::new(request.token),
-        )
-        .await?;
-    Ok(Json(BrokerAccessDto::from_domain(access)))
-}
 /// The standards discovery document for this API.
 pub const API_CATALOG_BODY: &[u8] = br#"{"linkset":[{"anchor":"/v1","service-desc":[{"href":"/v1/openapi.json","type":"application/json"}],"status":[{"href":"/v1/health","type":"application/json"}]}]}"#;
 
@@ -1202,48 +1168,6 @@ pub async fn create_account(
             title: account.title,
             institution: account.institution,
         }),
-    ))
-}
-
-/// Creating broker access.
-///
-/// The token is supplied by the owner and is not returned to the caller: the response contains —
-/// only the record identifier used to revoke access (§14).
-#[utoipa::path(
-    post,
-    path = "/v1/broker-access",
-    request_body = AddBrokerAccessRequest,
-    responses(
-        (status = 201, description = "Access created", body = BrokerAccessDto),
-        (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 422, description = "Broker code or token is empty", body = ApiError),
-        (status = 503, description = "Broker access encryption is not configured", body = ApiError)
-    ),
-    security(("bearer" = []))
-)]
-pub async fn add_broker_access(
-    State(state): State<ServerState>,
-    Extension(principal): Extension<Principal>,
-    Json(request): Json<AddBrokerAccessRequest>,
-) -> Result<(StatusCode, Json<BrokerAccessDto>), ApiFailure> {
-    require_admin(&principal)?;
-    // The token is wrapped in zeroising memory as soon as the body is parsed
-    // and is never copied thereafter: it remains in plaintext until encrypted in the adapter
-    // and is zeroised when dropped.
-    let token = Zeroizing::new(request.token);
-    let created = state
-        .services
-        .broker
-        .add_access(
-            principal.owner,
-            request.broker,
-            request.environment.to_domain(),
-            token,
-        )
-        .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(BrokerAccessDto::from_domain(created)),
     ))
 }
 

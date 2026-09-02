@@ -504,6 +504,27 @@ impl BrokerVault for SqliteAdapter {
             });
         }
 
+        // This step requires no network access: the contract lists the codes, but
+        // does not say what they map to in our system — the dictionary must be populated
+        // from our own knowledge (`dictionary_seed`).
+        // The contract cross-check is separate and invoked explicitly.
+        let Some((dictionary, entries)) =
+            iaam_broker::operation_kind::seed_for(code.as_str())
+        else {
+            return Err(AppError::Invalid {
+                field: "broker".to_owned(),
+                expected: "a broker with a known operation-type dictionary".to_owned(),
+                actual: code.as_str().to_owned(),
+            });
+        };
+        let entries: Vec<BrokerOperationKind> = entries
+            .iter()
+            .map(|(source_kind, kind)| BrokerOperationKind {
+                source_kind: (*source_kind).to_owned(),
+                kind: (*kind).to_owned(),
+            })
+            .collect();
+
         // Encrypt before handing off to the blocking task: the plaintext token
         // does not cross a thread boundary and is not copied into the closure.
         let sealed = seal(key, &token);
@@ -532,7 +553,7 @@ impl BrokerVault for SqliteAdapter {
         let environment_of_access = access.environment.clone();
         self.blocking(move |store| {
             store
-                .insert_broker_access(&access)
+                .insert_broker_access_with_operation_kinds(&access, dictionary, &entries)
                 .map_err(|error| match error {
                     iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
                         what: format!("{what} is already set up: revoke the active one first"),
@@ -540,37 +561,6 @@ impl BrokerVault for SqliteAdapter {
                     other => store_error(other),
                 })?;
 
-            // The operation-type dictionary is populated here, at the same time
-            // and by the same task: access set up without a dictionary would reject
-            // the very first import entirely, and the owner would troubleshoot
-            // the broker rather than the configuration.
-            //
-            // This step requires no network access: the contract lists the codes, but
-            // does not say what they map to in our system — the dictionary must be populated
-            // from our own knowledge (`dictionary_seed`).
-            // The contract cross-check is separate and invoked explicitly.
-            //
-            // Seeding leaves existing rows untouched: setting up
-            // access again must not override the owner's decision.
-            let Some((dictionary, entries)) =
-                iaam_broker::operation_kind::seed_for(broker_of_access.as_str())
-            else {
-                return Err(AppError::Invalid {
-                    field: "broker".to_owned(),
-                    expected: "a broker with a known operation-type dictionary".to_owned(),
-                    actual: broker_of_access.as_str().to_owned(),
-                });
-            };
-            let entries: Vec<BrokerOperationKind> = entries
-                .iter()
-                .map(|(source_kind, kind)| BrokerOperationKind {
-                    source_kind: (*source_kind).to_owned(),
-                    kind: (*kind).to_owned(),
-                })
-                .collect();
-            store
-                .extend_broker_operation_kinds(&broker_of_access, dictionary, &entries)
-                .map_err(store_error)?;
             let stored = store
                 .find_broker_access(owner_of_access, &broker_of_access, &environment_of_access)
                 .map_err(store_error)?

@@ -5920,7 +5920,7 @@ git commit -m "feat(app): синхронизация с брокером и св
 - Test: `crates/iaam-server/tests/contract.rs` (дополняется)
 
 **Interfaces:**
-- Маршруты: `POST /v1/documents` (загрузка отчёта, построчный вердикт), `POST /v1/documents/{id}/reparse`, `GET /v1/reconciliation?account&from&to`, `POST /v1/reconciliation/balance` (ответ владельца на `needs_reconciliation`), `GET|POST|DELETE /v1/classification-rules`, `POST /v1/brokers/{broker}/sync`, `PUT /v1/brokers/{broker}/access`.
+- Маршруты: `POST /v1/documents` (загрузка отчёта, построчный вердикт), `POST /v1/documents/{id}/reparse`, `GET /v1/reconciliation?account&from&to`, `POST /v1/reconciliation/balance` (ответ владельца на `needs_reconciliation`), `GET|POST|DELETE /v1/classification-rules`, `POST /v1/brokers/{broker}/sync`; брокерский доступ заводится и заменяется локальными командами `iaam broker access add` и `iaam broker access rotate`.
 
 **Acceptance Criteria:**
 - Загрузка отчёта возвращает **вердикт на строку**, а не один статус на документ (§10.1)

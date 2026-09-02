@@ -52,6 +52,7 @@ use iaam_server::dto::{ReturnsReportDto, VerdictDto};
 use iaam_server::error::ApiFailure;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
+use iaam_store::broker_access::NewBrokerAccess;
 use iaam_store::market::AccruedInterestRow;
 use iaam_store::market_source_codes::SourceCodeEntry;
 use iaam_store::schedule::{
@@ -271,6 +272,7 @@ fn unprovisioned_harness() -> Harness {
         None,
         false,
         false,
+        false,
     )
 }
 
@@ -280,6 +282,17 @@ fn empty_owner_harness() -> Harness {
         None,
         true,
         false,
+        false,
+    )
+}
+
+fn broker_access_harness() -> Harness {
+    harness_with_factory_and_provisioning(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        None,
+        true,
+        true,
+        true,
     )
 }
 
@@ -287,14 +300,15 @@ fn harness_with_factory(
     store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
 ) -> Harness {
-    harness_with_factory_and_provisioning(store, channel_factory, true, true)
+    harness_with_factory_and_provisioning(store, channel_factory, true, true, false)
 }
 
 fn harness_with_factory_and_provisioning(
-    store: SqliteStore,
+    mut store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
     provisioned: bool,
     with_account: bool,
+    with_broker_access: bool,
 ) -> Harness {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -352,6 +366,21 @@ fn harness_with_factory_and_provisioning(
                 &hash_token(readonly_token),
             )
             .expect("read token");
+    }
+
+    if with_broker_access {
+        let sealed = iaam_broker::credentials::seal(&Key::from_bytes([7; 32]), BROKER_TOKEN);
+        store
+            .insert_broker_access(&NewBrokerAccess {
+                id: Uuid::new_v4(),
+                owner,
+                broker: BrokerCode::parse("tinkoff").expect("broker code"),
+                environment: "sandbox".to_owned(),
+                scope: "read_only".to_owned(),
+                nonce: sealed.nonce().to_vec(),
+                ciphertext: sealed.ciphertext().to_vec(),
+            })
+            .expect("broker access");
     }
 
     // The key is created directly from bytes, not from a file: a file in a temporary directory
@@ -1598,6 +1627,103 @@ async fn the_openapi_document_declares_bearer_security() {
 }
 
 #[tokio::test]
+async fn no_openapi_request_body_accepts_credential_fields() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let paths = spec["paths"].as_object().expect("OpenAPI paths");
+    for (path, item) in paths {
+        let Some(operations) = item.as_object() else {
+            continue;
+        };
+        for (method, operation) in operations {
+            let request_body = resolve_request_body(&operation["requestBody"], &spec["components"]);
+            let Some(content) = request_body["content"].as_object() else {
+                continue;
+            };
+            for (content_type, media) in content {
+                let schema = &media["schema"];
+                assert!(
+                    !schema_contains_credential(
+                        schema,
+                        &spec["components"]["schemas"],
+                        &mut std::collections::HashSet::new(),
+                    ),
+                    "{method} {path} {content_type} accepts a credential-shaped field"
+                );
+            }
+        }
+    }
+}
+
+fn resolve_request_body<'a>(request_body: &'a Value, components: &'a Value) -> &'a Value {
+    let Some(reference) = request_body["$ref"].as_str() else {
+        return request_body;
+    };
+    let Some(name) = reference.strip_prefix("#/components/requestBodies/") else {
+        return request_body;
+    };
+    &components["requestBodies"][name]
+}
+
+fn schema_contains_credential(
+    schema: &Value,
+    components: &Value,
+    seen_refs: &mut std::collections::HashSet<String>,
+) -> bool {
+    if schema["format"].as_str() == Some("password") || schema["writeOnly"].as_bool() == Some(true)
+    {
+        return true;
+    }
+
+    if let Some(reference) = schema["$ref"].as_str() {
+        if !seen_refs.insert(reference.to_owned()) {
+            return false;
+        }
+        let Some(name) = reference.strip_prefix("#/components/schemas/") else {
+            return false;
+        };
+        return schema_contains_credential(&components[name], components, seen_refs);
+    }
+
+    if schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| {
+            properties
+                .values()
+                .any(|property| schema_contains_credential(property, components, seen_refs))
+        })
+    {
+        return true;
+    }
+
+    for key in ["items", "not", "additionalProperties"] {
+        if schema
+            .get(key)
+            .is_some_and(|child| schema_contains_credential(child, components, seen_refs))
+        {
+            return true;
+        }
+    }
+    for key in ["allOf", "oneOf", "anyOf"] {
+        if schema
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|children| {
+                children
+                    .iter()
+                    .any(|child| schema_contains_credential(child, components, seen_refs))
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[tokio::test]
 async fn the_openapi_document_exposes_only_source_price_qualities() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
@@ -2247,87 +2373,12 @@ async fn an_event_added_behind_the_snapshot_boundary_forces_a_recompute_not_a_fa
 /// so that a substring of it does not occur in the response by chance.
 const BROKER_TOKEN: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
 
-fn add_broker_access_body() -> Value {
-    json!({ "broker": "tinkoff", "environment": "sandbox", "token": BROKER_TOKEN })
-}
-
-#[tokio::test]
-async fn a_provisioned_broker_access_never_echoes_the_token_back() {
-    // A token returned in the response will end up in the client's log, in the history
-    // of the debugging request, and in a screenshot. What the server has not returned
-    // cannot end up there (§14).
-    let harness = harness();
-
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &add_broker_access_body(),
-        ),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(body["broker"], "tinkoff");
-    assert!(
-        !body.to_string().contains(BROKER_TOKEN),
-        "the token is not exposed through any field: {body}"
-    );
-    assert!(
-        body["revoked_at"].is_null(),
-        "the created access works: {body}"
-    );
-}
-
-#[tokio::test]
-async fn the_scope_of_a_broker_access_is_read_only_whatever_the_client_sends() {
-    // The permission scope is set by the system, not the client: trading permissions
-    // are never requested under any circumstances (§14). A field supplied by the client
-    // is silently ignored — accepting it would mean creating access
-    // that can trade.
-    let harness = harness();
-
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &json!({
-                "broker": "tinkoff",
-                "environment": "sandbox",
-                "token": BROKER_TOKEN,
-                "scope": "full_access",
-            }),
-        ),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(
-        body["scope"], "read_only",
-        "the permission scope is set by the system, not the client: {body}"
-    );
-}
-
 #[tokio::test]
 async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() {
     // Revocation is not deletion: the record remains in the history, but ceases to
     // be active. A record missing from the list would mean «there was no
     // access», not «access was revoked at such-and-such time».
-    let harness = harness();
-
-    let (status, created) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &add_broker_access_body(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{created}");
-    let id = created["id"].as_str().expect("identifier").to_owned();
+    let harness = broker_access_harness();
 
     let (status, list) = call(
         &harness.router,
@@ -2335,10 +2386,14 @@ async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{list}");
-    let listed = find_access(&list, &id).expect("the created access must be in the list");
+    let id = list[0]["id"]
+        .as_str()
+        .expect("seeded identifier")
+        .to_owned();
+    let listed = find_access(&list, &id).expect("the seeded access must be in the list");
     assert!(
         listed["revoked_at"].is_null(),
-        "the newly created access is active: {listed}"
+        "the seeded access is active: {listed}"
     );
 
     let (status, body) = call(
@@ -2362,143 +2417,10 @@ async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() 
 }
 
 #[tokio::test]
-async fn both_environments_of_one_broker_are_provisioned_side_by_side() {
-    // The environments use different tokens: the sandbox does not accept the production one, and
-    // production does not accept the sandbox one. Therefore both accesses must coexist, otherwise
-    // live validation and the production channel would be mutually exclusive.
-    let harness = harness();
-
-    let (status, sandbox) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &json!({ "broker": "tinkoff", "environment": "sandbox", "token": BROKER_TOKEN }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{sandbox}");
-    assert_eq!(sandbox["environment"], "sandbox");
-
-    let (status, prod) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &json!({ "broker": "tinkoff", "environment": "prod", "token": "t.another-production-token" }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{prod}");
-    assert_eq!(prod["environment"], "prod");
-    assert_ne!(sandbox["id"], prod["id"]);
-
-    let (status, list) = call(
-        &harness.router,
-        get("/v1/broker-access", Some(&harness.owner_token)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{list}");
-    let environments: Vec<&str> = list
-        .as_array()
-        .expect("access list")
-        .iter()
-        .filter_map(|access| access["environment"].as_str())
-        .collect();
-    assert!(environments.contains(&"prod"), "{list}");
-    assert!(environments.contains(&"sandbox"), "{list}");
-}
-
-#[tokio::test]
-async fn a_second_access_in_the_same_environment_is_refused_understandably() {
-    // Two active access credentials in the same environment mean it is unclear,
-    // which one the system uses. The rejection must state the reason:
-    // ‘internal error’ would send the owner looking for a fault
-    // where there is none — in fact, the old credential must be revoked first.
-    let harness = harness();
-
-    let (status, first) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &add_broker_access_body(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{first}");
-
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &add_broker_access_body(),
-        ),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-}
-
-#[tokio::test]
-async fn an_access_without_a_named_environment_is_refused() {
-    // A default here would mean silently recording a sandbox token
-    // as production: the gateway would reject the very first request, and the
-    // rejection text would not reveal the environment — verified against the live gateway.
-    let harness = harness();
-
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &json!({ "broker": "tinkoff", "token": BROKER_TOKEN }),
-        ),
-    )
-    .await;
-
-    assert_eq!(
-        status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "environment must not default: {body}"
-    );
-}
-
-#[tokio::test]
-async fn an_unknown_environment_is_refused() {
-    let harness = harness();
-
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &json!({ "broker": "tinkoff", "environment": "staging", "token": BROKER_TOKEN }),
-        ),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-}
-
-#[tokio::test]
 async fn a_read_only_token_may_not_touch_broker_access_at_all() {
-    // Creating someone else's token, reading the list, and revoking it are access
-    // management, not portfolio reading. A read token manages nothing.
-    let harness = harness();
-
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.readonly_token,
-            &add_broker_access_body(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["code"], "forbidden");
+    // Reading the list and revoking an access are management operations, not portfolio
+    // reading. A read token manages nothing.
+    let harness = broker_access_harness();
 
     let (status, body) = call(
         &harness.router,
@@ -3975,47 +3897,6 @@ async fn a_read_only_token_may_not_sync_the_market() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
     assert_eq!(response["code"], "forbidden");
-}
-
-/// Provisioned access without a dictionary would reject the very first export outright,
-/// and the owner would investigate the broker rather than the configuration. The dictionary
-/// is populated by the same operation, with no network access required: the contract
-/// lists the codes but does not say what they map to internally.
-#[tokio::test]
-async fn provisioning_an_access_fills_the_channel_dictionary() {
-    let (harness, path) = harness_on_disk();
-
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/broker-access",
-            &harness.owner_token,
-            &add_broker_access_body(),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-
-    let store = SqliteStore::open(&path).expect("second connection");
-    let broker = BrokerCode::parse("tinkoff").expect("broker code");
-    let dictionary = store.broker_operation_kinds(&broker).expect("dictionary");
-    assert_eq!(
-        dictionary.get("OPERATION_TYPE_COUPON").map(String::as_str),
-        Some("coupon"),
-        "dictionary was not seeded"
-    );
-    // A missing synonym is easier to overlook than anything else: it breaks no
-    // obvious case, yet half the export can no longer be parsed.
-    assert_eq!(
-        dictionary.get("OPERATION_TYPE_DIV_EXT").map(String::as_str),
-        Some("dividend"),
-        "synonym was lost during seeding"
-    );
-    assert!(
-        dictionary.len() >= 35,
-        "fewer entries were seeded than the old parser recognised: {}",
-        dictionary.len()
-    );
 }
 
 /// Runs issues through the same conversion used to deliver the text

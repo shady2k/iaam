@@ -18,6 +18,7 @@ iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
 iaam-server = { path = "../iaam-server", version = "0.1.0" }
 iaam-store = { path = "../iaam-store", version = "0.1.0" }
+clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }

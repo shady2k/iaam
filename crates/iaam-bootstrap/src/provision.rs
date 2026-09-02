@@ -18,7 +18,7 @@ pub enum ProvisionError {
     BrokerNotNamed,
     #[error("token is empty")]
     TokenEmpty,
-    #[error("owner not found: issue an owner token first through IAAM_ISSUE_OWNER_TOKEN")]
+    #[error("owner not found: run `iaam claim --label <label>` first")]
     NoOwner,
     #[error("multiple owners: choosing which one should receive access is impossible")]
     SeveralOwners,

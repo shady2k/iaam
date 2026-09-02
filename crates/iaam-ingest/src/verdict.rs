@@ -23,6 +23,15 @@ pub struct Rejection {
 /// (§10.6), the possible duplicate preserves an uncertain match for the owner,
 /// the rejected row could not be parsed (§10.1), and the quarantined row was
 /// parsed but could not be recorded.
+///
+/// **Whether the fact was recorded matters more than which code it was.**
+/// `Discrepancy` is recorded deliberately: the fact was received, and hiding
+/// it until it is explained would lose data. `NeedsReconciliation` is not
+/// recorded, just as deliberately: there is nothing to record, and the
+/// question has been put to the owner. `is_recorded` below draws that line,
+/// and every code's published meaning states which side of it the code falls
+/// on — but the reason is here, because it belongs to the whole vocabulary
+/// rather than to any one of its ten entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     /// Recorded; reconciliation matched.
@@ -61,28 +70,68 @@ pub enum Verdict {
     Quarantined { reason: String },
 }
 
-impl Verdict {
-    #[must_use]
-    pub const fn code(&self) -> &'static str {
-        match self {
-            Self::Accepted { .. } => "accepted",
-            Self::Provisional { .. } => "provisional",
-            Self::PossibleDuplicate { .. } => "possible_duplicate",
-            Self::Discrepancy { .. } => "discrepancy",
-            Self::NeedsReconciliation { .. } => "needs_reconciliation",
-            Self::Duplicate { .. } => "duplicate",
-            Self::NeedsClassification { .. } => "needs_classification",
-            Self::Unsupported { .. } => "unsupported",
-            Self::Rejected { .. } => "rejected",
-            Self::Quarantined { .. } => "quarantined",
+/// The verdict vocabulary: every variant, its wire code, and what the code means.
+///
+/// This is the single source for both. `Verdict::code` below is expanded from
+/// it, and so is the enumerated, described `verdict` schema the API publishes:
+/// pass the name of a macro that accepts
+/// `Variant => "code": "meaning",` arms and it will be called with the whole
+/// list. A code therefore cannot exist without a meaning, and a client reading
+/// the contract sees the same ten entries the server can produce.
+///
+/// A hand-written copy of this table drifts — the one in the agent skill
+/// listed eight of the ten and omitted `possible_duplicate` and `quarantined`,
+/// both of which are emitted in production.
+#[macro_export]
+macro_rules! verdict_vocabulary {
+    ($receiver:path) => {
+        $receiver! {
+            Accepted => "accepted":
+                "The fact was recorded and reconciliation matched.",
+            Provisional => "provisional":
+                "The fact was recorded; no independent confirmation is available yet.",
+            PossibleDuplicate => "possible_duplicate":
+                "The fact was recorded and resembles one already in the journal. Neither is deleted and neither is merged: the owner is shown both and decides.",
+            Discrepancy => "discrepancy":
+                "The fact was recorded, but reconciliation of the dimension does not match, and the owner is investigating.",
+            NeedsReconciliation => "needs_reconciliation":
+                "Nothing was recorded: there is no owner remainder for the dimension to reconcile against.",
+            Duplicate => "duplicate":
+                "Nothing new was recorded: the idempotency key already recorded this fact, and the existing event is returned.",
+            NeedsClassification => "needs_classification":
+                "Nothing was recorded: the classification is ambiguous and an answer from the owner is required.",
+            Unsupported => "unsupported":
+                "Nothing was recorded: the operation lies outside the perimeter, so its economic interpretation is not reconstructed.",
+            Rejected => "rejected":
+                "Nothing was recorded: the row could not be parsed.",
+            Quarantined => "quarantined":
+                "Nothing was recorded: the row was read, but no fact could be written from it.",
         }
-    }
+    };
+}
 
+macro_rules! define_verdict_code {
+    ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
+        impl Verdict {
+            /// Machine-readable code for the API (§13).
+            #[must_use]
+            pub const fn code(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $code,)+
+                }
+            }
+        }
+    };
+}
+
+verdict_vocabulary!(define_verdict_code);
+
+impl Verdict {
     /// Whether the row was recorded in the journal.
     ///
-    /// Discrepancy recorded: the fact was received and must not be hidden until clarified.
-    /// would mean losing data. The reconciliation requirement does not: there is nothing
-    /// to record there; the question has been put to the owner.
+    /// The line the type-level comment above draws: a discrepancy is a
+    /// recorded fact with an open question, and a reconciliation requirement is
+    /// a question with no fact behind it.
     #[must_use]
     pub const fn is_recorded(&self) -> bool {
         match self {

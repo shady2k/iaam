@@ -50,6 +50,8 @@ use time::{Date, OffsetDateTime};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use crate::vocabulary::{DataQualityStatusDto, NotComputableCodeDto, VerdictCodeDto};
+
 // Custom date format: the standard serialisation of `time::Date` is not
 // a «YYYY-MM-DD» string, and without this line the API would accept dates
 // in an unpredictable format. Verified by execution: without it, body parsing
@@ -740,7 +742,7 @@ impl CustodyRepairOutcomeDto {
 pub struct VerdictDto {
     /// One-based operation number in the input batch.
     pub row: usize,
-    pub verdict: String,
+    pub verdict: VerdictCodeDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<Uuid>,
     /// Existing event resembling a newly recorded possible duplicate.
@@ -771,7 +773,7 @@ impl VerdictDto {
     pub fn from_domain(row: usize, verdict: &Verdict) -> Self {
         let base = Self {
             row,
-            verdict: verdict.code().to_owned(),
+            verdict: VerdictCodeDto::from_domain(verdict),
             event_id: None,
             of_event_id: None,
             level: None,
@@ -846,7 +848,7 @@ pub struct ComputedDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_computable: Option<String>,
+    pub not_computable: Option<NotComputableCodeDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -861,7 +863,7 @@ impl ComputedDto {
             },
             Computed::NotComputable { reason } => Self {
                 value: None,
-                not_computable: Some(reason.code().to_owned()),
+                not_computable: Some(NotComputableCodeDto::from_domain(reason)),
                 detail: Some(describe(reason)),
             },
         }
@@ -986,7 +988,7 @@ pub struct RateDto {
     pub iterations: u32,
     pub day_count: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_computable: Option<String>,
+    pub not_computable: Option<NotComputableCodeDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -1014,7 +1016,7 @@ pub struct ComputedCalcMoneyDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<CalcMoneyDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_computable: Option<String>,
+    pub not_computable: Option<NotComputableCodeDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -1029,7 +1031,7 @@ impl ComputedCalcMoneyDto {
             },
             Computed::NotComputable { reason } => Self {
                 value: None,
-                not_computable: Some(reason.code().to_owned()),
+                not_computable: Some(NotComputableCodeDto::from_domain(reason)),
                 detail: Some(describe(reason)),
             },
         }
@@ -1120,7 +1122,7 @@ pub struct ComputedZeroReinvestmentMetricsDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<ZeroReinvestmentMetricsDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_computable: Option<String>,
+    pub not_computable: Option<NotComputableCodeDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -1135,7 +1137,7 @@ impl ComputedZeroReinvestmentMetricsDto {
             },
             Computed::NotComputable { reason } => Self {
                 value: None,
-                not_computable: Some(reason.code().to_owned()),
+                not_computable: Some(NotComputableCodeDto::from_domain(reason)),
                 detail: Some(describe(reason)),
             },
         }
@@ -1258,7 +1260,7 @@ pub struct ComputedLifetimeCohortMetricsDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<Vec<LifetimeCohortMetricDto>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_computable: Option<String>,
+    pub not_computable: Option<NotComputableCodeDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -1278,7 +1280,7 @@ impl ComputedLifetimeCohortMetricsDto {
             },
             Computed::NotComputable { reason } => Self {
                 value: None,
-                not_computable: Some(reason.code().to_owned()),
+                not_computable: Some(NotComputableCodeDto::from_domain(reason)),
                 detail: Some(describe(reason)),
             },
         }
@@ -1327,7 +1329,7 @@ fn rate_dto(
             error_bound: String::new(),
             iterations: 0,
             day_count: fallback_day_count.to_owned(),
-            not_computable: Some(reason.code().to_owned()),
+            not_computable: Some(NotComputableCodeDto::from_domain(reason)),
             detail: Some(describe(reason)),
         },
     }
@@ -1544,7 +1546,7 @@ pub struct NavCoverageDto {
 /// Data quality block (§10.5).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DataQualityDto {
-    pub status: String,
+    pub status: DataQualityStatusDto,
     pub nav_coverage: NavCoverageDto,
     pub position_coverage: PositionCoverageDto,
     pub executability: ExecutabilitySharesDto,
@@ -1554,7 +1556,7 @@ pub struct DataQualityDto {
 impl DataQualityDto {
     fn from_domain(quality: &DataQuality) -> Self {
         Self {
-            status: quality.status.code().to_owned(),
+            status: DataQualityStatusDto::from_domain(&quality.status),
             nav_coverage: NavCoverageDto {
                 accepted_independent: quality
                     .nav_coverage
@@ -2277,7 +2279,7 @@ impl ReturnsReportDto {
                 error_bound: String::new(),
                 iterations: 0,
                 day_count: report.applied_rules.day_count.code().to_owned(),
-                not_computable: Some(reason.code().to_owned()),
+                not_computable: Some(NotComputableCodeDto::from_domain(reason)),
                 detail: Some(describe(reason)),
             },
         };
@@ -3058,7 +3060,7 @@ mod tests {
         // such a response is worse than no response, because it looks complete.
         let event = EventId::new_random();
         let provisional = VerdictDto::from_domain(1, &Verdict::Provisional { event });
-        assert_eq!(provisional.verdict, "provisional");
+        assert_eq!(provisional.verdict.code(), "provisional");
         assert_eq!(
             provisional.row, 1,
             "line number is included in the response unchanged"
@@ -3077,7 +3079,7 @@ mod tests {
                 level: iaam_app::ingest::dedup::DedupLevel::Probabilistic,
             },
         );
-        assert_eq!(possible.verdict, "possible_duplicate");
+        assert_eq!(possible.verdict.code(), "possible_duplicate");
         assert_eq!(possible.event_id, Some(possible_event.inner()));
         assert_eq!(possible.of_event_id, Some(event.inner()));
         assert_eq!(possible.level, Some(5));
@@ -3155,7 +3157,7 @@ mod tests {
         });
 
         assert_eq!(
-            dto.not_computable.as_deref(),
+            dto.not_computable.map(NotComputableCodeDto::code),
             Some("accrued_observation_missing")
         );
         assert!(
@@ -3172,7 +3174,7 @@ mod tests {
         });
 
         assert_eq!(
-            dto.not_computable.as_deref(),
+            dto.not_computable.map(NotComputableCodeDto::code),
             Some("overlapping_schedule_coverage")
         );
         assert!(
@@ -3281,7 +3283,7 @@ mod tests {
         });
         assert_eq!(missing_price.value, None);
         assert_eq!(
-            missing_price.not_computable.as_deref(),
+            missing_price.not_computable.map(NotComputableCodeDto::code),
             Some("missing_price")
         );
         let detail = missing_price.detail.expect("explanation");

@@ -107,8 +107,17 @@ pub enum NotComputable {
     /// No flows cross the perimeter boundary.
     NoExternalFlows,
     /// The log slice contains events after the report date: it was assembled incorrectly.
+    ///
+    /// A defect report, not a refusal the owner can act on: the answer is
+    /// reported as a fault in the system, never paraphrased to him as a gap in
+    /// his data. Every other variant here translates into something to tell
+    /// him; this one and `Numeric` do not.
     StateNewerThanReport { last_event: Date, as_of: Date },
     /// Arithmetic impossibility: overflow, division by zero.
+    ///
+    /// A defect report, like `StateNewerThanReport`: the arithmetic could not
+    /// be performed, which is a fault in the system rather than something
+    /// missing from the owner's data.
     Numeric { code: &'static str },
     /// The account has funding outside the perimeter: the system does not reconstruct the economics.
     UnsupportedFinancing { account: AccountId },
@@ -152,43 +161,94 @@ pub enum NotComputable {
     ExpenseUnknown,
 }
 
-impl NotComputable {
-    /// Machine-readable code for the API (§13). The external agent parses the code,
-    /// and the text is intended for humans.
-    #[must_use]
-    pub const fn code(&self) -> &'static str {
-        match self {
-            Self::MissingPrice { .. } => "missing_price",
-            Self::MissingFxRate { .. } => "missing_fx_rate",
-            Self::QuotationBasisContradictsEvidence { .. } => {
-                "quotation_basis_contradicts_evidence"
-            }
-            Self::QuotationBasisUnknown { .. } => "quotation_basis_unknown",
-            Self::RemainingFaceUnknown { .. } => "remaining_face_unknown",
-            Self::PrincipalUnknown => "principal_unknown",
-            Self::SolverRefused { .. } => "solver_refused",
-            Self::NoExternalFlows => "no_external_flows",
-            Self::StateNewerThanReport { .. } => "state_newer_than_report",
-            Self::Numeric { .. } => "numeric",
-            Self::UnsupportedFinancing { .. } => "unsupported_financing",
-            Self::ScheduleMissing { .. } => "schedule_missing",
-            Self::AccruedObservationMissing { .. } => "accrued_observation_missing",
-            Self::CouponUndetermined { .. } => "coupon_undetermined",
-            Self::OutsideScheduleCoverage { .. } => "outside_schedule_coverage",
-            Self::OverlappingScheduleCoverage { .. } => "overlapping_schedule_coverage",
-            Self::ExitNotExecutable => "exit_not_executable",
-            Self::NonPositiveDuration { .. } => "non_positive_duration",
-            Self::NonPositiveInitialCapital => "non_positive_initial_capital",
-            Self::NegativeTerminalWealth => "negative_terminal_wealth",
-            Self::AcquisitionBasisUnknown => "acquisition_basis_unknown",
-            Self::AccruedInterestAtAcquisitionUnknown => "accrued_interest_at_acquisition_unknown",
-            Self::HistoricalReceiptsUnknown => "historical_receipts_unknown",
-            Self::CohortGap { .. } => "cohort_gap",
-            Self::CurrencyMismatch { .. } => "currency_mismatch",
-            Self::ExpenseUnknown => "expense_unknown",
+/// The refusal vocabulary: every variant, its wire code, and what the code means.
+///
+/// This is the single source for both. `NotComputable::code` below is expanded
+/// from it, and so is the enumerated, described `not_computable` schema the API
+/// publishes: pass the name of a macro that accepts
+/// `Variant => "code": "meaning",` arms and it will be called with the whole
+/// list. A refusal therefore reaches the caller with a sentence saying why,
+/// and the sentence cannot drift away from the code, because neither is
+/// written twice.
+///
+/// The meaning explains the code, not the instance: which instrument had no
+/// price is a property of one refusal and travels in `detail`.
+#[macro_export]
+macro_rules! not_computable_vocabulary {
+    ($receiver:path) => {
+        $receiver! {
+            MissingPrice => "missing_price":
+                "There is no price for the instrument, so the position cannot be valued: a valuation as of the report date is needed.",
+            MissingFxRate => "missing_fx_rate":
+                "There is no exchange rate for the pair on that date, so the amount cannot be expressed in the report currency.",
+            QuotationBasisContradictsEvidence => "quotation_basis_contradicts_evidence":
+                "The recorded quotation basis contradicts the source evidence, so the quote is not converted into money.",
+            QuotationBasisUnknown => "quotation_basis_unknown":
+                "The source does not substantiate what the quote is expressed in, so it is not converted into money.",
+            RemainingFaceUnknown => "remaining_face_unknown":
+                "The remaining face value of the bond is unknown, so a percentage quote cannot be turned into an amount.",
+            PrincipalUnknown => "principal_unknown":
+                "No face value was supplied for converting the quote.",
+            SolverRefused => "solver_refused":
+                "The return equation has no unique root, or the solver did not converge: the return is not defined for this sequence of flows.",
+            NoExternalFlows => "no_external_flows":
+                "No flow crosses the perimeter boundary: nothing was contributed, so there is no return to compute.",
+            StateNewerThanReport => "state_newer_than_report":
+                "The journal slice contains events later than the report date: it was assembled incorrectly. Report this as a defect in the system, not to the owner as a gap in his data.",
+            Numeric => "numeric":
+                "Arithmetic was impossible — an overflow or a division by zero. Report this as a defect in the system, not to the owner as a gap in his data.",
+            UnsupportedFinancing => "unsupported_financing":
+                "The account carries funding from outside the perimeter, so the economics of the period are not reconstructed.",
+            ScheduleMissing => "schedule_missing":
+                "No issue schedule exists at the knowledge coordinate, so the payments cannot be derived.",
+            AccruedObservationMissing => "accrued_observation_missing":
+                "There is no accrued interest observation for the exit date.",
+            CouponUndetermined => "coupon_undetermined":
+                "The coupon amount of the current period is unknown.",
+            OutsideScheduleCoverage => "outside_schedule_coverage":
+                "The report date lies outside the coverage of the issue schedule.",
+            OverlappingScheduleCoverage => "overlapping_schedule_coverage":
+                "The report date is covered by several schedule periods, so no single period can be chosen.",
+            ExitNotExecutable => "exit_not_executable":
+                "There is no feasible exit: the accrued interest cannot be realised today.",
+            NonPositiveDuration => "non_positive_duration":
+                "The end of the horizon is no later than the metric coordinate, so there is no period to annualise over.",
+            NonPositiveInitialCapital => "non_positive_initial_capital":
+                "The initial value is not positive, so a return on it means nothing.",
+            NegativeTerminalWealth => "negative_terminal_wealth":
+                "Terminal wealth is negative, so the growth rate has no real root.",
+            AcquisitionBasisUnknown => "acquisition_basis_unknown":
+                "The historical acquisition cost of the cohort is unknown, so the realised result cannot be derived.",
+            AccruedInterestAtAcquisitionUnknown => "accrued_interest_at_acquisition_unknown":
+                "The accrued interest paid on acquisition is unknown.",
+            HistoricalReceiptsUnknown => "historical_receipts_unknown":
+                "The history of received payments was aggregated in an unknown way, so it cannot be attributed to the cohort.",
+            CohortGap => "cohort_gap":
+                "The cohort cannot be assembled: the history of lots has a gap.",
+            CurrencyMismatch => "currency_mismatch":
+                "The amounts are in different currencies and were not converted.",
+            ExpenseUnknown => "expense_unknown":
+                "The expense is unknown and has no upper bound, so not even a bounded estimate can be given.",
         }
-    }
+    };
 }
+
+macro_rules! define_not_computable_code {
+    ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
+        impl NotComputable {
+            /// Machine-readable code for the API (§13). The external agent parses the code,
+            /// and the text is intended for humans.
+            #[must_use]
+            pub const fn code(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $code,)+
+                }
+            }
+        }
+    };
+}
+
+not_computable_vocabulary!(define_not_computable_code);
 
 impl From<ValuationError> for NotComputable {
     fn from(error: ValuationError) -> Self {
@@ -213,16 +273,39 @@ pub enum DataQualityStatus {
     Incomplete,
 }
 
-impl DataQualityStatus {
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Clean => "clean",
-            Self::Mixed => "mixed",
-            Self::Incomplete => "incomplete",
+/// The data quality vocabulary: every status, its wire code, and what it means.
+///
+/// The same single source as `not_computable_vocabulary`: `DataQualityStatus::code`
+/// and the published schema are both expanded from these arms.
+#[macro_export]
+macro_rules! data_quality_status_vocabulary {
+    ($receiver:path) => {
+        $receiver! {
+            Clean => "clean":
+                "There is no material issue, and the provisional and discrepant shares of value are both zero.",
+            Mixed => "mixed":
+                "Part of the value has no independent confirmation yet. This is a normal state, not an error: an account without an export is confirmed by the owner alone.",
+            Incomplete => "incomplete":
+                "A material issue affects the answer: read `material_issues` and pass it on to the owner.",
         }
-    }
+    };
 }
+
+macro_rules! define_data_quality_status_code {
+    ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
+        impl DataQualityStatus {
+            /// Machine-readable code for the API (§13).
+            #[must_use]
+            pub const fn code(self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $code,)+
+                }
+            }
+        }
+    };
+}
+
+data_quality_status_vocabulary!(define_data_quality_status_code);
 
 /// Material data quality issue. Shown to the owner
 /// only when it affects the result (§10.5).

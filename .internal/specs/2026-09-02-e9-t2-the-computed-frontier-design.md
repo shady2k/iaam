@@ -238,9 +238,15 @@ was declared, not so that every change is declared.
 a known id (`reference.rs:513`, `latest_contour_version` at 539). The database
 can answer it — `bundle.rs:120` already runs an all-contours query inline for
 export — so what is missing is an API, not a capability. This task adds a
-`ContourView` (contour id, latest version, title, account ids) through store,
-port and adapter; a boolean would be replaced in T3 the moment a report action
-needs to name the contour.
+`ContourView` through store, port and adapter.
+
+It carries the contour id and its latest version, and nothing else. An earlier
+draft of this section asked for the title and the account ids too, on the
+argument that a report action in T3 will want to name the contour. That is
+speculation: the detector needs to know whether a contour exists and which
+version is current, and `create_first_contour`'s candidate accounts come from
+`list_accounts`, not from here. The field that is actually needed later is added
+when the action that needs it is written.
 
 One behaviour must be decided rather than inherited: `load_contour` treats a
 version with no memberships as absent (`reference.rs:531`) while bundle import

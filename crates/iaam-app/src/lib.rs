@@ -4,6 +4,7 @@
 //! no monetary arithmetic here and there never can be: every number in an API response
 //! comes from `iaam-core`.
 
+pub mod actions;
 pub mod adapters;
 pub mod market_candidate;
 /// Ingestion types available to the transport layer.

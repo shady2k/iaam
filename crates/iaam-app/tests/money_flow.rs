@@ -279,7 +279,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
     )
     .await;
 
-    let rows = account_balances(
+    let report = account_balances(
         &services,
         &principal(owner),
         contour,
@@ -288,6 +288,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
     )
     .await
     .unwrap_or_else(|error| panic!("balances: {error}"));
+    let rows = &report.accounts;
 
     assert_eq!(rows.len(), 2);
     let untouched_row = rows
@@ -302,7 +303,14 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
         .find(|row| row.account == card)
         .expect("card account present");
     assert_eq!(card_row.cash.len(), 1);
-    assert_eq!(card_row.cash[0].amount().raw(), 300_000);
+    assert_eq!(card_row.cash[0].money.amount().raw(), 300_000);
+    // Nothing asserts what the card held before its first movement, so the
+    // figure is a running sum rather than a balance.
+    assert_eq!(
+        card_row.cash[0].opening,
+        iaam_app::scenarios::reports::CashOpening::Unasserted
+    );
+    assert!(report.negative_cash.is_empty());
     assert_eq!(card_row.positions.len(), 1);
     assert_eq!(
         card_row.positions[0].1,

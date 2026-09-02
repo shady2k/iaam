@@ -3198,7 +3198,7 @@ async fn the_balances_report_and_the_reconciliation_route_render_one_status() {
     .await;
     assert_eq!(status, StatusCode::OK, "{reconciliation}");
 
-    let from_report = &balances[0]["reconciliation"][0];
+    let from_report = &balances["accounts"][0]["reconciliation"][0];
     let from_route = &reconciliation["statuses"][0];
     // Assert the shared shape is the rich one before asserting equality: two
     // renderers that both dropped the claim would agree just as well.
@@ -5316,12 +5316,14 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let rows = body.as_array().expect("balance rows");
+    let rows = body["accounts"].as_array().expect("balance rows");
     assert_eq!(rows.len(), 1);
     let row = &rows[0];
     assert_eq!(row["account"], harness.account.inner().to_string());
     assert_eq!(row["cash"][0]["currency"], "RUB");
     assert_eq!(row["cash"][0]["amount"], "3000.00");
+    assert_eq!(row["cash"][0]["opening"], "unasserted");
+    assert_eq!(body["negative_cash"], json!([]));
     assert_eq!(
         row["positions"][0]["instrument"],
         harness.instrument.inner().to_string()
@@ -5377,7 +5379,7 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let rows = body.as_array().expect("balance rows");
+    let rows = body["accounts"].as_array().expect("balance rows");
     assert_eq!(rows.len(), 2);
     let reconciled_id = harness.account.inner().to_string();
     let unstated_id = unstated_account.inner().to_string();
@@ -5422,6 +5424,327 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
 
     drop(harness);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The reported defect: an instance with one month imported and no opening
+/// assertion showed a negative cash balance on an account that cannot be
+/// overdrawn. The number was a running sum from an unknown start presented as a
+/// balance, and nothing on the answer said so.
+#[tokio::test]
+async fn a_cash_figure_says_whether_its_start_was_asserted() {
+    let harness = harness();
+    let contour = json!({
+        "title": "August starts",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "3000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "idempotency_key": "start-deposit"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let balances = format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31");
+    let (status, body) = call(&harness.router, get(&balances, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cash = &body["accounts"][0]["cash"][0];
+    assert_eq!(cash["amount"], "3000.00", "{body}");
+    assert_eq!(cash["opening"], "unasserted", "{body}");
+
+    // The remedy the queue asks for: an assertion about the state before the
+    // interval's first event, recorded through the ordinary operation.
+    let opening = json!({
+        "account": harness.account.inner(),
+        "from": "2026-08-01",
+        "to": "2026-08-31",
+        "at": "opening",
+        "cash": { "currency": "RUB", "amount": "0.00" },
+    });
+    let (status, recorded) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &opening),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, body) = call(&harness.router, get(&balances, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cash = &body["accounts"][0]["cash"][0];
+    assert_eq!(cash["amount"], "3000.00", "{body}");
+    assert_eq!(cash["opening"], "asserted", "{body}");
+}
+
+/// An assertion that opens after the first movement leaves everything before it
+/// unasserted: the sum is still a running one, and saying otherwise would mark
+/// as a balance a figure with an unknown start.
+#[tokio::test]
+async fn an_opening_assertion_that_starts_too_late_asserts_nothing() {
+    let harness = harness();
+    let contour = json!({
+        "title": "Late opening",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "3000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "idempotency_key": "late-opening-deposit"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let late = json!({
+        "account": harness.account.inner(),
+        "from": "2026-08-10",
+        "to": "2026-08-31",
+        "at": "opening",
+        "cash": { "currency": "RUB", "amount": "3000.00" },
+    });
+    let (status, recorded) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &late),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["accounts"][0]["cash"][0]["opening"], "unasserted",
+        "{body}"
+    );
+}
+
+/// A negative cash balance is a fact the answer states, not an error, not a
+/// refusal, and not a row the report drops. A technical overdraft is real;
+/// whether this one is a problem is the reader's judgement, and the answer
+/// gives them the number and the start it was accumulated from.
+///
+/// The second account pins the finding the negative one only illustrates: from
+/// an unasserted start the plausible positive figure is exactly as unfounded as
+/// the impossible negative. Both are marked; only one is anomalous.
+#[tokio::test]
+async fn a_negative_cash_balance_is_stated_by_the_answer_and_not_refused() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Plausible" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let plausible = created["id"].as_str().expect("account id").to_owned();
+    let contour = json!({
+        "title": "Overdrawn",
+        "accounts": [harness.account.inner(), plausible],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "deposit",
+                "amount": "1000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "negative-deposit"
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "2500.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-06" },
+                "idempotency_key": "negative-withdrawal"
+            },
+            {
+                "account": plausible,
+                "type": "deposit",
+                "amount": "4200.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "plausible-deposit"
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["accounts"].as_array().expect("balance rows");
+    let overdrawn_id = harness.account.inner().to_string();
+    let overdrawn = rows
+        .iter()
+        .find(|row| row["account"].as_str() == Some(overdrawn_id.as_str()))
+        .expect("overdrawn row");
+    let positive = rows
+        .iter()
+        .find(|row| row["account"].as_str() == Some(plausible.as_str()))
+        .expect("plausible row");
+
+    // The row is there, carrying the negative number rather than hiding it.
+    assert_eq!(overdrawn["cash"][0]["amount"], "-1500.00", "{body}");
+    assert_eq!(positive["cash"][0]["amount"], "4200.00", "{body}");
+    // Both were accumulated from an unasserted start. The plausible one is not
+    // exempt from the marker for looking plausible.
+    assert_eq!(overdrawn["cash"][0]["opening"], "unasserted", "{body}");
+    assert_eq!(positive["cash"][0]["opening"], "unasserted", "{body}");
+
+    assert_eq!(
+        body["negative_cash"],
+        json!([{
+            "account": overdrawn_id,
+            "currency": "RUB",
+            "amount": "-1500.00",
+        }]),
+        "{body}"
+    );
+}
+
+/// The queue asks for the opening point first and does not put the closing
+/// question before the opening one is answered.
+#[tokio::test]
+async fn the_action_queue_asks_for_the_opening_balance_before_the_closing_one() {
+    let harness = harness();
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "3000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "idempotency_key": "queue-deposit"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let assertion_requests = |body: &Value| -> Vec<Value> {
+        body["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .filter(|item| item["kind"] == "provide_control_assertion")
+            .cloned()
+            .collect()
+    };
+
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let outstanding = assertion_requests(&body);
+    assert_eq!(outstanding.len(), 1, "{body}");
+    let opening = &outstanding[0];
+    assert_eq!(opening["target"]["request"]["preset"]["at"], "opening");
+    assert_eq!(opening["target"]["operationId"], "record_owner_balance");
+    let opening_id = opening["id"].as_str().expect("action id").to_owned();
+
+    let recorded = json!({
+        "account": harness.account.inner(),
+        "from": opening["target"]["request"]["preset"]["from"],
+        "to": opening["target"]["request"]["preset"]["to"],
+        "at": "opening",
+        "cash": { "currency": "RUB", "amount": "0.00" },
+    });
+    let (status, response) = call(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.owner_token,
+            &recorded,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let outstanding = assertion_requests(&body);
+    assert_eq!(outstanding.len(), 1, "{body}");
+    let closing = &outstanding[0];
+    assert_eq!(closing["target"]["request"]["preset"]["at"], "closing");
+    // One kind, two identities: an agent deduplicating by id sees new work
+    // rather than the question it already answered.
+    assert_eq!(closing["kind"], opening["kind"]);
+    assert_ne!(closing["id"].as_str().expect("action id"), opening_id);
 }
 
 #[tokio::test]

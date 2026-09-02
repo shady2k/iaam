@@ -17,7 +17,7 @@ use iaam_app::ports::{
 };
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
-use iaam_app::scenarios::reports::{AccountBalanceRow, MoneyFlowReport};
+use iaam_app::scenarios::reports::{AccountBalanceRow, BalancesReport, MoneyFlowReport};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -2239,6 +2239,42 @@ impl MoneyFlowReportDto {
     }
 }
 
+/// The balances answer: a row per contour account, and the negative cash the
+/// answer as a whole carries.
+///
+/// An object rather than a bare array of rows, for the reason the market series
+/// wrappers are objects: `negative_cash` is one fact about the whole answer, and
+/// a copy of it on every row would invite a client to believe it could differ
+/// between them.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BalancesReportDto {
+    pub accounts: Vec<AccountBalanceDto>,
+    /// Every account-and-currency in the scope whose cash balance is negative.
+    /// Always present; empty when none is.
+    ///
+    /// A **warning, not a prohibition**: a technical overdraft happens on an
+    /// ordinary account, and a margin balance is a liability that belongs in
+    /// NAV. Nothing refuses, suppresses, or drops a row over it — the answer
+    /// states it and the reader judges. A negative balance on an account that
+    /// cannot be overdrawn is a reason to read `accounts[].cash[].opening`
+    /// before reading the number as a balance at all.
+    pub negative_cash: Vec<NegativeCashDto>,
+}
+
+/// One account-and-currency carrying a negative cash balance at the report
+/// date.
+///
+/// Keyed the way a perimeter negative-cash span is keyed, so that when the
+/// perimeter assessment is wired in it becomes the source of these entries and
+/// adds its `from`, `resolved` and classification to them, rather than
+/// introducing a second notion of the same fact to reconcile with this one.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NegativeCashDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    pub amount: String,
+}
+
 /// Cash and positions for one contour account.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AccountBalanceDto {
@@ -2248,10 +2284,19 @@ pub struct AccountBalanceDto {
     pub positions: Vec<PositionQuantityDto>,
 }
 
+/// A cash figure and where its accumulation starts.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BalanceCashDto {
     pub currency: CurrencyDto,
     pub amount: String,
+    /// `asserted` — an opening assertion covers the state before this account's
+    /// first cash movement in this currency, so `amount` is a balance.
+    /// `unasserted` — nothing does, so `amount` is a running sum from an
+    /// unknown start and is not a balance. It rides on the cash figure rather
+    /// than beside it, in `reconciliation`, because it is what a caller reading
+    /// the figure needs in order to read it correctly, and because it differs
+    /// per account and currency.
+    pub opening: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2261,6 +2306,27 @@ pub struct PositionQuantityDto {
     pub quantity: String,
 }
 
+impl BalancesReportDto {
+    pub fn from_domain(report: &BalancesReport) -> Self {
+        Self {
+            accounts: report
+                .accounts
+                .iter()
+                .map(AccountBalanceDto::from_domain)
+                .collect(),
+            negative_cash: report
+                .negative_cash
+                .iter()
+                .map(|(account, money)| NegativeCashDto {
+                    account: account.inner(),
+                    currency: CurrencyDto::from_domain(money.currency()),
+                    amount: money.to_calc_dec().inner().to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
 impl AccountBalanceDto {
     pub fn from_domain(row: &AccountBalanceRow) -> Self {
         Self {
@@ -2268,9 +2334,10 @@ impl AccountBalanceDto {
             cash: row
                 .cash
                 .iter()
-                .map(|money| BalanceCashDto {
-                    currency: CurrencyDto::from_domain(money.currency()),
-                    amount: money.to_calc_dec().inner().to_string(),
+                .map(|cash| BalanceCashDto {
+                    currency: CurrencyDto::from_domain(cash.money.currency()),
+                    amount: cash.money.to_calc_dec().inner().to_string(),
+                    opening: cash.opening.code().to_owned(),
                 })
                 .collect(),
             reconciliation: row

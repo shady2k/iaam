@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::Event;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::ids::{AccountId, InstrumentId};
@@ -16,7 +17,7 @@ use iaam_core::projection::balances::{Balances, PositionKey};
 use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
-use iaam_core::reconciliation::claim::AssertionPeriod;
+use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
@@ -66,13 +67,88 @@ pub struct MoneyFlowReport {
     pub flow: MoneyFlow,
 }
 
+/// Whether anything asserts the state a cash figure was accumulated from.
+///
+/// The projection sums cash legs from zero. Zero is a starting point only when
+/// something says the account held nothing before its first event; otherwise the
+/// figure is the movement over the imported interval, not a balance.
+///
+/// This is carried by **every** cash figure, not only by figures that look
+/// wrong. In the reported case one account showed an impossible negative and
+/// the rest showed plausible positives — and from an unasserted start the
+/// plausible ones were exactly as unfounded as the impossible one. They were
+/// merely the ones that passed a plausibility check the reader happened to
+/// have. A marker that appeared only on anomalies would confirm that mistake.
+///
+/// The distinction is per account-and-currency, because that is what an opening
+/// assertion is about and what a cash figure is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CashOpening {
+    /// An opening assertion covers the state before this account's first cash
+    /// movement in this currency.
+    Asserted,
+    /// Nothing does: the figure accumulated from an unasserted start.
+    Unasserted,
+}
+
+impl CashOpening {
+    /// The machine-readable name carried to a caller.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Asserted => "asserted",
+            Self::Unasserted => "unasserted",
+        }
+    }
+}
+
+/// One cash figure together with what is known about where it started.
+///
+/// The two travel as one value rather than in parallel collections: a caller
+/// that carried them separately could render the amount and drop the marker,
+/// which is the defect this type exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountCash {
+    pub money: Money,
+    pub opening: CashOpening,
+}
+
 /// Cash, reconciliation, and positions for one contour account.
 #[derive(Debug, Clone)]
 pub struct AccountBalanceRow {
     pub account: iaam_core::ids::AccountId,
-    pub cash: Vec<Money>,
+    pub cash: Vec<AccountCash>,
     pub reconciliation: Vec<ReconciliationStatus>,
     pub positions: Vec<(PositionKey, Quantity)>,
+}
+
+/// The balances answer: one row per contour account, plus what is true of the
+/// answer rather than of a row.
+///
+/// `negative_cash` is on the answer because it is a fact about the set — which
+/// accounts carry a liability — and a reader looking for it should not have to
+/// scan every row's every currency to find out there is none. It is a warning,
+/// not a prohibition: a technical overdraft on an ordinary account is real, and
+/// a margin balance is a liability that belongs in NAV (§11). Nothing here
+/// refuses, suppresses, or calls it an error; the answer states it and the
+/// reader judges it, which is the stance `Balances::negative_cash` already
+/// takes.
+///
+/// **How this composes with the perimeter.** `perimeter::NegativeCashSpan`
+/// (`iaam-core/src/perimeter.rs`) is the richer statement of the same fact:
+/// account, currency, `from`, `resolved`, and a `NegativeCashClassification`.
+/// `perimeter::assess` has no caller yet, and wiring it is filed separately, so
+/// this entry deliberately carries only what the projection already knows —
+/// the key `(account, currency)` and the amount, which no span carries. The key
+/// is the span's key, and at one `as_of` at most one span per account and
+/// currency is still open, so each entry here is exactly that open span. When
+/// `assess` becomes the source, the span supplies `from`, `resolved` and the
+/// classification as added fields on the same entries; it does not replace a
+/// second, differently-keyed notion of negative cash, because there is none.
+#[derive(Debug, Clone)]
+pub struct BalancesReport {
+    pub accounts: Vec<AccountBalanceRow>,
+    pub negative_cash: Vec<(AccountId, Money)>,
 }
 
 async fn resolve_contour(
@@ -158,7 +234,7 @@ pub async fn account_balances(
     contour: ContourId,
     contour_version: Option<ContourVersion>,
     as_of: Date,
-) -> Result<Vec<AccountBalanceRow>, AppError> {
+) -> Result<BalancesReport, AppError> {
     let (_version, definition) =
         resolve_contour(services, principal, contour, contour_version).await?;
     let events = services
@@ -172,7 +248,7 @@ pub async fn account_balances(
     // status beside it had already stopped confirming it (§4.8).
     let effective = resolve(&events).map_err(AppError::Correction)?;
     let mut balances = Balances::new();
-    for event in effective {
+    for event in &effective {
         balances
             .apply(event)
             .map_err(ProjectionError::from)
@@ -194,11 +270,21 @@ pub async fn account_balances(
         .map(|account| account.id)
         .filter(|account| definition.contains(*account))
         .collect();
+    // Both read the effective set for the same reason `Balances` does above: a
+    // retracted movement is not this account's first one, and a retracted
+    // assertion anchors nothing. Reading the raw journal here would put the two
+    // answers back into one function, one line apart from where that was fixed.
+    let first_cash = first_cash_movements(&effective);
+    let openings = opening_cash_assertions(&effective);
     let mut rows = Vec::with_capacity(contour_accounts.len());
     for account in contour_accounts {
         let cash = balances
             .iter_cash()
-            .filter_map(|(owner_account, money)| (owner_account == account).then_some(money))
+            .filter(|(owner_account, _)| *owner_account == account)
+            .map(|(_, money)| AccountCash {
+                money,
+                opening: cash_opening(&first_cash, &openings, account, money.currency()),
+            })
             .collect();
         let reconciliation =
             crate::scenarios::reconciliation::statuses_for_account(&ledger, account, period);
@@ -213,7 +299,96 @@ pub async fn account_balances(
             positions,
         });
     }
-    Ok(rows)
+    // Restricted to the contour: the projection holds every account the owner
+    // has, and a liability outside the requested boundary is not a fact about
+    // this answer.
+    let negative_cash = balances
+        .negative_cash()
+        .filter(|(account, _)| definition.contains(*account))
+        .collect();
+    Ok(BalancesReport {
+        accounts: rows,
+        negative_cash,
+    })
+}
+
+/// The earliest effective date of a cash movement, per account and currency.
+///
+/// Keyed by the leg's account rather than the event's: a transfer between two
+/// accounts is one event and moves cash on both, and it is the leg that the
+/// projection accumulates.
+fn first_cash_movements(events: &[&Event]) -> BTreeMap<(AccountId, CurrencyCode), Date> {
+    let mut first = BTreeMap::new();
+    for event in events {
+        let Some(date) = event.dates.effective_date() else {
+            continue;
+        };
+        for leg in &event.legs {
+            let Some(money) = leg.cash_effect() else {
+                continue;
+            };
+            first
+                .entry((leg.account, money.currency()))
+                .and_modify(|known: &mut Date| {
+                    if date < *known {
+                        *known = date;
+                    }
+                })
+                .or_insert(date);
+        }
+    }
+    first
+}
+
+/// Every opening cash assertion in the journal, as the start of the interval it
+/// speaks about — that date is what has to reach back far enough.
+fn opening_cash_assertions(events: &[&Event]) -> Vec<(AccountId, CurrencyCode, Date)> {
+    events
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ControlAssertion {
+                period,
+                claim:
+                    ControlClaim::CashBalance {
+                        currency,
+                        at: BalancePoint::Opening,
+                        ..
+                    },
+            } => Some((event.account, currency, period.from)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether an opening assertion covers the state before the first cash movement.
+///
+/// An opening assertion states the balance before the first event of its
+/// interval, so it anchors the whole accumulation exactly when its interval
+/// starts no later than the first movement. An assertion that opens after that
+/// movement leaves everything before it unasserted, and the sum is still a
+/// running one.
+///
+/// An account with cash but no dated movement cannot be anchored by anything,
+/// so it reads as unasserted rather than as a balance.
+fn cash_opening(
+    first_cash: &BTreeMap<(AccountId, CurrencyCode), Date>,
+    openings: &[(AccountId, CurrencyCode, Date)],
+    account: AccountId,
+    currency: CurrencyCode,
+) -> CashOpening {
+    let Some(first) = first_cash.get(&(account, currency)) else {
+        return CashOpening::Unasserted;
+    };
+    if openings
+        .iter()
+        .any(|(asserted_account, asserted_currency, from)| {
+            *asserted_account == account && *asserted_currency == currency && from <= first
+        })
+    {
+        CashOpening::Asserted
+    } else {
+        CashOpening::Unasserted
+    }
 }
 
 struct ReportInputs<'a> {
@@ -863,6 +1038,61 @@ mod tests {
             iaam_core::numeric::decimal::Dec::zero()
         );
         assert_eq!(report.data_quality.status, DataQualityStatus::Clean);
+    }
+
+    #[test]
+    fn an_opening_assertion_anchors_only_what_it_reaches_back_over() {
+        // An opening assertion states the balance before the first event of its
+        // own interval. It therefore anchors the accumulation exactly when that
+        // interval starts no later than the first movement; one that opens
+        // after the movement leaves everything before it unasserted, and the
+        // figure is still a running sum.
+        let account = AccountId::new_random();
+        let other = AccountId::new_random();
+        let first = date!(2026 - 08 - 05);
+        let mut movements = BTreeMap::new();
+        movements.insert((account, CurrencyCode::Rub), first);
+        movements.insert((account, CurrencyCode::Usd), first);
+
+        let covering = [(account, CurrencyCode::Rub, date!(2026 - 08 - 01))];
+        assert_eq!(
+            cash_opening(&movements, &covering, account, CurrencyCode::Rub),
+            CashOpening::Asserted
+        );
+        // The same currency, another account: an assertion is not shared.
+        assert_eq!(
+            cash_opening(&movements, &covering, other, CurrencyCode::Rub),
+            CashOpening::Unasserted
+        );
+        // The same account, another currency: nor is it shared across those.
+        assert_eq!(
+            cash_opening(&movements, &covering, account, CurrencyCode::Usd),
+            CashOpening::Unasserted
+        );
+
+        // The boundary: an interval opening on the day of the first movement
+        // still speaks about the state before it.
+        let on_the_day = [(account, CurrencyCode::Rub, first)];
+        assert_eq!(
+            cash_opening(&movements, &on_the_day, account, CurrencyCode::Rub),
+            CashOpening::Asserted
+        );
+        let a_day_late = [(account, CurrencyCode::Rub, date!(2026 - 08 - 06))];
+        assert_eq!(
+            cash_opening(&movements, &a_day_late, account, CurrencyCode::Rub),
+            CashOpening::Unasserted
+        );
+        assert_eq!(
+            cash_opening(&movements, &[], account, CurrencyCode::Rub),
+            CashOpening::Unasserted
+        );
+    }
+
+    #[test]
+    fn each_cash_opening_has_a_distinct_machine_readable_code() {
+        assert_eq!(CashOpening::Asserted.code(), "asserted");
+        assert_eq!(CashOpening::Unasserted.code(), "unasserted");
+        assert_ne!(CashOpening::Asserted.code(), CashOpening::Unasserted.code());
     }
 
     #[test]

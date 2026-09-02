@@ -12,7 +12,9 @@ use iaam_core::instrument::CurrencyRoles;
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, Quantity};
 use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
-use iaam_core::perimeter::{PerimeterPolicy, assess};
+use iaam_core::perimeter::{
+    NegativeCashSpan, PerimeterAssessment, PerimeterPolicy, assess, assess_effective,
+};
 use iaam_core::projection::balances::{Balances, PositionKey};
 use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
@@ -113,6 +115,45 @@ pub struct AccountCash {
     pub opening: CashOpening,
 }
 
+/// Whether §11 lets the period's tax and financial reports be calculated for
+/// one account.
+///
+/// The refusal is **per account**: §11 requires the remainder of the scope to
+/// go on being calculated, so this is a field on a row rather than a state of
+/// the answer. It is also not a refusal of the row: the account's observed cash
+/// and positions are stated either way, because the perimeter retains an
+/// observable cash effect and declines only to reconstruct financing economics
+/// it does not support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeriodReports {
+    /// Nothing in the assessment stops the period's reports for this account.
+    Calculated,
+    /// §11 refuses them, for the reasons carried here. Never empty: it is
+    /// constructed only when the assessment says the account is blocked, and a
+    /// refusal without its reason is the shape the owner cannot act on.
+    Refused(Vec<NegativeCashSpan>),
+}
+
+impl PeriodReports {
+    /// The machine-readable name carried to a caller.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Calculated => "calculated",
+            Self::Refused(_) => "refused",
+        }
+    }
+
+    /// The spans that refuse the period's reports; empty when none does.
+    #[must_use]
+    pub fn refusals(&self) -> &[NegativeCashSpan] {
+        match self {
+            Self::Calculated => &[],
+            Self::Refused(spans) => spans,
+        }
+    }
+}
+
 /// Cash, reconciliation, and positions for one contour account.
 #[derive(Debug, Clone)]
 pub struct AccountBalanceRow {
@@ -120,6 +161,8 @@ pub struct AccountBalanceRow {
     pub cash: Vec<AccountCash>,
     pub reconciliation: Vec<ReconciliationStatus>,
     pub positions: Vec<(PositionKey, Quantity)>,
+    /// What §11 says about this account's period reports (§11).
+    pub period_reports: PeriodReports,
 }
 
 /// The balances answer: one row per contour account, plus what is true of the
@@ -137,18 +180,33 @@ pub struct AccountBalanceRow {
 /// **How this composes with the perimeter.** `perimeter::NegativeCashSpan`
 /// (`iaam-core/src/perimeter.rs`) is the richer statement of the same fact:
 /// account, currency, `from`, `resolved`, and a `NegativeCashClassification`.
-/// `perimeter::assess` has no caller yet, and wiring it is filed separately, so
-/// this entry deliberately carries only what the projection already knows —
-/// the key `(account, currency)` and the amount, which no span carries. The key
-/// is the span's key, and at one `as_of` at most one span per account and
-/// currency is still open, so each entry here is exactly that open span. When
-/// `assess` becomes the source, the span supplies `from`, `resolved` and the
-/// classification as added fields on the same entries; it does not replace a
-/// second, differently-keyed notion of negative cash, because there is none.
+/// The key is the span's key, and at one `as_of` at most one span per account
+/// and currency is still open, so each entry here **is** that open span — the
+/// projection supplies the amount, which no span carries, and the span supplies
+/// the dates and the classification. That is why wiring `assess` in was
+/// additive: it added fields to these entries rather than introducing a second,
+/// differently-keyed notion of negative cash to reconcile with them.
 #[derive(Debug, Clone)]
 pub struct BalancesReport {
     pub accounts: Vec<AccountBalanceRow>,
-    pub negative_cash: Vec<(AccountId, Money)>,
+    pub negative_cash: Vec<NegativeCash>,
+}
+
+/// One account-and-currency whose cash balance is negative at the report date,
+/// with the perimeter span it is the tail of.
+///
+/// The amount comes from the projection and the span from the assessment, and
+/// the **projection decides which entries exist**. A figure is never withheld
+/// for want of an explanation: if the assessment produced no open span for the
+/// key, the entry is still here with the number on it and `span` is `None`.
+/// Driving the list from the spans instead would let a disagreement between the
+/// two folds silently drop a negative balance from the answer, which is the one
+/// outcome §11 forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegativeCash {
+    pub account: AccountId,
+    pub money: Money,
+    pub span: Option<NegativeCashSpan>,
 }
 
 async fn resolve_contour(
@@ -254,7 +312,16 @@ pub async fn account_balances(
             .map_err(ProjectionError::from)
             .map_err(AppError::from_projection)?;
     }
-    let ledger = ReconciliationLedger::build(&events)?;
+    // §11 is assessed from the set already in hand rather than from the raw
+    // journal: `assess` would resolve it a second time, and a request that
+    // folds one journal three times leaves the next reader to work out which
+    // fold is authoritative.
+    let perimeter = assess_effective(&effective, PerimeterPolicy::default())?;
+    // `build_with`, as the returns path does it: a discrepancy the perimeter
+    // explains becomes `Excepted` rather than something the owner is sent to
+    // fix. Plain `build` here would have told him to reconcile financing the
+    // system deliberately does not reconstruct.
+    let ledger = ReconciliationLedger::build_with(&events, &perimeter.exceptions())?;
     let period = AssertionPeriod::between(as_of, as_of).ok_or_else(|| AppError::Invalid {
         field: "period".into(),
         expected: "from no later than to".into(),
@@ -297,19 +364,56 @@ pub async fn account_balances(
             cash,
             reconciliation,
             positions,
+            period_reports: period_reports(&perimeter, account),
         });
     }
+    // At the report date at most one span per account and currency is still
+    // open, so this is a lookup and not a search: each negative figure below is
+    // the tail of exactly one of these.
+    let open_spans: BTreeMap<(AccountId, CurrencyCode), NegativeCashSpan> = perimeter
+        .spans()
+        .iter()
+        .filter(|span| span.resolved.is_none())
+        .map(|span| ((span.account, span.currency), *span))
+        .collect();
     // Restricted to the contour: the projection holds every account the owner
     // has, and a liability outside the requested boundary is not a fact about
     // this answer.
     let negative_cash = balances
         .negative_cash()
         .filter(|(account, _)| definition.contains(*account))
+        .map(|(account, money)| NegativeCash {
+            account,
+            money,
+            span: open_spans.get(&(account, money.currency())).copied(),
+        })
         .collect();
     Ok(BalancesReport {
         accounts: rows,
         negative_cash,
     })
+}
+
+/// What §11 says about one account's period reports.
+///
+/// The predicate comes from the assessment rather than being re-derived here:
+/// `blocks_period_reports` is the §11 question, and a second answer to it in
+/// the wrapper is the kind of divergence that leaves the reason on the wire
+/// disagreeing with the refusal beside it. The spans are that answer's reason,
+/// filtered to the blocking ones — a temporary settlement deficit is not a
+/// reason for a refusal it did not cause.
+fn period_reports(perimeter: &PerimeterAssessment, account: AccountId) -> PeriodReports {
+    if !perimeter.blocks_period_reports(account) {
+        return PeriodReports::Calculated;
+    }
+    PeriodReports::Refused(
+        perimeter
+            .spans()
+            .iter()
+            .filter(|span| span.account == account && span.classification.blocks_reports())
+            .copied()
+            .collect(),
+    )
 }
 
 /// The earliest effective date of a cash movement, per account and currency.

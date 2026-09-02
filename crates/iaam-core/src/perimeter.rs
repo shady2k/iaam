@@ -53,15 +53,6 @@ pub enum NegativeCashClassification {
 }
 
 impl NegativeCashClassification {
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::TemporarySettlementDeficit => "temporary_settlement_deficit",
-            Self::UnsupportedMarginLiability => "unsupported_margin_liability",
-            Self::UnclassifiedNegativeCash => "unclassified_negative_cash",
-        }
-    }
-
     /// Whether this classification blocks tax and financial reports for the
     /// period (§11). A temporary settlement deficit does not.
     #[must_use]
@@ -72,6 +63,50 @@ impl NegativeCashClassification {
         }
     }
 }
+
+/// The negative-cash vocabulary: every classification, its wire code, and what
+/// the code means.
+///
+/// The single source for both, exactly as `not_computable_vocabulary` is for
+/// refusals: `NegativeCashClassification::code` below is expanded from these
+/// arms, and so is the enumerated, described schema the API publishes. Pass the
+/// name of a macro that accepts `Variant => "code": "meaning",` arms and it will
+/// be called with the whole list.
+///
+/// The point of the arrangement is that a classification cannot reach the wire
+/// without its meaning reaching the contract, because neither is written twice;
+/// and that a variant added here without an entry fails to compile.
+#[macro_export]
+macro_rules! negative_cash_classification_vocabulary {
+    ($receiver:path) => {
+        $receiver! {
+            TemporarySettlementDeficit => "temporary_settlement_deficit":
+                "The balance went negative and a known settlement restored it within the permitted term. Ordinary operation: the period's tax and financial reports are still calculated for the account.",
+            UnsupportedMarginLiability => "unsupported_margin_liability":
+                "Margin interest or another credit indicator accompanies the deficit, so the account carries financing from outside the perimeter. The system does not reconstruct that economics, and the period's tax and financial reports are refused for this account.",
+            UnclassifiedNegativeCash => "unclassified_negative_cash":
+                "The balance is negative for a reason the journal does not explain. The period's tax and financial reports are refused for this account until it is explained.",
+        }
+    };
+}
+
+macro_rules! define_negative_cash_classification_code {
+    ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
+        impl NegativeCashClassification {
+            /// Machine-readable code for the API (§13). The external agent
+            /// parses the code; the meaning beside it in the vocabulary is for
+            /// the human reading the contract.
+            #[must_use]
+            pub const fn code(self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $code,)+
+                }
+            }
+        }
+    };
+}
+
+negative_cash_classification_vocabulary!(define_negative_cash_classification_code);
 
 /// Negative-cash interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,9 +258,23 @@ pub fn assess(
     events: &[Event],
     policy: PerimeterPolicy,
 ) -> Result<PerimeterAssessment, PerimeterError> {
-    let effective = resolve(events)?;
+    assess_effective(&resolve(events)?, policy)
+}
+
+/// Perimeter assessment from a journal whose corrections are already resolved.
+///
+/// For the caller that has the effective set in hand and needs the assessment
+/// beside it. `resolve` is deterministic, so a second fold would not disagree
+/// with the first — it would merely do the same work again, and a request that
+/// folds the same journal three times invites the next reader to wonder which
+/// fold is the authoritative one. `assess` above is this function preceded by
+/// the fold, so there remains exactly one definition of what is in force.
+pub fn assess_effective(
+    effective: &[&Event],
+    policy: PerimeterPolicy,
+) -> Result<PerimeterAssessment, PerimeterError> {
     let mut ordered: Vec<(Date, &Event)> = Vec::with_capacity(effective.len());
-    for event in effective {
+    for event in effective.iter().copied() {
         let date = event
             .dates
             .effective_date()

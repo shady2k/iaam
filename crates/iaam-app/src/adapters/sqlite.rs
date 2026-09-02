@@ -11,9 +11,9 @@ use crate::error::AppError;
 use crate::ports::{
     AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
     BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView,
-    CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView, CustodyView,
-    InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal, Recorded, Scope,
-    SoleOwner, Store, TokenAdmin, TokenView,
+    CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
+    CustodyView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal,
+    Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -37,7 +37,7 @@ use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::categories::NewCategoryRule;
 use iaam_store::documents::BrokerCode;
 use iaam_store::events::Appended;
-use iaam_store::reference::{AccountRecord, AliasRecord, InstrumentRecord};
+use iaam_store::reference::{AccountRecord, AliasRecord, ContourRecord, InstrumentRecord};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
 use uuid::Uuid;
@@ -285,6 +285,20 @@ impl Store for SqliteAdapter {
                     institution: account.institution,
                 })
                 .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourView>, AppError> {
+        self.blocking(move |store| {
+            let contours = store.list_contours(owner).map_err(store_error)?;
+            Ok(contours
+                .into_iter()
+                .map(|record: ContourRecord| ContourView {
+                    id: record.id,
+                    version: record.version,
+                })
+                .collect())
         })
         .await
     }

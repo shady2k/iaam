@@ -80,6 +80,13 @@ pub struct AccountView {
     pub title: String,
     pub institution: Option<String>,
 }
+
+/// The current version of an owner's contour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContourView {
+    pub id: ContourId,
+    pub version: ContourVersion,
+}
 /// Instrument as seen by the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentView {
@@ -220,6 +227,7 @@ pub trait Store: Send + Sync {
     ) -> Result<(), AppError>;
 
     async fn upsert_account(&self, owner: OwnerId, account: AccountView) -> Result<(), AppError>;
+    async fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourView>, AppError>;
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;
 
     async fn save_snapshot(&self, owner: OwnerId, snapshot: Snapshot) -> Result<(), AppError>;

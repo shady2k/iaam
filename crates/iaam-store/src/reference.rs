@@ -20,6 +20,14 @@ pub struct AccountRecord {
     pub institution: Option<String>,
 }
 
+/// The current version of a contour owned by one portfolio owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContourRecord {
+    pub id: ContourId,
+    pub owner: OwnerId,
+    pub version: ContourVersion,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentRecord {
     pub id: InstrumentId,
@@ -504,6 +512,34 @@ impl SqliteStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// List each owned contour once, at its latest version.
+    ///
+    /// The query starts from contour versions rather than membership rows so an
+    /// empty contour remains visible; `load_contour` intentionally cannot
+    /// distinguish that case from a missing version.
+    pub fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT contour, MAX(version)
+             FROM contour_versions
+             WHERE owner = ?1
+             GROUP BY contour
+             ORDER BY contour",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
+        let mut contours = Vec::new();
+        for row in rows {
+            let (id, version) = row?;
+            contours.push(ContourRecord {
+                id: ContourId(parse_uuid(&id, "contour")?),
+                owner,
+                version: ContourVersion(version),
+            });
+        }
+        Ok(contours)
     }
 
     /// Circuit composition at a version **for the specified owner**.

@@ -1,0 +1,30 @@
+# Deny by default. The build context is the three paths the release build of
+# `iaam-bootstrap` actually reads, and nothing else reaches the daemon.
+#
+# A list of things to exclude would have to be extended every time the
+# repository grows a directory; this list has to be extended only when the build
+# genuinely needs a new input, which is a change somebody notices.
+*
+
+!Cargo.toml
+!Cargo.lock
+!crates
+
+# Test targets are not compiled by the release build, and their fixtures are
+# files shaped like data. Neither belongs in a builder.
+crates/*/tests
+crates/*/benches
+
+# Never, under any circumstances, and regardless of the rules above.
+**/target
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite3
+**/*.csv
+**/*.xls
+**/*.xlsx
+**/*.ofx
+**/*.qif
+**/*.pdf

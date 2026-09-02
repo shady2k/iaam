@@ -31,6 +31,10 @@ is how you match a term in them to the code.
 | выплата (плановая) | posting | `ExpectedPosting`, `PostingKind` |
 | компенсация | compensation | |
 | минимальная единица валюты | minor unit | |
+| внесение средств | contribution | `FlowClass::ExternalIn`; money crossing into the contour |
+| вывод средств | withdrawal | `FlowClass::ExternalOut` |
+| доходность | return | never “yield”; `xirr_pre_tax` is the pre-tax return |
+| ключевая ставка | key rate | `KeyRateObservation` |
 
 ## Securities and position
 
@@ -50,7 +54,15 @@ is how you match a term in them to the code.
 | оферта | offer | the right itself is `offer right` |
 | погашение | redemption | partial one is a partial redemption |
 | амортизация | amortisation | British `-isation`, as already in the code |
-| замещение | conversion | |
+| замещение | conversion | `LineageReason::Conversion`; the instrument itself is a replacement bond |
+| внешний код | external code | ISIN, ticker, MOEX `SECID`, FIGI, broker code; `AliasNamespace` |
+| справочник инструментов | instrument catalogue | `crates/iaam-core/src/instrument.rs`; shared across all owners |
+| справочник владельца | directory | `Directory`; the owner's own names for accounts and custody |
+| род инструмента | instrument kind | `InstrumentKind`; may be unset, and that is not an error |
+| валюта обязательства | denomination currency | |
+| валюта расчётов | settlement currency | |
+| валюта котировки | quote currency | |
+| валюта отчёта | report currency | a property of the report, not of the instrument |
 
 ## Journal and projection
 
@@ -69,6 +81,9 @@ is how you match a term in them to the code.
 | дельта | delta | |
 | порядок (внутри дня) | effective order | |
 | состояние поручения | order state | `ChannelOrderState`; the broker channel's own state, not ours |
+| ключ идемпотентности | idempotency key | `idempotency_key` |
+| утверждение (владельца) | assertion | `assertions`; what the owner states — never a second source |
+| восстановленное начало | reconstructed opening | a position that existed before the journal began |
 
 ## Dates
 
@@ -81,6 +96,9 @@ is how you match a term in them to the code.
 | дата вступления в силу | effective date | |
 | координата знания | knowledge coordinate | |
 | на дату | as of | |
+| дата приобретения | acquisition date | `acquisition_date` |
+| граница владения | ownership boundary | drawn from the acquisition date; without it a posting is unverifiable |
+| момент наблюдения | observation moment | `observed_at` |
 
 ## Input and import
 
@@ -104,6 +122,10 @@ is how you match a term in them to the code.
 | разрыв | gap | `BasisGap`, `AllocationGap` |
 | разрыв покрытия | coverage gap | `ImportCoverageGap`; refused rows leave named dimensions unconfirmed |
 | сверка | reconciliation | |
+| измерение (сверки) | dimension | `dimension`; what a verdict reconciled, e.g. cash or quantity |
+| основание котировки | quotation basis | `QuotationBasis`; effective, recorded and proof status are three different things |
+| граница полноты | completeness boundary | `complete_through` |
+| выведенная (граница) | inferred | `Boundary::InferredAcrossNonTradingDays`; not “derived” for this |
 | расхождение | discrepancy | |
 | материальная проблема | material issue | |
 | качество данных | data quality | |

@@ -126,6 +126,17 @@ An instrument's kind may be unset. That is an honest "unknown", not an error:
 the valuation of such a position is marked incomplete, and the system will not
 substitute something plausible for the kind.
 
+## How an amount is stated
+
+**Amounts are always positive.** The sign is carried by the kind of operation:
+a contribution and a withdrawal are different kinds, not one sum with two
+signs. Amounts travel as strings rather than numbers, because a JSON number
+loses precision and an amount in the journal is a fact.
+
+**An amount's scale must not exceed the currency's minor unit.** A surplus
+digit after the separator is refused, not rounded: rounding at the input
+substitutes a convenient number for a fact.
+
 ## Idempotency keys
 
 Always send an idempotency key if you can construct one. Repeating a request
@@ -165,6 +176,30 @@ the interval, and that is known only as of the report date.
 **Call `xirr_pre_tax` the pre-tax return.** Not "the return", not "how much was
 earned". Taxes are not yet computed in the system, and the difference can reach
 13–15 % of the result.
+
+## What an unconfirmed posting does and does not mean
+
+The report distinguishes two things that look alike and must never be reported
+alike.
+
+**A payment was not confirmed** — the owner did hold the security that day, the
+waiting period has expired, and no crediting fact is in the journal. That is a
+defect: tell the owner the date, the instrument, the account and the kind of
+payment — a coupon or a return of principal — and ask him to load the statement
+for that period.
+
+**There is nothing to reconcile with** — no conclusion is possible because the
+evidence is missing. **This is not a claim that money went missing.** Where the
+reason is simply that the journal begins later, it is not a defect at all:
+there is nothing to load.
+
+Several equally unprovable payments for one account-and-instrument pair collapse
+into a single problem carrying a count and date bounds, because a cause at the
+level of the source is repaired by one action. Do not expand it back into a list
+and do not report each date to the owner separately.
+
+**Never call `provisional` an error.** It means no independent confirmation has
+arrived yet, which is an ordinary state of a correct journal.
 
 ## A fact can be quoted, a derived value cannot
 

@@ -23,6 +23,7 @@ use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::source_row::{RefusedRow, RowName};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
+use iaam_core::instrument::AliasNamespace;
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::money_flow::MoneyFlowError;
@@ -4271,9 +4272,62 @@ pub struct CreateInstrumentRequest {
     pub quote_currency: String,
 }
 
+/// Transport namespace of an external instrument code. A separate type because
+/// the core's `AliasNamespace` knows nothing about OpenAPI and should not.
+///
+/// The five values are the whole domain: a code belongs to exactly one of these
+/// registers, and there is no «other». Enumerating them in the contract is the
+/// point — a client that has to guess the register guesses wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasNamespaceDto {
+    /// ISIN, the international securities identification number.
+    Isin,
+    /// MOEX security identifier, as the exchange publishes it.
+    MoexSecid,
+    /// Exchange ticker.
+    Ticker,
+    /// FIGI, the OpenFIGI instrument identifier.
+    Figi,
+    /// Internal broker code: different brokers use different codes for one
+    /// security, so this register is only meaningful next to its broker.
+    BrokerCode,
+}
+
+impl AliasNamespaceDto {
+    #[must_use]
+    pub const fn to_domain(self) -> AliasNamespace {
+        match self {
+            Self::Isin => AliasNamespace::Isin,
+            Self::MoexSecid => AliasNamespace::MoexSecid,
+            Self::Ticker => AliasNamespace::Ticker,
+            Self::Figi => AliasNamespace::Figi,
+            Self::BrokerCode => AliasNamespace::BrokerCode,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_domain(namespace: AliasNamespace) -> Self {
+        match namespace {
+            AliasNamespace::Isin => Self::Isin,
+            AliasNamespace::MoexSecid => Self::MoexSecid,
+            AliasNamespace::Ticker => Self::Ticker,
+            AliasNamespace::Figi => Self::Figi,
+            AliasNamespace::BrokerCode => Self::BrokerCode,
+        }
+    }
+}
+
+/// The question the agent skill calls «resolve an external code as of a date»:
+/// which instrument is behind this code, on this document's date.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ResolveInstrumentRequest {
-    pub namespace: String,
+    /// The register the code belongs to. Together with `value` it is the
+    /// **external code**: `isin` and `RU000A0JX0J2` name one register and one
+    /// code in it, and neither half means anything alone.
+    pub namespace: AliasNamespaceDto,
+    /// The code itself, exactly as the document prints it — the other half of
+    /// the external code.
     pub value: String,
     /// Document date. Required: ISIN changes, and there is no «current»
     /// answer (§4.7).

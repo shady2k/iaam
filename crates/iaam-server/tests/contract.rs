@@ -3637,9 +3637,62 @@ async fn resolving_a_code_outside_its_interval_names_the_known_range() {
 }
 
 #[tokio::test]
-async fn an_invalid_namespace_is_a_422_naming_the_field() {
-    let (app, token, _) = server_with_one_alias();
+async fn a_two_word_namespace_resolves_under_the_spelling_the_contract_publishes() {
+    // `moex_secid` is the one register whose wire code could drift when it
+    // passes through a transport enum: the variant is two words, the code is
+    // one lower-case string, and the store matches on the string.
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
+    let instrument = InstrumentId::new_random();
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: "SBER".into(),
+            title: "Sberbank".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("instrument");
+    store
+        .record_alias(&AliasRecord {
+            namespace: AliasNamespace::MoexSecid,
+            value: "SBER".into(),
+            instrument,
+            interval: AliasInterval {
+                valid_from: date!(2020 - 01 - 01),
+                valid_to: None,
+            },
+            source: SourceId::new_random(),
+        })
+        .expect("alias");
+    let harness = harness_with(store);
+
     let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/instruments/resolve",
+            &harness.owner_token,
+            &json!({"namespace": "moex_secid", "value": "SBER", "on": "2024-03-01"}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["instrument"], instrument.inner().to_string());
+}
+
+/// The five registers an external code can belong to, in the order the
+/// contract lists them.
+///
+/// Pinned as literals rather than read from `AliasNamespace`: these are wire
+/// codes, and a test that derives them from the type it is checking would
+/// accept a rename that breaks every client.
+const NAMESPACE_CODES: [&str; 5] = ["isin", "moex_secid", "ticker", "figi", "broker_code"];
+
+#[tokio::test]
+async fn an_invalid_namespace_is_refused_with_the_valid_ones_named() {
+    let (app, token, _) = server_with_one_alias();
+    let (status, _headers, bytes) = call_raw(
         &app,
         post(
             "/v1/instruments/resolve",
@@ -3650,7 +3703,53 @@ async fn an_invalid_namespace_is_a_422_naming_the_field() {
     .await;
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["field"], "namespace");
+    let refusal = String::from_utf8_lossy(&bytes);
+    assert!(
+        refusal.contains("namespace"),
+        "the refusal must name the field it is about: {refusal}"
+    );
+    // What the client needs from a refusal is the list it should have chosen
+    // from: an agent that has to look the registers up somewhere else guesses,
+    // and guessing is what this route was reported for.
+    for code in NAMESPACE_CODES {
+        assert!(
+            refusal.contains(code),
+            "a refused namespace must carry {code}, the enumeration of what is valid: {refusal}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_openapi_document_enumerates_every_namespace_and_explains_the_resolve_request() {
+    // Reported from outside: an agent guessed `code_kind`, `code` and `as_of`
+    // before reading the schema, and the schema then did not say which
+    // namespaces exist. Both halves are checked here.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = &spec["components"]["schemas"]["ResolveInstrumentRequest"];
+    assert!(
+        refers_to(&request["properties"]["namespace"], "AliasNamespaceDto"),
+        "the namespace field must point at the enumerated vocabulary: {}",
+        request["properties"]["namespace"]
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["AliasNamespaceDto"]["enum"],
+        json!(NAMESPACE_CODES),
+        "the contract must list every register an external code can belong to"
+    );
+
+    for field in ["namespace", "value", "on"] {
+        assert!(
+            !request["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "the resolve request field {field} arrives without a meaning"
+        );
+    }
 }
 
 #[tokio::test]

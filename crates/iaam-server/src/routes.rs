@@ -227,7 +227,11 @@ pub async fn resolve_instrument(
     let instrument = state
         .services
         .directory
-        .resolve(&request.namespace, &request.value, request.on)
+        .resolve(
+            request.namespace.to_domain().code(),
+            &request.value,
+            request.on,
+        )
         .await?;
     Ok(Json(ResolvedInstrumentDto {
         instrument: instrument.inner().to_string(),

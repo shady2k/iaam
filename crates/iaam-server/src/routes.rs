@@ -22,6 +22,7 @@ use iaam_app::scenarios::categories::{
     list_category_rules, list_groups, preview_category_rule, retire_category,
 };
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
+use iaam_app::scenarios::correction::correct_events;
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
 use iaam_app::scenarios::market_reference::{
@@ -60,15 +61,16 @@ use crate::dto::{
     ActionsResponseDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
     CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
     CategoryRuleRequest, ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
-    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
-    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DocumentDto, DocumentParams,
-    FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto, MarketFxSeriesDto,
+    CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
+    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
+    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
+    ImportCorrectionDto, InstrumentDto, IssuedTokenDto, MarketFxDto, MarketFxSeriesDto,
     MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
     MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
     QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams, ReconciliationResponseDto,
     ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
-    TokenDto, TokenScopeDto, VerdictDto,
+    ReturnsReportDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
@@ -416,6 +418,112 @@ pub async fn repair_custody(
     )
     .await?;
     Ok(Json(CustodyRepairOutcomeDto::from_domain(outcome)))
+}
+
+/// Correct events the owner names: retract one, or supersede one with another.
+///
+/// A separate route rather than a relation field on the ingest DTOs, and this is
+/// a security decision rather than a stylistic one. `Scope::may_submit` admits
+/// an agent token, so an ingest row able to carry a relation would make every
+/// ingest handler — operations, CSV, journal facts, broker synchronisation — a
+/// surface on which an agent could retract the owner's history, guarded only by
+/// a per-row check that any one of those inputs could forget to make. Here the
+/// authority is a property of the route and is checked once, exactly as
+/// `require_admin` guards every other owner-only route in this file.
+///
+/// Permission is checked before the body is parsed: an agent token receives 403
+/// even for a body that is itself invalid (§7, §14).
+#[utoipa::path(
+    post,
+    path = "/v1/corrections",
+    request_body = SubmitCorrectionsRequest,
+    responses(
+        (status = 200, description = "Verdict for each correction", body = Vec<VerdictDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 409, description = "A correction key is held by an unrelated event", body = ApiError),
+        (status = 422, description = "The correction would not resolve, or the acknowledgement is missing", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn submit_corrections(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiBytes(body): ApiBytes,
+) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let request: SubmitCorrectionsRequest = serde_json::from_slice(&body)
+        .map_err(|error| invalid_field("body", "correction JSON object", error.to_string()))?;
+
+    // The batch is converted whole before anything is written: a correction is
+    // one deliberate act, and half of one applied is worse than none.
+    let mut corrections = Vec::with_capacity(request.corrections.len());
+    for (index, correction) in request.corrections.iter().enumerate() {
+        let domain = correction.to_domain().map_err(|rejection| {
+            invalid_field(
+                format!("corrections[{index}].{}", rejection.field),
+                &rejection.expected,
+                rejection.actual,
+            )
+        })?;
+        corrections.push(domain);
+    }
+
+    let verdicts = correct_events(
+        &state.services,
+        &principal,
+        request.acknowledge_retraction,
+        &corrections,
+    )
+    .await?;
+    Ok(Json(
+        verdicts
+            .iter()
+            .enumerate()
+            .map(|(index, verdict)| VerdictDto::from_domain(index + 1, verdict))
+            .collect(),
+    ))
+}
+
+/// Retract a whole import, keyed on the source that was declared for it.
+///
+/// The remedy for a month imported against the wrong account map: one request,
+/// and one reversal fact per event the import left effective. Nothing is deleted
+/// and nothing is mutated — the originals stay in the journal and stop counting,
+/// which is what §4.8 means by a correction.
+#[utoipa::path(
+    post,
+    path = "/v1/corrections/imports",
+    request_body = CorrectImportRequest,
+    responses(
+        (status = 200, description = "What the correction retracted", body = ImportCorrectionDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 409, description = "A correction key is held by an unrelated event", body = ApiError),
+        (status = 422, description = "Invalid source, or the acknowledgement is missing", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn correct_import(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiBytes(body): ApiBytes,
+) -> Result<Json<ImportCorrectionDto>, ApiFailure> {
+    require_admin(&principal)?;
+    let request: CorrectImportRequest = serde_json::from_slice(&body).map_err(|error| {
+        invalid_field("body", "import correction JSON object", error.to_string())
+    })?;
+    let source = declared_source(principal.owner, &request.source)?;
+    let outcome = iaam_app::scenarios::correction::correct_import(
+        &state.services,
+        &principal,
+        request.acknowledge_retraction,
+        source,
+    )
+    .await?;
+    Ok(Json(ImportCorrectionDto::from_domain(outcome)))
 }
 
 /// Reconciliation statuses with grounds and assertion outcomes.
@@ -1536,23 +1644,7 @@ pub async fn ingest_operations(
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
     let source = match &request.source {
-        Some(declared) => {
-            let channel = declared.channel.trim();
-            if channel.is_empty() || channel.len() > 32 {
-                return Err(ApiFailure::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    ApiError {
-                        code: "invalid_request".into(),
-                        message: "channel must be 1..=32 characters".into(),
-                        field: Some("source.channel".into()),
-                        expected: Some("a short channel name such as file, paste or manual".into()),
-                        actual: Some(declared.channel.clone()),
-                        correlation_id: None,
-                    },
-                ));
-            }
-            SourceId::declared(principal.owner, AccountId(declared.account), channel)
-        }
+        Some(declared) => declared_source(principal.owner, declared)?,
         // No declaration: today's behaviour, so existing callers keep working.
         None => SourceId::new_random(),
     };
@@ -2125,6 +2217,37 @@ fn parse_as_of(value: Option<&str>) -> Result<Option<Date>, ApiFailure> {
             },
         )
     })
+}
+
+/// The source identity a declared source names, refused when it names none.
+///
+/// Shared by ingestion and by the import correction on purpose: the correction
+/// is keyed on the very identity the import was written under, and two copies
+/// of this derivation would eventually disagree about which import a correction
+/// retracts.
+fn declared_source(
+    owner: iaam_core::ids::OwnerId,
+    declared: &DeclaredSourceDto,
+) -> Result<SourceId, ApiFailure> {
+    let channel = declared.channel.trim();
+    if channel.is_empty() || channel.len() > 32 {
+        return Err(ApiFailure::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError {
+                code: "invalid_request".into(),
+                message: "channel must be 1..=32 characters".into(),
+                field: Some("source.channel".into()),
+                expected: Some("a short channel name such as file, paste or manual".into()),
+                actual: Some(declared.channel.clone()),
+                correlation_id: None,
+            },
+        ));
+    }
+    Ok(SourceId::declared(
+        owner,
+        AccountId(declared.account),
+        channel,
+    ))
 }
 
 fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {

@@ -37,10 +37,10 @@ use iaam_core::returns::{DataQualityStatus, NotComputable};
 /// its own sentence, and validation is unchanged — the value is still one of
 /// the listed strings.
 ///
-/// Visible to the crate because one vocabulary is not expanded from a domain
-/// macro: `AliasNamespaceDto` is converted in both directions and is written
-/// out in `dto.rs`, and it publishes itself through this function rather than
-/// through a second mechanism of its own.
+/// Visible to the crate because two vocabularies are not expanded from a domain
+/// macro: `AliasNamespaceDto` and `BalancePointDto` are converted in both
+/// directions and are written out in `dto.rs`, and they publish themselves
+/// through this function rather than through a second mechanism of their own.
 pub(crate) fn described_vocabulary(description: &str, codes: &[(&str, &str)]) -> RefOr<Schema> {
     codes
         .iter()
@@ -163,6 +163,8 @@ iaam_core::data_quality_status_vocabulary!(define_data_quality_status_dto);
 mod tests {
     use super::*;
 
+    use iaam_core::reconciliation::claim::BalancePoint;
+
     #[test]
     fn a_code_serialises_to_the_string_it_replaced() {
         // The field used to be a `String` holding `Verdict::code()`. Typing it
@@ -206,6 +208,31 @@ mod tests {
                 .expect("deserialisation"),
                 dto,
                 "a code the route accepted is no longer read back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_balance_point_serialises_as_it_did_when_it_was_a_bare_string() {
+        // The field arrived as `pub at: String` and the handler compared it
+        // against two literals. Typing it enumerates those two literals in the
+        // contract; it does not license changing either of them, and the action
+        // queue presets the field with `BalancePoint::code()` at both points.
+        for point in [BalancePoint::Opening, BalancePoint::Closing] {
+            let dto = crate::dto::BalancePointDto::from_domain(point);
+            assert_eq!(
+                serde_json::to_value(dto).expect("serialisation"),
+                serde_json::Value::String(point.code().to_owned())
+            );
+            assert_eq!(dto.code(), point.code());
+            assert_eq!(dto.to_domain(), point);
+            assert_eq!(
+                serde_json::from_value::<crate::dto::BalancePointDto>(serde_json::Value::String(
+                    point.code().to_owned()
+                ))
+                .expect("deserialisation"),
+                dto,
+                "a code the action queue presets is no longer read back"
             );
         }
     }

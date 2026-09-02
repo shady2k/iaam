@@ -5667,6 +5667,159 @@ async fn a_negative_cash_balance_is_stated_by_the_answer_and_not_refused() {
     );
 }
 
+/// The two ends of an interval, in the order the contract lists them.
+///
+/// Pinned as literals rather than read from `BalancePoint`: these are wire
+/// codes, and a test that derives them from the type it is checking would
+/// accept a rename that breaks every client and every action preset already
+/// issued.
+const BALANCE_POINT_CODES: [&str; 2] = ["opening", "closing"];
+
+#[tokio::test]
+async fn the_openapi_document_enumerates_and_explains_both_balance_points() {
+    // The field was a bare `String`, so the document said only that a string
+    // was wanted, and a caller reaching for the start of the interval could
+    // write `open`, `start` or `begin` and learn the answer by being refused.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = &spec["components"]["schemas"]["OwnerBalanceRequest"];
+    assert!(
+        refers_to(&request["properties"]["at"], "BalancePointDto"),
+        "the balance point field must point at the enumerated vocabulary: {}",
+        request["properties"]["at"]
+    );
+    assert_eq!(
+        published_vocabulary(&spec, "BalancePointDto"),
+        BALANCE_POINT_CODES,
+        "the contract must list both ends of the interval"
+    );
+
+    // One sentence for the field cannot carry the distinction the caller needs:
+    // whether the interval's own events are inside the figure or outside it.
+    let meanings: Vec<&str> = spec["components"]["schemas"]["BalancePointDto"]["oneOf"]
+        .as_array()
+        .expect("the points")
+        .iter()
+        .map(|item| item["description"].as_str().expect("a meaning"))
+        .collect();
+    assert_ne!(
+        meanings[0], meanings[1],
+        "both points are explained by the same sentence: {meanings:?}"
+    );
+
+    assert!(
+        spec["components"]["schemas"]["BalancePointDto"]
+            .get("enum")
+            .is_none(),
+        "the bare enumeration is still published beside the explained one"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_balance_point_is_refused_with_both_codes_named() {
+    // `open` is the guess the old contract invited: it published a string, and
+    // the two values it would accept lived in the handler.
+    let harness = harness();
+    let (status, body) = refusal(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.owner_token,
+            &json!({
+                "account": harness.account.inner(),
+                "from": "2026-08-01",
+                "to": "2026-08-31",
+                "at": "open",
+                "cash": { "currency": "RUB", "amount": "0.00" },
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body.get("field").and_then(Value::as_str),
+        Some("at"),
+        "the refusal must name the field it is about: {body}"
+    );
+    let rendered = body.to_string();
+    for code in BALANCE_POINT_CODES {
+        assert!(
+            rendered.contains(code),
+            "a refused balance point must carry {code}, the enumeration of what is valid: {body}"
+        );
+    }
+}
+
+/// The preset is a value the caller reads out of an action and sends back
+/// unread. Typing the field is not permission to change what the queue writes
+/// there, so the round trip is exercised with the preset itself rather than
+/// with a literal a test author chose.
+#[tokio::test]
+async fn a_balance_point_taken_from_an_action_is_accepted_verbatim() {
+    let harness = harness();
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "1500.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "idempotency_key": "preset-round-trip-deposit"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    // Both points, in the order the queue asks for them: the closing question
+    // is not put until the opening one is answered.
+    for expected in BALANCE_POINT_CODES {
+        let (status, body) = call(
+            &harness.router,
+            get("/v1/actions", Some(&harness.owner_token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let action = body["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .find(|item| item["kind"] == "provide_control_assertion")
+            .unwrap_or_else(|| panic!("no assertion request for the {expected} point: {body}"))
+            .clone();
+        let preset = &action["target"]["request"]["preset"];
+        assert_eq!(preset["at"], expected, "{action}");
+
+        let recorded = json!({
+            "account": preset["account"],
+            "from": preset["from"],
+            "to": preset["to"],
+            // Sent back exactly as it was read: no mapping, no spelling of our
+            // own. A preset the route will not accept is a queue that asks for
+            // work it then refuses.
+            "at": preset["at"],
+            "cash": { "currency": "RUB", "amount": "0.00" },
+        });
+        let (status, response) = call(
+            &harness.router,
+            post(
+                "/v1/reconciliation/balance",
+                &harness.owner_token,
+                &recorded,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the {expected} preset: {response}");
+    }
+}
+
 /// The queue asks for the opening point first and does not put the closing
 /// question before the opening one is answered.
 #[tokio::test]

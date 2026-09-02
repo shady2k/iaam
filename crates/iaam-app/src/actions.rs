@@ -272,8 +272,46 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
 
 /// Find every unresolved or informational fact in a reconciliation ledger.
 pub fn ledger_diagnostics(ledger: &ReconciliationLedger) -> Vec<Action> {
+    diagnostics(ledger, None)
+}
+
+/// The same facts, restricted to one account and the periods meeting one range.
+///
+/// A scoped sibling rather than a filter over the returned items: an `Action`
+/// publishes no typed subject, only an opaque `id` and prose, so a caller
+/// answering about one account can narrow the set only here, on the ledger's own
+/// typed gaps and statuses. The predicate is the one
+/// `scenarios::reconciliation::report` already applies to its statuses and gaps
+/// — the same account, and periods that intersect the requested range.
+pub fn ledger_diagnostics_for(
+    ledger: &ReconciliationLedger,
+    account: AccountId,
+    period: AssertionPeriod,
+) -> Vec<Action> {
+    diagnostics(ledger, Some((account, period)))
+}
+
+/// Whether one subject is in the requested scope. Everything is, unscoped.
+fn in_scope(
+    scope: Option<(AccountId, AssertionPeriod)>,
+    account: AccountId,
+    period: AssertionPeriod,
+) -> bool {
+    scope.is_none_or(|(wanted, range)| {
+        account == wanted && period.from <= range.to && range.from <= period.to
+    })
+}
+
+fn diagnostics(
+    ledger: &ReconciliationLedger,
+    scope: Option<(AccountId, AssertionPeriod)>,
+) -> Vec<Action> {
     let mut actions = Vec::new();
-    for gap in ledger.gaps() {
+    for gap in ledger
+        .gaps()
+        .iter()
+        .filter(|gap| in_scope(scope, gap.account, gap.period))
+    {
         let category = ledger
             .statuses()
             .find(|status| status.account() == gap.account && status.period() == gap.period)
@@ -323,7 +361,10 @@ pub fn ledger_diagnostics(ledger: &ReconciliationLedger) -> Vec<Action> {
             ),
         ));
     }
-    for status in ledger.statuses() {
+    for status in ledger
+        .statuses()
+        .filter(|status| in_scope(scope, status.account(), status.period()))
+    {
         for dimension in Dimension::all() {
             if status.dimension(dimension) == DimensionStatus::AcceptedInternal {
                 actions.push(blocked_action(
@@ -459,6 +500,18 @@ pub fn verdict_diagnostics(verdict: &Verdict) -> Option<Action> {
             level.number()
         ),
     ))
+}
+
+/// The diagnostics for every verdict one import produced, in the settled order.
+///
+/// The plural of [`verdict_diagnostics`], and the reason it exists is the
+/// ordering: a carrier that mapped the verdicts itself would sort at the call
+/// site, and two carriers sorting separately is how two orders appear.
+#[must_use]
+pub fn verdicts_diagnostics(verdicts: &[Verdict]) -> Vec<Action> {
+    let mut actions: Vec<Action> = verdicts.iter().filter_map(verdict_diagnostics).collect();
+    sort_actions(&mut actions);
+    actions
 }
 
 fn blocked_action(

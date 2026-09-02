@@ -607,6 +607,22 @@ pub trait TokenAdmin: Send + Sync {
     /// be issued to a second owner).
     async fn sole_owner(&self) -> Result<SoleOwner, AppError>;
 
+    /// Claim an unclaimed instance: create its owner and issue that owner's
+    /// first token, in the clear **once**, exactly as `issue_token` does.
+    ///
+    /// **Deciding that the instance is unclaimed and creating the token are one
+    /// operation, not two.** A caller that asked `sole_owner` and then issued
+    /// would leave a window in which a second console process sees the same
+    /// empty instance and creates a second owner with an unrelated portfolio —
+    /// a race that has happened before (ADR-0003). Nothing in the schema
+    /// prevents it, so the implementation must, under a write transaction it
+    /// holds across both steps.
+    ///
+    /// An already-claimed instance is refused with `AppError::Conflict`. That
+    /// is not a storage failure and retrying will not fix it: a second owner
+    /// token comes from `issue_token`.
+    async fn claim_owner(&self, label: String) -> Result<IssuedToken, AppError>;
+
     /// Issue a token. Returns it in the clear **once**: the database
     /// retains the hash, and there is nowhere to retrieve the token from a second time.
     async fn issue_token(

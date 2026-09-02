@@ -17,19 +17,15 @@ use iaam_app::ports::{
 };
 use iaam_broker::credentials::Key;
 use iaam_broker::environment::Environment;
-use iaam_core::ids::OwnerId;
 use iaam_http::client::HttpClient;
 use iaam_http::resilience::{RateLimiter as MarketRateLimiter, RetryPolicy};
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::SqliteStore;
-use iaam_store::broker_access::SoleOwner as StoredSoleOwner;
 use zeroize::Zeroizing;
 
 use crate::config::Config;
 use clap::{Parser, Subcommand, ValueEnum};
-use iaam_app::tokens::{hash_token, secret_hex};
-use iaam_store::tokens::{TokenRecord, TokenScope};
 
 #[derive(Debug, Parser)]
 #[command(name = "iaam", about = "The iaam service and local administration CLI")]
@@ -222,8 +218,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Serve => serve(config).await,
         Command::Claim { label } => {
-            let mut store = SqliteStore::open(&config.database)?;
-            let token = claim_owner(&mut store, &label)?;
+            let store = SqliteStore::open(&config.database)?;
+            let admin = SqliteAdapter::new(store);
+            let token = claim_owner(&admin, &label).await?;
             println!("{token}");
             Ok(())
         }
@@ -435,50 +432,21 @@ fn read_token() -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
 
 /// Claim an instance and issue its first owner token.
 ///
-/// The owner check and token insertion share one SQLite write transaction.
-/// Without `BEGIN IMMEDIATE`, two console processes can both observe an empty
-/// token table and create owners with unrelated portfolios.
-fn claim_owner(store: &mut SqliteStore, label: &str) -> Result<String, Box<dyn std::error::Error>> {
-    store
-        .connection_mut()
-        .busy_timeout(std::time::Duration::from_secs(5))?;
-    store.connection_mut().execute_batch("BEGIN IMMEDIATE")?;
-
-    let result: Result<String, Box<dyn std::error::Error>> = (|| {
-        if !matches!(store.sole_token_owner()?, StoredSoleOwner::None) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "instance is already claimed",
-            )
-            .into());
-        }
-
-        let token = secret_hex(32)?;
-        let record = TokenRecord {
-            id: uuid::Uuid::new_v4(),
-            owner: OwnerId::new_random(),
-            label: label.to_owned(),
-            scope: TokenScope::Owner,
-            revoked: false,
-        };
-        store.insert_token(&record, &hash_token(&token))?;
-        Ok(token)
-    })();
-
-    match result {
-        Ok(token) => {
-            if let Err(error) = store.connection_mut().execute_batch("COMMIT") {
-                let _ = store.connection_mut().execute_batch("ROLLBACK");
-                Err(error.into())
-            } else {
-                Ok(token)
-            }
-        }
-        Err(error) => {
-            let _ = store.connection_mut().execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
+/// Deciding that the instance is unclaimed and creating the token are one
+/// atomic operation, and it lives behind `TokenAdmin`: this command names it
+/// and prints its result, nothing more. Assembling a token record here as well
+/// would be a second implementation of credential issuance — and the one that
+/// mints the owner's token, so a change to issuance would pass it by in
+/// silence.
+///
+/// The token is printed once. It is nowhere else: not in a log, and not in the
+/// database, which keeps only its hash (§14).
+async fn claim_owner(
+    admin: &dyn TokenAdmin,
+    label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let issued = admin.claim_owner(label.to_owned()).await?;
+    Ok(issued.token)
 }
 
 /// Issue a token for the existing sole owner. The token itself is printed
@@ -514,8 +482,9 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, Cli, Command, TokenCommand,
-        TokenScopeArg, claim_owner, format_error_chain, legacy_replacement, read_broker_key,
+        BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, Cli, Command, SqliteAdapter,
+        TokenCommand, TokenScopeArg, claim_owner, format_error_chain, legacy_replacement,
+        read_broker_key,
     };
     use clap::Parser;
 
@@ -636,6 +605,12 @@ mod tests {
         }
     }
 
+    /// The property defended here is that exactly one of two simultaneous
+    /// claims wins. Moving issuance behind `TokenAdmin` did not change it: two
+    /// operating-system threads, one barrier, two connections to one file. Each
+    /// thread drives the async port on a runtime of its own, because the race
+    /// has to happen between threads rather than between two tasks that a
+    /// single-threaded executor would interleave for them.
     #[test]
     fn concurrent_claims_leave_one_owner_and_refuse_the_other() {
         use std::sync::{Arc, Barrier};
@@ -645,20 +620,25 @@ mod tests {
             "iaam-bootstrap-concurrent-claim-{}.sqlite",
             uuid::Uuid::new_v4()
         ));
-        let mut first = iaam_store::SqliteStore::open(&path).unwrap();
-        let mut second = iaam_store::SqliteStore::open(&path).unwrap();
+        let first = SqliteAdapter::new(iaam_store::SqliteStore::open(&path).unwrap());
+        let second = SqliteAdapter::new(iaam_store::SqliteStore::open(&path).unwrap());
         let barrier = Arc::new(Barrier::new(2));
 
-        let first_barrier = Arc::clone(&barrier);
-        let first_thread = thread::spawn(move || {
-            first_barrier.wait();
-            claim_owner(&mut first, "Main").map_err(|error| error.to_string())
-        });
-        let second_barrier = Arc::clone(&barrier);
-        let second_thread = thread::spawn(move || {
-            second_barrier.wait();
-            claim_owner(&mut second, "Savings").map_err(|error| error.to_string())
-        });
+        let claim = |adapter: SqliteAdapter, label: &'static str, barrier: Arc<Barrier>| {
+            thread::spawn(move || {
+                // The runtime is built before the barrier: the threads must meet
+                // at the claim itself, not at each other's start-up.
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                barrier.wait();
+                runtime
+                    .block_on(claim_owner(&adapter, label))
+                    .map_err(|error| error.to_string())
+            })
+        };
+        let first_thread = claim(first, "Main", Arc::clone(&barrier));
+        let second_thread = claim(second, "Savings", Arc::clone(&barrier));
 
         let first_result = first_thread.join().unwrap();
         let second_result = second_thread.join().unwrap();

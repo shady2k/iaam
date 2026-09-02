@@ -1038,6 +1038,104 @@ const fn broker_environment(environment: BrokerEnvironment) -> Environment {
     }
 }
 
+/// A credential the moment it is minted: the record the database keeps, the
+/// hash stored beside it, and the secret handed out exactly once.
+///
+/// **This is the only place that builds a token record.** Issuance used to be
+/// written twice — once in `issue_token` and once in the CLI's claim path,
+/// which needed its decision and its insert inside one transaction and so
+/// assembled a record of its own. The second copy was the one that minted the
+/// **owner's** token, and a change here — a longer secret, a different hash,
+/// another field worth recording — would have left it silently on the old
+/// behaviour with nothing failing to say so.
+struct MintedToken {
+    record: TokenRecord,
+    hash: String,
+    /// The token in the clear. Never logged, never stored: only `issued`
+    /// lets it out, and only once (§14).
+    secret: String,
+}
+
+impl MintedToken {
+    /// 32 bytes from the system source, not a «long enough» string: a token is
+    /// the key to someone else's money, and its strength is set here once for
+    /// the whole system.
+    ///
+    /// Minting happens before any database work: a failure of the randomness
+    /// source must not look like a store failure, and a secret obtained by
+    /// unknown means must never be issued at all.
+    fn mint(owner: OwnerId, label: String, scope: Scope) -> Result<Self, AppError> {
+        let secret = secret_hex(32)?;
+        let hash = hash_token(&secret);
+        Ok(Self {
+            record: TokenRecord {
+                id: Uuid::new_v4(),
+                owner,
+                label,
+                scope: scope_to_store(scope),
+                revoked: false,
+            },
+            hash,
+            secret,
+        })
+    }
+
+    /// Writes the record and the hash. The secret is not among them, so a leak
+    /// of the database file does not grant access to the API (§14).
+    fn store(&self, store: &SqliteStore) -> Result<(), AppError> {
+        store
+            .insert_token(&self.record, &self.hash)
+            .map_err(store_error)
+    }
+
+    /// The token in the clear, released once. Consumes the mint: there is no
+    /// second call, and nowhere to read the secret from afterwards.
+    fn issued(self) -> IssuedToken {
+        IssuedToken {
+            id: self.record.id,
+            token: self.secret,
+            label: self.record.label,
+            scope: scope_from_store(self.record.scope),
+        }
+    }
+}
+
+/// Runs `work` inside one `BEGIN IMMEDIATE` write transaction.
+///
+/// `IMMEDIATE`, not the default deferred begin: a deferred transaction takes
+/// its write lock at the first write, which is after the read that decided to
+/// write, and that gap is the race. `rusqlite::Transaction` is not used because
+/// it borrows the connection, and `work` needs the store itself.
+fn in_immediate_transaction<T>(
+    store: &mut SqliteStore,
+    work: impl FnOnce(&mut SqliteStore) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    store
+        .connection_mut()
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(sqlite_error)?;
+    match work(store) {
+        Ok(value) => match store.connection_mut().execute_batch("COMMIT") {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let _ = store.connection_mut().execute_batch("ROLLBACK");
+                Err(sqlite_error(error))
+            }
+        },
+        Err(error) => {
+            let _ = store.connection_mut().execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+/// The driver's own error, reported as a store failure. Generic over `Into`
+/// so that the driver type is not named here: `iaam-app` depends on
+/// `iaam-store`, not on `rusqlite`.
+fn sqlite_error(error: impl Into<iaam_store::StoreError>) -> AppError {
+    store_error(error.into())
+}
+
 #[async_trait]
 impl TokenAdmin for SqliteAdapter {
     async fn sole_owner(&self) -> Result<SoleOwner, AppError> {
@@ -1052,39 +1150,63 @@ impl TokenAdmin for SqliteAdapter {
         .await
     }
 
+    /// Claiming: the instance is checked to be unclaimed and its owner token is
+    /// created under one `BEGIN IMMEDIATE` write transaction, held for the whole
+    /// blocking call.
+    ///
+    /// Two console processes starting at the same instant used to be able to
+    /// both observe an empty token table and create owners with unrelated
+    /// portfolios. Nothing in the schema forbids a second owner, so the
+    /// transaction is the only thing that does (ADR-0003).
+    ///
+    /// The mint happens outside the transaction on purpose — see
+    /// `MintedToken::mint`. A secret minted for a claim that is then refused is
+    /// simply dropped: it was never written, printed, or logged.
+    async fn claim_owner(&self, label: String) -> Result<IssuedToken, AppError> {
+        let minted = MintedToken::mint(OwnerId::new_random(), label, Scope::Owner)?;
+        self.blocking(move |store| {
+            // The loser of the race must wait for the winner's transaction
+            // rather than fail at once as «database is locked».
+            store
+                .connection_mut()
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(sqlite_error)?;
+            in_immediate_transaction(store, |store| {
+                if !matches!(
+                    store.sole_token_owner().map_err(store_error)?,
+                    StoredSoleOwner::None
+                ) {
+                    // Not a store failure: a second owner token is issued by
+                    // `issue_token`, and retrying the claim will never work.
+                    return Err(AppError::Conflict {
+                        what: "instance is already claimed".to_owned(),
+                    });
+                }
+                minted.store(store)
+            })?;
+            Ok(minted.issued())
+        })
+        .await
+    }
+
     /// Token issuance: 32 random bytes, the hash goes into the database, the token itself goes out.
     ///
-    /// 32 bytes from the system source, not a «long enough»
-    /// string: a token is the key to someone else's money, and its strength here
-    /// is set once for the entire system. The token is returned in plaintext
-    /// exactly once — only the hash remains in the database, so a leak of the database file
-    /// does not grant access to the API (§14).
+    /// The token is returned in plaintext exactly once — only the hash remains
+    /// in the database, so a leak of the database file does not grant access to
+    /// the API (§14). The record, the secret and the hash all come from
+    /// `MintedToken`, which is what `claim_owner` mints too.
     async fn issue_token(
         &self,
         owner: OwnerId,
         label: String,
         scope: Scope,
     ) -> Result<IssuedToken, AppError> {
-        // The secret is generated before entering the blocking task: failure
-        // of the randomness source must not look like a database failure.
-        let token = secret_hex(32)?;
-        let hash = hash_token(&token);
-        let record = TokenRecord {
-            id: Uuid::new_v4(),
-            owner,
-            label: label.clone(),
-            scope: scope_to_store(scope),
-            revoked: false,
-        };
-        let id = record.id;
-        self.blocking(move |store| store.insert_token(&record, &hash).map_err(store_error))
-            .await?;
-        Ok(IssuedToken {
-            id,
-            token,
-            label,
-            scope,
+        let minted = MintedToken::mint(owner, label, scope)?;
+        self.blocking(move |store| {
+            minted.store(store)?;
+            Ok(minted.issued())
         })
+        .await
     }
 
     async fn list_tokens(&self, owner: OwnerId) -> Result<Vec<TokenView>, AppError> {

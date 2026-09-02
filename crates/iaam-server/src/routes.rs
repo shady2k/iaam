@@ -13,7 +13,7 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
-use iaam_app::ports::{AccountView, Principal, Scope, SoleOwner};
+use iaam_app::ports::{AccountView, Principal, Scope};
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
     list_category_rules, list_groups, preview_category_rule, retire_category,
@@ -35,9 +35,7 @@ use iaam_app::sync::{
 };
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{
-    AccountId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, OwnerId, SourceId,
-};
+use iaam_core::ids::{AccountId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -58,16 +56,15 @@ use crate::dto::{
     AccountBalanceDto, AccountDto, AddBrokerAccessRequest, BrokerAccessDto,
     BrokerAccessUpdateRequest, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
     CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClaimOutcomeDto, ClaimRequest, ClassificationRuleDto,
-    ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
-    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
-    CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
-    EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
-    MarketKeyRateDto, MarketPriceDto, MarketSourceDto, MarketSyncRequest, MoneyFlowReportDto,
-    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
-    ReconciliationStatusDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
-    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
-    VerdictDto,
+    CategoryRuleRequest, ClaimOutcomeDto, ClassificationRuleDto, ClassificationRuleRequest,
+    ContourVersionDto, CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest,
+    CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest,
+    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
+    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
+    MarketSyncRequest, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
+    QuotationBasisStatusDto, ReconciliationParams, ReconciliationStatusDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -1192,89 +1189,6 @@ pub async fn revoke_broker_access(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Claiming the instance.
-///
-/// **The only unauthenticated route apart from `/v1/health`.**
-/// It cannot be otherwise: the claimant does not yet have a token, and has no way
-/// to call a protected route. Instead of a token, access is granted by a one-time
-/// code printed to the console at startup — that is, proof is provided by
-/// access to the machine, rather than knowledge of anything transmitted.
-///
-/// There will never be open registration here: the second claimant would create
-/// an empty portfolio for themselves in someone else's database. An owner already exists — claiming
-/// is closed forever.
-#[utoipa::path(
-    post,
-    path = "/v1/claim",
-    request_body = ClaimRequest,
-    responses(
-        (status = 201, description = "Instance claimed", body = IssuedTokenDto),
-        (status = 403, description = "Code is invalid, expired, or already used", body = ApiError),
-        (status = 409, description = "An owner already exists: claiming is closed", body = ApiError)
-    )
-)]
-pub async fn claim(
-    State(state): State<ServerState>,
-    Json(request): Json<ClaimRequest>,
-) -> Result<(StatusCode, Json<IssuedTokenDto>), ApiFailure> {
-    // The code is checked before consulting the database state: being single-use is a property
-    // of the code itself, not a consequence of the owner being created. Checking
-    // and erasure happen in one operation under the same lock — if separated,
-    // two concurrent requests with the correct code would each receive an
-    // owner token.
-    if !state.accept_claim(&request.code) {
-        // Invalid, expired, and already used codes produce
-        // the **same** response: different responses would reveal that the guess was
-        // partly correct (§14).
-        return Err(claim_refused());
-    }
-
-    // The code was correct, but an owner was created in the meantime — for example, through
-    // the console after startup, making the printed code stale. Claiming
-    // permanently closed: a second owner in a single-user system
-    // means an empty portfolio in someone else's database. The code has already been consumed,
-    // and this is no loss — there is nothing to claim anyway.
-    match state.services.tokens.sole_owner().await? {
-        SoleOwner::None => {}
-        SoleOwner::Single(_) | SoleOwner::Several => {
-            return Err(ApiFailure::new(
-                StatusCode::CONFLICT,
-                ApiError::simple(
-                    "already_claimed",
-                    "instance already claimed: a lost token can be recovered from the console",
-                ),
-            ));
-        }
-    }
-
-    // The owner is created here and only here via the API: from then on they
-    // exist, and there will be no second claim.
-    let issued = state
-        .services
-        .tokens
-        .issue_token(OwnerId::new_random(), request.label, Scope::Owner)
-        .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(IssuedTokenDto::from_domain(issued)),
-    ))
-}
-
-/// Claim rejected.
-///
-/// A single message is deliberately used for three different reasons: a message that distinguishes
-/// «wrong code» from «expired code» confirms to a guesser that they
-/// guessed correctly (§14).
-fn claim_refused() -> ApiFailure {
-    ApiFailure::new(
-        StatusCode::FORBIDDEN,
-        ApiError::simple(
-            "claim_refused",
-            "claim code rejected: incorrect, expired or already used",
-        ),
-    )
-}
-
 /// Token issuance.
 ///
 /// The token is shown **once only**: only its hash remains in the database,
@@ -1298,7 +1212,7 @@ pub async fn create_token(
     require_admin(&principal)?;
     let scope = match request.scope {
         // Full-access tokens cannot be issued via the API: the owner is created
-        // by claiming the instance or using the console. Otherwise, a stolen owner token
+        // with `iaam claim --label <label>`. Otherwise, a stolen owner token
         // could immediately be replicated into indistinguishable copies,
         // and revoking the original would change nothing.
         TokenScopeDto::Owner => {
@@ -1307,7 +1221,7 @@ pub async fn create_token(
                 ApiError {
                     code: "invalid_request".into(),
                     message: "an owner token cannot be issued via the API: the owner is created \
-                              by claiming the instance or with a console command"
+                              with `iaam claim --label <label>`"
                         .into(),
                     field: Some("scope".into()),
                     expected: Some("agent or read_only".into()),

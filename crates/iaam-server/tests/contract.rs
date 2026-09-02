@@ -745,8 +745,7 @@ fn post(path: &str, token: &str, body: &Value) -> Request<Body> {
         .expect("request")
 }
 
-/// Request without a token: instance claiming is invoked when there is
-/// no token yet and nowhere to obtain one.
+/// Request without a token, used for public-route and missing-route checks.
 fn post_public(path: &str, body: &Value) -> Request<Body> {
     Request::builder()
         .uri(path)
@@ -754,56 +753,6 @@ fn post_public(path: &str, body: &Value) -> Request<Body> {
         .header("Content-Type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("request")
-}
-
-/// Harness without an owner: the instance has not yet been claimed.
-///
-/// A separate harness rather than a flag on the shared one: the shared harness has an owner
-/// from the outset, so there is nothing to claim there. The claim code is obtained
-/// from the same function the composition root uses to generate it — otherwise the test
-/// would not exercise the path by which the code reaches the user.
-async fn unclaimed_harness() -> (Router, String) {
-    unclaimed_harness_with(SqliteStore::open_in_memory().expect("in-memory database")).await
-}
-
-/// The same harness with a file-backed database: verifying that the owner was created
-/// **in addition to** the claim requires a second connection to the same database.
-async fn unclaimed_harness_on_disk() -> (Router, String, std::path::PathBuf) {
-    let path = std::env::temp_dir().join(format!("iaam-claim-{}.db", Uuid::new_v4()));
-    let store = SqliteStore::open(&path).expect("file-backed database");
-    let (router, code) = unclaimed_harness_with(store).await;
-    (router, code, path)
-}
-
-async fn unclaimed_harness_with(store: SqliteStore) -> (Router, String) {
-    let state = claim_state(store);
-    let code = iaam_server::claim::arm(&state)
-        .await
-        .expect("database state read")
-        .expect("there is no owner — a claim code must have been generated");
-    let (router, _) = build(state);
-    (router, code)
-}
-
-/// Server state over a prepared database.
-///
-/// Shared by the claim harnesses: constructing it in each would mean
-/// that the tests exercise different builds of the same thing.
-fn claim_state(store: SqliteStore) -> ServerState {
-    let adapter = Arc::new(SqliteAdapter::new(store));
-    let broker: Arc<dyn BrokerVault> = adapter.clone();
-    let tokens: Arc<dyn TokenAdmin> = adapter.clone();
-    let services = Arc::new(AppServices::new(
-        adapter.clone(),
-        adapter.clone(),
-        broker,
-        tokens,
-        Arc::new(FixedClock(date!(2026 - 01 - 01))),
-    ));
-    ServerState::new(
-        services,
-        Arc::new(RateLimiter::new(1_000, Duration::from_secs(60))),
-    )
 }
 
 #[tokio::test]
@@ -2448,164 +2397,37 @@ fn find_access(list: &Value, id: &str) -> Option<Value> {
         .cloned()
 }
 
-// --- Instance claiming and token management (§14) ---
+// --- Token management (§14) ---
 
 #[tokio::test]
-async fn the_printed_code_claims_the_instance_and_the_token_it_gives_works() {
-    // Claiming is not registration: the code is printed once at startup,
-    // and only the person who started the program can read it. Access
-    // to the console itself proves the right to the instance.
-    let (router, code) = unclaimed_harness().await;
+async fn the_removed_claim_route_is_not_documented_or_available() {
+    let harness = harness();
 
     let (status, body) = call(
-        &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "laptop" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(body["label"], "laptop");
-    assert_eq!(body["scope"], "owner");
-    let token = body["token"].as_str().expect("owner token").to_owned();
-    assert!(!token.is_empty(), "claiming must issue a token: {body}");
-
-    // The issued token is genuine: a protected request succeeds with it.
-    let (status, accounts) = call(&router, get("/v1/accounts", Some(&token))).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "claim token must grant access: {accounts}"
-    );
-}
-
-#[tokio::test]
-async fn the_same_claim_code_never_works_twice() {
-    // The code is single-use, and this is a property of the code itself: it is erased from
-    // memory when used. A second exchange is either a repeated
-    // request or someone else acting; they cannot be distinguished, and both receive
-    // the same rejection as an invalid code.
-    let (router, code) = unclaimed_harness().await;
-
-    let (status, body) = call(
-        &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "laptop" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-
-    let (status, body) = call(
-        &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "again" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["code"], "claim_refused");
-}
-
-#[tokio::test]
-async fn a_wrong_claim_code_is_refused_and_does_not_burn_the_right_one() {
-    // An invalid code does not erase the valid one: otherwise any outsider could
-    // permanently disable claiming with a single garbage request.
-    let (router, code) = unclaimed_harness().await;
-
-    let (status, body) = call(
-        &router,
-        post_public(
+        &harness.router,
+        post(
             "/v1/claim",
-            &json!({ "code": "wrong code", "label": "outsider" }),
+            &harness.owner_token,
+            &json!({ "code": "retired", "label": "laptop" }),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["code"], "claim_refused");
-
-    let (status, body) = call(
-        &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "laptop" })),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "the valid code must survive someone else's attempt: {body}"
-    );
-}
-
-#[tokio::test]
-async fn claiming_is_closed_once_an_owner_exists_even_with_a_valid_code() {
-    // The owner may have been created without claiming — via a console command
-    // after startup — making the code printed earlier stale. Accepting it
-    // would create a second owner: an empty portfolio in someone else's
-    // database, while the first owner's money appears to be gone.
-    let (router, code, path) = unclaimed_harness_on_disk().await;
-
-    {
-        let store = SqliteStore::open(&path).expect("second connection");
-        store
-            .insert_token(
-                &TokenRecord {
-                    id: Uuid::new_v4(),
-                    owner: OwnerId::new_random(),
-                    label: "created from the console".into(),
-                    scope: TokenScope::Owner,
-                    revoked: false,
-                },
-                &hash_token("issued-from-the-console"),
-            )
-            .expect("owner token");
-    }
-
-    let (status, body) = call(
-        &router,
-        post_public("/v1/claim", &json!({ "code": code, "label": "latecomer" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["code"], "already_claimed");
-}
-
-#[tokio::test]
-async fn an_instance_with_an_owner_generates_no_claim_code_at_all() {
-    // A secret that nobody needs still remains a secret,
-    // held in memory. An owner exists — so no code is generated at all,
-    // and claiming rejects every code presented.
-    let store = SqliteStore::open_in_memory().expect("in-memory database");
-    store
-        .insert_token(
-            &TokenRecord {
-                id: Uuid::new_v4(),
-                owner: OwnerId::new_random(),
-                label: "owner".into(),
-                scope: TokenScope::Owner,
-                revoked: false,
-            },
-            &hash_token("owner-secret-token"),
-        )
-        .expect("owner token");
-    let state = claim_state(store);
-
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(
-        iaam_server::claim::arm(&state)
-            .await
-            .expect("database state read")
-            .is_none(),
-        "there is an owner — no claim code should be generated"
+        body.is_null(),
+        "a missing route must have an empty body: {body}"
     );
-
-    let (router, _) = build(state);
-    let (status, body) = call(
-        &router,
-        post_public("/v1/claim", &json!({ "code": "any", "label": "outsider" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["code"], "claim_refused");
+    assert!(
+        !harness.api.paths.paths.contains_key("/v1/claim"),
+        "the retired claim route must not appear in OpenAPI"
+    );
 }
 
 #[tokio::test]
 async fn an_owner_token_is_never_issued_through_the_api() {
-    // An owner is created by claiming the instance or via the console. A route,
-    // issuing full access, would turn one stolen token
-    // into indistinguishable copies, and revoking the original would change nothing.
+    // An owner is created with `iaam claim --label <label>`. A route issuing
+    // full access would turn one stolen token into indistinguishable copies,
+    // and revoking the original would change nothing.
     let harness = harness();
 
     let (status, body) = call(

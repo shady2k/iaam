@@ -2413,39 +2413,13 @@ impl BrokerAccessDto {
     }
 }
 
-/// Claiming an instance.
-///
-/// The code is read from the console at server start-up — see `claim`. The label
-/// describes what the owner will use for access: «laptop», «phone».
-#[derive(Clone, Deserialize, ToSchema)]
-pub struct ClaimRequest {
-    /// One-time claim code. A secret: accepted but never
-    /// returned, so it is marked as `password` in the schema.
-    #[schema(format = Password, write_only, example = "<code from console>")]
-    pub code: String,
-    /// Label for the token being issued.
-    pub label: String,
-}
-
-/// Custom `Debug`: the claim code grants the right to create an owner,
-/// and derived output would write it to the very first log.
-impl fmt::Debug for ClaimRequest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ClaimRequest")
-            .field("code", &"<redacted>")
-            .field("label", &self.label)
-            .finish()
-    }
-}
-
 /// Permission scope in the transport layer. A separate type because the application's `Scope`
 /// knows nothing about OpenAPI and should not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenScopeDto {
     /// Full owner access. It is **not accepted** in an issuance request:
-    /// the owner is created by claiming the instance or via the console.
+    /// the owner is created with `iaam claim --label <label>`.
     Owner,
     Agent,
     ReadOnly,
@@ -2473,9 +2447,8 @@ pub struct CreateTokenRequest {
 
 /// Newly issued token.
 ///
-/// One type for both claiming an instance and issuing a token to an agent:
-/// in both cases, a secret is returned, shown **once**,
-/// and a second such type would be another place where that could be forgotten.
+/// The token is returned and shown **once**; only its hash remains in the
+/// database, so it cannot be shown again.
 #[derive(Clone, Serialize, ToSchema)]
 pub struct IssuedTokenDto {
     /// Record identifier — used to revoke the token.
@@ -3272,23 +3245,6 @@ mod tests {
         );
         assert_eq!(json["next_posting_date"], "2026-12-02");
         assert_eq!(json["next_principal_return_finality"], "final");
-    }
-
-    #[test]
-    fn a_claim_code_never_reaches_the_debug_output() {
-        // The assignment code grants the right to create an owner in an empty database.
-        const CODE: &str = "0123456789abcdef0123456789abcdef";
-        let request = ClaimRequest {
-            code: CODE.into(),
-            label: "laptop".into(),
-        };
-
-        let printed = format!("{request:?}");
-        assert!(
-            !printed.contains(CODE),
-            "assignment code leaked into debug output: {printed}"
-        );
-        assert!(printed.contains("laptop"), "{printed}");
     }
 
     #[test]

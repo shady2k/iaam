@@ -36,11 +36,11 @@ pub fn hash_token(token: &str) -> String {
 
 /// A random secret in hexadecimal.
 ///
-/// The source is `SysRng`, not `rand::rng()`: both the token and the claim code
-/// are effectively keys to other people's money, and a weak generator here costs more than
-/// everything else in this file. Source failure is returned as an error, not
-/// replaced with a fallback generator: a secret issued by unknown means,
-/// is worse than one not issued — no one will know about the former.
+/// The source is `SysRng`, not `rand::rng()`: tokens are effectively keys to
+/// other people's money, and a weak generator here costs more than everything
+/// else in this file. Source failure is returned as an error, not replaced with
+/// a fallback generator: a secret issued by unknown means is worse than one not
+/// issued — no one will know about the former.
 pub fn secret_hex(bytes: usize) -> Result<String, AppError> {
     let mut buffer = vec![0_u8; bytes];
     rand::rngs::SysRng

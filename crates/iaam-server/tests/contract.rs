@@ -3692,7 +3692,11 @@ const NAMESPACE_CODES: [&str; 5] = ["isin", "moex_secid", "ticker", "figi", "bro
 #[tokio::test]
 async fn an_invalid_namespace_is_refused_with_the_valid_ones_named() {
     let (app, token, _) = server_with_one_alias();
-    let (status, _headers, bytes) = call_raw(
+    // Typing this field moved its refusal upstream into the body extractor, and
+    // for as long as that extractor was axum's own the refusal arrived as text.
+    // `refusal` asserts the envelope; the assertions below assert what is in it.
+    // Both halves matter: an enumeration in an unparseable body is not an answer.
+    let (status, body) = refusal(
         &app,
         post(
             "/v1/instruments/resolve",
@@ -3703,18 +3707,19 @@ async fn an_invalid_namespace_is_refused_with_the_valid_ones_named() {
     .await;
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let refusal = String::from_utf8_lossy(&bytes);
-    assert!(
-        refusal.contains("namespace"),
-        "the refusal must name the field it is about: {refusal}"
+    assert_eq!(
+        body.get("field").and_then(Value::as_str),
+        Some("namespace"),
+        "the refusal must name the field it is about: {body}"
     );
     // What the client needs from a refusal is the list it should have chosen
     // from: an agent that has to look the registers up somewhere else guesses,
     // and guessing is what this route was reported for.
+    let rendered = body.to_string();
     for code in NAMESPACE_CODES {
         assert!(
-            refusal.contains(code),
-            "a refused namespace must carry {code}, the enumeration of what is valid: {refusal}"
+            rendered.contains(code),
+            "a refused namespace must carry {code}, the enumeration of what is valid: {body}"
         );
     }
 }

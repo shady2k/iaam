@@ -1,9 +1,9 @@
 ---
 name: iaam
-description: IAAM investment accounting. Works with two input channels, per-row verdicts, multi-dimensional reconciliation and pre-tax return. Use it when asked about the portfolio, return, contributions, value or data quality.
+description: IAAM personal accounting over a contour the owner draws. Works with two input channels, per-row verdicts, multi-dimensional reconciliation, categorised spending and income, and pre-tax return. Use it when asked about the portfolio, return, contributions, value, where the money went, spending by category, or data quality.
 ---
 
-# IAAM — investment accounting
+# IAAM — personal accounting
 
 ## Bootstrap
 
@@ -70,6 +70,40 @@ an account inside it is a contribution.
 A contour has a **version**. A report always returns the version it computed
 against. Two figures computed against different contour versions must not be
 compared.
+
+## What a category is, and what it cannot change
+
+A contour says which accounts are the owner's. A **category** says what his
+money was for. They answer different questions over the same journal, and
+confusing them is the mistake this section exists to prevent.
+
+A category is the owner's explanation, derived when a report is built from
+versioned rules over a row's identity, the source's own category, its
+description and its date. **The source's category is evidence, not a verdict.**
+Never invent a category, a rule, or the interval a rule is valid over: that is
+the owner's judgement, and a guess that has reached a report is
+indistinguishable from his decision. A row no rule matches stays explicitly
+undecomposed, and the report says so — never put it in a catch-all.
+
+Categories reach spending, refunds and kinds of income; a transfer carries none
+at all. A refund is subtracted from the category the money was spent in rather
+than reported as income — a returned appliance is not an earning. Cashback and
+interest on a balance are income, and they are reported under the owner's own
+income category exactly as an outflow is reported under his spending one.
+Whether a transfer crossed the contour's boundary is answered by the accounts it
+touched, and that question is already settled without a category.
+
+**Changing only a category assignment cannot change the return.** Not what was
+contributed, not what was withdrawn, not the contour's value, not
+`xirr_pre_tax`. Those are computed from the kind of each event, the accounts it
+touched and the contour's membership, and no category, category group or income
+flag enters any of them.
+
+Say it in those words, because the neighbouring sentence is false. Changing an
+event's **kind**, the accounts it touches, or the contour's membership does
+change all of them. A row reclassified from a payment out to a transfer is a
+different fact, not a different explanation of the same one — and it is the kind
+of change that must go back through the channel the fact arrived by.
 
 ## Two channels of fact, and what makes a confirmation independent
 

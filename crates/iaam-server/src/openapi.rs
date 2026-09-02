@@ -67,7 +67,9 @@ impl Modify for BearerSecurity {
     info(
         title = "IAAM",
         version = "1.0.0",
-        description = "Investment accounting. Stage 1: cash flows and pre-tax XIRR."
+        description = "Personal accounting over a contour the owner draws: what entered it, \
+                       what left it, what the money was for, and what it all returned before tax. \
+                       Stage 1: cash flows, categorised spending and income, and pre-tax XIRR."
     ),
     modifiers(&BearerSecurity),
     components(schemas(

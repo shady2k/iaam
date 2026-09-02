@@ -28,7 +28,7 @@ use iaam_app::scenarios::market_reference::{
     MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
     list_market_key_rate as read_market_key_rate, list_market_prices as read_market_prices,
 };
-use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, statuses};
+use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, report, statuses};
 use iaam_app::scenarios::reports::{
     MoneyFlowQuery, ReturnsQuery, account_balances, money_flow, returns,
 };
@@ -43,8 +43,8 @@ use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::PROJECTION_VERSION;
+use iaam_core::reconciliation::ReconciliationStatus;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
-use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
 use iaam_core::rules::LotRuleVersion;
 use iaam_core::valuation::{FxSource, FxTable};
 use rust_decimal::Decimal;
@@ -59,15 +59,15 @@ use crate::dto::{
     AccountBalanceDto, AccountCandidateDto, AccountDto, ActionDto, ActionTargetDto,
     ActionsResponseDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
     CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClaimOutcomeDto, ClassificationRuleDto, ClassificationRuleRequest,
-    ContourVersionDto, CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest,
-    CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest,
-    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
-    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
-    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
-    QuotationBasisStatusDto, ReconciliationParams, ReconciliationStatusDto, RequestPlanDto,
-    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    CategoryRuleRequest, ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
+    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
+    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DocumentDto, DocumentParams,
+    FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto,
+    MarketPriceDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
+    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
+    ReconciliationResponseDto, ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest,
+    ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -140,15 +140,17 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
             ActionCategory::Blocking => "blocking",
             ActionCategory::RequiredForGoal => "required_for_goal",
             ActionCategory::Recommended => "recommended",
+            ActionCategory::Informational => "informational",
         }
         .to_owned(),
         state: match action.state() {
             ActionState::Ready => "ready",
             ActionState::NeedsOwnerInput => "needs_owner_input",
+            ActionState::Blocked => "blocked",
         }
         .to_owned(),
         reason: action.reason().to_owned(),
-        required_scope: action.required_scope().code().to_owned(),
+        required_scope: action.required_scope().map(|scope| scope.code().to_owned()),
         target,
     }
 }
@@ -403,7 +405,7 @@ pub async fn repair_custody(
     path = "/v1/reconciliation",
     params(ReconciliationParams),
     responses(
-        (status = 200, description = "Reconciliation statuses", body = Vec<ReconciliationStatusDto>),
+        (status = 200, description = "Reconciliation statuses and coverage gaps", body = ReconciliationResponseDto),
         (status = 422, description = "Invalid date range", body = ApiError)
     ),
     security(("bearer" = []))
@@ -412,10 +414,10 @@ pub async fn reconciliation(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Query(params): Query<ReconciliationParams>,
-) -> Result<Json<Vec<ReconciliationStatusDto>>, ApiFailure> {
+) -> Result<Json<ReconciliationResponseDto>, ApiFailure> {
     let from = parse_query_date("from", &params.from)?;
     let to = parse_query_date("to", &params.to)?;
-    let statuses = statuses(
+    let reconciliation = report(
         &state.services,
         &principal,
         AccountId(params.account),
@@ -423,9 +425,18 @@ pub async fn reconciliation(
         to,
     )
     .await?;
-    Ok(Json(
-        statuses.iter().map(reconciliation_status_dto).collect(),
-    ))
+    Ok(Json(ReconciliationResponseDto {
+        statuses: reconciliation
+            .statuses
+            .iter()
+            .map(reconciliation_status_dto)
+            .collect(),
+        gaps: reconciliation
+            .gaps
+            .iter()
+            .map(crate::dto::TaintDto::from_domain)
+            .collect(),
+    }))
 }
 
 /// Record a balance declared by the owner.
@@ -1783,41 +1794,7 @@ fn document_dto(document: UploadedDocument) -> DocumentDto {
 }
 
 fn reconciliation_status_dto(status: &ReconciliationStatus) -> ReconciliationStatusDto {
-    ReconciliationStatusDto {
-        account: status.account().inner(),
-        from: status.period().from,
-        to: status.period().to,
-        dimensions: Dimension::all()
-            .into_iter()
-            .map(|dimension| DimensionStatusDto {
-                dimension: dimension.code().to_owned(),
-                status: status.dimension(dimension).code().to_owned(),
-            })
-            .collect(),
-        evidence: status
-            .evidence()
-            .iter()
-            .map(|evidence| EvidenceDto {
-                ground: evidence.ground().code().to_owned(),
-                level: evidence.level().code().to_owned(),
-                dimensions: evidence
-                    .dimensions()
-                    .into_iter()
-                    .map(|dimension| dimension.code().to_owned())
-                    .collect(),
-                confirming_parser: evidence.confirming().parser_version.0.clone(),
-                confirmed_parser: evidence.confirmed().parser_version.0.clone(),
-            })
-            .collect(),
-        outcomes: status
-            .outcomes()
-            .iter()
-            .map(|outcome| ClaimOutcomeDto {
-                claim: outcome.claim.discriminant().to_owned(),
-                outcome: outcome.outcome.code().to_owned(),
-            })
-            .collect(),
-    }
+    ReconciliationStatusDto::from_domain(status)
 }
 
 fn parse_knowledge_as_of(value: Option<&str>) -> Result<OffsetDateTime, ApiFailure> {

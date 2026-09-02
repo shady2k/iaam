@@ -68,7 +68,10 @@ pub struct MoneyFlow {
     cash_delta: Ledger,
     went_out_by_category: CategoryLedger,
     earned_by_capital_by_source: EarningLedger,
-    not_decomposed: (BTreeMap<CurrencyCode, u64>, Ledger),
+    /// Per-account count and amount are retained so diagnostics can name the account.
+    /// Older serialized `MoneyFlow` values with the currency-only count shape are not
+    /// promised to deserialize.
+    not_decomposed: (BTreeMap<(AccountId, CurrencyCode), u64>, Ledger),
 }
 
 /// What produced an earning.
@@ -167,7 +170,7 @@ impl MoneyFlow {
         } else {
             None
         };
-        let mut not_decomposed_currencies = BTreeSet::new();
+        let mut not_decomposed_keys = BTreeSet::new();
 
         for leg in &event.legs {
             if !contour.contains(leg.account) {
@@ -267,7 +270,7 @@ impl MoneyFlow {
                             Some(CategoryAssignment::NotDecomposed) | None => {
                                 add_not_decomposed(
                                     &mut self.not_decomposed,
-                                    &mut not_decomposed_currencies,
+                                    &mut not_decomposed_keys,
                                     leg.account,
                                     amount,
                                     event.id,
@@ -296,7 +299,7 @@ impl MoneyFlow {
                             Some(CategoryAssignment::NotDecomposed) | None => {
                                 add_not_decomposed(
                                     &mut self.not_decomposed,
-                                    &mut not_decomposed_currencies,
+                                    &mut not_decomposed_keys,
                                     leg.account,
                                     amount,
                                     event.id,
@@ -328,7 +331,7 @@ impl MoneyFlow {
                             )?;
                             add_not_decomposed(
                                 &mut self.not_decomposed,
-                                &mut not_decomposed_currencies,
+                                &mut not_decomposed_keys,
                                 leg.account,
                                 amount,
                                 event.id,
@@ -461,16 +464,60 @@ impl MoneyFlow {
             .collect()
     }
 
-    /// Returns the number and amount of outflow rows without a category.
+    /// Returns the total number and amount of outflow rows without a category.
     pub fn not_decomposed(&self, currency: CurrencyCode) -> Result<(u64, Money), MoneyFlowError> {
         let count = self
             .not_decomposed
             .0
-            .get(&currency)
-            .copied()
-            .unwrap_or_default();
+            .iter()
+            .filter(|((_, item_currency), _)| *item_currency == currency)
+            .try_fold(0_u64, |total, (_, count)| {
+                total
+                    .checked_add(*count)
+                    .ok_or(MoneyFlowError::AggregateOverflow {
+                        quantity: "not_decomposed_count",
+                    })
+            })?;
         let amount = total(&self.not_decomposed.1, currency, "not_decomposed")?;
         Ok((count, amount))
+    }
+
+    /// Returns undecomposed outflow rows grouped by account.
+    pub fn not_decomposed_by_account(
+        &self,
+        currency: CurrencyCode,
+    ) -> Result<Vec<(AccountId, u64, Money)>, MoneyFlowError> {
+        let mut amounts = BTreeMap::<AccountId, i128>::new();
+        for ((account, item_currency), amount) in &self.not_decomposed.1 {
+            if *item_currency == currency {
+                let total = amounts.entry(*account).or_default();
+                *total = total.checked_add(i128::from(amount.raw())).ok_or(
+                    MoneyFlowError::AggregateOverflow {
+                        quantity: "not_decomposed",
+                    },
+                )?;
+            }
+        }
+        self.not_decomposed
+            .0
+            .iter()
+            .filter_map(|((account, item_currency), count)| {
+                (*item_currency == currency).then_some((*account, *count))
+            })
+            .map(|(account, count)| {
+                Ok((
+                    account,
+                    count,
+                    Money::new(
+                        narrow(
+                            amounts.get(&account).copied().unwrap_or_default(),
+                            "not_decomposed",
+                        )?,
+                        currency,
+                    ),
+                ))
+            })
+            .collect()
     }
 
     pub fn earned_by_capital(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
@@ -653,8 +700,8 @@ fn add_category(
 }
 
 fn add_not_decomposed(
-    decomposition: &mut (BTreeMap<CurrencyCode, u64>, Ledger),
-    seen_currencies: &mut BTreeSet<CurrencyCode>,
+    decomposition: &mut (BTreeMap<(AccountId, CurrencyCode), u64>, Ledger),
+    seen_keys: &mut BTreeSet<(AccountId, CurrencyCode)>,
     account: AccountId,
     money: Money,
     event: EventId,
@@ -666,8 +713,11 @@ fn add_not_decomposed(
         "not_decomposed",
         event,
     )?;
-    if seen_currencies.insert(money.currency()) {
-        let count = decomposition.0.entry(money.currency()).or_default();
+    if seen_keys.insert((account, money.currency())) {
+        let count = decomposition
+            .0
+            .entry((account, money.currency()))
+            .or_default();
         *count = count
             .checked_add(1)
             .ok_or(MoneyFlowError::AggregateOverflow {
@@ -1596,12 +1646,55 @@ mod tests {
     }
 
     #[test]
+    fn undecomposed_breakdown_preserves_each_accounts_count_when_amounts_cancel() {
+        let first = AccountId::new_random();
+        let second = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [first, second]);
+        let mut flow = MoneyFlow::new();
+        for (account, amount) in [(first, -5_000), (first, 5_000), (second, -2_000)] {
+            flow.apply(
+                &outflow(account, "row", rub(amount)),
+                &contour,
+                august(),
+                &NoCategories,
+            )
+            .expect("applies");
+        }
+
+        let by_account = flow
+            .not_decomposed_by_account(CurrencyCode::Rub)
+            .expect("aggregate fits");
+        assert_eq!(by_account.len(), 2);
+        assert_eq!(
+            by_account
+                .iter()
+                .find(|(account, _, _)| *account == first)
+                .copied(),
+            Some((first, 2, rub(0)))
+        );
+        assert_eq!(
+            by_account
+                .iter()
+                .find(|(account, _, _)| *account == second)
+                .copied(),
+            Some((second, 1, rub(2_000)))
+        );
+        assert_eq!(
+            flow.not_decomposed(CurrencyCode::Rub)
+                .expect("aggregate fits"),
+            (3, rub(2_000))
+        );
+    }
+    #[test]
     fn undecomposed_count_overflow_is_reported_without_panicking() {
         let card = AccountId::new_random();
         let contour =
             ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
         let mut flow = MoneyFlow::new();
-        flow.not_decomposed.0.insert(CurrencyCode::Rub, u64::MAX);
+        flow.not_decomposed
+            .0
+            .insert((card, CurrencyCode::Rub), u64::MAX);
 
         let error = flow
             .apply(

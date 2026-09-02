@@ -144,6 +144,7 @@ pub struct ReconciliationStatus {
     dimensions: BTreeMap<Dimension, DimensionStatus>,
     evidence: Vec<Evidence>,
     outcomes: Vec<ClaimCheck>,
+    taints: Vec<Taint>,
 }
 
 impl ReconciliationStatus {
@@ -178,6 +179,11 @@ impl ReconciliationStatus {
     pub fn outcomes(&self) -> &[ClaimCheck] {
         &self.outcomes
     }
+
+    #[must_use]
+    pub fn taints(&self) -> &[Taint] {
+        &self.taints
+    }
 }
 
 /// A group of assertions from one document about one account over one interval.
@@ -197,6 +203,7 @@ struct StatementGroup {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationLedger {
     statuses: Vec<ReconciliationStatus>,
+    gaps: Vec<Taint>,
 }
 
 impl ReconciliationLedger {
@@ -221,12 +228,16 @@ impl ReconciliationLedger {
         // The evidence is built from the effective set, exactly as the projection
         // is: a retracted assertion that still formed a group would keep
         // confirming the interval it was withdrawn from, and — a reversal
-        // carrying the kind of its target — would assert it twice.
+        // carrying the kind of its target — would assert its claim twice.
         let groups = collect_groups(&effective_events);
         let gaps = collect_coverage_gaps(&effective_events);
-        let tainted: Vec<BTreeSet<Dimension>> = groups
+        let tainted: Vec<Vec<Taint>> = groups
             .iter()
-            .map(|group| tainted_dimensions(group, &gaps))
+            .map(|group| correlated_taints(group, &gaps))
+            .collect();
+        let tainted_dimensions: Vec<BTreeSet<Dimension>> = tainted
+            .iter()
+            .map(|items| dimensions_from_taints(items))
             .collect();
 
         // Step 1: reconcile each group against its projection.
@@ -254,25 +265,26 @@ impl ReconciliationLedger {
         let mut evidence: Vec<(AccountId, AssertionPeriod, Evidence)> = Vec::new();
         for (index, outcomes) in checked.iter().enumerate() {
             let group = &groups[index];
-            if let Some(item) = ground_five(group, outcomes, &tainted[index]) {
+            if let Some(item) = ground_five(group, outcomes, &tainted_dimensions[index]) {
                 evidence.push((group.account, group.period, item));
             }
-            if let Some((period, item)) = ground_one(index, outcomes, &groups, &tainted) {
+            if let Some((period, item)) = ground_one(index, outcomes, &groups, &tainted_dimensions)
+            {
                 evidence.push((group.account, period, item));
             }
         }
-        evidence.extend(ground_two(&groups, &tainted));
-        evidence.extend(ground_three(&groups, &checked, &tainted));
+        evidence.extend(ground_two(&groups, &tainted_dimensions));
+        evidence.extend(ground_three(&groups, &checked, &tainted_dimensions));
 
         // Step 3: statuses.
         let mut statuses: Vec<ReconciliationStatus> = Vec::new();
         for (index, outcomes) in checked.into_iter().enumerate() {
             merge_status(
                 &mut statuses,
-                build_status(&groups[index], outcomes, &evidence),
+                build_status(&groups[index], outcomes, &evidence, &tainted[index]),
             );
         }
-        Ok(Self { statuses })
+        Ok(Self { statuses, gaps })
     }
 
     /// Add evidence that the journal cannot yet generate:
@@ -302,6 +314,7 @@ impl ReconciliationLedger {
                     dimensions: map,
                     evidence: vec![item],
                     outcomes: Vec::new(),
+                    taints: Vec::new(),
                 });
             }
         }
@@ -310,6 +323,12 @@ impl ReconciliationLedger {
 
     pub fn statuses(&self) -> impl Iterator<Item = &ReconciliationStatus> {
         self.statuses.iter()
+    }
+
+    /// Every effective import coverage gap, including gaps with no assertion group.
+    #[must_use]
+    pub fn gaps(&self) -> &[Taint] {
+        &self.gaps
     }
 
     /// Dimension status on a date.
@@ -382,50 +401,63 @@ fn collect_groups(events: &[&Event]) -> Vec<StatementGroup> {
     groups
 }
 
-#[derive(Debug, Clone)]
-struct CoverageGap {
-    account: AccountId,
-    period: AssertionPeriod,
-    source: crate::ids::SourceId,
-    parser_version: crate::event::provenance::ParserVersion,
-    dimensions: BTreeSet<Dimension>,
+/// An import coverage gap projected from the effective journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Taint {
+    pub account: AccountId,
+    pub period: AssertionPeriod,
+    pub source: crate::ids::SourceId,
+    pub parser_version: crate::event::provenance::ParserVersion,
+    pub dimensions: BTreeSet<Dimension>,
+    pub refused: u32,
+    pub rows: Vec<crate::event::source_row::RefusedRow>,
 }
 
-fn collect_coverage_gaps(events: &[&Event]) -> Vec<CoverageGap> {
+fn collect_coverage_gaps(events: &[&Event]) -> Vec<Taint> {
     events
         .iter()
         .filter_map(|event| {
             let EventKind::ImportCoverageGap {
-                period, dimensions, ..
+                period,
+                dimensions,
+                refused,
+                rows,
             } = &event.kind
             else {
                 return None;
             };
-            Some(CoverageGap {
+            Some(Taint {
                 account: event.account,
                 period: *period,
                 source: event.provenance.source(),
                 parser_version: event.provenance.parser_version().clone(),
                 dimensions: dimensions.clone(),
+                refused: *refused,
+                rows: rows.clone(),
             })
         })
         .collect()
 }
 
-fn tainted_dimensions(group: &StatementGroup, gaps: &[CoverageGap]) -> BTreeSet<Dimension> {
-    let mut tainted = BTreeSet::new();
-    for gap in gaps {
-        // Correlate an attempt by (account, period, source, parser version), deliberately
-        // omitting document: each assertion claim can carry a distinct document hash.
-        if gap.account == group.account
-            && gap.period == group.period
-            && gap.source == group.channel.source
-            && gap.parser_version == group.channel.parser_version
-        {
-            tainted.extend(&gap.dimensions);
-        }
-    }
-    tainted
+fn correlated_taints(group: &StatementGroup, gaps: &[Taint]) -> Vec<Taint> {
+    gaps.iter()
+        .filter(|gap| {
+            // Correlate an attempt by (account, period, source, parser version), deliberately
+            // omitting document: each assertion claim can carry a distinct document hash.
+            gap.account == group.account
+                && gap.period == group.period
+                && gap.source == group.channel.source
+                && gap.parser_version == group.channel.parser_version
+        })
+        .cloned()
+        .collect()
+}
+
+fn dimensions_from_taints(taints: &[Taint]) -> BTreeSet<Dimension> {
+    taints
+        .iter()
+        .flat_map(|taint| taint.dimensions.iter().copied())
+        .collect()
 }
 
 /// Evidence 5: separate control sections of the same document reconciled
@@ -667,6 +699,7 @@ fn build_status(
     group: &StatementGroup,
     outcomes: Vec<ClaimCheck>,
     evidence: &[(AccountId, AssertionPeriod, Evidence)],
+    taints: &[Taint],
 ) -> ReconciliationStatus {
     let mut dimensions: BTreeMap<Dimension, DimensionStatus> = BTreeMap::new();
     let mut own_evidence = Vec::new();
@@ -692,6 +725,7 @@ fn build_status(
         dimensions,
         evidence: own_evidence,
         outcomes,
+        taints: taints.to_vec(),
     }
 }
 
@@ -736,6 +770,11 @@ fn merge_status(into: &mut Vec<ReconciliationStatus>, status: ReconciliationStat
     }
     existing.evidence.extend(status.evidence);
     existing.outcomes.extend(status.outcomes);
+    for taint in status.taints {
+        if !existing.taints.contains(&taint) {
+            existing.taints.push(taint);
+        }
+    }
 }
 
 /// Tests for internal registry functions.
@@ -1012,6 +1051,7 @@ mod internals {
             dimensions,
             evidence: Vec::new(),
             outcomes: Vec::new(),
+            taints: Vec::new(),
         }
     }
 
@@ -1149,6 +1189,7 @@ mod internals {
                     DimensionStatus::Discrepant,
                 ),
             ],
+            gaps: Vec::new(),
         };
         assert_eq!(
             ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
@@ -1191,6 +1232,7 @@ mod internals {
                 Dimension::Cash,
                 DimensionStatus::AcceptedInternal,
             )],
+            gaps: Vec::new(),
         }
         .with_external_evidence(vec![(account, march(), evidence.clone())]);
         assert_eq!(
@@ -1249,6 +1291,7 @@ mod internals {
                     DimensionStatus::Provisional,
                 ),
             ],
+            gaps: Vec::new(),
         }
         .with_external_evidence(vec![(account, march(), evidence)]);
 

@@ -4,9 +4,14 @@ use crate::error::AppError;
 use crate::ports::{
     AccountActivityView, AccountView, ContourView, ControlAssertionView, Scope, Store,
 };
+use crate::scenarios::reports::MoneyFlowReport;
+use iaam_core::event::source_row::RowName;
 use iaam_core::ids::{AccountId, OwnerId};
-use iaam_core::reconciliation::Dimension;
+use iaam_core::money::Money;
+use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
+use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
+use iaam_ingest::Verdict;
 
 /// The policy-visible kind of an outstanding action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -15,6 +20,12 @@ pub enum ActionKind {
     CreateFirstContour,
     StartAccountImport,
     ProvideControlAssertion,
+    CoverageGapUnrepaired,
+    IndependentConfirmationMissing,
+    DiscrepancyUnresolved,
+    UndecomposedOutflows,
+    UnexplainedResidual,
+    PossibleDuplicateUndecided,
 }
 
 impl ActionKind {
@@ -26,16 +37,27 @@ impl ActionKind {
             Self::CreateFirstContour => "create_first_contour",
             Self::StartAccountImport => "start_account_import",
             Self::ProvideControlAssertion => "provide_control_assertion",
+            Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
+            Self::IndependentConfirmationMissing => "independent_confirmation_missing",
+            Self::DiscrepancyUnresolved => "discrepancy_unresolved",
+            Self::UndecomposedOutflows => "undecomposed_outflows",
+            Self::UnexplainedResidual => "unexplained_residual",
+            Self::PossibleDuplicateUndecided => "possible_duplicate_undecided",
         }
     }
 }
 
 /// The policy category assigned to an action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ActionCategory {
+    /// Work that prevents the system from accepting another action.
     Blocking,
+    /// Work required for a named goal.
     RequiredForGoal,
+    /// Work that improves quality but is not required.
     Recommended,
+    /// A fact that requires no action.
+    Informational,
 }
 
 /// Whether an action can be invoked without asking the owner.
@@ -43,6 +65,8 @@ pub enum ActionCategory {
 pub enum ActionState {
     Ready,
     NeedsOwnerInput,
+    /// No operation in this API is available for this item.
+    Blocked,
 }
 
 /// A source from which the value of a missing request field must come.
@@ -109,6 +133,9 @@ pub enum ActionTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionInvariantError {
     ReadyWithoutOperation,
+    BlockedWithOperation,
+    BlockedWithScope,
+    NonBlockedWithoutScope,
 }
 
 /// What an action is, apart from its prose and its target.
@@ -123,7 +150,7 @@ pub struct ActionFacts {
     pub kind: ActionKind,
     pub category: ActionCategory,
     pub state: ActionState,
-    pub required_scope: Scope,
+    pub required_scope: Option<Scope>,
 }
 
 /// One outstanding item in the owner's computed policy frontier.
@@ -134,7 +161,7 @@ pub struct Action {
     category: ActionCategory,
     state: ActionState,
     reason: String,
-    required_scope: Scope,
+    required_scope: Option<Scope>,
     target: ActionTarget,
 }
 
@@ -150,6 +177,18 @@ impl Action {
             (ActionState::Ready, ActionTarget::None)
         ) {
             return Err(ActionInvariantError::ReadyWithoutOperation);
+        }
+        if matches!(
+            (facts.state, &target),
+            (ActionState::Blocked, ActionTarget::Operation { .. })
+        ) {
+            return Err(ActionInvariantError::BlockedWithOperation);
+        }
+        if facts.state == ActionState::Blocked && facts.required_scope.is_some() {
+            return Err(ActionInvariantError::BlockedWithScope);
+        }
+        if facts.state != ActionState::Blocked && facts.required_scope.is_none() {
+            return Err(ActionInvariantError::NonBlockedWithoutScope);
         }
         Ok(Self {
             id: facts.id,
@@ -187,8 +226,7 @@ impl Action {
         &self.reason
     }
 
-    #[must_use]
-    pub const fn required_scope(&self) -> Scope {
+    pub const fn required_scope(&self) -> Option<Scope> {
         self.required_scope
     }
 
@@ -232,6 +270,242 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
     ))
 }
 
+/// Find every unresolved or informational fact in a reconciliation ledger.
+pub fn ledger_diagnostics(ledger: &ReconciliationLedger) -> Vec<Action> {
+    let mut actions = Vec::new();
+    for gap in ledger.gaps() {
+        let category = ledger
+            .statuses()
+            .find(|status| status.account() == gap.account && status.period() == gap.period)
+            .map_or(ActionCategory::RequiredForGoal, |status| {
+                if gap.dimensions.iter().all(|dimension| {
+                    status.dimension(*dimension) == DimensionStatus::AcceptedIndependent
+                }) {
+                    ActionCategory::Informational
+                } else {
+                    ActionCategory::RequiredForGoal
+                }
+            });
+        let rows = if gap.rows.is_empty() {
+            "the legacy record cannot name the refused rows".to_owned()
+        } else {
+            let names = gap
+                .rows
+                .iter()
+                .map(|row| format!("{}:{}", row.key.source.inner(), row_name_text(&row.key.row)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("refused rows: {names}")
+        };
+        actions.push(blocked_action(
+            format!(
+                "{}:{}:{}:{}:{}",
+                ActionKind::CoverageGapUnrepaired.id(),
+                gap.account.inner(),
+                gap.period.from,
+                gap.period.to,
+                gap.source.inner()
+            ),
+            ActionKind::CoverageGapUnrepaired,
+            category,
+            format!(
+                "Account {} has a coverage gap from {} through {} in dimensions {}; {} ({} rows refused); no repair operation exists in this API.",
+                gap.account.inner(),
+                gap.period.from,
+                gap.period.to,
+                gap.dimensions
+                    .iter()
+                    .map(|dimension| dimension.code())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                rows,
+                gap.refused
+            ),
+        ));
+    }
+    for status in ledger.statuses() {
+        for dimension in Dimension::all() {
+            if status.dimension(dimension) == DimensionStatus::AcceptedInternal {
+                actions.push(blocked_action(
+                    format!(
+                        "{}:{}:{}:{}:{}",
+                        ActionKind::IndependentConfirmationMissing.id(),
+                        status.account().inner(),
+                        status.period().from,
+                        status.period().to,
+                        dimension.code()
+                    ),
+                    ActionKind::IndependentConfirmationMissing,
+                    ActionCategory::RequiredForGoal,
+                    format!(
+                        "Account {} reached internal confirmation for {} from {} through {} but has no confirmation from a different parser and document; no acquisition operation exists in this API.",
+                        status.account().inner(),
+                        dimension.code(),
+                        status.period().from,
+                        status.period().to
+                    ),
+                ));
+            }
+        }
+        for (index, check) in status.outcomes().iter().enumerate() {
+            let ClaimOutcome::Discrepant(discrepancy) = check.outcome else {
+                continue;
+            };
+            actions.push(blocked_action(
+                format!(
+                    "{}:{}:{}:{}:{}:{}",
+                    ActionKind::DiscrepancyUnresolved.id(),
+                    status.account().inner(),
+                    status.period().from,
+                    status.period().to,
+                    discrepancy.field,
+                    index
+                ),
+                ActionKind::DiscrepancyUnresolved,
+                ActionCategory::RequiredForGoal,
+                format!(
+                    "Account {} has an unresolved {} discrepancy from {} through {}: claimed {}, observed {}, delta {}; the system cannot identify which side is wrong and no resolution operation exists in this API.",
+                    status.account().inner(),
+                    discrepancy.field,
+                    status.period().from,
+                    status.period().to,
+                    claim_value_text(discrepancy.claimed),
+                    claim_value_text(discrepancy.observed),
+                    claim_value_text(discrepancy.delta)
+                ),
+            ));
+        }
+    }
+    sort_actions(&mut actions);
+    actions
+}
+
+/// Find undecomposed outflows and unexplained account residuals in a flow report.
+pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
+    let mut actions = Vec::new();
+    for currency in report.flow.currencies() {
+        let undecomposed = report
+            .flow
+            .not_decomposed_by_account(currency)
+            .expect("money flow undecomposed breakdown");
+        for (account, count, amount) in undecomposed {
+            actions.push(blocked_action(
+                format!(
+                    "{}:{}:{}",
+                    ActionKind::UndecomposedOutflows.id(),
+                    account.inner(),
+                    currency.code()
+                ),
+                ActionKind::UndecomposedOutflows,
+                ActionCategory::Informational,
+                format!(
+                    "Account {} has {} undecomposed outflow rows totaling {} {}; the rows are not identified and no report operation can provide a rule.",
+                    account.inner(),
+                    count,
+                    amount.to_calc_dec().inner(),
+                    currency.code()
+                ),
+            ));
+        }
+    }
+    for (account, amount) in report
+        .flow
+        .residuals_by_account()
+        .expect("money flow residual breakdown")
+    {
+        actions.push(blocked_action(
+            format!(
+                "{}:{}:{}",
+                ActionKind::UnexplainedResidual.id(),
+                account.inner(),
+                amount.currency().code()
+            ),
+            ActionKind::UnexplainedResidual,
+            ActionCategory::Informational,
+            format!(
+                "Account {} has an unexplained residual of {} {}; the report quantities do not explain its cash change and no report operation can resolve it.",
+                account.inner(),
+                amount.to_calc_dec().inner(),
+                amount.currency().code()
+            ),
+        ));
+    }
+    sort_actions(&mut actions);
+    actions
+}
+
+/// Find an import-time possible duplicate that has no stored decision.
+pub fn verdict_diagnostics(verdict: &Verdict) -> Option<Action> {
+    let Verdict::PossibleDuplicate {
+        event, of, level, ..
+    } = verdict
+    else {
+        return None;
+    };
+    Some(blocked_action(
+        format!(
+            "{}:{}:{}:{}",
+            ActionKind::PossibleDuplicateUndecided.id(),
+            event.inner(),
+            of.inner(),
+            level.number()
+        ),
+        ActionKind::PossibleDuplicateUndecided,
+        ActionCategory::RequiredForGoal,
+        format!(
+            "Event {} may duplicate event {} at deduplication level {}; the owner must decide and no decision operation exists in this API.",
+            event.inner(),
+            of.inner(),
+            level.number()
+        ),
+    ))
+}
+
+fn blocked_action(
+    id: String,
+    kind: ActionKind,
+    category: ActionCategory,
+    reason: String,
+) -> Action {
+    Action::new(
+        ActionFacts {
+            id,
+            kind,
+            category,
+            state: ActionState::Blocked,
+            required_scope: None,
+        },
+        reason,
+        ActionTarget::None,
+    )
+    .expect("blocked diagnostic has no operation or scope")
+}
+
+fn sort_actions(actions: &mut [Action]) {
+    actions.sort_by(|left, right| {
+        left.category()
+            .cmp(&right.category())
+            .then_with(|| left.id().cmp(right.id()))
+    });
+}
+
+fn claim_value_text(value: ClaimValue) -> String {
+    match value {
+        ClaimValue::Money { amount, currency } => format!(
+            "{} {}",
+            Money::new(amount, currency).to_calc_dec().inner(),
+            currency.code()
+        ),
+        ClaimValue::Quantity(quantity) => quantity.0.inner().to_string(),
+    }
+}
+
+fn row_name_text(name: &RowName) -> String {
+    match name {
+        RowName::Given(name) => format!("given:{name}"),
+        RowName::Fingerprint(name) => format!("fingerprint:{name}"),
+    }
+}
 fn actions_from_state(
     accounts: &[AccountView],
     contours: &[ContourView],
@@ -358,7 +632,7 @@ fn start_account_import_action(account: AccountId) -> Action {
             kind: ActionKind::StartAccountImport,
             category: ActionCategory::RequiredForGoal,
             state: ActionState::NeedsOwnerInput,
-            required_scope: Scope::Owner,
+            required_scope: Some(Scope::Owner),
         },
         format!(
             "Account {} has no business facts; import a statement or connect a broker. \
@@ -392,7 +666,7 @@ fn provide_control_assertion_action(account: AccountId, period: AssertionPeriod)
             kind: ActionKind::ProvideControlAssertion,
             category: ActionCategory::Recommended,
             state: ActionState::NeedsOwnerInput,
-            required_scope: Scope::Owner,
+            required_scope: Some(Scope::Owner),
         },
         format!(
             "Account {} has business facts from {} through {}; record its closing cash balance. \
@@ -425,7 +699,7 @@ fn first_account_action() -> Action {
             kind: ActionKind::CreateFirstAccount,
             category: ActionCategory::Blocking,
             state: ActionState::NeedsOwnerInput,
-            required_scope: Scope::Owner,
+            required_scope: Some(Scope::Owner),
         },
         "No account exists; create one before portfolio actions can be offered.",
         ActionTarget::Operation {
@@ -460,7 +734,7 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
             kind: ActionKind::CreateFirstContour,
             category: ActionCategory::RequiredForGoal,
             state: ActionState::NeedsOwnerInput,
-            required_scope: Scope::Owner,
+            required_scope: Some(Scope::Owner),
         },
         "No contour exists; report boundaries cannot be computed until one is created.",
         ActionTarget::Operation {
@@ -491,7 +765,20 @@ mod tests {
     use crate::adapters::sqlite::SqliteAdapter;
     use crate::ports::Store;
     use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+    use iaam_core::dates::{EffectiveOrder, EventDates};
+    use iaam_core::event::kind::EventKind;
+    use iaam_core::event::leg::Leg;
+    use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+    use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
+    use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+    use iaam_core::ids::{EventId, SourceId};
+    use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+    use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
+    use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+    use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
     use iaam_store::SqliteStore;
+    use std::collections::BTreeSet;
+    use time::macros::date;
 
     fn store() -> SqliteAdapter {
         SqliteAdapter::new(SqliteStore::open_in_memory().expect("in-memory store"))
@@ -532,7 +819,7 @@ mod tests {
         assert_eq!(action.kind(), ActionKind::CreateFirstAccount);
         assert_eq!(action.category(), ActionCategory::Blocking);
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
-        assert_eq!(action.required_scope(), Scope::Owner);
+        assert_eq!(action.required_scope(), Some(Scope::Owner));
         let ActionTarget::Operation { operation, request } = action.target() else {
             panic!("first account needs an operation target");
         };
@@ -692,7 +979,7 @@ mod tests {
                 kind: ActionKind::CreateFirstAccount,
                 category: ActionCategory::Blocking,
                 state: ActionState::Ready,
-                required_scope: Scope::Owner,
+                required_scope: Some(Scope::Owner),
             },
             "invalid",
             ActionTarget::None,
@@ -877,5 +1164,662 @@ mod tests {
             BalancePoint::Closing,
             Dimension::Cash
         ));
+    }
+    fn diagnostic_event(account: AccountId, kind: EventKind, day: time::Date) -> Event {
+        let source = SourceId::new_random();
+        Event {
+            id: EventId::new_random(),
+            schema_version: SCHEMA_VERSION,
+            owner: OwnerId::new_random(),
+            account,
+            kind,
+            dates: EventDates::for_cash(iaam_core::dates::CashPostedDate(day)),
+            order: EffectiveOrder::new(day, 0),
+            legs: Vec::new(),
+            provenance: Provenance::new(
+                source,
+                RawHash::parse(&"a".repeat(64)).expect("raw hash"),
+                ParserVersion("diagnostic/1".to_owned()),
+            ),
+            relation: Relation::None,
+            confidence: Confidence::Known,
+            idempotency_key: None,
+        }
+    }
+
+    fn gap_ledger(account: AccountId) -> ReconciliationLedger {
+        let period =
+            AssertionPeriod::between(date!(2026 - 08 - 01), date!(2026 - 08 - 31)).expect("period");
+        let source = SourceId::new_random();
+        let dimensions = BTreeSet::from([Dimension::Cash]);
+        let row = RefusedRow {
+            key: SourceRowKey {
+                source,
+                row: RowName::Given("row-17".to_owned()),
+            },
+            dimensions: dimensions.clone(),
+        };
+        let event = diagnostic_event(
+            account,
+            EventKind::ImportCoverageGap {
+                period,
+                dimensions,
+                refused: 1,
+                rows: vec![row],
+            },
+            period.to,
+        );
+        ReconciliationLedger::build(&[event]).expect("gap ledger")
+    }
+
+    #[test]
+    fn a_coverage_gap_diagnostic_names_the_refused_row_and_has_no_call() {
+        let ledger = gap_ledger(AccountId::new_random());
+        let action = ledger_diagnostics(&ledger)
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
+            .expect("coverage gap diagnostic");
+
+        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(action.state(), ActionState::Blocked);
+        assert_eq!(action.required_scope(), None);
+        assert_eq!(action.target(), &ActionTarget::None);
+        assert!(action.reason().contains("given:row-17"));
+    }
+
+    #[test]
+    fn a_gap_without_a_status_is_still_a_required_diagnostic() {
+        let actions = ledger_diagnostics(&gap_ledger(AccountId::new_random()));
+        assert!(actions.iter().any(|action| {
+            action.kind() == ActionKind::CoverageGapUnrepaired
+                && action.category() == ActionCategory::RequiredForGoal
+        }));
+    }
+
+    #[test]
+    fn internal_confirmation_without_independence_is_named() {
+        let account = AccountId::new_random();
+        let period =
+            AssertionPeriod::between(date!(2026 - 08 - 01), date!(2026 - 08 - 31)).expect("period");
+        let ledger = ReconciliationLedger::build(&[diagnostic_event(
+            account,
+            EventKind::ControlAssertion {
+                period,
+                claim: ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(0),
+                    at: BalancePoint::Closing,
+                },
+            },
+            period.to,
+        )])
+        .expect("status ledger")
+        .with_external_evidence(vec![(
+            account,
+            period,
+            Evidence::from_match(
+                Ground::BrokerApiAgreesWithStatement,
+                SourceChannel {
+                    source: SourceId::new_random(),
+                    parser_version: ParserVersion("same".to_owned()),
+                    document: RawHash::parse(&"c".repeat(64)),
+                },
+                SourceChannel {
+                    source: SourceId::new_random(),
+                    parser_version: ParserVersion("same".to_owned()),
+                    document: RawHash::parse(&"c".repeat(64)),
+                },
+                BTreeSet::from([Dimension::Cash]),
+            )
+            .expect("evidence"),
+        )]);
+        let action = ledger_diagnostics(&ledger)
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::IndependentConfirmationMissing)
+            .expect("independence diagnostic");
+
+        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(action.state(), ActionState::Blocked);
+        assert!(action.reason().contains("different parser and document"));
+        assert_eq!(action.target(), &ActionTarget::None);
+    }
+
+    #[test]
+    fn discrepancy_diagnostic_names_both_sides_and_delta() {
+        let account = AccountId::new_random();
+        let period =
+            AssertionPeriod::between(date!(2026 - 08 - 01), date!(2026 - 08 - 31)).expect("period");
+        let observed_amount = Money::new(PostedMinor::new(500), CurrencyCode::Rub);
+        let mut observed = diagnostic_event(
+            account,
+            EventKind::CashIn {
+                amount: observed_amount,
+            },
+            period.to,
+        );
+        observed.legs = vec![Leg::cash(account, observed_amount)];
+        let assertion = diagnostic_event(
+            account,
+            EventKind::ControlAssertion {
+                period,
+                claim: ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(1_000),
+                    at: BalancePoint::Closing,
+                },
+            },
+            period.to,
+        );
+        let ledger =
+            ReconciliationLedger::build(&[observed, assertion]).expect("discrepant ledger");
+        let action = ledger_diagnostics(&ledger)
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::DiscrepancyUnresolved)
+            .expect("discrepancy diagnostic");
+
+        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(action.state(), ActionState::Blocked);
+        assert!(
+            action.reason().contains("claimed 10.00 RUB"),
+            "{}",
+            action.reason()
+        );
+        assert!(action.reason().contains("observed 5.00 RUB"));
+        assert!(action.reason().contains("delta 5.00 RUB"));
+        assert_eq!(action.target(), &ActionTarget::None);
+    }
+
+    #[test]
+    fn flow_diagnostics_names_undecomposed_account_and_residual_account() {
+        let account = AccountId::new_random();
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let period = DateWindow {
+            from: date!(2026 - 08 - 01),
+            to: date!(2026 - 08 - 31),
+        };
+        let mut flow = MoneyFlow::new();
+        let outflow_amount = Money::new(PostedMinor::new(-700), CurrencyCode::Rub);
+        let mut outflow = diagnostic_event(
+            account,
+            EventKind::CashOut {
+                amount: outflow_amount,
+            },
+            date!(2026 - 08 - 03),
+        );
+        outflow.legs = vec![Leg::cash(account, outflow_amount)];
+        flow.apply(&outflow, &contour, period, &NoCategories)
+            .expect("outflow");
+        let opening_amount = Money::new(PostedMinor::new(-200), CurrencyCode::Rub);
+        let mut opening = diagnostic_event(
+            account,
+            EventKind::OpeningCash {
+                amount: opening_amount,
+            },
+            date!(2026 - 08 - 04),
+        );
+        opening.legs = vec![Leg::cash(account, opening_amount)];
+        flow.apply(&opening, &contour, period, &NoCategories)
+            .expect("opening balance");
+        let report = MoneyFlowReport {
+            contour: contour.id(),
+            version: ContourVersion(1),
+            from: period.from,
+            to: period.to,
+            category_rule_versions: Vec::new(),
+            flow,
+        };
+        let actions = flow_diagnostics(&report);
+
+        let undecomposed = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::UndecomposedOutflows)
+            .expect("undecomposed diagnostic");
+        assert_eq!(undecomposed.category(), ActionCategory::Informational);
+        assert!(undecomposed.reason().contains(&account.inner().to_string()));
+        assert_eq!(undecomposed.state(), ActionState::Blocked);
+        assert_eq!(undecomposed.target(), &ActionTarget::None);
+        let residual = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::UnexplainedResidual)
+            .expect("residual diagnostic");
+        assert_eq!(residual.category(), ActionCategory::Informational);
+        assert!(residual.reason().contains(&account.inner().to_string()));
+        assert_eq!(residual.target(), &ActionTarget::None);
+    }
+
+    #[test]
+    fn possible_duplicate_diagnostic_names_both_events_and_level() {
+        let event = EventId::new_random();
+        let of = EventId::new_random();
+        let action = verdict_diagnostics(&Verdict::PossibleDuplicate {
+            event,
+            of,
+            level: iaam_ingest::dedup::DedupLevel::Probabilistic,
+        })
+        .expect("duplicate diagnostic");
+
+        assert_eq!(action.kind(), ActionKind::PossibleDuplicateUndecided);
+        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(action.state(), ActionState::Blocked);
+        assert!(action.id().contains(&event.inner().to_string()));
+        assert!(action.id().contains(&of.inner().to_string()));
+        assert!(action.id().ends_with(":5"));
+        assert_eq!(action.target(), &ActionTarget::None);
+    }
+
+    #[test]
+    fn a_blocked_action_has_no_operation_and_no_scope() {
+        let result = Action::new(
+            ActionFacts {
+                id: "blocked".to_owned(),
+                kind: ActionKind::CreateFirstAccount,
+                category: ActionCategory::RequiredForGoal,
+                state: ActionState::Blocked,
+                required_scope: None,
+            },
+            "nothing can call this",
+            ActionTarget::None,
+        );
+
+        let action = result.expect("valid blocked action");
+        assert_eq!(action.target(), &ActionTarget::None);
+        assert_eq!(action.required_scope(), None);
+    }
+
+    #[test]
+    fn blocked_action_rejects_an_operation_and_a_scope() {
+        let operation = Action::new(
+            ActionFacts {
+                id: "blocked-operation".to_owned(),
+                kind: ActionKind::CreateFirstAccount,
+                category: ActionCategory::RequiredForGoal,
+                state: ActionState::Blocked,
+                required_scope: None,
+            },
+            "nothing can call this",
+            ActionTarget::Operation {
+                operation: OperationKey::CreateAccount,
+                request: RequestPlan {
+                    preset: BTreeMap::new(),
+                    missing: Vec::new(),
+                },
+            },
+        );
+        assert_eq!(operation, Err(ActionInvariantError::BlockedWithOperation));
+
+        let scope = Action::new(
+            ActionFacts {
+                id: "blocked-scope".to_owned(),
+                kind: ActionKind::CreateFirstAccount,
+                category: ActionCategory::RequiredForGoal,
+                state: ActionState::Blocked,
+                required_scope: Some(Scope::Owner),
+            },
+            "nothing can call this",
+            ActionTarget::None,
+        );
+        assert_eq!(scope, Err(ActionInvariantError::BlockedWithScope));
+    }
+
+    #[test]
+    fn a_nonblocked_action_requires_a_scope() {
+        let result = Action::new(
+            ActionFacts {
+                id: "missing-scope".to_owned(),
+                kind: ActionKind::CreateFirstAccount,
+                category: ActionCategory::Blocking,
+                state: ActionState::NeedsOwnerInput,
+                required_scope: None,
+            },
+            "invalid",
+            ActionTarget::Operation {
+                operation: OperationKey::CreateAccount,
+                request: RequestPlan {
+                    preset: BTreeMap::new(),
+                    missing: Vec::new(),
+                },
+            },
+        );
+        assert_eq!(result, Err(ActionInvariantError::NonBlockedWithoutScope));
+    }
+
+    fn august() -> AssertionPeriod {
+        AssertionPeriod::between(date!(2026 - 08 - 01), date!(2026 - 08 - 31)).expect("period")
+    }
+
+    fn cash_gap_event(account: AccountId, refused: u32, rows: Vec<RefusedRow>) -> Event {
+        diagnostic_event(
+            account,
+            EventKind::ImportCoverageGap {
+                period: august(),
+                dimensions: BTreeSet::from([Dimension::Cash]),
+                refused,
+                rows,
+            },
+            august().to,
+        )
+    }
+
+    fn refused_row(source: SourceId, name: &str) -> RefusedRow {
+        RefusedRow {
+            key: SourceRowKey {
+                source,
+                row: RowName::Given(name.to_owned()),
+            },
+            dimensions: BTreeSet::from([Dimension::Cash]),
+        }
+    }
+
+    fn cash_balance_assertion(account: AccountId, minor: i64) -> Event {
+        diagnostic_event(
+            account,
+            EventKind::ControlAssertion {
+                period: august(),
+                claim: ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(minor),
+                    at: BalancePoint::Closing,
+                },
+            },
+            august().to,
+        )
+    }
+
+    fn cash_in_event(account: AccountId, minor: i64, day: time::Date) -> Event {
+        let amount = Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
+        let mut event = diagnostic_event(account, EventKind::CashIn { amount }, day);
+        event.legs = vec![Leg::cash(account, amount)];
+        event
+    }
+
+    fn channel(parser: &str, document: &str) -> SourceChannel {
+        SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion(parser.to_owned()),
+            document: RawHash::parse(&document.repeat(64)),
+        }
+    }
+
+    fn independent_cash_evidence() -> Evidence {
+        Evidence::from_match(
+            Ground::BrokerApiAgreesWithStatement,
+            channel("left", "c"),
+            channel("right", "d"),
+            BTreeSet::from([Dimension::Cash]),
+        )
+        .expect("independent evidence")
+    }
+
+    fn internal_cash_evidence() -> Evidence {
+        Evidence::from_match(
+            Ground::BrokerApiAgreesWithStatement,
+            channel("same", "c"),
+            channel("same", "c"),
+            BTreeSet::from([Dimension::Cash]),
+        )
+        .expect("internal evidence")
+    }
+
+    fn flow_report(
+        flow: MoneyFlow,
+        contour: &ContourDefinition,
+        period: DateWindow,
+    ) -> MoneyFlowReport {
+        MoneyFlowReport {
+            contour: contour.id(),
+            version: ContourVersion(1),
+            from: period.from,
+            to: period.to,
+            category_rule_versions: Vec::new(),
+            flow,
+        }
+    }
+
+    fn undecomposed_report(accounts: &[AccountId]) -> MoneyFlowReport {
+        let contour = ContourDefinition::new(
+            ContourId::new_random(),
+            ContourVersion(1),
+            accounts.to_vec(),
+        );
+        let period = DateWindow {
+            from: date!(2026 - 08 - 01),
+            to: date!(2026 - 08 - 31),
+        };
+        let mut flow = MoneyFlow::new();
+        for account in accounts {
+            let outflow_amount = Money::new(PostedMinor::new(-700), CurrencyCode::Rub);
+            let mut outflow = diagnostic_event(
+                *account,
+                EventKind::CashOut {
+                    amount: outflow_amount,
+                },
+                date!(2026 - 08 - 03),
+            );
+            outflow.legs = vec![Leg::cash(*account, outflow_amount)];
+            flow.apply(&outflow, &contour, period, &NoCategories)
+                .expect("outflow");
+            let opening_amount = Money::new(PostedMinor::new(-200), CurrencyCode::Rub);
+            let mut opening = diagnostic_event(
+                *account,
+                EventKind::OpeningCash {
+                    amount: opening_amount,
+                },
+                date!(2026 - 08 - 04),
+            );
+            opening.legs = vec![Leg::cash(*account, opening_amount)];
+            flow.apply(&opening, &contour, period, &NoCategories)
+                .expect("opening balance");
+        }
+        flow_report(flow, &contour, period)
+    }
+
+    /// Every outflow carries a category and every account closes: the report has
+    /// nothing left over to report.
+    fn decomposed_report(account: AccountId) -> MoneyFlowReport {
+        let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
+        let period = DateWindow {
+            from: date!(2026 - 08 - 01),
+            to: date!(2026 - 08 - 31),
+        };
+        let mut flow = MoneyFlow::new();
+        flow.apply(
+            &cash_in_event(account, 700, date!(2026 - 08 - 03)),
+            &contour,
+            period,
+            &NoCategories,
+        )
+        .expect("inflow");
+        flow_report(flow, &contour, period)
+    }
+
+    /// A legacy record predates schema 8 and holds no refused rows. Rendering it as
+    /// a gap that refused nothing would read as a gap with no consequence, so the
+    /// prose says the rows cannot be named and still reports how many there were.
+    #[test]
+    fn a_legacy_gap_without_rows_cannot_name_them_and_says_so() {
+        let ledger =
+            ReconciliationLedger::build(&[cash_gap_event(AccountId::new_random(), 3, Vec::new())])
+                .expect("legacy gap ledger");
+
+        let action = ledger_diagnostics(&ledger)
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
+            .expect("legacy coverage gap diagnostic");
+
+        assert!(
+            action.reason().contains("cannot name the refused rows"),
+            "{}",
+            action.reason()
+        );
+        assert!(
+            !action.reason().contains("refused rows:"),
+            "a legacy gap must not claim to list rows: {}",
+            action.reason()
+        );
+        assert!(
+            action.reason().contains("3 rows refused"),
+            "the count survives even when the rows do not: {}",
+            action.reason()
+        );
+        assert_eq!(action.target(), &ActionTarget::None);
+    }
+
+    /// §6: a clean second channel can carry a dimension to independence while an
+    /// older gap stands. The gap is then a fact, not outstanding work — and the
+    /// category must be computed from the dimension statuses rather than fixed.
+    #[test]
+    fn a_gap_whose_tainted_dimensions_are_all_independent_is_informational() {
+        let account = AccountId::new_random();
+        let source = SourceId::new_random();
+        let ledger = ReconciliationLedger::build(&[
+            cash_gap_event(account, 1, vec![refused_row(source, "row-4")]),
+            cash_balance_assertion(account, 0),
+        ])
+        .expect("confirmed gap ledger")
+        .with_external_evidence(vec![(account, august(), independent_cash_evidence())]);
+
+        let action = ledger_diagnostics(&ledger)
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
+            .expect("coverage gap diagnostic");
+
+        assert_eq!(action.category(), ActionCategory::Informational);
+        assert_eq!(action.state(), ActionState::Blocked);
+        assert_eq!(action.target(), &ActionTarget::None);
+    }
+
+    /// The same fixture with the dimension one level lower stays required: the
+    /// two assertions together show the category is computed and not a constant.
+    #[test]
+    fn a_gap_whose_tainted_dimension_stops_at_internal_stays_required() {
+        let account = AccountId::new_random();
+        let source = SourceId::new_random();
+        let ledger = ReconciliationLedger::build(&[
+            cash_gap_event(account, 1, vec![refused_row(source, "row-4")]),
+            cash_balance_assertion(account, 0),
+        ])
+        .expect("internal gap ledger")
+        .with_external_evidence(vec![(account, august(), internal_cash_evidence())]);
+
+        let action = ledger_diagnostics(&ledger)
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
+            .expect("coverage gap diagnostic");
+
+        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+    }
+
+    /// One ledger, one flow report and one verdict that between them produce every
+    /// diagnostic this task defines.
+    fn every_diagnostic() -> Vec<Action> {
+        let discrepant = AccountId::new_random();
+        let internal = AccountId::new_random();
+        let source = SourceId::new_random();
+        let ledger = ReconciliationLedger::build(&[
+            cash_gap_event(discrepant, 1, vec![refused_row(source, "row-9")]),
+            cash_in_event(discrepant, 500, august().to),
+            cash_balance_assertion(discrepant, 1_000),
+            cash_balance_assertion(internal, 0),
+        ])
+        .expect("diagnostic ledger")
+        .with_external_evidence(vec![(internal, august(), internal_cash_evidence())]);
+
+        let mut actions = ledger_diagnostics(&ledger);
+        actions.extend(flow_diagnostics(&undecomposed_report(&[
+            AccountId::new_random(),
+        ])));
+        actions.extend(verdict_diagnostics(&Verdict::PossibleDuplicate {
+            event: EventId::new_random(),
+            of: EventId::new_random(),
+            level: iaam_ingest::dedup::DedupLevel::Probabilistic,
+        }));
+        actions
+    }
+
+    /// The universal assertions are worthless over an empty set, so the exact set
+    /// of kinds is asserted **first**: the sweep below then runs over something.
+    #[test]
+    fn every_diagnostic_is_blocked_with_no_target_and_no_scope() {
+        let actions = every_diagnostic();
+
+        let kinds: BTreeSet<ActionKind> = actions.iter().map(Action::kind).collect();
+        assert_eq!(
+            kinds,
+            BTreeSet::from([
+                ActionKind::CoverageGapUnrepaired,
+                ActionKind::IndependentConfirmationMissing,
+                ActionKind::DiscrepancyUnresolved,
+                ActionKind::UndecomposedOutflows,
+                ActionKind::UnexplainedResidual,
+                ActionKind::PossibleDuplicateUndecided,
+            ]),
+            "the sweep must run over every diagnostic kind, not a subset"
+        );
+
+        for action in &actions {
+            assert_eq!(action.target(), &ActionTarget::None, "{}", action.id());
+            assert_eq!(action.state(), ActionState::Blocked, "{}", action.id());
+            assert_eq!(action.required_scope(), None, "{}", action.id());
+        }
+    }
+
+    /// An agent deduplicates by `id`. Two accounts holding the same diagnostic
+    /// must not collapse into one item.
+    #[test]
+    fn two_accounts_with_the_same_diagnostic_get_distinct_ids() {
+        let first = AccountId::new_random();
+        let second = AccountId::new_random();
+        let source = SourceId::new_random();
+        let ledger = ReconciliationLedger::build(&[
+            cash_gap_event(first, 1, vec![refused_row(source, "row-1")]),
+            cash_gap_event(second, 1, vec![refused_row(source, "row-2")]),
+        ])
+        .expect("two-account gap ledger");
+
+        let diagnostics = ledger_diagnostics(&ledger);
+        let gaps: Vec<&Action> = diagnostics
+            .iter()
+            .filter(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
+            .collect();
+        assert_eq!(gaps.len(), 2);
+        assert_ne!(gaps[0].id(), gaps[1].id());
+
+        let flow = flow_diagnostics(&undecomposed_report(&[first, second]));
+        let undecomposed: Vec<&Action> = flow
+            .iter()
+            .filter(|action| action.kind() == ActionKind::UndecomposedOutflows)
+            .collect();
+        assert_eq!(undecomposed.len(), 2);
+        assert_ne!(undecomposed[0].id(), undecomposed[1].id());
+    }
+
+    /// Nothing outstanding, nothing informational: the detectors say nothing
+    /// rather than filling the answer with items that mean "all is well".
+    #[test]
+    fn a_reconciled_and_decomposed_report_yields_no_diagnostics() {
+        let account = AccountId::new_random();
+        let ledger = ReconciliationLedger::build(&[
+            cash_in_event(account, 1_000, august().to),
+            cash_balance_assertion(account, 1_000),
+        ])
+        .expect("matched ledger");
+
+        assert!(
+            ledger_diagnostics(&ledger).is_empty(),
+            "{:?}",
+            ledger_diagnostics(&ledger)
+        );
+        let report = decomposed_report(account);
+        assert!(
+            flow_diagnostics(&report).is_empty(),
+            "{:?}",
+            flow_diagnostics(&report)
+        );
+        assert!(
+            verdict_diagnostics(&Verdict::Accepted {
+                event: EventId::new_random()
+            })
+            .is_none()
+        );
     }
 }

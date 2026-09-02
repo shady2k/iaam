@@ -37,7 +37,7 @@ help: ## List targets
 # --- Quality gates -----------------------------------------------------
 
 .PHONY: check
-check: fmt lint arch privacy fixtures deps test doc-test ## Everything that avoids the network and completes within minutes
+check: fmt lint arch privacy skill-doc fixtures deps test doc-test ## Everything that avoids the network and completes within minutes
 
 .PHONY: fmt
 fmt: ## Format (check)
@@ -62,6 +62,10 @@ hooks: ## Install the git hooks, including the privacy guard
 .PHONY: privacy
 privacy: ## No personal data in the tree (shapes only; needs no configuration)
 	$(RUN) ./scripts/check-no-personal-data.sh $(BASE)
+
+.PHONY: skill-doc
+skill-doc: ## The agent document narrates no route, method or status code
+	$(RUN) ./scripts/check-agent-skill.sh
 
 .PHONY: fixtures
 fixtures: ## Frozen reference data and dead fixtures

@@ -9,6 +9,7 @@ use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
+use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
 use iaam_ingest::dedup::IdentityScope;
@@ -62,7 +63,13 @@ pub async fn report(
         .store
         .load_events_through(principal.owner, period.to)
         .await?;
-    let ledger = ReconciliationLedger::build(&events)?;
+    // `build_with`, as the balances and returns paths do it. Plain `build` here
+    // told the owner to reconcile financing the system deliberately does not
+    // reconstruct, and — since the balances answer moved to the excepted ledger —
+    // would have made two routes render one account's cash dimension differently,
+    // one `discrepant` and one `excepted`, from the same journal.
+    let perimeter = assess(&events, PerimeterPolicy::default())?;
+    let ledger = ReconciliationLedger::build_with(&events, &perimeter.exceptions())?;
     Ok(ReconciliationReport {
         statuses: statuses_for_account(&ledger, account, period),
         actions: ledger_diagnostics_for(&ledger, account, period),

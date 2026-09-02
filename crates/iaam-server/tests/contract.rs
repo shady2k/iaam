@@ -8950,3 +8950,112 @@ async fn one_owners_journal_is_invisible_to_another() {
         "another owner's journal reached this token: {page}"
     );
 }
+
+/// Both routes read one journal, so they must render one status for one account.
+///
+/// The balances answer moved to the excepted ledger when the perimeter was wired;
+/// `/v1/reconciliation` was still building the plain one, so a financing account
+/// would have read `excepted` in one place and `discrepant` in the other from the
+/// same facts. The existing test that pins the two together has no financing in its
+/// fixture and could not have caught it.
+#[tokio::test]
+async fn the_two_routes_agree_about_a_financing_account() {
+    let harness = harness();
+    let account = harness.account.inner().to_string();
+
+    let contour = json!({ "title": "Financing", "accounts": [account] });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    // A deficit with the credit indicator beside it: the perimeter classifies this
+    // as financing it does not reconstruct, which is what raises the exception.
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": account, "type": "deposit", "amount": "1000.00",
+                "currency": "RUB", "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "agree-deposit"
+            },
+            {
+                "account": account, "type": "withdrawal", "amount": "2500.00",
+                "currency": "RUB", "dates": { "cash_posted": "2026-08-06" },
+                "idempotency_key": "agree-withdrawal"
+            },
+            {
+                "account": account, "type": "fee", "amount": "40.00",
+                "currency": "RUB", "origin": "margin_interest",
+                "dates": { "cash_posted": "2026-08-07" },
+                "idempotency_key": "agree-margin-interest"
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    // An assertion the journal cannot match, so there is a status to compare at all.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.owner_token,
+            &json!({
+                "account": account,
+                "from": "2026-08-01",
+                "to": "2026-08-31",
+                "at": "closing",
+                "cash": { "currency": "RUB", "amount": "9999.00" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, balances) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{balances}");
+
+    let (status, reconciliation) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reconciliation?account={account}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reconciliation}");
+
+    let from_balances = balances["accounts"][0]["reconciliation"]
+        .as_array()
+        .expect("statuses on the balances answer");
+    let from_route = reconciliation["statuses"]
+        .as_array()
+        .expect("statuses on the reconciliation route");
+    assert!(
+        !from_balances.is_empty() && !from_route.is_empty(),
+        "the fixture must produce a status to compare: {balances} / {reconciliation}"
+    );
+    // The whole status object, not one field of it: the two routes read one
+    // journal for one account and one period, so every dimension, outcome and
+    // exception in it has to match. Comparing a single field is how a
+    // divergence like this one stays invisible.
+    assert_eq!(
+        from_balances, from_route,
+        "one account, one journal, two answers: {balances} / {reconciliation}"
+    );
+}

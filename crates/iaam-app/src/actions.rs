@@ -580,10 +580,23 @@ fn actions_from_state(
         let Some(period) = control_assertion_eligibility(account) else {
             continue;
         };
-        let point = BalancePoint::Closing;
         let dimension = Dimension::Cash;
-        if control_assertion_gap(assertions, account.account, period, point, dimension) {
-            actions.push(provide_control_assertion_action(account.account, period));
+        // The opening point is asked for first, and the closing one is not asked
+        // for until it is answered. A closing balance compared against a sum
+        // accumulated from an unasserted start yields a discrepancy that is not
+        // one: it is the opening balance nobody asked for. Emitting both at once
+        // would put the second question before the first is answered.
+        if let Some(point) = [BalancePoint::Opening, BalancePoint::Closing]
+            .into_iter()
+            .find(|point| {
+                control_assertion_gap(assertions, account.account, period, *point, dimension)
+            })
+        {
+            actions.push(provide_control_assertion_action(
+                account.account,
+                period,
+                point,
+            ));
         }
     }
     actions
@@ -697,8 +710,24 @@ fn start_account_import_action(account: AccountId) -> Action {
     .expect("account import action needs owner input")
 }
 
-fn provide_control_assertion_action(account: AccountId, period: AssertionPeriod) -> Action {
-    let point = BalancePoint::Closing;
+/// The request for one control assertion, at the point it is wanted for.
+///
+/// Parameterised by the point rather than split into a second `ActionKind`: the
+/// kind names the work — obtain a control assertion from a document and record
+/// it — and that work is the same at either end of the interval. The same
+/// operation, the same preset fields, the same missing `/cash`, the same
+/// category and scope; a second kind would duplicate all of it and oblige every
+/// consumer that switches on the kind to learn a second name for one job.
+///
+/// The point is not lost by that choice: it already sits in the action's id,
+/// between the interval and the dimension, so an opening request and a closing
+/// request for the same account and interval are two identities and an agent
+/// deduplicating by id never collapses them into one.
+fn provide_control_assertion_action(
+    account: AccountId,
+    period: AssertionPeriod,
+    point: BalancePoint,
+) -> Action {
     let dimension = Dimension::Cash;
     let mut preset = BTreeMap::new();
     preset.insert("account".to_owned(), account.inner().to_string().into());
@@ -717,17 +746,41 @@ fn provide_control_assertion_action(account: AccountId, period: AssertionPeriod)
                 dimension.code()
             ),
             kind: ActionKind::ProvideControlAssertion,
-            category: ActionCategory::Recommended,
+            // Required for the goal, at either point, not `Recommended`.
+            //
+            // Without the opening assertion the cash figure is a movement over
+            // the imported interval and not a balance at all, so the assertion
+            // is not work that "improves quality but is not required" — it is
+            // what makes the number mean anything. Without the closing one the
+            // interval has nothing to reconcile against and its dimensions stay
+            // provisional; `IndependentConfirmationMissing` already grades the
+            // absence of confirmation as required, and grading the assertion
+            // that produces it as optional would contradict that. So neither
+            // point is recommended-only, and the queue stops telling the owner
+            // that the one thing which would make his numbers trustworthy is
+            // his to skip.
+            category: ActionCategory::RequiredForGoal,
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
         },
-        format!(
-            "Account {} has business facts from {} through {}; record its closing cash balance. \
-             An assertion is evidence to reconcile, not proof of a match; a discrepancy may remain.",
-            account.inner(),
-            period.from,
-            period.to
-        ),
+        match point {
+            BalancePoint::Opening => format!(
+                "Account {} has business facts from {} through {}; record its opening cash balance. \
+                 Until it is recorded, the cash figure for this account is a sum accumulated from \
+                 an unasserted start, and a closing balance compared against it reports the missing \
+                 opening balance as a discrepancy.",
+                account.inner(),
+                period.from,
+                period.to
+            ),
+            BalancePoint::Closing => format!(
+                "Account {} has business facts from {} through {}; record its closing cash balance. \
+                 An assertion is evidence to reconcile, not proof of a match; a discrepancy may remain.",
+                account.inner(),
+                period.from,
+                period.to
+            ),
+        },
         ActionTarget::Operation {
             operation: OperationKey::RecordOwnerBalance,
             request: RequestPlan {
@@ -1096,6 +1149,59 @@ mod tests {
         );
     }
 
+    /// The account, its period, and the assertions already recorded for it.
+    fn assertion_queue(
+        account: &AccountView,
+        period: AssertionPeriod,
+        recorded: &[ControlAssertionView],
+    ) -> Vec<Action> {
+        let activity = AccountActivityView {
+            account: account.id,
+            has_business_fact: true,
+            first_effective_date: Some(period.from),
+            last_effective_date: Some(period.to),
+        };
+        actions_from_state(
+            std::slice::from_ref(account),
+            &[],
+            std::slice::from_ref(&activity),
+            recorded,
+        )
+    }
+
+    fn recorded_cash_assertion(
+        account: AccountId,
+        period: AssertionPeriod,
+        point: BalancePoint,
+    ) -> ControlAssertionView {
+        ControlAssertionView {
+            account,
+            period,
+            point: Some(point),
+            dimension: Dimension::Cash,
+        }
+    }
+
+    fn the_only_assertion_action(actions: &[Action]) -> &Action {
+        let mut found = actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::ProvideControlAssertion);
+        let action = found.next().expect("control assertion action");
+        assert!(
+            found.next().is_none(),
+            "the queue must not put the second question before the first is answered"
+        );
+        action
+    }
+
+    fn assertion_preset(action: &Action) -> &RequestPlan {
+        let ActionTarget::Operation { operation, request } = action.target() else {
+            panic!("control assertion needs an operation target");
+        };
+        assert_eq!(*operation, OperationKey::RecordOwnerBalance);
+        request
+    }
+
     #[test]
     fn a_business_fact_gets_one_scoped_control_assertion_action() {
         let account = account();
@@ -1104,52 +1210,95 @@ mod tests {
             time::macros::date!(2026 - 03 - 31),
         )
         .expect("period");
-        let activity = AccountActivityView {
-            account: account.id,
-            has_business_fact: true,
-            first_effective_date: Some(period.from),
-            last_effective_date: Some(period.to),
-        };
 
-        let actions = actions_from_state(
-            std::slice::from_ref(&account),
-            &[],
-            std::slice::from_ref(&activity),
-            &[],
-        );
-        let assertion = actions
-            .iter()
-            .find(|action| action.kind() == ActionKind::ProvideControlAssertion)
-            .expect("control assertion action");
-        let ActionTarget::Operation { operation, request } = assertion.target() else {
-            panic!("control assertion needs an operation target");
-        };
-        assert_eq!(*operation, OperationKey::RecordOwnerBalance);
+        let actions = assertion_queue(&account, period, &[]);
+        let request = assertion_preset(the_only_assertion_action(&actions));
         assert_eq!(request.preset["account"], account.id.inner().to_string());
         assert_eq!(request.preset["from"], period.from.to_string());
         assert_eq!(request.preset["to"], period.to.to_string());
-        assert_eq!(request.preset["at"], "closing");
         assert_eq!(request.missing.len(), 1);
         assert_eq!(request.missing[0].pointer, "/cash");
 
-        let matching = [ControlAssertionView {
-            account: account.id,
-            period,
-            point: Some(BalancePoint::Closing),
-            dimension: Dimension::Cash,
-        }];
-        assert!(control_assertion_completion(
-            &matching,
-            account.id,
-            period,
-            BalancePoint::Closing,
-            Dimension::Cash
-        ));
+        let both = [
+            recorded_cash_assertion(account.id, period, BalancePoint::Opening),
+            recorded_cash_assertion(account.id, period, BalancePoint::Closing),
+        ];
+        for point in [BalancePoint::Opening, BalancePoint::Closing] {
+            assert!(control_assertion_completion(
+                &both,
+                account.id,
+                period,
+                point,
+                Dimension::Cash
+            ));
+        }
         assert!(
-            actions_from_state(&[account], &[], &[activity], &matching)
+            assertion_queue(&account, period, &both)
                 .iter()
                 .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
         );
+    }
+
+    #[test]
+    fn the_opening_point_is_asked_for_before_the_closing_one() {
+        // The defect this ordering exists for: with nothing asserting the state
+        // before the first event, the projection sums from zero, and a closing
+        // assertion compared against that sum reports the missing opening
+        // balance as a discrepancy. Asking for the closing point first is asking
+        // the second question before the first is answered.
+        let account = account();
+        let period = AssertionPeriod::between(
+            time::macros::date!(2026 - 03 - 01),
+            time::macros::date!(2026 - 03 - 31),
+        )
+        .expect("period");
+
+        let fresh = assertion_queue(&account, period, &[]);
+        let opening = the_only_assertion_action(&fresh);
+        assert_eq!(assertion_preset(opening).preset["at"], "opening");
+
+        let after_opening = assertion_queue(
+            &account,
+            period,
+            &[recorded_cash_assertion(
+                account.id,
+                period,
+                BalancePoint::Opening,
+            )],
+        );
+        let closing = the_only_assertion_action(&after_opening);
+        assert_eq!(assertion_preset(closing).preset["at"], "closing");
+
+        // Two questions about the same account and interval, one kind, two
+        // identities: an agent deduplicating by id sees the closing request as
+        // new work rather than as the opening one it already answered.
+        assert_eq!(opening.kind(), closing.kind());
+        assert_ne!(opening.id(), closing.id());
+    }
+
+    #[test]
+    fn a_closing_assertion_alone_does_not_answer_the_opening_question() {
+        // A source that stated only its closing balance leaves the start
+        // unasserted, and the queue must keep asking for it rather than fall
+        // silent because something was recorded.
+        let account = account();
+        let period = AssertionPeriod::between(
+            time::macros::date!(2026 - 03 - 01),
+            time::macros::date!(2026 - 03 - 31),
+        )
+        .expect("period");
+
+        let actions = assertion_queue(
+            &account,
+            period,
+            &[recorded_cash_assertion(
+                account.id,
+                period,
+                BalancePoint::Closing,
+            )],
+        );
+        let request = assertion_preset(the_only_assertion_action(&actions));
+        assert_eq!(request.preset["at"], "opening");
     }
 
     #[test]

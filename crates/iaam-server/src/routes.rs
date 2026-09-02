@@ -56,8 +56,8 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountBalanceDto, AccountCandidateDto, AccountDto, ActionDto, ActionTargetDto,
-    ActionsResponseDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
+    AccountCandidateDto, AccountDto, ActionDto, ActionTargetDto, ActionsResponseDto,
+    BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
     CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
     CategoryRuleRequest, ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
     CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
@@ -1753,7 +1753,7 @@ pub struct BalancesParams {
     path = "/v1/reports/balances",
     params(BalancesParams),
     responses(
-        (status = 200, description = "Cash and positions by account", body = [AccountBalanceDto]),
+        (status = 200, description = "Cash and positions by account, and the scope's negative cash", body = BalancesReportDto),
         (status = 404, description = "Scope not found", body = ApiError),
         (status = 422, description = "Invalid report date", body = ApiError),
         (status = 500, description = "Balances could not be built", body = ApiError)
@@ -1764,9 +1764,9 @@ pub async fn balances_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiQuery(params): ApiQuery<BalancesParams>,
-) -> Result<Json<Vec<AccountBalanceDto>>, ApiFailure> {
+) -> Result<Json<BalancesReportDto>, ApiFailure> {
     let as_of = parse_query_date("as_of", &params.as_of)?;
-    let rows = account_balances(
+    let report = account_balances(
         &state.services,
         &principal,
         ContourId(params.contour),
@@ -1774,9 +1774,7 @@ pub async fn balances_report(
         as_of,
     )
     .await?;
-    Ok(Json(
-        rows.iter().map(AccountBalanceDto::from_domain).collect(),
-    ))
+    Ok(Json(BalancesReportDto::from_domain(&report)))
 }
 
 /// Returns report parameters.

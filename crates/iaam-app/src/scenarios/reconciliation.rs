@@ -3,7 +3,7 @@
 //! There are no calculations here: a journal slice is passed to the core, and
 //! its statuses, assertion outcomes, and grounds for escalation are returned.
 
-use iaam_core::dates::{EffectiveOrder, EventDates};
+use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
@@ -164,7 +164,14 @@ pub async fn record_owner_balance(
                 period: balance.period,
                 claim,
             },
-            dates: EventDates::empty(),
+            // Dated at the end of the interval it speaks about, as the sync
+            // path dates the assertions it parses out of a report, and as the
+            // store already stamps this event's `effective_date` column from
+            // its order. An undated assertion is not merely unordered:
+            // `reconciliation::observe` refuses a journal containing an event
+            // that "falls within no period", so one such event made every
+            // reconciliation, balances and returns report fail to build.
+            dates: EventDates::for_cash(CashPostedDate(balance.period.to)),
             order: EffectiveOrder::new(balance.period.to, sequence as u32),
             legs: Vec::new(),
             provenance: provenance.clone(),

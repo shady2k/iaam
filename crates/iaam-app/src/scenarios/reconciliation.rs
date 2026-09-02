@@ -15,6 +15,7 @@ use iaam_ingest::dedup::IdentityScope;
 use time::Date;
 
 use crate::AppServices;
+use crate::actions::{Action, ledger_diagnostics_for};
 use crate::error::AppError;
 use crate::ports::{Principal, Recorded};
 
@@ -34,6 +35,12 @@ pub struct OwnerBalance {
 pub struct ReconciliationReport {
     pub statuses: Vec<ReconciliationStatus>,
     pub gaps: Vec<iaam_core::reconciliation::Taint>,
+    /// What this range's statuses and gaps leave outstanding.
+    ///
+    /// Computed here, where the ledger is already in hand, rather than by a
+    /// caller: a handler that rebuilt the ledger would fold the journal twice
+    /// for one request, and the second fold could disagree with the first.
+    pub actions: Vec<Action>,
 }
 
 /// Builds statuses and gaps for intervals intersecting the requested range.
@@ -58,6 +65,7 @@ pub async fn report(
     let ledger = ReconciliationLedger::build(&events)?;
     Ok(ReconciliationReport {
         statuses: statuses_for_account(&ledger, account, period),
+        actions: ledger_diagnostics_for(&ledger, account, period),
         gaps: ledger
             .gaps()
             .iter()

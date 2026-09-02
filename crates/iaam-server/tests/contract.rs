@@ -5827,3 +5827,589 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
         }
     }
 }
+
+/// E9.T5. Every assertion below is made on a carrier's raw JSON, and none of
+/// them calls a diagnostic function: `ledger_diagnostics` and `flow_diagnostics`
+/// shipped in T4 with their ordering and their filtering already tested, so a
+/// test that called them would pass before this attachment existed and prove
+/// nothing about it.
+///
+/// The account filter cannot be checked against the envelope afterwards — the
+/// reconciliation response does not name its own subject (`iaam-647w`) — so the
+/// fixture carries a gap on a **second** account and the proof is that account's
+/// absence from the whole response body.
+#[tokio::test]
+async fn reconciliation_actions_name_only_the_requested_account() {
+    let (harness, path) = harness_on_disk();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Second account" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let other = AccountId(
+        Uuid::parse_str(created["id"].as_str().expect("created account id")).expect("account uuid"),
+    );
+
+    add_coverage_gap(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2025 - 01 - 01),
+        date!(2025 - 01 - 31),
+    );
+    // A day short of the first gap's end, and still inside the requested range:
+    // the journal admits one event per owner, effective date and sequence, so two
+    // gaps cannot share an end date. The range covers both, which leaves the
+    // account as the only reason either could be excluded.
+    add_coverage_gap(
+        &path,
+        harness.owner,
+        other,
+        date!(2025 - 01 - 01),
+        date!(2025 - 01 - 30),
+    );
+
+    let (status, response) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2025-01-01&to=2025-01-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let actions = response["actions"].as_array().expect("actions");
+    assert_eq!(actions.len(), 1, "{response}");
+    assert_eq!(actions[0]["kind"], "coverage_gap_unrepaired");
+    assert!(
+        actions[0]["id"]
+            .as_str()
+            .expect("action id")
+            .contains(&harness.account.inner().to_string()),
+        "the item must name the account it was asked about: {response}"
+    );
+    assert!(
+        !response.to_string().contains(&other.inner().to_string()),
+        "another account's gap must not ride along: {response}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same binding on the other coordinate. Asserted in both directions in one
+/// test: a filter that dropped everything would satisfy the exclusion alone.
+#[tokio::test]
+async fn reconciliation_actions_exclude_a_period_outside_the_requested_range() {
+    let (harness, path) = harness_on_disk();
+    add_coverage_gap(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2025 - 03 - 01),
+        date!(2025 - 03 - 31),
+    );
+
+    let (status, march) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2025-03-01&to=2025-03-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{march}");
+    assert_eq!(
+        march["actions"].as_array().expect("actions").len(),
+        1,
+        "the gap's own range must carry its item: {march}"
+    );
+
+    let (status, january) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2025-01-01&to=2025-01-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{january}");
+    assert_eq!(
+        january["actions"],
+        json!([]),
+        "a March gap must not answer a January question: {january}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An attached item is the same envelope `/v1/actions` returns, and a blocked one
+/// says so by carrying no address and no authorisation for a call that does not
+/// exist. This cannot prove the conversion was reused — identical hand-built JSON
+/// would pass — and the reuse is a review point, not a test.
+#[tokio::test]
+async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
+    let (harness, path) = harness_on_disk();
+    add_coverage_gap(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2025 - 01 - 01),
+        date!(2025 - 01 - 31),
+    );
+
+    let (status, response) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2025-01-01&to=2025-01-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let item = &response["actions"][0];
+    let keys: std::collections::BTreeSet<&str> = item
+        .as_object()
+        .expect("action object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from(["id", "kind", "category", "state", "reason", "target"]),
+        "{item}"
+    );
+    assert_eq!(item["category"], "required_for_goal", "{item}");
+    assert_eq!(item["state"], "blocked", "{item}");
+    assert_eq!(item["target"], json!({ "type": "none" }), "{item}");
+    assert!(
+        item["reason"].as_str().expect("reason").contains("row-17"),
+        "the prose must carry the refused row it names: {item}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `skip_serializing_if` on the new field is exactly the mistake this asserts
+/// against: an absent key is indistinguishable from a bug to an agent, while an
+/// empty array says the carrier looked and found nothing.
+#[tokio::test]
+async fn a_clean_instance_carries_actions_present_and_empty() {
+    let harness = harness();
+    let contour = json!({
+        "title": "Empty contour",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let (status, reconciliation) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2025-01-01&to=2025-01-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reconciliation}");
+    assert!(
+        reconciliation.get("actions").is_some(),
+        "the key must be present on a clean instance: {reconciliation}"
+    );
+    assert_eq!(reconciliation["actions"], json!([]), "{reconciliation}");
+
+    let (status, flow) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{flow}");
+    assert!(
+        flow.get("actions").is_some(),
+        "the key must be present on a clean instance: {flow}"
+    );
+    assert_eq!(flow["actions"], json!([]), "{flow}");
+}
+
+/// Category alone leaves ties in generation order, which is not assertable. Two
+/// gaps of one category prove the second key is applied.
+#[tokio::test]
+async fn actions_of_one_category_come_back_in_id_order() {
+    let (harness, path) = harness_on_disk();
+    add_coverage_gap(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2025 - 01 - 11),
+        date!(2025 - 01 - 20),
+    );
+    add_coverage_gap(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2025 - 01 - 01),
+        date!(2025 - 01 - 10),
+    );
+
+    let (status, response) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2025-01-01&to=2025-01-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let actions = response["actions"].as_array().expect("actions");
+    assert_eq!(actions.len(), 2, "{response}");
+    let categories: std::collections::BTreeSet<&str> = actions
+        .iter()
+        .map(|action| action["category"].as_str().expect("category"))
+        .collect();
+    assert_eq!(categories.len(), 1, "the tie must be within one category");
+    let ids: Vec<&str> = actions
+        .iter()
+        .map(|action| action["id"].as_str().expect("id"))
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "{response}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The flow projection admits no leg from outside the contour, so the report
+/// cannot name an account it does not cover — and neither may the items riding
+/// along with it. An account with its own unexplained residual, left out of the
+/// contour, is what proves that.
+#[tokio::test]
+async fn flow_report_actions_name_only_accounts_in_the_contour() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Outside the contour" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let outside = created["id"]
+        .as_str()
+        .expect("created account id")
+        .to_owned();
+
+    let contour = json!({
+        "title": "One account only",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    for (account, key) in [
+        (harness.account.inner().to_string(), "inside-opening"),
+        (outside.clone(), "outside-opening"),
+    ] {
+        let operations = json!({
+            "source_label": "manual entry",
+            "operations": [{
+                "account": account,
+                "type": "opening_cash",
+                "amount": "500.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": key,
+            }]
+        });
+        let (status, verdicts) = call(
+            &harness.router,
+            post("/v1/ingest/operations", &harness.owner_token, &operations),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{verdicts}");
+    }
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let actions = body["actions"].as_array().expect("actions");
+    assert_eq!(actions.len(), 1, "{body}");
+    assert_eq!(actions[0]["kind"], "unexplained_residual");
+    assert!(
+        actions[0]["id"]
+            .as_str()
+            .expect("action id")
+            .contains(&harness.account.inner().to_string()),
+        "{body}"
+    );
+    assert!(
+        !body.to_string().contains(&outside),
+        "an account outside the contour must not ride along: {body}"
+    );
+}
+
+/// Two rows against one prior event.
+///
+/// Both rows carry the prior event's canonical content — the fingerprint ignores
+/// the source's own row identifier — so each is a possible duplicate of it, and
+/// each is recorded and added to what the next row is compared against. The
+/// identity of the item keys on the **new** event, so collapsing the two would
+/// discard the event the second item exists to name.
+struct TwinRowsChannel {
+    source: iaam_core::reconciliation::evidence::SourceChannel,
+}
+
+#[async_trait::async_trait]
+impl BrokerChannel for TwinRowsChannel {
+    async fn fetch_operations(
+        &self,
+        account: AccountId,
+        _from: Date,
+        _to: Date,
+    ) -> Result<ParsedOperations, BrokerError> {
+        let row = |operation_id: &str| SubmittedOperation {
+            account,
+            kind: OperationKind::Deposit {
+                amount_minor: 1_000,
+                currency: CurrencyCode::Rub,
+            },
+            dates: OperationDates {
+                cash_posted: Some(date!(2025 - 01 - 01)),
+                ..Default::default()
+            },
+            source_time: None,
+            idempotency_key: None,
+            source_operation_id: Some(operation_id.to_owned()),
+            source_category: None,
+            description: None,
+        };
+        Ok(ParsedOperations {
+            accepted: vec![row("twin-a"), row("twin-b")],
+            quarantined: Vec::new(),
+        })
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _at: Date,
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        Ok(PortfolioSnapshot {
+            as_of: PortfolioAsOf::Current,
+            claims: Vec::new(),
+        })
+    }
+
+    fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
+        self.source.clone()
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Source
+    }
+}
+
+#[tokio::test]
+async fn a_sync_carries_one_bound_item_per_possible_duplicate() {
+    let channel: Arc<dyn BrokerChannel> = Arc::new(TwinRowsChannel {
+        source: iaam_core::reconciliation::evidence::SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("contract-test".to_owned()),
+            document: None,
+        },
+    });
+    let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory { channel });
+    let harness = harness_with_factory(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        Some(factory),
+    );
+
+    // The prior event, recorded through another channel: the same operation,
+    // named by neither a row identifier nor a document, so a later import can
+    // only suspect it and never prove it.
+    let seed = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "10.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-01-01" },
+        }]
+    });
+    let (status, seeded) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &seed),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{seeded}");
+    let prior = seeded[0]["event_id"].as_str().expect("seeded event id");
+
+    let (status, response) = call(
+        &harness.router,
+        post(
+            "/v1/brokers/tinkoff/sync",
+            &harness.owner_token,
+            &json!({
+                "account": harness.account.inner(),
+                "from": "2025-01-01",
+                "to": "2025-01-31",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["possible_duplicates"], 2, "{response}");
+
+    let recorded = response["recorded"].as_array().expect("recorded");
+    let new_events: Vec<&str> = recorded
+        .iter()
+        .filter(|verdict| verdict["verdict"] == "possible_duplicate")
+        .map(|verdict| {
+            assert_eq!(verdict["of_event_id"], prior, "{response}");
+            verdict["event_id"].as_str().expect("event id")
+        })
+        .collect();
+    assert_eq!(new_events.len(), 2, "{response}");
+
+    let actions = response["actions"].as_array().expect("actions");
+    assert_eq!(actions.len(), 2, "{response}");
+    for event in &new_events {
+        assert!(
+            actions.iter().any(|action| {
+                action["kind"] == "possible_duplicate_undecided"
+                    && action["id"].as_str().expect("action id").contains(event)
+            }),
+            "every recorded possible duplicate must have its own item naming it: {response}"
+        );
+    }
+    let ids: std::collections::BTreeSet<&str> = actions
+        .iter()
+        .map(|action| action["id"].as_str().expect("action id"))
+        .collect();
+    assert_eq!(ids.len(), 2, "two rows are two items: {response}");
+}
+
+/// A bare `Provisional` carries nothing: the frontier already asks for an
+/// assertion over the account's whole observed span, a sync knows only its own
+/// requested range, and nothing decides which of the two periods to ask for.
+#[tokio::test]
+async fn a_sync_whose_verdicts_are_all_provisional_carries_an_empty_actions_array() {
+    let channel: Arc<dyn BrokerChannel> = Arc::new(PopulatedChannel {
+        source: iaam_core::reconciliation::evidence::SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("contract-test".to_owned()),
+            document: None,
+        },
+    });
+    let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory { channel });
+    let harness = harness_with_factory(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        Some(factory),
+    );
+    let (status, response) = call(
+        &harness.router,
+        post(
+            "/v1/brokers/tinkoff/sync",
+            &harness.owner_token,
+            &json!({
+                "account": harness.account.inner(),
+                "from": "2025-01-01",
+                "to": "2025-01-31",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["recorded"][0]["verdict"], "provisional");
+    assert!(response.get("actions").is_some(), "{response}");
+    assert_eq!(response["actions"], json!([]), "{response}");
+}
+
+/// Nothing the document and CSV paths produce has an item: `PossibleDuplicate`
+/// is constructed in the broker sync path alone, and every other verdict has no
+/// diagnostic. An always-empty array on those two would be a field that can
+/// never say anything.
+#[tokio::test]
+async fn the_csv_and_document_responses_carry_no_actions_key() {
+    let harness = harness();
+    let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
+        2025-01-01,deposit,Brokerage,,,,,1000.00,,,RUB,csv-actions-1\n";
+    let request = Request::builder()
+        .uri("/v1/ingest/csv")
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from(document))
+        .expect("request");
+    let (status, body) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.is_array(), "{body}");
+    assert!(!body.to_string().contains("\"actions\""), "{body}");
+
+    let request = Request::builder()
+        .uri(format!("/v1/documents?account={}", harness.account.inner()))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .body(Body::from(
+            include_bytes!("../../../tests/fixtures/reports/tinkoff-synthetic.xlsx").as_slice(),
+        ))
+        .expect("request");
+    let (status, response) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(response.get("actions").is_none(), "{response}");
+}

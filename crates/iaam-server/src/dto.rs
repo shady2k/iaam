@@ -1928,6 +1928,10 @@ pub struct MoneyFlowReportDto {
     pub currencies: Vec<MoneyFlowCurrencyDto>,
     /// Accounts whose own cash change the six quantities do not explain.
     pub unexplained: Vec<AccountResidualDto>,
+    /// What this report leaves outstanding. Always present: an empty array says
+    /// the report was examined and found nothing, while an absent key would be
+    /// indistinguishable from a bug to the agent reading it.
+    pub actions: Vec<ActionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1995,7 +1999,13 @@ pub struct NotDecomposedAccountDto {
 }
 
 impl MoneyFlowReportDto {
-    pub fn from_domain(report: &MoneyFlowReport) -> Result<Self, MoneyFlowError> {
+    /// `actions` is a parameter rather than a field set afterwards: the transport
+    /// resolves an operation through its catalogue and the DTO cannot, and a
+    /// carrier that could be built without them would eventually be.
+    pub fn from_domain(
+        report: &MoneyFlowReport,
+        actions: Vec<ActionDto>,
+    ) -> Result<Self, MoneyFlowError> {
         let currencies = report
             .flow
             .currencies()
@@ -2115,6 +2125,7 @@ impl MoneyFlowReportDto {
             category_rule_versions: report.category_rule_versions.clone(),
             currencies,
             unexplained,
+            actions,
         })
     }
 }
@@ -3923,6 +3934,9 @@ pub struct ReconciliationStatusDto {
 pub struct ReconciliationResponseDto {
     pub statuses: Vec<ReconciliationStatusDto>,
     pub gaps: Vec<TaintDto>,
+    /// What these statuses and gaps leave outstanding, bound to the account and
+    /// range that were asked for. Always present, empty included.
+    pub actions: Vec<ActionDto>,
 }
 
 /// Owner category in the living reference list.
@@ -4190,11 +4204,14 @@ pub struct SyncOutcomeDto {
     pub assertions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assertions_withheld: Option<AssertionsWithheldDto>,
+    /// What this synchronisation's own verdicts leave outstanding. Always
+    /// present, empty included.
+    pub actions: Vec<ActionDto>,
 }
 
 impl SyncOutcomeDto {
     #[must_use]
-    pub fn from_domain(outcome: iaam_app::sync::SyncOutcome) -> Self {
+    pub fn from_domain(outcome: iaam_app::sync::SyncOutcome, actions: Vec<ActionDto>) -> Self {
         Self {
             recorded: outcome
                 .recorded
@@ -4213,6 +4230,7 @@ impl SyncOutcomeDto {
                     }
                 }
             }),
+            actions,
         }
     }
 }

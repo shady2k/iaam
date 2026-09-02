@@ -413,6 +413,7 @@ pub async fn repair_custody(
 pub async fn reconciliation(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     Query(params): Query<ReconciliationParams>,
 ) -> Result<Json<ReconciliationResponseDto>, ApiFailure> {
     let from = parse_query_date("from", &params.from)?;
@@ -435,6 +436,13 @@ pub async fn reconciliation(
             .gaps
             .iter()
             .map(crate::dto::TaintDto::from_domain)
+            .collect(),
+        // The scenario computed these while the ledger was in hand; this handler
+        // renders them through the one conversion `/v1/actions` also uses.
+        actions: reconciliation
+            .actions
+            .iter()
+            .map(|action| action_dto(action, &catalog))
             .collect(),
     }))
 }
@@ -856,6 +864,7 @@ pub async fn preview_category_rule_route(
 pub async fn sync_broker(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     Path(broker): Path<String>,
     Json(request): Json<BrokerSyncRequest>,
 ) -> Result<Json<SyncOutcomeDto>, ApiFailure> {
@@ -876,7 +885,11 @@ pub async fn sync_broker(
         request.to,
     )
     .await?;
-    Ok(Json(SyncOutcomeDto::from_domain(outcome)))
+    let actions = iaam_app::actions::verdicts_diagnostics(&outcome.recorded)
+        .iter()
+        .map(|action| action_dto(action, &catalog))
+        .collect();
+    Ok(Json(SyncOutcomeDto::from_domain(outcome, actions)))
 }
 
 /// Manually synchronise one market series.
@@ -1601,6 +1614,7 @@ pub struct MoneyFlowParams {
 pub async fn flow_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     Query(params): Query<MoneyFlowParams>,
 ) -> Result<Json<MoneyFlowReportDto>, ApiFailure> {
     let query = MoneyFlowQuery {
@@ -1610,7 +1624,14 @@ pub async fn flow_report(
         to: parse_query_date("to", &params.to)?,
     };
     let report = money_flow(&state.services, &principal, &query).await?;
-    let dto = MoneyFlowReportDto::from_domain(&report).map_err(iaam_app::error::AppError::from)?;
+    // No scoping: the projection admits no leg from outside the contour, so the
+    // report cannot name an account it does not cover.
+    let actions = iaam_app::actions::flow_diagnostics(&report)
+        .iter()
+        .map(|action| action_dto(action, &catalog))
+        .collect();
+    let dto = MoneyFlowReportDto::from_domain(&report, actions)
+        .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
 }
 

@@ -16,13 +16,14 @@ use iaam_app::ports::{
     IssuedToken, Scope, TokenView,
 };
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
+use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
 use iaam_app::scenarios::reports::{AccountBalanceRow, MoneyFlowReport};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::source_row::{RefusedRow, RowName};
-use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
+use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId};
 use iaam_core::instrument::AliasNamespace;
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -678,6 +679,107 @@ pub struct SubmitOperationsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DeclaredSourceDto>,
     pub operations: Vec<OperationDto>,
+}
+
+/// One correction the owner submits.
+///
+/// Tagged on `relation` and named exactly as [`iaam_core::event::Relation`] is,
+/// because the tag *is* the relation written into the journal. A wire word that
+/// differed from the journal's would make the caller translate between two
+/// vocabularies for one concept.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "relation", rename_all = "snake_case")]
+pub enum CorrectionDto {
+    /// Retract the target. It stays in the journal and stops being effective.
+    Reversal {
+        /// Identifier of the event to retract.
+        target: Uuid,
+    },
+    /// Supersede the target with the operation given here.
+    ///
+    /// The whole operation, not a patch of one: the journal records facts as
+    /// stated, and a partial correction would leave it holding a value nobody
+    /// ever submitted.
+    Replacement {
+        /// Identifier of the event being superseded.
+        target: Uuid,
+        /// Boxed so the enum is not sized for its largest variant: a reversal
+        /// carries an identifier, a replacement carries a whole operation.
+        operation: Box<OperationDto>,
+    },
+}
+
+/// Correct events the owner names.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SubmitCorrectionsRequest {
+    /// Acknowledge that a retracted fact stops counting in every report, and
+    /// that re-submitting the same rows does not bring it back.
+    ///
+    /// Required rather than implied: a correction rewrites what every
+    /// downstream report says, and a bare call is indistinguishable from a
+    /// mistake.
+    #[serde(default)]
+    pub acknowledge_retraction: bool,
+    /// Applied together or not at all: a correction batch is one deliberate act,
+    /// unlike an import, whose rows are judged one by one.
+    pub corrections: Vec<CorrectionDto>,
+}
+
+/// Correct a whole import, keyed on the source the caller declared for it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CorrectImportRequest {
+    /// Acknowledge that the retracted facts stop counting in every report, and
+    /// that re-submitting the same rows does not bring them back.
+    #[serde(default)]
+    pub acknowledge_retraction: bool,
+    /// The declared source of the import to retract — the same account and
+    /// channel that were submitted with it.
+    pub source: DeclaredSourceDto,
+}
+
+/// Outcome of correcting one whole declared import.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct ImportCorrectionDto {
+    /// The source identity the correction was keyed on.
+    pub source: Uuid,
+    /// Effective events this import still had in the journal.
+    pub affected: usize,
+    /// Reversed by an earlier correction: a repeat run reports these and writes
+    /// nothing.
+    pub already_reversed: usize,
+    /// Reversal facts written by this run. Nothing was deleted and nothing was
+    /// mutated: each is a new event referencing the one it retracts.
+    pub written: usize,
+}
+
+impl CorrectionDto {
+    /// Conversion to a domain correction.
+    ///
+    /// The rejection names the field of the operation, without the batch index:
+    /// the caller's loop position is known to the handler, not to one element.
+    pub fn to_domain(&self) -> Result<CorrectionRequest, Rejection> {
+        Ok(match self {
+            Self::Reversal { target } => CorrectionRequest::Reversal {
+                target: EventId(*target),
+            },
+            Self::Replacement { target, operation } => CorrectionRequest::Replacement {
+                target: EventId(*target),
+                operation: Box::new(operation.to_domain()?),
+            },
+        })
+    }
+}
+
+impl ImportCorrectionDto {
+    #[must_use]
+    pub const fn from_domain(outcome: ImportCorrectionOutcome) -> Self {
+        Self {
+            source: outcome.source.inner(),
+            affected: outcome.affected,
+            already_reversed: outcome.already_reversed,
+            written: outcome.written,
+        }
+    }
 }
 
 /// Acknowledgement required before retracting affected trades without live broker access.

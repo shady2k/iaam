@@ -7117,3 +7117,529 @@ async fn an_unparsable_path_parameter_is_refused_in_the_documented_shape() {
     assert_eq!(body["code"], "invalid_request", "{body}");
     assert_eq!(body["field"], "id", "{body}");
 }
+
+/// The correction routes, their schemas, and the refusal an agent token gets.
+///
+/// The permission is the point of the route existing separately from ingestion:
+/// `Scope::may_submit` admits an agent, so an agent that could carry a relation
+/// on an ingest row could retract the owner's history.
+#[tokio::test]
+async fn corrections_are_described_and_an_agent_token_is_refused() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = &spec["paths"]["/v1/corrections"]["post"];
+    assert!(events.is_object(), "correction route is missing: {spec}");
+    assert_eq!(
+        events["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SubmitCorrectionsRequest"
+    );
+    let imports = &spec["paths"]["/v1/corrections/imports"]["post"];
+    assert!(
+        imports.is_object(),
+        "import correction route is missing: {spec}"
+    );
+    assert_eq!(
+        imports["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/CorrectImportRequest"
+    );
+    assert_eq!(
+        imports["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ImportCorrectionDto"
+    );
+    for field in ["source", "affected", "already_reversed", "written"] {
+        assert!(
+            spec["components"]["schemas"]["ImportCorrectionDto"]["properties"][field].is_object(),
+            "response schema is missing {field}: {spec}"
+        );
+    }
+    for schema in ["SubmitCorrectionsRequest", "CorrectImportRequest"] {
+        assert!(
+            spec["components"]["schemas"][schema]["properties"]["acknowledge_retraction"]
+                .is_object(),
+            "{schema} does not require the acknowledgement: {spec}"
+        );
+    }
+    // The wire word for a relation is the journal's own word: a caller reading
+    // the contract must not have to translate between two vocabularies.
+    let relations = spec["components"]["schemas"]["CorrectionDto"]["oneOf"]
+        .as_array()
+        .expect("CorrectionDto is a tagged union");
+    let tags: std::collections::BTreeSet<String> = relations
+        .iter()
+        .filter_map(|variant| {
+            variant["properties"]["relation"]["enum"][0]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        tags,
+        ["replacement".to_owned(), "reversal".to_owned()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<String>>(),
+        "unexpected relation tags: {relations:?}"
+    );
+
+    for path in ["/v1/corrections", "/v1/corrections/imports"] {
+        for token in [&harness.agent_token, &harness.readonly_token] {
+            let (status, body) = call(
+                &harness.router,
+                post(path, token, &json!({"acknowledge_retraction": true})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+            assert_eq!(body["code"], "forbidden", "{path}: {body}");
+        }
+    }
+}
+
+/// Seed one deposit and return the event identifier the server minted for it.
+async fn seed_correctable_deposit(
+    harness: &Harness,
+    channel: &str,
+    key: &str,
+    amount: &str,
+) -> Uuid {
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "correction-contract",
+                "source": { "account": harness.account.inner(), "channel": channel },
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": amount,
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-08-05" },
+                    "idempotency_key": key
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    verdicts[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("recorded event identifier")
+}
+
+#[tokio::test]
+async fn a_correction_is_refused_until_the_owner_acknowledges_the_retraction() {
+    let harness = harness();
+    let event = seed_correctable_deposit(&harness, "file", "correction-ack", "100.00").await;
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({ "corrections": [{ "relation": "reversal", "target": event }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["field"], "acknowledge_retraction");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({ "source": { "account": harness.account.inner(), "channel": "file" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "acknowledge_retraction");
+}
+
+#[tokio::test]
+async fn a_correction_naming_an_event_the_journal_does_not_hold_is_refused() {
+    let harness = harness();
+    let missing = Uuid::new_v4();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": missing }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["field"], "corrections[0].target");
+    assert_eq!(body["actual"], missing.to_string());
+}
+
+/// A second replacement of one event is refused, and refused **before** anything
+/// is written: the journal is append-only, and a conflicting replacement in it
+/// would fail every later read rather than only the request that added it.
+#[tokio::test]
+async fn a_conflicting_replacement_is_refused_and_leaves_the_journal_untouched() {
+    let (harness, path) = harness_on_disk();
+    let event = seed_correctable_deposit(&harness, "file", "correction-conflict", "100.00").await;
+
+    let replacement = json!({
+        "acknowledge_retraction": true,
+        "corrections": [{
+            "relation": "replacement",
+            "target": event,
+            "operation": {
+                "account": harness.account.inner(),
+                "type": "deposit",
+                "amount": "120.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" }
+            }
+        }]
+    });
+    let (status, body) = call(
+        &harness.router,
+        post("/v1/corrections", &harness.owner_token, &replacement),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    let before = journal_of(&path, harness.owner).len();
+    let (status, body) = call(
+        &harness.router,
+        post("/v1/corrections", &harness.owner_token, &replacement),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["field"], "corrections[0].target");
+    assert_eq!(body["actual"], event.to_string());
+    assert_eq!(
+        journal_of(&path, harness.owner).len(),
+        before,
+        "a refused correction must write nothing"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Reversing an event that is not a fact changes nothing, and saying so is
+/// better than writing a correction whose effect the owner cannot observe.
+#[tokio::test]
+async fn reversing_a_reversal_is_refused() {
+    let harness = harness();
+    let event = seed_correctable_deposit(&harness, "file", "correction-double", "100.00").await;
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": event }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reversal = body[0]["event_id"].as_str().expect("reversal identifier");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": reversal }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "corrections[0].target");
+}
+
+/// A repeated import correction reports what an earlier run retracted and adds
+/// no second reversal of the same event.
+#[tokio::test]
+async fn correcting_one_import_twice_writes_nothing_the_second_time() {
+    let harness = harness();
+    seed_correctable_deposit(&harness, "file", "correction-repeat-a", "100.00").await;
+    seed_correctable_deposit(&harness, "file", "correction-repeat-b", "200.00").await;
+
+    let request = json!({
+        "acknowledge_retraction": true,
+        "source": { "account": harness.account.inner(), "channel": "file" }
+    });
+    let (status, first) = call(
+        &harness.router,
+        post("/v1/corrections/imports", &harness.owner_token, &request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["affected"], 2);
+    assert_eq!(first["already_reversed"], 0);
+    assert_eq!(first["written"], 2);
+
+    let (status, second) = call(
+        &harness.router,
+        post("/v1/corrections/imports", &harness.owner_token, &request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["source"], first["source"],
+        "the same declared source"
+    );
+    assert_eq!(
+        second["affected"], 0,
+        "nothing effective is left to retract"
+    );
+    assert_eq!(second["already_reversed"], 2);
+    assert_eq!(second["written"], 0);
+}
+
+fn journal_of(path: &std::path::Path, owner: OwnerId) -> Vec<iaam_core::event::Event> {
+    SqliteStore::open(path)
+        .expect("second connection")
+        .load_events(owner)
+        .expect("owner journal")
+}
+
+/// The reported case, end to end.
+///
+/// A month imported against the wrong account map, corrected in one request;
+/// entries that were already right survive untouched; nothing is deleted, and
+/// each retracted event gains a reversal fact referencing it. Then one of the
+/// retracted rows is re-stated against the account it belonged to, and the
+/// reports move to match.
+#[tokio::test]
+async fn an_import_against_the_wrong_account_map_is_corrected_end_to_end() {
+    let (harness, path) = harness_on_disk();
+    let wrong = harness.account.inner();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let right = created["id"].as_str().expect("account identifier");
+    let right = Uuid::parse_str(right).expect("account uuid");
+
+    let contour_of =
+        |accounts: Vec<Uuid>, title: &str| json!({ "title": title, "accounts": accounts });
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &contour_of(vec![wrong], "Mis-mapped"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mismapped = body["contour"].as_str().expect("contour").to_owned();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &contour_of(vec![right], "Intended"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let intended = body["contour"].as_str().expect("contour").to_owned();
+
+    // The month, imported against the wrong account map: every row landed on
+    // the account the map named instead of the one the rows belong to.
+    let (status, mismapped_rows) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "August statement",
+                "source": { "account": wrong, "channel": "file" },
+                "operations": [
+                    {
+                        "account": wrong,
+                        "type": "deposit",
+                        "amount": "3000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "august-row-1"
+                    },
+                    {
+                        "account": wrong,
+                        "type": "deposit",
+                        "amount": "500.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-06" },
+                        "idempotency_key": "august-row-2"
+                    }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{mismapped_rows}");
+    let first_row = mismapped_rows[0]["event_id"]
+        .as_str()
+        .expect("recorded event")
+        .to_owned();
+
+    // Entries that were already right. They must survive the correction.
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "source": { "account": right, "channel": "manual" },
+                "operations": [{
+                    "account": right,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-08-07" },
+                    "idempotency_key": "august-correct-row"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let came_in = |contour: &str| {
+        let router = harness.router.clone();
+        let token = harness.owner_token.clone();
+        let path = format!("/v1/reports/flow?contour={contour}&from=2026-08-01&to=2026-08-31");
+        async move {
+            let (status, body) = call(&router, get(&path, Some(&token))).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            // A contour with nothing left in it reports no currency at all, and
+            // that is the same statement as an inflow of zero.
+            body["currencies"]
+                .as_array()
+                .expect("currencies")
+                .iter()
+                .find(|entry| entry["currency"] == "RUB")
+                .and_then(|entry| entry["came_in"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "0.00".to_owned())
+        }
+    };
+
+    assert_eq!(came_in(&mismapped).await, "3500.00");
+    assert_eq!(came_in(&intended).await, "1000.00");
+
+    let before = journal_of(&path, harness.owner);
+    assert_eq!(before.len(), 3, "three imported facts");
+
+    let (status, corrected) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": { "account": wrong, "channel": "file" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{corrected}");
+    assert_eq!(corrected["affected"], 2);
+    assert_eq!(corrected["written"], 2);
+
+    assert_eq!(
+        came_in(&mismapped).await,
+        "0.00",
+        "the mis-mapped import no longer counts"
+    );
+    assert_eq!(
+        came_in(&intended).await,
+        "1000.00",
+        "entries that were already right survive the correction"
+    );
+
+    // Nothing deleted, nothing mutated: the originals are still there, and each
+    // has gained a reversal fact that references it.
+    let after = journal_of(&path, harness.owner);
+    assert_eq!(after.len(), before.len() + 2, "two reversal facts appended");
+    for original in &before {
+        let stored = after
+            .iter()
+            .find(|event| event.id == original.id)
+            .expect("the original fact is still in the journal");
+        assert_eq!(stored, original, "an original fact was mutated");
+    }
+    let reversed: std::collections::BTreeSet<Uuid> = after
+        .iter()
+        .filter_map(|event| match event.relation {
+            iaam_core::event::Relation::Reversal { target } => Some(target.inner()),
+            _ => None,
+        })
+        .collect();
+    let mismapped_ids: std::collections::BTreeSet<Uuid> = before
+        .iter()
+        .filter(|event| event.account.inner() == wrong)
+        .map(|event| event.id.inner())
+        .collect();
+    assert_eq!(reversed, mismapped_ids, "one reversal per mis-mapped fact");
+
+    // The retraction is only half the repair: the row still belongs somewhere.
+    // Re-stating it as a replacement moves it to the account it was always for.
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{
+                    "relation": "replacement",
+                    "target": first_row,
+                    "operation": {
+                        "account": right,
+                        "type": "deposit",
+                        "amount": "3000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "august-row-1-corrected"
+                    }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    assert_eq!(came_in(&mismapped).await, "0.00");
+    assert_eq!(
+        came_in(&intended).await,
+        "4000.00",
+        "the re-stated row now counts where it belongs"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}

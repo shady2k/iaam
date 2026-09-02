@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::ids::{AccountId, InstrumentId};
 use iaam_core::instrument::CurrencyRoles;
@@ -130,8 +131,14 @@ pub async fn money_flow(
         from: query.from,
         to: query.to,
     };
+    // The **effective** set, not the raw journal: a reversed or replaced event is
+    // still recorded, and folding it would report money that the owner has
+    // already retracted. `resolve` is the only definition of that set — the same
+    // one `projection::project` folds — so there is no second answer here to
+    // what the journal currently says (§4.8).
+    let effective = resolve(&events).map_err(AppError::Correction)?;
     let mut flow = MoneyFlow::new();
-    for event in &events {
+    for event in effective {
         flow.apply(event, &definition, window, &categories)?;
     }
     Ok(MoneyFlowReport {
@@ -158,8 +165,14 @@ pub async fn account_balances(
         .store
         .load_events_through(principal.owner, as_of)
         .await?;
+    // Balances and the reconciliation ledger must read the same journal. The
+    // ledger resolves internally; folding the raw slice into `Balances` beside
+    // it would give one function two answers to what is currently effective,
+    // and a retracted deposit would keep counting in the cash figure while the
+    // status beside it had already stopped confirming it (§4.8).
+    let effective = resolve(&events).map_err(AppError::Correction)?;
     let mut balances = Balances::new();
-    for event in &events {
+    for event in effective {
         balances
             .apply(event)
             .map_err(ProjectionError::from)

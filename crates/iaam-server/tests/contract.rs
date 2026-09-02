@@ -6634,3 +6634,156 @@ async fn the_csv_and_document_responses_carry_no_actions_key() {
     assert_eq!(status, StatusCode::OK, "{response}");
     assert!(response.get("actions").is_none(), "{response}");
 }
+
+/// A refusal from an extractor, in the shape the contract promises.
+///
+/// The response is read as bytes rather than through `call`, because the
+/// defect these tests were written for was a `text/plain` body that `call`
+/// would quietly turn into `Value::Null`.
+async fn refusal(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
+    let (status, headers, bytes) = call_raw(router, request).await;
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned()),
+        Some("application/json".to_owned()),
+        "a refusal must be JSON, status {status}, body {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "a refusal must deserialise as ApiError: {error}, body {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    });
+    assert!(
+        body.get("code").and_then(Value::as_str).is_some(),
+        "a refusal must carry a machine-readable code: {body}"
+    );
+    assert!(
+        body.get("message").and_then(Value::as_str).is_some(),
+        "a refusal must carry a message: {body}"
+    );
+    (status, body)
+}
+
+#[tokio::test]
+async fn a_missing_query_parameter_is_refused_in_the_documented_shape() {
+    // axum's own `Query` answers `400 text/plain` here. A client parsing
+    // errors would then need two encodings, and the operation declares
+    // neither the status nor the media type it was actually served.
+    let harness = harness();
+    let (status, body) = refusal(
+        &harness.router,
+        get("/v1/reconciliation", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+    assert_eq!(body["field"], "account", "{body}");
+
+    let declared = harness.api.paths.paths["/v1/reconciliation"]
+        .get
+        .as_ref()
+        .expect("the reconciliation operation");
+    assert!(
+        declared.responses.responses.contains_key("422"),
+        "the status served must be the status declared"
+    );
+}
+
+#[tokio::test]
+async fn a_body_missing_a_required_field_is_refused_in_the_documented_shape() {
+    let harness = harness();
+    let (status, body) = refusal(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({"institution": "Bank One"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+    assert_eq!(body["field"], "title", "{body}");
+
+    let declared = harness.api.paths.paths["/v1/accounts"]
+        .post
+        .as_ref()
+        .expect("the account creation operation");
+    for status in ["400", "413", "415", "422"] {
+        assert!(
+            declared.responses.responses.contains_key(status),
+            "the operation can serve {status} and must declare it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_body_does_not_come_back_in_the_refusal() {
+    // The value that failed is the caller's, and a rejected body is exactly
+    // the kind of thing that carries the owner's data. Only the name of the
+    // field and the type expected of it may be returned.
+    let harness = harness();
+    let (status, body) = refusal(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({"title": {"nested": "not-a-title"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "title", "{body}");
+    assert_eq!(body["expected"], "a string", "{body}");
+    assert!(body.get("actual").is_none(), "{body}");
+    assert!(!body.to_string().contains("not-a-title"), "{body}");
+}
+
+#[tokio::test]
+async fn a_syntactically_broken_body_is_refused_in_the_documented_shape() {
+    let harness = harness();
+    let request = Request::builder()
+        .uri("/v1/accounts")
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "application/json")
+        .body(Body::from("{\"title\": "))
+        .expect("request");
+    let (status, body) = refusal(&harness.router, request).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+}
+
+#[tokio::test]
+async fn a_body_without_the_json_content_type_is_refused_in_the_documented_shape() {
+    // The one refusal that is deliberately not a `422`: nothing was parsed,
+    // so there is no field to name. The status differs; the shape does not.
+    let harness = harness();
+    let request = Request::builder()
+        .uri("/v1/accounts")
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/plain")
+        .body(Body::from(json!({"title": "Main"}).to_string()))
+        .expect("request");
+    let (status, body) = refusal(&harness.router, request).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert_eq!(body["code"], "unsupported_media_type", "{body}");
+}
+
+#[tokio::test]
+async fn an_unparsable_path_parameter_is_refused_in_the_documented_shape() {
+    let harness = harness();
+    let (status, body) = refusal(
+        &harness.router,
+        get("/v1/instruments/not-a-uuid", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+    assert_eq!(body["field"], "id", "{body}");
+}

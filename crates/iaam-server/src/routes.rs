@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
@@ -70,6 +70,7 @@ use crate::dto::{
     SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
+use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
@@ -186,14 +187,15 @@ pub async fn list_instruments(
     params(("id" = Uuid, Path, description = "Instrument identifier")),
     responses(
         (status = 200, description = "Reference catalogue instrument", body = InstrumentDto),
-        (status = 404, description = "Instrument unknown", body = ApiError)
+        (status = 404, description = "Instrument unknown", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn get_instrument(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<InstrumentDto>, ApiFailure> {
     let instrument = state
         .services
@@ -215,14 +217,17 @@ pub async fn get_instrument(
     responses(
         (status = 200, description = "Instrument by code as at date", body = ResolvedInstrumentDto),
         (status = 404, description = "Code unknown", body = ApiError),
-        (status = 422, description = "Code known, but not on this date, or namespace invalid", body = ApiError)
+        (status = 422, description = "Code known, but not on this date, or namespace invalid", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn resolve_instrument(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
-    Json(request): Json<ResolveInstrumentRequest>,
+    ApiJson(request): ApiJson<ResolveInstrumentRequest>,
 ) -> Result<Json<ResolvedInstrumentDto>, ApiFailure> {
     let instrument = state
         .services
@@ -245,14 +250,16 @@ pub async fn resolve_instrument(
     responses(
         (status = 201, description = "Instrument recorded", body = InstrumentDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 422, description = "Invalid instrument data", body = ApiError)
+        (status = 422, description = "Invalid instrument data", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_instrument(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    body: Bytes,
+    ApiBytes(body): ApiBytes,
 ) -> Result<(StatusCode, Json<InstrumentDto>), ApiFailure> {
     require_admin(&principal)?;
     let request: CreateInstrumentRequest = serde_json::from_slice(&body)
@@ -310,15 +317,17 @@ pub async fn create_instrument(
     responses(
         (status = 200, description = "Outcome for each row", body = DocumentDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 422, description = "Document unrecognised or invalid", body = ApiError)
+        (status = 422, description = "Document unrecognised or invalid", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn upload_document(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Query(params): Query<DocumentParams>,
-    body: Bytes,
+    ApiQuery(params): ApiQuery<DocumentParams>,
+    ApiBytes(body): ApiBytes,
 ) -> Result<Json<DocumentDto>, ApiFailure> {
     let directory = build_directory(&state.services, &principal).await?;
     let result = upload_report(
@@ -344,16 +353,18 @@ pub async fn upload_document(
     responses(
         (status = 200, description = "Outcome for each row", body = DocumentDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 422, description = "Hash or document invalid", body = ApiError)
+        (status = 422, description = "Hash or document invalid", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn reparse_document(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Path(document_hash): Path<String>,
-    Query(params): Query<DocumentParams>,
-    body: Bytes,
+    ApiPath(document_hash): ApiPath<String>,
+    ApiQuery(params): ApiQuery<DocumentParams>,
+    ApiBytes(body): ApiBytes,
 ) -> Result<Json<DocumentDto>, ApiFailure> {
     let directory = build_directory(&state.services, &principal).await?;
     let result = reparse_report(
@@ -379,15 +390,18 @@ pub async fn reparse_document(
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 422, description = "Invalid repair request", body = ApiError),
         (status = 409, description = "Repair idempotency conflict", body = ApiError),
-        (status = 503, description = "Broker access is not configured", body = ApiError)
+        (status = 503, description = "Broker access is not configured", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn repair_custody(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Path(account): Path<Uuid>,
-    Json(request): Json<CustodyRepairRequest>,
+    ApiPath(account): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<CustodyRepairRequest>,
 ) -> Result<Json<CustodyRepairOutcomeDto>, ApiFailure> {
     let outcome = iaam_app::scenarios::custody_repair::repair_custody(
         &state.services,
@@ -414,7 +428,7 @@ pub async fn reconciliation(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
-    Query(params): Query<ReconciliationParams>,
+    ApiQuery(params): ApiQuery<ReconciliationParams>,
 ) -> Result<Json<ReconciliationResponseDto>, ApiFailure> {
     let from = parse_query_date("from", &params.from)?;
     let to = parse_query_date("to", &params.to)?;
@@ -456,14 +470,17 @@ pub async fn reconciliation(
     responses(
         (status = 200, description = "Updated statuses", body = Vec<ReconciliationStatusDto>),
         (status = 403, description = "Owner only", body = ApiError),
-        (status = 422, description = "Invalid balance", body = ApiError)
+        (status = 422, description = "Invalid balance", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn reconciliation_balance(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<OwnerBalanceRequest>,
+    ApiJson(request): ApiJson<OwnerBalanceRequest>,
 ) -> Result<Json<Vec<ReconciliationStatusDto>>, ApiFailure> {
     require_admin(&principal)?;
     let period = AssertionPeriod::between(request.from, request.to).ok_or_else(|| {
@@ -571,14 +588,17 @@ pub async fn list_classification_rules(
     responses(
         (status = 201, description = "Rule added", body = ClassificationRuleDto),
         (status = 403, description = "Owner only", body = ApiError),
-        (status = 422, description = "Invalid rule", body = ApiError)
+        (status = 422, description = "Invalid rule", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_classification_rule(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<ClassificationRuleRequest>,
+    ApiJson(request): ApiJson<ClassificationRuleRequest>,
 ) -> Result<(StatusCode, Json<ClassificationRuleDto>), ApiFailure> {
     require_admin(&principal)?;
     let rule = create_rule(
@@ -602,14 +622,15 @@ pub async fn create_classification_rule(
     responses(
         (status = 204, description = "Rule retired"),
         (status = 403, description = "Owner only", body = ApiError),
-        (status = 404, description = "Rule not found", body = ApiError)
+        (status = 404, description = "Rule not found", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn delete_classification_rule(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<StatusCode, ApiFailure> {
     require_admin(&principal)?;
     retire_rule(&state.services, &principal, id).await?;
@@ -651,14 +672,17 @@ pub async fn list_category_groups(
     responses(
         (status = 201, description = "Category group added", body = CategoryGroupDto),
         (status = 403, description = "Owner only", body = ApiError),
-        (status = 422, description = "Invalid category group", body = ApiError)
+        (status = 422, description = "Invalid category group", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_category_group_route(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<CategoryGroupRequest>,
+    ApiJson(request): ApiJson<CategoryGroupRequest>,
 ) -> Result<(StatusCode, Json<CategoryGroupDto>), ApiFailure> {
     require_admin(&principal)?;
     let title = request.title.trim();
@@ -706,14 +730,17 @@ pub async fn list_category_reference(
         (status = 201, description = "Category added", body = CategoryDto),
         (status = 403, description = "Owner only", body = ApiError),
         (status = 404, description = "Category group not found", body = ApiError),
-        (status = 422, description = "Invalid category", body = ApiError)
+        (status = 422, description = "Invalid category", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_category_route(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<CategoryRequest>,
+    ApiJson(request): ApiJson<CategoryRequest>,
 ) -> Result<(StatusCode, Json<CategoryDto>), ApiFailure> {
     require_admin(&principal)?;
     let category = create_category(
@@ -743,14 +770,15 @@ pub async fn create_category_route(
     responses(
         (status = 204, description = "Category retired"),
         (status = 403, description = "Owner only", body = ApiError),
-        (status = 404, description = "Category not found", body = ApiError)
+        (status = 404, description = "Category not found", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn delete_category(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<StatusCode, ApiFailure> {
     require_admin(&principal)?;
     retire_category(&state.services, &principal, CategoryId(id)).await?;
@@ -785,14 +813,17 @@ pub async fn list_category_rules_route(
     responses(
         (status = 201, description = "Category rule added", body = CategoryRuleDto),
         (status = 403, description = "Owner only", body = ApiError),
-        (status = 422, description = "Invalid category rule", body = ApiError)
+        (status = 422, description = "Invalid category rule", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_category_rule_route(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<CategoryRuleRequest>,
+    ApiJson(request): ApiJson<CategoryRuleRequest>,
 ) -> Result<(StatusCode, Json<CategoryRuleDto>), ApiFailure> {
     require_admin(&principal)?;
     let matcher = parse_category_matcher(request.matcher)?;
@@ -820,14 +851,17 @@ pub async fn create_category_rule_route(
     responses(
         (status = 200, description = "Category rule impact", body = CategoryRuleImpactDto),
         (status = 403, description = "Owner only", body = ApiError),
-        (status = 422, description = "Invalid category rule", body = ApiError)
+        (status = 422, description = "Invalid category rule", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn preview_category_rule_route(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<CategoryRuleRequest>,
+    ApiJson(request): ApiJson<CategoryRuleRequest>,
 ) -> Result<Json<CategoryRuleImpactDto>, ApiFailure> {
     require_admin(&principal)?;
     let matcher = parse_category_matcher(request.matcher)?;
@@ -857,7 +891,11 @@ pub async fn preview_category_rule_route(
     responses(
         (status = 200, description = "Synchronisation result", body = SyncOutcomeDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 503, description = "Broker channel or access is not configured", body = ApiError)
+        (status = 503, description = "Broker channel or access is not configured", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -865,8 +903,8 @@ pub async fn sync_broker(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
-    Path(broker): Path<String>,
-    Json(request): Json<BrokerSyncRequest>,
+    ApiPath(broker): ApiPath<String>,
+    ApiJson(request): ApiJson<BrokerSyncRequest>,
 ) -> Result<Json<SyncOutcomeDto>, ApiFailure> {
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
@@ -901,14 +939,17 @@ pub async fn sync_broker(
         (status = 200, description = "Market synchronisation result", body = MarketSyncOutcomeDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 422, description = "Invalid range", body = ApiError),
-        (status = 503, description = "Market transport is not configured", body = ApiError)
+        (status = 503, description = "Market transport is not configured", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn sync_market(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<MarketSyncRequest>,
+    ApiJson(request): ApiJson<MarketSyncRequest>,
 ) -> Result<Json<MarketSyncOutcomeDto>, ApiFailure> {
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
@@ -973,7 +1014,7 @@ pub struct MarketKeyRateParams {
 pub async fn list_market_prices(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
-    Query(params): Query<MarketPricesParams>,
+    ApiQuery(params): ApiQuery<MarketPricesParams>,
 ) -> Result<Json<Vec<MarketPriceDto>>, ApiFailure> {
     let from = parse_query_date("from", &params.from)?;
     let to = parse_query_date("to", &params.to)?;
@@ -1007,7 +1048,7 @@ pub async fn list_market_prices(
 pub async fn list_market_fx(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
-    Query(params): Query<MarketFxParams>,
+    ApiQuery(params): ApiQuery<MarketFxParams>,
 ) -> Result<Json<Vec<MarketFxDto>>, ApiFailure> {
     let from = parse_query_date("from_date", &params.from_date)?;
     let to = parse_query_date("to_date", &params.to_date)?;
@@ -1040,7 +1081,7 @@ pub async fn list_market_fx(
 pub async fn list_market_key_rate(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
-    Query(params): Query<MarketKeyRateParams>,
+    ApiQuery(params): ApiQuery<MarketKeyRateParams>,
 ) -> Result<Json<Vec<MarketKeyRateDto>>, ApiFailure> {
     let from = parse_query_date("from", &params.from)?;
     let to = parse_query_date("to", &params.to)?;
@@ -1168,14 +1209,18 @@ pub async fn list_accounts(
     request_body = CreateAccountRequest,
     responses(
         (status = 201, description = "Account created", body = AccountDto),
-        (status = 403, description = "Insufficient permissions", body = ApiError)
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_account(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<CreateAccountRequest>,
+    ApiJson(request): ApiJson<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<AccountDto>), ApiFailure> {
     require_admin(&principal)?;
     let account = AccountView {
@@ -1235,14 +1280,15 @@ pub async fn list_broker_access(
     responses(
         (status = 204, description = "Access revoked"),
         (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 503, description = "Broker access encryption is not configured", body = ApiError)
+        (status = 503, description = "Broker access encryption is not configured", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn revoke_broker_access(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<StatusCode, ApiFailure> {
     require_admin(&principal)?;
     state
@@ -1264,14 +1310,17 @@ pub async fn revoke_broker_access(
     responses(
         (status = 201, description = "Token issued and shown once only", body = IssuedTokenDto),
         (status = 403, description = "Insufficient privileges", body = ApiError),
-        (status = 422, description = "The owner scope cannot be issued via the API", body = ApiError)
+        (status = 422, description = "The owner scope cannot be issued via the API", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_token(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<CreateTokenRequest>,
+    ApiJson(request): ApiJson<CreateTokenRequest>,
 ) -> Result<(StatusCode, Json<IssuedTokenDto>), ApiFailure> {
     require_admin(&principal)?;
     let scope = match request.scope {
@@ -1345,14 +1394,15 @@ pub async fn list_tokens(
     responses(
         (status = 204, description = "Token revoked"),
         (status = 403, description = "Insufficient privileges", body = ApiError),
-        (status = 404, description = "Token does not exist or belongs to someone else", body = ApiError)
+        (status = 404, description = "Token does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn revoke_token(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<StatusCode, ApiFailure> {
     require_admin(&principal)?;
     state
@@ -1371,14 +1421,18 @@ pub async fn revoke_token(
     request_body = CreateContourVersionRequest,
     responses(
         (status = 201, description = "Version created", body = ContourVersionDto),
-        (status = 403, description = "Insufficient privileges", body = ApiError)
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn create_contour_version(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<CreateContourVersionRequest>,
+    ApiJson(request): ApiJson<CreateContourVersionRequest>,
 ) -> Result<(StatusCode, Json<ContourVersionDto>), ApiFailure> {
     require_admin(&principal)?;
     if request.accounts.is_empty() {
@@ -1427,14 +1481,18 @@ pub async fn create_contour_version(
     request_body = SubmitOperationsRequest,
     responses(
         (status = 200, description = "Verdict for each operation", body = Vec<VerdictDto>),
-        (status = 403, description = "Insufficient permissions", body = ApiError)
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn ingest_operations(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<SubmitOperationsRequest>,
+    ApiJson(request): ApiJson<SubmitOperationsRequest>,
 ) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
@@ -1494,14 +1552,18 @@ pub async fn ingest_operations(
     request_body = SubmitJournalEventsRequest,
     responses(
         (status = 200, description = "Verdict for each fact", body = Vec<VerdictDto>),
-        (status = 403, description = "Insufficient permissions", body = ApiError)
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn ingest_journal_events(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Json(request): Json<SubmitJournalEventsRequest>,
+    ApiJson(request): ApiJson<SubmitJournalEventsRequest>,
 ) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
@@ -1615,7 +1677,7 @@ pub async fn flow_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
-    Query(params): Query<MoneyFlowParams>,
+    ApiQuery(params): ApiQuery<MoneyFlowParams>,
 ) -> Result<Json<MoneyFlowReportDto>, ApiFailure> {
     let query = MoneyFlowQuery {
         contour: ContourId(params.contour),
@@ -1663,7 +1725,7 @@ pub struct BalancesParams {
 pub async fn balances_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Query(params): Query<BalancesParams>,
+    ApiQuery(params): ApiQuery<BalancesParams>,
 ) -> Result<Json<Vec<AccountBalanceDto>>, ApiFailure> {
     let as_of = parse_query_date("as_of", &params.as_of)?;
     let rows = account_balances(
@@ -1703,14 +1765,15 @@ pub struct ReturnsParams {
     responses(
         (status = 200, description = "Report", body = ReturnsReportDto),
         (status = 404, description = "Scope not found", body = ApiError),
-        (status = 500, description = "Invariant violated", body = ApiError)
+        (status = 500, description = "Invariant violated", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn returns_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Query(params): Query<ReturnsParams>,
+    ApiQuery(params): ApiQuery<ReturnsParams>,
 ) -> Result<Json<ReturnsReportDto>, ApiFailure> {
     let query = ReturnsQuery {
         contour: ContourId(params.contour),
@@ -1737,15 +1800,18 @@ pub async fn returns_report(
     request_body = Vec<FxRateDto>,
     responses(
         (status = 200, description = "Report using the specified exchange rates", body = ReturnsReportDto),
-        (status = 422, description = "Invalid exchange rate", body = ApiError)
+        (status = 422, description = "Invalid exchange rate", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn returns_report_with_rates(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-    Query(params): Query<ReturnsParams>,
-    Json(rates): Json<Vec<FxRateDto>>,
+    ApiQuery(params): ApiQuery<ReturnsParams>,
+    ApiJson(rates): ApiJson<Vec<FxRateDto>>,
 ) -> Result<Json<ReturnsReportDto>, ApiFailure> {
     let mut fx = FxTable::new(FxSource::OwnerSupplied);
     for rate in &rates {

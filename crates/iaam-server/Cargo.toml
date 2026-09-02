@@ -12,6 +12,12 @@ rust-version.workspace = true
 iaam-app = { path = "../iaam-app", version = "0.1.0" }
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
 axum = "0.8"
+# The three crates axum itself parses queries and bodies with. Taken
+# directly so that `extract` can read the failure structurally — the field
+# serde stopped at — instead of parsing axum's prose about it.
+form_urlencoded = "1"
+serde_path_to_error = "0.1"
+serde_urlencoded = "0.7"
 rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

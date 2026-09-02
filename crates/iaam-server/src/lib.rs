@@ -10,6 +10,7 @@ pub mod auth;
 pub use action_catalog::{ActionCatalog, ActionCatalogError, ActionOperation};
 pub mod dto;
 pub mod error;
+pub mod extract;
 pub mod openapi;
 pub mod rate_limit;
 pub mod routes;

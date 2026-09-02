@@ -62,12 +62,13 @@ use crate::dto::{
     CategoryRuleRequest, ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
     CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
     CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DocumentDto, DocumentParams,
-    FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto,
-    MarketPriceDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
-    ReconciliationResponseDto, ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest,
-    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto, MarketFxSeriesDto,
+    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
+    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
+    QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams, ReconciliationResponseDto,
+    ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
+    ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
+    TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
@@ -1034,7 +1035,7 @@ pub struct MarketKeyRateParams {
     path = "/v1/market/prices",
     params(MarketPricesParams),
     responses(
-        (status = 200, description = "Prices with provenance", body = Vec<MarketPriceDto>),
+        (status = 200, description = "Prices with provenance and the completeness boundary", body = MarketPriceSeriesDto),
         (status = 422, description = "Invalid range", body = ApiError)
     ),
     security(("bearer" = []))
@@ -1043,11 +1044,11 @@ pub async fn list_market_prices(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
     ApiQuery(params): ApiQuery<MarketPricesParams>,
-) -> Result<Json<Vec<MarketPriceDto>>, ApiFailure> {
+) -> Result<Json<MarketPriceSeriesDto>, ApiFailure> {
     let from = parse_query_date("from", &params.from)?;
     let to = parse_query_date("to", &params.to)?;
     let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
-    let views = read_market_prices(
+    let series = read_market_prices(
         state.services.as_ref(),
         MarketPricesQuery {
             instrument: InstrumentId(params.instrument),
@@ -1059,7 +1060,10 @@ pub async fn list_market_prices(
         },
     )
     .await?;
-    Ok(Json(views.into_iter().map(market_price_dto).collect()))
+    Ok(Json(MarketPriceSeriesDto {
+        rows: series.rows.into_iter().map(market_price_dto).collect(),
+        complete_through: series.complete_through,
+    }))
 }
 
 /// Official exchange-rate series with provenance for each row.
@@ -1068,7 +1072,7 @@ pub async fn list_market_prices(
     path = "/v1/market/fx",
     params(MarketFxParams),
     responses(
-        (status = 200, description = "Exchange rates with provenance", body = Vec<MarketFxDto>),
+        (status = 200, description = "Exchange rates with provenance and the completeness boundary", body = MarketFxSeriesDto),
         (status = 422, description = "Invalid range", body = ApiError)
     ),
     security(("bearer" = []))
@@ -1077,11 +1081,11 @@ pub async fn list_market_fx(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
     ApiQuery(params): ApiQuery<MarketFxParams>,
-) -> Result<Json<Vec<MarketFxDto>>, ApiFailure> {
+) -> Result<Json<MarketFxSeriesDto>, ApiFailure> {
     let from = parse_query_date("from", &params.from)?;
     let to = parse_query_date("to", &params.to)?;
     let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
-    let views = read_market_fx(
+    let series = read_market_fx(
         state.services.as_ref(),
         MarketFxQuery {
             base: params.base.to_domain(),
@@ -1092,7 +1096,10 @@ pub async fn list_market_fx(
         },
     )
     .await?;
-    Ok(Json(views.into_iter().map(market_fx_dto).collect()))
+    Ok(Json(MarketFxSeriesDto {
+        rows: series.rows.into_iter().map(market_fx_dto).collect(),
+        complete_through: series.complete_through,
+    }))
 }
 
 /// Official key-rate intervals with boundary provenance.
@@ -1101,7 +1108,7 @@ pub async fn list_market_fx(
     path = "/v1/market/key-rate",
     params(MarketKeyRateParams),
     responses(
-        (status = 200, description = "Key-rate intervals with provenance", body = Vec<MarketKeyRateDto>),
+        (status = 200, description = "Key-rate intervals with provenance and the completeness boundary", body = MarketKeyRateSeriesDto),
         (status = 422, description = "Invalid range", body = ApiError)
     ),
     security(("bearer" = []))
@@ -1110,11 +1117,11 @@ pub async fn list_market_key_rate(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
     ApiQuery(params): ApiQuery<MarketKeyRateParams>,
-) -> Result<Json<Vec<MarketKeyRateDto>>, ApiFailure> {
+) -> Result<Json<MarketKeyRateSeriesDto>, ApiFailure> {
     let from = parse_query_date("from", &params.from)?;
     let to = parse_query_date("to", &params.to)?;
     let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
-    let views = read_market_key_rate(
+    let series = read_market_key_rate(
         state.services.as_ref(),
         MarketKeyRateQuery {
             from,
@@ -1123,7 +1130,10 @@ pub async fn list_market_key_rate(
         },
     )
     .await?;
-    Ok(Json(views.into_iter().map(market_key_rate_dto).collect()))
+    Ok(Json(MarketKeyRateSeriesDto {
+        rows: series.rows.into_iter().map(market_key_rate_dto).collect(),
+        complete_through: series.complete_through,
+    }))
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -1938,7 +1948,6 @@ fn market_price_dto(
         source: view.source,
         observed_at: view.observed_at,
         quality: view.quality,
-        complete_through: view.complete_through,
     }
 }
 
@@ -1953,7 +1962,6 @@ fn market_fx_dto(view: iaam_app::scenarios::market_reference::MarketFxView) -> M
         source: view.source,
         observed_at: view.observed_at,
         quality: view.quality,
-        complete_through: view.complete_through,
     }
 }
 
@@ -1968,7 +1976,6 @@ fn market_key_rate_dto(
         observed_at: view.observed_at,
         quality: view.quality,
         boundary: view.boundary,
-        complete_through: view.complete_through,
     }
 }
 

@@ -3849,9 +3849,10 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
         "/v1/market/key-rate?from=2026-08-03&to=2026-08-10&knowledge_as_of=2099-01-01T00:00:00Z";
 
     for token in [&harness.owner_token, &harness.agent_token] {
-        let (status, prices) = call(&harness.router, get(&prices_path, Some(token))).await;
+        let (status, price_series) = call(&harness.router, get(&prices_path, Some(token))).await;
         assert_eq!(status, StatusCode::OK);
-        let prices = prices.as_array().expect("price array");
+        assert_eq!(price_series["complete_through"], "2026-08-03");
+        let prices = price_series["rows"].as_array().expect("price rows");
         assert_eq!(prices.len(), 2);
         for price in prices {
             for field in [
@@ -3870,7 +3871,6 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
                 );
             }
             assert_eq!(price["source"], "moex-iss");
-            assert_eq!(price["complete_through"], "2026-08-03");
             // Proof of the quotation's basis is what distinguishes a price
             // from a guess (§10.2). If lost in transit,
             // it leaves no trace: the response looks the same.
@@ -3883,18 +3883,12 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
             assert_eq!(price["quotation_basis_status"], "not_proven");
         }
 
-        let (status, fx) = call(&harness.router, get(fx_path, Some(token))).await;
+        let (status, fx_series) = call(&harness.router, get(fx_path, Some(token))).await;
         assert_eq!(status, StatusCode::OK);
-        let fx = fx.as_array().expect("array of exchange rates");
+        assert_eq!(fx_series["complete_through"], "2026-08-03");
+        let fx = fx_series["rows"].as_array().expect("exchange-rate rows");
         assert_eq!(fx.len(), 1);
-        for field in [
-            "value",
-            "date",
-            "source",
-            "observed_at",
-            "quality",
-            "complete_through",
-        ] {
+        for field in ["value", "date", "source", "observed_at", "quality"] {
             assert!(
                 fx[0].get(field).is_some(),
                 "exchange rate has no {field}: {}",
@@ -3904,20 +3898,151 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
         assert_eq!(fx[0]["source"], "cbr");
         assert_eq!(fx[0]["quality"], "official");
 
-        let (status, key_rates) = call(&harness.router, get(key_rate_path, Some(token))).await;
+        let (status, key_rate_series) =
+            call(&harness.router, get(key_rate_path, Some(token))).await;
         assert_eq!(status, StatusCode::OK);
-        let key_rates = key_rates.as_array().expect("array of key-rate intervals");
+        assert_eq!(key_rate_series["complete_through"], "2026-08-10");
+        let key_rates = key_rate_series["rows"]
+            .as_array()
+            .expect("key-rate interval rows");
         assert_eq!(key_rates.len(), 2);
         assert_eq!(key_rates[0]["observed_at"], "2026-08-20T00:00:00Z");
         assert_eq!(key_rates[0]["quality"], "observed");
         assert_eq!(key_rates[1]["boundary"], "inferred_across_non_trading_days");
         assert_eq!(key_rates[1]["quality"], "inferred");
-        assert_eq!(key_rates[1]["complete_through"], "2026-08-10");
     }
 
     for path in [prices_path.as_str(), fx_path, key_rate_path] {
         let (status, _) = call(&harness.router, get(path, None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "route is open: {path}");
+    }
+}
+
+#[tokio::test]
+async fn an_empty_series_still_says_how_far_the_data_goes() {
+    // An agent asking for a period this instance holds nothing for was told `[]`,
+    // which reads the same as "the series is complete and there is simply no
+    // value in that interval". The two are different facts, and only the
+    // completeness boundary tells them apart, so it rides on the answer rather
+    // than on a row that may not exist.
+    let held = harness();
+    seed_market(&held).await;
+    let empty = harness();
+
+    let prices_of = |instrument: iaam_core::ids::InstrumentId, from: &str, to: &str| {
+        format!(
+            "/v1/market/prices?instrument={}&board=TQBR&session=1&from={from}&to={to}&knowledge_as_of=2099-01-01T00:00:00Z",
+            instrument.inner()
+        )
+    };
+    // Same shape of question on each of the three routes: an interval the
+    // instance holds no row for.
+    let cases = [
+        (
+            "prices",
+            prices_of(held.instrument, "2026-08-04", "2026-08-10"),
+            prices_of(empty.instrument, "2026-08-04", "2026-08-10"),
+            "2026-08-03",
+        ),
+        (
+            "fx",
+            "/v1/market/fx?base=USD&quote=RUB&from=2026-08-01&to=2026-08-02&knowledge_as_of=2099-01-01T00:00:00Z".to_owned(),
+            "/v1/market/fx?base=USD&quote=RUB&from=2026-08-01&to=2026-08-02&knowledge_as_of=2099-01-01T00:00:00Z".to_owned(),
+            "2026-08-03",
+        ),
+        (
+            "key-rate",
+            "/v1/market/key-rate?from=2026-07-01&to=2026-07-31&knowledge_as_of=2099-01-01T00:00:00Z".to_owned(),
+            "/v1/market/key-rate?from=2026-07-01&to=2026-07-31&knowledge_as_of=2099-01-01T00:00:00Z".to_owned(),
+            "2026-08-10",
+        ),
+    ];
+
+    for (route, held_path, empty_path, boundary) in cases {
+        // No value in this interval — but the series is known through `boundary`.
+        let (status, body) = call(&held.router, get(&held_path, Some(&held.agent_token))).await;
+        assert_eq!(status, StatusCode::OK, "{route} was refused: {body}");
+        assert!(
+            body["rows"].as_array().expect("rows").is_empty(),
+            "{route} answered rows for an interval it holds none for: {body}"
+        );
+        assert_eq!(
+            body["complete_through"], boundary,
+            "{route} lost the completeness boundary on an empty answer: {body}"
+        );
+
+        // Nothing held for the series at all — the boundary is explicitly absent.
+        let (status, body) = call(&empty.router, get(&empty_path, Some(&empty.agent_token))).await;
+        assert_eq!(status, StatusCode::OK, "{route} was refused: {body}");
+        assert!(
+            body["rows"].as_array().expect("rows").is_empty(),
+            "{route} answered rows from an instance holding nothing: {body}"
+        );
+        assert!(
+            body.get("complete_through").is_some_and(Value::is_null),
+            "{route} did not say that nothing is held: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_market_series_wrapper_is_written_down_in_the_contract() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (route, schema_name, row_schema) in [
+        (
+            "/v1/market/prices",
+            "MarketPriceSeriesDto",
+            "MarketPriceDto",
+        ),
+        ("/v1/market/fx", "MarketFxSeriesDto", "MarketFxDto"),
+        (
+            "/v1/market/key-rate",
+            "MarketKeyRateSeriesDto",
+            "MarketKeyRateDto",
+        ),
+    ] {
+        let body = &spec["paths"][route]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"];
+        assert_eq!(
+            body["$ref"],
+            format!("#/components/schemas/{schema_name}"),
+            "{route} does not answer the series wrapper: {body}"
+        );
+
+        let schema = &spec["components"]["schemas"][schema_name];
+        assert_eq!(
+            schema["properties"]["rows"]["items"]["$ref"],
+            format!("#/components/schemas/{row_schema}"),
+            "{schema_name} does not name its rows: {schema}"
+        );
+        assert_eq!(
+            schema["properties"]["complete_through"]["format"], "date",
+            "{schema_name} does not describe the boundary as a date: {schema}"
+        );
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .map(|field| field.as_str().expect("field name"))
+            .collect();
+        assert!(
+            required.contains(&"rows") && required.contains(&"complete_through"),
+            // A boundary the contract lets an answer omit is one an agent
+            // will not look for.
+            "{schema_name} lets an answer omit a field: {schema}"
+        );
+
+        // The boundary is a property of the answer, not of a row: a row that
+        // repeated it would invite a client to believe it could differ per row.
+        assert!(
+            spec["components"]["schemas"][row_schema]["properties"]
+                .get("complete_through")
+                .is_none(),
+            "{row_schema} still carries the series boundary"
+        );
     }
 }
 
@@ -3937,7 +4062,10 @@ async fn the_exchange_rate_route_spells_the_pair_and_the_interval_apart() {
         StatusCode::OK,
         "exchange rates were refused: {body}"
     );
-    assert_eq!(body.as_array().expect("array of exchange rates").len(), 1);
+    assert_eq!(
+        body["rows"].as_array().expect("exchange-rate rows").len(),
+        1
+    );
 
     // The old spelling is gone rather than quietly accepted beside the new one.
     let old_spelling = "/v1/market/fx?from=USD&to=RUB&from_date=2026-08-01&to_date=2026-08-03";

@@ -13,6 +13,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
+use iaam_app::actions::{Action, ActionCategory, ActionState, ActionTarget, ProvidedBy};
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{AccountView, Principal, Scope};
@@ -54,22 +55,112 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::ServerState;
+use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountBalanceDto, AccountDto, AddBrokerAccessRequest, BrokerAccessDto,
-    BrokerAccessUpdateRequest, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClaimOutcomeDto, ClassificationRuleDto, ClassificationRuleRequest,
-    ContourVersionDto, CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest,
-    CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest,
-    DimensionStatusDto, DocumentDto, DocumentParams, EvidenceDto, FxRateDto, HealthDto,
-    InstrumentDto, IssuedTokenDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto, MarketSourceDto,
-    MarketSyncRequest, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
-    QuotationBasisStatusDto, ReconciliationParams, ReconciliationStatusDto,
-    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    AccountBalanceDto, AccountCandidateDto, AccountDto, ActionDto, ActionTargetDto,
+    ActionsResponseDto, AddBrokerAccessRequest, BrokerAccessDto, BrokerAccessUpdateRequest,
+    BrokerSyncRequest, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest,
+    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClaimOutcomeDto,
+    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto, CreateAccountRequest,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    CustodyRepairOutcomeDto, CustodyRepairRequest, DimensionStatusDto, DocumentDto, DocumentParams,
+    EvidenceDto, FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto,
+    MarketKeyRateDto, MarketPriceDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
+    MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
+    ReconciliationParams, ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest,
+    ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use iaam_app::scenarios::documents::UploadedDocument;
+
+pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
+pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
+
+/// The computed actions currently blocking or advancing owner setup.
+#[utoipa::path(
+    get,
+    path = "/v1/actions",
+    responses((status = 200, description = "Computed owner actions", body = ActionsResponseDto)),
+    security(("bearer" = []))
+)]
+pub async fn list_actions(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+) -> Result<Json<ActionsResponseDto>, ApiFailure> {
+    let actions =
+        iaam_app::actions::frontier(principal.owner, state.services.store.as_ref()).await?;
+    Ok(Json(ActionsResponseDto {
+        policy_version: 1,
+        items: actions
+            .iter()
+            .map(|action| action_dto(action, &catalog))
+            .collect(),
+    }))
+}
+
+fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
+    let target = match action.target() {
+        ActionTarget::Operation { operation, request } => {
+            let resolved = catalog.operation(*operation);
+            ActionTargetDto::Operation {
+                operation_id: resolved.operation_id.clone(),
+                method: resolved.method.clone(),
+                path: resolved.path.clone(),
+                request_schema: resolved.request_schema.clone(),
+                request: RequestPlanDto {
+                    missing: request
+                        .missing
+                        .iter()
+                        .map(|missing| MissingInputDto {
+                            pointer: missing.pointer.clone(),
+                            provided_by: provided_by_code(missing.provided_by),
+                            candidates: missing.candidates.as_ref().map(|candidates| {
+                                candidates
+                                    .iter()
+                                    .map(|candidate| AccountCandidateDto {
+                                        id: candidate.id.inner(),
+                                        title: candidate.title.clone(),
+                                        institution: candidate.institution.clone(),
+                                    })
+                                    .collect()
+                            }),
+                        })
+                        .collect(),
+                },
+            }
+        }
+        ActionTarget::None => ActionTargetDto::None,
+    };
+    ActionDto {
+        id: action.id().to_owned(),
+        kind: action.kind().id().to_owned(),
+        category: match action.category() {
+            ActionCategory::Blocking => "blocking",
+            ActionCategory::RequiredForGoal => "required_for_goal",
+            ActionCategory::Recommended => "recommended",
+        }
+        .to_owned(),
+        state: match action.state() {
+            ActionState::Ready => "ready",
+            ActionState::NeedsOwnerInput => "needs_owner_input",
+        }
+        .to_owned(),
+        reason: action.reason().to_owned(),
+        required_scope: action.required_scope().code().to_owned(),
+        target,
+    }
+}
+
+fn provided_by_code(source: ProvidedBy) -> String {
+    match source {
+        ProvidedBy::Owner => "owner",
+        ProvidedBy::ExternalDocument => "external_document",
+        ProvidedBy::Caller => "caller",
+    }
+    .to_owned()
+}
 
 /// List of instruments in the global reference catalogue.
 #[utoipa::path(
@@ -1080,6 +1171,7 @@ pub async fn list_accounts(
 #[utoipa::path(
     post,
     path = "/v1/accounts",
+    operation_id = CREATE_ACCOUNT_OPERATION_ID,
     request_body = CreateAccountRequest,
     responses(
         (status = 201, description = "Account created", body = AccountDto),
@@ -1324,6 +1416,7 @@ pub async fn revoke_token(
 #[utoipa::path(
     post,
     path = "/v1/contours",
+    operation_id = CREATE_CONTOUR_VERSION_OPERATION_ID,
     request_body = CreateContourVersionRequest,
     responses(
         (status = 201, description = "Version created", body = ContourVersionDto),

@@ -5,7 +5,9 @@
 //! and the requirement is testable — any number in the agent's response that is absent
 //! from the API responses is an error.
 
+pub mod action_catalog;
 pub mod auth;
+pub use action_catalog::{ActionCatalog, ActionCatalogError, ActionOperation};
 pub mod dto;
 pub mod error;
 pub mod openapi;
@@ -15,9 +17,10 @@ pub mod routes;
 use std::sync::Arc;
 
 use axum::routing::get;
-use axum::{Json, Router, middleware};
+use axum::{Extension, Json, Router, middleware};
 use iaam_app::AppServices;
 use iaam_app::jobs::{MarketScheduler, MarketSyncJob};
+use thiserror::Error;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -50,17 +53,20 @@ impl ServerState {
     }
 }
 
+/// A failure while assembling the server and its action catalog.
+#[derive(Debug, Error)]
+pub enum BuildError {
+    #[error(transparent)]
+    ActionCatalog(#[from] ActionCatalogError),
+}
+
 /// Builds the axum application together with the generated specification.
 ///
 /// The public endpoints are `/v1/health` and the specification; all other
 /// endpoints require authentication from the first request (§14).
-pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
-    // In production, build is called from within the tokio runtime. This check
-    // preserves the ability to build a Router in a normal synchronous test.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::mem::drop(state.market_scheduler.clone().spawn());
-    }
+pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), BuildError> {
     let protected = OpenApiRouter::new()
+        .routes(routes!(routes::list_actions))
         .routes(routes!(routes::list_accounts, routes::create_account))
         .routes(routes!(routes::list_instruments, routes::create_instrument))
         .routes(routes!(routes::get_instrument))
@@ -120,9 +126,17 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
         .routes(routes!(routes::health))
         .merge(protected)
         .split_for_parts();
+    let catalog = ActionCatalog::from_openapi(&api)?;
+
+    // In production, build is called from within the tokio runtime. This check
+    // preserves the ability to build a Router in a normal synchronous test.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::mem::drop(state.market_scheduler.clone().spawn());
+    }
 
     let spec = api.clone();
     let router = router
+        .layer(Extension(Arc::new(catalog)))
         .route(
             "/v1/openapi.json",
             get(move || {
@@ -131,5 +145,5 @@ pub fn build(state: ServerState) -> (Router, utoipa::openapi::OpenApi) {
             }),
         )
         .with_state(state);
-    (router, api)
+    Ok((router, api))
 }

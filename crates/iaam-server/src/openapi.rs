@@ -10,11 +10,12 @@ use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 
 use crate::dto::{
-    AccountBalanceDto, AccountDto, AccountResidualDto, AddBrokerAccessRequest, AmountDto,
-    BasisCertaintyDto, BasisTransferRuleDto, BondPositionMetricsDto, BondScenarioResultDto,
-    BrokerAccessDto, BrokerAccessUpdateRequest, BrokerEnvironmentDto, BrokerSyncRequest,
-    CalcMoneyDto, CategoryAmountDto, CategoryDto, CategoryMoveDto, CategoryRequest,
-    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, CertaintyDto, ClaimOutcomeDto,
+    AccountBalanceDto, AccountCandidateDto, AccountDto, AccountResidualDto, ActionDto,
+    ActionTargetDto, ActionsResponseDto, AddBrokerAccessRequest, AmountDto, BasisCertaintyDto,
+    BasisTransferRuleDto, BondPositionMetricsDto, BondScenarioResultDto, BrokerAccessDto,
+    BrokerAccessUpdateRequest, BrokerEnvironmentDto, BrokerSyncRequest, CalcMoneyDto,
+    CategoryAmountDto, CategoryDto, CategoryMoveDto, CategoryRequest, CategoryRuleDto,
+    CategoryRuleImpactDto, CategoryRuleRequest, CertaintyDto, ClaimOutcomeDto,
     ClassificationRuleDto, ClassificationRuleRequest, ComputedCalcMoneyDto, ComputedDto,
     ComputedLifetimeCohortMetricsDto, ComputedZeroReinvestmentMetricsDto, ContourVersionDto,
     CorporateActionDto, CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest,
@@ -24,13 +25,14 @@ use crate::dto::{
     FractionalTreatmentDto, FxRateDto, HealthDto, IncomeKindDto, IrrLabelDto, IssuedTokenDto,
     JournalEventDto, JournalFactDto, KnowledgeDto, LegacyDerivedPositionDto,
     LifetimeCohortMetricDto, LiquidationEstimateDto, MarketFxDto, MarketKeyRateDto, MarketPriceDto,
-    MarketSourceDto, MarketSyncRequest, MoneyFlowCurrencyDto, MoneyFlowReportDto, NotDecomposedDto,
-    OfferChoiceDto, OpeningAssertionsDto, OperationDatesDto, OperationDto, OperationKindDto,
-    OwnerBalanceRequest, PositionCoverageDto, PostingKindDto, PriceFreshnessDto, PriceOriginDto,
-    PriceProvenanceDto, PriceQualityDto, PriceSelectionDto, ProspectiveMetricDto,
-    QuotationBasisDto, QuotationBasisStatusDto, RateDto, ReconciliationStatusDto, ReturnsReportDto,
-    SelectedPriceDto, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
-    TokenDto, TristateDto, UncoveredPositionDto, VerdictDto, ZeroReinvestmentMetricsDto,
+    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowCurrencyDto, MoneyFlowReportDto,
+    NotDecomposedDto, OfferChoiceDto, OpeningAssertionsDto, OperationDatesDto, OperationDto,
+    OperationKindDto, OwnerBalanceRequest, PositionCoverageDto, PostingKindDto, PriceFreshnessDto,
+    PriceOriginDto, PriceProvenanceDto, PriceQualityDto, PriceSelectionDto, ProspectiveMetricDto,
+    QuotationBasisDto, QuotationBasisStatusDto, RateDto, ReconciliationStatusDto, RequestPlanDto,
+    ReturnsReportDto, SelectedPriceDto, SubmitJournalEventsRequest, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TristateDto, UncoveredPositionDto, VerdictDto,
+    ZeroReinvestmentMetricsDto,
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
@@ -68,6 +70,12 @@ impl Modify for BearerSecurity {
     modifiers(&BearerSecurity),
     components(schemas(
         AccountDto,
+        AccountCandidateDto,
+        ActionDto,
+        ActionTargetDto,
+        ActionsResponseDto,
+        MissingInputDto,
+        RequestPlanDto,
         AccountBalanceDto,
         AccountResidualDto,
         AddBrokerAccessRequest,

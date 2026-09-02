@@ -9,92 +9,100 @@ API is and how a credential is obtained, except by reading a document a human
 maintains. That document (`docs/agent-skill/SKILL.md`) is wrong in four places
 today.
 
-This task gives the agent a first call that answers without prose, and makes the
-refusal it gets without a credential say something true.
+This task gives it a first call that answers without prose, and makes the refusal
+it gets without a credential say something true.
+
+**Nothing here is invented.** A survey of agent-facing API standards found that
+every part of this task is already specified by somebody: the entry point by
+RFC 9727, the link relations by RFC 8631, the document format by RFC 9264, the
+error body by RFC 9457, and the challenge header by RFC 6750. An earlier draft
+of this spec invented a `GET /v1` document and an `authenticate` action object;
+both are withdrawn, because a bespoke entry point is one more thing an agent must
+be told about out of band — which is the disease, not the cure.
 
 **What it does not do.** It does not get anyone authenticated: a token is issued
-at the console and injected into the client by local tooling (ADR-0003), and no
-API call produces one. Two earlier drafts of this spec were larger and both were
-withdrawn — the first claimed standalone bootstrap value it did not have; the
-second carried the whole action envelope and its route resolver into a task whose
-only action had no address, so its contract tests would have been green and
-vacuous. **The envelope and the resolver move to E9.T2**, where the first real
-operation exists to exercise them.
+at the console by `iaam claim` and injected into the client by local tooling
+(ADR-0003), and no API call produces one. The action envelope and its route
+resolver live in **E9.T2**, where the first real operation exists to exercise
+them; shipping them here would produce a contract suite that is green and proves
+nothing, since no action in this task has an address.
 
 ## What already exists
 
 - `/v1/openapi.json` is **unauthenticated**, added to the combined router after
-  `split_for_parts` (`lib.rs:174`). It answers which operations exist, with
-  methods, paths, schemas and security. It is mounted with plain `Router::route`,
-  so it does not describe itself — and `/v1` must not be mounted the same way, or
-  discovery will advertise a capability document that omits discovery.
+  `split_for_parts` (`lib.rs`). It is mounted with plain `Router::route`, so it
+  does not describe itself.
 - `/v1/health` answers unauthenticated with status and versions, and discloses
-  nothing about owner or claim state.
+  nothing about owner state.
+- `POST /v1/claim` is **gone** as of `iaam-iw9s`, along with the one-time code.
 - `ApiError` carries `code`, `message`, `field`, `expected`, `actual`,
-  `correlation_id` (`error.rs`).
+  `correlation_id` (`error.rs`) — a hand-rolled shape that RFC 9457 standardises.
+  Migrating it is `iaam-3pkr`, not this task.
 
-The OpenAPI document is necessary and insufficient. It says what may be called.
-It cannot say why an operation is relevant now, which values the system already
-holds, or what observably proves a step done. It is the capability document; E9
-adds the work, starting at T2.
+## 1. The entry point is `/.well-known/api-catalog`
 
-## 1. `GET /v1` — the discovery document
-
-Unprotected, mounted through `OpenApiRouter` so that it appears in the document
-it points at.
+RFC 9727 registers that path for exactly this purpose: a resource listing the
+APIs a publisher offers. The document is `application/linkset+json` (RFC 9264),
+and the relation types come from RFC 8631 — `service-desc` for a machine-readable
+description, `service-doc` for human documentation, `status` for health.
 
 ```json
 {
-  "service": "iaam",
-  "api_version": "v1",
-  "openapi": "/v1/openapi.json",
-  "health": "/v1/health",
-  "authentication": {
-    "scheme": "bearer",
-    "header": "Authorization: Bearer <token>",
-    "credentials_are_external": true,
-    "how": "Tokens are issued at the server console and injected by local tooling. No API call issues one."
-  }
+  "linkset": [
+    {
+      "anchor": "https://<host>/v1",
+      "service-desc": [
+        { "href": "/v1/openapi.json", "type": "application/json" }
+      ],
+      "status": [
+        { "href": "/v1/health", "type": "application/json" }
+      ]
+    }
+  ]
 }
 ```
 
-No journal `SCHEMA_VERSION` here. An API client writes DTOs, not journal events;
-the journal schema version is data-compatibility diagnostics and already reaches
-clients through `/v1/health`, which discovery links to. Publishing it as though
-it were the contract version would invite a client to branch on the wrong number.
+Unprotected, and it reads no state.
 
-No action object either. An earlier draft carried an `authenticate` action with
-no operation and, after claiming moved to the CLI, no options — which is not an
-action but a polite way of saying nothing. The status code, the standard
-challenge header and this `authentication` object already say it, and calling it
-an action would make `/v1/actions` mean less when it arrives.
+An agent that knows nothing else now needs one convention it already has — a
+well-known URI — to reach the complete contract. There is no bespoke discovery
+document to learn, and consequently nothing new to keep in sync.
+
+`service-doc` is added when there is a human document worth pointing at.
+`docs/agent-skill/SKILL.md` is not that document until `iaam-zu6m` reduces it to
+what cannot be computed.
 
 ### What it must not say
 
-Discovery must not disclose whether the instance has been claimed or whether an
-owner exists. It is built entirely from constants and reads no state, so this is
-a property of its construction rather than a filter over an answer.
+The catalog must not disclose whether an owner exists or whether the instance has
+been provisioned. It is built from constants and reads no state, so this is a
+property of its construction rather than a filter over an answer. Stated as: the
+response body is byte-identical across instance states, asserted over status,
+the relevant headers and the raw bytes.
 
-Stated as: **the response body is byte-identical across instance states**,
-asserted over status, the relevant headers and the raw bytes. It is not a claim
-that every observable channel is closed — with claiming removed from HTTP
-(ADR-0003) the timing difference in `accept_claim` disappears along with the
-route, but this document does not pretend to have audited channels it does not
-control.
+## 2. The security scheme states the credential contract
 
-## 2. `401` becomes protocol-correct
+The one thing an invented discovery document was carrying that the standards do
+not — "credentials are external; no API call issues one" — belongs in the OpenAPI
+security scheme description, which every client already reads and which is
+generated from code. `BearerSecurity` in `openapi.rs` already sets a description;
+it is corrected to say where a token comes from and that no route issues one.
+
+That is the whole of it. A separate prose endpoint would be `SKILL.md` in JSON.
+
+## 3. `401` becomes protocol-correct
 
 `ApiFailure::unauthorized()` returns a status and a JSON body and nothing else
-(`error.rs:70`). It gains:
+(`error.rs`). It gains:
 
 - `WWW-Authenticate: Bearer` when no credential was presented, and
-  `WWW-Authenticate: Bearer error="invalid_token"` when one was presented and
-  rejected — the fuller RFC 6750 challenge belongs only on the second, because
-  the first has no token to call invalid.
+  `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750 §3) when one was
+  presented and rejected — the fuller challenge belongs only on the second,
+  because the first has no token to call invalid.
 - `Cache-Control: no-store` and `Vary: Authorization`, so an intermediary cannot
-  cache a refusal and replay it. Discovery itself may be publicly cacheable
+  cache a refusal and replay it. The catalog itself may be publicly cacheable
   precisely because it is state-independent.
-- A `code` and `message` naming the external remedy: a token comes from the
+- A body naming the external remedy: a token is issued by `iaam claim` at the
   console, and no call issues one.
 
 Both refusal paths are tested, because they run through materially different
@@ -102,63 +110,47 @@ code: a missing `Authorization` header returns before the rate limiter
 (`auth.rs:47-49`), while a present-but-unknown token passes through it first
 (`auth.rs:50-70`).
 
-The body on the missing-header path stays **small and allocation-free per
-request** — a static serialized constant, not a structure rebuilt and cloned.
-That path is unlimited by the rate limiter, so its cost is an attacker's lever.
-Making it limited is out of scope and belongs with `iaam-hbfw`.
+The body on the missing-header path is a **static serialized constant**, not a
+structure rebuilt and cloned per request. That path is unlimited by the rate
+limiter, so its cost is an attacker's lever. Making it limited is out of scope
+and belongs with `iaam-hbfw`.
 
 `403` is not in scope: a scope refusal cannot honestly say what to do before the
 re-examination in `iaam-hbfw`.
 
-## 3. Dependency on the CLI
-
-This task depends on `iaam-iw9s`, which moves claiming to the CLI and deletes
-`POST /v1/claim` with its one-time code.
-
-The order matters and is not a preference. While that route exists, discovery
-must either advertise it — routing a bootstrap secret through the agent, which
-the owner has forbidden absolutely — or state that no API call issues a
-credential, which would be false. Shipping the CLI first leaves an awkward
-window in which the console works and `/v1` does not yet explain it; shipping
-discovery first leaves a window in which the API lies. The awkward window is the
-one to take.
-
 ## 4. Tests
 
-- Discovery's body is byte-identical across instance states, over status, the
-  relevant headers and raw bytes.
-- `/v1` appears in `/v1/openapi.json`, which catches it being mounted with plain
-  `Router::route`.
-- Discovery names no route that is absent from the completed OpenAPI document.
-- `401` with no header: bare `Bearer` challenge, `no-store`, `Vary`, and the
-  external-remedy code.
+- The catalog's body is byte-identical across instance states, over status,
+  headers and raw bytes.
+- It is served as `application/linkset+json`, and every `href` it names resolves
+  to a route that exists.
+- `POST /v1/claim` is absent from the router and from the generated document —
+  the same assertion `iaam-iw9s` makes, kept because this task's honesty depends
+  on it.
+- `401` with no header: bare `Bearer`, `no-store`, `Vary`, and the
+  external-remedy body.
 - `401` with an unknown or revoked token: `error="invalid_token"`, same cache
   headers.
-- A contract test asserts `POST /v1/claim` is gone — the same assertion
-  `iaam-iw9s` makes, kept here because this task's honesty depends on it.
+- The security scheme description names the console as the source of a token.
 
 ## 5. Not in this task
 
-The action envelope, `ActionOptionDto`, the action catalog and its resolution
-from the completed OpenAPI, the fallible `build` and the reordering that
-validates before spawning the market scheduler — all of it moves to **E9.T2**,
-where `/v1/actions` has operations to address. Shipping a resolver here would
-mean a contract suite that appears to prove address resolution while no action
-has an address.
-
-Also out: any work queue or state reading (E9.T2), `403` remediation and the
-rate-limiting hole (`iaam-hbfw`), actions attached to verdicts (E9.T5), and edits
-to `docs/agent-skill/SKILL.md` beyond what `iaam-zu6m` does on its own.
+The action envelope, the action catalog and its resolution from the completed
+OpenAPI, the fallible `build` and the reordering that validates before spawning
+the market scheduler — all in **E9.T2**. The RFC 9457 migration of `ApiError` is
+`iaam-3pkr`. Any work queue or state reading is E9.T2. `403` remediation and the
+rate-limiting hole are `iaam-hbfw`. Actions on verdicts are E9.T5. Reducing
+`docs/agent-skill/SKILL.md` is `iaam-zu6m`.
 
 ## 6. Risks
 
-**The task is small enough to look pointless.** It ships one document and a
-header. Its value is that the entry point exists before anything needs to point
-at it, and that the refusal an agent will hit most often stops being mute. If it
-is folded into T2 instead, T2 grows a second concern; that trade was considered
-and rejected because T2 is already the largest task in the epic.
+**Two entry points for one release.** Until `iaam-3pkr` lands, the catalog is
+standards-shaped while error bodies are still bespoke. That is visible
+inconsistency, accepted because the alternative is one task that changes every
+error response in the API at the same time as introducing the entry point.
 
-**Discovery becomes a second document.** If `GET /v1` grows prose about how the
-system works, it is the skill in JSON. It carries versions, two links and the
-authentication scheme. Anything else belongs in the OpenAPI descriptions or in
-`/v1/actions`.
+**The catalog is trivially small.** It links two documents. Its value is that it
+is the address an agent tries without being told, and that it grows the right way
+— `service-doc` when there is prose worth reading, more anchors when there is a
+second API. If it starts carrying explanation instead of links, it has become the
+thing this epic deletes.

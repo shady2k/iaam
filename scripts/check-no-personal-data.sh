@@ -31,12 +31,18 @@ err() { echo "PRIVACY: $*" >&2; fail=1; }
 # statement is not, and the two are told apart by where they live, because
 # nothing in the bytes distinguishes them.
 DATA_SUFFIXES='\.(csv|tsv|db|sqlite3?|xlsx?|xls|zip|ofx|qif|pdf)$'
-# A skill's fixtures belong to the skill: check-fixtures.sh freezes what lives
-# under tests/fixtures/ and demands a Rust test name it, which a Python
+# An import tool's fixtures belong to the tool: check-fixtures.sh freezes what
+# lives under tests/fixtures/ and demands a Rust test name it, which a Python
 # importer's sample cannot satisfy. The location is the whitelist, exactly as it
 # is for the others — a real export dropped here would be a deliberate act, not
 # an accident.
-ALLOWED_DATA_DIRS='^(tests/fixtures/|crates/[^/]+/tests/fixtures/|\.claude/skills/[^/]+/fixtures/|docs/)'
+#
+# The allowance names tools/, not .claude/skills/, and that is the whole point of
+# where it points: the tools are vendor-neutral and have exactly one copy, while
+# .claude/skills/ holds pointers (iaam-u7ns). A fixture copied back under
+# .claude/ is refused here, before it can become a second source of truth that
+# drifts from the first.
+ALLOWED_DATA_DIRS='^(tests/fixtures/|crates/[^/]+/tests/fixtures/|tools/[^/]+/fixtures/|docs/)'
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   if ! printf '%s\n' "$path" | grep -qE "$ALLOWED_DATA_DIRS"; then
@@ -70,9 +76,14 @@ if [ "$probe_amount" != '+ a total of 4 647 798,79 roubles' ]; then
   err "the amount shape misclassifies its own probe"
   exit 1
 fi
-probe_path=$(printf '%s\n' 'tests/fixtures/reports/synthetic.xlsx' 'statements/august.csv' \
+probe_path=$(printf '%s\n' 'tests/fixtures/reports/synthetic.xlsx' \
+  'tools/tbank-csv-import/fixtures/synthetic-export.csv' \
+  '.claude/skills/tbank-csv-import/fixtures/synthetic-export.csv' \
+  'statements/august.csv' \
   | grep -vE "$ALLOWED_DATA_DIRS" || true)
-if [ "$probe_path" != 'statements/august.csv' ]; then
+expected_refusals='.claude/skills/tbank-csv-import/fixtures/synthetic-export.csv
+statements/august.csv'
+if [ "$probe_path" != "$expected_refusals" ]; then
   err "the fixture-directory rule misclassifies its own probe"
   exit 1
 fi

@@ -3839,7 +3839,7 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
         "/v1/market/prices?instrument={}&board=TQBR&session=1&from=2026-08-01&to=2026-08-03&knowledge_as_of=2099-01-01T00:00:00Z",
         harness.instrument.inner()
     );
-    let fx_path = "/v1/market/fx?from=USD&to=RUB&from_date=2026-08-01&to_date=2026-08-03&knowledge_as_of=2099-01-01T00:00:00Z";
+    let fx_path = "/v1/market/fx?base=USD&quote=RUB&from=2026-08-01&to=2026-08-03&knowledge_as_of=2099-01-01T00:00:00Z";
     let key_rate_path =
         "/v1/market/key-rate?from=2026-08-03&to=2026-08-10&knowledge_as_of=2099-01-01T00:00:00Z";
 
@@ -3914,6 +3914,104 @@ async fn market_reference_routes_require_auth_and_preserve_provenance() {
         let (status, _) = call(&harness.router, get(path, None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "route is open: {path}");
     }
+}
+
+#[tokio::test]
+async fn the_exchange_rate_route_spells_the_pair_and_the_interval_apart() {
+    // `from` and `to` meant a currency here and an interval everywhere else,
+    // so an agent that had learned the interval sent `from=2026-01-01` and was
+    // told to send a currency instead. The pair is `base`/`quote`; `from` and
+    // `to` are the interval, as on every other route.
+    let harness = harness();
+    seed_market(&harness).await;
+
+    let path = "/v1/market/fx?base=USD&quote=RUB&from=2026-08-01&to=2026-08-03";
+    let (status, body) = call(&harness.router, get(path, Some(&harness.agent_token))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "exchange rates were refused: {body}"
+    );
+    assert_eq!(body.as_array().expect("array of exchange rates").len(), 1);
+
+    // The old spelling is gone rather than quietly accepted beside the new one.
+    let old_spelling = "/v1/market/fx?from=USD&to=RUB&from_date=2026-08-01&to_date=2026-08-03";
+    let (status, _) = call(
+        &harness.router,
+        get(old_spelling, Some(&harness.agent_token)),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "the old parameter names still answer: {old_spelling}"
+    );
+
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let declared: Vec<&str> = spec["paths"]["/v1/market/fx"]["get"]["parameters"]
+        .as_array()
+        .expect("declared parameters")
+        .iter()
+        .map(|parameter| parameter["name"].as_str().expect("parameter name"))
+        .collect();
+    assert_eq!(
+        declared,
+        vec!["base", "quote", "from", "to", "knowledge_as_of"],
+        "the contract spells the exchange-rate parameters differently"
+    );
+}
+
+#[tokio::test]
+async fn every_market_parameter_is_described_and_the_moex_ones_name_their_origin() {
+    // A bare `board` or `session` cannot be guessed: both are MOEX ISS column
+    // values, and the contract is the only place an agent can learn that.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = |route: &str| -> Vec<(String, String)> {
+        spec["paths"][route]["get"]["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("declared parameters of {route}"))
+            .iter()
+            .map(|parameter| {
+                let name = parameter["name"]
+                    .as_str()
+                    .expect("parameter name")
+                    .to_owned();
+                let description = parameter["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(
+                    !description.trim().is_empty(),
+                    "{route} leaves {name} undescribed"
+                );
+                (name, description)
+            })
+            .collect()
+    };
+
+    for route in ["/v1/market/prices", "/v1/market/fx", "/v1/market/key-rate"] {
+        assert!(
+            !described(route).is_empty(),
+            "{route} declares no parameter"
+        );
+    }
+
+    let prices: std::collections::BTreeMap<String, String> =
+        described("/v1/market/prices").into_iter().collect();
+    assert!(
+        prices["board"].contains("BOARDID") && prices["board"].contains("MOEX"),
+        "board does not name its MOEX origin: {}",
+        prices["board"]
+    );
+    assert!(
+        prices["session"].contains("TRADINGSESSION") && prices["session"].contains("MOEX"),
+        "session does not name its MOEX origin: {}",
+        prices["session"]
+    );
 }
 
 // --- Journal facts: corporate actions and an offer -----------------

@@ -928,13 +928,27 @@ pub async fn sync_market(
 /// Price series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct MarketPricesParams {
+    /// Instrument identifier.
     pub instrument: Uuid,
+    /// Trading board — the MOEX `BOARDID` of the observation, stored verbatim
+    /// from the source. The source owns the set of values; `TQBR` (shares) and
+    /// `TQOB` (bonds) are the ones the parser's fixtures carry.
     pub board: String,
+    /// Trading session — the MOEX ISS `TRADINGSESSION` of the observation.
+    /// Together with the board it fixes the trading mode a price belongs to,
+    /// which is what separates regular trading from the evening session. The
+    /// source owns the set of values and this code does not enumerate them:
+    /// `3` is the only one the parser's fixtures carry, and a response without
+    /// the column is stored as `0`.
     pub session: i64,
+    /// Inclusive start of the interval, YYYY-MM-DD.
     #[param(value_type = String, format = Date)]
     pub from: String,
+    /// Inclusive end of the interval, YYYY-MM-DD.
     #[param(value_type = String, format = Date)]
     pub to: String,
+    /// Knowledge cut-off, RFC 3339: rows recorded after this moment are
+    /// invisible to the answer. By default — now.
     #[serde(default)]
     pub knowledge_as_of: Option<String>,
 }
@@ -942,12 +956,18 @@ pub struct MarketPricesParams {
 /// Exchange-rate series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct MarketFxParams {
-    pub from: CurrencyDto,
-    pub to: CurrencyDto,
+    /// Base currency of the pair: the currency being priced.
+    pub base: CurrencyDto,
+    /// Quote currency of the pair: the currency the rate is expressed in.
+    pub quote: CurrencyDto,
+    /// Inclusive start of the interval, YYYY-MM-DD.
     #[param(value_type = String, format = Date)]
-    pub from_date: String,
+    pub from: String,
+    /// Inclusive end of the interval, YYYY-MM-DD.
     #[param(value_type = String, format = Date)]
-    pub to_date: String,
+    pub to: String,
+    /// Knowledge cut-off, RFC 3339: rows recorded after this moment are
+    /// invisible to the answer. By default — now.
     #[serde(default)]
     pub knowledge_as_of: Option<String>,
 }
@@ -955,10 +975,14 @@ pub struct MarketFxParams {
 /// Key-rate series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct MarketKeyRateParams {
+    /// Inclusive start of the interval, YYYY-MM-DD.
     #[param(value_type = String, format = Date)]
     pub from: String,
+    /// Inclusive end of the interval, YYYY-MM-DD.
     #[param(value_type = String, format = Date)]
     pub to: String,
+    /// Knowledge cut-off, RFC 3339: rows recorded after this moment are
+    /// invisible to the answer. By default — now.
     #[serde(default)]
     pub knowledge_as_of: Option<String>,
 }
@@ -1013,16 +1037,16 @@ pub async fn list_market_fx(
     Extension(_principal): Extension<Principal>,
     Query(params): Query<MarketFxParams>,
 ) -> Result<Json<Vec<MarketFxDto>>, ApiFailure> {
-    let from = parse_query_date("from_date", &params.from_date)?;
-    let to = parse_query_date("to_date", &params.to_date)?;
+    let from = parse_query_date("from", &params.from)?;
+    let to = parse_query_date("to", &params.to)?;
     let knowledge_as_of = parse_knowledge_as_of(params.knowledge_as_of.as_deref())?;
     let views = read_market_fx(
         state.services.as_ref(),
         MarketFxQuery {
-            from: params.from.to_domain(),
-            to: params.to.to_domain(),
-            from_date: from,
-            to_date: to,
+            base: params.base.to_domain(),
+            quote: params.quote.to_domain(),
+            from,
+            to,
             knowledge_as_of,
         },
     )

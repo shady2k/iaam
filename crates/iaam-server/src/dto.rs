@@ -2595,6 +2595,50 @@ pub struct FxRateDto {
     pub rate: String,
 }
 
+/// A price series: its rows and the boundary the data is complete through.
+///
+/// The boundary is a property of the answer rather than of a row — it is one
+/// value for the whole series — and it is returned even when `rows` is empty.
+/// That is the only way a client can tell "this instance holds nothing for the
+/// series" (`complete_through` is `null`) from "the series is complete and
+/// holds no value in this interval".
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketPriceSeriesDto {
+    pub rows: Vec<MarketPriceDto>,
+    /// The date the series is known to be complete through, or `null` when this
+    /// instance has published nothing for the series at all. Always present:
+    /// an answer that omitted it would say nothing about how far the data goes.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date, required = true)]
+    pub complete_through: Option<Date>,
+}
+
+/// An exchange-rate series: its rows and the boundary the data is complete
+/// through. Same shape and same reading as [`MarketPriceSeriesDto`].
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketFxSeriesDto {
+    pub rows: Vec<MarketFxDto>,
+    /// The date the series is known to be complete through, or `null` when this
+    /// instance has published nothing for the series at all. Always present:
+    /// an answer that omitted it would say nothing about how far the data goes.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date, required = true)]
+    pub complete_through: Option<Date>,
+}
+
+/// A key-rate series: its intervals and the boundary the data is complete
+/// through. Same shape and same reading as [`MarketPriceSeriesDto`].
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MarketKeyRateSeriesDto {
+    pub rows: Vec<MarketKeyRateDto>,
+    /// The date the series is known to be complete through, or `null` when this
+    /// instance has published nothing for the series at all. Always present:
+    /// an answer that omitted it would say nothing about how far the data goes.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date, required = true)]
+    pub complete_through: Option<Date>,
+}
+
 /// Price observation with full provenance.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MarketPriceDto {
@@ -2617,9 +2661,6 @@ pub struct MarketPriceDto {
     pub source: String,
     pub observed_at: String,
     pub quality: String,
-    #[serde(with = "iso_date::option")]
-    #[schema(value_type = Option<String>, format = Date)]
-    pub complete_through: Option<Date>,
 }
 
 /// Exchange-rate observation with full provenance.
@@ -2636,9 +2677,6 @@ pub struct MarketFxDto {
     pub source: String,
     pub observed_at: String,
     pub quality: String,
-    #[serde(with = "iso_date::option")]
-    #[schema(value_type = Option<String>, format = Date)]
-    pub complete_through: Option<Date>,
 }
 
 /// Key rate interval derived from daily observations.
@@ -2655,9 +2693,6 @@ pub struct MarketKeyRateDto {
     pub observed_at: String,
     pub quality: String,
     pub boundary: String,
-    #[serde(with = "iso_date::option")]
-    #[schema(value_type = Option<String>, format = Date)]
-    pub complete_through: Option<Date>,
 }
 
 /// Service status.

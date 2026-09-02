@@ -55,6 +55,18 @@ pub enum QuotationBasisStatus {
     NotProven,
 }
 
+/// A reference series together with the boundary its data is complete through.
+///
+/// The boundary belongs to the answer, not to a row: it is one value for the
+/// whole series, and it must survive an answer that holds no rows at all —
+/// otherwise "this instance holds nothing for that period" and "there is no
+/// value in this interval" look alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketSeries<T> {
+    pub rows: Vec<T>,
+    pub complete_through: Option<Date>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketPriceView {
     pub instrument: InstrumentId,
@@ -71,7 +83,6 @@ pub struct MarketPriceView {
     pub source: String,
     pub observed_at: String,
     pub quality: String,
-    pub complete_through: Option<Date>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +96,6 @@ pub struct MarketFxView {
     pub source: String,
     pub observed_at: String,
     pub quality: String,
-    pub complete_through: Option<Date>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,13 +107,12 @@ pub struct MarketKeyRateView {
     pub observed_at: String,
     pub quality: String,
     pub boundary: String,
-    pub complete_through: Option<Date>,
 }
 
 pub async fn list_market_prices(
     services: &AppServices,
     query: MarketPricesQuery,
-) -> Result<Vec<MarketPriceView>, AppError> {
+) -> Result<MarketSeries<MarketPriceView>, AppError> {
     validate_range(query.from, query.to)?;
     let knowledge_as_of = format_timestamp(query.knowledge_as_of)?;
     let series = SeriesKey {
@@ -137,15 +146,16 @@ pub async fn list_market_prices(
             },
         )
         .map_err(store_error)?;
-    rows.into_iter()
-        .map(|row| price_view(row, complete_through))
-        .collect()
+    Ok(MarketSeries {
+        rows: rows.into_iter().map(price_view).collect::<Result<_, _>>()?,
+        complete_through,
+    })
 }
 
 pub async fn list_market_fx(
     services: &AppServices,
     query: MarketFxQuery,
-) -> Result<Vec<MarketFxView>, AppError> {
+) -> Result<MarketSeries<MarketFxView>, AppError> {
     validate_range(query.from, query.to)?;
     let knowledge_as_of = format_timestamp(query.knowledge_as_of)?;
     let base_code = query.base.code().to_owned();
@@ -173,15 +183,16 @@ pub async fn list_market_fx(
             },
         )
         .map_err(store_error)?;
-    rows.into_iter()
-        .map(|row| fx_view(row, complete_through))
-        .collect()
+    Ok(MarketSeries {
+        rows: rows.into_iter().map(fx_view).collect::<Result<_, _>>()?,
+        complete_through,
+    })
 }
 
 pub async fn list_market_key_rate(
     services: &AppServices,
     query: MarketKeyRateQuery,
-) -> Result<Vec<MarketKeyRateView>, AppError> {
+) -> Result<MarketSeries<MarketKeyRateView>, AppError> {
     validate_range(query.from, query.to)?;
     let knowledge_as_of = format_timestamp(query.knowledge_as_of)?;
     let series = SeriesKey {
@@ -201,16 +212,20 @@ pub async fn list_market_key_rate(
         .iter()
         .map(key_rate_observation)
         .collect::<Result<Vec<_>, _>>()?;
-    derive_intervals(&observations)
+    let rows = derive_intervals(&observations)
         .into_iter()
         .filter(|interval| {
             interval.from <= query.to && interval.until.is_none_or(|until| until > query.from)
         })
-        .map(|interval| key_rate_view(interval, &observations, complete_through))
-        .collect()
+        .map(|interval| key_rate_view(interval, &observations))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MarketSeries {
+        rows,
+        complete_through,
+    })
 }
 
-fn price_view(row: PriceRow, complete_through: Option<Date>) -> Result<MarketPriceView, AppError> {
+fn price_view(row: PriceRow) -> Result<MarketPriceView, AppError> {
     let instrument = row
         .instrument_id
         .parse::<Uuid>()
@@ -243,11 +258,10 @@ fn price_view(row: PriceRow, complete_through: Option<Date>) -> Result<MarketPri
         source: "moex-iss".to_owned(),
         observed_at: canonical_timestamp(&row.observed_at)?,
         quality: row.executability,
-        complete_through,
     })
 }
 
-fn fx_view(row: FxRow, complete_through: Option<Date>) -> Result<MarketFxView, AppError> {
+fn fx_view(row: FxRow) -> Result<MarketFxView, AppError> {
     let from = CurrencyCode::from_code(&row.from_code)
         .ok_or_else(|| invalid_value("from", row.from_code.clone()))?;
     let to = CurrencyCode::from_code(&row.to_code)
@@ -262,7 +276,6 @@ fn fx_view(row: FxRow, complete_through: Option<Date>) -> Result<MarketFxView, A
         source: "cbr".to_owned(),
         observed_at: canonical_timestamp(&row.observed_at)?,
         quality: "official".to_owned(),
-        complete_through,
     })
 }
 
@@ -281,7 +294,6 @@ fn key_rate_observation(row: &KeyRateRow) -> Result<KeyRateObservation, AppError
 fn key_rate_view(
     interval: iaam_market::cbr::key_rate::RateInterval,
     observations: &[KeyRateObservation],
-    complete_through: Option<Date>,
 ) -> Result<MarketKeyRateView, AppError> {
     let observation = observations
         .iter()
@@ -306,7 +318,6 @@ fn key_rate_view(
             "observed"
         }
         .to_owned(),
-        complete_through,
     })
 }
 
@@ -372,7 +383,6 @@ mod tests {
             source: "cbr".into(),
             observed_at: "2026-08-20T00:00:00Z".into(),
             quality: "official".into(),
-            complete_through: None,
         };
         assert_eq!(view.source, "cbr");
         assert_eq!(view.quality, "official");
@@ -381,22 +391,19 @@ mod tests {
 
     #[test]
     fn migrated_row_without_basis_remains_a_view() {
-        let view = price_view(
-            PriceRow {
-                instrument_id: Uuid::nil().to_string(),
-                board: "TQBR".to_owned(),
-                session: 3,
-                trade_date: "2026-08-03".to_owned(),
-                kind: "close".to_owned(),
-                observed_at: "2026-08-26T09:00:00Z".to_owned(),
-                price: "281.39".to_owned(),
-                currency: "RUB".to_owned(),
-                quotation_basis: "unknown".to_owned(),
-                basis_evidence: String::new(),
-                executability: "indicative_previous_close".to_owned(),
-            },
-            None,
-        )
+        let view = price_view(PriceRow {
+            instrument_id: Uuid::nil().to_string(),
+            board: "TQBR".to_owned(),
+            session: 3,
+            trade_date: "2026-08-03".to_owned(),
+            kind: "close".to_owned(),
+            observed_at: "2026-08-26T09:00:00Z".to_owned(),
+            price: "281.39".to_owned(),
+            currency: "RUB".to_owned(),
+            quotation_basis: "unknown".to_owned(),
+            basis_evidence: String::new(),
+            executability: "indicative_previous_close".to_owned(),
+        })
         .expect("migration row is valid for the view");
 
         assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
@@ -406,13 +413,10 @@ mod tests {
     }
     #[test]
     fn matching_basis_has_proven_status() {
-        let view = price_view(
-            price_row(
-                "percent_of_remaining_face",
-                "iss:engines/stock/markets/bonds",
-            ),
-            None,
-        )
+        let view = price_view(price_row(
+            "percent_of_remaining_face",
+            "iss:engines/stock/markets/bonds",
+        ))
         .expect("price row");
 
         assert_eq!(view.quotation_basis, QuotationBasis::PercentOfRemainingFace);
@@ -422,10 +426,10 @@ mod tests {
 
     #[test]
     fn contradictory_basis_has_contradicts_status() {
-        let view = price_view(
-            price_row("money_per_unit", "iss:engines/stock/markets/bonds"),
-            None,
-        )
+        let view = price_view(price_row(
+            "money_per_unit",
+            "iss:engines/stock/markets/bonds",
+        ))
         .expect("price row");
 
         assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
@@ -438,7 +442,7 @@ mod tests {
 
     #[test]
     fn missing_evidence_has_not_proven_status() {
-        let view = price_view(price_row("money_per_unit", "test:market"), None).expect("price row");
+        let view = price_view(price_row("money_per_unit", "test:market")).expect("price row");
 
         assert_eq!(view.quotation_basis, QuotationBasis::Unknown);
         assert_eq!(view.quotation_basis_status, QuotationBasisStatus::NotProven);

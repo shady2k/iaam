@@ -13,8 +13,8 @@ use crate::ports::{
     BrokerChannelFactory, BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert,
     CategoryRuleView, CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView,
     ContourView, ControlAssertionView, CustodyView, InstrumentDirectory, InstrumentUpsert,
-    InstrumentView, IssuedToken, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin,
-    TokenView,
+    InstrumentView, IssuedToken, JournalQuery, Principal, Recorded, Scope, SoleOwner, Store,
+    TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -37,7 +37,10 @@ use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::categories::NewCategoryRule;
 use iaam_store::documents::BrokerCode;
-use iaam_store::events::{AccountActivityRecord, Appended, ControlAssertionRecord};
+use iaam_store::events::{
+    AccountActivityRecord, Appended, ControlAssertionRecord, JournalCursor as StoredJournalCursor,
+    JournalQuery as StoredJournalQuery,
+};
 use iaam_store::reference::{AccountRecord, AliasRecord, ContourRecord, InstrumentRecord};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
@@ -229,6 +232,32 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .load_events_through(owner, through)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_journal_events(
+        &self,
+        owner: OwnerId,
+        query: JournalQuery,
+    ) -> Result<Vec<Event>, AppError> {
+        let query = StoredJournalQuery {
+            event: query.event,
+            idempotency_key: query.idempotency_key,
+            account: query.account,
+            source: query.source,
+            from: query.from,
+            to: query.to,
+            after: query.after.map(|cursor| StoredJournalCursor {
+                effective_date: cursor.effective_date,
+                sequence: cursor.sequence,
+            }),
+            limit: query.limit,
+        };
+        self.blocking(move |store| {
+            store
+                .list_journal_events(owner, &query)
                 .map_err(store_error)
         })
         .await

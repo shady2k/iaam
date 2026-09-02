@@ -7117,3 +7117,340 @@ async fn an_unparsable_path_parameter_is_refused_in_the_documented_shape() {
     assert_eq!(body["code"], "invalid_request", "{body}");
     assert_eq!(body["field"], "id", "{body}");
 }
+
+/// Post one deposit and return the identifier of the event it became.
+///
+/// Amounts and titles here are invented — `Main`, `Savings`, `Shop One` — and
+/// no line of this file is trimmed from a real export (CLAUDE.md).
+async fn ingest_deposit(
+    harness: &Harness,
+    account: AccountId,
+    amount: &str,
+    posted: &str,
+    idempotency_key: &str,
+    declared_channel: Option<&str>,
+) -> Uuid {
+    let mut body = json!({
+        "source_label": "contract test",
+        "operations": [{
+            "account": account.inner(),
+            "type": "deposit",
+            "amount": amount,
+            "currency": "RUB",
+            "dates": { "cash_posted": posted },
+            "idempotency_key": idempotency_key,
+            "description": "Shop One"
+        }]
+    });
+    if let Some(channel) = declared_channel {
+        body["source"] = json!({ "account": account.inner(), "channel": channel });
+    }
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    verdicts[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("the ingest verdict names the event it recorded")
+}
+
+async fn create_account(harness: &Harness, title: &str) -> AccountId {
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": title }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    AccountId(
+        body["id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .expect("the created account names itself"),
+    )
+}
+
+#[tokio::test]
+async fn an_ingested_operation_can_be_read_back_by_its_idempotency_key() {
+    // The defect this route exists for: 177 rows went in with verdict
+    // `provisional` and then could not be looked at. An agent forbidden its own
+    // arithmetic has nothing to quote about a single row unless it can read it.
+    let harness = harness();
+    let event = ingest_deposit(
+        &harness,
+        harness.account,
+        "1000.00",
+        "2026-03-01",
+        "key-one",
+        None,
+    )
+    .await;
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=key-one",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("journal rows");
+    assert_eq!(rows.len(), 1, "an idempotency key addresses one event");
+    let row = &rows[0];
+    assert_eq!(row["event"], event.to_string());
+    assert_eq!(row["account"], harness.account.inner().to_string());
+    assert_eq!(row["idempotency_key"], "key-one");
+    assert_eq!(row["kind"], "cash_in");
+    assert_eq!(row["effective_date"], "2026-03-01");
+    assert_eq!(row["dates"]["cash_posted"], "2026-03-01");
+    assert_eq!(row["description"], "Shop One");
+    assert_eq!(row["relation"]["kind"], "none");
+    assert!(row["source"].is_string(), "the row names its source: {row}");
+    // The amount is returned leg by leg, exactly as recorded: the route sums
+    // nothing, so there is a number the agent may quote verbatim (§13).
+    let legs = row["legs"].as_array().expect("legs");
+    assert_eq!(legs.len(), 1);
+    assert_eq!(legs[0]["kind"], "cash");
+    assert_eq!(legs[0]["amount"], "1000.00");
+    assert_eq!(legs[0]["currency"], "RUB");
+}
+
+#[tokio::test]
+async fn an_idempotency_key_that_addresses_nothing_is_a_clean_not_found() {
+    // An empty page would say "the journal holds no such row" in the same
+    // breath as "you narrowed to nothing", and the caller cannot tell which.
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=never-submitted",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_found");
+}
+
+#[tokio::test]
+async fn the_journal_narrows_by_account_and_by_date_range() {
+    let harness = harness();
+    let savings = create_account(&harness, "Savings").await;
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "1000.00",
+        "2026-03-01",
+        "main-march",
+        None,
+    )
+    .await;
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "2000.00",
+        "2026-04-01",
+        "main-april",
+        None,
+    )
+    .await;
+    ingest_deposit(
+        &harness,
+        savings,
+        "3000.00",
+        "2026-03-01",
+        "savings-march",
+        None,
+    )
+    .await;
+
+    let account_only = format!("/v1/journal/events?account={}", harness.account.inner());
+    let (status, page) = call(
+        &harness.router,
+        get(&account_only, Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["rows"].as_array().expect("rows").len(), 2);
+
+    let with_range = format!(
+        "/v1/journal/events?account={}&from=2026-03-01&to=2026-03-31",
+        harness.account.inner()
+    );
+    let (status, page) = call(
+        &harness.router,
+        get(&with_range, Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "the range excludes April: {page}");
+    assert_eq!(rows[0]["idempotency_key"], "main-march");
+}
+
+#[tokio::test]
+async fn the_journal_narrows_by_the_source_the_caller_declared() {
+    // The identity of a declared source is derived, never handed out, so the
+    // only way to ask "what did that import put in" is to name the account and
+    // channel again. If this read derived it differently from ingest, the
+    // answer would be empty and look like an import that never landed.
+    let harness = harness();
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "1000.00",
+        "2026-03-01",
+        "from-file",
+        Some("file"),
+    )
+    .await;
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "2000.00",
+        "2026-03-02",
+        "from-paste",
+        Some("paste"),
+    )
+    .await;
+
+    let path = format!(
+        "/v1/journal/events?source_account={}&source_channel=file",
+        harness.account.inner()
+    );
+    let (status, page) = call(&harness.router, get(&path, Some(&harness.agent_token))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "a channel is part of the source: {page}");
+    assert_eq!(rows[0]["idempotency_key"], "from-file");
+
+    // Half a declared source is a different question, not a wider one.
+    let half = format!(
+        "/v1/journal/events?source_account={}",
+        harness.account.inner()
+    );
+    let (status, body) = call(&harness.router, get(&half, Some(&harness.agent_token))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["field"], "source_channel");
+}
+
+#[tokio::test]
+async fn the_journal_lists_without_any_narrowing() {
+    // Reading the list is not a privilege beyond reading the aggregates: every
+    // balance, flow and return this API serves is computed from these very rows.
+    let harness = harness();
+    let savings = create_account(&harness, "Savings").await;
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "1000.00",
+        "2026-03-01",
+        "one",
+        None,
+    )
+    .await;
+    ingest_deposit(&harness, savings, "2000.00", "2026-03-02", "two", None).await;
+
+    for token in [
+        &harness.owner_token,
+        &harness.agent_token,
+        &harness.readonly_token,
+    ] {
+        let (status, page) = call(&harness.router, get("/v1/journal/events", Some(token))).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let rows = page["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2, "an unfiltered listing returns both: {page}");
+        assert!(
+            page.get("next").is_none(),
+            "a last page names no position to resume from: {page}"
+        );
+    }
+
+    let (status, _) = call(&harness.router, get("/v1/journal/events", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the journal read is open");
+}
+
+#[tokio::test]
+async fn paging_the_journal_neither_skips_nor_repeats_a_row() {
+    // Two events on one day is the case an offset gets wrong and a date-only
+    // cursor gets wrong in the other direction: the second row of the day would
+    // either be served twice or never.
+    let harness = harness();
+    for (index, key) in ["one", "two", "three", "four"].iter().enumerate() {
+        let day = format!("2026-03-{:02}", index / 2 + 1);
+        ingest_deposit(&harness, harness.account, "1000.00", &day, key, None).await;
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut path = "/v1/journal/events?limit=1".to_owned();
+    for _ in 0..10 {
+        let (status, page) = call(&harness.router, get(&path, Some(&harness.agent_token))).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let rows = page["rows"].as_array().expect("rows");
+        assert!(rows.len() <= 1, "a page of one returned more: {page}");
+        for row in rows {
+            seen.push(
+                row["idempotency_key"]
+                    .as_str()
+                    .expect("each row names its key")
+                    .to_owned(),
+            );
+        }
+        let Some(next) = page["next"].as_str() else {
+            break;
+        };
+        path = format!("/v1/journal/events?limit=1&after={next}");
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            "one".to_owned(),
+            "two".to_owned(),
+            "three".to_owned(),
+            "four".to_owned()
+        ],
+        "paging must walk the journal once, in order, with nothing dropped"
+    );
+}
+
+#[tokio::test]
+async fn a_page_size_outside_the_permitted_range_is_refused_by_name() {
+    let harness = harness();
+    for limit in ["0", "201"] {
+        let path = format!("/v1/journal/events?limit={limit}");
+        let (status, body) = call(&harness.router, get(&path, Some(&harness.agent_token))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["field"], "limit");
+    }
+}
+
+#[tokio::test]
+async fn one_owners_journal_is_invisible_to_another() {
+    // A read scoped by a filter and not by the owner would let anyone holding a
+    // token read every journal on the instance (§14).
+    let mine = harness();
+    let theirs = harness();
+    ingest_deposit(&mine, mine.account, "1000.00", "2026-03-01", "mine", None).await;
+
+    let (status, page) = call(
+        &theirs.router,
+        get("/v1/journal/events", Some(&theirs.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(
+        page["rows"].as_array().expect("rows").is_empty(),
+        "another owner's journal reached this token: {page}"
+    );
+}

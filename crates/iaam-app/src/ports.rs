@@ -205,6 +205,42 @@ pub trait InstrumentDirectory: Send + Sync {
     async fn list_custody_places(&self, owner: OwnerId) -> Result<Vec<CustodyView>, AppError>;
 }
 
+/// Position in the journal's total order.
+///
+/// `(effective_date, sequence)` is unique per owner by database index, so a
+/// page resumes from the last row it returned instead of counting rows it has
+/// already seen. An offset would shift under a concurrent append and silently
+/// skip or repeat a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalCursor {
+    pub effective_date: Date,
+    pub sequence: u32,
+}
+
+/// What narrows one read of the journal.
+///
+/// Every handle is optional and they combine: a caller that holds an
+/// idempotency key uses it, one that remembers only which account it imported
+/// into narrows by that and a date range, and one that holds neither reads the
+/// journal from the start a page at a time. The port carries the query as a
+/// struct rather than as eight arguments so that adding a handle does not
+/// silently reorder the ones already there (§15.1).
+#[derive(Debug, Clone, Default)]
+pub struct JournalQuery {
+    pub event: Option<iaam_core::ids::EventId>,
+    pub idempotency_key: Option<String>,
+    pub account: Option<AccountId>,
+    pub source: Option<iaam_core::ids::SourceId>,
+    /// Inclusive lower bound on the effective date.
+    pub from: Option<Date>,
+    /// Inclusive upper bound on the effective date.
+    pub to: Option<Date>,
+    /// Resume strictly after this position.
+    pub after: Option<JournalCursor>,
+    /// Maximum rows the store may return.
+    pub limit: u32,
+}
+
 /// Store for facts and reference data.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -221,6 +257,18 @@ pub trait Store: Send + Sync {
         &self,
         owner: OwnerId,
         through: Date,
+    ) -> Result<Vec<Event>, AppError>;
+
+    /// One page of the owner's journal, narrowed by whatever handles the caller
+    /// holds and bounded by `limit`.
+    ///
+    /// Separate from [`Store::load_events_through`], which loads the whole slice
+    /// a projection replays: that one exists to compute a report and would hand
+    /// a transport the entire journal at once.
+    async fn list_journal_events(
+        &self,
+        owner: OwnerId,
+        query: JournalQuery,
     ) -> Result<Vec<Event>, AppError>;
 
     /// The owner is included in every reference-data and scope query.

@@ -3,7 +3,7 @@
 use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::kind::{CONTROL_ASSERTION_KIND, EventKind, IMPORT_COVERAGE_GAP_KIND};
 use iaam_core::event::{Event, Relation};
-use iaam_core::ids::{AccountId, EventId, OwnerId};
+use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::IdentityScope;
@@ -379,4 +379,136 @@ fn lookup(
     Ok(found
         .and_then(|id| uuid::Uuid::parse_str(&id).ok())
         .map(EventId))
+}
+
+/// Position in the journal's total order.
+///
+/// `(owner, effective_date, sequence)` is unique by index, so this pair names
+/// exactly one row and paging can resume from it without an offset. An offset
+/// would shift under a concurrent write and silently skip or repeat a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalCursor {
+    pub effective_date: Date,
+    pub sequence: u32,
+}
+
+/// One narrowed page of the owner's journal.
+///
+/// Every handle is optional here, and the rule that a read must narrow by
+/// *something* deliberately is not. That rule is a policy about what an API
+/// caller may ask for, it lives in the application where the refusal is
+/// written, and a second copy of it in the store would drift from the first.
+#[derive(Debug, Clone, Default)]
+pub struct JournalQuery {
+    pub event: Option<EventId>,
+    pub idempotency_key: Option<String>,
+    pub account: Option<AccountId>,
+    pub source: Option<SourceId>,
+    /// Inclusive lower bound on the effective date.
+    pub from: Option<Date>,
+    /// Inclusive upper bound on the effective date.
+    pub to: Option<Date>,
+    /// Resume after this position, exclusive.
+    pub after: Option<JournalCursor>,
+    /// Maximum rows to return.
+    pub limit: u32,
+}
+
+impl SqliteStore {
+    /// Read a narrowed page of the owner's journal in `(date, sequence)` order.
+    ///
+    /// The owner is part of every clause, not merely of the identifier the
+    /// caller supplied: an event identifier is a UUID, and a UUID confers no
+    /// right to read someone else's journal (§14).
+    pub fn list_journal_events(
+        &self,
+        owner: OwnerId,
+        query: &JournalQuery,
+    ) -> Result<Vec<Event>, StoreError> {
+        let (sql, parameters) = journal_sql(owner, query);
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            let event: Event = serde_json::from_str(&payload)
+                .map_err(|source| StoreError::EventDecode { id, source })?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+}
+
+/// Assemble the narrowed query and its bound parameters.
+///
+/// The SQL is built rather than written out because the handles are
+/// independent: spelling every combination would be sixteen statements that
+/// must agree on the ordering, and one of them would eventually not.
+/// Nothing from the caller is interpolated — only placeholder numbers are —
+/// so a value can never become SQL.
+fn journal_sql(owner: OwnerId, query: &JournalQuery) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = String::from("SELECT id, payload FROM events WHERE owner = ?1");
+    let mut parameters: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(owner.inner().to_string())];
+
+    let mut bind = |sql: &mut String, clause: &str, value: Box<dyn rusqlite::ToSql>| {
+        parameters.push(value);
+        sql.push_str(&clause.replace('?', &format!("?{}", parameters.len())));
+    };
+
+    if let Some(event) = query.event {
+        bind(&mut sql, " AND id = ?", Box::new(event.inner().to_string()));
+    }
+    if let Some(key) = query.idempotency_key.as_ref() {
+        bind(&mut sql, " AND idempotency_key = ?", Box::new(key.clone()));
+    }
+    if let Some(account) = query.account {
+        bind(
+            &mut sql,
+            " AND account = ?",
+            Box::new(account.inner().to_string()),
+        );
+    }
+    if let Some(source) = query.source {
+        bind(
+            &mut sql,
+            " AND source = ?",
+            Box::new(source.inner().to_string()),
+        );
+    }
+    if let Some(from) = query.from {
+        bind(
+            &mut sql,
+            " AND effective_date >= ?",
+            Box::new(from.to_string()),
+        );
+    }
+    if let Some(to) = query.to {
+        bind(
+            &mut sql,
+            " AND effective_date <= ?",
+            Box::new(to.to_string()),
+        );
+    }
+    if let Some(after) = query.after {
+        // Strictly after the cursor in the same order the rows come back in.
+        // Comparing the pair, rather than the date alone, is what stops the
+        // last row of a page from opening the next one.
+        bind(
+            &mut sql,
+            " AND (effective_date > ?",
+            Box::new(after.effective_date.to_string()),
+        );
+        bind(
+            &mut sql,
+            " OR (effective_date = ?",
+            Box::new(after.effective_date.to_string()),
+        );
+        bind(&mut sql, " AND sequence > ?))", Box::new(after.sequence));
+    }
+
+    sql.push_str(" ORDER BY effective_date, sequence");
+    bind(&mut sql, " LIMIT ?", Box::new(i64::from(query.limit)));
+    (sql, parameters)
 }

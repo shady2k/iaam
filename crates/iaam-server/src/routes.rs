@@ -24,6 +24,7 @@ use iaam_app::scenarios::categories::{
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
+use iaam_app::scenarios::journal::{DeclaredSource, JournalReadQuery, read_journal};
 use iaam_app::scenarios::market_reference::{
     MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
     list_market_key_rate as read_market_key_rate, list_market_prices as read_market_prices,
@@ -62,13 +63,13 @@ use crate::dto::{
     CategoryRuleRequest, ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
     CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
     CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DocumentDto, DocumentParams,
-    FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, MarketFxDto, MarketFxSeriesDto,
-    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
-    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
-    QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams, ReconciliationResponseDto,
-    ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
-    TokenDto, TokenScopeDto, VerdictDto,
+    FxRateDto, HealthDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto, JournalPageDto,
+    MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
+    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
+    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
+    ReconciliationResponseDto, ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest,
+    ResolvedInstrumentDto, ReturnsReportDto, SubmitJournalEventsRequest, SubmitOperationsRequest,
+    SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
@@ -2068,6 +2069,153 @@ fn matcher_text(value: &serde_json::Value, field: &str) -> Result<String, ApiFai
             )
         })
 }
+/// Journal read parameters. Every filter is optional and they combine.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct JournalParams {
+    /// The client key supplied at ingest. It addresses at most one event, so a
+    /// key that matches nothing is reported as a missing resource rather than
+    /// as an empty page.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Only events recorded against this account.
+    #[serde(default)]
+    pub account: Option<Uuid>,
+    /// Account of the source the caller declared when it submitted. Supplied
+    /// together with `source_channel`; the pair is how a caller asks what one
+    /// import put in.
+    #[serde(default)]
+    pub source_account: Option<Uuid>,
+    /// Channel of the declared source: `file`, `paste`, `manual`.
+    #[serde(default)]
+    pub source_channel: Option<String>,
+    /// Inclusive start of the effective-date interval, YYYY-MM-DD.
+    #[serde(default)]
+    #[param(value_type = Option<String>, format = Date)]
+    pub from: Option<String>,
+    /// Inclusive end of the effective-date interval, YYYY-MM-DD.
+    #[serde(default)]
+    #[param(value_type = Option<String>, format = Date)]
+    pub to: Option<String>,
+    /// Position returned as `next` by an earlier page. Absent reads from the
+    /// start of the journal.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Rows per page, 1 to 200. Absent means 50.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// The owner's journal events, a page at a time.
+///
+/// **These are journal events, not the operations that were submitted.** Ingest
+/// normalises an operation into an event and keeps the event; the operation as
+/// posted is not stored and cannot be handed back. A deposit submitted as an
+/// operation comes back here as a `cash_in` event carrying one cash leg, and an
+/// agent that reports it as "the operation" will misdescribe what the system
+/// holds.
+///
+/// Every filter is optional. Without any, the whole journal is readable a page
+/// at a time, oldest first, ordered by effective date and then by the order
+/// within that date — the pair the journal's own uniqueness is built on, so a
+/// page can neither skip nor repeat a row.
+///
+/// No number here is computed: legs are returned exactly as recorded and
+/// nothing is summed.
+#[utoipa::path(
+    get,
+    path = "/v1/journal/events",
+    params(JournalParams),
+    responses(
+        (status = 200, description = "One page of journal events", body = JournalPageDto),
+        (status = 404, description = "An idempotency key that addresses no event", body = ApiError),
+        (status = 422, description = "A parameter could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_journal_events(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<JournalParams>,
+) -> Result<Json<JournalPageDto>, ApiFailure> {
+    let from = params
+        .from
+        .as_deref()
+        .map(|value| parse_query_date("from", value))
+        .transpose()?;
+    let to = params
+        .to
+        .as_deref()
+        .map(|value| parse_query_date("to", value))
+        .transpose()?;
+    let source = declared_source_filter(params.source_account, params.source_channel)?;
+    let page = read_journal(
+        state.services.store.as_ref(),
+        principal.owner,
+        JournalReadQuery {
+            idempotency_key: params.idempotency_key,
+            account: params.account.map(AccountId),
+            source,
+            from,
+            to,
+            after: params.after,
+            limit: params.limit,
+        },
+    )
+    .await?;
+    Ok(Json(JournalPageDto {
+        rows: page
+            .rows
+            .iter()
+            .map(JournalEventReadDto::from_domain)
+            .collect(),
+        next: page.next,
+    }))
+}
+
+/// The two halves of a declared source travel together.
+///
+/// Half a source is not a narrower filter, it is a different question the
+/// caller did not mean to ask: an account alone would silently widen the answer
+/// to every channel, and a channel alone to every account.
+fn declared_source_filter(
+    account: Option<Uuid>,
+    channel: Option<String>,
+) -> Result<Option<DeclaredSource>, ApiFailure> {
+    match (account, channel) {
+        (None, None) => Ok(None),
+        (Some(account), Some(channel)) => Ok(Some(DeclaredSource {
+            account: AccountId(account),
+            channel,
+        })),
+        (Some(_), None) => Err(missing_companion(
+            "source_channel",
+            "a channel, supplied together with source_account",
+        )),
+        (None, Some(_)) => Err(missing_companion(
+            "source_account",
+            "an account, supplied together with source_channel",
+        )),
+    }
+}
+
+/// A parameter that is required because another one was supplied.
+///
+/// There is no `actual` to report — the field is absent, and echoing the
+/// companion's value instead would name one field and quote another.
+fn missing_companion(field: &'static str, expected: &'static str) -> ApiFailure {
+    ApiFailure::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ApiError {
+            code: "invalid_request".into(),
+            message: format!("required query parameter {field} is missing"),
+            field: Some(field.to_owned()),
+            expected: Some(expected.to_owned()),
+            actual: None,
+            correlation_id: None,
+        },
+    )
+}
+
 fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure> {
     Date::parse(
         value,

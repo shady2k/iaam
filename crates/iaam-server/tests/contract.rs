@@ -2781,15 +2781,21 @@ async fn reconciliation_returns_nonempty_status_content() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    let statuses = response.as_array().expect("reconciliation statuses");
+    let statuses = response["statuses"]
+        .as_array()
+        .expect("reconciliation statuses");
     assert_eq!(statuses.len(), 1);
+    assert!(response["gaps"].is_array());
     assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
     assert_eq!(statuses[0]["from"], "2025-01-01");
     assert_eq!(statuses[0]["to"], "2025-01-31");
     assert_eq!(statuses[0]["dimensions"][0]["dimension"], "cash");
     assert_eq!(statuses[0]["dimensions"][0]["status"], "provisional");
-    assert_eq!(statuses[0]["outcomes"][0]["claim"], "cash_balance");
-    assert_eq!(statuses[0]["outcomes"][0]["outcome"], "not_comparable");
+    assert_eq!(statuses[0]["outcomes"][0]["claim"]["kind"], "cash_balance");
+    assert_eq!(
+        statuses[0]["outcomes"][0]["outcome"]["code"],
+        "not_comparable"
+    );
     drop(harness);
     let _ = std::fs::remove_file(&path);
 }
@@ -2816,8 +2822,176 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
     assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
     assert_eq!(statuses[0]["dimensions"][0]["dimension"], "cash");
     assert_eq!(statuses[0]["dimensions"][0]["status"], "provisional");
-    assert_eq!(statuses[0]["outcomes"][0]["claim"], "cash_balance");
-    assert_eq!(statuses[0]["outcomes"][0]["outcome"], "not_comparable");
+    assert_eq!(statuses[0]["outcomes"][0]["claim"]["kind"], "cash_balance");
+    assert_eq!(
+        statuses[0]["outcomes"][0]["outcome"]["code"],
+        "not_comparable"
+    );
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A coverage gap is written by the broker sync path before any assertion is
+/// recorded, so it can exist with no reconciliation status to hang it on. Written
+/// straight into the journal here for the same reason
+/// `add_reconciliation_assertion_for_period` is: no route records a gap.
+fn add_coverage_gap(
+    path: &std::path::Path,
+    owner: OwnerId,
+    account: AccountId,
+    from: Date,
+    to: Date,
+) {
+    let period =
+        iaam_core::reconciliation::claim::AssertionPeriod::between(from, to).expect("period");
+    let source = SourceId::new_random();
+    let event = iaam_core::event::Event {
+        id: iaam_core::ids::EventId::new_random(),
+        schema_version: iaam_core::event::SCHEMA_VERSION,
+        owner,
+        account,
+        kind: EventKind::ImportCoverageGap {
+            period,
+            dimensions: std::collections::BTreeSet::from([Dimension::Cash]),
+            refused: 1,
+            rows: vec![iaam_core::event::source_row::RefusedRow {
+                key: iaam_core::event::source_row::SourceRowKey {
+                    source,
+                    row: iaam_core::event::source_row::RowName::Given("row-17".to_owned()),
+                },
+                dimensions: std::collections::BTreeSet::from([Dimension::Cash]),
+            }],
+        },
+        dates: EventDates::for_cash(CashPostedDate(period.to)),
+        order: EffectiveOrder::new(period.to, 1),
+        legs: Vec::new(),
+        provenance: iaam_core::event::provenance::Provenance::new(
+            source,
+            iaam_core::event::provenance::RawHash::parse(&"c".repeat(64)).expect("hash"),
+            ParserVersion("contract-test".to_owned()),
+        ),
+        relation: iaam_core::event::Relation::None,
+        confidence: iaam_core::event::Confidence::Known,
+        idempotency_key: None,
+    };
+    SqliteStore::open(path)
+        .expect("second connection")
+        .append_event(&event, IdentityScope::Source)
+        .expect("coverage gap");
+}
+
+/// The gap correlates with no assertion group, so nothing in `statuses` mentions
+/// it. A response that reported only statuses would answer "nothing to report"
+/// about an account whose import demonstrably refused a row.
+#[tokio::test]
+async fn the_reconciliation_response_carries_a_gap_that_matched_no_status() {
+    let (harness, path) = harness_on_disk();
+    add_coverage_gap(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2025 - 01 - 01),
+        date!(2025 - 01 - 31),
+    );
+
+    let (status, response) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2025-01-01&to=2025-01-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["statuses"].as_array().expect("statuses").len(),
+        0,
+        "a gap forms no assertion group: {response}"
+    );
+    let gaps = response["gaps"].as_array().expect("gaps");
+    assert_eq!(gaps.len(), 1, "{response}");
+    assert_eq!(gaps[0]["account"], json!(harness.account.inner()));
+    assert_eq!(gaps[0]["from"], "2025-01-01");
+    assert_eq!(gaps[0]["to"], "2025-01-31");
+    assert_eq!(gaps[0]["parser_version"], "contract-test");
+    assert_eq!(gaps[0]["dimensions"], json!(["cash"]));
+    assert_eq!(gaps[0]["refused"], 1);
+    assert_eq!(gaps[0]["rows"][0]["row"], json!({ "given": "row-17" }));
+    assert_eq!(gaps[0]["rows"][0]["dimensions"], json!(["cash"]));
+
+    drop(harness);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `dto.rs` and `routes.rs` held independent copies of this conversion, which is
+/// how a change to it ships half done and looks finished. The two are now one
+/// function, and this pins that: the balances report and `/v1/reconciliation`
+/// must render the same status, so a re-divergence fails here and not at a reader.
+#[tokio::test]
+async fn the_balances_report_and_the_reconciliation_route_render_one_status() {
+    let (harness, path) = harness_on_disk();
+    add_reconciliation_assertion_for_period(
+        &path,
+        harness.owner,
+        harness.account,
+        date!(2026 - 08 - 01),
+        date!(2026 - 08 - 31),
+    );
+
+    let contour = json!({
+        "title": "August reconciliation",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let (status, balances) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{balances}");
+
+    let (status, reconciliation) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reconciliation?account={}&from=2026-08-01&to=2026-08-31",
+                harness.account.inner()
+            ),
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reconciliation}");
+
+    let from_report = &balances[0]["reconciliation"][0];
+    let from_route = &reconciliation["statuses"][0];
+    // Assert the shared shape is the rich one before asserting equality: two
+    // renderers that both dropped the claim would agree just as well.
+    assert_eq!(
+        from_route["outcomes"][0]["claim"]["claimed"],
+        json!({ "money": { "amount": "100.00", "currency": "RUB" } }),
+        "{from_route}"
+    );
+    assert_eq!(
+        from_route["outcomes"][0]["outcome"]["reason"], "no_journal_coverage",
+        "{from_route}"
+    );
+    assert_eq!(from_report, from_route);
+
     drop(harness);
     let _ = std::fs::remove_file(&path);
 }
@@ -4541,7 +4715,19 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
                 { "dimension": "income", "status": "provisional" },
             ],
             "evidence": [],
-            "outcomes": [{ "claim": "cash_balance", "outcome": "not_comparable" }],
+            "outcomes": [{
+                "claim": {
+                    "kind": "cash_balance",
+                    "at": "closing",
+                    "currency": "RUB",
+                    "claimed": { "money": { "amount": "100.00", "currency": "RUB" } },
+                },
+                "outcome": {
+                    "code": "not_comparable",
+                    "reason": "no_journal_coverage",
+                },
+            }],
+            "taints": [],
         }])
     );
     assert_eq!(unstated["reconciliation"], json!([]));

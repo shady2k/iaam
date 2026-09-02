@@ -946,3 +946,89 @@ fn a_reversed_coverage_gap_stops_withholding_confirmation() {
         "a retracted gap withholds nothing: it is not part of the journal that counts"
     );
 }
+
+/// A gap that correlated with a group must reach the status it tainted, and carry
+/// the rows it refused: a reader holding one status must not have to re-correlate
+/// the journal to say what was missed. The same fixture is asserted clean first,
+/// or "no taints" would prove only that the fixture built nothing.
+#[test]
+fn a_tainted_status_carries_the_gaps_rows_and_an_untainted_status_carries_none() {
+    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+
+    for status in ReconciliationLedger::build(&events).unwrap().statuses() {
+        assert!(
+            status.taints().is_empty(),
+            "no gap in the journal, so no status is tainted"
+        );
+    }
+
+    events.push(coverage_gap(
+        &channel_with_document(&first_channel, "gap"),
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        2,
+        vec![],
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    let status = ledger
+        .statuses()
+        .find(|status| status.account() == account && status.period() == march())
+        .expect("status for the asserted interval");
+    assert_eq!(status.taints().len(), 1, "{:?}", status.taints());
+    let taint = &status.taints()[0];
+    assert_eq!(taint.dimensions, BTreeSet::from([Dimension::Cash]));
+    assert_eq!(taint.refused, 2);
+    assert_eq!(
+        taint
+            .rows
+            .iter()
+            .map(|row| row.key.row.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            RowName::Given("row-0".to_owned()),
+            RowName::Given("row-1".to_owned()),
+        ]
+    );
+}
+
+/// The sync path writes the gap and can then return before recording any
+/// assertion, so a gap exists that no group correlates with and no status
+/// mentions. The ledger's own list is the only place it can be seen.
+#[test]
+fn ledger_gaps_hold_a_gap_that_correlated_with_no_group() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let channel = TestChannel::new("tinkoff-api/1", "gap-only");
+
+    let ledger = ReconciliationLedger::build(&[coverage_gap(
+        &channel,
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    )])
+    .unwrap();
+
+    assert_eq!(
+        ledger.statuses().count(),
+        0,
+        "a coverage gap forms no assertion group"
+    );
+    assert_eq!(ledger.gaps().len(), 1);
+    assert_eq!(ledger.gaps()[0].account, account);
+    assert_eq!(
+        ledger.gaps()[0].dimensions,
+        BTreeSet::from([Dimension::Cash])
+    );
+    assert_eq!(ledger.gaps()[0].refused, 1);
+    assert_eq!(ledger.gaps()[0].rows.len(), 1);
+}

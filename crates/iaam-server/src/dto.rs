@@ -21,11 +21,14 @@ use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
+use iaam_core::event::source_row::{RefusedRow, RowName};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::money_flow::MoneyFlowError;
-use iaam_core::reconciliation::{Dimension, ReconciliationStatus};
+use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
+use iaam_core::reconciliation::claim::ControlClaim;
+use iaam_core::reconciliation::{ClaimCheck, Dimension, ReconciliationStatus, Taint};
 use iaam_core::returns::zero_reinvestment::{
     BondScenarioResult, IrrLabel, LifetimeCohortMetric, ProspectiveMetric, ZeroReinvestmentMetrics,
 };
@@ -1981,6 +1984,14 @@ pub struct CategoryAmountDto {
 pub struct NotDecomposedDto {
     pub count: u64,
     pub amount: String,
+    pub by_account: Vec<NotDecomposedAccountDto>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NotDecomposedAccountDto {
+    pub account: Uuid,
+    pub count: u64,
+    pub amount: String,
 }
 
 impl MoneyFlowReportDto {
@@ -2010,6 +2021,16 @@ impl MoneyFlowReportDto {
                     })
                     .collect();
                 let (count, amount) = report.flow.not_decomposed(currency)?;
+                let by_account = report
+                    .flow
+                    .not_decomposed_by_account(currency)?
+                    .into_iter()
+                    .map(|(account, count, amount)| NotDecomposedAccountDto {
+                        account: account.inner(),
+                        count,
+                        amount: amount.to_calc_dec().inner().to_string(),
+                    })
+                    .collect();
                 Ok(MoneyFlowCurrencyDto {
                     currency: CurrencyDto::from_domain(currency),
                     came_in: report
@@ -2071,6 +2092,7 @@ impl MoneyFlowReportDto {
                     not_decomposed: NotDecomposedDto {
                         count,
                         amount: amount.to_calc_dec().inner().to_string(),
+                        by_account,
                     },
                 })
             })
@@ -2165,26 +2187,14 @@ impl ReconciliationStatusDto {
             evidence: status
                 .evidence()
                 .iter()
-                .map(|evidence| EvidenceDto {
-                    ground: evidence.ground().code().to_owned(),
-                    level: evidence.level().code().to_owned(),
-                    dimensions: evidence
-                        .dimensions()
-                        .into_iter()
-                        .map(|dimension| dimension.code().to_owned())
-                        .collect(),
-                    confirming_parser: evidence.confirming().parser_version.0.clone(),
-                    confirmed_parser: evidence.confirmed().parser_version.0.clone(),
-                })
+                .map(EvidenceDto::from_domain)
                 .collect(),
             outcomes: status
                 .outcomes()
                 .iter()
-                .map(|outcome| ClaimOutcomeDto {
-                    claim: outcome.claim.discriminant().to_owned(),
-                    outcome: outcome.outcome.code().to_owned(),
-                })
+                .map(ClaimOutcomeDto::from_domain)
                 .collect(),
+            taints: status.taints().iter().map(TaintDto::from_domain).collect(),
         }
     }
 }
@@ -2331,7 +2341,8 @@ pub struct ActionDto {
     pub category: String,
     pub state: String,
     pub reason: String,
-    pub required_scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_scope: Option<String>,
     pub target: ActionTargetDto,
 }
 
@@ -2646,8 +2657,10 @@ pub struct HealthDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iaam_core::event::provenance::{ParserVersion, RawHash};
     use iaam_core::ids::{EventId, InstrumentId};
     use iaam_core::numeric::xirr::SolverRefusal;
+    use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
 
     fn amount(value: &str) -> AmountDto {
         AmountDto {
@@ -3372,6 +3385,203 @@ mod tests {
             duplicate.map(|code| code.as_str()).unwrap_or("<unknown>")
         );
     }
+
+    fn claim_check(claim: ControlClaim, outcome: ClaimOutcome) -> ClaimCheck {
+        ClaimCheck { claim, outcome }
+    }
+
+    fn rendered(check: &ClaimCheck) -> serde_json::Value {
+        serde_json::to_value(ClaimOutcomeDto::from_domain(check)).expect("claim outcome renders")
+    }
+
+    fn cash_balance(minor: i64) -> ControlClaim {
+        ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(minor),
+            at: iaam_core::reconciliation::claim::BalancePoint::Closing,
+        }
+    }
+
+    /// The outcome object carries `code` plus **exactly one** of the three details,
+    /// and `matched` carries none. A renderer that filled a second key would let an
+    /// agent read a stale discrepancy off an excepted outcome.
+    #[test]
+    fn each_claim_outcome_renders_only_its_own_detail() {
+        let discrepancy = iaam_core::reconciliation::check::Discrepancy {
+            field: "amount",
+            claimed: ClaimValue::Money {
+                amount: PostedMinor::new(1_000),
+                currency: CurrencyCode::Rub,
+            },
+            observed: ClaimValue::Money {
+                amount: PostedMinor::new(400),
+                currency: CurrencyCode::Rub,
+            },
+            delta: ClaimValue::Money {
+                amount: PostedMinor::new(600),
+                currency: CurrencyCode::Rub,
+            },
+        };
+        let cases = [
+            (ClaimOutcome::Matched, "matched", Vec::<&str>::new()),
+            (
+                ClaimOutcome::Discrepant(discrepancy),
+                "discrepant",
+                vec!["discrepancy"],
+            ),
+            (
+                ClaimOutcome::NotComparable {
+                    reason: iaam_core::reconciliation::check::NotComparable::NoJournalCoverage,
+                },
+                "not_comparable",
+                vec!["reason"],
+            ),
+            (
+                ClaimOutcome::Excepted {
+                    exception:
+                        iaam_core::reconciliation::check::ReconciliationException::UnsupportedRepoEncumbrance,
+                },
+                "excepted",
+                vec!["exception"],
+            ),
+        ];
+
+        for (outcome, code, present) in cases {
+            let value = rendered(&claim_check(cash_balance(1_000), outcome));
+            let outcome = &value["outcome"];
+            assert_eq!(outcome["code"], code);
+            for key in ["discrepancy", "reason", "exception"] {
+                assert_eq!(
+                    outcome.get(key).is_some(),
+                    present.contains(&key),
+                    "{code} rendered {key} as {outcome}"
+                );
+            }
+        }
+
+        let discrepant = rendered(&claim_check(
+            cash_balance(1_000),
+            ClaimOutcome::Discrepant(discrepancy),
+        ));
+        assert_eq!(
+            discrepant["outcome"]["discrepancy"],
+            serde_json::json!({
+                "field": "amount",
+                "claimed": { "money": { "amount": "10.00", "currency": "RUB" } },
+                "observed": { "money": { "amount": "4.00", "currency": "RUB" } },
+                "delta": { "money": { "amount": "6.00", "currency": "RUB" } },
+            })
+        );
+    }
+
+    /// A turnover asserts two values. A single `claimed` would have to pick one of
+    /// them, and the reader could not tell which.
+    #[test]
+    fn a_cash_turnover_claim_renders_debit_and_credit_and_no_single_claimed() {
+        let value = rendered(&claim_check(
+            ControlClaim::CashTurnover {
+                currency: CurrencyCode::Rub,
+                debit: PostedMinor::new(1_500),
+                credit: PostedMinor::new(2_500),
+            },
+            ClaimOutcome::Matched,
+        ));
+
+        assert_eq!(value["claim"]["kind"], "cash_turnover");
+        assert_eq!(value["claim"]["debit"], "15.00");
+        assert_eq!(value["claim"]["credit"], "25.00");
+        assert!(
+            value["claim"].get("claimed").is_none(),
+            "a turnover has two sides, not one claimed value: {value}"
+        );
+    }
+
+    /// A quantity is not money and must not be rendered as though it were.
+    #[test]
+    fn a_position_quantity_claim_renders_a_tagged_quantity() {
+        let value = rendered(&claim_check(
+            ControlClaim::PositionQuantity {
+                instrument: InstrumentId::new_random(),
+                custody: iaam_core::ids::CustodyId::new_random(),
+                quantity: iaam_core::money::Quantity(Dec::new(rust_decimal::Decimal::from(10))),
+                at: iaam_core::reconciliation::claim::BalancePoint::Closing,
+            },
+            ClaimOutcome::Matched,
+        ));
+
+        assert_eq!(value["claim"]["kind"], "position_quantity");
+        assert_eq!(
+            value["claim"]["claimed"],
+            serde_json::json!({ "quantity": "10" })
+        );
+    }
+
+    fn source_channel(parser: &str, document: Option<&str>) -> SourceChannel {
+        SourceChannel {
+            source: iaam_core::ids::SourceId::new_random(),
+            parser_version: ParserVersion(parser.to_owned()),
+            document: document.and_then(|hex| RawHash::parse(&hex.repeat(64))),
+        }
+    }
+
+    /// Independence needs the document, not the source: two channels sharing a
+    /// parser version differ only by document, and the DTO must show it.
+    #[test]
+    fn evidence_renders_the_documents_that_decide_independence() {
+        let confirming = source_channel("shared/1", Some("c"));
+        let confirmed = source_channel("shared/1", Some("d"));
+        assert!(
+            !confirming.is_independent_of(&confirmed),
+            "a shared parser version is not independence"
+        );
+        let evidence = Evidence::from_match(
+            Ground::BrokerApiAgreesWithStatement,
+            confirming,
+            confirmed,
+            std::collections::BTreeSet::from([Dimension::Cash]),
+        )
+        .expect("evidence");
+
+        let value =
+            serde_json::to_value(EvidenceDto::from_domain(&evidence)).expect("evidence renders");
+        assert_eq!(value["confirming_parser"], "shared/1");
+        assert_eq!(value["confirmed_parser"], "shared/1");
+        assert_eq!(value["confirming_document"], "c".repeat(64));
+        assert_eq!(value["confirmed_document"], "d".repeat(64));
+        assert_ne!(value["confirming_document"], value["confirmed_document"]);
+    }
+
+    /// Two absent documents compare equal, so the pair is **not** independent —
+    /// the case a reader would most easily assume it was. The DTO renders the
+    /// absence as absence rather than as two indistinguishable blanks.
+    #[test]
+    fn two_absent_documents_are_not_independent_and_render_as_absent() {
+        let confirming = source_channel("api/1", None);
+        let confirmed = source_channel("api/2", None);
+        assert!(
+            !confirming.is_independent_of(&confirmed),
+            "an absent document is not a distinct document"
+        );
+        let evidence = Evidence::from_match(
+            Ground::BrokerApiAgreesWithStatement,
+            confirming,
+            confirmed,
+            std::collections::BTreeSet::from([Dimension::Cash]),
+        )
+        .expect("evidence");
+
+        let value =
+            serde_json::to_value(EvidenceDto::from_domain(&evidence)).expect("evidence renders");
+        assert_eq!(value["level"], "accepted_internal");
+        assert!(
+            value.get("confirming_document").is_none(),
+            "an absent document is omitted, not blank: {value}"
+        );
+        assert!(
+            value.get("confirmed_document").is_none(),
+            "an absent document is omitted, not blank: {value}"
+        );
+    }
 }
 /// Report upload parameters. The route body is the workbook's binary bytes.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -3420,13 +3630,276 @@ pub struct EvidenceDto {
     pub dimensions: Vec<String>,
     pub confirming_parser: String,
     pub confirmed_parser: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirming_document: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_document: Option<String>,
+}
+
+impl EvidenceDto {
+    pub(crate) fn from_domain(evidence: &iaam_core::reconciliation::Evidence) -> Self {
+        Self {
+            ground: evidence.ground().code().to_owned(),
+            level: evidence.level().code().to_owned(),
+            dimensions: evidence
+                .dimensions()
+                .into_iter()
+                .map(|dimension| dimension.code().to_owned())
+                .collect(),
+            confirming_parser: evidence.confirming().parser_version.0.clone(),
+            confirmed_parser: evidence.confirmed().parser_version.0.clone(),
+            confirming_document: evidence
+                .confirming()
+                .document
+                .as_ref()
+                .map(|document| document.as_str().to_owned()),
+            confirmed_document: evidence
+                .confirmed()
+                .document
+                .as_ref()
+                .map(|document| document.as_str().to_owned()),
+        }
+    }
+}
+
+/// A money or quantity value in a claim or discrepancy.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimValueDto {
+    Money {
+        amount: String,
+        currency: CurrencyDto,
+    },
+    Quantity(String),
+}
+
+/// The tagged claim asserted by a source.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClaimDto {
+    CashBalance {
+        currency: CurrencyDto,
+        at: String,
+        claimed: ClaimValueDto,
+    },
+    PositionQuantity {
+        instrument: Uuid,
+        custody: Uuid,
+        at: String,
+        claimed: ClaimValueDto,
+    },
+    CashTurnover {
+        currency: CurrencyDto,
+        debit: String,
+        credit: String,
+    },
+    FeesTotal {
+        currency: CurrencyDto,
+        claimed: ClaimValueDto,
+    },
+    IncomeTotal {
+        currency: CurrencyDto,
+        claimed: ClaimValueDto,
+    },
+    TaxWithheldTotal {
+        currency: CurrencyDto,
+        claimed: ClaimValueDto,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DiscrepancyDto {
+    pub field: String,
+    pub claimed: ClaimValueDto,
+    pub observed: ClaimValueDto,
+    pub delta: ClaimValueDto,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClaimOutcomeDetailDto {
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discrepancy: Option<DiscrepancyDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception: Option<String>,
 }
 
 /// Outcome of one control assertion.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimOutcomeDto {
-    pub claim: String,
-    pub outcome: String,
+    pub claim: ClaimDto,
+    pub outcome: ClaimOutcomeDetailDto,
+}
+
+impl ClaimOutcomeDto {
+    pub(crate) fn from_domain(check: &ClaimCheck) -> Self {
+        let outcome = match check.outcome {
+            ClaimOutcome::Matched => ClaimOutcomeDetailDto {
+                code: "matched".to_owned(),
+                discrepancy: None,
+                reason: None,
+                exception: None,
+            },
+            ClaimOutcome::Discrepant(discrepancy) => ClaimOutcomeDetailDto {
+                code: "discrepant".to_owned(),
+                discrepancy: Some(DiscrepancyDto {
+                    field: discrepancy.field.to_owned(),
+                    claimed: claim_value_dto(discrepancy.claimed),
+                    observed: claim_value_dto(discrepancy.observed),
+                    delta: claim_value_dto(discrepancy.delta),
+                }),
+                reason: None,
+                exception: None,
+            },
+            ClaimOutcome::NotComparable { reason } => ClaimOutcomeDetailDto {
+                code: "not_comparable".to_owned(),
+                discrepancy: None,
+                reason: Some(reason.code().to_owned()),
+                exception: None,
+            },
+            ClaimOutcome::Excepted { exception } => ClaimOutcomeDetailDto {
+                code: "excepted".to_owned(),
+                discrepancy: None,
+                reason: None,
+                exception: Some(exception.code().to_owned()),
+            },
+        };
+        Self {
+            claim: claim_dto(check.claim),
+            outcome,
+        }
+    }
+}
+
+fn money_text(amount: iaam_core::money::PostedMinor, currency: CurrencyCode) -> String {
+    Money::new(amount, currency)
+        .to_calc_dec()
+        .inner()
+        .to_string()
+}
+
+fn claim_value_dto(value: ClaimValue) -> ClaimValueDto {
+    match value {
+        ClaimValue::Money { amount, currency } => ClaimValueDto::Money {
+            amount: money_text(amount, currency),
+            currency: CurrencyDto::from_domain(currency),
+        },
+        ClaimValue::Quantity(quantity) => ClaimValueDto::Quantity(quantity.0.inner().to_string()),
+    }
+}
+
+fn claim_dto(claim: ControlClaim) -> ClaimDto {
+    match claim {
+        ControlClaim::CashBalance {
+            currency,
+            amount,
+            at,
+        } => ClaimDto::CashBalance {
+            currency: CurrencyDto::from_domain(currency),
+            at: at.code().to_owned(),
+            claimed: claim_value_dto(ClaimValue::Money { amount, currency }),
+        },
+        ControlClaim::PositionQuantity {
+            instrument,
+            custody,
+            quantity,
+            at,
+        } => ClaimDto::PositionQuantity {
+            instrument: instrument.inner(),
+            custody: custody.inner(),
+            at: at.code().to_owned(),
+            claimed: claim_value_dto(ClaimValue::Quantity(quantity)),
+        },
+        ControlClaim::CashTurnover {
+            currency,
+            debit,
+            credit,
+        } => ClaimDto::CashTurnover {
+            currency: CurrencyDto::from_domain(currency),
+            debit: money_text(debit, currency),
+            credit: money_text(credit, currency),
+        },
+        ControlClaim::FeesTotal { currency, amount } => ClaimDto::FeesTotal {
+            currency: CurrencyDto::from_domain(currency),
+            claimed: claim_value_dto(ClaimValue::Money { amount, currency }),
+        },
+        ControlClaim::IncomeTotal { currency, amount } => ClaimDto::IncomeTotal {
+            currency: CurrencyDto::from_domain(currency),
+            claimed: claim_value_dto(ClaimValue::Money { amount, currency }),
+        },
+        ControlClaim::TaxWithheldTotal { currency, amount } => ClaimDto::TaxWithheldTotal {
+            currency: CurrencyDto::from_domain(currency),
+            claimed: claim_value_dto(ClaimValue::Money { amount, currency }),
+        },
+    }
+}
+
+/// A refused row preserved in a coverage-gap projection.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RefusedRowDto {
+    pub source: Uuid,
+    pub row: RowNameDto,
+    pub dimensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RowNameDto {
+    Given(String),
+    Fingerprint(String),
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TaintDto {
+    pub account: Uuid,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub to: Date,
+    pub source: Uuid,
+    pub parser_version: String,
+    pub dimensions: Vec<String>,
+    pub refused: u32,
+    pub rows: Vec<RefusedRowDto>,
+}
+
+impl TaintDto {
+    pub(crate) fn from_domain(taint: &Taint) -> Self {
+        Self {
+            account: taint.account.inner(),
+            from: taint.period.from,
+            to: taint.period.to,
+            source: taint.source.inner(),
+            parser_version: taint.parser_version.0.clone(),
+            dimensions: taint
+                .dimensions
+                .iter()
+                .map(|dimension| dimension.code().to_owned())
+                .collect(),
+            refused: taint.refused,
+            rows: taint.rows.iter().map(refused_row_dto).collect(),
+        }
+    }
+}
+
+fn refused_row_dto(row: &RefusedRow) -> RefusedRowDto {
+    let row_name = match &row.key.row {
+        RowName::Given(value) => RowNameDto::Given(value.clone()),
+        RowName::Fingerprint(value) => RowNameDto::Fingerprint(value.clone()),
+    };
+    RefusedRowDto {
+        source: row.key.source.inner(),
+        row: row_name,
+        dimensions: row
+            .dimensions
+            .iter()
+            .map(|dimension| dimension.code().to_owned())
+            .collect(),
+    }
 }
 
 /// Account reconciliation status for an interval.
@@ -3442,6 +3915,14 @@ pub struct ReconciliationStatusDto {
     pub dimensions: Vec<DimensionStatusDto>,
     pub evidence: Vec<EvidenceDto>,
     pub outcomes: Vec<ClaimOutcomeDto>,
+    pub taints: Vec<TaintDto>,
+}
+
+/// Reconciliation statuses and every effective coverage gap in the requested range.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReconciliationResponseDto {
+    pub statuses: Vec<ReconciliationStatusDto>,
+    pub gaps: Vec<TaintDto>,
 }
 
 /// Owner category in the living reference list.

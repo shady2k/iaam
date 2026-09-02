@@ -29,14 +29,21 @@ pub struct OwnerBalance {
     pub raw_hash: RawHash,
 }
 
-/// Builds statuses for intervals intersecting the requested range.
-pub async fn statuses(
+/// Reconciliation statuses and effective coverage gaps for a requested range.
+#[derive(Debug, Clone)]
+pub struct ReconciliationReport {
+    pub statuses: Vec<ReconciliationStatus>,
+    pub gaps: Vec<iaam_core::reconciliation::Taint>,
+}
+
+/// Builds statuses and gaps for intervals intersecting the requested range.
+pub async fn report(
     services: &AppServices,
     principal: &Principal,
     account: AccountId,
     from: Date,
     to: Date,
-) -> Result<Vec<ReconciliationStatus>, AppError> {
+) -> Result<ReconciliationReport, AppError> {
     let Some(period) = AssertionPeriod::between(from, to) else {
         return Err(AppError::Invalid {
             field: "period".into(),
@@ -49,7 +56,32 @@ pub async fn statuses(
         .load_events_through(principal.owner, period.to)
         .await?;
     let ledger = ReconciliationLedger::build(&events)?;
-    Ok(statuses_for_account(&ledger, account, period))
+    Ok(ReconciliationReport {
+        statuses: statuses_for_account(&ledger, account, period),
+        gaps: ledger
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.account == account
+                    && gap.period.from <= period.to
+                    && period.from <= gap.period.to
+            })
+            .cloned()
+            .collect(),
+    })
+}
+
+/// Builds statuses for intervals intersecting the requested range.
+pub async fn statuses(
+    services: &AppServices,
+    principal: &Principal,
+    account: AccountId,
+    from: Date,
+    to: Date,
+) -> Result<Vec<ReconciliationStatus>, AppError> {
+    Ok(report(services, principal, account, from, to)
+        .await?
+        .statuses)
 }
 
 pub(super) fn statuses_for_account(

@@ -1867,8 +1867,8 @@ pub async fn returns_report_with_rates(
             )
         })?;
         fx = fx.with_rate(
-            rate.from.to_domain(),
-            rate.to.to_domain(),
+            rate.base.to_domain(),
+            rate.quote.to_domain(),
             rate.date,
             Dec::new(parsed),
         );
@@ -1953,8 +1953,8 @@ fn market_price_dto(
 
 fn market_fx_dto(view: iaam_app::scenarios::market_reference::MarketFxView) -> MarketFxDto {
     MarketFxDto {
-        from: CurrencyDto::from_domain(view.from),
-        to: CurrencyDto::from_domain(view.to),
+        base: CurrencyDto::from_domain(view.base),
+        quote: CurrencyDto::from_domain(view.quote),
         nominal: view.nominal,
         value: view.value,
         unit_rate: view.unit_rate,

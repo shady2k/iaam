@@ -85,10 +85,15 @@ pub struct MarketPriceView {
     pub quality: String,
 }
 
+/// One exchange-rate observation.
+///
+/// The pair is `base`/`quote` here as it is on the wire: the query, the row and
+/// this view say the same two words, and `from`/`to` are left to mean the
+/// interval, which is what they mean everywhere else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketFxView {
-    pub from: CurrencyCode,
-    pub to: CurrencyCode,
+    pub base: CurrencyCode,
+    pub quote: CurrencyCode,
     pub nominal: u32,
     pub value: String,
     pub unit_rate: String,
@@ -262,13 +267,17 @@ fn price_view(row: PriceRow) -> Result<MarketPriceView, AppError> {
 }
 
 fn fx_view(row: FxRow) -> Result<MarketFxView, AppError> {
-    let from = CurrencyCode::from_code(&row.from_code)
-        .ok_or_else(|| invalid_value("from", row.from_code.clone()))?;
-    let to = CurrencyCode::from_code(&row.to_code)
-        .ok_or_else(|| invalid_value("to", row.to_code.clone()))?;
+    // The store keeps the columns it has always kept: `from_code`/`to_code` are
+    // the names of two SQLite columns and of the rows already written into
+    // them, and renaming them is a migration, not a spelling. The pair takes
+    // its published name here, at the boundary that publishes it.
+    let base = CurrencyCode::from_code(&row.from_code)
+        .ok_or_else(|| invalid_value("base", row.from_code.clone()))?;
+    let quote = CurrencyCode::from_code(&row.to_code)
+        .ok_or_else(|| invalid_value("quote", row.to_code.clone()))?;
     Ok(MarketFxView {
-        from,
-        to,
+        base,
+        quote,
         nominal: row.nominal,
         value: row.value,
         unit_rate: row.unit_rate,
@@ -374,8 +383,8 @@ mod tests {
     #[test]
     fn app_reference_views_keep_provenance_fields() {
         let view = MarketFxView {
-            from: CurrencyCode::Usd,
-            to: CurrencyCode::Rub,
+            base: CurrencyCode::Usd,
+            quote: CurrencyCode::Rub,
             nominal: 1,
             value: "80".into(),
             unit_rate: "80".into(),

@@ -41,7 +41,7 @@ tests test the envelope.
 | `MoneyFlowReportDto` | `GET /v1/reports/flow` | **carries** — contour, version, from, to (`dto.rs:1916`) |
 | `SyncOutcomeDto` | `POST /v1/brokers/{broker}/sync` | **carries** the one self-contained verdict item |
 | `DocumentDto` | `POST /v1/documents`, `POST /v1/documents/{id}/reparse` | **carries nothing** — §4 |
-| `Vec<VerdictDto>` | `POST /v1/ingest/csv` | **carries nothing** — §4 |
+| `Vec<VerdictDto>` | `POST /v1/ingest/csv`, `POST /v1/ingest/operations` | **carries nothing** — §4 |
 
 Two precisions, because the bead and the earlier draft both got them wrong:
 
@@ -88,7 +88,7 @@ cover.
 
 ## 4. Where there is no action, and why — each one a decision
 
-**`POST /v1/documents`, its reparse sibling, and `POST /v1/ingest/csv` carry
+**`POST /v1/documents`, its reparse sibling, and both ingest routes carry
 nothing, because nothing they produce has an item.**
 `Verdict::PossibleDuplicate` is constructed in exactly one place in production
 code — `scenarios/sync.rs:189`, the broker sync path. The document and CSV paths

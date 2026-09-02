@@ -4,40 +4,49 @@ Bead: `iaam-y10f` · Epic: `iaam-l5y9` · Decision: ADR-0003 · Date: 2026-09-02
 
 ## What this task is for
 
-An agent arriving at a running instance has no way to learn how to authenticate
-except by reading a document a human maintains. That document
-(`docs/agent-skill/SKILL.md`) is wrong in four places today. This task gives the
-agent a first call that answers the question without prose, and defines the one
-envelope every later answer in E9 will use.
+An agent arriving at a running instance has no canonical way to learn what this
+API is and how to authenticate, except by reading a document a human maintains.
+That document (`docs/agent-skill/SKILL.md`) is wrong in four places today.
 
-It is useful on its own: a client with no prior knowledge reaches an
-authenticated state, and a stale document stops being the only path in.
+This task gives the agent a first call that answers without prose, and defines
+the one envelope every later answer in E9 will use.
+
+**What it does not do, stated plainly.** It does not get anyone authenticated. A
+token is issued at the console and injected into the client by local tooling
+(ADR-0003); no API call produces one, and after this task none can. The value
+here is a canonical entry point, an honest recovery answer on `401`, and the
+contract plus its route resolver — which is infrastructure the next three tasks
+all stand on. An earlier draft of this spec claimed "a client with no prior
+knowledge reaches an authenticated state". That was false and is withdrawn.
 
 ## What already exists
 
-- `/v1/openapi.json` is **unauthenticated**. It is added to the combined router
-  after `split_for_parts`, outside the `authenticate` middleware
-  (`crates/iaam-server/src/lib.rs:168`). It answers which operations exist, with
-  methods, paths, schemas and security requirements.
-- `/v1/health` and `/v1/claim` are the other two unprotected routes.
+- `/v1/openapi.json` is **unauthenticated**, added to the combined router after
+  `split_for_parts`, outside the `authenticate` middleware (`lib.rs:174`). It
+  answers which operations exist, with methods, paths, schemas and security. It
+  is mounted with plain `Router::route`, so it does not describe itself — and
+  `/v1` must not be mounted the same way, or discovery will advertise a
+  capability document that omits discovery.
+- `/v1/health` answers unauthenticated with status and versions.
 - `ApiError` carries `code`, `message`, `field`, `expected`, `actual`,
-  `correlation_id` (`crates/iaam-server/src/error.rs`).
+  `correlation_id` (`error.rs`).
 
 The OpenAPI document is necessary and insufficient. It says what may be called.
 It cannot say why an operation is relevant now, which values the system already
-holds, whether a condition blocks or merely advises, or what observably proves
-the step done. It is the capability document; E9 adds the work.
+holds, whether a condition blocks or advises, or what observably proves a step
+done. It is the capability document; E9 adds the work.
 
 ## 1. `GET /v1` — the discovery document
 
-Unprotected, alongside `health` and `claim`. Returns:
+Unprotected, mounted through `OpenApiRouter` so that it appears in the document
+it points at.
 
 ```json
 {
   "service": "iaam",
   "api_version": "v1",
-  "schema_version": 11,
   "openapi": "/v1/openapi.json",
+  "health": "/v1/health",
   "authentication": {
     "scheme": "bearer",
     "header": "Authorization: Bearer <token>"
@@ -46,160 +55,204 @@ Unprotected, alongside `health` and `claim`. Returns:
 }
 ```
 
-`schema_version` and the projection version already reach clients through
-`HealthDto`; discovery repeats the journal schema version because an agent that
-cannot parse the journal contract should learn it before writing, not after.
+No journal `SCHEMA_VERSION` here. An API client writes DTOs, not journal events;
+the journal schema version is data-compatibility diagnostics and already reaches
+clients through `/v1/health`, which discovery links to. Publishing it as though
+it were the contract version would invite a client to branch on the wrong number.
 
 ### What it must not say
 
-It must not disclose whether the instance has been claimed. `claim` deliberately
-returns the same `403` for an invalid, an expired and an already-used code
-(`routes.rs:1228-1231`), so that a guess cannot be confirmed. A discovery
-document saying "this instance is unclaimed" would hand back exactly what that
-refusal withholds. The `409 already_claimed` answer is not a leak, because it is
-reachable only with a correct code.
+Discovery must not disclose whether the instance has been claimed or whether an
+owner exists. It is built entirely from constants and the static action catalog
+and reads no state, so this is a property of its construction, not a filter over
+an answer.
 
-Therefore the discovery answer is **byte-identical** on a claimed and an
-unclaimed instance, and a test asserts that against both states.
+The requirement is stated as: **the response body is byte-identical across
+instance states**, asserted by a test over status, the relevant headers and the
+raw bytes. It is not a claim that every observable channel is closed — with
+claiming removed from HTTP (ADR-0003) the timing difference in `accept_claim`
+disappears along with the route, but this document does not pretend to have
+audited channels it does not control.
 
 ## 2. The action envelope
 
-One tagged type, defined once, used by every answer in E9. In this task it is a
-transport type in `iaam-server`; the domain-side action kinds arrive with the
-detectors in E9.T2, and map into this envelope rather than replacing it.
+One type, defined once, used by every answer in E9. In this task it is a
+transport type in `iaam-server`; domain-side action kinds arrive with the
+detectors in E9.T2 and map into it rather than replacing it.
 
 ```rust
 pub struct ActionDto {
+    pub id: String,               // stable identity: dedup, rendering, tracking across refreshes
     pub kind: String,             // stable discriminator; the agent branches on this
     pub state: ActionState,       // ready | blocked_external | informational
     pub reason: ActionReason,     // { code, message } — code is control flow, message is not
-    pub subject: Option<Value>,   // typed per kind at the point of construction
     pub required_scope: Option<String>,
     pub operation: Option<OperationRef>,
     pub request: Option<ActionRequest>,   // { preset, missing }
     pub completion: Option<Completion>,
-    pub alternatives: Vec<ActionDto>,     // mutually sufficient ways to satisfy one need
+    pub options: Vec<ActionOptionDto>,    // mutually sufficient ways to satisfy one need
 }
 ```
 
+`ActionOptionDto` is a **narrower, non-recursive** type: `kind`, `reason`,
+`operation`, `request`. An option cannot contain options. A recursive action type
+would admit arbitrary-depth trees, leave it ambiguous whether the parent or a
+leaf is the thing to do, force every client into recursive traversal, and require
+deliberate recursion handling in the generated schema.
+
+There is **no `subject` field** in this version. An untyped `Value` reserved for
+"typed at construction" is typed only for us: the client and the schema still see
+arbitrary JSON. Authentication has no domain subject, so nothing is lost; a
+tagged subject type is added in E9.T2 when the first real subject exists.
+
 Three rules that are the point of the type:
 
-- **There is no `executor`.** Every call is made by the agent (ADR-0003). What a
-  response says is where a missing value comes from, never who types the request.
-- **`operation` is `Option`.** Where no call resolves the need, it is `null` and
+- **There is no `executor`.** No response assigns an HTTP call to a human
+  (ADR-0003). `required_scope` stays, because clients differ in what they may do.
+- **`operation` is `Option`.** Where no call resolves the need it is `null` and
   `state` says why. A plausible URL that does not fix the problem is worse than
-  silence, because the agent will follow it.
-- **`request.missing` names values, not prose.** Each entry is a JSON Pointer
-  into the request schema plus `provided_by`: `owner` (knowledge only the owner
-  has), `external_document`, or `caller` (the request itself is malformed).
-  `request.preset` carries everything the system already knows, so the agent
-  copies nothing from an unrelated field.
+  silence: the agent will follow it.
+- **`request.missing` names values, not prose.** Each entry is a JSON Pointer into
+  the request schema plus `provided_by`: `owner` (knowledge only the owner has),
+  `external_document`, or `caller` (the request itself is malformed).
+  `request.preset` carries what the system already knows, so the agent copies
+  nothing from an unrelated field.
 
-`subject`, `request` and `completion` are typed per kind where they are built.
-They are not free-form bags: this task ships one kind, and the shape of the next
-is decided when its detector is written.
+**Legal combinations are constrained, not merely avoided by constructors.** A
+`ready` action has an operation; an `informational` one has none; `request`
+without `operation` is not representable; an action carries either an operation
+or options, never both. Where the Rust type cannot express this, a test asserts
+each illegal combination is unreachable, and the schema documents the constraint.
 
 ## 3. The `authenticate` action
 
-The only kind in this task. Identical on every instance:
+The only kind in this task, and after ADR-0003 it has exactly one option, because
+no API call issues a credential any more:
 
 ```json
 {
+  "id": "authentication-required",
   "kind": "authenticate",
   "state": "blocked_external",
   "reason": {
     "code": "no_credentials",
-    "message": "This API requires a bearer token."
+    "message": "This API requires a bearer token. Tokens are issued at the server console and injected by local tooling; no API call issues one."
   },
-  "alternatives": [
-    {
-      "kind": "present_bearer_token",
-      "state": "blocked_external",
-      "reason": { "code": "token_not_held",
-                  "message": "Present a token the owner has issued." },
-      "operation": null
-    },
-    {
-      "kind": "claim_instance",
-      "state": "blocked_external",
-      "reason": { "code": "claim_code_not_held",
-                  "message": "A one-time code is printed to the server console at startup." },
-      "operation": {
-        "operation_id": "claim",
-        "method": "POST",
-        "path": "/v1/claim",
-        "request_schema": "#/components/schemas/ClaimRequest"
-      },
-      "request": { "missing": [ { "pointer": "/code", "provided_by": "owner" } ] }
-    }
-  ]
+  "options": []
 }
 ```
 
-`blocked_external` on both, because the system cannot supply either credential.
-Neither alternative asserts anything about this instance's state, so the answer
-conceals nothing and reveals nothing.
+`blocked_external`, and it is honest: the system cannot supply the credential and
+no operation exists that would. It asserts nothing about this instance's state,
+so it is identical everywhere.
+
+`claim_instance` was in an earlier draft and is removed. Claiming moves to the
+CLI with the one-time code retired (ADR-0003), so advertising it would send an
+agent to a route that will not exist and, worse, would route a bootstrap secret
+through the agent. This task therefore **depends on** the claim route's removal
+in `iaam-iw9s`, or it advertises a lie for one release.
 
 ## 4. `401` carries the same action
 
-`ApiFailure::unauthorized()` gains the same envelope in its body. An agent whose
-token expired mid-session learns the way back in from the refusal itself, and the
-type gets its second carrier immediately, which is what proves it is a shared
-contract rather than one endpoint's shape.
+`ApiFailure::unauthorized()` gains the envelope, and the response gains what the
+protocol requires and it currently lacks:
 
-`403` is not in scope here: a scope refusal needs the re-examination in
-`iaam-hbfw` before it can honestly say what to do.
+- `WWW-Authenticate: Bearer` — the JSON body supplements the standard challenge,
+  it does not replace it.
+- `Cache-Control: no-store` and `Vary: Authorization`, so an intermediary cannot
+  cache a refusal and replay it. Discovery itself may be publicly cacheable
+  precisely because it is state-independent.
+
+The action on this path is a **constant**. `authenticate` never varies, so it is
+built once and cheaply cloned, not reassembled per refusal. This matters because
+a missing `Authorization` header returns `401` **before** the rate limiter
+(`auth.rs:47-49`), so that path is unlimited: enlarging it must not make it
+expensive. Making that path limited is out of scope here and belongs with the
+scope work in `iaam-hbfw`.
+
+Both refusal paths are tested — no header at all, and a token that is unknown or
+revoked — because they run through materially different code.
+
+`403` is not in scope: a scope refusal cannot honestly say what to do before the
+re-examination in `iaam-hbfw`.
 
 ## 5. Addresses come from the registered routes
 
-`operation_id` is the only address written by hand, and it is written on the
-route itself. utoipa 5.5 accepts an expression, so the id is a shared constant
-rather than a repeated literal.
+`operation_id` is the only address written by hand, and it is written on the route
+itself. `utoipa-gen` 5.5.0 takes `operation_id` as an `Expr` (`src/path.rs:48`),
+so a shared constant is used rather than a repeated literal.
 
 Resolution reads the **completed** OpenAPI document — the one `build` returns
-from `split_for_parts` (`lib.rs:165`) — not `ApiDoc::openapi()`. `ApiDoc`
-declares schemas; the paths are merged by `OpenApiRouter` from the `routes!`
-registrations. Resolving against `ApiDoc` alone would happily hand out an
-operation that was never mounted.
+from `split_for_parts` — not `ApiDoc::openapi()`. `ApiDoc` declares schemas; the
+paths are merged by `OpenApiRouter` from the `routes!` registrations, so
+resolving against `ApiDoc` alone would hand out an operation that was never
+mounted.
 
-The resolver is built once at server construction and fails construction — not a
-request — if an id is missing or duplicated. A server that cannot address its own
-actions must not start.
+What that resolution proves, and what it does not: it proves a route was
+registered through `routes!` and gives its declared method, path, request body
+and security. It does **not** prove the middleware chain, that runtime
+authorization matches the declared security, or that the handler accepts what the
+schema claims. The black-box test below is not redundant with it.
 
-The alternative, calling the generated `__path_claim::path()` marker directly,
-is rejected: it is doc-hidden generated API, and it proves only that the
-attribute exists, not that the route was mounted.
+### Construction becomes fallible, and order changes
+
+`build(state) -> (Router, OpenApi)` has no error channel (`lib.rs:107`), and it
+spawns the market scheduler **before** assembling the routers (`lib.rs:110`) — so
+a validation failure today would come after a background side effect.
+
+This task changes it to `build(state) -> Result<(Router, OpenApi), BuildError>`
+and reorders: assemble routers, produce the completed document, resolve and
+validate the action catalog, install it, and only then spawn the scheduler and
+return. A server that cannot address its own actions must not start, and must not
+have started anything else first. Call sites in `iaam-bootstrap` and the contract
+tests are updated.
+
+The catalog is installed into `ServerState` behind a `OnceLock`, which resolves
+the circularity: the state exists before the document does, and discovery and the
+authentication middleware both need the catalog.
+
+The alternative — calling the generated `__path_claim::path()` marker directly —
+is rejected: it is doc-hidden generated API and proves only that an attribute
+exists, not that a route was mounted.
 
 ## 6. Tests
 
-- Discovery answers identically on a claimed and an unclaimed instance, asserted
-  byte for byte.
-- Every action kind resolves to exactly one operation in the completed document.
-- The advertised method and path equal the resolved operation's.
-- Every `pointer` in `request.missing` names a real property of the referenced
+- Discovery's body is byte-identical across instance states, over status, the
+  relevant headers and raw bytes.
+- **Every input the referenced schema requires is either preset or listed in
+  `request.missing`.** Asserting only that each listed pointer names a real
+  property would pass while an action stayed unusable — the defect that an
+  earlier draft of this spec actually had, omitting `label` from `ClaimRequest`.
+- Each pointer in `request.missing` names a real property of the referenced
   component schema.
-- A black-box request to the advertised address reaches the handler, so a route
-  that exists only in the document is caught.
-- Server construction fails on a missing or duplicated `operation_id`, proved by
-  a test that removes one.
-- `401` carries the same envelope as discovery.
+- Every action kind resolves to exactly one operation, and the advertised method
+  and path equal the resolved operation's.
+- A black-box request to each advertised address reaches its handler.
+- Illegal envelope combinations are unreachable (§2).
+- `ActionCatalog` construction rejects a document with a missing or duplicated
+  `operation_id` — a unit test over a mutated document, since `build` cannot be
+  compiled with a route removed. Separately, `build` returns a catalog containing
+  every declared kind.
+- `401` carries the envelope, `WWW-Authenticate` and `Cache-Control`, on both
+  refusal paths.
 
 ## 7. Not in this task
 
-No work queue, no detectors, no state reading (E9.T2). No `403` remediation
-(`iaam-hbfw`). No actions attached to verdicts (E9.T5). No changes to
-`docs/agent-skill/SKILL.md` beyond what `iaam-zu6m` does independently. No
-generic predicate language, now or later.
+No work queue, no detectors, no state reading (E9.T2). No `403` remediation and
+no rate-limiting change (`iaam-hbfw`). No actions attached to verdicts (E9.T5).
+No edits to `docs/agent-skill/SKILL.md` beyond what `iaam-zu6m` does on its own.
+No generic predicate language, now or later.
 
 ## 8. Risks
 
-**The envelope is designed against one kind.** Shipping a shared type on a single
-example risks a shape that does not fit the second. Mitigated by the fields being
-optional and by the next kind arriving one task later, while nothing external
-depends on the contract yet — and by `subject` and `completion` being typed at
-construction, so the first wrong guess costs a variant, not the type.
+**The envelope is designed against one kind, and a thin one.** `authenticate`
+exercises `state`, `reason` and `id`, but not `operation`, `request` or
+`completion` — the fields that carry the weight later. Mitigated by nothing
+external depending on the contract yet and by E9.T2 arriving next; accepted
+knowingly, because the alternative is designing the envelope inside the queue
+task and shipping both at once.
 
 **Discovery becomes a second document.** If `GET /v1` grows prose about how the
-system works, it is the skill in JSON. It carries versions, one link, the
-authentication scheme, and one action. Anything else belongs in the OpenAPI
+system works, it is the skill in JSON. It carries versions, two links, the
+authentication scheme and one action. Anything else belongs in the OpenAPI
 descriptions or in `/v1/actions`.

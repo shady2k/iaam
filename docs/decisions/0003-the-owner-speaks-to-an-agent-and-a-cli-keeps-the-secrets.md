@@ -42,15 +42,24 @@ from — the owner's knowledge, an external document, or state the system alread
 holds — never who types the request. There is no `executor` field. There is a
 `required_scope` field, because clients differ in what they may do.
 
-**2. Nothing but its own access token ever reaches the agent.** No claim code, no
-broker credential, no encryption key, no second party's secret. The one
-credential an agent receives is the bearer token issued to that agent.
+**2. No credential or secret except its own access token ever reaches the
+agent.** No claim code, no broker credential, no encryption key, no second
+party's secret. The agent of course receives the owner's portfolio data and the
+values he states in conversation — that is its work; what it never receives is a
+credential other than its own.
 
 The boundary is between the **model's context** and the **agent host's
 configuration**. A bearer token injected into an HTTP client by local tooling has
 not "passed through the agent" in the sense this decision forbids; a secret typed
 into a conversation has. Only the second is prohibited, and it is prohibited
 absolutely.
+
+That distinction is a boundary, not an enforcement, and naming it is not the same
+as having it. A host qualifies only if it injects the credential without exposing
+it to the model: the token is not readable as an environment variable the model
+can print, the `Authorization` header is redacted from traces and tool output,
+and no request echo returns it. A host lacking those properties has not kept the
+secret out of the model's context; it has renamed where the secret sits.
 
 **3. The CLI is rewritten as real subcommands, and it owns secrets and the trust
 root.** Claiming an instance, issuing and revoking tokens, generating and
@@ -60,9 +69,18 @@ is not a secret or the trust root moves into it.
 Claiming moves there **entirely**, and the one-time code is retired with it.
 `POST /v1/claim`, `CLAIM_LIFETIME` and `accept_claim` exist for one reason: HTTP
 needs a proof of console access, and a code read from the console is that proof.
-A CLI has console access by definition and has nothing to prove. `iaam claim`
-creates the owner directly through the store, as `provision.rs` already does for
-broker access, and prints the token once.
+The CLI does not need to prove it — but not because it is a CLI. Its authority
+comes from the operating system: the identity it runs as, the file permissions on
+the database and the key, and the deployment boundary that decides who may
+execute it at all. A CLI invoked from somewhere those do not hold has no more
+authority than an HTTP caller, and the deployment is what must guarantee they do.
+
+`iaam claim` creates the owner directly through the store, as `provision.rs`
+already does for broker access, and prints the token once. It must do so
+atomically: today `issue_owner_token` reads `sole_owner()` and then issues
+(`main.rs:318-338`), with no single-owner constraint behind it — a race would
+create two owners, which is exactly the failure that function's own comment
+records having happened before.
 
 Non-secret operations do **not** follow their secret siblings out of HTTP: broker
 access status and revocation, and token metadata and revocation, stay callable,
@@ -133,4 +151,6 @@ the CLI owns issuance and broker credentials, not before.
 
 **What we give up.** The idea that the owner might administer the system directly
 over HTTP. The coming web UI is a client like any other: it reads the same queue
-and is issued its own credential, and it does not get a private path.
+and is issued its own credential, and it does not get a private path. Its own
+credential buys attribution and independent revocation — not containment: a
+second owner-scope credential can destroy exactly as much as the first.

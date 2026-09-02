@@ -3740,8 +3740,8 @@ async fn the_openapi_document_enumerates_every_namespace_and_explains_the_resolv
         request["properties"]["namespace"]
     );
     assert_eq!(
-        spec["components"]["schemas"]["AliasNamespaceDto"]["enum"],
-        json!(NAMESPACE_CODES),
+        published_vocabulary(&spec, "AliasNamespaceDto"),
+        NAMESPACE_CODES,
         "the contract must list every register an external code can belong to"
     );
 
@@ -3755,6 +3755,51 @@ async fn the_openapi_document_enumerates_every_namespace_and_explains_the_resolv
             "the resolve request field {field} arrives without a meaning"
         );
     }
+}
+
+#[tokio::test]
+async fn every_namespace_code_arrives_with_the_sentence_that_explains_it() {
+    // The five registers were published as a bare list of strings: utoipa
+    // renders a unit-variant enum as `{"type":"string","enum":[…]}` and
+    // discards the doc comment beside each variant, so the meanings written in
+    // `dto.rs` reached a reader of `dto.rs` and nobody else. `moex_secid` next
+    // to `ticker` is exactly the choice a client gets wrong when the document
+    // says only that both exist.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Published by the same mechanism as the verdict codes, and read the same
+    // way: `published_vocabulary` fails if a code arrives without a meaning.
+    let codes = published_vocabulary(&spec, "AliasNamespaceDto");
+    assert_eq!(codes, NAMESPACE_CODES);
+
+    let meanings: Vec<&str> = spec["components"]["schemas"]["AliasNamespaceDto"]["oneOf"]
+        .as_array()
+        .expect("the registers")
+        .iter()
+        .map(|item| item["description"].as_str().expect("a meaning"))
+        .collect();
+    let mut distinct = meanings.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        meanings.len(),
+        // One sentence repeated across five codes explains none of them.
+        "two registers are explained by the same sentence: {meanings:?}"
+    );
+
+    // A schema change is not permission to change what the route accepts: the
+    // codes above are the ones the route still resolves under, which
+    // `a_two_word_namespace_resolves_under_the_spelling_the_contract_publishes`
+    // exercises end to end for the one code that could drift.
+    assert!(
+        spec["components"]["schemas"]["AliasNamespaceDto"]
+            .get("enum")
+            .is_none(),
+        "the bare enumeration is still published beside the explained one"
+    );
 }
 
 #[tokio::test]
@@ -4093,6 +4138,98 @@ async fn the_exchange_rate_route_spells_the_pair_and_the_interval_apart() {
         vec!["base", "quote", "from", "to", "knowledge_as_of"],
         "the contract spells the exchange-rate parameters differently"
     );
+}
+
+#[tokio::test]
+async fn one_name_for_the_currency_pair_runs_from_the_query_to_the_row() {
+    // The query learned `base`/`quote` when `from` and `to` collided with the
+    // interval, and the two bodies kept the old spelling: an agent asked for a
+    // pair under one pair of names and read it back under another, which is the
+    // same defect one level down. Request body, response row and query all say
+    // `base`/`quote` now.
+    let harness = harness();
+    seed_market(&harness).await;
+
+    let path = "/v1/market/fx?base=USD&quote=RUB&from=2026-08-01&to=2026-08-03";
+    let (status, body) = call(&harness.router, get(path, Some(&harness.agent_token))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "exchange rates were refused: {body}"
+    );
+    let row = &body["rows"][0];
+    assert_eq!(row["base"], "USD", "the row does not name the base: {row}");
+    assert_eq!(
+        row["quote"], "RUB",
+        "the row does not name the quote: {row}"
+    );
+    assert!(
+        row.get("from").is_none() && row.get("to").is_none(),
+        "the row still spells the pair the way the interval is spelled: {row}"
+    );
+
+    // The owner-supplied rates are a request body, and they take the same two
+    // names: a client that sends `base` and reads `base` learns one vocabulary.
+    let (_, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Pair", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+    let report_path =
+        format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-01-01");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            &report_path,
+            &harness.owner_token,
+            &json!([{ "base": "USD", "quote": "RUB", "date": "2026-01-01", "rate": "90.00" }]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rate spelled as a pair was refused: {body}"
+    );
+
+    let (status, _) = call(
+        &harness.router,
+        post(
+            &report_path,
+            &harness.owner_token,
+            &json!([{ "from": "USD", "to": "RUB", "date": "2026-01-01", "rate": "90.00" }]),
+        ),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "the old spelling is still accepted beside the new one"
+    );
+
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    for schema in ["FxRateDto", "MarketFxDto"] {
+        let properties = &spec["components"]["schemas"][schema]["properties"];
+        for field in ["base", "quote"] {
+            assert!(
+                properties.get(field).is_some(),
+                "{schema} does not publish {field}: {properties}"
+            );
+        }
+        for field in ["from", "to"] {
+            assert!(
+                properties.get(field).is_none(),
+                "{schema} still spells the pair {field}: {properties}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

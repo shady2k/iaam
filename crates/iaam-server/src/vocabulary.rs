@@ -36,7 +36,12 @@ use iaam_core::returns::{DataQualityStatus, NotComputable};
 /// the meaning of an individual code has nowhere to go. Here each code carries
 /// its own sentence, and validation is unchanged — the value is still one of
 /// the listed strings.
-fn described_vocabulary(description: &str, codes: &[(&str, &str)]) -> RefOr<Schema> {
+///
+/// Visible to the crate because one vocabulary is not expanded from a domain
+/// macro: `AliasNamespaceDto` is converted in both directions and is written
+/// out in `dto.rs`, and it publishes itself through this function rather than
+/// through a second mechanism of its own.
+pub(crate) fn described_vocabulary(description: &str, codes: &[(&str, &str)]) -> RefOr<Schema> {
     codes
         .iter()
         .fold(
@@ -180,6 +185,29 @@ mod tests {
             serde_json::to_value(DataQualityStatusDto::Incomplete).expect("serialisation"),
             serde_json::json!("incomplete")
         );
+    }
+
+    #[test]
+    fn a_namespace_code_serialises_as_it_did_before_it_was_explained() {
+        // `AliasNamespaceDto` gained a `oneOf` schema so that each register
+        // could carry its meaning. The schema is what a client reads; the five
+        // strings are what it sends, and those had to stay exactly as they were.
+        for namespace in iaam_core::instrument::AliasNamespace::ALL {
+            let dto = crate::dto::AliasNamespaceDto::from_domain(namespace);
+            assert_eq!(
+                serde_json::to_value(dto).expect("serialisation"),
+                serde_json::Value::String(namespace.code().to_owned())
+            );
+            assert_eq!(dto.code(), namespace.code());
+            assert_eq!(
+                serde_json::from_value::<crate::dto::AliasNamespaceDto>(serde_json::Value::String(
+                    namespace.code().to_owned()
+                ))
+                .expect("deserialisation"),
+                dto,
+                "a code the route accepted is no longer read back"
+            );
+        }
     }
 
     #[test]

@@ -48,10 +48,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use time::{Date, OffsetDateTime};
-use utoipa::{IntoParams, ToSchema};
+use utoipa::openapi::RefOr;
+use utoipa::openapi::schema::Schema;
+use utoipa::{IntoParams, PartialSchema, ToSchema};
 use uuid::Uuid;
 
-use crate::vocabulary::{DataQualityStatusDto, NotComputableCodeDto, VerdictCodeDto};
+use crate::vocabulary::{
+    DataQualityStatusDto, NotComputableCodeDto, VerdictCodeDto, described_vocabulary,
+};
 
 // Custom date format: the standard serialisation of `time::Date` is not
 // a «YYYY-MM-DD» string, and without this line the API would accept dates
@@ -2585,10 +2589,16 @@ pub struct ContourVersionDto {
 }
 
 /// Exchange rate for a date specified by the owner (§6.1).
+///
+/// The pair is spelled `base`/`quote`, as it is in the `market/fx` query and in
+/// the rows that route answers: `from` and `to` are the interval on every other
+/// route, and one name per thing is worth more than a shorter name here.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FxRateDto {
-    pub from: CurrencyDto,
-    pub to: CurrencyDto,
+    /// The currency being priced — the `USD` of `USD/RUB`.
+    pub base: CurrencyDto,
+    /// The currency it is priced in — the `RUB` of `USD/RUB`.
+    pub quote: CurrencyDto,
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub date: Date,
@@ -2664,10 +2674,15 @@ pub struct MarketPriceDto {
 }
 
 /// Exchange-rate observation with full provenance.
+///
+/// The pair is spelled as the query spells it, `base`/`quote`: a client that
+/// asked for `base=USD&quote=RUB` reads the same two names back.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MarketFxDto {
-    pub from: CurrencyDto,
-    pub to: CurrencyDto,
+    /// The currency being priced — the `USD` of `USD/RUB`.
+    pub base: CurrencyDto,
+    /// The currency it is priced in — the `RUB` of `USD/RUB`.
+    pub quote: CurrencyDto,
     pub nominal: u32,
     pub value: String,
     pub unit_rate: String,
@@ -4313,23 +4328,57 @@ pub struct CreateInstrumentRequest {
 /// The five values are the whole domain: a code belongs to exactly one of these
 /// registers, and there is no «other». Enumerating them in the contract is the
 /// point — a client that has to guess the register guesses wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+///
+/// Each register is explained in [`AliasNamespaceDto::VOCABULARY`] rather than
+/// in a doc comment per variant: utoipa renders a unit-variant enum as a bare
+/// list of strings and discards those comments, so a meaning written there
+/// reaches a reader of this file and nobody else. The published schema is a
+/// `oneOf` built by `vocabulary::described_vocabulary`, the same shape the
+/// verdict, refusal and data-quality codes are published in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasNamespaceDto {
-    /// ISIN, the international securities identification number.
     Isin,
-    /// MOEX security identifier, as the exchange publishes it.
     MoexSecid,
-    /// Exchange ticker.
     Ticker,
-    /// FIGI, the OpenFIGI instrument identifier.
     Figi,
-    /// Internal broker code: different brokers use different codes for one
-    /// security, so this register is only meaningful next to its broker.
     BrokerCode,
 }
 
 impl AliasNamespaceDto {
+    /// Every register with the sentence that explains it, in declaration order.
+    ///
+    /// The code half is taken from the domain, so the contract cannot come to
+    /// disagree with what the server accepts; only the meaning is written here.
+    const VOCABULARY: &'static [(&'static str, &'static str)] = &[
+        (
+            AliasNamespace::Isin.code(),
+            "ISIN — the international securities identification number, twelve characters beginning with a country code. The register a prospectus, a depositary statement or a broker report prints by default, and the one to reach for when the document offers more than one code.",
+        ),
+        (
+            AliasNamespace::MoexSecid.code(),
+            "The Moscow Exchange security identifier, exactly as the exchange publishes it in `SECID`. It names a security on that exchange and nowhere else.",
+        ),
+        (
+            AliasNamespace::Ticker.code(),
+            "An exchange ticker. The shortest code and the least reliable one: tickers are reused between venues and reassigned over time, so a ticker identifies a security only next to the venue and the date it was read on.",
+        ),
+        (
+            AliasNamespace::Figi.code(),
+            "FIGI — the OpenFIGI instrument identifier, twelve characters. Unlike an ISIN it is never reassigned, which makes it the register to prefer when a security's history matters.",
+        ),
+        (
+            AliasNamespace::BrokerCode.code(),
+            "A broker's internal code. Different brokers use different codes for one security, so this register is meaningful only beside the broker whose report the code was read from.",
+        ),
+    ];
+
+    /// The code as it appears on the wire.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        self.to_domain().code()
+    }
+
     #[must_use]
     pub const fn to_domain(self) -> AliasNamespace {
         match self {
@@ -4352,6 +4401,17 @@ impl AliasNamespaceDto {
         }
     }
 }
+
+impl PartialSchema for AliasNamespaceDto {
+    fn schema() -> RefOr<Schema> {
+        described_vocabulary(
+            "The register an external instrument code belongs to. Together with the code itself it is the external code: neither half means anything alone, and there is no «other» register to fall back on — a code that fits none of these five is a code this route cannot resolve.",
+            Self::VOCABULARY,
+        )
+    }
+}
+
+impl ToSchema for AliasNamespaceDto {}
 
 /// The question the agent skill calls «resolve an external code as of a date»:
 /// which instrument is behind this code, on this document's date.

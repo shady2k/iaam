@@ -1,301 +1,702 @@
-# Развёртывание
+# Deployment
 
-## Запуск
+The reader of this document is an agent, and the document is written to be
+executed. Every step is a command followed by the output that proves it worked.
+A step whose success cannot be observed by running something is not a step and
+is not in here. Where a step can fail, the failure names what is missing, who
+supplies it, and the command that supplies it.
 
-```bash
-export IAAM_DATABASE=/var/lib/iaam/iaam.db
-export IAAM_LISTEN=127.0.0.1:8080
-iaam serve
-```
+Nothing here is a "sensible location". `/var/lib/iaam/iaam.db`,
+`/etc/iaam/broker-key`, the image tag `iaam:0.1.0` and the container name `iaam`
+are literal values that the commands below actually pass, and you may replace
+them with other literal values — but nothing in the program, the image or this
+repository will guess them for you. There are no defaults for a path, and there
+will not be: a database in an unexpected place looks exactly like a lost
+portfolio.
 
-| Переменная | Умолчание | Смысл |
+---
+
+## 1. What is deployed
+
+`crates/iaam-bootstrap` builds one binary, `iaam`. It is the entire deployable
+and it has two roles.
+
+| Role | Command | Run by |
 |---|---|---|
-| `IAAM_DATABASE` | нет, обязательна | путь к файлу базы |
-| `IAAM_BROKER_KEY_FILE` | нет | файл с ключом шифрования брокерских доступов |
-| `IAAM_LISTEN` | `127.0.0.1:8080` | адрес прослушивания |
-| `IAAM_RATE_LIMIT` | `120` | запросов на токен в окне |
-| `IAAM_RATE_WINDOW_SECONDS` | `60` | длина окна |
-| `RUST_LOG` | `info` | уровень логирования |
+| HTTP service | `iaam serve` | a service manager, unattended |
+| local administration | `iaam claim`, `iaam token issue`, `iaam broker key …`, `iaam broker access …` | the owner, at a console |
 
-Умолчание адреса — петлевой интерфейс намеренно: сервис не предназначен
-смотреть в интернет напрямую.
+The second role is not a convenience wrapper. Under
+[ADR-0003](decisions/0003-the-owner-speaks-to-an-agent-and-a-cli-keeps-the-secrets.md)
+the CLI owns the trust root and every secret: **no HTTP route issues an owner
+token, and no HTTP route accepts a broker credential.** The CLI's authority is
+the operating system's — the identity it runs as, the permissions on the
+database and key files, and the boundary that decides who may execute it at all.
+A deployment where anyone can run `iaam claim` against the database file has
+given away ownership of the instance; §3.4 and §4.4 are where that boundary is
+actually set.
 
-## Токены
+Three rules follow, and they hold for every step below.
 
-Токен предъявляется заголовком `Authorization: Bearer <токен>`. Любой
-выпущенный токен показывается **один раз**: в базе лежит только его хеш,
-и повторить показ неоткуда.
+- **A secret never travels through a conversation with an agent.** The owner
+  token is printed once on a console. A broker token is pasted into a console on
+  standard input. An agent receives its own bearer token from its host's
+  configuration and never any other credential.
+- **A run-time input is never baked into an image or a committed file.** The
+  database path, the bind address, the key file and its contents, and the
+  account and counterparty maps the import skills take are supplied when the
+  program runs, from outside this repository.
+- **The console is where ownership is established.** `iaam claim` prints the
+  first owner token exactly once. There is no one-time claim code and no
+  `POST /v1/claim`; both were retired with ADR-0003.
 
-`IAAM_DATABASE` читает **каждая** консольная команда, а не только запуск
-сервиса: умолчания у пути к базе нет и не будет — база в неожиданном
-месте выглядит как пропавший портфель.
+---
 
-### Первый токен: присвоение экземпляра
+## 2. Configuration
 
-В пустой базе владельца нет. Запустите локальную команду:
+### 2.1 Every variable the program reads
 
-```bash
-iaam claim --label <метка>
-```
+| Variable | Kind | Default | Read by |
+|---|---|---|---|
+| `IAAM_DATABASE` | **required** | none — every subcommand refuses without it | every subcommand, including `serve` |
+| `IAAM_BROKER_KEY_FILE` | path to a secret | none | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
+| `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
+| `IAAM_RATE_LIMIT` | optional | `120` | `serve` |
+| `IAAM_RATE_WINDOW_SECONDS` | optional | `60` | `serve` |
+| `RUST_LOG` | optional | `info` | `serve` |
 
-Команда создаёт владельца напрямую через базу, печатает токен владельца
-один раз и завершается, не поднимая сервер и не вызывая API. Код читать не
-нужно: одноразовый код присвоения удалён.
+`IAAM_BROKER_KEY_FILE` is optional for `serve` only in the sense that a service
+that never talks to a broker can run without it. If it is set and the file is
+absent, `serve` refuses to start rather than starting silently without
+encryption. Broker routes on a server started without it answer
+`{"code":"not_configured", …}`; the fix is a restart with the key, not a
+different call.
 
-### Токены агенту и на чтение
+### 2.2 Secrets
 
-Остальные токены владелец выпускает по API:
+Never in the image, never in a file committed to this repository, never in a
+conversation.
 
-```bash
-OWNER=<токен владельца>
+| Secret | Where it lives | How it is created |
+|---|---|---|
+| broker encryption key | a file outside the database, mode `0600`, e.g. `/etc/iaam/broker-key` | `iaam broker key generate` (§6.1) |
+| owner token | the operator's password manager; only its hash is in the database | `iaam claim` (§3.5, §4.4) |
+| agent / read-only tokens | the agent host's configuration | `POST /v1/tokens` (§7) |
+| the broker's own token | nowhere in configuration — it is pasted on standard input and stored only as ciphertext | `iaam broker access add` (§6.3) |
 
-# выпустить
-curl -sS -X POST http://127.0.0.1:8080/v1/tokens \
-  -H "authorization: Bearer $OWNER" -H 'content-type: application/json' \
-  -d '{"label": "домашний агент", "scope": "agent"}'
+### 2.3 Run-time inputs that must never be baked in
 
-# посмотреть выданные (меток и областей — без токенов и хешей)
-curl -sS http://127.0.0.1:8080/v1/tokens -H "authorization: Bearer $OWNER"
+The database file, the key file, the published bind address, and the account and
+counterparty maps used by the import skills (which is why those skills take
+`--account-map` and know nothing on their own). They are arguments and mounts,
+not image contents.
 
-# отозвать
-curl -sS -X DELETE http://127.0.0.1:8080/v1/tokens/<id> \
-  -H "authorization: Bearer $OWNER"
-```
+### 2.4 Variables that are now refused
 
-| Область | Что может |
+ADR-0003 replaced the provisioning environment variables with subcommands. The
+program refuses to start if one of them is set, and names its replacement.
+
+| Refused variable | Replacement |
 |---|---|
-| `owner` | всё, включая управление токенами и брокерским доступом |
-| `agent` | подавать события и читать |
-| `read_only` | только читать |
+| `IAAM_ISSUE_OWNER_TOKEN` | `iaam token issue` |
+| `IAAM_ADD_BROKER_ACCESS` | `iaam broker access add` |
+| `IAAM_GENERATE_BROKER_KEY` | `iaam broker key generate` |
+| `IAAM_BROKER_KEY_OLD_FILE` | `iaam broker key rotate --old <path> --new <path>` |
+| `IAAM_BROKER_KEY_NEW_FILE` | `iaam broker key rotate --old <path> --new <path>` |
 
-Область `owner` через API не выпускается — ответ `422`. Иначе украденный
-токен владельца немедленно размножался бы в неотличимые копии, и отзыв
-исходного ничего бы не менял.
+Check, on either route:
 
-### Потерянный токен владельца
-
-Восстановление — консольное, и только консольное:
-
-```bash
-iaam token issue --label <метка> --scope owner
+```console
+$ IAAM_DATABASE=/var/lib/iaam/iaam.db IAAM_ISSUE_OWNER_TOKEN=console iaam token issue --label console
+error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue`
+$ echo $?
+1
 ```
 
-Команда берёт существующего единственного владельца из базы, печатает
-новый токен владельца один раз и завершается, не поднимая сервер. Для
-пустой базы используйте `iaam claim --label <метка>`.
+If you see this, an old unit file, shell profile or compose file is still
+setting it. Remove the variable; the subcommand is the whole replacement.
 
-Старый токен при этом **не отзывается сам** — отзовите его по
-`DELETE /v1/tokens/{id}`, иначе потерянный продолжает пускать.
+---
 
-## Доступ к брокеру
+## 3. Route A — container
 
-Брокерский токен даёт доступ к счёту, поэтому в базе он лежит только
-шифротекстом, а ключ живёт вне базы (§14).
+The image is built from this repository's `Dockerfile`. It contains the binary
+and nothing else: no database, no key, no map, no token, no bind address.
 
-### Ключ заводит программа
+### 3.1 Preconditions
 
-```bash
-export IAAM_DATABASE=/var/lib/iaam/iaam.db
-export IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key
-iaam broker key generate
+```console
+$ docker version --format '{{.Server.Version}}'
+29.7.2
 ```
 
-Ключ **не печатается и не возвращается наружу**: то, чего человек не
-увидел, он не может ни переслать, ни сохранить не туда. Файл создаётся
-с режимом `0600`.
+Any version that supports multi-stage builds will do; the number above is what
+this was verified against.
 
-Существующий файл не перезаписывается. Новый ключ на месте старого
-делает нечитаемыми все заведённые доступы — молча и необратимо.
+**On failure** — `Cannot connect to the Docker daemon` means docker is not
+running or your user is not in the `docker` group. Supplied by the machine's
+administrator: `sudo systemctl start docker`, then
+`sudo usermod --append --groups docker "$USER"` and a new login session.
 
-Ключ заводится **до** запуска сервиса: заданная `IAAM_BROKER_KEY_FILE`,
-указывающая на несуществующий файл, — отказ при старте, а не тихий
-старт без шифрования.
+### 3.2 Build the image
 
-### Смена ключа
+From a clean checkout, with the repository root as the working directory:
 
-Команда принимает два уже существующих файла: старый ключ и заранее
-созданный новый. Она расшифровывает все записи `broker_access`, включая
-отозванные, подготавливает новые шифротексты и заменяет их одной
-транзакцией:
-
-```bash
-export IAAM_DATABASE=/var/lib/iaam/iaam.db
-iaam broker key rotate \
-  --old /etc/iaam/broker-key \
-  --new /etc/iaam/broker-key.next
+```console
+$ docker build --tag iaam:0.1.0 .
+…
+ => => naming to docker.io/library/iaam:0.1.0
+$ echo $?
+0
 ```
 
-Команда не заменяет и не удаляет файлы ключей. **Сохраните резервную
-копию старого ключа до успешного завершения команды и проверки доступа**:
-при отказе старые записи остаются под старым ключом. Только после этого
-можно заменить файл, который использует сервис, новым ключом; старый
-бэкап не удаляйте до подтверждения восстановления из него.
+The build needs network access to crates.io and to the Debian archive. It takes
+several minutes the first time and compiles the workspace with `--locked`, so a
+`Cargo.lock` that does not match the manifests fails the build instead of
+quietly resolving something else.
 
+**On failure** — `failed to solve: … no such file or directory` for
+`Cargo.lock` means the checkout is incomplete; the fix is a full `git clone`.
+A network error during `cargo build` is the build host's proxy or DNS, supplied
+by the machine's administrator.
 
-### Потеря ключа
+### 3.3 Prove the image is what it claims
 
-Ключ находится вне базы, а в `broker_access` лежат только шифротексты.
-Новый ключ не расшифрует старые записи. Поэтому одна копия
-`IAAM_DATABASE` не является восстановлением: без резервной копии старого
-ключа существующие брокерские доступы и работа сервиса с ними не
-восстановятся.
-
-Восстановление выполняется так:
-
-1. верните старый ключ из защищённой резервной копии в файл, доступный
-   службе;
-2. проверьте, что сервис снова читает существующие доступы;
-3. при необходимости заранее создайте новый ключ и выполните штатную
-   ротацию:
-   ```bash
-   iaam broker key rotate --old <старый-файл> --new <новый-файл>
-   ```
-4. сохраните резервную копию старого ключа до проверки новой конфигурации.
-
-Если старого ключа нет, не создавайте новый поверх старого файла и не
-обещайте восстановление из базы: это может позволить завести новые
-доступы, но не вернёт старые шифротексты.
-
-### Токен песочницы Т-Инвестиций
-
-Токен выпускается в настройках Т-Инвестиций, режим — **только чтение**.
-Область записывается рядом с доступом как `read_only`, но у брокера она
-**не перепроверяется**: система полагается на то, что выпущен токен
-именно на чтение. Выпустите торговый — она этого не заметит.
-
-Песочный и боевой доступы живут рядом: они различаются средой
-(`environment`), и действующий доступ один на тройку
-владелец+брокер+среда. Живая проверка берёт **песочный** доступ явно
-и боевым не пользуется никогда.
-
-**Канал отчётов песочницей не проверяется.** `GetBrokerReport` живёт
-только на боевом контуре; в песочнице его нет. Живая проверка отвечает
-на другой вопрос — жив ли шлюз, годен ли вшитый корень доверия, принят
-ли заведённый доступ.
-
-
-### Доступ из консоли
-
-Консольная команда читает брокерский токен из стандартного ввода, а не
-из аргумента командной строки:
-
-```bash
-export IAAM_DATABASE=/var/lib/iaam/iaam.db
-export IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key
-iaam broker access add --broker tinkoff --environment sandbox
-# вставьте токен, затем Ctrl-D
+```console
+$ docker image inspect iaam:0.1.0 --format 'user={{.Config.User}} entrypoint={{.Config.Entrypoint}} env={{.Config.Env}}'
+user=10001:10001 entrypoint=[/usr/local/bin/iaam] env=[PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin]
 ```
 
-Не передавайте токен аргументом командной строки: список процессов виден
-всей машине, а история командной оболочки переживает сессию. Открытым
-токен живёт ровно до шифрования и зануляется.
+Two things are being checked, and both are requirements rather than trivia. The
+user is not root. `env` contains `PATH` and nothing else — no `IAAM_*` variable
+is compiled into the image, which is what "configuration, not a default" means
+in practice.
 
-### Замена доступа
+```console
+$ docker run --rm iaam:0.1.0 --help
+The iaam service and local administration CLI
 
-Если действующий токен брокера заменён, не отправляйте новый токен по HTTP:
-замените его локально через ту же консольную границу:
+Usage: iaam <COMMAND>
 
-```bash
-iaam broker access rotate --broker tinkoff --environment sandbox
-# вставьте новый токен, затем Ctrl-D
+Commands:
+  serve   Run the iaam server
+  claim   Claim a fresh instance and print its owner token once
+  token   Manage API tokens
+  broker  Manage broker credentials and access
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
 ```
 
-Команда обновляет шифротекст действующего доступа на месте: его
-идентификатор и история сохраняются, а открытый токен существует только до
-шифрования. Аргументы команды содержат только брокера и среду, но не секрет.
+The entrypoint is the binary, so everything after the image name is arguments to
+`iaam`.
 
-У брокера запрашивается **только доступ на чтение**. Область прав
-записывается рядом с доступом и разбирается перед каждым обращением:
-запись, обещающая торговые права, даёт отказ, а не доступ.
+### 3.4 Create the host directories
 
-Проверить, что токена нет в базе, можно так же, как это делает тест:
+The container runs as uid/gid `10001`, and a bind mount keeps the host's
+ownership. The directory must therefore belong to that uid, and the number is
+fixed in the `Dockerfile` precisely so this command can name it.
 
-```bash
-grep -a "первые-символы-токена" "$IAAM_DATABASE" && echo УТЕЧКА || echo чисто
+```console
+$ sudo install --directory --owner 10001 --group 10001 --mode 0700 /var/lib/iaam
+$ stat --format '%u %g %a' /var/lib/iaam
+10001 10001 700
 ```
 
-### Как доставлять ключ в бою
+Mode `0700` is the access control. The database file itself is created `0644`;
+it is the directory that keeps other users out of it, and this is the step that
+decides who can run `iaam claim` against the instance (§1).
 
-Переменной окружения — **не надо**: она видна в `/proc/<pid>/environ`
-тому же пользователю и наследуется каждым дочерним процессом. В systemd
-для этого есть credentials:
+**On failure** — output other than `10001 10001 700` means the directory existed
+with other ownership. Supplied by the machine's administrator:
+`sudo chown 10001:10001 /var/lib/iaam && sudo chmod 0700 /var/lib/iaam`. If it
+is skipped, the next step fails with `unable to open database file`.
+
+### 3.5 Claim the instance
+
+This creates the owner and prints the owner token. It happens **once** in the
+life of a database.
+
+```console
+$ docker run --rm \
+    --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
+    --env IAAM_DATABASE=/var/lib/iaam/iaam.db \
+    iaam:0.1.0 claim --label console
+1f0c…  (64 hexadecimal characters, on one line)
+```
+
+Record it in the operator's password manager now. Then check that the claim took
+effect, by making it a second time:
+
+```console
+$ docker run --rm --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
+    --env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam:0.1.0 claim --label console
+error: instance is already claimed
+$ echo $?
+1
+```
+
+That refusal is the proof the first call took effect. The database now holds one
+owner and the hash of one token; the token itself exists only where the operator
+put it. There is no command that shows it again. Losing it costs a console
+visit (§7.3), not the instance.
+
+**On failure** — `error: SQLite error: unable to open database file:
+/var/lib/iaam/iaam.db` is §3.4 not done: the directory exists but the container's
+uid cannot write to it. `error: variable IAAM_DATABASE is not set …` is a missing
+`--env`, supplied by whoever writes the run command.
+
+### 3.6 Start the service
+
+```console
+$ docker run --detach --name iaam --restart unless-stopped \
+    --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
+    --env IAAM_DATABASE=/var/lib/iaam/iaam.db \
+    --env IAAM_LISTEN=0.0.0.0:8080 \
+    --publish 127.0.0.1:8080:8080 \
+    --read-only --tmpfs /tmp \
+    --cap-drop ALL --security-opt no-new-privileges \
+    iaam:0.1.0 serve
+456d86886aac…
+$ docker logs iaam
+2026-09-02T15:48:19.889341Z  INFO iaam: server started address=0.0.0.0:8080
+```
+
+`IAAM_LISTEN` must be set here, and setting it is not a weakening of the
+program's loopback default. Inside a network namespace `127.0.0.1` is reachable
+only from that same container, so `--publish` would forward to nothing.
+`--publish 127.0.0.1:8080:8080` puts the socket back on the host's loopback,
+which is where the default meant it to be. Publishing on `0.0.0.0` instead
+exposes an HTTP service that carries bearer tokens in clear text; put a reverse
+proxy in front of it first (§8).
+
+`--read-only`, `--cap-drop ALL` and `--security-opt no-new-privileges` are not
+decoration: the service writes only to the mounted data directory, and it was
+verified to start and serve with all three.
+
+**On failure** — the container exits immediately and `docker logs iaam` holds
+the reason. Every message the program can print at start-up is in §11.
+
+### 3.7 Administration afterwards
+
+Every administrative command is the same image with a different argument list
+and no `--detach`. The service does not need to be stopped for any of them,
+except a change to the key the running server reads, which needs a restart
+(§6.1).
+
+---
+
+## 4. Route B — binary on the host
+
+Use this where there is no container runtime, or where the broker key must be
+delivered by systemd credentials (§6.6), which is the stronger option.
+
+### 4.1 Build
+
+All commands run inside the project's development environment.
+
+```console
+$ nix develop -c cargo build --release --locked --package iaam-bootstrap
+    Finished `release` profile [optimized] target(s) in …
+$ ls -l target/release/iaam
+-rwxr-xr-x … target/release/iaam
+```
+
+**On failure** — `nix: command not found` means the toolchain is not installed on
+the build host; supplied by the machine's administrator, or build on another
+machine and copy the binary. `--locked` failing means `Cargo.lock` does not
+match the manifests: commit the lock file rather than removing the flag.
+
+### 4.2 Install
+
+```console
+$ sudo install --mode 0755 --owner root --group root target/release/iaam /usr/local/bin/iaam
+$ iaam --help
+The iaam service and local administration CLI
+…
+```
+
+Owned by `root` and not by the service user: the service must not be able to
+rewrite the program it runs.
+
+### 4.3 Service user and directories
+
+```console
+$ sudo useradd --system --home-dir /var/lib/iaam --shell /usr/sbin/nologin iaam
+$ sudo install --directory --owner iaam --group iaam --mode 0700 /var/lib/iaam
+$ stat --format '%U %G %a' /var/lib/iaam
+iaam iaam 700
+```
+
+### 4.4 Claim the instance
+
+```console
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam claim --label console
+1f0c…  (64 hexadecimal characters, on one line)
+```
+
+`sudo -u iaam` is the point of the step: the command must run as the identity
+that owns the database, because that identity is the whole of its authority
+(§1). Repeating it answers `error: instance is already claimed`, exactly as in
+§3.5.
+
+### 4.5 The unit file
 
 ```ini
+[Unit]
+Description=iaam
+After=network-online.target
+Wants=network-online.target
+
 [Service]
 User=iaam
 Group=iaam
+ExecStart=/usr/local/bin/iaam serve
+Environment=IAAM_DATABASE=/var/lib/iaam/iaam.db
+Environment=IAAM_LISTEN=127.0.0.1:8080
+# The key is delivered as a credential, not as an environment variable (§6.6).
 LoadCredential=broker-key:/etc/iaam/broker-key
 Environment=IAAM_BROKER_KEY_FILE=%d/broker-key
-Environment=IAAM_DATABASE=/var/lib/iaam/iaam.db
-ExecStart=/usr/local/bin/iaam serve
+Restart=on-failure
 
-# Обычные ограничения службы, не относящиеся к ключу напрямую,
-# но снимающие половину способов до него добраться.
+# Ordinary service confinement. Not specific to the key, but it removes half of
+# the ways to reach it.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
 StateDirectory=iaam
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-`%d` — каталог credentials: ramfs, режим `0400`, владелец — пользователь
-службы. Другим пользователям он не виден, дочерним процессам не
-наследуется, в списке процессов не мелькает. Сам `/etc/iaam/broker-key`
-при этом принадлежит `root` с режимом `0600`: служба читает его не
-напрямую, а через systemd.
+Write it to `/etc/systemd/system/iaam.service`, then:
 
-**Если на машине есть TPM**, ключ можно не держать на диске открытым:
-
-```bash
-systemd-creds encrypt --with-key=host+tpm2 /etc/iaam/broker-key /etc/iaam/broker-key.cred
+```console
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now iaam
+$ systemctl is-active iaam
+active
+$ journalctl -u iaam -n 1 --no-pager
+… iaam[…]: INFO iaam: server started address=127.0.0.1:8080
 ```
 
-и в юните `SetCredentialEncrypted=broker-key:...` вместо `LoadCredential=`.
-Тогда украденный диск или бэкап не дают ничего: блоб расшифровывается
-только на этой машине, а перезапуск остаётся автоматическим. **TPM
-необязателен** — без него работает вариант выше, и от кражи файла базы
-он защищает так же. Появится TPM — сменится одна строка в юните, код
-не меняется.
+Drop the two key lines if this instance has no broker access yet; add them and
+`systemctl restart iaam` after §6.1.
 
-### Чего это не закрывает
+**On failure** — `systemctl is-active iaam` printing `failed` means the process
+exited; `journalctl -u iaam -n 20 --no-pager` holds the message, and §11 holds
+its meaning.
 
-От `root` на работающей машине не защищает ничто. Root читает память
-процесса, читает каталог credentials, а если бы и не мог — просто
-попросит саму службу сходить к брокеру. Это свойство задачи, а не
-недоработка: программа, умеющая расшифровать без человека, расшифрует и
-для того, кто ею владеет.
+---
 
-Исключить и это можно единственным способом — выводить ключ из пароля,
-который владелец вводит при каждом запуске. Тогда до ввода не
-расшифровывается ничего, но и синхронизация после перезагрузки стоит,
-пока человек не разблокирует. Такого режима сейчас нет; если он нужен,
-это отдельная работа.
+## 5. Proof that the deployment works
 
-Ущерб от утечки ограничен по построению: торговых прав у токена нет.
+Three calls, in order. The third is the one that proves it. Replace `$OWNER`
+with the token from §3.5 or §4.4; on the container route the port is the one
+`--publish` names.
 
-## Два режима проверки
+```console
+$ curl -sS -i http://127.0.0.1:8080/.well-known/api-catalog
+HTTP/1.1 200 OK
+content-type: application/linkset+json
+…
+{"linkset":[{"anchor":"/v1","service-desc":[{"href":"/v1/openapi.json","type":"application/json"}],"status":[{"href":"/v1/health","type":"application/json"}]}]}
 
-```bash
-# 1. Обычный: сети не касается вовсе, разбор проверяется на
-#    замороженных образцах ответов. Этот режим идёт в CI.
-nix develop -c cargo test --workspace
+$ curl -sS http://127.0.0.1:8080/v1/health
+{"status":"ok","schema_version":11,"projection_version":8}
 
-# 2. Песочница: настоящий шлюз брокера, настоящий заведённый доступ.
-#    Отвечает не «правильно ли мы разбираем», а «не изменился ли мир».
-IAAM_DATABASE=... IAAM_BROKER_KEY_FILE=...   nix develop -c cargo test -p iaam-broker --features sandbox
+$ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/actions
+{"policy_version":1,"items":[{"id":"create_first_account","kind":"create_first_account","category":"blocking","state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered.","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}]}
 ```
 
-Второй режим требует заведённого доступа и **падает**, если его нет:
-режим запрошен явно, и молчаливый пропуск был бы враньём зелёного
-прогона.
+The first call is the discovery document (RFC 9727) and the entry point for an
+arriving agent: it links the machine-readable contract at `/v1/openapi.json` and
+the status route. The second proves the process is up; check `"status":"ok"`
+rather than the version numbers, which move with the build.
 
-`--all-features` в прогонах не используйте: она включит режим песочницы
-и превратит любой прогон в поход в интернет.
+The third is the proof. It authenticated a token that only a console could have
+issued, read the store, and resolved the action's address from the routes the
+server actually registered — transport, storage and the trust root in one
+answer. On a freshly claimed instance the queue holds exactly the item above,
+and an agent's work starts there rather than in any document a human maintains.
 
-## HTTPS
+**On failure** — `{"code":"unauthorized", …}` means the header is missing,
+misspelled or carries a revoked token; §7 issues a new one, and only a console
+can issue an owner token. `Connection refused` means the service is not
+listening where you are asking: on the container route compare `docker port iaam`
+with the URL, and see §11 for the `IAAM_LISTEN` case.
 
-Сервис слушает HTTP на петлевом интерфейсе. TLS терминирует реверс-прокси
-(nginx, Caddy). Пример для Caddy:
+---
+
+## 6. Broker access
+
+A broker token grants access to a real account, so the database holds only
+ciphertext and the key lives outside the database. `serve` reads the key; only
+the console writes credentials.
+
+### 6.1 Create the key
+
+Container route:
+
+```console
+$ sudo install --directory --owner 10001 --group 10001 --mode 0700 /etc/iaam
+$ docker run --rm \
+    --mount type=bind,source=/etc/iaam,target=/etc/iaam \
+    --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
+    --env IAAM_DATABASE=/var/lib/iaam/iaam.db \
+    --env IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key \
+    iaam:0.1.0 broker key generate
+key created: /etc/iaam/broker-key
+$ sudo stat --format '%a' /etc/iaam/broker-key
+600
+```
+
+Binary route:
+
+```console
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db \
+      IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key iaam broker key generate
+key created: /etc/iaam/broker-key
+```
+
+The key is never printed and never returned: what nobody saw cannot be forwarded
+or saved in the wrong place. An existing file is never overwritten —
+
+```console
+$ … iaam broker key generate
+error: key file /etc/iaam/broker-key already exists: overwriting it would make every configured access unreadable
+```
+
+— because a new key on top of an old one makes every configured access
+undecryptable, silently and permanently.
+
+Create the key **before** the service reads it, and then restart the service so
+it picks it up: §3.6 with the key mounted, or `systemctl restart iaam`.
+
+### 6.2 Point the running service at the key
+
+Container route: add to the `docker run` of §3.6, mounting the key read-only
+because `serve` only reads it.
+
+```
+    --mount type=bind,source=/etc/iaam/broker-key,target=/etc/iaam/broker-key,readonly \
+    --env IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key \
+```
+
+Check:
+
+```console
+$ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/broker-access
+[]
+```
+
+`[]` is success on an instance with no credentials yet. The failure to look for
+is this one:
+
+```console
+{"code":"not_configured","message":"broker access encryption is not configured: set IAAM_BROKER_KEY_FILE and restart the server"}
+```
+
+It means the running process was started without the key. The fix is the
+restart, not a different call.
+
+### 6.3 Provision a credential
+
+The token is read from standard input, never from an argument: the process list
+is visible to the whole machine and shell history outlives the session.
+
+```console
+$ docker run --rm --interactive \
+    --mount type=bind,source=/etc/iaam/broker-key,target=/etc/iaam/broker-key,readonly \
+    --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
+    --env IAAM_DATABASE=/var/lib/iaam/iaam.db \
+    --env IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key \
+    iaam:0.1.0 broker access add --broker tinkoff --environment sandbox
+paste the broker token and finish input (Ctrl-D):
+broker access tinkoff (sandbox) provisioned: f4df6218-…
+```
+
+Binary route: the same arguments after
+`sudo -u iaam env IAAM_DATABASE=… IAAM_BROKER_KEY_FILE=… iaam`.
+
+`--interactive` is required on the container route; without it there is no
+standard input to paste into. `--environment` has no default because tokens
+differ between `prod` and `sandbox`, and using the wrong one produces a gateway
+rejection whose message does not mention the environment.
+
+The token requested from the broker is **read-only**. The scope is recorded
+beside the access and parsed before every call, so a record promising trading
+rights is refused rather than used — but the broker is not asked to confirm it.
+Issue a trading token and the system will not notice.
+
+Check that the plaintext did not reach the database, the same way the test does:
+
+```console
+$ sudo grep -a "<first characters of the token>" /var/lib/iaam/iaam.db && echo LEAK || echo clean
+clean
+```
+
+### 6.4 Replace a credential
+
+When the broker's token is replaced, do not send the new one over HTTP — no
+route accepts it. Replace it across the same console boundary:
+
+```console
+$ … iaam broker access rotate --broker tinkoff --environment sandbox
+paste the broker token and finish input (Ctrl-D):
+broker access tinkoff (sandbox) replaced: f4df6218-…
+```
+
+The ciphertext of the active access is updated in place: its identifier and
+history survive, the arguments carry only the broker and the environment, and
+the plaintext exists only until it is encrypted.
+
+### 6.5 Rotate the key
+
+The command takes two files that already exist: the old key and a new one
+created beforehand. It decrypts every `broker_access` row, including revoked
+ones, and replaces them in a single transaction.
+
+```console
+$ … IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key.next iaam broker key generate
+key created: /etc/iaam/broker-key.next
+$ … iaam broker key rotate --old /etc/iaam/broker-key --new /etc/iaam/broker-key.next
+broker accesses re-encrypted: 1
+```
+
+The command replaces no files and deletes none. **Keep a backup of the old key
+until the command has succeeded and access has been verified**: on failure the
+old rows remain under the old key. Only then point the service at the new file
+and restart it, and do not delete the backup until a restore from it has been
+confirmed.
+
+Losing the key is not recoverable from the database: it holds ciphertext only,
+and a new key does not decrypt old rows. A copy of `IAAM_DATABASE` alone is
+therefore not a restore. If the old key is gone, do not create a new one over
+the old file and do not promise recovery: new credentials can be provisioned,
+old ciphertext cannot be read.
+
+### 6.6 Delivering the key in production
+
+Not through an environment variable: its value is readable in
+`/proc/<pid>/environ` by the same user and is inherited by every child process.
+On the binary route, systemd credentials are the mechanism, and the unit in §4.5
+already uses them. `%d` is the credentials directory — ramfs, mode `0400`, owned
+by the service user, invisible to other users, not inherited by children, absent
+from the process list. `/etc/iaam/broker-key` itself stays owned by `root` with
+mode `0600`; the service reads it through systemd rather than directly.
+
+Where a TPM is present the key need not sit on disk in the clear:
+
+```console
+$ sudo systemd-creds encrypt --with-key=host+tpm2 /etc/iaam/broker-key /etc/iaam/broker-key.cred
+```
+
+and `SetCredentialEncrypted=broker-key:…` replaces `LoadCredential=` in the
+unit. A stolen disk or backup then yields nothing, and restarts stay automatic.
+A TPM is optional; without one the variant above works and protects against
+theft of the database file just as well. When a TPM appears, one line of the
+unit changes and no code does.
+
+### 6.7 What none of this closes
+
+Nothing protects against `root` on a running machine. Root reads process memory,
+reads the credentials directory, and failing both can simply ask the service to
+call the broker. That is a property of the problem: a program that can decrypt
+without a human will decrypt for whoever owns it. The only way to exclude it is
+to derive the key from a passphrase entered at every start, which costs
+unattended restarts and does not exist here. The damage is bounded by
+construction instead: the token has no trading rights.
+
+---
+
+## 7. Tokens
+
+A token is presented as `Authorization: Bearer <token>`. Every issued token is
+shown **once**; the database holds only its hash and there is nowhere to show it
+from again.
+
+### 7.1 Issue a token for an agent
+
+The owner token issues the rest over the API:
+
+```console
+$ curl -sS -X POST http://127.0.0.1:8080/v1/tokens \
+    -H "authorization: Bearer $OWNER" -H 'content-type: application/json' \
+    -d '{"label": "home agent", "scope": "agent"}'
+{"id":"8b0f5714-…","token":"0d69…","label":"home agent","scope":"agent"}
+```
+
+| Scope | May |
+|---|---|
+| `owner` | everything, including token and broker-access administration |
+| `agent` | submit events and read |
+| `read_only` | read |
+
+The `owner` scope cannot be issued over the API:
+
+```console
+$ curl -sS -X POST http://127.0.0.1:8080/v1/tokens -H "authorization: Bearer $OWNER" \
+    -H 'content-type: application/json' -d '{"label": "second", "scope": "owner"}'
+{"code":"invalid_request","message":"an owner token cannot be issued via the API: the owner is created with `iaam claim --label <label>`","field":"scope","expected":"agent or read_only","actual":"owner"}
+```
+
+Otherwise a stolen owner token could immediately copy itself into
+indistinguishable duplicates, and revoking the original would change nothing.
+
+Give the issued token to the agent through its host's configuration — an
+injected header the model cannot print — and not by pasting it into a
+conversation. ADR-0003 §2 draws that line and explains why the distinction is
+between the model's context and the host's configuration.
+
+### 7.2 List and revoke
+
+```console
+$ curl -sS http://127.0.0.1:8080/v1/tokens -H "authorization: Bearer $OWNER"
+[{"id":"9520643a-…","label":"console","scope":"owner","created_at":"…","revoked_at":null}, …]
+
+$ curl -sS -X DELETE http://127.0.0.1:8080/v1/tokens/8b0f5714-… \
+    -H "authorization: Bearer $OWNER" -o /dev/null -w 'HTTP %{http_code}\n'
+HTTP 204
+```
+
+Labels and scopes are listed; tokens and hashes are not, and cannot be — the
+hash is all an attacker would need. Revoked tokens stay in the list, because
+"when did this token stop working" is a question that needs an answer. A revoked
+token is then indistinguishable from an unknown one: both get `401`.
+
+### 7.3 A lost owner token
+
+Recovery is by console, and only by console:
+
+```console
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam token issue --label console --scope owner
+1f0c…
+```
+
+On the container route, the `docker run` form of §3.5 with
+`token issue --label console --scope owner` in place of `claim`. The command
+takes the single existing owner from the database, prints a new owner token once
+and exits without starting a server. On an empty database it refuses:
+
+```console
+error: instance has no owner: run `iaam claim --label <label>` first
+```
+
+The lost token is **not** revoked by this: revoke it with
+`DELETE /v1/tokens/{id}`, or it keeps working.
+
+---
+
+## 8. In front of the service
+
+### 8.1 TLS
+
+The service speaks plain HTTP on the loopback interface. TLS is terminated by a
+reverse proxy:
 
 ```
 iaam.example.com {
@@ -303,26 +704,102 @@ iaam.example.com {
 }
 ```
 
-Без прокси токен уходит по сети открытым текстом. Это единственная
-причина, по которой прокси обязателен.
+Without a proxy the bearer token crosses the network in clear text. That is the
+only reason the proxy is mandatory, and it is sufficient.
 
-## Ограничение частоты
+### 8.2 Rate limiting
 
-Встроенный ограничитель — фиксированное окно на токен внутри процесса.
-Он защищает от зациклившегося агента, **но не от распределённой нагрузки
-и не от злоумышленника**: состояние не делится между процессами и
-сбрасывается при перезапуске. Ограничение на уровне прокси остаётся
-обязательным.
+The built-in limiter is a fixed window per token inside one process. It protects
+against an agent stuck in a loop; it does not protect against distributed load
+or an attacker, because its state is not shared between processes and is lost on
+restart. A limit at the proxy remains mandatory.
 
-## Бэкап
+---
 
-Копия файла базы не является полноценным бэкапом: она привязана к версии
-схемы и к платформе. Регулярно выгружайте архивный бандл — он переносим
-и проверяется контрольной суммой при импорте.
+## 9. Backup
 
-```bash
-sqlite3 "$IAAM_DATABASE" ".backup /var/backups/iaam-$(date +%F).db"
+```console
+$ sudo -u iaam sqlite3 /var/lib/iaam/iaam.db ".backup /var/backups/iaam-$(date +%F).db"
+$ ls -l /var/backups/
 ```
 
-Файл базы содержит весь журнал фактов. Обращайтесь с ним как с выпиской
-из банка.
+A copy of the database file is not a complete backup: it is tied to a schema
+version and to a platform. Export the archive bundle regularly — it is portable
+and its checksum is verified on import.
+
+The database file contains the entire journal of facts. Handle it like a bank
+statement. Back up the broker key separately and to a different place (§6.5); a
+backup of the database without the key restores the record but not the access.
+
+---
+
+## 10. Two check modes
+
+```console
+$ nix develop -c cargo nextest run --workspace
+```
+
+touches no network: parsing is checked against frozen sample responses, and this
+is the mode CI runs.
+
+```console
+$ IAAM_DATABASE=… IAAM_BROKER_KEY_FILE=… nix develop -c cargo test -p iaam-broker --features sandbox
+```
+
+uses the broker's real sandbox gateway and a real configured access. It answers
+a different question — is the gateway alive, is the embedded trust anchor still
+valid, is the configured access accepted — and it **fails** when no access is
+configured, because the mode was requested explicitly and a silent skip would be
+a lie told by a green run.
+
+The sandbox does not check the report channel: `GetBrokerReport` exists only on
+the production contour. Sandbox and production accesses live side by side,
+distinguished by `environment`, with one active access per owner + broker +
+environment; the live check takes the sandbox access explicitly and never uses
+the production one.
+
+Never pass `--all-features`: it enables the sandbox feature and turns any run
+into a trip to the internet.
+
+---
+
+## 11. Failure index
+
+Every message below is printed by the program. The right-hand column says who
+supplies what is missing and with which command.
+
+| Message | Meaning | Fix |
+|---|---|---|
+| `error: variable IAAM_DATABASE is not set; set it (allowed values: database file path)` | no database path given; there is no default | whoever writes the run command: add `--env IAAM_DATABASE=/var/lib/iaam/iaam.db` or `Environment=IAAM_DATABASE=…` |
+| `error: variable IAAM_LISTEN is invalid: 8080; allowed values: socket address such as 127.0.0.1:8080` | a port without a host | use `0.0.0.0:8080` in a container, `127.0.0.1:8080` on a host |
+| ``error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue` `` | a retired provisioning variable is set (§2.4) | remove it from the unit, profile or compose file and run the subcommand |
+| `error: instance is already claimed` | the database already has an owner | expected on a second `claim`; for a new token use `iaam token issue --scope owner` (§7.3) |
+| ``error: instance has no owner: run `iaam claim --label <label>` first`` | `token issue` against an empty database | run `iaam claim --label console` (§3.5, §4.4) |
+| ``error: key file /etc/iaam/broker-key not found; run `iaam broker key generate` `` | `IAAM_BROKER_KEY_FILE` points at nothing | the owner, at a console: §6.1 |
+| `error: key file … already exists: overwriting it would make every configured access unreadable` | `broker key generate` over an existing key | none needed; to change keys use `broker key rotate` (§6.5) |
+| `error: key file … exists but is unreadable or has an invalid format` | wrong file, or a damaged key | restore the key from backup. Do **not** create a new one over it |
+| `error: SQLite error: unable to open database file: /var/lib/iaam/iaam.db` | the data directory is not writable by the process's uid | the machine's administrator: `sudo chown 10001:10001 /var/lib/iaam` (container) or `sudo chown iaam:iaam /var/lib/iaam` (host) |
+| `{"code":"unauthorized", …}` (401) | header missing, or the token is unknown or revoked | §7.1 for an agent token; §7.3 for an owner token |
+| `{"code":"not_configured","message":"broker access encryption is not configured: …"}` | the server was started without `IAAM_BROKER_KEY_FILE` | restart it with the key mounted: §6.2 |
+| `{"code":"invalid_request","message":"an owner token cannot be issued via the API: …"}` (422) | `scope: owner` requested over HTTP | by design; issue it at the console (§7.3) |
+| `Connection refused` from curl | nothing is listening at that address | container: `IAAM_LISTEN` left at the loopback default while publishing a port (§3.6). Host: `systemctl is-active iaam` |
+
+---
+
+## 12. Why there is no compose file
+
+A compose file committed to this repository would be the natural place to write
+down the host database path, the key file path and the published address — which
+are exactly the run-time inputs that must stay outside it (§2.3). The
+`docker run` commands above carry those values as arguments, where they are
+visible at the moment somebody chooses them, and no committed file accumulates a
+default that nobody meant to publish.
+
+The one-shot administrative commands are the second reason: `claim`,
+`token issue` and `broker access add` are interactive, run once, and read a
+secret from standard input. `docker compose run` adds a layer of indirection
+around each of them and buys nothing, since there is exactly one long-running
+service to orchestrate.
+
+An operator who wants compose can write one outside this repository from §3.6;
+nothing in the image depends on its absence.

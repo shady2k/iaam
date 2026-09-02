@@ -99,6 +99,21 @@ pub enum ActionInvariantError {
     ReadyWithoutOperation,
 }
 
+/// What an action is, apart from its prose and its target.
+///
+/// Packaged as a struct rather than five arguments: `id` and `reason` are both
+/// strings and would sit next to each other in a call, where swapping them is
+/// easy and noticing it is not. The same reasoning as `Posting` in the core's
+/// test support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionFacts {
+    pub id: String,
+    pub kind: ActionKind,
+    pub category: ActionCategory,
+    pub state: ActionState,
+    pub required_scope: Scope,
+}
+
 /// One outstanding item in the owner's computed policy frontier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Action {
@@ -114,24 +129,23 @@ pub struct Action {
 impl Action {
     /// Construct an action while rejecting a ready item without an operation.
     pub fn new(
-        id: impl Into<String>,
-        kind: ActionKind,
-        category: ActionCategory,
-        state: ActionState,
+        facts: ActionFacts,
         reason: impl Into<String>,
-        required_scope: Scope,
         target: ActionTarget,
     ) -> Result<Self, ActionInvariantError> {
-        if matches!((state, &target), (ActionState::Ready, ActionTarget::None)) {
+        if matches!(
+            (facts.state, &target),
+            (ActionState::Ready, ActionTarget::None)
+        ) {
             return Err(ActionInvariantError::ReadyWithoutOperation);
         }
         Ok(Self {
-            id: id.into(),
-            kind,
-            category,
-            state,
+            id: facts.id,
+            kind: facts.kind,
+            category: facts.category,
+            state: facts.state,
             reason: reason.into(),
-            required_scope,
+            required_scope: facts.required_scope,
             target,
         })
     }
@@ -218,12 +232,14 @@ fn contour_completion(contours: &[ContourView]) -> bool {
 
 fn first_account_action() -> Action {
     Action::new(
-        identity(ActionKind::CreateFirstAccount),
-        ActionKind::CreateFirstAccount,
-        ActionCategory::Blocking,
-        ActionState::NeedsOwnerInput,
+        ActionFacts {
+            id: identity(ActionKind::CreateFirstAccount),
+            kind: ActionKind::CreateFirstAccount,
+            category: ActionCategory::Blocking,
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Scope::Owner,
+        },
         "No account exists; create one before portfolio actions can be offered.",
-        Scope::Owner,
         ActionTarget::Operation {
             operation: OperationKey::CreateAccount,
             request: RequestPlan {
@@ -250,12 +266,14 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
     candidates.sort_by_key(|candidate| candidate.id.inner());
 
     Action::new(
-        identity(ActionKind::CreateFirstContour),
-        ActionKind::CreateFirstContour,
-        ActionCategory::RequiredForGoal,
-        ActionState::NeedsOwnerInput,
+        ActionFacts {
+            id: identity(ActionKind::CreateFirstContour),
+            kind: ActionKind::CreateFirstContour,
+            category: ActionCategory::RequiredForGoal,
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Scope::Owner,
+        },
         "No contour exists; report boundaries cannot be computed until one is created.",
-        Scope::Owner,
         ActionTarget::Operation {
             operation: OperationKey::CreateContour,
             request: RequestPlan {
@@ -440,12 +458,14 @@ mod tests {
     #[test]
     fn a_ready_action_requires_an_operation_target() {
         let result = Action::new(
+            ActionFacts {
+                id: "invalid".to_owned(),
+                kind: ActionKind::CreateFirstAccount,
+                category: ActionCategory::Blocking,
+                state: ActionState::Ready,
+                required_scope: Scope::Owner,
+            },
             "invalid",
-            ActionKind::CreateFirstAccount,
-            ActionCategory::Blocking,
-            ActionState::Ready,
-            "invalid",
-            Scope::Owner,
             ActionTarget::None,
         );
 

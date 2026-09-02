@@ -249,6 +249,57 @@ fn a_contour_version_cannot_be_edited_in_place() {
         Some(ContourVersion(1))
     );
 }
+#[test]
+fn list_contours_returns_latest_version_per_owner_and_contour() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let other_owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let contour = ContourId::new_random();
+    let other_contour = ContourId::new_random();
+
+    store
+        .upsert_account(&AccountRecord {
+            id: account,
+            owner,
+            title: "Main".into(),
+            institution: None,
+        })
+        .unwrap();
+
+    for version in [1, 2] {
+        let definition = ContourDefinition::new(contour, ContourVersion(version), [account]);
+        store
+            .insert_contour_version(owner, &definition, "Main", &[account])
+            .unwrap();
+    }
+    let empty = ContourDefinition::new(other_contour, ContourVersion(1), []);
+    store
+        .insert_contour_version(owner, &empty, "Savings", &[])
+        .unwrap();
+    let foreign = ContourDefinition::new(contour, ContourVersion(7), []);
+    store
+        .insert_contour_version(other_owner, &foreign, "Main", &[])
+        .unwrap();
+
+    let listed = store.list_contours(owner).unwrap();
+
+    assert_eq!(listed.len(), 2);
+    assert!(
+        listed
+            .iter()
+            .any(|entry| entry.id == contour && entry.version == ContourVersion(2))
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|entry| entry.id == other_contour && entry.version == ContourVersion(1))
+    );
+    let foreign_list = store.list_contours(other_owner).unwrap();
+    assert_eq!(foreign_list.len(), 1);
+    assert_eq!(foreign_list[0].id, foreign.id());
+    assert_eq!(foreign_list[0].version, ContourVersion(7));
+}
 
 #[test]
 fn accounts_round_trip() {

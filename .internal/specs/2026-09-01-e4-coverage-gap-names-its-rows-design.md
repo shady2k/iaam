@@ -276,12 +276,15 @@ not change whether individual claims match (`:344`).
 
 ### 7. Both collectors read the effective set
 
-`build_with` computes `resolve(events)` and then passes the **raw** slice to
-both `collect_groups` and `collect_coverage_gaps`
-(`crates/iaam-core/src/reconciliation/mod.rs:220-222`). Groups, gaps and
-resolutions must all be collected from the effective set. The `collect_groups`
-half is an independent live defect — a reversed control assertion still produces
-evidence — tracked as iaam-ueo1.
+Groups, gaps and resolutions must all be collected from the effective set.
+
+**Landed ahead of this epic (iaam-ueo1).** `build_with` computed
+`resolve(events)` and then passed the **raw** slice to both `collect_groups` and
+`collect_coverage_gaps`; both now take `&[&Event]` and receive the effective
+set. That was an independent live defect: a reversed control assertion still
+formed a group, and — a reversal carrying the kind of its target — asserted its
+claim twice. What remains here is the third collector, resolutions, which must
+read the same set when it exists.
 
 ### 8. Who writes what, and in which order
 
@@ -347,8 +350,8 @@ the owner to find a second data source instead of finishing the import.
 4. `sync_broker` fills `rows` from **both** refusal layers — the adapter's
    quarantine list and the normalisation rejections added by iaam-bl07 — and
    appends resolutions for rows it disposes of, facts first.
-5. Reconciliation: both collectors read the effective set (closes iaam-ueo1);
-   the resolution rule; taint as a first-class ledger constraint over
+5. Reconciliation: the resolution collector reads the effective set as the
+   other two already do (iaam-ueo1); the resolution rule; taint as a first-class ledger constraint over
    overlapping periods; `with_external_evidence` cannot bypass it.
 6. The owner's repair path: read outstanding rows, and a repair that names the
    row key it disposes of, under truthful manual provenance.

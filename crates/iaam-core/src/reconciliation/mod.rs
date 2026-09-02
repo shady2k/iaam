@@ -218,8 +218,12 @@ impl ReconciliationLedger {
         exceptions: &crate::perimeter::PerimeterExceptions,
     ) -> Result<Self, ObserveError> {
         let effective_events = resolve(events)?;
-        let groups = collect_groups(events);
-        let gaps = collect_coverage_gaps(events);
+        // The evidence is built from the effective set, exactly as the projection
+        // is: a retracted assertion that still formed a group would keep
+        // confirming the interval it was withdrawn from, and — a reversal
+        // carrying the kind of its target — would assert it twice.
+        let groups = collect_groups(&effective_events);
+        let gaps = collect_coverage_gaps(&effective_events);
         let tainted: Vec<BTreeSet<Dimension>> = groups
             .iter()
             .map(|group| tainted_dimensions(group, &gaps))
@@ -351,7 +355,7 @@ fn apply_exceptions(
     }
 }
 
-fn collect_groups(events: &[Event]) -> Vec<StatementGroup> {
+fn collect_groups(events: &[&Event]) -> Vec<StatementGroup> {
     let mut groups: Vec<StatementGroup> = Vec::new();
     for event in events {
         let EventKind::ControlAssertion { period, claim } = event.kind else {
@@ -387,7 +391,7 @@ struct CoverageGap {
     dimensions: BTreeSet<Dimension>,
 }
 
-fn collect_coverage_gaps(events: &[Event]) -> Vec<CoverageGap> {
+fn collect_coverage_gaps(events: &[&Event]) -> Vec<CoverageGap> {
     events
         .iter()
         .filter_map(|event| {

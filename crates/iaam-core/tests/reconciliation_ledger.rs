@@ -1,12 +1,11 @@
 //! Account completeness status over an interval, by dimension (§10.3).
 use std::collections::BTreeSet;
 
-use iaam_core::event::Event;
-use iaam_core::event::EventValidationError;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
-use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId};
+use iaam_core::event::{Event, EventValidationError, Relation};
+use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::reconciliation::check::ClaimOutcome;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -880,5 +879,70 @@ fn a_status_carries_the_grounds_that_produced_it() {
         status.outcomes().len(),
         3,
         "all three verified assertions remain visible"
+    );
+}
+
+/// The same event, retracted.
+///
+/// A reversal carries the kind and the legs of what it withdraws (§4.8), which
+/// is why a reversed control assertion is not merely still present in the raw
+/// journal but present twice.
+fn reversal_of(event: &Event) -> Event {
+    let mut reversal = event.clone();
+    reversal.id = EventId::new_random();
+    reversal.relation = Relation::Reversal { target: event.id };
+    reversal
+}
+
+#[test]
+fn a_reversed_control_assertion_no_longer_confirms() {
+    let (_owner, account, _instrument, _custody, _channel, mut events) = seeded_journal();
+    assert_eq!(
+        ReconciliationLedger::build(&events).unwrap().status_for(
+            account,
+            date!(2026 - 03 - 15),
+            Dimension::Cash
+        ),
+        DimensionStatus::AcceptedIndependent,
+        "the unretracted journal confirms; without this the test proves nothing"
+    );
+
+    let reversals: Vec<Event> = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
+        .map(reversal_of)
+        .collect();
+    events.extend(reversals);
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        DimensionStatus::Provisional,
+        "a retracted assertion must withdraw the confirmation it produced"
+    );
+}
+
+#[test]
+fn a_reversed_coverage_gap_stops_withholding_confirmation() {
+    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    let gap = coverage_gap(
+        &channel_with_document(&first_channel, "gap"),
+        AssertionScope {
+            owner,
+            account,
+            period: march(),
+        },
+        [Dimension::Cash],
+        1,
+        vec![],
+    );
+    events.push(reversal_of(&gap));
+    events.push(gap);
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        DimensionStatus::AcceptedIndependent,
+        "a retracted gap withholds nothing: it is not part of the journal that counts"
     );
 }

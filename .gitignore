@@ -28,3 +28,6 @@ __pycache__/
 
 # Отчёт покрытия: артефакт `make coverage`, а не исходник.
 lcov.info
+
+# Subagent worktrees created by the agent harness inside the checkout.
+.claude/worktrees/

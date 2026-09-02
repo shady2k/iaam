@@ -9,6 +9,7 @@ use iaam_core::ids::{
 use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::ControlClaim;
+use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::rules::LotRuleVersion;
 use iaam_http::HttpRequest;
@@ -87,6 +88,25 @@ pub struct ContourView {
     pub id: ContourId,
     pub version: ContourVersion,
 }
+
+/// Per-account business activity projected by the journal store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountActivityView {
+    pub account: AccountId,
+    pub has_business_fact: bool,
+    pub first_effective_date: Option<Date>,
+    pub last_effective_date: Option<Date>,
+}
+
+/// One control assertion's matching dimensions, projected without its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlAssertionView {
+    pub account: AccountId,
+    pub period: AssertionPeriod,
+    pub point: Option<BalancePoint>,
+    pub dimension: Dimension,
+}
+
 /// Instrument as seen by the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentView {
@@ -229,6 +249,15 @@ pub trait Store: Send + Sync {
     async fn upsert_account(&self, owner: OwnerId, account: AccountView) -> Result<(), AppError>;
     async fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourView>, AppError>;
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;
+    async fn list_account_activity(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountActivityView>, AppError>;
+    async fn list_control_assertions(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<Vec<ControlAssertionView>, AppError>;
 
     async fn save_snapshot(&self, owner: OwnerId, snapshot: Snapshot) -> Result<(), AppError>;
     async fn load_snapshot(

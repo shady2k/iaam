@@ -1,12 +1,15 @@
 //! Fact log: recording and reading.
 
 use iaam_core::dates::EffectiveOrder;
+use iaam_core::event::kind::{CONTROL_ASSERTION_KIND, EventKind, IMPORT_COVERAGE_GAP_KIND};
 use iaam_core::event::{Event, Relation};
-use iaam_core::ids::{EventId, OwnerId};
+use iaam_core::ids::{AccountId, EventId, OwnerId};
+use iaam_core::reconciliation::Dimension;
+use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::IdentityScope;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
+use time::format_description::well_known::{Iso8601, Rfc3339};
+use time::{Date, OffsetDateTime};
 
 use crate::{SqliteStore, StoreError};
 
@@ -19,6 +22,24 @@ use crate::{SqliteStore, StoreError};
 pub enum Appended {
     Inserted { id: EventId },
     Duplicate { existing: EventId },
+}
+
+/// Activity bounds for one account, excluding bookkeeping events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountActivityRecord {
+    pub account: AccountId,
+    pub has_business_fact: bool,
+    pub first_effective_date: Option<Date>,
+    pub last_effective_date: Option<Date>,
+}
+
+/// The state needed to match one control assertion without loading the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlAssertionRecord {
+    pub account: AccountId,
+    pub period: AssertionPeriod,
+    pub point: Option<BalancePoint>,
+    pub dimension: Dimension,
 }
 
 impl SqliteStore {
@@ -124,6 +145,93 @@ impl SqliteStore {
         )
     }
 
+    /// Summarise every owned account without loading its journal events.
+    pub fn list_account_activity(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountActivityRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT a.id, COUNT(e.id), MIN(e.effective_date), MAX(e.effective_date)
+             FROM accounts AS a
+             LEFT JOIN events AS e
+               ON e.owner = a.owner
+              AND e.account = a.id
+              AND e.kind NOT IN (?2, ?3)
+             WHERE a.owner = ?1
+             GROUP BY a.id
+             ORDER BY a.id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                owner.inner().to_string(),
+                CONTROL_ASSERTION_KIND,
+                IMPORT_COVERAGE_GAP_KIND
+            ],
+            |row| {
+                let id: String = row.get(0)?;
+                let first: Option<String> = row.get(2)?;
+                let last: Option<String> = row.get(3)?;
+                Ok((id, row.get::<_, i64>(1)? > 0, first, last))
+            },
+        )?;
+        let mut activity = Vec::new();
+        for row in rows {
+            let (id, has_business_fact, first, last) = row?;
+            activity.push(AccountActivityRecord {
+                account: AccountId(parse_uuid(&id, "account")?),
+                has_business_fact,
+                first_effective_date: first.as_deref().map(parse_date).transpose()?,
+                last_effective_date: last.as_deref().map(parse_date).transpose()?,
+            });
+        }
+        Ok(activity)
+    }
+
+    /// List only an account's control assertions; payload matching stays in Rust.
+    pub fn list_control_assertions(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<Vec<ControlAssertionRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, payload
+             FROM events
+             WHERE owner = ?1 AND account = ?2 AND kind = ?3
+             ORDER BY effective_date, sequence, id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                owner.inner().to_string(),
+                account.inner().to_string(),
+                CONTROL_ASSERTION_KIND
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut assertions = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            let event: Event = serde_json::from_str(&payload)
+                .map_err(|source| StoreError::EventDecode { id, source })?;
+            let EventKind::ControlAssertion { period, claim } = event.kind else {
+                continue;
+            };
+            let point = match &claim {
+                iaam_core::reconciliation::claim::ControlClaim::CashBalance { at, .. }
+                | iaam_core::reconciliation::claim::ControlClaim::PositionQuantity { at, .. } => {
+                    Some(*at)
+                }
+                _ => None,
+            };
+            assertions.push(ControlAssertionRecord {
+                account: event.account,
+                period,
+                point,
+                dimension: claim.dimension(),
+            });
+        }
+        Ok(assertions)
+    }
+
     fn query_events(
         &self,
         sql: &str,
@@ -142,6 +250,20 @@ impl SqliteStore {
         }
         Ok(events)
     }
+}
+
+fn parse_uuid(value: &str, what: &'static str) -> Result<uuid::Uuid, StoreError> {
+    uuid::Uuid::parse_str(value).map_err(|_| StoreError::NotFound {
+        what,
+        id: value.to_owned(),
+    })
+}
+
+fn parse_date(value: &str) -> Result<Date, StoreError> {
+    Date::parse(value, &Iso8601::DATE).map_err(|_| StoreError::InvalidValue {
+        field: "effective_date",
+        value: value.to_owned(),
+    })
 }
 
 /// Insert an event. The body is factored out of the public methods: both write paths

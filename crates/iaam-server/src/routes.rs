@@ -74,6 +74,7 @@ use iaam_app::scenarios::documents::UploadedDocument;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
+pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 
 /// The computed actions currently blocking or advancing owner setup.
 #[utoipa::path(
@@ -108,6 +109,7 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
                 path: resolved.path.clone(),
                 request_schema: resolved.request_schema.clone(),
                 request: RequestPlanDto {
+                    preset: request.preset.clone(),
                     missing: request
                         .missing
                         .iter()
@@ -430,6 +432,7 @@ pub async fn reconciliation(
 #[utoipa::path(
     post,
     path = "/v1/reconciliation/balance",
+    operation_id = RECORD_OWNER_BALANCE_OPERATION_ID,
     request_body = OwnerBalanceRequest,
     responses(
         (status = 200, description = "Updated statuses", body = Vec<ReconciliationStatusDto>),

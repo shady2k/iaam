@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
-    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView,
-    CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
-    CustodyView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, Principal,
-    Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    AccountActivityView, AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel,
+    BrokerChannelFactory, BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert,
+    CategoryRuleView, CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView,
+    ContourView, ControlAssertionView, CustodyView, InstrumentDirectory, InstrumentUpsert,
+    InstrumentView, IssuedToken, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin,
+    TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -36,7 +37,7 @@ use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::categories::NewCategoryRule;
 use iaam_store::documents::BrokerCode;
-use iaam_store::events::Appended;
+use iaam_store::events::{AccountActivityRecord, Appended, ControlAssertionRecord};
 use iaam_store::reference::{AccountRecord, AliasRecord, ContourRecord, InstrumentRecord};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
@@ -312,6 +313,47 @@ impl Store for SqliteAdapter {
                     id: record.id,
                     title: record.title,
                     institution: record.institution,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    async fn list_account_activity(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountActivityView>, AppError> {
+        self.blocking(move |store| {
+            let activity = store.list_account_activity(owner).map_err(store_error)?;
+            Ok(activity
+                .into_iter()
+                .map(|record: AccountActivityRecord| AccountActivityView {
+                    account: record.account,
+                    has_business_fact: record.has_business_fact,
+                    first_effective_date: record.first_effective_date,
+                    last_effective_date: record.last_effective_date,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    async fn list_control_assertions(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<Vec<ControlAssertionView>, AppError> {
+        self.blocking(move |store| {
+            let assertions = store
+                .list_control_assertions(owner, account)
+                .map_err(store_error)?;
+            Ok(assertions
+                .into_iter()
+                .map(|record: ControlAssertionRecord| ControlAssertionView {
+                    account: record.account,
+                    period: record.period,
+                    point: record.point,
+                    dimension: record.dimension,
                 })
                 .collect())
         })

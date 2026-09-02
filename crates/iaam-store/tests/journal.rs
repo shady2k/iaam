@@ -7,9 +7,13 @@ use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_core::reconciliation::Dimension;
+use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
-use iaam_store::events::Appended;
+use iaam_store::events::{AccountActivityRecord, Appended};
+use iaam_store::reference::AccountRecord;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -74,6 +78,25 @@ impl Ctx {
             idempotency_key: None,
         }
     }
+}
+
+fn insert_account(store: &SqliteStore, ctx: &Ctx) {
+    store
+        .upsert_account(&AccountRecord {
+            id: ctx.account,
+            owner: ctx.owner,
+            title: "Main".into(),
+            institution: Some("Savings".into()),
+        })
+        .unwrap();
+}
+
+fn bookkeeping_event(ctx: &Ctx, sequence: u32, kind: EventKind) -> Event {
+    let mut event = ctx.deposit(sequence, 100_000);
+    event.kind = kind;
+    event.dates = EventDates::empty();
+    event.legs.clear();
+    event
 }
 
 #[test]
@@ -401,4 +424,103 @@ fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
         (1..=successful_writes as u32).collect::<Vec<_>>(),
         "successful writes must occupy the sequence without gaps"
     );
+}
+
+#[test]
+fn account_activity_keeps_an_empty_owned_account() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    insert_account(&store, &ctx);
+
+    let activity = store.list_account_activity(ctx.owner).unwrap();
+    assert_eq!(
+        activity,
+        vec![AccountActivityRecord {
+            account: ctx.account,
+            has_business_fact: false,
+            first_effective_date: None,
+            last_effective_date: None,
+        }]
+    );
+    assert!(
+        store
+            .list_control_assertions(ctx.owner, ctx.account)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn account_activity_excludes_both_bookkeeping_kinds() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    insert_account(&store, &ctx);
+    let period = AssertionPeriod::between(date!(2026 - 02 - 01), date!(2026 - 02 - 28)).unwrap();
+    store
+        .append_event(
+            &bookkeeping_event(
+                &ctx,
+                1,
+                EventKind::ControlAssertion {
+                    period,
+                    claim: ControlClaim::CashBalance {
+                        currency: CurrencyCode::Rub,
+                        amount: PostedMinor::new(100_000),
+                        at: BalancePoint::Closing,
+                    },
+                },
+            ),
+            IdentityScope::Source,
+        )
+        .unwrap();
+    let mut dimensions = BTreeSet::new();
+    dimensions.insert(Dimension::Cash);
+    store
+        .append_event(
+            &bookkeeping_event(
+                &ctx,
+                2,
+                EventKind::ImportCoverageGap {
+                    period,
+                    dimensions,
+                    refused: 1,
+                    rows: Vec::new(),
+                },
+            ),
+            IdentityScope::Source,
+        )
+        .unwrap();
+
+    let activity = store.list_account_activity(ctx.owner).unwrap();
+    assert!(!activity[0].has_business_fact);
+    assert_eq!(activity[0].first_effective_date, None);
+    let assertions = store
+        .list_control_assertions(ctx.owner, ctx.account)
+        .unwrap();
+    assert_eq!(assertions.len(), 1);
+    assert_eq!(assertions[0].period, period);
+    assert_eq!(assertions[0].point, Some(BalancePoint::Closing));
+    assert_eq!(assertions[0].dimension, Dimension::Cash);
+}
+
+#[test]
+fn account_activity_reports_bounds_for_business_facts() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    insert_account(&store, &ctx);
+    let first = ctx.deposit(1, 100_000);
+    let mut last = ctx.deposit(2, 200_000);
+    last.order = EffectiveOrder::new(date!(2026 - 03 - 15), 2);
+    last.dates = EventDates::for_cash(CashPostedDate(date!(2026 - 03 - 15)));
+    store.append_event(&first, IdentityScope::Source).unwrap();
+    store.append_event(&last, IdentityScope::Source).unwrap();
+
+    let activity = store.list_account_activity(ctx.owner).unwrap();
+    assert_eq!(activity.len(), 1);
+    assert!(activity[0].has_business_fact);
+    assert_eq!(
+        activity[0].first_effective_date,
+        Some(date!(2026 - 02 - 01))
+    );
+    assert_eq!(activity[0].last_effective_date, Some(date!(2026 - 03 - 15)));
 }

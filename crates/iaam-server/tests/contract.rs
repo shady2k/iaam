@@ -5427,8 +5427,11 @@ async fn actions_endpoint_reports_the_first_contour_and_its_candidates() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let items = body["items"].as_array().expect("action items");
-    assert_eq!(items.len(), 1);
-    let item = &items[0];
+    assert_eq!(items.len(), 2);
+    let item = items
+        .iter()
+        .find(|item| item["kind"] == "create_first_contour")
+        .expect("first contour action");
     assert_eq!(item["kind"], "create_first_contour");
     assert_eq!(item["target"]["operationId"], "create_contour_version");
     assert_eq!(item["target"]["method"], "POST");
@@ -5487,6 +5490,10 @@ fn every_action_kind_resolves_to_one_matching_post_operation() {
     for (key, path) in [
         (OperationKey::CreateAccount, "/v1/accounts"),
         (OperationKey::CreateContour, "/v1/contours"),
+        (
+            OperationKey::RecordOwnerBalance,
+            "/v1/reconciliation/balance",
+        ),
     ] {
         let resolved = catalog.operation(key);
         assert_eq!(resolved.method, "POST");
@@ -5596,7 +5603,9 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
 
         for item in body["items"].as_array().expect("action items") {
             let target = &item["target"];
-            assert_eq!(target["type"], "operation");
+            if target["type"] == "none" {
+                continue;
+            }
             let schema_name = target["requestSchema"]
                 .as_str()
                 .expect("request schema reference")

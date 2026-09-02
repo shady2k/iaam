@@ -30,10 +30,14 @@ pub struct MarketPricesQuery {
 
 #[derive(Debug, Clone)]
 pub struct MarketFxQuery {
-    pub from: CurrencyCode,
-    pub to: CurrencyCode,
-    pub from_date: Date,
-    pub to_date: Date,
+    /// The currency being priced.
+    pub base: CurrencyCode,
+    /// The currency the rate is expressed in.
+    pub quote: CurrencyCode,
+    /// Inclusive start of the interval.
+    pub from: Date,
+    /// Inclusive end of the interval.
+    pub to: Date,
     pub knowledge_as_of: OffsetDateTime,
 }
 
@@ -142,17 +146,17 @@ pub async fn list_market_fx(
     services: &AppServices,
     query: MarketFxQuery,
 ) -> Result<Vec<MarketFxView>, AppError> {
-    validate_range(query.from_date, query.to_date)?;
+    validate_range(query.from, query.to)?;
     let knowledge_as_of = format_timestamp(query.knowledge_as_of)?;
-    let from_code = query.from.code().to_owned();
-    let to_code = query.to.code().to_owned();
+    let base_code = query.base.code().to_owned();
+    let quote_code = query.quote.code().to_owned();
     let series = SeriesKey {
         source_id: "cbr".to_owned(),
         dataset: "fx".to_owned(),
-        series_key: format!("{from_code}:{to_code}"),
+        series_key: format!("{base_code}:{quote_code}"),
     };
-    let from = query.from_date.to_string();
-    let to = query.to_date.to_string();
+    let from = query.from.to_string();
+    let to = query.to.to_string();
     let store = services.market_store.lock().await;
     let complete_through = store
         .complete_through_at_or_before(&series, &knowledge_as_of)
@@ -160,8 +164,8 @@ pub async fn list_market_fx(
     let rows = store
         .fx_between(
             &series,
-            &from_code,
-            &to_code,
+            &base_code,
+            &quote_code,
             MarketWindow {
                 from: &from,
                 to: &to,

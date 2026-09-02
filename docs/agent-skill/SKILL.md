@@ -1,9 +1,9 @@
 ---
 name: iaam
-description: Учёт инвестиций IAAM. Работает с двумя входными каналами, построчными вердиктами, многомерной сверкой и доходностью до налога. Используйте, когда спрашивают про портфель, доходность, пополнения, стоимость или качество данных.
+description: IAAM investment accounting. Works with two input channels, per-row verdicts, multi-dimensional reconciliation and pre-tax return. Use it when asked about the portfolio, return, contributions, value or data quality.
 ---
 
-# IAAM — учёт инвестиций
+# IAAM — investment accounting
 
 ## Bootstrap
 
@@ -34,277 +34,215 @@ refused for want of one, say so — there is no other route to try.
 
 Everything below is what those three steps cannot tell you.
 
-## Главное правило
+## The overriding rule
 
-**Собственная арифметика запрещена.** Любое число в вашем ответе обязано
-присутствовать в ответе API дословно. Не складывайте суммы, не считайте
-проценты, не переводите валюты, не оценивайте доходность «примерно».
-Число, которого нет в ответе API, является ошибкой — даже если оно верное.
+**Arithmetic of your own is forbidden.** Every number in your answer must be
+present verbatim in the API's answer. Do not add amounts together, do not
+compute percentages, do not convert currencies, do not estimate a return
+"roughly".
+A number that is not in the API's answer is an error — even when it is correct.
 
-Если API отказался вычислить величину, ответ так и звучит: система
-не может её вычислить, и вот почему. Замена отказа собственной оценкой —
-самая дорогая ошибка, которую здесь можно сделать.
+If the API refused to compute a quantity, the answer says exactly that: the
+system cannot compute it, and here is why. Replacing a refusal with an estimate
+of your own is the most expensive mistake that can be made here.
 
-## Агент — внешний клиент
+## The agent is an external client
 
-Агент не является частью системы и доступа к её хранилищу не имеет.
-Он не пишет в журнал напрямую: запись — результат прохождения приёмки,
-а не отдельное действие. Он не заводит счета и контуры: границу портфеля
-проводит владелец. И он не держит у себя выписок владельца — их загружает
-сам владелец, а агент видит ровно то, что владелец ему показал.
+The agent is not part of the system and has no access to its storage. It does
+not write to the journal directly: a record is the outcome of passing ingest,
+not a separate action. It does not create accounts or contours: the portfolio's
+boundary is drawn by the owner. And it does not hold the owner's statements —
+the owner loads them himself, and the agent sees exactly what the owner has
+shown it.
 
-Отсюда следует то, что легко нарушить из лучших побуждений: недостающее
-значение запрашивается у владельца, а не достраивается. Догадка, попавшая
-в журнал, неотличима от факта.
+From this follows the thing that is easiest to violate out of the best
+intentions: a missing value is asked of the owner, not filled in. A guess that
+has reached the journal is indistinguishable from a fact.
 
-## Что такое контур
+## What a contour is
 
-Контур — это набор счетов, который владелец считает «своим портфелем».
-Граница проводится владельцем, а не учреждением. Перевод денег между
-двумя счетами **внутри** контура доходность не меняет: это перекладывание
-из кармана в карман. Перевод со счёта вне контура на счёт внутри —
-внесение средств.
+A contour is the set of accounts the owner considers "his portfolio". The
+boundary is drawn by the owner, not by an institution. Moving money between two
+accounts **inside** the contour does not change the return: it is shifting it
+from one pocket to another. A transfer from an account outside the contour to
+an account inside it is a contribution.
 
-У контура есть **версия**. Отчёт всегда возвращает версию, по которой
-считал. Две цифры, посчитанные по разным версиям контура, сравнивать
-нельзя.
+A contour has a **version**. A report always returns the version it computed
+against. Two figures computed against different contour versions must not be
+compared.
 
-## Два канала фактов и что делает подтверждение независимым
+## Two channels of fact, and what makes a confirmation independent
 
-У IAAM два независимых канала получения фактов: разбор отчёта брокера и
-операции, полученные от API брокера. Разбор ответов API живёт отдельно от
-парсеров отчётов, и это не дублирование, а условие независимости: два
-отчёта, разобранные одним и тем же парсером, вторым источником не
-становятся — воспроизводится ошибка парсера, а не подтверждается факт.
-Совпадение двух разных каналов повышает статус измерения до
-`accepted_independent`.
+IAAM has two independent channels through which facts arrive: parsing a broker
+report, and operations received from the broker's API. Parsing API answers
+lives separately from the report parsers, and that is not duplication but the
+condition of independence: two reports parsed by one and the same parser do not
+become a second source — the parser's error is reproduced, the fact is not
+confirmed. Agreement between two different channels raises the dimension's
+status to `accepted_independent`.
 
-Оба канала записывают факты в один append-only журнал.
+Both channels write facts into one append-only journal.
 
-**Утверждение владельца независимым источником не является.** Названный им
-остаток — это то, с чем сверяют, а не второе доказательство: совпадение
-даёт `accepted_internal`, и называть такую величину независимо
-подтверждённой нельзя. Разница не косметическая — владелец обычно помнит
-остаток из того же приложения, из которого пришла выписка.
+**An assertion by the owner is not an independent source.** A balance he names
+is what is reconciled against, not a second proof: agreement gives
+`accepted_internal`, and such a quantity must not be called independently
+confirmed. The difference is not cosmetic — the owner usually remembers the
+balance from the same application the statement came from.
 
-## Внешний код инструмента разрешается на дату
+## An instrument's external code resolves as of a date
 
-Инструмент называется **внешним кодом**, а не идентификатором. Годятся
-ISIN, тикер, `SECID` MOEX, FIGI и внутренний код брокера. Место хранения
-называется именем из справочника владельца.
+An instrument is named by an **external code**, not by an identifier. An ISIN,
+a ticker, a MOEX `SECID`, a FIGI and a broker's internal code all serve. The
+place of custody is named by a name from the owner's directory.
 
-Код разрешается **на дату операции**, и это не формальность. ISIN
-меняется корпоративным действием: отчёт за прошлый год приходит со
-старым кодом, выгрузка биржи — с новым, и оба обязаны сойтись на один
-инструмент. Поэтому «текущего» ответа на вопрос, какая бумага стоит за
-кодом, не существует — ответ бывает только на дату.
+A code resolves **as of the operation's date**, and this is not a formality. An
+ISIN changes through a corporate action: the report for last year arrives with
+the old code, the exchange's export with the new one, and both are obliged to
+converge on one instrument. So there is no "current" answer to the question of
+which security stands behind a code — the answer exists only as of a date.
 
-Отсюда два разных отказа, которые нельзя путать:
+Two different refusals follow from this, and they must not be confused:
 
-| Отказ | Что произошло | Что делать |
+| Refusal | What happened | What to do |
 |---|---|---|
-| код неизвестен | такой бумаги в справочнике нет | завести инструмент — это работа владельца, агенту запись в справочник запрещена |
-| код известен, но не на эту дату | код существует, но его интервал действия не покрывает дату документа | проверить **дату документа**: скорее всего она неверна, а не бумага |
+| the code is unknown | there is no such security in the catalogue | create the instrument — that is the owner's work; the agent is forbidden to write to the catalogue |
+| the code is known, but not on this date | the code exists, but its interval of validity does not cover the document's date | check the **document's date**: it is more likely to be wrong than the security is |
 
-Второй случай — почти всегда признак порчи данных, а не пробела в
-справочнике. Новый код в документе, датированном до смены, означает, что
-документ или его дата собраны неправильно.
+The second case is almost always a sign of corrupted data rather than of a gap
+in the catalogue. A new code in a document dated before the change means that
+the document, or its date, was assembled wrongly.
 
-Справочник инструментов **общий для всех владельцев**: выпуск облигации
-один на всех, и испорченная запись испортит данные не только вашего
-владельца. Поэтому запись в него агентским токеном запрещена, и это
-ограничение прав, а не отсутствие возможности у системы.
+The instrument catalogue is **shared across all owners**: a bond issue is one
+and the same for everyone, and a corrupted record will corrupt data beyond your
+owner's. Writing to it with an agent token is therefore forbidden, and that is
+a restriction of rights, not an absence of the capability in the system.
 
-У инструмента три валюты, и они различаются: валюта обязательства,
-валюта расчётов и валюта котировки. У замещающих облигаций они
-расходятся. Валюты отчёта среди них нет — она свойство отчёта, а не
-бумаги.
+An instrument has three currencies, and they differ: the denomination currency,
+the settlement currency and the quote currency. On replacement bonds they
+diverge. The report currency is not among them — it is a property of the
+report, not of the security.
 
-Род инструмента может быть не установлен. Это честное «неизвестно», а не
-ошибка: оценка такой позиции помечается неполной, и подставлять вместо
-рода что-нибудь правдоподобное система не станет.
+An instrument's kind may be unset. That is an honest "unknown", not an error:
+the valuation of such a position is marked incomplete, and the system will not
+substitute something plausible for the kind.
 
-## Что означает вердикт
+## How an amount is stated
 
-Приёмка отвечает вердиктом на каждую строку; порядок строк сохраняется
-полем `row`. Словарь кодов и то, что каждый означает, закреплены в
-`crates/iaam-ingest/src/verdict.rs`:
+**Amounts are always positive.** The sign is carried by the kind of operation:
+a contribution and a withdrawal are different kinds, not one sum with two
+signs. Amounts travel as strings rather than numbers, because a JSON number
+loses precision and an amount in the journal is a fact.
 
-| Вердикт | Значение |
-|---|---|
-| `accepted` | факт записан, и сверка сошлась |
-| `provisional` | факт записан, независимого подтверждения нет |
-| `possible_duplicate` | факт записан и похож на уже имеющийся; ни один из двух не удаляется и не сливается — владельцу показывают оба |
-| `discrepancy` | факт записан, но измерение не сошлось |
-| `duplicate` | повтор уже записанного факта по ключу идемпотентности |
-| `needs_reconciliation` | сверять не с чем: нет остатка владельца по измерению |
-| `needs_classification` | классификация неоднозначна, нужен ответ владельца |
-| `unsupported` | операция вне периметра §11 |
-| `rejected` | строка не разобрана |
-| `quarantined` | строка прочитана, но факт из неё не записан |
+**An amount's scale must not exceed the currency's minor unit.** A surplus
+digit after the separator is refused, not rounded: rounding at the input
+substitutes a convenient number for a fact.
 
-Словарь шире того, что встречается на практике: часть кодов существует
-для состояний, которых сегодняшняя приёмка не порождает. Незнакомый код
-читайте по этой таблице, а не по догадке о том, что «наверное, имелось
-в виду».
+## Idempotency keys
 
-Первые пять означают, что факт **уже в журнале**; `duplicate` при этом
-ссылается на существующий факт, а не создаёт второй. Остальные пять
-говорят, что записи нет, и почему.
+Always send an idempotency key if you can construct one. Repeating a request
+with the same key returns `duplicate` and the identifier of the first event —
+that is the right answer, not an error. Without a key, sending again creates a
+second event: two identical purchases on one day are a legitimate situation,
+and the system has no right to merge them.
 
-Различие между «записан» и «не записан» важнее самого кода. `discrepancy`
-записан намеренно: факт получен, и прятать его до выяснения значило бы
-терять данные. `needs_reconciliation` не записан столь же намеренно:
-записывать там нечего, вопрос задан владельцу.
+## What to assert for a reconstructed opening
 
-Поля вердикта — `event_id`, `account_id`, `dimension`, `detail`, `field`,
-`expected`, `actual` — появляются только там, где относятся к коду.
-Показывайте владельцу то, что пришло, и не восполняйте пустое.
+A position-opening operation has an optional block of assertions — what the
+owner asserts about a position that existed before the journal began. The set
+of fields and their permitted values are described in the contract; what
+matters here is something else.
 
-**Величины всегда положительные.** Знак задаёт вид операции: пополнение
-и списание — разные виды, а не разные знаки одной суммы. Суммы передаются
-строками, а не числами: JSON-число теряет точность, а сумма в журнале —
-это факт.
+An absent block means the owner asserted nothing. That is a legitimate state,
+not a gap in the request: do not fill it with guesses. By default every field
+stands at its most ignorant value. The default preserves ignorance; it does not
+derive confidence from the fact that the neighbouring fields are filled in.
 
-**Точность суммы не должна превышать минимальную единицу валюты.** Лишний
-знак после запятой отклоняется, а не округляется: округление на входе —
-это подмена факта удобным числом.
+What is asserted here reaches the reconciliation of postings. Without an
+acquisition date there is nothing to draw the ownership boundary with, and
+postings on such a security land in `material_issues` as unverifiable instead
+of being checked. Ask the owner for the date if he remembers it; if he does
+not, leave "unknown" rather than substituting the start of the journal.
 
-## Ключи идемпотентности
+## How to read the return report
 
-Всегда передавайте ключ идемпотентности, если можете его построить. Повтор
-запроса с тем же ключом вернёт `duplicate` и идентификатор первого
-события — это правильный ответ, а не ошибка. Без ключа повторная отправка
-создаст второе событие: две одинаковые покупки в один день — законная
-ситуация, и система не имеет права их склеивать.
+The report returns what was contributed and withdrawn over the whole history,
+the contour's value as of the report date, the pre-tax return, the rules
+applied and a `data_quality` block.
 
-## Что заявлять при восстановленном начале
+**The report's period is the whole history.** A return over an arbitrary
+interval is not computed at this stage: it would need the value at the start of
+the interval, and that is known only as of the report date.
 
-У операции открытия позиции есть необязательный блок утверждений — то, что
-владелец утверждает о позиции, существовавшей до начала журнала. Состав
-полей и их допустимые значения описаны в контракте; здесь важно другое.
+**Call `xirr_pre_tax` the pre-tax return.** Not "the return", not "how much was
+earned". Taxes are not yet computed in the system, and the difference can reach
+13–15 % of the result.
 
-Отсутствующий блок означает, что владелец не утверждал ничего. Это
-законное состояние, а не пробел в запросе: не заполняйте его догадками.
-По умолчанию каждое поле стоит в самом незнающем значении. Умолчание
-сохраняет незнание, а не выводит уверенность из заполненности соседних
-полей.
+## What an unconfirmed posting does and does not mean
 
-Заявленное здесь доходит до сверки выплат. Без даты приобретения границу
-владения провести нечем, и выплаты по такой бумаге попадут в
-`material_issues` как недоказуемые вместо того, чтобы быть проверенными.
-Спросите у владельца дату, если он её помнит; если не помнит — оставьте
-«неизвестно», а не подставляйте начало журнала.
+The report distinguishes two things that look alike and must never be reported
+alike.
 
-## Как прочитать отчёт о доходности
+**A payment was not confirmed** — the owner did hold the security that day, the
+waiting period has expired, and no crediting fact is in the journal. That is a
+defect: tell the owner the date, the instrument, the account and the kind of
+payment — a coupon or a return of principal — and ask him to load the statement
+for that period.
 
-Отчёт возвращает внесённое и выведенное за всю историю, стоимость контура
-на дату отчёта, доходность до налога, применённые правила и блок
-`data_quality`.
+**There is nothing to reconcile with** — no conclusion is possible because the
+evidence is missing. **This is not a claim that money went missing.** Where the
+reason is simply that the journal begins later, it is not a defect at all:
+there is nothing to load.
 
-**Период отчёта — вся история.** Доходность за произвольный интервал
-на этом этапе не считается: для неё нужна стоимость на начало интервала,
-а она известна только на дату отчёта.
+Several equally unprovable payments for one account-and-instrument pair collapse
+into a single problem carrying a count and date bounds, because a cause at the
+level of the source is repaired by one action. Do not expand it back into a list
+and do not report each date to the owner separately.
 
-**`xirr_pre_tax` называйте доходностью до налога.** Не «доходностью»,
-не «сколько заработано». Налоги в системе ещё не считаются, и разница
-может достигать 13–15 % от результата.
+**Never call `provisional` an error.** It means no independent confirmation has
+arrived yet, which is an ordinary state of a correct journal.
 
-## Как читать `not_computable`
+## A fact can be quoted, a derived value cannot
 
-Любая величина может прийти без значения и с полем `not_computable`:
+The key rate, an FX rate and a price as of a date are served as reference
+facts: every row carries the value, the date or the interval's boundaries, the
+source, the observation moment, the quality and the completeness boundary. Such
+a row can be quoted to the owner verbatim.
 
-| Код | Значение | Что сказать владельцу |
-|---|---|---|
-| `missing_price` | нет цены инструмента | «нужна оценка бумаги на дату отчёта» |
-| `missing_fx_rate` | нет курса на дату | «нужен курс валюты» |
-| `solver_refused` | уравнение доходности не имеет единственного корня | «доходность не определена для такой последовательности потоков» |
-| `no_external_flows` | не было ни одного вложения | «вложений в контур не было» |
-| `state_newer_than_report` | срез собран неверно | сообщить как ошибку системы |
-| `numeric` | арифметика невозможна | сообщить как ошибку системы |
-| `unsupported_financing` | финансирование вне периметра на счёте | объяснить, что экономика этого счёта за период не достраивается |
+Adding them up, recomputing them and deriving a return from them is not
+allowed. Any derived quantity is taken from the report whole — otherwise it
+becomes your arithmetic rather than the system's answer.
 
-Отказ — это ответ. Пересчитывать его самостоятельно нельзя.
+For prices, distinguish three things: the effective quotation basis, the basis
+exactly as the source recorded it, and the machine status of how well that
+basis is proven. Their agreement is not a given, and a divergence between them
+means the source contradicts itself. For the key rate, an interval's boundary
+may be marked as inferred: the source gave only trading days, and the exact
+effective date fell between them.
 
-## Как читать `data_quality`
+When the API refuses because of request frequency, lower the frequency rather
+than repeating immediately.
 
-- `status` имеет значения `clean`, `mixed` и `incomplete`;
-- `nav_coverage` содержит четыре доли стоимости: `accepted_independent`,
-  `accepted_internal`, `provisional` и `discrepant`;
-- `material_issues` перечисляет только проблемы, влияющие на ответ:
-  например, отсутствие независимого источника, расхождение, отрицательный
-  денежный остаток, неисполняемая цена или запланированная выплата, не
-  подтверждённая журналом.
+## What here is checked
 
-`clean` означает, что нет материальных проблем, а доли `provisional` и
-`discrepant` равны нулю. `mixed` означает, что часть стоимости ещё не
-имеет независимого подтверждения. `incomplete` означает материальную
-проблему; прочитайте `material_issues` и передайте её владельцу. Не
-заменяйте статус собственной долей и не называйте `provisional`
-ошибкой.
-
-Отдельно читайте проблемы по запланированным выплатам. Система различает
-две разные вещи, и путать их нельзя:
-
-- **выплата не подтверждена** — бумага в этот день владельцу
-  принадлежала, срок ожидания истёк, а факта зачисления в журнале нет.
-  Это дефект: сообщите владельцу дату, инструмент, счёт и вид выплаты
-  (купон или возврат номинала) и попросите догрузить выписку за период;
-- **сверку провести нечем** — вывод невозможен, потому что не хватает
-  доказательства. Это **не** утверждение о пропаже денег. Причина
-  названа: неизвестна дата приобретения, недоказуемо владение на дату
-  фиксации, источник не сообщил дату фиксации, не установлен вид
-  выплаты, нет ни даты зачисления, ни даты платежа, график не заслуживает
-  доверия — либо выплата пришлась на время до первого события журнала.
-  Последняя причина дефектом не считается: журнал просто начинается
-  позже, дозагружать нечего.
-
-Несколько одинаково недоказуемых выплат по одной паре «счёт, инструмент»
-сворачиваются в одну проблему с числом и границами дат: причина уровня
-источника чинится одним действием. Не пересчитывайте её обратно
-в список и не докладывайте владельцу каждую дату отдельно.
-
-## Факт можно процитировать, производную — нет
-
-Ставку, курс и цену на дату система отдаёт как справочные факты: каждая
-строка содержит значение, дату или границы интервала, источник, момент
-наблюдения, качество и границу полноты. Такую строку можно процитировать
-владельцу дословно.
-
-Складывать их, пересчитывать и выводить из них доходность нельзя. Любая
-производная величина берётся из отчёта целиком — иначе она становится
-вашей арифметикой, а не ответом системы.
-
-Для цен различайте три вещи: эффективное основание котировки, основание
-ровно в том виде, в каком его записал источник, и машинный статус
-доказанности этого основания. Их совпадение — не данность, и расхождение
-между ними означает, что источник противоречит сам себе. У ключевой ставки
-граница интервала может быть помечена как выведенная: источник дал только
-рабочие дни, и точная дата вступления попала между ними.
-
-Когда API отказывает из-за частоты запросов, снижайте частоту, а не
-повторяйте немедленно.
-
-## Что здесь проверено
-
-Десять кодов вердикта и правило «записан ли факт» закреплены в
-`crates/iaam-ingest/src/verdict.rs` и его тестах. Основания независимости,
-статусы по измерениям, четыре доли `nav_coverage`, пересчёт истории и
-периметр §11 проверяются тестами `iaam-core` в
+The ten verdict codes and the "is the fact recorded" rule are fixed in
+`crates/iaam-ingest/src/verdict.rs` and its tests. The grounds of independence,
+the statuses by dimension, the four shares of `nav_coverage`, the recomputation
+of history and the §11 perimeter are checked by the `iaam-core` tests in
 `reconciliation_grounds.rs`, `reconciliation_ledger.rs`, `data_quality.rs`,
-`perimeter.rs` и golden-сценариях.
+`perimeter.rs` and the golden scenarios.
 
-То, чего здесь нет, проверено тем, что отсутствует:
-`scripts/check-agent-skill.sh` отказывает, если в этом файле появляется
-маршрут, метод или код состояния HTTP. Утверждение о доступности, которого
-нельзя записать, не может устареть.
+What is not here is checked by its absence:
+`scripts/check-agent-skill.sh` refuses if a route, a method or an HTTP status
+code appears in this file. A claim about availability that cannot be written
+down cannot go stale.
 
-## Чего система не делает
+## What the system does not do
 
-Не считает налоги, не считает TWR, ряд стоимости и доходность за
-произвольный подинтервал, не реализует экономику шортов, маржи и
-производных и не восстанавливает потерянный ключ шифрования из одной базы.
-Цену и курсы для расчёта должны предоставить входные данные или владелец.
+It does not compute taxes, does not compute TWR, a value series or a return
+over an arbitrary sub-interval, does not implement the economics of shorts,
+margin and derivatives, and does not recover a lost encryption key from a
+single database. The price and the FX rates for a calculation must be supplied
+by the input data or by the owner.
 
-Что система умеет **сейчас** — вопрос к самой системе, а не к этому файлу:
-на него отвечают контракт и очередь действий.
+What the system can do **now** is a question for the system itself, not for
+this file: the contract and the action queue answer it.

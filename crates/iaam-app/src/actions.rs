@@ -729,7 +729,12 @@ mod tests {
             last_effective_date: None,
         };
 
-        let actions = actions_from_state(&[account.clone()], &[], &[activity.clone()], &[]);
+        let actions = actions_from_state(
+            std::slice::from_ref(&account),
+            &[],
+            std::slice::from_ref(&activity),
+            &[],
+        );
         let import = actions
             .iter()
             .find(|action| action.kind() == ActionKind::StartAccountImport)
@@ -766,7 +771,12 @@ mod tests {
             last_effective_date: Some(period.to),
         };
 
-        let actions = actions_from_state(&[account.clone()], &[], &[activity.clone()], &[]);
+        let actions = actions_from_state(
+            std::slice::from_ref(&account),
+            &[],
+            std::slice::from_ref(&activity),
+            &[],
+        );
         let assertion = actions
             .iter()
             .find(|action| action.kind() == ActionKind::ProvideControlAssertion)
@@ -845,7 +855,7 @@ mod tests {
             first_effective_date: Some(time::macros::date!(2026 - 03 - 01)),
             last_effective_date: Some(time::macros::date!(2026 - 03 - 31)),
         };
-        let actions = actions_from_state(&[account.clone()], &[], &[activity], &[]);
+        let actions = actions_from_state(std::slice::from_ref(&account), &[], &[activity], &[]);
         assert!(
             actions
                 .iter()

@@ -68,7 +68,7 @@ async fn the_sandbox_accepts_the_provisioned_access() {
     let access = store
         .find_broker_access(owner, &broker, Environment::Sandbox.code())
         .expect("access read")
-        .expect("Tinkoff sandbox access is not configured: POST /v1/broker-access");
+        .expect("Tinkoff sandbox access is not configured: run `iaam broker access add` locally");
 
     assert_eq!(
         BrokerScope::parse(&access.scope),

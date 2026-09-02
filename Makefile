@@ -150,10 +150,10 @@ broker-key: require-database require-broker-key ## Create a key for encrypting c
 # The token is read from standard input: the process list is visible across the
 # machine, and shell history outlives the session.
 .PHONY: broker-access
-broker-access: require-database require-broker-key ## Fallback path to POST /v1/broker-access (BROKER=..., ENVIRONMENT=prod|sandbox)
+broker-access: require-database require-broker-key ## Provision a broker credential locally (BROKER=..., ENVIRONMENT=prod|sandbox)
 	@test -n "$(ENVIRONMENT)" || { \
 		echo "ENVIRONMENT is not set: prod or sandbox — tokens differ between environments." >&2; \
 		echo "  make broker-access BROKER=$(BROKER) ENVIRONMENT=sandbox" >&2; \
 		exit 1; }
-	IAAM_ADD_BROKER_ACCESS="$(BROKER)" IAAM_BROKER_ENVIRONMENT="$(ENVIRONMENT)" \
-		$(RUN) cargo run -p iaam-bootstrap --release
+	$(RUN) cargo run -p iaam-bootstrap --release -- broker access add \
+		--broker "$(BROKER)" --environment "$(ENVIRONMENT)"

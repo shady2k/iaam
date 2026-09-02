@@ -2383,41 +2383,6 @@ pub struct CreateAccountRequest {
     pub institution: Option<String>,
 }
 
-/// Broker token submission.
-///
-/// **`Debug` is implemented manually.** A derived implementation would print the token in full,
-/// and `{:?}` on a request that failed to parse is a common way to find out why
-/// it failed to parse. Once the token is in the log, it cannot be removed (§14).
-///
-/// There is intentionally no permission scope here: it is set by the system, not
-/// the client (§14). Extra body fields are silently ignored, so
-/// any «scope» sent by the client has no effect.
-#[derive(Deserialize, ToSchema)]
-pub struct AddBrokerAccessRequest {
-    /// Broker code, for example `tinkoff`.
-    pub broker: String,
-    /// Broker environment. The field is required and has no default: tokens
-    /// differ between environments, and silently recording the wrong environment causes
-    /// the gateway to reject the first request — with no indication in the message
-    /// that the environment is the cause.
-    pub environment: BrokerEnvironmentDto,
-    /// Broker token. A secret: accepted but never returned,
-    /// so it is marked as `password` and `writeOnly` in the schema.
-    #[schema(format = Password, write_only, example = "<secret>")]
-    pub token: String,
-}
-
-impl fmt::Debug for AddBrokerAccessRequest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AddBrokerAccessRequest")
-            .field("broker", &self.broker)
-            .field("environment", &self.environment)
-            .field("token", &"<hidden>")
-            .finish()
-    }
-}
-
 /// Broker environment in the transport layer. A separate type because
 /// the port's `BrokerEnvironment` knows nothing about OpenAPI and should not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -3133,33 +3098,6 @@ mod tests {
     }
 
     #[test]
-    fn the_debug_of_a_broker_request_never_carries_the_token() {
-        // Using `{:?}` on a request that failed to parse is a common way to investigate,
-        // why it failed, and a derived `Debug` would send
-        // the token itself there. It cannot then be removed from the log (§14).
-        const TOKEN: &str = "t.Xk3nQ7wPz9-secret-broker-token-000";
-        let request = AddBrokerAccessRequest {
-            broker: "tinkoff".into(),
-            environment: BrokerEnvironmentDto::Sandbox,
-            token: TOKEN.into(),
-        };
-
-        let printed = format!("{request:?}");
-        assert!(
-            !printed.contains(TOKEN),
-            "token leaked into debug output: {printed}"
-        );
-        assert!(
-            printed.contains("tinkoff"),
-            "the broker code is not secret and must remain visible: {printed}"
-        );
-        assert!(
-            printed.contains("Sandbox"),
-            "the environment is not secret and must remain visible: {printed}"
-        );
-    }
-
-    #[test]
     fn an_issued_token_never_reaches_the_debug_output() {
         // The response containing the token is shown once — and that is the only time it
         // exists in the clear. A derived `Debug` would send it
@@ -3796,11 +3734,6 @@ impl SyncOutcomeDto {
     }
 }
 /// Access secret replacement: the secret is never part of the response.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct BrokerAccessUpdateRequest {
-    pub environment: BrokerEnvironmentDto,
-    pub token: String,
-}
 
 /// Instrument catalogue entry.
 ///

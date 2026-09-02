@@ -16,9 +16,10 @@
 //! not the owner+broker pair.
 
 use iaam_core::ids::OwnerId;
-use rusqlite::{TransactionBehavior, params};
+use rusqlite::{Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
+use crate::broker_operation_kinds::BrokerOperationKind;
 use crate::documents::BrokerCode;
 use crate::{SqliteStore, StoreError, now};
 
@@ -89,6 +90,36 @@ pub enum SoleOwner {
     Several,
 }
 
+fn insert_broker_access_in_transaction(
+    transaction: &Transaction<'_>,
+    access: &NewBrokerAccess,
+) -> Result<(), StoreError> {
+    let inserted = transaction.execute(
+        "INSERT INTO broker_access (
+             id, owner, broker, environment, scope, nonce, ciphertext, created_at, revoked_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+        params![
+            access.id.to_string(),
+            access.owner.inner().to_string(),
+            access.broker.as_str(),
+            access.environment,
+            access.scope,
+            access.nonce,
+            access.ciphertext,
+            now(),
+        ],
+    );
+    if let Err(rusqlite::Error::SqliteFailure(error, _)) = &inserted
+        && error.code == rusqlite::ErrorCode::ConstraintViolation
+    {
+        return Err(StoreError::AlreadyExists {
+            what: "active broker access in this environment",
+        });
+    }
+    inserted?;
+    Ok(())
+}
+
 impl SqliteStore {
     /// The owner, if there is only one in the system.
     pub fn sole_token_owner(&self) -> Result<SoleOwner, StoreError> {
@@ -113,43 +144,46 @@ impl SqliteStore {
         })
     }
 
-    /// Provisioning access.
+    /// Provisioning access, without its operation dictionary.
     ///
     /// A second active access to the same broker is rejected
     /// by the unique index: it is unknown which of the two the system
     /// would use to access the broker.
+    ///
+    /// **Not for provisioning.** A credential stored without its dictionary
+    /// cannot import anything, and the failure is quiet — a missing synonym
+    /// breaks no obvious case while half an export stops parsing. Every
+    /// production path uses `insert_broker_access_with_operation_kinds`; what
+    /// remains here serves fixtures that have no dictionary to care about.
     pub fn insert_broker_access(&mut self, access: &NewBrokerAccess) -> Result<(), StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let inserted = transaction.execute(
-            "INSERT INTO broker_access (
-                 id, owner, broker, environment, scope, nonce, ciphertext, created_at, revoked_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
-            params![
-                access.id.to_string(),
-                access.owner.inner().to_string(),
-                access.broker.as_str(),
-                access.environment,
-                access.scope,
-                access.nonce,
-                access.ciphertext,
-                now(),
-            ],
-        );
-        // A uniqueness violation means “access already exists in this environment”,
+        insert_broker_access_in_transaction(&transaction, access)?;
+        transaction.commit()?;
+        Ok(())
+    }
 
-        // not a storage failure. Handle it here: otherwise it propagates through the layers.
-        // the answer to the owner's question, not SQLite text that
-        // reveals the schema's structure externally.
-        if let Err(rusqlite::Error::SqliteFailure(error, _)) = &inserted
-            && error.code == rusqlite::ErrorCode::ConstraintViolation
-        {
-            return Err(StoreError::AlreadyExists {
-                what: "active broker access in this environment",
-            });
-        }
-        inserted?;
+    /// Provision access and its initial operation dictionary atomically.
+    ///
+    /// A credential without its dictionary cannot be imported. Keeping both
+    /// writes in this transaction prevents a crash from creating that state.
+    pub fn insert_broker_access_with_operation_kinds(
+        &mut self,
+        access: &NewBrokerAccess,
+        dictionary: &str,
+        entries: &[BrokerOperationKind],
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_broker_access_in_transaction(&transaction, access)?;
+        Self::extend_broker_operation_kinds_in_transaction(
+            &transaction,
+            &access.broker,
+            dictionary,
+            entries,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -299,5 +333,44 @@ impl SqliteStore {
             });
         }
         Ok(access)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_and_dictionary_are_rolled_back_together() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let broker = BrokerCode::parse("tinkoff").unwrap();
+        let access = NewBrokerAccess {
+            id: Uuid::new_v4(),
+            owner: OwnerId::new_random(),
+            broker: broker.clone(),
+            environment: "sandbox".to_owned(),
+            scope: "read_only".to_owned(),
+            nonce: vec![1, 2, 3],
+            ciphertext: vec![4, 5, 6],
+        };
+        let error = store
+            .insert_broker_access_with_operation_kinds(
+                &access,
+                "test dictionary",
+                &[BrokerOperationKind {
+                    source_kind: "INVALID_KIND".to_owned(),
+                    kind: "not_a_known_kind".to_owned(),
+                }],
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::Sqlite(_)));
+        assert!(
+            store
+                .find_broker_access(access.owner, &broker, "sandbox")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.broker_operation_kinds(&broker).unwrap().is_empty());
     }
 }

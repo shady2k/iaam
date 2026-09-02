@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{TransactionBehavior, params};
+use rusqlite::{Transaction, TransactionBehavior, params};
 
 use crate::documents::BrokerCode;
 use crate::{SqliteStore, StoreError, now};
@@ -66,6 +66,42 @@ pub struct DictionaryOutcome {
 }
 
 impl SqliteStore {
+    /// Populate the channel dictionary within an existing transaction.
+    ///
+    /// Existing entries are **not** touched, and the owner's decision
+    /// also means: the update adds what was missing rather than
+    /// overwriting what exists.
+    pub(crate) fn extend_broker_operation_kinds_in_transaction(
+        transaction: &Transaction<'_>,
+        broker: &BrokerCode,
+        dictionary: &str,
+        entries: &[BrokerOperationKind],
+    ) -> Result<DictionaryOutcome, StoreError> {
+        let mut outcome = DictionaryOutcome::default();
+        let mut statement = transaction.prepare(
+            "INSERT INTO broker_operation_kinds
+                 (broker, source_kind, kind, origin, dictionary, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (broker, source_kind) DO NOTHING",
+        )?;
+        for entry in entries {
+            let inserted = statement.execute(params![
+                broker.as_str(),
+                entry.source_kind,
+                entry.kind,
+                KindOrigin::Contract.code(),
+                dictionary,
+                now(),
+            ])?;
+            if inserted == 0 {
+                outcome.already_known += 1;
+            } else {
+                outcome.added += 1;
+            }
+        }
+        Ok(outcome)
+    }
+
     /// Populate the channel dictionary from the contract.
     ///
     /// Existing entries are **not** touched, and the owner's decision
@@ -81,30 +117,12 @@ impl SqliteStore {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut outcome = DictionaryOutcome::default();
-        {
-            let mut statement = transaction.prepare(
-                "INSERT INTO broker_operation_kinds
-                     (broker, source_kind, kind, origin, dictionary, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT (broker, source_kind) DO NOTHING",
-            )?;
-            for entry in entries {
-                let inserted = statement.execute(params![
-                    broker.as_str(),
-                    entry.source_kind,
-                    entry.kind,
-                    KindOrigin::Contract.code(),
-                    dictionary,
-                    now(),
-                ])?;
-                if inserted == 0 {
-                    outcome.already_known += 1;
-                } else {
-                    outcome.added += 1;
-                }
-            }
-        }
+        let outcome = Self::extend_broker_operation_kinds_in_transaction(
+            &transaction,
+            broker,
+            dictionary,
+            entries,
+        )?;
         transaction.commit()?;
         Ok(outcome)
     }

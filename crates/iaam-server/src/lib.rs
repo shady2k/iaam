@@ -71,10 +71,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::list_instruments, routes::create_instrument))
         .routes(routes!(routes::get_instrument))
         .routes(routes!(routes::resolve_instrument))
-        .routes(routes!(
-            routes::list_broker_access,
-            routes::add_broker_access
-        ))
+        .routes(routes!(routes::list_broker_access))
         .routes(routes!(routes::revoke_broker_access))
         .routes(routes!(routes::list_tokens, routes::create_token))
         .routes(routes!(routes::revoke_token))
@@ -109,7 +106,6 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::list_market_key_rate))
         .routes(routes!(routes::list_market_fx))
         .routes(routes!(routes::list_market_prices))
-        .routes(routes!(routes::update_broker_access))
         .routes(routes!(
             routes::returns_report,
             routes::returns_report_with_rates

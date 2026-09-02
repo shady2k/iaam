@@ -123,6 +123,13 @@ enum BrokerAccessCommand {
         #[arg(long, value_enum)]
         environment: BrokerEnvironmentArg,
     },
+    /// Replace an active broker credential from standard input.
+    Rotate {
+        #[arg(long)]
+        broker: String,
+        #[arg(long, value_enum)]
+        environment: BrokerEnvironmentArg,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -284,6 +291,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             println!(
                 "broker access {broker} ({}) provisioned: {id}",
+                Environment::from(environment).code()
+            );
+            Ok(())
+        }
+        Command::Broker {
+            command:
+                BrokerCommand::Access {
+                    command:
+                        BrokerAccessCommand::Rotate {
+                            broker,
+                            environment,
+                        },
+                },
+        } => {
+            let mut store = SqliteStore::open(&config.database)?;
+            let key = read_broker_key(&broker_key_path(&config)?)?;
+            let id = provision::replace_broker_access(
+                &mut store,
+                &key,
+                &broker,
+                environment.into(),
+                &read_token()?,
+            )?;
+            println!(
+                "broker access {broker} ({}) replaced: {id}",
                 Environment::from(environment).code()
             );
             Ok(())
@@ -482,8 +514,8 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, TokenCommand, TokenScopeArg, claim_owner, format_error_chain,
-        legacy_replacement, read_broker_key,
+        BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, Cli, Command, TokenCommand,
+        TokenScopeArg, claim_owner, format_error_chain, legacy_replacement, read_broker_key,
     };
     use clap::Parser;
 
@@ -550,6 +582,33 @@ mod tests {
                     ..
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn cli_parses_broker_access_rotate_without_a_token_argument() {
+        let cli = Cli::try_parse_from([
+            "iaam",
+            "broker",
+            "access",
+            "rotate",
+            "--broker",
+            "tinkoff",
+            "--environment",
+            "sandbox",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Broker {
+                command: BrokerCommand::Access {
+                    command: BrokerAccessCommand::Rotate {
+                        broker,
+                        environment: BrokerEnvironmentArg::Sandbox,
+                    },
+                },
+            } if broker == "tinkoff"
         ));
     }
 

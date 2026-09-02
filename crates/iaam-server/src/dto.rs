@@ -2316,6 +2316,65 @@ pub struct AccountDto {
     pub institution: Option<String>,
 }
 
+/// The computed action policy returned for an owner.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ActionsResponseDto {
+    pub policy_version: u32,
+    pub items: Vec<ActionDto>,
+}
+
+/// One computed action.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ActionDto {
+    pub id: String,
+    pub kind: String,
+    pub category: String,
+    pub state: String,
+    pub reason: String,
+    pub required_scope: String,
+    pub target: ActionTargetDto,
+}
+
+/// The tagged target of an action.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActionTargetDto {
+    Operation {
+        #[serde(rename = "operationId")]
+        operation_id: String,
+        method: String,
+        path: String,
+        #[serde(rename = "requestSchema")]
+        request_schema: String,
+        request: RequestPlanDto,
+    },
+    None,
+}
+
+/// Request fields that the policy cannot fill.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestPlanDto {
+    pub missing: Vec<MissingInputDto>,
+}
+
+/// One missing request field and its source.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MissingInputDto {
+    pub pointer: String,
+    pub provided_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<AccountCandidateDto>>,
+}
+
+/// An account that can be selected for a contour.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountCandidateDto {
+    pub id: Uuid,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
+}
+
 /// Account creation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAccountRequest {

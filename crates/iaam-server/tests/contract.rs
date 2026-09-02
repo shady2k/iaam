@@ -15,6 +15,7 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use iaam_app::AppServices;
+use iaam_app::actions::OperationKey;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
 use iaam_app::ingest::dedup::IdentityScope;
@@ -45,6 +46,7 @@ use iaam_core::returns::{
 };
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable};
+use iaam_server::action_catalog::{ActionCatalog, ActionCatalogError};
 use iaam_server::auth::hash_token;
 use iaam_server::dto::{ReturnsReportDto, VerdictDto};
 use iaam_server::error::ApiFailure;
@@ -268,6 +270,16 @@ fn unprovisioned_harness() -> Harness {
         SqliteStore::open_in_memory().expect("in-memory database"),
         None,
         false,
+        false,
+    )
+}
+
+fn empty_owner_harness() -> Harness {
+    harness_with_factory_and_provisioning(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        None,
+        true,
+        false,
     )
 }
 
@@ -275,26 +287,29 @@ fn harness_with_factory(
     store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
 ) -> Harness {
-    harness_with_factory_and_provisioning(store, channel_factory, true)
+    harness_with_factory_and_provisioning(store, channel_factory, true, true)
 }
 
 fn harness_with_factory_and_provisioning(
     store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
     provisioned: bool,
+    with_account: bool,
 ) -> Harness {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
 
     if provisioned {
-        store
-            .upsert_account(&AccountRecord {
-                id: account,
-                owner,
-                title: "Brokerage".into(),
-                institution: None,
-            })
-            .expect("account");
+        if with_account {
+            store
+                .upsert_account(&AccountRecord {
+                    id: account,
+                    owner,
+                    title: "Brokerage".into(),
+                    institution: None,
+                })
+                .expect("account");
+        }
 
         let owner_token = "owner-secret-token";
         store
@@ -373,7 +388,7 @@ fn harness_with_factory_and_provisioning(
         services,
         Arc::new(RateLimiter::new(1_000, Duration::from_secs(60))),
     );
-    let (router, api) = build(state);
+    let (router, api) = build(state).expect("build");
 
     Harness {
         router,
@@ -5480,4 +5495,259 @@ async fn retired_category_group_failure_has_actionable_response_fields() {
     assert_eq!(body["field"], "group");
     assert_eq!(body["expected"], "an active category group");
     assert_eq!(body["actual"], "group-42");
+}
+
+#[tokio::test]
+async fn actions_endpoint_is_authenticated_and_reports_the_empty_owner_frontier() {
+    let harness = empty_owner_harness();
+    let (status, body) = call(&harness.router, get("/v1/actions", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "unauthorized");
+
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["policy_version"], 1);
+    let items = body["items"].as_array().expect("action items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "create_first_account");
+    assert_eq!(items[0]["kind"], "create_first_account");
+    assert_eq!(items[0]["category"], "blocking");
+    assert_eq!(items[0]["state"], "needs_owner_input");
+    assert_eq!(items[0]["required_scope"], "owner");
+    assert_eq!(items[0]["target"]["type"], "operation");
+    assert_eq!(items[0]["target"]["operationId"], "create_account");
+    assert_eq!(items[0]["target"]["method"], "POST");
+    assert_eq!(items[0]["target"]["path"], "/v1/accounts");
+    assert_eq!(
+        items[0]["target"]["requestSchema"],
+        "#/components/schemas/CreateAccountRequest"
+    );
+    assert_eq!(
+        items[0]["target"]["request"]["missing"][0]["pointer"],
+        "/title"
+    );
+    assert_eq!(
+        items[0]["target"]["request"]["missing"][0]["provided_by"],
+        "owner"
+    );
+}
+
+#[tokio::test]
+async fn actions_endpoint_reports_the_first_contour_and_its_candidates() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().expect("action items");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(item["kind"], "create_first_contour");
+    assert_eq!(item["target"]["operationId"], "create_contour_version");
+    assert_eq!(item["target"]["method"], "POST");
+    assert_eq!(item["target"]["path"], "/v1/contours");
+    assert_eq!(
+        item["target"]["requestSchema"],
+        "#/components/schemas/CreateContourVersionRequest"
+    );
+    let missing = item["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing inputs");
+    assert_eq!(missing.len(), 2);
+    assert!(missing.iter().any(|entry| entry["pointer"] == "/title"));
+    let accounts = missing
+        .iter()
+        .find(|entry| entry["pointer"] == "/accounts")
+        .expect("account candidate input");
+    assert_eq!(accounts["provided_by"], "owner");
+    assert_eq!(
+        accounts["candidates"][0]["id"],
+        harness.account.inner().to_string()
+    );
+}
+
+#[tokio::test]
+async fn each_advertised_action_address_reaches_its_handler() {
+    let empty = empty_owner_harness();
+    let (status, body) = call(
+        &empty.router,
+        post(
+            "/v1/accounts",
+            &empty.owner_token,
+            &json!({"title": "Main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let contour = harness();
+    let (status, body) = call(
+        &contour.router,
+        post(
+            "/v1/contours",
+            &contour.owner_token,
+            &json!({"title": "Main", "accounts": [contour.account.inner()]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[test]
+fn every_action_kind_resolves_to_one_matching_post_operation() {
+    let harness = harness();
+    let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
+    for (key, path) in [
+        (OperationKey::CreateAccount, "/v1/accounts"),
+        (OperationKey::CreateContour, "/v1/contours"),
+    ] {
+        let resolved = catalog.operation(key);
+        assert_eq!(resolved.method, "POST");
+        assert_eq!(resolved.path, path);
+        let item = harness.api.paths.paths.get(path).expect("path item");
+        let operation = item.post.as_ref().expect("post operation");
+        assert_eq!(
+            operation.operation_id.as_deref(),
+            Some(resolved.operation_id.as_str())
+        );
+    }
+}
+
+#[test]
+fn action_catalog_rejects_missing_and_duplicate_operation_ids() {
+    let harness = harness();
+
+    let mut missing = harness.api.clone();
+    missing
+        .paths
+        .paths
+        .get_mut("/v1/accounts")
+        .expect("accounts path")
+        .post
+        .as_mut()
+        .expect("accounts operation")
+        .operation_id = None;
+    assert!(matches!(
+        ActionCatalog::from_openapi(&missing),
+        Err(ActionCatalogError::MissingOperationId { .. })
+    ));
+
+    let mut duplicate = harness.api.clone();
+    duplicate
+        .paths
+        .paths
+        .get_mut("/v1/contours")
+        .expect("contours path")
+        .post
+        .as_mut()
+        .expect("contours operation")
+        .operation_id = Some("create_account".into());
+    assert!(matches!(
+        ActionCatalog::from_openapi(&duplicate),
+        Err(ActionCatalogError::DuplicateOperationId { .. })
+    ));
+
+    let mut absent = harness.api;
+    absent.paths.paths.remove("/v1/contours");
+    assert!(matches!(
+        ActionCatalog::from_openapi(&absent),
+        Err(ActionCatalogError::MissingActionOperation { operation_id })
+            if operation_id == "create_contour_version"
+    ));
+}
+
+#[test]
+fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
+    let target = json!({
+        "type": "operation",
+        "operationId": "create_account",
+        "method": "POST",
+        "path": "/v1/accounts",
+        "requestSchema": "#/components/schemas/CreateAccountRequest",
+        "request": {"missing": [{"pointer": "/title", "provided_by": "owner"}]}
+    });
+    let parsed: iaam_server::dto::ActionTargetDto =
+        serde_json::from_value(target.clone()).expect("tagged target");
+    assert_eq!(serde_json::to_value(parsed).expect("target JSON"), target);
+
+    let harness = harness();
+    let schema = serde_json::to_value(&harness.api).expect("OpenAPI JSON")["components"]["schemas"]
+        ["ActionTargetDto"]
+        .clone();
+    let variants = schema["oneOf"].as_array().expect("tagged oneOf schema");
+    assert!(variants.len() >= 2);
+    let operation = variants
+        .iter()
+        .find(|variant| {
+            variant["properties"]["type"]["enum"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "operation"))
+        })
+        .expect("operation variant");
+    let required = operation["required"]
+        .as_array()
+        .expect("operation required");
+    for field in ["operationId", "method", "path", "requestSchema", "request"] {
+        assert!(required.iter().any(|value| value == field), "{field}");
+    }
+}
+
+#[tokio::test]
+async fn every_action_request_schema_required_input_is_advertised_as_missing() {
+    // The advertised list is read from the endpoint, not written here. An
+    // earlier version of this test compared the schema against a literal, which
+    // would have stayed green while the response stopped advertising a field —
+    // the same shape of mistake this epic exists to remove.
+    for harness in [empty_owner_harness(), harness()] {
+        let body_of_spec = serde_json::to_value(&harness.api).expect("OpenAPI JSON");
+        let (status, body) = call(
+            &harness.router,
+            get("/v1/actions", Some(&harness.owner_token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        for item in body["items"].as_array().expect("action items") {
+            let target = &item["target"];
+            assert_eq!(target["type"], "operation");
+            let schema_name = target["requestSchema"]
+                .as_str()
+                .expect("request schema reference")
+                .strip_prefix("#/components/schemas/")
+                .expect("component schema reference")
+                .to_owned();
+            let advertised: Vec<String> = target["request"]["missing"]
+                .as_array()
+                .expect("missing inputs")
+                .iter()
+                .map(|entry| {
+                    entry["pointer"]
+                        .as_str()
+                        .expect("missing pointer")
+                        .to_owned()
+                })
+                .collect();
+            let preset = target["request"]["preset"].as_object();
+
+            for field in body_of_spec["components"]["schemas"][&schema_name]["required"]
+                .as_array()
+                .expect("required request fields")
+            {
+                let name = field.as_str().expect("field name");
+                let pointer = format!("/{name}");
+                assert!(
+                    advertised.iter().any(|value| value == &pointer)
+                        || preset.is_some_and(|values| values.contains_key(name)),
+                    "{schema_name} requires {pointer}, and the action neither presets \
+                     it nor lists it as missing: {target}"
+                );
+            }
+        }
+    }
 }

@@ -370,7 +370,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let state = ServerState::new(services, limiter);
-    let (router, _api) = build(state);
+    let (router, _api) = build(state)?;
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(address = %config.listen, "server started");

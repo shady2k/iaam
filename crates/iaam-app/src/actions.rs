@@ -78,7 +78,7 @@ impl OperationKey {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CreateAccount => "create_account",
-            Self::CreateContour => "create_contour",
+            Self::CreateContour => "create_contour_version",
         }
     }
 }

@@ -1734,6 +1734,227 @@ async fn the_openapi_document_exposes_only_source_price_qualities() {
     );
 }
 
+/// Every code of one published vocabulary, in document order, with the sentence
+/// that explains it.
+///
+/// Read from the document rather than from the Rust type on purpose: what a
+/// client can learn is what the document says, and a check against the enum
+/// would pass just as happily with an empty schema.
+fn published_vocabulary(spec: &serde_json::Value, schema: &str) -> Vec<String> {
+    let items = spec["components"]["schemas"][schema]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema} must publish its codes as a oneOf: {spec}"));
+    assert!(
+        !spec["components"]["schemas"][schema]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "{schema} must say what the vocabulary as a whole is for"
+    );
+    items
+        .iter()
+        .map(|item| {
+            let code = item["enum"][0]
+                .as_str()
+                .unwrap_or_else(|| panic!("a code in {schema} is not a string: {item}"))
+                .to_owned();
+            let meaning = item["description"].as_str().unwrap_or_default();
+            assert!(
+                !meaning.trim().is_empty(),
+                "code {code} in {schema} arrives without a meaning"
+            );
+            code
+        })
+        .collect()
+}
+
+/// Whether a property points at the named schema, directly or through the
+/// `oneOf` that an optional field is rendered as.
+fn refers_to(property: &serde_json::Value, schema: &str) -> bool {
+    let reference = json!(format!("#/components/schemas/{schema}"));
+    if property["$ref"] == reference {
+        return true;
+    }
+    property["oneOf"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["$ref"] == reference))
+}
+
+#[tokio::test]
+async fn the_openapi_document_enumerates_and_explains_every_verdict() {
+    // A verdict code the document does not list is a code the agent has to
+    // look up somewhere else, and every hand-written list drifts: the one in
+    // the agent skill listed eight of these ten and omitted `possible_duplicate`
+    // and `quarantined`, both of which production emits.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(
+        refers_to(
+            &spec["components"]["schemas"]["VerdictDto"]["properties"]["verdict"],
+            "VerdictCodeDto"
+        ),
+        "the verdict field must point at the vocabulary: {}",
+        spec["components"]["schemas"]["VerdictDto"]["properties"]["verdict"]
+    );
+
+    assert_eq!(
+        published_vocabulary(&spec, "VerdictCodeDto"),
+        vec![
+            "accepted",
+            "provisional",
+            "possible_duplicate",
+            "discrepancy",
+            "needs_reconciliation",
+            "duplicate",
+            "needs_classification",
+            "unsupported",
+            "rejected",
+            "quarantined",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_openapi_document_enumerates_and_explains_every_refusal() {
+    // `not_computable` is a refusal the owner is told about. A bare code says
+    // nothing without a document beside it; the vocabulary carries the sentence
+    // itself, and the same list types every value that may be refused.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for schema in [
+        "ComputedDto",
+        "RateDto",
+        "ComputedCalcMoneyDto",
+        "ComputedZeroReinvestmentMetricsDto",
+        "ComputedLifetimeCohortMetricsDto",
+    ] {
+        let property = &spec["components"]["schemas"][schema]["properties"]["not_computable"];
+        assert!(
+            refers_to(property, "NotComputableCodeDto"),
+            "{schema}.not_computable must point at the vocabulary: {property}"
+        );
+    }
+
+    assert_eq!(
+        published_vocabulary(&spec, "NotComputableCodeDto"),
+        vec![
+            "missing_price",
+            "missing_fx_rate",
+            "quotation_basis_contradicts_evidence",
+            "quotation_basis_unknown",
+            "remaining_face_unknown",
+            "principal_unknown",
+            "solver_refused",
+            "no_external_flows",
+            "state_newer_than_report",
+            "numeric",
+            "unsupported_financing",
+            "schedule_missing",
+            "accrued_observation_missing",
+            "coupon_undetermined",
+            "outside_schedule_coverage",
+            "overlapping_schedule_coverage",
+            "exit_not_executable",
+            "non_positive_duration",
+            "non_positive_initial_capital",
+            "negative_terminal_wealth",
+            "acquisition_basis_unknown",
+            "accrued_interest_at_acquisition_unknown",
+            "historical_receipts_unknown",
+            "cohort_gap",
+            "currency_mismatch",
+            "expense_unknown",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_openapi_document_enumerates_and_explains_the_data_quality_status() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(refers_to(
+        &spec["components"]["schemas"]["DataQualityDto"]["properties"]["status"],
+        "DataQualityStatusDto"
+    ));
+    assert_eq!(
+        published_vocabulary(&spec, "DataQualityStatusDto"),
+        vec!["clean", "mixed", "incomplete"]
+    );
+}
+
+#[tokio::test]
+async fn a_published_code_is_the_code_the_response_carries() {
+    // The vocabularies enumerate; they must enumerate what actually arrives.
+    // A schema that lists ten plausible codes while the server sends an
+    // eleventh is worse than no schema, because it is believed.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let verdicts = published_vocabulary(&spec, "VerdictCodeDto");
+    let statuses = published_vocabulary(&spec, "DataQualityStatusDto");
+
+    let contour = json!({
+        "title": "Vocabulary",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "1000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-01-01" },
+        }],
+    });
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let code = response[0]["verdict"].as_str().expect("verdict code");
+    assert!(
+        verdicts.iter().any(|published| published == code),
+        "the verdict {code} is not in the published vocabulary {verdicts:?}"
+    );
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2025-12-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let quality = report["data_quality"]["status"]
+        .as_str()
+        .expect("data quality status");
+    assert!(
+        statuses.iter().any(|published| published == quality),
+        "the status {quality} is not in the published vocabulary {statuses:?}"
+    );
+}
+
 #[tokio::test]
 async fn the_openapi_document_declares_report_quality_and_liquidation_fields() {
     let harness = harness();

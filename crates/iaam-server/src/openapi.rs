@@ -37,6 +37,7 @@ use crate::dto::{
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
+use crate::vocabulary::{DataQualityStatusDto, NotComputableCodeDto, VerdictCodeDto};
 
 /// Authentication scheme. Declared separately: `utoipa` generates it
 /// from types, but the `Bearer` requirement cannot be expressed by a type.
@@ -181,6 +182,11 @@ impl Modify for BearerSecurity {
         TokenDto,
         UncoveredPositionDto,
         VerdictDto,
+        // The published vocabularies: every code the API can return, each with
+        // the sentence that explains it (§13).
+        VerdictCodeDto,
+        NotComputableCodeDto,
+        DataQualityStatusDto,
     ))
 )]
 pub struct ApiDoc;

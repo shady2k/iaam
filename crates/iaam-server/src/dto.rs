@@ -3733,8 +3733,6 @@ impl SyncOutcomeDto {
         }
     }
 }
-/// Access secret replacement: the secret is never part of the response.
-
 /// Instrument catalogue entry.
 ///
 /// The alias's `source` field is deliberately absent here: the catalogue is global

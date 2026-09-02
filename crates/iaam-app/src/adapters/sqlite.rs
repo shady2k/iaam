@@ -508,8 +508,7 @@ impl BrokerVault for SqliteAdapter {
         // does not say what they map to in our system — the dictionary must be populated
         // from our own knowledge (`dictionary_seed`).
         // The contract cross-check is separate and invoked explicitly.
-        let Some((dictionary, entries)) =
-            iaam_broker::operation_kind::seed_for(code.as_str())
+        let Some((dictionary, entries)) = iaam_broker::operation_kind::seed_for(code.as_str())
         else {
             return Err(AppError::Invalid {
                 field: "broker".to_owned(),

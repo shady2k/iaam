@@ -29,7 +29,7 @@ use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::money_flow::MoneyFlowError;
 use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
-use iaam_core::reconciliation::claim::ControlClaim;
+use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{ClaimCheck, Dimension, ReconciliationStatus, Taint};
 use iaam_core::returns::zero_reinvestment::{
     BondScenarioResult, IrrLabel, LifetimeCohortMetric, ProspectiveMetric, ZeroReinvestmentMetrics,
@@ -4336,6 +4336,87 @@ pub struct OwnerPositionDto {
     pub quantity: String,
 }
 
+/// Which end of the interval a balance assertion is about. A separate type
+/// because the core's `BalancePoint` knows nothing about OpenAPI and should not.
+///
+/// The two values are the whole domain, and the field used to be a bare
+/// `String`: a caller that wanted the start of the interval had `open`,
+/// `start`, `begin` and `opening` to choose from, and learned which one the
+/// route meant by being refused. Enumerating them in the contract is the point.
+///
+/// This matters more than it did while the field was only ever written by hand:
+/// the action queue presets it at both points, so the value is something a
+/// caller reads out of an action and sends back, and an action whose preset the
+/// contract cannot explain is an action the caller has to guess at.
+///
+/// Each point is explained in [`BalancePointDto::VOCABULARY`] rather than in a
+/// doc comment per variant, for the reason [`AliasNamespaceDto`] gives: utoipa
+/// renders a unit-variant enum as a bare list of strings and discards those
+/// comments. The published schema is a `oneOf` built by
+/// `vocabulary::described_vocabulary`, the same shape the verdict, refusal,
+/// data-quality and namespace codes are published in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalancePointDto {
+    Opening,
+    Closing,
+}
+
+impl BalancePointDto {
+    /// Both points with the sentence that explains each, in declaration order.
+    ///
+    /// The code half is taken from the domain, so the contract cannot come to
+    /// disagree with what the server accepts; only the meaning is written here.
+    ///
+    /// The two sentences are the ones a caller most needs, and they are what a
+    /// single sentence for the whole field cannot carry: the difference between
+    /// the two points is not a spelling but a question of whether the interval's
+    /// own events are inside the figure or outside it.
+    const VOCABULARY: &'static [(&'static str, &'static str)] = &[
+        (
+            BalancePoint::Opening.code(),
+            "The opening balance: the state before the first event in the interval. Without it the figure a report shows for the interval is a movement over the interval and not a balance at all, because the sum starts from zero rather than from what was there.",
+        ),
+        (
+            BalancePoint::Closing.code(),
+            "The closing balance: the state including the last event in the interval. This is the figure a statement prints at the foot of the period, and the one the interval's own reconciliation is compared against.",
+        ),
+    ];
+
+    /// The code as it appears on the wire.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        self.to_domain().code()
+    }
+
+    #[must_use]
+    pub const fn to_domain(self) -> BalancePoint {
+        match self {
+            Self::Opening => BalancePoint::Opening,
+            Self::Closing => BalancePoint::Closing,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_domain(point: BalancePoint) -> Self {
+        match point {
+            BalancePoint::Opening => Self::Opening,
+            BalancePoint::Closing => Self::Closing,
+        }
+    }
+}
+
+impl PartialSchema for BalancePointDto {
+    fn schema() -> RefOr<Schema> {
+        described_vocabulary(
+            "Which end of the interval the assertion is about. The two points are not interchangeable: an opening figure states what was there before the interval began, a closing one states what was there after it ended, and there is no third answer. When the value comes from an action's preset it is sent back exactly as it was read.",
+            Self::VOCABULARY,
+        )
+    }
+}
+
+impl ToSchema for BalancePointDto {}
+
 /// Owner's response to a control balance request.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct OwnerBalanceRequest {
@@ -4346,7 +4427,9 @@ pub struct OwnerBalanceRequest {
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub to: Date,
-    pub at: String,
+    /// Which end of the interval the assertion is about. Sent back unchanged
+    /// when it was read from an action's preset.
+    pub at: BalancePointDto,
     #[serde(default)]
     pub cash: Option<OwnerCashDto>,
     #[serde(default)]

@@ -46,7 +46,7 @@ use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::PROJECTION_VERSION;
 use iaam_core::reconciliation::ReconciliationStatus;
-use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
+use iaam_core::reconciliation::claim::AssertionPeriod;
 use iaam_core::rules::LotRuleVersion;
 use iaam_core::valuation::{FxSource, FxTable};
 use rust_decimal::Decimal;
@@ -604,13 +604,10 @@ pub async fn reconciliation_balance(
             format!("{}..{}", request.from, request.to),
         )
     })?;
-    let at = match request.at.as_str() {
-        "opening" => BalancePoint::Opening,
-        "closing" => BalancePoint::Closing,
-        actual => {
-            return Err(invalid_field("at", "opening or closing", actual.to_owned()));
-        }
-    };
+    // The point is no longer parsed here: `BalancePointDto` is the enumeration,
+    // so a value outside it is refused by the body extractor with both codes
+    // named, and this handler cannot be reached holding a third one.
+    let at = request.at.to_domain();
     let cash = request
         .cash
         .map(|cash| {

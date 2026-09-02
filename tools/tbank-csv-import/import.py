@@ -18,7 +18,7 @@ from decimal import Decimal
 
 
 CHANNEL_DEFAULT = "file"
-# Default only: the export this skill was written against posts the two legs of
+# Default only: the export this tool was written against posts the two legs of
 # an internal transfer about a second apart. Another institution posts them
 # further apart, so it is a flag rather than a constant — but a WIDE window
 # starts joining two genuinely separate transfers of the same round amount,
@@ -37,7 +37,7 @@ def date_of(row):
 
 
 def row_key(account_id, channel, raw_line, ordinal):
-    """Build the row key required by import-skill design section 3."""
+    """Build the row key required by the import design, section 3."""
     digest = hashlib.sha256(raw_line.encode("utf-8")).hexdigest()
     return f"{account_id}/{channel}/{digest}/{ordinal}"
 
@@ -168,7 +168,7 @@ def transfer_to_own_account(row, statement_account_id, other_account_id, currenc
 
     Nothing in an export distinguishes a payment to a stranger from a top-up of
     the same person's account at another bank, so the answer arrives through
-    --counterparty-map at run time and is never written into this skill. The
+    --counterparty-map at run time and is never written into this file. The
     direction follows the sign: money leaving the statement's account goes to
     the other one, and money arriving came from it, which the API expresses as a
     transfer filed on the sending account."""
@@ -353,7 +353,7 @@ def main():
         "Counterparties the operator declares to be their own accounts; their "
         "rows become transfers "
         "between his own accounts instead of money crossing the contour. Owner "
-        "knowledge, supplied per run and never stored in this skill.",
+        "knowledge, supplied per run and never stored in this tool.",
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")

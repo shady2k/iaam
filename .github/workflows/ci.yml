@@ -25,6 +25,13 @@ jobs:
         run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Architecture guards
         run: nix develop -c ./scripts/check-architecture.sh
+      # The agent document explains meaning and does not retell the API. A route,
+      # a method or a status code in it is an availability claim that nothing
+      # checks and that goes stale silently — it claimed `501` for three route
+      # families that worked (iaam-zu6m). The step is here as well as in `make
+      # check` because the Makefile repeats CI step for step.
+      - name: Agent document
+        run: nix develop -c ./scripts/check-agent-skill.sh
       - name: Diff lint
         env:
           # Владелец выставляет переменную в настройках репозитория,

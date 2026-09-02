@@ -47,6 +47,28 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Import Tools
+
+The owner's data is imported by ordinary Python 3 scripts in `tools/`, not by
+anything vendor-specific. They use only the standard library, take every input as
+an explicit argument, and are run directly:
+
+| Tool | What it moves |
+|---|---|
+| `tools/tbank-csv-import/import.py` | a T-Bank operations export into iaam operations |
+| `tools/actual-budget-migrate/migrate_categories.py` | an Actual Budget category list into iaam categories |
+
+Read `tools/README.md` first, then the tool's own `README.md`. Those files are
+the only copy of the rules; `.claude/skills/` holds pointers to them so that
+Claude Code lists them as skills, and holds no script and no fixture. Do not
+duplicate either — two copies of an importer drift silently.
+
+**The agent does not hold the owner's data.** He runs these himself against his
+own files. Account maps, counterparty maps and database paths are run-time
+arguments living outside this repository; never commit one, and never point a
+script at real data to check that it works. Each tool's fixtures are invented end
+to end and are what you test against.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
 

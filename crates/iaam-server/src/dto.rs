@@ -8,8 +8,6 @@
 //! numbers: the JSON number `0.1` in binary floating point is not equal to one
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
-use std::fmt;
-
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
@@ -43,6 +41,8 @@ use iaam_core::valuation::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
 use time::{Date, OffsetDateTime};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -2354,6 +2354,8 @@ pub enum ActionTargetDto {
 /// Request fields that the policy cannot fill.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestPlanDto {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub preset: BTreeMap<String, serde_json::Value>,
     pub missing: Vec<MissingInputDto>,
 }
 

@@ -129,6 +129,13 @@ pub enum IncomeKind {
     DepositInterest,
 }
 
+/// Storage discriminants used by SQL projections as well as the event API.
+///
+/// Keeping these values beside `EventKind::discriminant` prevents a projection
+/// from silently drifting when a journal kind is renamed.
+pub const CONTROL_ASSERTION_KIND: &str = "control_assertion";
+pub const IMPORT_COVERAGE_GAP_KIND: &str = "import_coverage_gap";
+
 /// The event type is exhaustive — `#[non_exhaustive]` is intentionally **not**
 /// used: the core has no external consumers, and exhaustiveness enables
 /// complete handling checks (§15.1).
@@ -312,8 +319,8 @@ impl EventKind {
             Self::OpeningPosition { .. } => "opening_position",
             Self::OpeningCash { .. } => "opening_cash",
             Self::Valuation { .. } => "valuation",
-            Self::ControlAssertion { .. } => "control_assertion",
-            Self::ImportCoverageGap { .. } => "import_coverage_gap",
+            Self::ControlAssertion { .. } => CONTROL_ASSERTION_KIND,
+            Self::ImportCoverageGap { .. } => IMPORT_COVERAGE_GAP_KIND,
             Self::CorporateAction { .. } => "corporate_action",
             Self::OfferExercise { .. } => "offer_exercise",
         }

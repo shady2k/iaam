@@ -70,7 +70,11 @@ impl ActionCatalog {
         }
 
         let mut operations = BTreeMap::new();
-        for key in [OperationKey::CreateAccount, OperationKey::CreateContour] {
+        for key in [
+            OperationKey::CreateAccount,
+            OperationKey::CreateContour,
+            OperationKey::RecordOwnerBalance,
+        ] {
             let operation_id = key.as_str();
             let Some((path, method, operation)) = by_id.get(operation_id) else {
                 return Err(ActionCatalogError::MissingActionOperation {

@@ -91,6 +91,21 @@ that no item can carry, and the honest answer for this route was no. A
 something that moves and published everywhere `ActionDto` is published — not
 beside one of the four.
 
+### 1.4b A count is named as a count
+
+Where a response does publish a count — because the thing counted is not in the
+response and the client therefore cannot count it — the field is named so that it
+cannot be read as a list. `ImportSessionContentsDto.row_count` and
+`SourceInventoryDto.row_count` are both `row_count` and not `rows`, and the
+suffix was bought with a client's mistake: `rows` sat beside `questions`, a list
+of one-row-shaped items, and an external agent wrote `len(rows)` against it twice
+before reading the field description.
+
+The rule has a companion in §1.3: `rows` is the right name for a list of rows,
+and `POST /v1/import-sessions/{session}/commit` uses it for exactly that. One
+word cannot be both, and the count is the one that gives way — a client that
+indexes into a list it was given is doing the ordinary thing.
+
 ### 1.5 What this means when a new list route is added
 
 Decide the shape when the route is published, because it cannot be changed
@@ -132,7 +147,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/reconciliation` | `ReconciliationResponseDto` | object, `statuses` | three lists — `statuses`, `gaps`, `actions` — none of them a property of another's rows |
 | `GET /v1/transfer-pairings` | `CrossSourceMatchingDto` | object, `candidates` | `without_counterpart` — the legs nothing paired with, which no candidate can carry |
 | `GET /v1/accounts/{id}/transfer-partners` | `AccountTransferPartnersDto` | object, `partners` | `stated` — whether the owner has ruled at all, which an empty array cannot say |
-| `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, and how many questions are unanswered |
+| `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, `row_count`, and how many questions are unanswered |
 | `GET /v1/reports/balances` | `BalancesReportDto` | object, `accounts` | `negative_cash`, `population` |
 | `GET /v1/reports/returns` | `ReturnsAnswerDto` | object | not a list at the top level; `population` sits beside the report's own figures |
 | `GET /v1/reports/flow` | `MoneyFlowReportDto` | object, `currencies` | the interval, the scope version, `population`, `actions` |
@@ -511,3 +526,53 @@ gate and not the shape.
 And the rule cuts both ways by design. A new route that turns out to write a
 standing decision as a side effect is gated on that decision, not on its own
 name — which is the whole of §4.1 read forwards instead of backwards.
+
+---
+
+## 5. A structure is never sent as a string
+
+> **A field whose value is a structure is a JSON object on the wire, in both
+> directions. It is never a JSON document encoded inside a JSON string, and the
+> shape a route prints is a shape the route that writes it accepts unchanged.**
+
+### 5.1 Why the read shape and the write shape must be one
+
+Every other rule in this file can be learned from documentation. This one cannot,
+because the client is a language model and the way a language model discovers a
+write shape is by copying the shape it just read. A field that reads as one thing
+and is written as another has no signal a client can follow: it has to guess, and
+each guess costs a rejected request.
+
+`POST /v1/classification-rules` used to take `matcher` and `outcome` as **strings
+containing** the JSON that the listing prints — and an external client needed two
+attempts to compose the write shape after reading the read shape. Both are now
+objects on both sides, and `RuleMatcherDto` and `ClassifiedAsDto` are the same
+types in the request body and in the response, so the round trip is a property of
+the type rather than of two definitions that agree today.
+
+### 5.2 Why a string is worse than an object even when it round-trips
+
+A structure inside a string does round-trip, in the narrow sense: copy the string
+back and the server parses it. What it does not do is say what may be put in it.
+An object publishes its members in the specification; a string publishes
+`type: string`, and the members exist only in prose the client has to find. It
+also puts the encoding in the client's hands — escaping, key order, whether a
+member may be omitted or must be `null` — none of which the client can verify
+before sending.
+
+The store keeps such values as opaque text on purpose: `import_sessions` and the
+rule tables document exactly that, and the reason is that the store must not know
+the classifier's vocabulary. That is a storage decision, and it stops at the
+storage boundary. What reaches the wire is the parsed structure, read by the same
+function the classifier reads it with — one reader, so a rule cannot be printed
+in a vocabulary it may not be written in.
+
+### 5.3 Where the rule is not yet kept
+
+`GET /v1/category-rules` prints `matcher` as a string holding the stored JSON,
+while `POST /v1/category-rules` documents an object. The write side does also
+accept the string, in seven spellings, so a client that copies what it read is
+accepted — the asymmetry is in what the two sides *say*, and a client that
+follows the specification writes a shape it will never read back. Straightening
+it means choosing one spelling of a category matcher and retiring the other six,
+which is its own decision about breaking a client and is not made here.

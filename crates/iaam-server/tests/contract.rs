@@ -3140,8 +3140,8 @@ async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
 async fn classification_rules_are_visible_versioned_and_retirable() {
     let harness = harness();
     let request = json!({
-        "matcher": r#"{"kind":"income"}"#,
-        "outcome": r#"{"kind":"external_flow"}"#,
+        "matcher": { "kind": "income" },
+        "outcome": { "kind": "external_flow" },
     });
     let (status, created) = call(
         &harness.router,
@@ -3160,7 +3160,7 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
     .await;
     assert_eq!(status, StatusCode::OK, "{history}");
     assert_eq!(history.as_array().expect("history").len(), 1);
-    assert_eq!(history[0]["matcher"], r#"{"kind":"income"}"#);
+    assert_eq!(history[0]["matcher"], json!({ "kind": "income" }));
     assert!(!history.to_string().contains(BROKER_TOKEN), "{history}");
 
     let (status, body) = call(
@@ -3189,8 +3189,8 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
 async fn only_the_owner_can_manage_classification_rules() {
     let harness = harness();
     let rule = json!({
-        "matcher": r#"{"kind":"income"}"#,
-        "outcome": r#"{"kind":"external_flow"}"#,
+        "matcher": { "kind": "income" },
+        "outcome": { "kind": "external_flow" },
     });
     for (method, body) in [
         (
@@ -7425,9 +7425,24 @@ fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
     let required = operation["required"]
         .as_array()
         .expect("operation required");
-    for field in ["operationId", "method", "path", "requestSchema", "request"] {
+    for field in ["operationId", "method", "path", "request"] {
         assert!(required.iter().any(|value| value == field), "{field}");
     }
+    // `requestSchema` is declared and is not required: a call that takes no
+    // request body has no request schema, and the one such call an action or a
+    // refusal offers is abandoning an import session. Present in the properties
+    // so a client knows to look for it; absent from `required` so its absence is
+    // a shape the contract admits rather than a violation of it.
+    assert!(
+        operation["properties"]
+            .get("requestSchema")
+            .is_some_and(|schema| !schema.is_null()),
+        "the schema reference must still be described: {operation}"
+    );
+    assert!(
+        !required.iter().any(|value| value == "requestSchema"),
+        "a body-less call has no request schema: {operation}"
+    );
 }
 
 #[tokio::test]
@@ -9669,8 +9684,8 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     // A rule on the description the source printed. Matching it requires the
     // subject rebuilt from the event to carry that description.
     let by_description = json!({
-        "matcher": r#"{"description_contains":"shop one"}"#,
-        "outcome": r#"{"kind":"fee","origin":"account_maintenance"}"#,
+        "matcher": { "description_contains": "shop one" },
+        "outcome": { "kind": "fee", "origin": "account_maintenance" },
     });
     let (status, first) = call(
         &harness.router,
@@ -9698,8 +9713,8 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     // A rule on the word the source used for the row — not on `cash_out`,
     // which is the classification this rule exists to revise.
     let by_source_kind = json!({
-        "matcher": r#"{"kind":"Card operation"}"#,
-        "outcome": r#"{"kind":"income"}"#,
+        "matcher": { "kind": "Card operation" },
+        "outcome": { "kind": "income" },
     });
     let (status, second) = call(
         &harness.router,
@@ -9739,13 +9754,141 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{plan}");
 }
 
+/// What the listing prints is what the create route accepts, unchanged.
+///
+/// The one thing an LLM client cannot infer is a write shape that differs from
+/// the read shape, because inference is copying the shape it just saw. So the
+/// test sends nothing of its own on the second write: it takes `matcher` and
+/// `outcome` out of the response verbatim and posts them back, and the rule that
+/// comes out has to be the rule that went in.
+///
+/// A rule created by answering an import question is round-tripped too, and it
+/// is the harder half: nothing about it was composed by a client, so it is the
+/// shape the server itself writes that has to be readable as a request.
+#[tokio::test]
+async fn a_classification_rule_round_trips_through_the_shape_it_is_read_in() {
+    let harness = harness();
+    let savings = account_with(&harness, &json!({ "title": "Savings" })).await;
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": { "counterparty_account": "Savings", "kind": "INNER" },
+                "outcome": { "kind": "internal_transfer", "to": savings },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (status, history) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let read = &history.as_array().expect("history")[0];
+    assert_eq!(
+        read["matcher"],
+        json!({ "counterparty_account": "Savings", "kind": "INNER" }),
+        "the matcher is read as the object it was written as: {read}"
+    );
+    assert_eq!(
+        read["outcome"],
+        json!({ "kind": "internal_transfer", "to": savings }),
+        "the outcome is read as the object it was written as: {read}"
+    );
+
+    // Nothing composed here: exactly what was read, sent back.
+    let (status, again) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({ "matcher": read["matcher"], "outcome": read["outcome"] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "what the listing prints must be accepted verbatim: {again}"
+    );
+    assert_eq!(again["matcher"], read["matcher"], "{again}");
+    assert_eq!(again["outcome"], read["outcome"], "{again}");
+
+    // The rule the server writes for itself, when the owner answers a question,
+    // has to survive the same journey.
+    let account = harness.account.inner();
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "round-trip-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"].as_str().expect("session");
+    let question = verdicts[0]["question_id"].as_str().expect("question");
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    let learned = answered["rule"]
+        .as_str()
+        .expect("the rule the answer wrote");
+
+    let (status, history) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let read = history
+        .as_array()
+        .expect("history")
+        .iter()
+        .find(|rule| rule["id"] == json!(learned))
+        .expect("the rule the answer wrote is in the listing");
+    let (status, again) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({ "matcher": read["matcher"], "outcome": read["outcome"] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a rule the server wrote must be readable as a request: {again}"
+    );
+    assert_eq!(again["matcher"], read["matcher"], "{again}");
+    assert_eq!(again["outcome"], read["outcome"], "{again}");
+}
+
 /// A rule matching nothing says so, rather than saying nothing.
 #[tokio::test]
 async fn a_classification_rule_that_matches_nothing_returns_an_empty_plan() {
     let harness = harness();
     let rule = json!({
-        "matcher": r#"{"description_contains":"nothing here"}"#,
-        "outcome": r#"{"kind":"income"}"#,
+        "matcher": { "description_contains": "nothing here" },
+        "outcome": { "kind": "income" },
     });
     let (status, created) = call(
         &harness.router,
@@ -11144,8 +11287,15 @@ fn every_remedy_the_register_names_is_a_call_the_contract_publishes() {
                 resolved.method,
                 resolved.path
             );
+            // A caveat's remedy is always a call that takes a body: it is a
+            // fact the owner supplies, and there is nowhere but the body to put
+            // it. The `Option` exists for the calls a *refusal* offers, which
+            // include one that takes nothing — abandoning an import session.
             assert!(
-                !resolved.request_schema.is_empty(),
+                resolved
+                    .request_schema
+                    .as_ref()
+                    .is_some_and(|schema| !schema.is_empty()),
                 "{} names {}, whose request shape is not published",
                 kind.code(),
                 key.as_str()
@@ -12644,6 +12794,67 @@ async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_i
     );
 }
 
+/// A count is named as a count, so no client reads it as the list beside it.
+///
+/// `rows` sat next to `questions`, which is a list of the same per-row shape,
+/// and an external agent wrote `len(rows)` against it twice. The count is now
+/// `row_count` in both places that publish one — the session's contents and the
+/// assessment's source inventory — and the word `rows` appears in neither,
+/// because a name a client can be wrong about is what caused the mistake.
+#[tokio::test]
+async fn a_session_publishes_its_row_count_under_a_name_no_client_can_index() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "counted-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session identifier")
+        .to_owned();
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(contents["row_count"], 1, "{contents}");
+    assert!(
+        contents.get("rows").is_none(),
+        "a count must not answer to the name of the list it sits beside: {contents}"
+    );
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["source_inventory"]["row_count"], 1, "{plan}");
+    assert!(
+        plan["source_inventory"].get("rows").is_none(),
+        "the inventory's count sits between two lists and must not read as a third: {plan}"
+    );
+}
+
 /// The answer is a durable rule, and what the rule makes durable is **what the
 /// row is** — not which way the next one runs.
 ///
@@ -12999,6 +13210,191 @@ async fn a_declaration_by_identifier_and_by_uuid_reach_the_same_session() {
     assert_eq!(
         opened[0], opened[1],
         "one import has one open session, however the account was named"
+    );
+}
+
+/// An import already under way is named, not silently continued.
+///
+/// One import has one open session, and re-declaring it used to answer
+/// `201 Created` with the session that already existed — indistinguishable from
+/// one just made. A caller that reused a label for a different file had its rows
+/// join the earlier ones, and the commit was then refused over questions raised
+/// by rows it had never sent. Nothing said which session was in the way and
+/// nothing said it could be thrown away; the owner found `abandon` by
+/// experiment.
+///
+/// The empty case still hands the session back: that is a caller retrying the
+/// open call, and there is nothing in an empty session to mix a statement into.
+#[tokio::test]
+async fn a_declared_import_that_already_holds_rows_is_refused_and_the_refusal_names_the_session() {
+    let harness = harness();
+    let account = account_with(
+        &harness,
+        &json!({ "title": "Main", "provider": "bank-one", "provider_account_id": "acct-1" }),
+    )
+    .await;
+    let declaration =
+        json!({ "source": { "account": "acct-1", "channel": "file", "label": "march" } });
+
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    // Nothing fed yet, so the same declaration is the same open call.
+    let (status, again) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{again}");
+    assert_eq!(
+        again["session"], opened["session"],
+        "one import has one open session: {again}"
+    );
+
+    let account = Uuid::parse_str(&account).expect("account uuid");
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(account, "march-1")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "needs_classification", "{rows}");
+
+    let (status, refused) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a statement half imported is not silently continued: {refused}"
+    );
+    assert_eq!(refused["code"], "invalid_request", "{refused}");
+    assert_eq!(refused["field"], "source.label", "{refused}");
+    assert_eq!(refused["pointer"], "/source/label", "{refused}");
+    let actual = refused["actual"].as_str().expect("what stands in the way");
+    assert!(
+        actual.contains(&session),
+        "the refusal must name the session standing in the way: {refused}"
+    );
+    assert!(
+        actual.contains("1 rows") && actual.contains("1 unanswered"),
+        "and say what it holds: {refused}"
+    );
+
+    // Both calls that end the session, and answering leads because a session
+    // waiting on a question cannot be committed.
+    let offered: Vec<&str> = refused["resolutions"]
+        .as_array()
+        .expect("the calls that end it")
+        .iter()
+        .map(|option| option["operationId"].as_str().expect("operation"))
+        .collect();
+    assert_eq!(
+        offered,
+        ["answer_import_question", "abandon_import_session"],
+        "{refused}"
+    );
+    let abandon = &refused["resolutions"][1];
+    assert_eq!(abandon["method"], "POST", "{refused}");
+    assert_eq!(
+        abandon["path"], "/v1/import-sessions/{session}/abandon",
+        "{refused}"
+    );
+    assert_eq!(
+        abandon["request"]["preset"]["session"],
+        json!(session),
+        "{refused}"
+    );
+    assert!(
+        abandon.get("requestSchema").is_none(),
+        "abandoning takes no body, and the refusal must not invent one: {refused}"
+    );
+
+    // Abandoning is the way out, and the declaration works again afterwards.
+    let (status, abandoned) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/abandon"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{abandoned}");
+    let (status, fresh) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{fresh}");
+    assert_ne!(
+        fresh["session"], opened["session"],
+        "the abandoned session is not reopened: {fresh}"
+    );
+}
+
+/// With every question answered, committing is what the refusal leads with.
+#[tokio::test]
+async fn a_settled_import_under_way_is_refused_with_the_commit_that_ends_it() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let declaration =
+        json!({ "source": { "account": account, "channel": "file", "label": "march" } });
+
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [{
+                "account": account,
+                "type": "deposit",
+                "amount": "1000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-03-02" },
+                "idempotency_key": "settled-one",
+            }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "held", "{rows}");
+
+    let (status, refused) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let offered: Vec<&str> = refused["resolutions"]
+        .as_array()
+        .expect("the calls that end it")
+        .iter()
+        .map(|option| option["operationId"].as_str().expect("operation"))
+        .collect();
+    assert_eq!(
+        offered,
+        ["commit_import_session", "abandon_import_session"],
+        "a session waiting on nobody is committed, not answered: {refused}"
     );
 }
 
@@ -13653,7 +14049,7 @@ async fn an_assessment_says_what_the_import_will_and_will_not_record() {
     .await;
     assert_eq!(status, StatusCode::OK, "{plan}");
 
-    assert_eq!(plan["source_inventory"]["rows"], 2, "{plan}");
+    assert_eq!(plan["source_inventory"]["row_count"], 2, "{plan}");
     assert_eq!(
         plan["source_inventory"]["accounts"]
             .as_array()
@@ -15637,8 +16033,10 @@ async fn a_rejected_field_with_a_closed_vocabulary_publishes_its_values() {
 
 /// The classification outcome vocabulary travels as values, not as a sentence.
 ///
-/// The rule's outcome is a JSON string the caller composes, so the four
-/// classifications it may name are the caller's business and not the store's.
+/// `outcome.kind` is one of four words and the schema does not say which, so the
+/// refusal carries them. The check runs at the door — before the rule is stored
+/// — because a rule the classifier cannot read is a decision written and lost in
+/// the same call.
 #[tokio::test]
 async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
     let harness = harness();
@@ -15648,8 +16046,8 @@ async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
             "/v1/classification-rules",
             &harness.owner_token,
             &json!({
-                "matcher": r#"{"kind":"income"}"#,
-                "outcome": r#"{"kind":"gift"}"#,
+                "matcher": { "kind": "income" },
+                "outcome": { "kind": "gift" },
             }),
         ),
     )

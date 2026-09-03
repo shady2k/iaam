@@ -62,19 +62,68 @@ pub struct RuleChange {
     pub plan: Vec<PlannedCorrection>,
 }
 
+/// Store a rule stated in the classifier's own types, and say what it corrects.
+///
+/// The condition and the outcome arrive as [`RuleMatcher`] and
+/// [`Classification`] rather than as the JSON the store keeps, and that is the
+/// point: the encoding lives in [`matcher_json`] and [`outcome_json`] here,
+/// beside [`rule_from_view`], which is the only thing that reads it back. A
+/// transport that assembled the stored JSON itself would be a second writer of
+/// a format with one reader, and the two would drift silently — the rule would
+/// go in, and the owner's decision would be unreadable afterwards.
 pub async fn create_rule(
     services: &AppServices,
     principal: &Principal,
-    matcher: String,
-    outcome: String,
+    matcher: &RuleMatcher,
+    outcome: Classification,
     replaces: Option<Uuid>,
 ) -> Result<RuleChange, AppError> {
     let rule = services
         .rules
-        .create_rule(principal.owner, matcher, outcome, replaces)
+        .create_rule(
+            principal.owner,
+            encoded(&matcher_json(matcher), "matcher")?,
+            encoded(&outcome_json(outcome), "outcome")?,
+            replaces,
+        )
         .await?;
     let plan = recompute_history(services, principal.owner).await?;
     Ok(RuleChange { rule, plan })
+}
+
+/// The condition, in the form the rule store keeps it in.
+///
+/// Every key [`rule_from_view`] reads is written, `null` included, so that a
+/// stored rule states what it does not ask about instead of leaving a reader to
+/// infer it from an absence.
+#[must_use]
+pub fn matcher_json(matcher: &RuleMatcher) -> Value {
+    serde_json::json!({
+        "counterparty_account": matcher.counterparty_account,
+        "description_contains": matcher.description_contains,
+        "kind": matcher.kind,
+    })
+}
+
+/// A classification, in the form the rule store keeps it in.
+///
+/// The inverse of [`parse_outcome`], and it must stay so: a rule written in
+/// words that parser cannot read is a decision the owner can never see again.
+#[must_use]
+pub fn outcome_json(classification: Classification) -> Value {
+    let named = classified_as(classification);
+    match named.to {
+        Some(to) => serde_json::json!({ "kind": named.kind, "to": to.inner().to_string() }),
+        None => match named.origin {
+            Some(origin) => serde_json::json!({ "kind": named.kind, "origin": origin }),
+            None => serde_json::json!({ "kind": named.kind }),
+        },
+    }
+}
+
+fn encoded(value: &Value, field: &'static str) -> Result<String, AppError> {
+    serde_json::to_string(value)
+        .map_err(|error| AppError::Store(format!("{field} could not be written: {error}")))
 }
 
 pub async fn retire_rule(
@@ -152,7 +201,12 @@ fn planned(correction: &Correction) -> PlannedCorrection {
 /// The inverse of [`parse_outcome`], and it must stay so: the plan speaks the
 /// vocabulary the owner writes rules in, or it names a decision they cannot
 /// restate as a rule.
-const fn classified_as(classification: Classification) -> ClassifiedAs {
+///
+/// Public because the transport renders a stored rule's outcome with it. A rule
+/// read back in a vocabulary other than the one it may be written in is a rule
+/// a caller cannot send again, which is the whole of iaam-gpo3.
+#[must_use]
+pub const fn classified_as(classification: Classification) -> ClassifiedAs {
     match classification {
         Classification::InternalTransfer { to } => ClassifiedAs {
             kind: "internal_transfer",
@@ -241,26 +295,43 @@ fn parse_outcome(outcome: Map<String, Value>) -> Result<Classification, AppError
         .get("kind")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_outcome("field kind"))?;
+    outcome_from(
+        kind,
+        outcome.get("to").and_then(Value::as_str),
+        outcome.get("origin").and_then(Value::as_str),
+    )
+}
+
+/// The outcome vocabulary, read from three fields rather than from JSON.
+///
+/// The stored rule and the request body carry the same three words in different
+/// containers — an object in the store, named members of a request DTO on the
+/// wire — and both must be read by one function. Two readers would eventually
+/// admit a word on one side that the other refuses, and a rule accepted at the
+/// door that the classifier cannot read is a decision written and lost in the
+/// same call.
+pub fn outcome_from(
+    kind: &str,
+    to: Option<&str>,
+    origin: Option<&str>,
+) -> Result<Classification, AppError> {
     match kind {
         "internal_transfer" => {
-            let raw = outcome
-                .get("to")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_outcome("field to"))?;
+            let raw = to.ok_or_else(|| invalid_outcome("field to"))?;
             let to = Uuid::parse_str(raw).map_err(|_| invalid_outcome(raw))?;
             Ok(Classification::InternalTransfer { to: AccountId(to) })
         }
         "external_flow" => Ok(Classification::ExternalFlow),
         "income" => Ok(Classification::Income),
         "fee" => Ok(Classification::Fee {
-            origin: match outcome.get("origin").and_then(Value::as_str) {
+            origin: match origin {
                 Some("brokerage") => FeeOrigin::Brokerage,
                 Some("depositary") => FeeOrigin::Depositary,
                 Some("account_maintenance") => FeeOrigin::AccountMaintenance,
                 Some("margin_interest") => FeeOrigin::MarginInterest,
                 Some("other") => FeeOrigin::Other,
-                Some(actual) => return Err(invalid_outcome(actual)),
-                None => return Err(invalid_outcome("field origin")),
+                Some(actual) => Err(invalid_outcome(actual))?,
+                None => Err(invalid_outcome("field origin"))?,
             },
         }),
         actual => Err(invalid_outcome(actual)),

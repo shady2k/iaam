@@ -450,6 +450,39 @@ result a balance. For the same reason a currency whose cash is not entirely
 anchored has **no entry** in the snapshot's `total` at all — no whole exists to
 state, and both halves above it still say everything they know.
 
+**Reconciliation says the same thing in its own words.** A source's balance
+assertion over a fold nothing anchors is `not_comparable` with the reason
+`opening_not_asserted` — not `discrepant`. The distinction matters because the
+two are opposite instructions: `discrepant` means the figures disagree and one
+of them is wrong; `opening_not_asserted` means there is no baseline to hold the
+figure against, and nothing the owner stated is being contradicted. Never
+report the second as an error he made. What lifts it is an opening assertion
+reaching back to the start of the recorded history, or the import of the
+history before it.
+
+**A balance can be checked without being known.** Where nothing anchors the
+start of a history, the system cannot say what an account holds — but between
+two balances a source stated it can say whether the recorded movements account
+for the distance. Such an outcome carries `compared` =
+`change_since_stated_balance` and the date it is measured from. A `matched`
+there is a statement about the interval, not about the holding: report it as
+"the movements since that date add up", never as "the balance is confirmed".
+A `discrepant` there is the strongest finding reconciliation makes over an
+unanchored history, and it means the two stated balances and the movements
+between them do not join. It is a discrepancy and not a correction: a later
+statement does not overwrite an earlier one, and correcting a recorded
+assertion is an explicit act with its own operation.
+
+**Never reconstruct what the system compared.** Every reconciliation outcome
+carries a `basis`: how many of the account's events were folded into the
+observed figure, the first and last dates folded, and what the fold started
+from. Read it before reporting anything about the outcome. The window is the
+account's recorded history reaching into the interval, not the interval that
+was asked about, and a balance folded over one imported month is not the
+evidence a balance folded over four years is. Do not add up the owner's
+operations yourself to work out what the number was made of — that is the work
+this field exists to end.
+
 A negative cash figure is reported as a fact and is never refused or hidden. It
 is not by itself an error: a margin account is legitimately negative, and a card
 can carry a technical overdraft. On an account where the owner would not expect

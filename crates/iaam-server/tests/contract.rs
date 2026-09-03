@@ -5648,6 +5648,17 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
                     "code": "not_comparable",
                     "reason": "no_journal_coverage",
                 },
+                // Every outcome says what it was compared against, this one
+                // included: no events, no window, and nothing folded from a
+                // state (`iaam-lg2t`).
+                "basis": {
+                    "events_folded": 0,
+                    "folded_from": null,
+                    "folded_through": null,
+                    "start": "no_recorded_movement",
+                    "compared": "level",
+                    "compared_since": null,
+                },
             }],
             "taints": [],
         }])

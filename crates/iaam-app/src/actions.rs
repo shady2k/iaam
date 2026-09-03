@@ -4395,6 +4395,22 @@ mod tests {
             period.to,
         );
         observed.legs = vec![Leg::cash(account, observed_amount)];
+        // The opening is asserted as well as the closing. Without it the closing
+        // figure is a sum from a start nothing states and is not compared at all
+        // (`iaam-d7hn`), so there would be no discrepancy for this diagnostic to
+        // name. Zero, because the account's history begins with the inflow above.
+        let anchor = diagnostic_event(
+            account,
+            EventKind::ControlAssertion {
+                period,
+                claim: ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(0),
+                    at: BalancePoint::Opening,
+                },
+            },
+            period.from,
+        );
         let assertion = diagnostic_event(
             account,
             EventKind::ControlAssertion {
@@ -4408,7 +4424,7 @@ mod tests {
             period.to,
         );
         let ledger =
-            ReconciliationLedger::build(&[observed, assertion]).expect("discrepant ledger");
+            ReconciliationLedger::build(&[observed, anchor, assertion]).expect("discrepant ledger");
         let action = ledger_actions(&ledger)
             .into_iter()
             .find(|action| action.kind() == ActionKind::DiscrepancyUnresolved)
@@ -4677,6 +4693,28 @@ mod tests {
         )
     }
 
+    /// The opening half of a control section: what the source says was there
+    /// before the interval's first event.
+    ///
+    /// Zero, and present in every fixture that expects a closing balance to be
+    /// compared at all. Without it the closing figure is a sum from a start
+    /// nothing states and the outcome is `OpeningNotAsserted`, not a
+    /// discrepancy (`iaam-d7hn`).
+    fn cash_opening_assertion(account: AccountId) -> Event {
+        diagnostic_event(
+            account,
+            EventKind::ControlAssertion {
+                period: august(),
+                claim: ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(0),
+                    at: BalancePoint::Opening,
+                },
+            },
+            august().from,
+        )
+    }
+
     fn cash_in_event(account: AccountId, minor: i64, day: time::Date) -> Event {
         let amount = Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
         let mut event = diagnostic_event(account, EventKind::CashIn { amount }, day);
@@ -4940,6 +4978,7 @@ mod tests {
         let ledger = ReconciliationLedger::build(&[
             cash_gap_event(discrepant, 1, vec![refused_row(source, "row-9")]),
             cash_in_event(discrepant, 500, august().to),
+            cash_opening_assertion(discrepant),
             cash_balance_assertion(discrepant, 1_000),
             cash_balance_assertion(internal, 0),
         ])

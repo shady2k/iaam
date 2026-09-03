@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::event::Event;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::ids::{AccountId, InstrumentId};
@@ -19,8 +18,8 @@ use iaam_core::projection::balances::Balances;
 use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
-use iaam_core::reconciliation::ReconciliationLedger;
-use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+use iaam_core::reconciliation::claim::AssertionPeriod;
+use iaam_core::reconciliation::{OpeningAnchor, OpeningAnchors, ReconciliationLedger};
 use iaam_core::report::assets;
 use iaam_core::returns::{
     KnowledgeCoordinate, ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs,
@@ -508,12 +507,17 @@ async fn balances_with_prices(
     let population = report_population(services, principal, &definition).await?;
     let contour_accounts: Vec<AccountId> =
         population.covered().map(|entry| entry.account).collect();
-    // Both read the effective set for the same reason `Balances` does above: a
+    // The effective set for the same reason `Balances` uses it above: a
     // retracted movement is not this account's first one, and a retracted
-    // assertion anchors nothing. Reading the raw journal here would put the two
-    // answers back into one function, one line apart from where that was fixed.
-    let first_cash = first_cash_movements(&effective);
-    let openings = opening_cash_assertions(&effective);
+    // assertion anchors nothing.
+    //
+    // The rule itself is `iaam_core::reconciliation::OpeningAnchors` and is not
+    // restated here. It used to be, and reconciliation applied a different one
+    // over the same silence: this answer refused to call an unanchored fold a
+    // balance while reconciliation called it zero and told the owner his own
+    // anchor was wrong (`iaam-d7hn`). Two copies of one rule is what made that
+    // possible.
+    let anchors = OpeningAnchors::of(&effective);
     let mut rows = Vec::with_capacity(contour_accounts.len());
     for account in contour_accounts {
         let cash = balances
@@ -521,7 +525,7 @@ async fn balances_with_prices(
             .filter(|(owner_account, _)| *owner_account == account)
             .map(|(_, money)| AccountCash {
                 money,
-                opening: cash_opening(&first_cash, &openings, account, money.currency()),
+                opening: cash_opening(anchors.cash(account, money.currency())),
             })
             .collect();
         let reconciliation =
@@ -612,82 +616,17 @@ fn period_reports(perimeter: &PerimeterAssessment, account: AccountId) -> Period
     )
 }
 
-/// The earliest effective date of a cash movement, per account and currency.
+/// The balances answer's word for what the core rule decided.
 ///
-/// Keyed by the leg's account rather than the event's: a transfer between two
-/// accounts is one event and moves cash on both, and it is the leg that the
-/// projection accumulates.
-fn first_cash_movements(events: &[&Event]) -> BTreeMap<(AccountId, CurrencyCode), Date> {
-    let mut first = BTreeMap::new();
-    for event in events {
-        let Some(date) = event.dates.effective_date() else {
-            continue;
-        };
-        for leg in &event.legs {
-            let Some(money) = leg.cash_effect() else {
-                continue;
-            };
-            first
-                .entry((leg.account, money.currency()))
-                .and_modify(|known: &mut Date| {
-                    if date < *known {
-                        *known = date;
-                    }
-                })
-                .or_insert(date);
-        }
-    }
-    first
-}
-
-/// Every opening cash assertion in the journal, as the start of the interval it
-/// speaks about — that date is what has to reach back far enough.
-fn opening_cash_assertions(events: &[&Event]) -> Vec<(AccountId, CurrencyCode, Date)> {
-    events
-        .iter()
-        .filter_map(|event| match event.kind {
-            EventKind::ControlAssertion {
-                period,
-                claim:
-                    ControlClaim::CashBalance {
-                        currency,
-                        at: BalancePoint::Opening,
-                        ..
-                    },
-            } => Some((event.account, currency, period.from)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Whether an opening assertion covers the state before the first cash movement.
-///
-/// An opening assertion states the balance before the first event of its
-/// interval, so it anchors the whole accumulation exactly when its interval
-/// starts no later than the first movement. An assertion that opens after that
-/// movement leaves everything before it unasserted, and the sum is still a
-/// running one.
-///
-/// An account with cash but no dated movement cannot be anchored by anything,
-/// so it reads as unasserted rather than as a balance.
-fn cash_opening(
-    first_cash: &BTreeMap<(AccountId, CurrencyCode), Date>,
-    openings: &[(AccountId, CurrencyCode, Date)],
-    account: AccountId,
-    currency: CurrencyCode,
-) -> CashOpening {
-    let Some(first) = first_cash.get(&(account, currency)) else {
-        return CashOpening::Unasserted;
-    };
-    if openings
-        .iter()
-        .any(|(asserted_account, asserted_currency, from)| {
-            *asserted_account == account && *asserted_currency == currency && from <= first
-        })
-    {
-        CashOpening::Asserted
-    } else {
-        CashOpening::Unasserted
+/// A translation and nothing else: the rule lives in
+/// [`OpeningAnchors`](iaam_core::reconciliation::OpeningAnchors), which
+/// reconciliation reads too, and this maps its answer onto the vocabulary this
+/// report publishes. Two spellings of one distinction are tolerable; two rules
+/// were not.
+const fn cash_opening(anchor: OpeningAnchor) -> CashOpening {
+    match anchor {
+        OpeningAnchor::Asserted => CashOpening::Asserted,
+        OpeningAnchor::Unasserted => CashOpening::Unasserted,
     }
 }
 
@@ -1354,54 +1293,6 @@ mod tests {
             iaam_core::numeric::decimal::Dec::zero()
         );
         assert_eq!(report.data_quality.status, DataQualityStatus::Clean);
-    }
-
-    #[test]
-    fn an_opening_assertion_anchors_only_what_it_reaches_back_over() {
-        // An opening assertion states the balance before the first event of its
-        // own interval. It therefore anchors the accumulation exactly when that
-        // interval starts no later than the first movement; one that opens
-        // after the movement leaves everything before it unasserted, and the
-        // figure is still a running sum.
-        let account = AccountId::new_random();
-        let other = AccountId::new_random();
-        let first = date!(2026 - 08 - 05);
-        let mut movements = BTreeMap::new();
-        movements.insert((account, CurrencyCode::Rub), first);
-        movements.insert((account, CurrencyCode::Usd), first);
-
-        let covering = [(account, CurrencyCode::Rub, date!(2026 - 08 - 01))];
-        assert_eq!(
-            cash_opening(&movements, &covering, account, CurrencyCode::Rub),
-            CashOpening::Asserted
-        );
-        // The same currency, another account: an assertion is not shared.
-        assert_eq!(
-            cash_opening(&movements, &covering, other, CurrencyCode::Rub),
-            CashOpening::Unasserted
-        );
-        // The same account, another currency: nor is it shared across those.
-        assert_eq!(
-            cash_opening(&movements, &covering, account, CurrencyCode::Usd),
-            CashOpening::Unasserted
-        );
-
-        // The boundary: an interval opening on the day of the first movement
-        // still speaks about the state before it.
-        let on_the_day = [(account, CurrencyCode::Rub, first)];
-        assert_eq!(
-            cash_opening(&movements, &on_the_day, account, CurrencyCode::Rub),
-            CashOpening::Asserted
-        );
-        let a_day_late = [(account, CurrencyCode::Rub, date!(2026 - 08 - 06))];
-        assert_eq!(
-            cash_opening(&movements, &a_day_late, account, CurrencyCode::Rub),
-            CashOpening::Unasserted
-        );
-        assert_eq!(
-            cash_opening(&movements, &[], account, CurrencyCode::Rub),
-            CashOpening::Unasserted
-        );
     }
 
     #[test]

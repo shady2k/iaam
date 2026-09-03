@@ -54,9 +54,17 @@ fn one_parser_journal(deposits: &[i64]) -> (AccountId, Vec<Event>) {
             vec![Leg::cash(account, rub(*amount))],
         ));
     }
-    // The last document's control sections agree with the result.
+    // The last document's control sections agree with the result. The opening
+    // balance is among them, as it is in a real control section: without it the
+    // closing figure is a sum from a start nothing asserts and is not compared
+    // at all (`iaam-d7hn`), which would make every property below vacuous.
     let channel = TestChannel::new("same/1", "control");
     for (index, claim) in [
+        ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(0),
+            at: BalancePoint::Opening,
+        },
         ControlClaim::CashBalance {
             currency: CurrencyCode::Rub,
             amount: PostedMinor::new(total),

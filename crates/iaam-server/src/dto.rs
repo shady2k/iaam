@@ -49,7 +49,7 @@ use iaam_core::instrument::AliasNamespace;
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::money_flow::MoneyFlowError;
-use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
+use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue, ObservationBasis};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{ClaimCheck, Dimension, ReconciliationStatus, Taint};
 use iaam_core::returns::zero_reinvestment::{
@@ -5415,7 +5415,23 @@ mod tests {
     }
 
     fn claim_check(claim: ControlClaim, outcome: ClaimOutcome) -> ClaimCheck {
-        ClaimCheck { claim, outcome }
+        ClaimCheck {
+            claim,
+            outcome,
+            // Stated rather than defaulted: a basis exists to describe a real
+            // fold, and a placeholder standing in for one is the shape §4.9
+            // forbids. One March event over an asserted start is the ordinary
+            // case these rendering tests are about.
+            basis: iaam_core::reconciliation::check::ObservationBasis {
+                folded: iaam_core::reconciliation::observed::FoldSpan {
+                    events: 1,
+                    first: Some(time::macros::date!(2026 - 03 - 10)),
+                    last: Some(time::macros::date!(2026 - 03 - 10)),
+                },
+                start: iaam_core::reconciliation::check::ObservedStart::Asserted,
+                compared: iaam_core::reconciliation::check::Compared::Level,
+            },
+        }
     }
 
     fn rendered(check: &ClaimCheck) -> serde_json::Value {
@@ -5831,6 +5847,92 @@ pub struct DiscrepancyDto {
     pub delta: ClaimValueDto,
 }
 
+/// What the observed side of a comparison was folded from.
+///
+/// **A `discrepant` outcome used to state three numbers and nothing about where
+/// the middle one came from.** The owner facing one had no way to ask the system
+/// what it had added up: he summed the account's legs by hand over the whole
+/// period and spent five iterations guessing why the total did not agree with
+/// the system's. The fold was in the system the whole time; only its width was
+/// unpublished.
+///
+/// Present on **every** outcome. A `matched` says how wide the confirmation is —
+/// a balance folded over one imported month is not the evidence a balance folded
+/// over four years is — and a `not_comparable` needs it most, because `start` is
+/// the whole of its reason.
+///
+/// It carries a count and a window, not the events. Their identities would be an
+/// unbounded list on every outcome, and they are already answerable, for exactly
+/// this window and account, from the operations listing.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ObservationBasisDto {
+    /// How many of the account's events were folded into the observed figure.
+    pub events_folded: u64,
+    /// The effective date of the earliest one. Null when none was folded — an
+    /// opening figure over a journal that begins inside the interval.
+    ///
+    /// These are the dates actually folded, **not** the interval's boundaries,
+    /// which `from` and `to` on the status above already give. A March closing
+    /// balance over a journal that begins in February is folded from February,
+    /// and naming March would name a window the figure does not come from.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub folded_from: Option<Date>,
+    /// The effective date of the latest one. Null under the same condition.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub folded_through: Option<Date>,
+    /// What the fold began from, as one of four words.
+    ///
+    /// `asserted` — the journal states what was held before the first movement
+    /// folded in, so the figure is a balance. `unasserted` — nothing states it,
+    /// so the figure is movement from an unknown start; this is the reason a
+    /// balance claim answers `not_comparable`. `no_recorded_movement` — the
+    /// journal has never moved this currency or holding, so the claim was
+    /// compared against the absence of a record rather than against a sum.
+    /// `not_a_balance` — the claim is an interval total, which starts from no
+    /// state at all.
+    pub start: String,
+    /// Which quantity was actually put against the claim.
+    ///
+    /// `level` — the figure itself. `change_since_stated_balance` — the change
+    /// since an earlier balance a source stated, which is comparable even where
+    /// `start` is `unasserted`, because the unknown start is in both folds and
+    /// cancels out of their difference.
+    ///
+    /// **Read it before reporting a `matched`.** A matched change says the
+    /// movements recorded since that earlier statement account exactly for the
+    /// distance to this one; it says nothing about the level, which is still
+    /// unknown. A matched change and a matched level are different findings and
+    /// must not be reported alike.
+    pub compared: String,
+    /// The date of the stated balance a change is measured from. Null where
+    /// `compared` is `level`.
+    ///
+    /// It narrows the window above rather than replacing it: `folded_from` and
+    /// `events_folded` describe the whole fold the observed figure came out of,
+    /// and the movements that had to account for the change are the part of it
+    /// after this date. Both are stated because both are asked — the first
+    /// says how much history the figure rests on, the second what the verdict
+    /// is actually about.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub compared_since: Option<Date>,
+}
+
+impl ObservationBasisDto {
+    fn from_domain(basis: ObservationBasis) -> Self {
+        Self {
+            events_folded: basis.folded.events,
+            folded_from: basis.folded.first,
+            folded_through: basis.folded.last,
+            start: basis.start.code().to_owned(),
+            compared: basis.compared.code().to_owned(),
+            compared_since: basis.compared.since(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimOutcomeDetailDto {
     pub code: String,
@@ -5842,11 +5944,15 @@ pub struct ClaimOutcomeDetailDto {
     pub exception: Option<String>,
 }
 
-/// Outcome of one control assertion.
+/// Outcome of one control assertion, with what it was reached from.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimOutcomeDto {
     pub claim: ClaimDto,
     pub outcome: ClaimOutcomeDetailDto,
+    /// The fold the outcome's `observed` figure came out of. Always present:
+    /// a verdict that does not describe the comparison it is a verdict on is
+    /// what sent the owner to add up his own account by hand.
+    pub basis: ObservationBasisDto,
 }
 
 impl ClaimOutcomeDto {
@@ -5885,6 +5991,7 @@ impl ClaimOutcomeDto {
         Self {
             claim: claim_dto(check.claim),
             outcome,
+            basis: ObservationBasisDto::from_domain(check.basis),
         }
     }
 }

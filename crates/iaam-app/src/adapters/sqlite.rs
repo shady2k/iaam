@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountActivityView, AccountAliasView, AccountCreated, AccountDetailView,
-    AccountScopeExclusionView, AccountTransferStatementView, AccountView, AliasUpsert, AliasView,
-    BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
-    CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
-    ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
-    CustodyView, DocumentToKeep, ImportObservationView, ImportQuestionView, ImportSessionState,
+    AccountActivityView, AccountAliasView, AccountCreated, AccountDeclarations,
+    AccountDeclarationsRecorded, AccountDetailView, AccountIdentityView, AccountScopeExclusionView,
+    AccountTransferStatementView, AccountView, AliasUpsert, AliasView, BrokerAccessView,
+    BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault, CategoryGroupView,
+    CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView, ClassificationRuleStore,
+    ClassificationRuleView, ContourView, ControlAssertionView, CustodyView, Declared,
+    DocumentToKeep, ImportObservationView, ImportQuestionView, ImportSessionState,
     ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken,
     JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin,
     TokenView,
@@ -53,9 +54,10 @@ use iaam_store::import_session::{
     StoredQuestion, StoredSession,
 };
 use iaam_store::reference::{
-    AccountAliasRecord, AccountCreation, AccountDetailRecord, AccountIdentity, AccountRecord,
+    AccountAliasRecord, AccountCreation, AccountDeclarations as StoredAccountDeclarations,
+    AccountDetailRecord, AccountIdentity, AccountIdentity as StoredAccountIdentity, AccountRecord,
     AccountScopeExclusionRecord, AccountTransferStatementRecord, AliasRecord, ContourRecord,
-    InstrumentRecord,
+    Declared as StoredDeclared, InstrumentRecord,
 };
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
@@ -458,6 +460,51 @@ impl Store for SqliteAdapter {
             store
                 .replace_account_aliases(owner, account, &aliases)
                 .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn replace_account_declarations(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        declarations: AccountDeclarations,
+    ) -> Result<AccountDeclarationsRecorded, AppError> {
+        self.blocking(move |store| {
+            let declarations = StoredAccountDeclarations {
+                identity: declared(declarations.identity, |identity| StoredAccountIdentity {
+                    provider: identity.provider,
+                    provider_account_id: identity.provider_account_id,
+                }),
+                cash_class: declared(declarations.cash_class, |class| class),
+                negative_balance_expectation: declared(
+                    declarations.negative_balance_expectation,
+                    |expectation| expectation,
+                ),
+            };
+            let recorded = store
+                .replace_account_declarations(owner, account, &declarations)
+                .map_err(|error| match error {
+                    // Another of the owner's accounts already answers to this
+                    // identity. A `500` would send him looking for a fault
+                    // instead of at the account that holds it.
+                    iaam_store::StoreError::AlreadyExists { what } => AppError::Conflict {
+                        what: format!("{what}: withdraw it there first"),
+                    },
+                    iaam_store::StoreError::NotFound { what, id } => {
+                        AppError::NotFound { what, id }
+                    }
+                    other => store_error(other),
+                })?;
+            Ok(AccountDeclarationsRecorded {
+                account: account_detail_view(recorded.account),
+                previous_identity: recorded
+                    .previous_identity
+                    .map(|identity| AccountIdentityView {
+                        provider: identity.provider,
+                        provider_account_id: identity.provider_account_id,
+                    }),
+            })
         })
         .await
     }
@@ -1788,6 +1835,21 @@ fn account_detail_record(owner: OwnerId, account: AccountDetailView) -> AccountD
 }
 
 /// The store's row, as the port's account.
+/// One declaration across the port boundary, value mapped and the three states
+/// kept.
+///
+/// Written once rather than three times: a hand-written `match` per field is
+/// three chances to map [`Declared::Cleared`] onto `Untouched`, and that mistake
+/// reads as «the owner withdrew nothing» while silently keeping a statement he
+/// withdrew.
+fn declared<T, U>(declared: Declared<T>, value: impl FnOnce(T) -> U) -> StoredDeclared<U> {
+    match declared {
+        Declared::Untouched => StoredDeclared::Untouched,
+        Declared::Cleared => StoredDeclared::Cleared,
+        Declared::Stated(stated) => StoredDeclared::Stated(value(stated)),
+    }
+}
+
 fn account_detail_view(record: AccountDetailRecord) -> AccountDetailView {
     let (provider, provider_account_id) = match record.identity {
         Some(identity) => (Some(identity.provider), Some(identity.provider_account_id)),

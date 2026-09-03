@@ -11621,6 +11621,17 @@ fn unresolved_row(account: Uuid, key: &str) -> Value {
     })
 }
 
+/// The same row with the source stating which way the money went.
+///
+/// Everything a rule matches on is unchanged — the word the source used is still
+/// `INNER` — so a rule written for the row above matches this one too. What is
+/// added is the one thing no rule can supply.
+fn directed_row(account: Uuid, key: &str, direction: &str) -> Value {
+    let mut row = unresolved_row(account, key);
+    row["direction"] = json!(direction);
+    row
+}
+
 async fn journal_rows(harness: &Harness) -> usize {
     let (status, page) = call(
         &harness.router,
@@ -11709,13 +11720,25 @@ async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_i
     );
 }
 
-/// The answer is a durable rule, so the same row is not asked about twice.
+/// The answer is a durable rule, and what the rule makes durable is **what the
+/// row is** — not which way the next one runs.
 ///
-/// Two submissions of the same shape under different keys: the first raises a
-/// question, the answer writes a rule, and the second settles against that rule
-/// and is recorded without asking anyone.
+/// Three submissions of the same shape under different keys. The first states no
+/// direction and raises a question; the answer writes a rule. The second states
+/// a direction, so the rule settles it and it reaches the journal without asking
+/// anyone: that is the durability the rule exists for, and it covers every row a
+/// source gives a direction for.
+///
+/// The third states no direction either, and it is asked again — not about what
+/// it is, which the rule answers, but about which way it ran. A rule matches on
+/// a counterparty, a payment purpose and the word the source used, and none of
+/// those is a direction: two rows matching one rule run opposite ways, which is
+/// exactly what money between two of the owner's own accounts does. Replaying
+/// the direction of the row the rule was learned from would record half of them
+/// backwards and ask nobody, which is iaam-xf49 generalised over every future
+/// import.
 #[tokio::test]
-async fn answering_the_question_writes_a_rule_and_the_next_row_is_not_asked_about() {
+async fn answering_the_question_writes_a_rule_that_settles_what_the_next_row_is() {
     let harness = harness();
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
@@ -11769,8 +11792,9 @@ async fn answering_the_question_writes_a_rule_and_the_next_row_is_not_asked_abou
         "one answer, one rule: {rules}"
     );
 
-    // The same shape again. The rule settles it, so it is recorded rather than
-    // questioned — and it is recorded as the transfer the owner named, not as a
+    // The same shape again, this time with the source stating the direction. The
+    // rule settles what it is, the source settles which way it went, and nothing
+    // is left to ask — it is recorded as the transfer the owner named, not as a
     // deposit.
     let (status, again) = call(
         &harness.router,
@@ -11779,7 +11803,7 @@ async fn answering_the_question_writes_a_rule_and_the_next_row_is_not_asked_abou
             &harness.owner_token,
             &json!({
                 "source": { "account": account, "channel": "file", "label": "april" },
-                "operations": [unresolved_row(account, "inner-two")],
+                "operations": [directed_row(account, "inner-two", "out")],
             }),
         ),
     )
@@ -11806,6 +11830,55 @@ async fn answering_the_question_writes_a_rule_and_the_next_row_is_not_asked_abou
     assert_eq!(
         page["rows"][0]["kind"], "cash_transfer",
         "the owner answered «sent to my own account», so that is the fact: {page}"
+    );
+
+    // And a third row the source again gave no direction for. The rule still
+    // says what it is; it cannot say which way this one ran, and answering that
+    // out of the rule would be the guess (iaam-xf49). So it is asked — about the
+    // direction, with both directions among the alternatives.
+    let (status, third) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "may" },
+                "operations": [unresolved_row(account, "inner-three")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    assert_eq!(
+        third[0]["verdict"], "needs_classification",
+        "a direction the source never stated is the owner's to give, every \
+         time: {third}"
+    );
+    let alternatives: Vec<&str> = third[0]["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|entry| entry["answer"].as_str().expect("answer code"))
+        .collect();
+    assert!(
+        alternatives.contains(&"sent_to_own_account")
+            && alternatives.contains(&"received_from_own_account"),
+        "and the question offers both, which is what makes it answerable: \
+         {third}"
+    );
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=inner-three",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nothing may be recorded while the question waits: {page}"
     );
 }
 

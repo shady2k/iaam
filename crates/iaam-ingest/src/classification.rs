@@ -109,12 +109,57 @@ impl RuleMatcher {
 }
 
 /// What the operation turned out to be.
+///
+/// **This is the vocabulary a rule is written in, and a rule carries no
+/// direction.** A rule fires on rows the owner has never seen; a direction
+/// carried over from the row he wrote it on would be asserted about all of them.
+/// So `InternalTransfer` names the account on the far side and says nothing
+/// about which way the money ran — see [`Self::implied_movement`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Classification {
-    InternalTransfer { to: AccountId },
+    /// A transfer between the owner's own accounts. `to` is the **far side** of
+    /// the movement — the account that is not the row's own — whichever
+    /// direction it went in.
+    InternalTransfer {
+        to: AccountId,
+    },
     ExternalFlow,
-    Fee { origin: FeeOrigin },
+    Fee {
+        origin: FeeOrigin,
+    },
     Income,
+}
+
+impl Classification {
+    /// The direction this classification states on its own, when it states one.
+    ///
+    /// Two of the four do, and they do because the classification **is** the
+    /// direction: a fee leaves the account and income arrives at it. Nothing has
+    /// to be read off the row to know that, and answering `None` for them would
+    /// send a settled row back to the owner as a question.
+    ///
+    /// The other two answer `None`, and that is the whole point of the function
+    /// existing. `ExternalFlow` never claimed one. `InternalTransfer` looks as
+    /// though it does, because it names an account — and comparing that account
+    /// with the row's own does yield an answer of the right *type*. It is still
+    /// a guess: the account named is the far side, and both
+    /// [`Answer::SentToOwnAccount`] and [`Answer::ReceivedFromOwnAccount`]
+    /// record the far side here, so the comparison reads money that arrived as
+    /// money that left. Deriving a direction from it was the defect this
+    /// function was written to make unavailable.
+    ///
+    /// Which leaves exactly two ways a direction can enter: the source stated
+    /// one ([`ClassificationSubject::movement`]) or the owner did
+    /// ([`Answer::movement`]). Both are total over types that distinguish the
+    /// two directions structurally. There is no third.
+    #[must_use]
+    pub const fn implied_movement(self) -> Option<Movement> {
+        match self {
+            Self::Fee { .. } => Some(Movement::Out),
+            Self::Income => Some(Movement::In),
+            Self::InternalTransfer { .. } | Self::ExternalFlow => None,
+        }
+    }
 }
 
 /// The owner's decision recorded by the rule.
@@ -363,9 +408,15 @@ impl Answer {
     /// `ReceivedFromOwnAccount { from }` becomes `InternalTransfer { to: from }`
     /// and that is not a slip: a rule matches on the **counterparty**, and the
     /// account a rule names is the far side of the movement, whichever way it
-    /// went. Which side is which on a given row is recovered by comparing that
-    /// account with the row's own — see [`Classification`]'s use in the import
-    /// session.
+    /// went. The direction the owner gave is deliberately dropped here, because
+    /// it was a fact about *his row* and a rule is a claim about every row that
+    /// matches it.
+    ///
+    /// So this is a lossy projection on purpose, and the loss must not be
+    /// reversed by comparing the named account with the row's own: see
+    /// [`Classification::implied_movement`]. The direction that answers **this**
+    /// row is on [`Self::movement`], and the two are handed to
+    /// `ObservedRow::resolve` together.
     #[must_use]
     pub const fn classification(&self) -> Classification {
         match self {

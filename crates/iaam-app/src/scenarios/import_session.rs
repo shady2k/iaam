@@ -1409,13 +1409,17 @@ impl Resolver {
     /// Two things have to be true before a row can be recorded: **what** it was
     /// and **which way** the money went. `classify` answers the first. The
     /// second comes from the source when it stated a direction, and otherwise
-    /// from the classification itself, which carries one for three of its four
-    /// outcomes: a fee leaves, income arrives, and an internal transfer's
-    /// direction is read from which side of it this account is on.
+    /// from the classification — but only from the two outcomes that *are* a
+    /// direction: a fee leaves and income arrives.
     ///
-    /// `ExternalFlow` is the one outcome that carries no direction. A
-    /// directionless row settled as an external flow is therefore still asked
-    /// about — the alternative is picking `deposit`, which is the bug.
+    /// The other two carry none, and a directionless row settled as either is
+    /// therefore still asked about. `ExternalFlow` was always the obvious case —
+    /// the alternative is picking `deposit`, which is the bug the observation
+    /// shape was introduced for. `InternalTransfer` is the same case wearing an
+    /// account: it names the far side, not a destination, and reading a
+    /// direction out of it was iaam-xf49. Both now reach
+    /// [`Question::UnresolvedDirection`], which is the question that names a
+    /// direction and a classification in one answer.
     fn assess(&self, row: &ObservedRow) -> Assessment {
         // The owner's transfer statement reaches classification here, and only
         // here. It is applied to the resolution rather than to the candidates
@@ -1477,15 +1481,26 @@ impl Resolver {
                 let word = stated
                     .as_deref()
                     .map_or_else(|| "no direction".to_owned(), |stated| format!("«{stated}»"));
-                let other = counterparty.as_deref().map_or_else(
-                    || "named no counterparty".to_owned(),
-                    |name| format!("named «{name}» as the other side"),
+                // What the row leaves open depends on whether it named anybody.
+                // A row that named a counterparty leaves only the direction open
+                // — and since iaam-xf49 that includes one the directory
+                // recognised, which settles what the row is and not which way it
+                // ran. Saying the other side cannot be read would then be false.
+                let rest = counterparty.as_deref().map_or_else(
+                    || {
+                        "named no counterparty, so neither which way the money \
+                         went nor who was on the other side can be read from \
+                         the row"
+                            .to_owned()
+                    },
+                    |name| {
+                        format!(
+                            "named «{name}» as the other side, so which way the \
+                             money went cannot be read from the row"
+                        )
+                    },
                 );
-                format!(
-                    "On {account}, the source stated {word} and {other}, \
-                     so neither which way the money went nor the account on the \
-                     other side can be read from the row. Which was it?"
-                )
+                format!("On {account}, the source stated {word} and {rest}. Which was it?")
             }
         }
     }
@@ -1515,23 +1530,21 @@ fn identifies(account: &AccountDetailView, printed: &str, on: Option<time::Date>
 }
 
 /// Which way the money went, when anything says so.
+///
+/// Two things may say so and there is no third. The source stated a direction,
+/// or the classification is one — a fee leaves and income arrives, which
+/// [`Classification::implied_movement`] decides beside the type, so that a fifth
+/// outcome has to answer the question rather than inherit an answer.
+///
+/// An internal transfer is not one of those, and this function used to treat it
+/// as one: it compared the account the classification names with the row's own
+/// and called the difference a direction. The account it names is the **far
+/// side**, so that comparison always said "out" — including for
+/// `Answer::ReceivedFromOwnAccount { from }`, which records the far side in the
+/// same place for money that arrived (iaam-xf49). Nothing derives a direction
+/// from an internal transfer now; a directionless one is asked about.
 fn movement_of(classification: Classification, row: &ObservedRow) -> Option<Movement> {
-    if let Some(movement) = row.movement() {
-        return Some(movement);
-    }
-    match classification {
-        // The account a rule names is the far side of the movement: equal to
-        // this row's account it means the money arrived, different from it that
-        // the money left.
-        Classification::InternalTransfer { to } => Some(if to == row.account {
-            Movement::In
-        } else {
-            Movement::Out
-        }),
-        Classification::Fee { .. } => Some(Movement::Out),
-        Classification::Income => Some(Movement::In),
-        Classification::ExternalFlow => None,
-    }
+    row.movement().or_else(|| classification.implied_movement())
 }
 
 /// The account an answer names, when it names one.
@@ -1731,6 +1744,15 @@ mod tests {
         }
     }
 
+    /// A resolver holding rules the owner has already written.
+    fn ruled(accounts: Vec<AccountDetailView>, rules: Vec<ClassificationRule>) -> Resolver {
+        Resolver {
+            accounts,
+            statements: Vec::new(),
+            rules,
+        }
+    }
+
     fn stating(
         accounts: Vec<AccountDetailView>,
         statements: Vec<(AccountId, Vec<AccountId>)>,
@@ -1761,6 +1783,29 @@ mod tests {
             },
             source_time: None,
             identity: RowIdentity::default(),
+        }
+    }
+
+    /// The same row with the source stating no direction.
+    ///
+    /// A bank printing the word it uses for a movement internal to itself, with
+    /// an amount beside it: not which side of it this account was on, and — the
+    /// sign notwithstanding — nothing a direction can be read out of.
+    fn directionless(row: ObservedRow) -> ObservedRow {
+        ObservedRow {
+            direction: ObservedDirection::Inner,
+            amount_minor: 1_000,
+            source_kind: Some("INNER".to_owned()),
+            ..row
+        }
+    }
+
+    /// The same row with the source stating that the money arrived.
+    fn incoming(row: ObservedRow) -> ObservedRow {
+        ObservedRow {
+            direction: ObservedDirection::In,
+            amount_minor: 1_000,
+            ..row
         }
     }
 
@@ -2010,6 +2055,149 @@ mod tests {
             ),
             "«none of my others» is an answer, and it answers this"
         );
+    }
+
+    // --- which way the money went ----------------------------------------
+
+    #[test]
+    fn a_directionless_internal_transfer_is_asked_and_not_derived() {
+        // The row the source gave an amount and no direction for, whose
+        // counterparty the directory does recognise. Recognising it settles
+        // **what** the row is; it does not settle which way it ran. Deriving
+        // `Out` from "the far side is not this account" is the guess
+        // `question_for` refuses one function away — the answer would be
+        // recorded and the guess made anyway, one step further along.
+        let main = account(1);
+        let checking = account(2);
+        let resolver = resolver(vec![detail(main, "Main"), detail(checking, "Checking")]);
+
+        match resolver.assess(&directionless(row(main, "Checking", None))) {
+            Assessment::Ambiguous { question } => assert_eq!(
+                question,
+                Question::UnresolvedDirection {
+                    account: main,
+                    stated: Some("INNER".to_owned()),
+                    counterparty: Some("Checking".to_owned()),
+                },
+                "the direction is what is open, and it is what is asked"
+            ),
+            Assessment::Settled {
+                classification,
+                movement,
+            } => panic!(
+                "the source stated no direction, so there is none to settle                  with: {classification:?} {movement:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_rule_learned_from_an_incoming_transfer_does_not_make_a_row_outgoing() {
+        // The other half of the same defect, and the one that shows the
+        // derivation was wrong in **both** directions.
+        // `Answer::ReceivedFromOwnAccount { from }` records the far side in the
+        // rule, exactly as the outgoing answer does. A later directionless row
+        // the rule matches would then derive `Out` for money that arrived.
+        let main = account(1);
+        let savings = account(2);
+        let learned = Answer::ReceivedFromOwnAccount { from: savings };
+        let rule = ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher: RuleMatcher {
+                counterparty_account: Some("Somebody".to_owned()),
+                description_contains: None,
+                kind: None,
+            },
+            outcome: learned.classification(),
+        };
+        let resolver = ruled(
+            vec![detail(main, "Main"), detail(savings, "Savings")],
+            vec![rule],
+        );
+
+        match resolver.assess(&directionless(row(main, "Somebody", None))) {
+            Assessment::Ambiguous { question } => assert!(
+                matches!(question, Question::UnresolvedDirection { .. }),
+                "{question:?}"
+            ),
+            Assessment::Settled { movement, .. } => panic!(
+                "the rule names the far side and no direction; the owner                  answered «received» when he wrote it: {movement:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_row_whose_source_stated_a_direction_settles_without_a_question() {
+        // The ordinary case, and the one that must not start asking: broadening
+        // the question to every internal transfer would be a worse defect than
+        // the one being fixed. The source said which way the money went, and
+        // the directory said what the row is — nothing is open.
+        let main = account(1);
+        let checking = account(2);
+        let resolver = resolver(vec![detail(main, "Main"), detail(checking, "Checking")]);
+
+        match resolver.assess(&row(main, "Checking", None)) {
+            Assessment::Settled {
+                classification,
+                movement,
+            } => {
+                assert_eq!(
+                    classification,
+                    Classification::InternalTransfer { to: checking }
+                );
+                assert_eq!(movement, Movement::Out, "the source printed «out»");
+            }
+            Assessment::Ambiguous { question } => {
+                panic!("the source stated the direction: {question:?}")
+            }
+        }
+
+        match resolver.assess(&incoming(row(main, "Checking", None))) {
+            Assessment::Settled {
+                classification,
+                movement,
+            } => {
+                assert_eq!(
+                    classification,
+                    Classification::InternalTransfer { to: checking },
+                    "the far side is the same account whichever way the row ran"
+                );
+                assert_eq!(movement, Movement::In, "and the source printed «in»");
+            }
+            Assessment::Ambiguous { question } => {
+                panic!("the source stated the direction: {question:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_fee_and_income_still_settle_a_directionless_row() {
+        // Two of the four outcomes are a direction: a fee leaves and income
+        // arrives. Nothing about them is a guess, and the fix must not take
+        // them away — a row settled as a fee has never needed to be asked.
+        let main = account(1);
+        let fee = ruled(
+            vec![detail(main, "Main")],
+            vec![ClassificationRule {
+                id: iaam_core::ids::ClassificationRuleId::new_random(),
+                version: 1,
+                matcher: RuleMatcher {
+                    counterparty_account: Some("Somebody".to_owned()),
+                    description_contains: None,
+                    kind: None,
+                },
+                outcome: Classification::Fee {
+                    origin: FeeOrigin::AccountMaintenance,
+                },
+            }],
+        );
+
+        match fee.assess(&directionless(row(main, "Somebody", None))) {
+            Assessment::Settled { movement, .. } => assert_eq!(movement, Movement::Out),
+            Assessment::Ambiguous { question } => {
+                panic!("a fee leaves the account, and that is not a guess: {question:?}")
+            }
+        }
     }
 
     #[test]

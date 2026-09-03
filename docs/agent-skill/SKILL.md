@@ -312,15 +312,29 @@ The journal begins when it begins. Before its first record the system knows
 nothing about what was on an account, so a cash figure it computes is the sum of
 the movements it has seen — a **movement from an unasserted start**, which is
 not a balance and must not be reported as one. Only an assertion by the owner
-about the state before the first movement anchors that sum; the answer says, for
-each account and currency, which of the two it is holding, and that mark is
-there whether the figure looks plausible or not.
+about the state before the first movement anchors that sum.
 
-This is the trap: after a first import most of the figures look ordinary and one
-may look impossible. They are equally unfounded. The ordinary-looking ones
-merely passed a plausibility check the reader happened to have, and reporting
-them as balances while flagging only the strange one endorses four errors to
-catch one. Read the mark, not the number.
+**The figure names itself, so there is nothing to remember.** Every cash figure
+in every report is an object with a `kind`, and the number is spelled for the
+kind it is. `balance` carries a `balance`; `movement_since_unknown_start`
+carries a `movement`; there is no field called `amount` on any of them. A
+report cannot be skimmed for cash figures and turned into holdings, because the
+holdings figure is only there when the anchor is.
+
+This is the trap the shape closes: after a first import most of the figures look
+ordinary and one may look impossible. They are equally unfounded. The
+ordinary-looking ones merely passed a plausibility check the reader happened to
+have, and reporting them as balances while flagging only the strange one
+endorses four errors to catch one.
+
+**A total does not average the two away.** On the asset snapshot, a class total
+folds several accounts, and the owner may have anchored some of them and not
+others. Such a total is `mixed`: it carries a `balance` and a `movement` and no
+sum of them, because a stock added to a flow is neither. Report the two, or
+report the one that answers the question asked; do not add them and call the
+result a balance. For the same reason a currency whose cash is not entirely
+anchored has **no entry** in the snapshot's `total` at all — no whole exists to
+state, and both halves above it still say everything they know.
 
 A negative cash figure is reported as a fact and is never refused or hidden. It
 is not by itself an error: a margin account is legitimately negative, and a card

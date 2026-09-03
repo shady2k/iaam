@@ -117,8 +117,9 @@ impl ActionKind {
     ///   for any of the four to say.
     /// - `ProvideControlAssertion` — the closing assertion is the claim side of
     ///   reconciliation, and the opening one is what makes the snapshot's cash a
-    ///   balance: `reports::account_balances` publishes `CashOpening::Asserted`
-    ///   or `Unasserted` per account and currency, from exactly these events.
+    ///   balance: `reports::account_balances` decides `CashOpening::Asserted`
+    ///   or `Unasserted` per account and currency from exactly these events,
+    ///   and only the first spells the figure `CashFigure::Balance`.
     ///   **Not returns and not flow**: a control assertion has no legs, so it
     ///   moves no number in either; it only grades confidence there.
     /// - `CoverageGapUnrepaired`, `IndependentConfirmationMissing`,
@@ -2527,9 +2528,10 @@ mod tests {
                     &[AssetSnapshot, MoneyFlow, Returns, Reconciliation]
                 }
                 // The closing assertion is reconciliation's claim side; the
-                // opening one is what makes the snapshot's cash a balance, which
-                // `account_balances` publishes as `CashOpening`. It has no legs,
-                // so it moves no number in flow or returns.
+                // opening one is what makes the snapshot's cash a balance rather
+                // than movement, which `account_balances` decides per account
+                // and currency. It has no legs, so it moves no number in flow or
+                // returns.
                 ActionKind::ProvideControlAssertion => &[AssetSnapshot, Reconciliation],
                 // All three are about whether a period is confirmed.
                 ActionKind::CoverageGapUnrepaired

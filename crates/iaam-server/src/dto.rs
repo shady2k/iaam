@@ -8,16 +8,22 @@
 //! numbers: the JSON number `0.1` in binary floating point is not equal to one
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
+use iaam_app::ingest::classification::{Answer, AnswerShape};
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
+use iaam_app::ingest::observation::{
+    Intake, ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity,
+};
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CategoryRuleView, CategoryView, ClassificationRuleView,
     IssuedToken, Scope, TokenView,
 };
+use iaam_app::ports::{ImportQuestionView, ImportSessionView};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::classification::{ClassifiedAs, PlannedCorrection, RuleChange};
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
+use iaam_app::scenarios::import_session::HeldRow;
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, BalancesReport, MoneyFlowReport, PopulationAccount, ReportPopulation,
     ReturnsOutcome,
@@ -466,6 +472,46 @@ pub enum OperationKindDto {
         currency: CurrencyDto,
         quality: PriceQualityDto,
     },
+    /// A row the source did not resolve, submitted as the source stated it.
+    ///
+    /// Every other variant here is a conclusion. A bank row that prints a word
+    /// meaning "internal to this institution" beside an amount is not one:
+    /// `deposit` and `withdrawal` assert a direction the source did not give,
+    /// and `transfer` demands an account the caller does not know. Sending one
+    /// of them anyway is how a withdrawal was recorded as a deposit and had to
+    /// be corrected afterwards.
+    ///
+    /// So this variant states the observation and nothing more. It is not a
+    /// weaker version of the others and does not replace them: a caller that
+    /// **has** concluded is still right to say so, and should.
+    UnresolvedDirection {
+        /// The amount with the sign the source printed. It is not made
+        /// positive: the sign is evidence about direction where the source used
+        /// one, and making it positive discards that.
+        amount: String,
+        currency: CurrencyDto,
+        /// The direction the source stated: `in`, `out`, `inner` or `unknown`.
+        ///
+        /// `inner` is a stated direction that does not resolve to one — the
+        /// money did not leave the institution, and which of the owner's
+        /// accounts was on which side is not said. Omitting the field means
+        /// `unknown`: the source said nothing at all, which is a weaker
+        /// statement than `inner` and is kept apart from it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<String>,
+        /// The party the source named, verbatim, when it named one.
+        ///
+        /// A name, not an account identifier: recognising it as one of the
+        /// owner's accounts is a conclusion, and this shape exists so the
+        /// caller does not have to reach one. The server resolves it against
+        /// the owner's directory, and a counterparty it recognises settles the
+        /// row with no question asked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        counterparty: Option<String>,
+        /// The document the row was read out of, as the source names it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_document: Option<String>,
+    },
 }
 
 /// Complete operation.
@@ -510,6 +556,62 @@ fn optional_minor(
 }
 
 impl OperationDto {
+    /// Conversion to whatever the caller actually submitted.
+    ///
+    /// The two arms are the point: a conclusion is converted to an operation
+    /// exactly as it always was, and an observation is converted to an
+    /// observation rather than to a conclusion nobody made.
+    pub fn to_intake(&self) -> Result<Intake, Rejection> {
+        let OperationKindDto::UnresolvedDirection {
+            amount,
+            currency,
+            direction,
+            counterparty,
+            source_document,
+        } = &self.kind
+        else {
+            return Ok(Intake::Concluded {
+                operation: Box::new(self.to_domain()?),
+            });
+        };
+        Ok(Intake::Observed {
+            row: Box::new(ObservedRow {
+                account: AccountId(self.account),
+                direction: match direction.as_deref() {
+                    Some(stated) => ObservedDirection::parse(stated)?,
+                    // Absent means the source said nothing, which is
+                    // `Unknown` and deliberately not `Inner`.
+                    None => ObservedDirection::Unknown,
+                },
+                // `minor` and not the positivity check every conclusive kind
+                // runs after it: those kinds derive the sign from the kind,
+                // while an observation has no kind to derive it from. The
+                // source's own sign is the only statement about direction there
+                // is, and normalising it away would discard the evidence this
+                // shape exists to carry.
+                amount_minor: minor(amount, *currency, "amount")?,
+                currency: currency.to_domain(),
+                counterparty: counterparty
+                    .clone()
+                    .map_or(ObservedCounterparty::Unknown, ObservedCounterparty::Named),
+                source_kind: self.source_category.clone(),
+                description: self.description.clone(),
+                dates: OperationDates {
+                    trade: self.dates.trade,
+                    settled: self.dates.settled,
+                    cash_posted: self.dates.cash_posted,
+                    paid: self.dates.paid,
+                },
+                source_time: None,
+                identity: RowIdentity {
+                    document: source_document.clone(),
+                    row: self.source_operation_id.clone(),
+                    idempotency_key: self.idempotency_key.clone(),
+                },
+            }),
+        })
+    }
+
     /// Conversion to a domain operation.
     ///
     /// The only place where transport meets the domain. A rejection
@@ -663,6 +765,18 @@ impl OperationDto {
                 currency: currency.to_domain(),
                 quality: quality.to_domain(),
             },
+            // An observation is not an operation, and refusing here rather than
+            // inventing one is the whole of iaam-6qsa. The callers that reach
+            // this function want a fact: a replacement correction supersedes an
+            // event with a stated fact, and a row nobody has concluded cannot
+            // supersede anything.
+            OperationKindDto::UnresolvedDirection { .. } => {
+                return Err(Rejection {
+                    field: "type".into(),
+                    expected: "an operation whose kind states what happened".into(),
+                    actual: "unresolved_direction".into(),
+                });
+            }
         })
     }
 }
@@ -910,6 +1024,44 @@ pub struct VerdictDto {
     /// The dimension for which values do not match or there is nothing to reconcile (§10.3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimension: Option<String>,
+    /// The import session holding the row, for a row that needs an answer.
+    ///
+    /// The published verdict carries the question as a sentence, and a sentence
+    /// is not something a caller can answer. These two identifiers are, and they
+    /// are what makes the question reachable after this response is gone: the
+    /// question is a stored row, not a line in a response body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    /// The question raised about the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<Uuid>,
+    /// What may be said in answer to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternatives: Option<Vec<AnswerAlternativeDto>>,
+}
+
+/// One alternative a question offers.
+///
+/// Published with the question rather than assumed by the caller: an answer the
+/// question does not admit is a different mistake from an answer that is wrong,
+/// and only the first can be refused before anything is written.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnswerAlternativeDto {
+    /// The word to send back: `sent_to_own_account`, `received_from_own_account`,
+    /// `paid`, `received`, `fee`, `income`.
+    pub answer: String,
+    /// Whether the answer must also name one of the owner's accounts.
+    pub needs_account: bool,
+}
+
+impl AnswerAlternativeDto {
+    #[must_use]
+    pub fn from_domain(shape: AnswerShape) -> Self {
+        Self {
+            answer: shape.code().to_owned(),
+            needs_account: shape.needs_account(),
+        }
+    }
 }
 
 impl VerdictDto {
@@ -927,6 +1079,9 @@ impl VerdictDto {
             detail: None,
             account_id: None,
             dimension: None,
+            session_id: None,
+            question_id: None,
+            alternatives: None,
         };
         match verdict {
             Verdict::Accepted { event } => Self {
@@ -5818,4 +5973,257 @@ impl JournalEventReadDto {
 fn format_source_time(time: time::Time) -> String {
     let (hour, minute, second) = time.as_hms();
     format!("{hour:02}:{minute:02}:{second:02}")
+}
+
+// ---------------------------------------------------------------------------
+// Import sessions (iaam-3kru, iaam-6qsa)
+// ---------------------------------------------------------------------------
+
+/// Open an import session.
+///
+/// The declaration is optional and means what it means everywhere else: it names
+/// the account, channel and label these rows belong to. Naming it is what lets a
+/// second submission of the same import reach the same session rather than
+/// opening a parallel one holding half the answers.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OpenImportSessionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<DeclaredSourceDto>,
+}
+
+/// Rows fed into a session.
+///
+/// The same shape the conclusive route takes, and deliberately so: a session is
+/// not a second intake vocabulary, it is the same rows held rather than recorded.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddImportRowsRequest {
+    pub operations: Vec<OperationDto>,
+}
+
+/// A session as the owner reads it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportSessionDto {
+    pub session: Uuid,
+    /// `open`, `committed` or `abandoned`.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<Uuid>,
+    pub opened_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+}
+
+impl ImportSessionDto {
+    #[must_use]
+    pub fn from_domain(session: &ImportSessionView) -> Self {
+        Self {
+            session: session.id.inner(),
+            state: session.state.code().to_owned(),
+            source: session.source.map(|id| id.inner()),
+            import: session.import.map(|id| id.inner()),
+            opened_at: session.opened_at.clone(),
+            closed_at: session.closed_at.clone(),
+        }
+    }
+}
+
+/// One question the session is waiting on.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportQuestionDto {
+    pub question: Uuid,
+    pub session: Uuid,
+    /// The row in the session the question is about.
+    pub row: u32,
+    /// The question in words, with the owner's own account titles in it.
+    pub prompt: String,
+    pub alternatives: Vec<AnswerAlternativeDto>,
+    pub asked_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<String>,
+    /// The classification rule the answer created, so the same counterparty is
+    /// not asked about twice. Absent when the row offered nothing a rule can
+    /// match on: a rule that asks nothing matches nothing, and writing one would
+    /// record a decision that never applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Uuid>,
+}
+
+impl ImportQuestionDto {
+    #[must_use]
+    pub fn from_domain(question: &ImportQuestionView) -> Self {
+        Self {
+            question: question.id.inner(),
+            session: question.session.inner(),
+            row: question.row,
+            prompt: question.prompt.clone(),
+            alternatives: serde_json::from_str::<Vec<AnswerShape>>(&question.alternatives)
+                .unwrap_or_default()
+                .into_iter()
+                .map(AnswerAlternativeDto::from_domain)
+                .collect(),
+            asked_at: question.asked_at.clone(),
+            answered_at: question.answered_at.clone(),
+            rule: question
+                .rule
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok()),
+        }
+    }
+}
+
+/// Everything a session holds.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportSessionContentsDto {
+    #[serde(flatten)]
+    pub session: ImportSessionDto,
+    /// How many rows are held, conclusive and observed together.
+    pub rows: usize,
+    /// Every question, answered and unanswered.
+    pub questions: Vec<ImportQuestionDto>,
+    /// How many are still waiting on the owner. Commit refuses while this is
+    /// not zero.
+    pub unanswered: usize,
+}
+
+/// The owner's answer to one question.
+///
+/// `answer` is one of the words the question published in its alternatives.
+/// `account` is required by exactly the two that name one, and refused by the
+/// rest: an answer carrying an account the question does not take is a caller
+/// mistake worth naming rather than ignoring.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnswerImportQuestionRequest {
+    pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Uuid>,
+    /// Where a fee came from, for the `fee` answer only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<FeeOriginDto>,
+}
+
+impl AnswerImportQuestionRequest {
+    /// Conversion to the owner's decision.
+    ///
+    /// The account is checked here rather than deeper: a missing one is a
+    /// malformed answer, and a superfluous one is a caller that believes it
+    /// answered something else.
+    pub fn to_domain(&self) -> Result<Answer, Rejection> {
+        let account = self.account.map(AccountId);
+        let answer = match self.answer.as_str() {
+            "sent_to_own_account" => Answer::SentToOwnAccount {
+                to: account.ok_or_else(|| self.missing_account())?,
+            },
+            "received_from_own_account" => Answer::ReceivedFromOwnAccount {
+                from: account.ok_or_else(|| self.missing_account())?,
+            },
+            "paid" => Answer::Paid,
+            "received" => Answer::Received,
+            "fee" => Answer::Fee {
+                origin: self
+                    .origin
+                    .map_or(FeeOrigin::Other, FeeOriginDto::to_domain),
+            },
+            "income" => Answer::Income,
+            other => {
+                return Err(Rejection {
+                    field: "answer".into(),
+                    expected: "sent_to_own_account, received_from_own_account, paid, \
+                               received, fee or income"
+                        .into(),
+                    actual: other.to_owned(),
+                });
+            }
+        };
+        Ok(answer)
+    }
+
+    fn missing_account(&self) -> Rejection {
+        Rejection {
+            field: "account".into(),
+            expected: "the owner's account this answer names".into(),
+            actual: "absent".into(),
+        }
+    }
+}
+
+/// What committing a session wrote.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportCommitDto {
+    #[serde(flatten)]
+    pub session: ImportSessionDto,
+    /// A verdict per held row, in the order the rows were fed.
+    pub rows: Vec<VerdictDto>,
+}
+
+/// One row a session is holding.
+///
+/// Deliberately not a [`VerdictDto`]. A verdict answers "what was recorded", and
+/// the answer for every row a session holds is "nothing, yet" — which is not
+/// `quarantined`, whose published meaning is that no fact *could* be written
+/// from the row. A held row will be written, at commit and at no other moment.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportRowDto {
+    /// The row's position in the session, one-based.
+    pub row: u32,
+    /// `held`, `needs_classification` or `rejected`.
+    pub state: String,
+    /// The question this row raised, for `needs_classification`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternatives: Option<Vec<AnswerAlternativeDto>>,
+    /// Why the row could not be read, for `rejected`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+}
+
+impl ImportRowDto {
+    #[must_use]
+    pub fn from_domain(held: &HeldRow) -> Self {
+        let base = Self {
+            row: held.row(),
+            state: String::new(),
+            question_id: None,
+            prompt: None,
+            alternatives: None,
+            field: None,
+            expected: None,
+            actual: None,
+        };
+        match held {
+            HeldRow::Held { .. } => Self {
+                state: "held".to_owned(),
+                ..base
+            },
+            HeldRow::Questioned { asked } => Self {
+                state: "needs_classification".to_owned(),
+                question_id: Some(asked.question.inner()),
+                prompt: Some(asked.prompt.clone()),
+                alternatives: Some(
+                    asked
+                        .alternatives
+                        .iter()
+                        .copied()
+                        .map(AnswerAlternativeDto::from_domain)
+                        .collect(),
+                ),
+                ..base
+            },
+            HeldRow::Rejected { rejection, .. } => Self {
+                state: "rejected".to_owned(),
+                field: Some(rejection.field.clone()),
+                expected: Some(rejection.expected.clone()),
+                actual: Some(rejection.actual.clone()),
+                ..base
+            },
+        }
+    }
 }

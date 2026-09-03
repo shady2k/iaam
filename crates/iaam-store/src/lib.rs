@@ -14,6 +14,7 @@ pub mod bundle;
 pub mod categories;
 pub mod documents;
 pub mod events;
+pub mod import_session;
 pub mod reference;
 pub mod rules;
 pub mod schedule;

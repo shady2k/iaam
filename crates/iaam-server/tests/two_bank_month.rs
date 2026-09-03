@@ -670,7 +670,6 @@ async fn a_second_bank_joins_the_contour_instead_of_minting_another() {
 /// it: `INNER` with an amount, and neither the side this account was on nor the
 /// account on the other side.
 #[tokio::test]
-#[ignore = "iaam-6qsa: no operation shape expresses a row whose direction the source did not give"]
 async fn an_ambiguous_row_does_not_silently_become_a_deposit() {
     let harness = harness();
     let accounts = create_accounts(&harness).await;

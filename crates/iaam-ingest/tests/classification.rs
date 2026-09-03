@@ -50,7 +50,7 @@ fn transfer_to(name: &str, account: AccountId) -> ClassificationSubject {
         counterparty: Counterparty::Named(name.to_owned()),
         description: Some("Перевод по номеру счёта".to_owned()),
         source_kind: Some("Перевод".to_owned()),
-        movement: Movement::Out,
+        movement: Some(Movement::Out),
     }
 }
 
@@ -65,7 +65,7 @@ fn a_transfer_to_an_own_account_needs_no_rule() {
         counterparty: Counterparty::OwnAccount(other),
         description: None,
         source_kind: None,
-        movement: Movement::Out,
+        movement: Some(Movement::Out),
     };
 
     assert_eq!(
@@ -177,7 +177,7 @@ fn the_description_matcher_ignores_letter_case() {
         counterparty: Counterparty::Unknown,
         description: Some("КОМИССИЯ ЗА ОБСЛУЖИВАНИЕ".to_owned()),
         source_kind: None,
-        movement: Movement::Out,
+        movement: Some(Movement::Out),
     };
     let by_description = rule(
         1,
@@ -249,7 +249,7 @@ fn an_outflow_without_a_counterparty_asks_fee_or_withdrawal() {
         counterparty: Counterparty::Unknown,
         description: None,
         source_kind: None,
-        movement: Movement::Out,
+        movement: Some(Movement::Out),
     };
 
     assert_eq!(
@@ -268,7 +268,7 @@ fn an_inflow_without_a_counterparty_asks_income_or_return() {
         counterparty: Counterparty::Unknown,
         description: None,
         source_kind: None,
-        movement: Movement::In,
+        movement: Some(Movement::In),
     };
 
     assert_eq!(

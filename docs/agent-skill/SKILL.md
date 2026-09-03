@@ -62,6 +62,81 @@ has reached the journal is indistinguishable from a fact — every report will
 read it as one, and only the owner, who knows what actually happened, can
 retract it.
 
+## A row you cannot classify is submitted as such
+
+The rule above — a missing value is asked of the owner, not filled in — used to
+have no way of being obeyed at intake. Every operation kind stated a conclusion:
+two of them asserted which way the money went, and the third demanded the
+account on the other side. A bank row printed as an amount and a word meaning
+"internal to this institution" is none of those, and the only shapes on offer
+forced a guess. One was made, a withdrawal was recorded as a deposit, and it had
+to be retracted afterwards.
+
+There is now a shape for the row itself. It states what the source stated and
+nothing more: the account the statement is for, the source's own direction word
+including the one that resolves to no direction, the amount **with the sign the
+source printed**, the party the source named if it named one, the word the
+source used for the operation, and the identifiers of the document and the row.
+Where the source said nothing, the shape says so explicitly; absence is a
+statement, not a default.
+
+**Use it whenever you have not concluded, and do not use it when you have.** A
+row you can read is submitted as what it is, and should be — the shape is not a
+safer default, it is the truthful answer to a different question. Submitting an
+observation for a row whose direction the source plainly gave throws away
+evidence and puts a question to the owner that the statement already answered.
+
+What comes back for a row the system cannot settle is a verdict saying so, and
+**nothing is recorded**: the balance does not move on a guess. The system settles
+what it can without asking — a counterparty it recognises as one of the owner's
+own accounts is an internal transfer, and a row matching a rule the owner has
+already written is classified by that rule. Only what neither settles becomes a
+question.
+
+## A question is a thing, not a sentence
+
+The question that comes back is a durable resource with an identifier, and it
+outlives the response that carried it. If you lose the response, the question is
+still there and can be found again; the answer is a later call naming the
+question, which is what makes it possible for the owner to take a day over it.
+
+Every question publishes the answers it admits, and an answer it does not admit
+is refused rather than interpreted. **Never answer one yourself.** Which way the
+money went and whose account was on the other side are facts about the owner's
+affairs; you may show him the question and the alternatives, and relay what he
+says.
+
+The owner's answer is kept as one of his classification rules, so the same
+counterparty is not asked about a second time. That is also why the answer
+matters beyond the one row: it is a decision recorded in his own vocabulary, and
+he can see it, change it, and retire it afterwards like any other rule.
+
+## An import can be held open before it is committed
+
+Rows can also be accumulated in an **import session** instead of being recorded
+one at a time. A session is opened, fed rows from one or more sources,
+questioned, answered, and then either committed or abandoned.
+
+It is not a database transaction, and the difference matters: answering a
+question can take the owner days, and nothing is held open in the machine
+meanwhile. What is durable is the session itself.
+
+Two properties are worth stating plainly, because everything else follows from
+them:
+
+- **Nothing in a session is in the journal, and nothing in the journal is
+  provisional.** A session's rows are not facts yet. They become facts at
+  commit, all at once, and at no other moment.
+- **Abandoning a session leaves the journal exactly as it was.** There is nothing
+  to retract, because nothing was recorded. This is the difference between
+  changing your mind before a commit and correcting a fact afterwards — the
+  first costs nothing, and the second is a retraction that every report the
+  owner has already read will stop counting.
+
+A session refuses to commit while any of its questions is unanswered. That
+refusal is the point of it: committing with a question open records exactly the
+guess the question exists to prevent.
+
 ## What a contour is
 
 A contour is the set of accounts the owner considers "his portfolio". The

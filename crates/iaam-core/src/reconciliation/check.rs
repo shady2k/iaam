@@ -7,8 +7,8 @@
 //! comes from the contract's rounding algorithm rather than being set here.
 
 use super::anchor::OpeningAnchor;
-use super::claim::ControlClaim;
-use super::observed::{ObservedTotals, Turnover};
+use super::claim::{BalancePoint, ControlClaim};
+use super::observed::{FoldSpan, ObservedTotals, Turnover};
 use crate::money::{CurrencyCode, PostedMinor, Quantity};
 use crate::numeric::decimal::Dec;
 
@@ -97,6 +97,119 @@ impl ReconciliationException {
             Self::UnsupportedRepoEncumbrance => "unsupported_repo_encumbrance",
             Self::UnsupportedFinancingPresent => "unsupported_financing_present",
         }
+    }
+}
+
+/// What the observed side of one comparison was: the fold it came out of, and
+/// what that fold began from.
+///
+/// **A discrepancy used to state three numbers and nothing about where the
+/// middle one came from.** An owner facing `discrepant` on a figure he had
+/// confirmed had no way to ask the system what it had added up: he summed every
+/// leg of the account by hand, over the whole period, and spent five iterations
+/// guessing why the total did not match (`iaam-lg2t`). The system held the fold
+/// the entire time.
+///
+/// It is carried by **every** outcome and not only by discrepancies. A `matched`
+/// says what the confirmation covers — a balance folded over one imported month
+/// is not the same evidence as one folded over four years — and a
+/// `not_comparable` needs it most of all, because the fold's start is the whole
+/// of its reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationBasis {
+    /// The events folded into the observed figure, and the dates they span.
+    pub folded: FoldSpan,
+    /// What the fold began from.
+    pub start: ObservedStart,
+}
+
+/// What the observed figure was accumulated from.
+///
+/// Four answers rather than an anchored/unanchored flag, because a flag would
+/// have to lie twice: an interval total starts from no state at all, and a
+/// currency the account has never moved has no sum whose start could have been
+/// invented. Reporting either as «unasserted» would send a reader looking for a
+/// missing opening assertion that would change nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservedStart {
+    /// The journal states what was held before the first movement folded in, so
+    /// the figure is a balance.
+    Asserted,
+    /// Nothing states it. The figure is the movement over the recorded
+    /// interval, and this is the reason a balance claim is not comparable.
+    Unasserted,
+    /// The journal has never moved this currency or this holding, so what the
+    /// claim was compared against is the absence of any record rather than a
+    /// sum. Zero here is the whole of what the journal says, not a placeholder
+    /// for an unknown amount.
+    NoRecordedMovement,
+    /// The claim is an interval total — a turnover, a fee, income, withheld tax
+    /// — and a total starts from no state. Asking after its opening is a
+    /// category error, which is why it has its own answer instead of a null.
+    NotABalance,
+}
+
+impl ObservedStart {
+    /// Machine-readable code for the API (§13).
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Asserted => "asserted",
+            Self::Unasserted => "unasserted",
+            Self::NoRecordedMovement => "no_recorded_movement",
+            Self::NotABalance => "not_a_balance",
+        }
+    }
+}
+
+/// What one claim is compared against, stated so it can be published beside the
+/// outcome.
+///
+/// Kept beside [`check_claim`] and reading the same two accessors, so that the
+/// window named to the owner is the window the comparison used. Deriving it in
+/// the transport from the interval's boundaries would have named a window the
+/// figure does not come from: a March closing balance over a journal that begins
+/// in February is folded from February.
+#[must_use]
+pub fn observation_basis(claim: &ControlClaim, observed: &ObservedTotals) -> ObservationBasis {
+    match *claim {
+        ControlClaim::CashBalance { currency, at, .. } => ObservationBasis {
+            folded: folded_to(at, observed),
+            start: start_of(observed.cash_anchor(currency)),
+        },
+        ControlClaim::PositionQuantity {
+            instrument,
+            custody,
+            at,
+            ..
+        } => ObservationBasis {
+            folded: folded_to(at, observed),
+            start: start_of(observed.position_anchor(instrument, custody)),
+        },
+        ControlClaim::CashTurnover { .. }
+        | ControlClaim::FeesTotal { .. }
+        | ControlClaim::IncomeTotal { .. }
+        | ControlClaim::TaxWithheldTotal { .. } => ObservationBasis {
+            folded: observed.folded_within(),
+            start: ObservedStart::NotABalance,
+        },
+    }
+}
+
+/// An opening figure comes out of what preceded the interval; a closing figure
+/// out of that and the interval both.
+fn folded_to(at: BalancePoint, observed: &ObservedTotals) -> FoldSpan {
+    match at {
+        BalancePoint::Opening => observed.folded_before(),
+        BalancePoint::Closing => observed.folded_before().merge(observed.folded_within()),
+    }
+}
+
+const fn start_of(anchor: Option<OpeningAnchor>) -> ObservedStart {
+    match anchor {
+        Some(OpeningAnchor::Asserted) => ObservedStart::Asserted,
+        Some(OpeningAnchor::Unasserted) => ObservedStart::Unasserted,
+        None => ObservedStart::NoRecordedMovement,
     }
 }
 
@@ -329,7 +442,7 @@ mod tests {
     /// March; its *presence*, not its value, is what anchors (`iaam-d7hn`).
     fn journal_with_one_deposit(account: AccountId, minor: i64) -> Vec<crate::event::Event> {
         vec![
-            opening_anchor(account),
+            opening_anchor(account, date!(2026 - 03 - 01)),
             event_with(
                 account,
                 date!(2026 - 03 - 10),
@@ -340,15 +453,19 @@ mod tests {
         ]
     }
 
-    /// A source's opening assertion for March, reaching the start of the
-    /// interval. No legs: an assertion moves no money (§10.3).
-    fn opening_anchor(account: AccountId) -> crate::event::Event {
+    /// A source's opening assertion reaching back to `from`. No legs: an
+    /// assertion moves no money (§10.3).
+    ///
+    /// The date is a parameter because reaching back far enough is the whole of
+    /// what makes an assertion an anchor: one that opens after the first
+    /// movement leaves everything before it unasserted.
+    fn opening_anchor(account: AccountId, from: time::Date) -> crate::event::Event {
         event_with(
             account,
-            date!(2026 - 03 - 01),
+            from,
             0,
             EventKind::ControlAssertion {
-                period: march(),
+                period: AssertionPeriod::between(from, date!(2026 - 03 - 31)).unwrap(),
                 claim: ControlClaim::CashBalance {
                     currency: CurrencyCode::Rub,
                     amount: PostedMinor::new(0),
@@ -586,6 +703,166 @@ mod tests {
                 reason: NotComparable::OpeningNotAsserted
             }
         );
+    }
+
+    #[test]
+    fn a_closing_outcome_names_the_window_it_was_folded_over() {
+        // `iaam-lg2t`: the owner told `discrepant` had no way to ask what the
+        // system had added up, so he added up the account by hand. The window
+        // named is the one the figure comes from — February, where the journal
+        // begins — and not the interval asked about.
+        let account = AccountId::new_random();
+        let events = vec![
+            opening_anchor(account, date!(2026 - 02 - 01)),
+            event_with(
+                account,
+                date!(2026 - 02 - 20),
+                1,
+                EventKind::CashIn {
+                    amount: rub(100_000),
+                },
+                vec![Leg::cash(account, rub(100_000))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 10),
+                1,
+                EventKind::CashIn {
+                    amount: rub(50_000),
+                },
+                vec![Leg::cash(account, rub(50_000))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 04 - 05),
+                1,
+                EventKind::CashIn { amount: rub(7) },
+                vec![Leg::cash(account, rub(7))],
+            ),
+        ];
+        let observed = observe(&events, account, march()).unwrap();
+
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(999),
+            at: BalancePoint::Closing,
+        };
+        let basis = observation_basis(&closing, &observed);
+        assert_eq!(
+            basis.folded.events, 2,
+            "the April inflow is after the interval and is in no fold"
+        );
+        assert_eq!(basis.folded.first, Some(date!(2026 - 02 - 20)));
+        assert_eq!(basis.folded.last, Some(date!(2026 - 03 - 10)));
+        assert_eq!(basis.start, ObservedStart::Asserted);
+
+        // The opening figure of the same interval comes out of a narrower fold,
+        // and saying so is the difference between «we compared your March
+        // opening against February» and «we compared it against March».
+        let opening = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(999),
+            at: BalancePoint::Opening,
+        };
+        let basis = observation_basis(&opening, &observed);
+        assert_eq!(basis.folded.events, 1);
+        assert_eq!(basis.folded.first, Some(date!(2026 - 02 - 20)));
+        assert_eq!(basis.folded.last, Some(date!(2026 - 02 - 20)));
+    }
+
+    #[test]
+    fn an_interval_total_states_that_it_starts_from_no_balance() {
+        // A turnover is a flow. Reporting it as accumulated from an unasserted
+        // start would send the owner to record an opening assertion that would
+        // change nothing about it.
+        let account = AccountId::new_random();
+        let observed = observe(
+            &journal_with_one_deposit(account, 100_000),
+            account,
+            march(),
+        )
+        .unwrap();
+        let turnover = ControlClaim::CashTurnover {
+            currency: CurrencyCode::Rub,
+            debit: PostedMinor::new(100_000),
+            credit: PostedMinor::new(0),
+        };
+        let basis = observation_basis(&turnover, &observed);
+        assert_eq!(basis.start, ObservedStart::NotABalance);
+        assert_eq!(basis.folded.events, 1, "only the interval's own events");
+        assert_eq!(basis.folded.first, Some(date!(2026 - 03 - 10)));
+    }
+
+    #[test]
+    fn an_unanchored_balance_says_so_in_its_basis_as_well_as_its_outcome() {
+        // The outcome names the reason and the basis names the fold; the owner
+        // needs both, because «not comparable» without the window does not say
+        // which stretch of history has no anchor.
+        let account = AccountId::new_random();
+        let events = vec![event_with(
+            account,
+            date!(2026 - 02 - 20),
+            1,
+            EventKind::CashIn {
+                amount: rub(100_000),
+            },
+            vec![Leg::cash(account, rub(100_000))],
+        )];
+        let observed = observe(&events, account, march()).unwrap();
+        let opening = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(100_000),
+            at: BalancePoint::Opening,
+        };
+        assert_eq!(
+            check_claim(&opening, &observed),
+            ClaimOutcome::NotComparable {
+                reason: NotComparable::OpeningNotAsserted
+            }
+        );
+        let basis = observation_basis(&opening, &observed);
+        assert_eq!(basis.start, ObservedStart::Unasserted);
+        assert_eq!(basis.folded.first, Some(date!(2026 - 02 - 20)));
+    }
+
+    #[test]
+    fn a_key_the_journal_never_moved_is_not_called_unasserted() {
+        // The account has an anchored rouble history and no dollar activity at
+        // all. Zero dollars is the whole of what the journal says, not a sum
+        // from an invented start, and calling it `unasserted` would send the
+        // owner after an opening assertion that would confirm nothing.
+        let account = AccountId::new_random();
+        let observed = observe(
+            &journal_with_one_deposit(account, 100_000),
+            account,
+            march(),
+        )
+        .unwrap();
+        let dollars = ControlClaim::CashBalance {
+            currency: CurrencyCode::Usd,
+            amount: PostedMinor::new(0),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(check_claim(&dollars, &observed), ClaimOutcome::Matched);
+        assert_eq!(
+            observation_basis(&dollars, &observed).start,
+            ObservedStart::NoRecordedMovement
+        );
+    }
+
+    #[test]
+    fn every_kind_of_start_has_a_distinct_code() {
+        let starts = [
+            ObservedStart::Asserted,
+            ObservedStart::Unasserted,
+            ObservedStart::NoRecordedMovement,
+            ObservedStart::NotABalance,
+        ];
+        let mut codes: Vec<&str> = starts.iter().map(|start| start.code()).collect();
+        let count = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), count, "start codes collided");
     }
 
     #[test]

@@ -352,6 +352,16 @@ report the second as an error he made. What lifts it is an opening assertion
 reaching back to the start of the recorded history, or the import of the
 history before it.
 
+**Never reconstruct what the system compared.** Every reconciliation outcome
+carries a `basis`: how many of the account's events were folded into the
+observed figure, the first and last dates folded, and what the fold started
+from. Read it before reporting anything about the outcome. The window is the
+account's recorded history reaching into the interval, not the interval that
+was asked about, and a balance folded over one imported month is not the
+evidence a balance folded over four years is. Do not add up the owner's
+operations yourself to work out what the number was made of — that is the work
+this field exists to end.
+
 A negative cash figure is reported as a fact and is never refused or hidden. It
 is not by itself an error: a margin account is legitimately negative, and a card
 can carry a technical overdraft. On an account where the owner would not expect

@@ -978,11 +978,12 @@ pub async fn commit_session(
     // intermediate state that misleads: for as long as it stands alone, the
     // figures look confirmable against a journal that is short the very rows
     // this attempt dropped.
-    let assertions = control_assertions(principal.owner, &planned.plan);
+    let assertions = control_assertions(principal.owner, planned.source, &planned.plan);
     let stated = assertions.len();
     let mut writing = assertions;
     writing.extend(coverage_gaps(
         principal.owner,
+        planned.source,
         &planned.plan,
         &planned.declined,
     ));
@@ -1352,6 +1353,15 @@ pub struct PlannedSession {
     /// `commit_delta.retained_unrecorded`. This is that same fact in the shape
     /// the journal records it, not a second finding.
     declined: Vec<DeclinedRow>,
+    /// The source everything this plan would write stands under.
+    ///
+    /// Read once, here, rather than recovered by each writer from
+    /// `plan.session.source`. A session that declared none has one minted for
+    /// the occasion, and minting it three times — once to normalise the rows,
+    /// once for the control assertions, once for the coverage gaps — would give
+    /// one commit three sources, and leave a refused row named under an
+    /// identity nothing else in that commit carries.
+    source: SourceId,
 }
 
 /// One row a commit was handed and will not take.
@@ -1859,6 +1869,7 @@ pub async fn plan_session(
 
     Ok(PlannedSession {
         declined,
+        source,
         plan: ImportPlan {
             session: contents.session,
             revision,
@@ -2290,8 +2301,11 @@ fn control_assertion_key(
 ///
 /// [`ControlClaim::CashBalance`]: iaam_core::reconciliation::claim::ControlClaim::CashBalance
 /// [`ControlClaim::CashTurnover`]: iaam_core::reconciliation::claim::ControlClaim::CashTurnover
-fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event::Event> {
-    let source = plan.session.source.unwrap_or_else(SourceId::new_random);
+fn control_assertions(
+    owner: OwnerId,
+    source: SourceId,
+    plan: &ImportPlan,
+) -> Vec<iaam_core::event::Event> {
     let mut events = Vec::new();
     for section in plan
         .control_reconciliation
@@ -2519,10 +2533,10 @@ fn coverage_gap_key(account: AccountId, period: AssertionPeriod, rows: &[Refused
 /// statement.
 fn coverage_gaps(
     owner: OwnerId,
+    source: SourceId,
     plan: &ImportPlan,
     declined: &[DeclinedRow],
 ) -> Vec<iaam_core::event::Event> {
-    let source = plan.session.source.unwrap_or_else(SourceId::new_random);
     let mut written: BTreeSet<(AccountId, time::Date, time::Date)> = BTreeSet::new();
     let mut events = Vec::new();
     for section in plan

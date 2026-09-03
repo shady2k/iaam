@@ -5,18 +5,22 @@
 //! The schema does not change; only the price source changes.
 
 pub mod candidate;
+pub mod selection;
 
 pub use candidate::{
     LegacyValuationOutcome, PriceCandidate, PriceFreshness, PriceKind, PriceOrigin,
     PriceProvenance, PriceQuery, PriceSelection, QuotationBasis, SelectedPrice,
     SourceExecutability, Uncovered, UncoveredReason, Venue, candidate_from_legacy_valuation,
 };
+pub use selection::{PriceDecision, PriceInputs, decide_price};
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::Date;
 
+use crate::event::Event;
+use crate::event::kind::EventKind;
 use crate::ids::InstrumentId;
 use crate::money::{CurrencyCode, Money};
 use crate::numeric::NumericError;
@@ -82,6 +86,40 @@ impl PriceBoard {
             .entry(price.instrument)
             .or_default()
             .insert(price.as_of, price);
+    }
+
+    /// Record whatever price one journal event states, and nothing when it
+    /// states none.
+    ///
+    /// The single definition of «a journal event that carries a price».
+    /// [`crate::projection::advance`] calls it while it folds, and so does the
+    /// asset snapshot, which needs a board without needing a whole projection.
+    /// Written twice, the two would drift, and a report would then value a
+    /// holding from a price the projection had decided not to record.
+    ///
+    /// An event with no effective date records nothing: a price is a fact about
+    /// a day, and a price without one cannot be looked up at or before
+    /// anything.
+    pub fn observe(&mut self, event: &Event) {
+        let EventKind::Valuation {
+            instrument,
+            price,
+            currency,
+            quality,
+        } = &event.kind
+        else {
+            return;
+        };
+        let Some(as_of) = event.dates.effective_date() else {
+            return;
+        };
+        self.record(InstrumentPrice {
+            instrument: *instrument,
+            price: *price,
+            currency: *currency,
+            quality: *quality,
+            as_of,
+        });
     }
 
     /// Price for an instrument on a date, or its latest observation before it.

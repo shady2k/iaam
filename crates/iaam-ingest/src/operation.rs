@@ -32,6 +32,16 @@ pub struct OperationDates {
 }
 
 impl OperationDates {
+    /// The day the row is dated by, when it carries one.
+    ///
+    /// Delegated to [`EventDates::effective_date`] rather than restated: an
+    /// ordering written twice drifts, and the day a row is read as happening on
+    /// must be the day the journal will date the fact it becomes.
+    #[must_use]
+    pub fn effective_date(self) -> Option<time::Date> {
+        self.to_event_dates().effective_date()
+    }
+
     fn to_event_dates(self) -> EventDates {
         EventDates {
             trade: self.trade.map(TradeDate),

@@ -15,6 +15,11 @@ expression: report
   "as_of": "2026-01-01",
   "bond_attributes": [],
   "bond_metrics": [],
+  "confidence": {
+    "caveats": [],
+    "complete": true,
+    "goal": "returns"
+  },
   "contributed": {
     "value": "50000.00"
   },

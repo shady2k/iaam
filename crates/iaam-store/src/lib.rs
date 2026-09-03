@@ -23,6 +23,8 @@ pub mod snapshots;
 pub mod tokens;
 
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use thiserror::Error;
@@ -138,6 +140,45 @@ pub enum ResolveError {
     Store(#[from] StoreError),
 }
 
+/// How long a connection waits for a lock another connection holds.
+///
+/// Also the budget for [`enable_wal`], so that one opening waits once, not twice.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pause between attempts to switch the journal mode. Long enough that a refused connection
+/// is not spinning, short enough that the usual case—the other connection is a moment away
+/// from finishing its own switch—costs one pause rather than a visible delay.
+const RETRY_PAUSE: Duration = Duration::from_millis(10);
+
+/// Switch the file to WAL, waiting out a connection that is switching it at the same moment.
+///
+/// Changing the journal mode needs a brief exclusive lock, and this is the one place where
+/// SQLite reports SQLITE_BUSY without consulting `busy_timeout`—so the wait has to be written
+/// out here. Two processes opening a fresh file at the same instant both find it in the
+/// default mode and both attempt the switch; the one that is refused retries, and by then the
+/// file is in WAL already and the pragma is a no-op. The mode is a property of the file, not
+/// of the connection, so there is nothing else to reconcile.
+fn enable_wal(conn: &Connection) -> Result<(), StoreError> {
+    let deadline = Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let busy = matches!(
+                    error,
+                    rusqlite::Error::SqliteFailure(inner, _)
+                        if inner.code == rusqlite::ErrorCode::DatabaseBusy
+                            || inner.code == rusqlite::ErrorCode::DatabaseLocked
+                );
+                if !busy || Instant::now() >= deadline {
+                    return Err(error.into());
+                }
+                thread::sleep(RETRY_PAUSE);
+            }
+        }
+    }
+}
+
 /// Database connection.
 ///
 /// Owns the connection exclusively: `rusqlite::Connection` is not `Sync`,
@@ -162,12 +203,19 @@ impl SqliteStore {
     }
 
     fn prepare(conn: Connection) -> Result<Self, StoreError> {
+        // Set first, before anything touches the file: by default a locked database
+        // returns SQLITE_BUSY at once, so the server starting and a CLI command run a
+        // moment later turn a wait of milliseconds into a hard failure. Five seconds is
+        // far longer than any write this program makes—the longest is migrating an empty
+        // file—and short enough that a holder that is genuinely stuck is reported rather
+        // than waited on forever.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // foreign_keys are disabled by default in SQLite: without this line
         // declared foreign keys are not checked at all.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // WAL: a reader does not block a writer. For a single user,
         // this is not about load, but about preventing a report from failing during a write.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        enable_wal(&conn)?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let store = Self { conn };
         schema::migrate(&store.conn)?;

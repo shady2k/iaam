@@ -10,6 +10,7 @@ use iaam_core::projection::ProjectionError;
 use iaam_core::projection::active_instruments::ActiveInstrumentsError;
 use iaam_core::projection::money_flow::MoneyFlowError;
 use iaam_core::reconciliation::observed::ObserveError;
+use iaam_core::report::assets::AssetSnapshotError;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -85,6 +86,13 @@ pub enum AppError {
     /// of the quantity journal.
     #[error("synchronisation schedule not built: {0}")]
     Schedule(#[source] ActiveInstrumentsError),
+    /// The asset snapshot did not fold: a currency mixed inside one total, or a
+    /// decimal overflow while adding rows. Separate from `Projection`, because
+    /// the projection succeeded — it is the summation over its rows that did
+    /// not, and reporting it as a projection failure would send an investigator
+    /// to the journal rather than to the totals.
+    #[error("asset snapshot not built: {0}")]
+    AssetSnapshot(#[source] AssetSnapshotError),
 }
 
 impl From<ObserveError> for AppError {
@@ -128,6 +136,7 @@ impl AppError {
             Self::MoneyFlow(_) => "money_flow_failed",
             Self::Reconciliation(_) => "reconciliation_failed",
             Self::Schedule(_) => "schedule_not_built",
+            Self::AssetSnapshot(_) => "asset_snapshot_not_built",
             Self::Perimeter(_) => "perimeter_assessment_failed",
             Self::Correction(_) => "corrections_do_not_resolve",
             Self::NotConfigured { .. } => "not_configured",

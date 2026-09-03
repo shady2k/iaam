@@ -6,6 +6,7 @@ use iaam_core::instrument::{
     AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind, Lineage, LineageReason,
 };
 use iaam_core::money::CurrencyCode;
+use iaam_core::report::balances::NegativeBalanceExpectation;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use time::Date;
 use time::format_description::well_known::Iso8601;
@@ -18,6 +19,201 @@ pub struct AccountRecord {
     pub owner: OwnerId,
     pub title: String,
     pub institution: Option<String>,
+}
+
+/// What kind of cash an account holds, as the owner declares it.
+///
+/// **Nothing branches on this value, and nothing may start.** It is a grouping
+/// label: report grouping reads it to render a heading, and no rule, no
+/// projection, no classification, no validation, no invariant and no refusal
+/// reads it at all (decision 0004 §3). A later feature that wants to branch on
+/// it is evidence that the objection recorded in `iaam-d41s` was right, and the
+/// answer then is to give that feature its own declaration rather than to grow
+/// this one.
+///
+/// One branch is named because it is the one that would be reached for first,
+/// and it is forbidden by name: **which negative balances are impossible must
+/// not be derived from this label.** "A savings account cannot be overdrawn,
+/// therefore warn" is precisely the reasoning `iaam-d41s` refuses, and it is
+/// wrong on the first ordinary technical overdraft.
+///
+/// The type lives in the storage adapter rather than in `iaam-core` on purpose:
+/// the core is where rules live, and a label no rule may read has no business
+/// being reachable from one.
+///
+/// Cash only. `Balances` separates cash from positions structurally, so
+/// `brokerage` and `security_position` are not values here: a position on an
+/// instrument is what the journal records and needs no declaration.
+///
+/// Unset is a value — "not stated" — and is expressed by `Option::None` rather
+/// than by a variant, so a caller cannot pass it where a stated class is meant.
+/// It is never inferred from a title or from a transaction pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CashAssetClass {
+    Deposit,
+    Savings,
+    CardAccount,
+    Wallet,
+}
+
+impl CashAssetClass {
+    /// All variants. This exists for table-driven tests: a list assembled by
+    /// hand in a test would silently drift from the `enum`.
+    pub const ALL: [Self; 4] = [
+        Self::Deposit,
+        Self::Savings,
+        Self::CardAccount,
+        Self::Wallet,
+    ];
+
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Deposit => "deposit",
+            Self::Savings => "savings",
+            Self::CardAccount => "card_account",
+            Self::Wallet => "wallet",
+        }
+    }
+
+    /// Parse a code. `None`, rather than a default, ensures an unknown class
+    /// reaches the caller instead of becoming a deposit.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.code() == code)
+    }
+}
+
+/// The identity a source prints for one account.
+///
+/// `provider` is the client's own label for the source; it scopes
+/// `provider_account_id`, which is **opaque to iaam** — not parsed, not
+/// shape-checked, not validated against a register, and never rendered where a
+/// title belongs. Equality and uniqueness are the entire contract, and they are
+/// enough for the upsert (decision 0004 §1).
+///
+/// A struct rather than two adjacent `String` fields on the account: the
+/// compiler cannot see two `String` values passed the wrong way round, and an
+/// identity stored backwards would look like a legitimate one belonging to
+/// nobody.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AccountIdentity {
+    pub provider: String,
+    pub provider_account_id: String,
+}
+
+/// A further identifier that reaches one account, valid over an interval.
+///
+/// Two cards over one underlying account are one account with two aliases, and
+/// its balance is counted once. A card that stopped working is an alias whose
+/// interval closed: there is no binding lifecycle, so "expired", "reissued",
+/// "blocked" and "closed" are the same fact here, deliberately (decision 0004
+/// §2).
+///
+/// [`AliasInterval`] is reused rather than respelled: instruments already carry
+/// exactly this shape for exactly this reason, and a second spelling of a
+/// half-open interval is a second set of off-by-one bugs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAliasRecord {
+    /// Opaque for the same reason `provider_account_id` is opaque.
+    pub value: String,
+    pub interval: AliasInterval,
+}
+
+/// An account with everything decision 0004 gives it.
+///
+/// Separate from [`AccountRecord`], which stays the summary the pre-existing
+/// callers read. The separation is the point: the identity, the aliases and the
+/// class travel only to the callers built to carry them, so a reader of the
+/// summary cannot begin to branch on a label that nothing may branch on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDetailRecord {
+    pub id: AccountId,
+    pub owner: OwnerId,
+    pub title: String,
+    pub institution: Option<String>,
+    /// `None` — the account carries no external identity. Accounts written
+    /// before decision 0004 are all in this state, and none of them is given one
+    /// by guesswork.
+    pub identity: Option<AccountIdentity>,
+    pub cash_class: Option<CashAssetClass>,
+    /// What the owner says a negative balance on this account would mean
+    /// (`iaam-d41s`). `None` is «he has not said».
+    ///
+    /// A **second** value beside `cash_class`, never derived from it. Decision
+    /// 0004 §3 forbids the merge by name: «a savings account cannot be
+    /// overdrawn, therefore warn» is wrong on the first ordinary technical
+    /// overdraft. The type comes from `iaam_core::report::balances` because
+    /// that is the one place that reads it — unlike [`CashAssetClass`], which
+    /// lives here precisely so no rule can reach it.
+    pub negative_balance_expectation: Option<NegativeBalanceExpectation>,
+    pub aliases: Vec<AccountAliasRecord>,
+}
+
+/// What [`SqliteStore::create_account`] did.
+///
+/// `Existing` is not a failure: it is the upsert by external identity working.
+/// It is distinguished from `Created` so the caller can tell the truth about
+/// what happened rather than reporting a creation that did not occur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountCreation {
+    Created(AccountDetailRecord),
+    /// The identity was already known: this is the account created last time.
+    Existing(AccountDetailRecord),
+}
+
+/// One declaration in a replacement: the owner's word, his withdrawal of it, or
+/// his silence.
+///
+/// Three states, not two, and the third is the whole reason this type exists. A
+/// replacement that spelled «leave this alone» and «he states none» the same way
+/// would clear, on every call, every field the caller did not happen to
+/// mention — and one of the fields it governs decides which account a later
+/// import lands on.
+///
+/// [`AccountTransferStatementRecord`] draws the same line one noun away: an
+/// empty partner list is «money moves between this account and none of my
+/// others», and having said nothing at all is a different fact. The distinction
+/// is borrowed rather than reinvented, because a second spelling of it is a
+/// second place for a silence to be read as an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declared<T> {
+    /// Not mentioned. The stored value stands exactly as it stood.
+    Untouched,
+    /// Stated as none. The stored value is cleared, and the account goes back to
+    /// «he has not said» — which is a thing he is allowed to say.
+    Cleared,
+    /// Stated as this.
+    Stated(T),
+}
+
+/// The declarations an account carries beside its title, as the owner now states
+/// them.
+///
+/// Three independent statements rather than one set, so each carries its own
+/// [`Declared`]. Folding them into a single replaced value would make stating a
+/// cash class withdraw an identity, which is exactly the accident the third
+/// state exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeclarations {
+    pub identity: Declared<AccountIdentity>,
+    pub cash_class: Declared<CashAssetClass>,
+    pub negative_balance_expectation: Declared<NegativeBalanceExpectation>,
+}
+
+/// What [`SqliteStore::replace_account_declarations`] recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeclarationsRecorded {
+    pub account: AccountDetailRecord,
+    /// The identity the account carried until this call, when the call replaced
+    /// it with a different one or withdrew it.
+    ///
+    /// `None` covers the three cases that need no announcement: the account
+    /// carried no identity, the call did not mention the identity, or the
+    /// identity stated is the one already recorded. Giving an identity to an
+    /// account that had none is an ordinary first statement; re-pointing one is
+    /// not, and this field is how the caller is told which of the two happened.
+    pub previous_identity: Option<AccountIdentity>,
 }
 
 /// The current version of a contour owned by one portfolio owner.
@@ -164,6 +360,355 @@ impl SqliteStore {
                 title,
                 institution,
             });
+        }
+        Ok(accounts)
+    }
+
+    /// Create an account, upserting by external identity.
+    ///
+    /// A create carrying an identity that already exists returns the account
+    /// created last time rather than minting a second one, and changes nothing
+    /// about it. The title is a display name: repeating an identity under a
+    /// different title is not a rename, and treating it as one would let a
+    /// re-import silently overwrite what the owner reads.
+    ///
+    /// An account carrying no identity is always created. Two accounts that
+    /// state no identity are not the same account, and merging them on the
+    /// strength of a shared absence is the one mistake the partial uniqueness
+    /// index exists to prevent.
+    ///
+    /// Immediate transaction: the lookup and the insert are a check-then-act,
+    /// and two concurrent imports of one statement would otherwise both find
+    /// nothing and both mint an account.
+    pub fn create_account(
+        &mut self,
+        account: &AccountDetailRecord,
+    ) -> Result<AccountCreation, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(identity) = &account.identity {
+            let existing: Option<String> = transaction
+                .query_row(
+                    "SELECT id FROM accounts
+                     WHERE owner = ?1 AND provider = ?2 AND provider_account_id = ?3",
+                    params![
+                        account.owner.inner().to_string(),
+                        identity.provider,
+                        identity.provider_account_id,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                let id = AccountId(parse_uuid(&id, "account")?);
+                let stored = read_account_detail(&transaction, account.owner, id)?;
+                transaction.commit()?;
+                return Ok(AccountCreation::Existing(stored));
+            }
+        }
+
+        transaction.execute(
+            "INSERT INTO accounts
+                 (id, owner, title, institution, created_at,
+                  provider, provider_account_id, cash_class,
+                  negative_balance_expectation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                account.id.inner().to_string(),
+                account.owner.inner().to_string(),
+                account.title,
+                account.institution,
+                now(),
+                account.identity.as_ref().map(|it| it.provider.as_str()),
+                account
+                    .identity
+                    .as_ref()
+                    .map(|it| it.provider_account_id.as_str()),
+                account.cash_class.map(CashAssetClass::code),
+                account
+                    .negative_balance_expectation
+                    .map(NegativeBalanceExpectation::code),
+            ],
+        )?;
+        for alias in &account.aliases {
+            transaction.execute(
+                "INSERT INTO account_aliases (owner, account, value, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    account.owner.inner().to_string(),
+                    account.id.inner().to_string(),
+                    alias.value,
+                    date_to_text(alias.interval.valid_from),
+                    alias.interval.valid_to.map(date_to_text),
+                ],
+            )?;
+        }
+        let stored = read_account_detail(&transaction, account.owner, account.id)?;
+        transaction.commit()?;
+        Ok(AccountCreation::Created(stored))
+    }
+
+    /// Replace one account's aliases with the set the owner now states.
+    ///
+    /// Replacement rather than an add-one/close-one pair, following
+    /// `record_account_transfer_statement`: the owner states what is true now,
+    /// and a diff against what he said last time is a second thing to get wrong.
+    /// A card that stopped working is stated as an alias whose interval closed,
+    /// alongside whichever alias replaced it.
+    ///
+    /// The account must be the owner's. The delete alone would silently succeed
+    /// against a stranger's account, so ownership is established first rather
+    /// than left to the foreign key on the insert — an empty set would never
+    /// reach one.
+    pub fn replace_account_aliases(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+        aliases: &[AccountAliasRecord],
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let held: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM accounts WHERE owner = ?1 AND id = ?2",
+                params![owner.inner().to_string(), account.inner().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if held.is_none() {
+            return Err(StoreError::NotFound {
+                what: "account",
+                id: account.inner().to_string(),
+            });
+        }
+
+        transaction.execute(
+            "DELETE FROM account_aliases WHERE owner = ?1 AND account = ?2",
+            params![owner.inner().to_string(), account.inner().to_string()],
+        )?;
+        for alias in aliases {
+            transaction.execute(
+                "INSERT INTO account_aliases (owner, account, value, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    owner.inner().to_string(),
+                    account.inner().to_string(),
+                    alias.value,
+                    date_to_text(alias.interval.valid_from),
+                    alias.interval.valid_to.map(date_to_text),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Replace the declarations an account carries: the identity its source
+    /// prints, the class of cash the owner says it holds, and what he expects a
+    /// negative balance on it to mean.
+    ///
+    /// The three could previously be stated only at creation, and
+    /// [`Self::create_account`] deliberately ignores them when it finds the
+    /// identity already known — that call is an upsert by identity, not an
+    /// update of one. So every account that already existed could never acquire
+    /// any of the three, which is the defect this method closes.
+    ///
+    /// Replacement rather than a patch, following
+    /// [`Self::replace_account_aliases`]: the owner says what is true now. What
+    /// is different here is that the three are separate statements, so the
+    /// replacement is per field and [`Declared::Untouched`] is what leaves one
+    /// alone.
+    ///
+    /// **Re-pointing an identity is allowed, and is reported rather than
+    /// refused.** The tempting rule — refuse a change once facts were imported
+    /// under the old identity — cannot be stated against this schema. `events`
+    /// records a fact against an account id and a free `source` label; no
+    /// column and no event kind records the external identity in force when the
+    /// row arrived, and the journal is append-only in the database, so nothing
+    /// can be backfilled to make it. A refusal would therefore have to be
+    /// conditioned on «this account has facts at all», which is a different
+    /// claim: it refuses an account whose whole history was typed in by hand
+    /// under no identity, and it still does not answer the question anyone
+    /// asked. What the caller gets instead is [`previous_identity`], so a
+    /// re-pointing is visible as a re-pointing.
+    ///
+    /// [`previous_identity`]: AccountDeclarationsRecorded::previous_identity
+    ///
+    /// Immediate transaction: the collision check and the update are a
+    /// check-then-act, and two calls claiming one identity would otherwise both
+    /// find it free.
+    pub fn replace_account_declarations(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+        declarations: &AccountDeclarations,
+    ) -> Result<AccountDeclarationsRecorded, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Reading the account first establishes that it is this owner's: the
+        // update alone would report success having matched no row, and the
+        // caller would be told he had recorded a statement about someone else's
+        // account (§14).
+        let held = read_account_detail(&transaction, owner, account)?;
+
+        let identity = match &declarations.identity {
+            Declared::Untouched => held.identity.clone(),
+            Declared::Cleared => None,
+            Declared::Stated(identity) => Some(identity.clone()),
+        };
+        // The partial unique index would abort the update with a message naming
+        // two columns; the owner needs to be told that another of his accounts
+        // already answers to this identity. The check is skipped when the
+        // identity is unchanged, because a row does not collide with itself.
+        if let Some(wanted) = identity.as_ref() {
+            if held.identity.as_ref() != Some(wanted) {
+                let taken: Option<String> = transaction
+                    .query_row(
+                        "SELECT id FROM accounts
+                         WHERE owner = ?1 AND provider = ?2 AND provider_account_id = ?3",
+                        params![
+                            owner.inner().to_string(),
+                            wanted.provider,
+                            wanted.provider_account_id,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if taken.is_some() {
+                    return Err(StoreError::AlreadyExists {
+                        what: "an account with that external identity",
+                    });
+                }
+            }
+        }
+
+        let cash_class = match &declarations.cash_class {
+            Declared::Untouched => held.cash_class,
+            Declared::Cleared => None,
+            Declared::Stated(class) => Some(*class),
+        };
+        let expectation = match &declarations.negative_balance_expectation {
+            Declared::Untouched => held.negative_balance_expectation,
+            Declared::Cleared => None,
+            Declared::Stated(expectation) => Some(*expectation),
+        };
+
+        transaction.execute(
+            "UPDATE accounts
+                SET provider = ?3,
+                    provider_account_id = ?4,
+                    cash_class = ?5,
+                    negative_balance_expectation = ?6
+              WHERE owner = ?1 AND id = ?2",
+            params![
+                owner.inner().to_string(),
+                account.inner().to_string(),
+                identity.as_ref().map(|it| it.provider.as_str()),
+                identity.as_ref().map(|it| it.provider_account_id.as_str()),
+                cash_class.map(CashAssetClass::code),
+                expectation.map(NegativeBalanceExpectation::code),
+            ],
+        )?;
+
+        let stored = read_account_detail(&transaction, owner, account)?;
+        transaction.commit()?;
+
+        // Announced only when an identity was displaced. Giving one to an
+        // account that had none is ordinary, and restating the one already
+        // recorded displaced nothing.
+        let previous_identity = match &declarations.identity {
+            Declared::Untouched => None,
+            Declared::Cleared | Declared::Stated(_) => held
+                .identity
+                .filter(|previous| identity.as_ref() != Some(previous)),
+        };
+        Ok(AccountDeclarationsRecorded {
+            account: stored,
+            previous_identity,
+        })
+    }
+
+    /// Every account of one owner, with the identity, aliases and class it
+    /// carries.
+    ///
+    /// An account written before decision 0004 reads back with no identity, no
+    /// class and no aliases. That is the honest answer rather than a defect: the
+    /// migration invented nothing.
+    pub fn list_account_details(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountDetailRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, title, institution, provider, provider_account_id, cash_class,
+                    negative_balance_expectation
+             FROM accounts WHERE owner = ?1 ORDER BY title, id",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            let (
+                id,
+                title,
+                institution,
+                provider,
+                provider_account_id,
+                cash_class,
+                negative_balance_expectation,
+            ) = row?;
+            accounts.push(AccountDetailRecord {
+                id: AccountId(parse_uuid(&id, "account")?),
+                owner,
+                title,
+                institution,
+                identity: external_identity(provider, provider_account_id),
+                cash_class: parse_cash_class(cash_class.as_deref())?,
+                negative_balance_expectation: parse_negative_balance_expectation(
+                    negative_balance_expectation.as_deref(),
+                )?,
+                aliases: Vec::new(),
+            });
+        }
+        drop(statement);
+
+        let mut statement = self.conn.prepare(
+            "SELECT account, value, valid_from, valid_to FROM account_aliases
+             WHERE owner = ?1 ORDER BY account, valid_from, value",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (account, value, valid_from, valid_to) = row?;
+            let account = AccountId(parse_uuid(&account, "account")?);
+            let alias = AccountAliasRecord {
+                value,
+                interval: AliasInterval {
+                    valid_from: text_to_date(&valid_from)?,
+                    valid_to: valid_to.as_deref().map(text_to_date).transpose()?,
+                },
+            };
+            if let Some(target) = accounts.iter_mut().find(|entry| entry.id == account) {
+                target.aliases.push(alias);
+            }
         }
         Ok(accounts)
     }
@@ -678,31 +1223,40 @@ impl SqliteStore {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO account_transfer_statements (owner, account, recorded_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (owner, account) DO UPDATE SET recorded_at = excluded.recorded_at
-             WHERE account_transfer_statements.owner = excluded.owner",
-            params![
-                owner.inner().to_string(),
-                account.inner().to_string(),
-                now(),
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM account_transfer_partners WHERE owner = ?1 AND account = ?2",
-            params![owner.inner().to_string(), account.inner().to_string()],
-        )?;
-        for partner in partners {
-            transaction.execute(
-                "INSERT OR IGNORE INTO account_transfer_partners (owner, account, partner)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    owner.inner().to_string(),
-                    account.inner().to_string(),
-                    partner.inner().to_string(),
-                ],
-            )?;
+        write_transfer_statement(&transaction, owner, account, partners)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record, or replace, several of those statements in one transaction.
+    ///
+    /// Transport, not meaning. Each entry is the same complete enumeration the
+    /// single-account form records, and stating one account's partners still
+    /// says nothing about any other account's — the relation is directed here
+    /// because the question «these, and no others» is answerable only per
+    /// account.
+    ///
+    /// What the batch adds is atomicity, and it is why the loop the caller could
+    /// have written is not good enough: [`Self::record_account_transfer_statement`]
+    /// commits per call, so a failure on the fifth of twelve would leave four
+    /// statements replaced and eight standing as they were — the owner having
+    /// half-said something he was saying all at once. Everything here lands in
+    /// one immediate transaction or none of it does.
+    ///
+    /// An empty batch is a no-op rather than an error.
+    pub fn record_account_transfer_statements(
+        &mut self,
+        owner: OwnerId,
+        statements: &[AccountTransferStatementRecord],
+    ) -> Result<(), StoreError> {
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for statement in statements {
+            write_transfer_statement(&transaction, owner, statement.account, &statement.partners)?;
         }
         transaction.commit()?;
         Ok(())
@@ -813,6 +1367,164 @@ impl SqliteStore {
         )?;
         Ok(version.map(ContourVersion))
     }
+}
+
+/// Both halves of an external identity, or neither.
+///
+/// The partial uniqueness index binds only rows that carry both columns, so a
+/// row carrying one of them is not an identity and must not be read as one.
+fn external_identity(
+    provider: Option<String>,
+    provider_account_id: Option<String>,
+) -> Option<AccountIdentity> {
+    match (provider, provider_account_id) {
+        (Some(provider), Some(provider_account_id)) => Some(AccountIdentity {
+            provider,
+            provider_account_id,
+        }),
+        _ => None,
+    }
+}
+
+/// A stored class code, refusing one this build does not know.
+///
+/// An unrecognised code is an error rather than `None`: `None` means "the owner
+/// has not said", and reading a value the owner did say as a value he did not
+/// would put a wrong heading on a report he is meant to trust.
+fn parse_cash_class(code: Option<&str>) -> Result<Option<CashAssetClass>, StoreError> {
+    code.map(|code| {
+        CashAssetClass::from_code(code).ok_or_else(|| StoreError::InvalidValue {
+            field: "accounts.cash_class",
+            value: code.to_owned(),
+        })
+    })
+    .transpose()
+}
+
+/// A stored expectation code, refusing one this build does not know.
+///
+/// An unrecognised code is an error rather than `None`, for the reason
+/// [`parse_cash_class`] gives: `None` means «the owner has not said», and
+/// reading a statement he did make as one he did not would drop a warning he
+/// asked for.
+fn parse_negative_balance_expectation(
+    code: Option<&str>,
+) -> Result<Option<NegativeBalanceExpectation>, StoreError> {
+    code.map(|code| {
+        NegativeBalanceExpectation::from_code(code).ok_or_else(|| StoreError::InvalidValue {
+            field: "accounts.negative_balance_expectation",
+            value: code.to_owned(),
+        })
+    })
+    .transpose()
+}
+
+/// One account with its identity, class and aliases, read inside a transaction.
+fn read_account_detail(
+    transaction: &rusqlite::Transaction<'_>,
+    owner: OwnerId,
+    id: AccountId,
+) -> Result<AccountDetailRecord, StoreError> {
+    let (title, institution, provider, provider_account_id, cash_class, expectation) = transaction
+        .query_row(
+            "SELECT title, institution, provider, provider_account_id, cash_class,
+                    negative_balance_expectation
+             FROM accounts WHERE owner = ?1 AND id = ?2",
+            params![owner.inner().to_string(), id.inner().to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound {
+            what: "account",
+            id: id.inner().to_string(),
+        })?;
+
+    let mut statement = transaction.prepare(
+        "SELECT value, valid_from, valid_to FROM account_aliases
+         WHERE owner = ?1 AND account = ?2 ORDER BY valid_from, value",
+    )?;
+    let rows = statement.query_map(
+        params![owner.inner().to_string(), id.inner().to_string()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    let mut aliases = Vec::new();
+    for row in rows {
+        let (value, valid_from, valid_to) = row?;
+        aliases.push(AccountAliasRecord {
+            value,
+            interval: AliasInterval {
+                valid_from: text_to_date(&valid_from)?,
+                valid_to: valid_to.as_deref().map(text_to_date).transpose()?,
+            },
+        });
+    }
+
+    Ok(AccountDetailRecord {
+        id,
+        owner,
+        title,
+        institution,
+        identity: external_identity(provider, provider_account_id),
+        cash_class: parse_cash_class(cash_class.as_deref())?,
+        negative_balance_expectation: parse_negative_balance_expectation(expectation.as_deref())?,
+        aliases,
+    })
+}
+
+/// Write one transfer statement inside a transaction the caller owns.
+///
+/// The single-account form and the batch form share this body rather than each
+/// carrying its own copy of the SQL: a second copy is a second thing to keep in
+/// step, and the one that drifted would record a statement subtly unlike the
+/// one the other records.
+fn write_transfer_statement(
+    conn: &rusqlite::Connection,
+    owner: OwnerId,
+    account: AccountId,
+    partners: &[AccountId],
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO account_transfer_statements (owner, account, recorded_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT (owner, account) DO UPDATE SET recorded_at = excluded.recorded_at
+         WHERE account_transfer_statements.owner = excluded.owner",
+        params![
+            owner.inner().to_string(),
+            account.inner().to_string(),
+            now(),
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM account_transfer_partners WHERE owner = ?1 AND account = ?2",
+        params![owner.inner().to_string(), account.inner().to_string()],
+    )?;
+    for partner in partners {
+        conn.execute(
+            "INSERT OR IGNORE INTO account_transfer_partners (owner, account, partner)
+             VALUES (?1, ?2, ?3)",
+            params![
+                owner.inner().to_string(),
+                account.inner().to_string(),
+                partner.inner().to_string(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn parse_uuid(value: &str, what: &'static str) -> Result<uuid::Uuid, StoreError> {

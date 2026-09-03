@@ -10,9 +10,9 @@ use iaam_core::event::source_row::RowName;
 use iaam_core::ids::{AccountId, EventId, OwnerId};
 use iaam_core::money::{CurrencyCode, Money};
 use iaam_core::projection::money_flow::UndecomposedCause;
-use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
+use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue, Discrepancy};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
-use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
+use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger, Taint};
 use iaam_ingest::Verdict;
 use iaam_ingest::classification::Question;
 
@@ -64,19 +64,262 @@ impl ActionKind {
             Self::PossibleDuplicateUndecided => "possible_duplicate_undecided",
         }
     }
+
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 14] = [
+        Self::CreateFirstAccount,
+        Self::CreateFirstContour,
+        Self::AccountScopeUndecided,
+        Self::ResolveTransferRelationships,
+        Self::StartAccountImport,
+        Self::ProvideControlAssertion,
+        Self::AnswerClassificationQuestion,
+        Self::CoverageGapUnrepaired,
+        Self::IndependentConfirmationMissing,
+        Self::DiscrepancyUnresolved,
+        Self::UndecomposedOutflows,
+        Self::ExternalTransfersUncategorised,
+        Self::UnexplainedResidual,
+        Self::PossibleDuplicateUndecided,
+    ];
+
+    /// The reports this kind's outstanding work stands between the owner and.
+    ///
+    /// The single table, and the reason it lives on the kind rather than at each
+    /// producer: [`ActionCategory::required_for`] is the only way to build the
+    /// required category, so a kind cannot be graded required for one set of
+    /// goals in one branch and another set in the next.
+    ///
+    /// Empty for the four kinds the queue never grades required — a blocking
+    /// item, a recommendation, two statements of fact — and empty is refused by
+    /// [`Action::new`], so an attempt to promote one of them without deciding
+    /// what it blocks fails at construction rather than publishing a required
+    /// item that names nothing.
+    ///
+    /// Exhaustive on purpose. A fifteenth kind cannot compile until someone has
+    /// answered, for that kind, the question this whole type exists to answer.
+    ///
+    /// Each entry is what the code does, not what the item's prose suggests:
+    ///
+    /// - `CreateFirstContour`, `AccountScopeUndecided` — an account in no
+    ///   contour is outside `report_population`'s covered set, so it is absent
+    ///   from balances, flow and returns. **Not reconciliation**:
+    ///   `reconciliation::report` takes an account and never resolves a contour.
+    /// - `ResolveTransferRelationships` — an unpaired leg is a `CashOut` or a
+    ///   `CashIn`, which `MoneyFlow::apply` counts as money crossing the
+    ///   perimeter and `FlowLog` records as an external contribution or
+    ///   withdrawal. **Not asset snapshot**: the leg lands on its own account's
+    ///   cash whether or not its partner is known. **Not reconciliation**:
+    ///   pairing rewrites two events as one with the same two legs, so observed
+    ///   cash and turnover per account are unchanged.
+    /// - `StartAccountImport`, `AnswerClassificationQuestion` — a row that is in
+    ///   no journal is in no report, and an account with no facts has nothing
+    ///   for any of the four to say.
+    /// - `ProvideControlAssertion` — the closing assertion is the claim side of
+    ///   reconciliation, and the opening one is what makes the snapshot's cash a
+    ///   balance: `reports::account_balances` publishes `CashOpening::Asserted`
+    ///   or `Unasserted` per account and currency, from exactly these events.
+    ///   **Not returns and not flow**: a control assertion has no legs, so it
+    ///   moves no number in either; it only grades confidence there.
+    /// - `CoverageGapUnrepaired`, `IndependentConfirmationMissing`,
+    ///   `DiscrepancyUnresolved` — all three are about whether a period is
+    ///   confirmed, and nothing else. `EventKind::ImportCoverageGap` says so in
+    ///   as many words: it is «a statement about this attempt», not about the
+    ///   interval, and the refused rows may already be in the journal from
+    ///   another channel.
+    /// - `PossibleDuplicateUndecided` — `DedupDecision::records_the_row` is true
+    ///   for a possible duplicate, so the row **is** in the journal and may be
+    ///   the same money counted twice. That is wrong in every report.
+    #[must_use]
+    pub const fn goals(self) -> ReportGoals {
+        use ReportGoal::{AssetSnapshot, MoneyFlow, Reconciliation, Returns};
+        match self {
+            // Blocking, not required work: no goal.
+            Self::CreateFirstAccount => ReportGoals::NONE,
+            Self::CreateFirstContour | Self::AccountScopeUndecided => {
+                ReportGoals::of(&[AssetSnapshot, MoneyFlow, Returns])
+            }
+            Self::ResolveTransferRelationships => ReportGoals::of(&[MoneyFlow, Returns]),
+            Self::StartAccountImport
+            | Self::AnswerClassificationQuestion
+            | Self::PossibleDuplicateUndecided => ReportGoals::ALL,
+            Self::ProvideControlAssertion => ReportGoals::of(&[AssetSnapshot, Reconciliation]),
+            Self::CoverageGapUnrepaired
+            | Self::IndependentConfirmationMissing
+            | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
+            // Recommended and informational: never required, so no goal.
+            Self::UndecomposedOutflows
+            | Self::ExternalTransfersUncategorised
+            | Self::UnexplainedResidual => ReportGoals::NONE,
+        }
+    }
+}
+
+/// One report the owner is trying to reach.
+///
+/// The four are the whole vocabulary, and they are the four report scenarios
+/// this workspace computes: [`crate::scenarios::reports::account_balances`],
+/// [`crate::scenarios::reports::money_flow`],
+/// [`crate::scenarios::reports::returns`] and
+/// [`crate::scenarios::reconciliation::report`]. A fifth name would be a goal no
+/// code produces, and a queue whose goals do not match the reports is worse than
+/// a queue with no goals at all, because it would be believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReportGoal {
+    /// What the owner holds, per account: `reports::account_balances`.
+    AssetSnapshot,
+    /// Where money came from and where it went: `reports::money_flow`.
+    MoneyFlow,
+    /// What the holdings earned: `reports::returns`.
+    Returns,
+    /// Whether the journal agrees with the documents: `reconciliation::report`.
+    Reconciliation,
+}
+
+impl ReportGoal {
+    /// Every goal, in the order the queue publishes them.
+    pub const ALL: [Self; 4] = [
+        Self::AssetSnapshot,
+        Self::MoneyFlow,
+        Self::Returns,
+        Self::Reconciliation,
+    ];
+
+    /// The stable wire name of this goal.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::AssetSnapshot => "asset_snapshot",
+            Self::MoneyFlow => "money_flow",
+            Self::Returns => "returns",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+
+    /// This goal's place in a set's bit pattern.
+    const fn bit(self) -> u8 {
+        match self {
+            Self::AssetSnapshot => 1,
+            Self::MoneyFlow => 1 << 1,
+            Self::Returns => 1 << 2,
+            Self::Reconciliation => 1 << 3,
+        }
+    }
+}
+
+/// A set of goals, held as a bit pattern so that it stays [`Copy`].
+///
+/// A bitmask rather than a `BTreeSet<ReportGoal>`, and the reason is
+/// [`ActionCategory`]. That type is `Copy`, it is returned **by value** from a
+/// `const fn` accessor on [`Action`], and every consumer switches on it by
+/// value. A heap set inside it would have taken `Copy` away from the category,
+/// turned [`Action::category`] into a borrow, and rippled through the server's
+/// mapping and every test that compares one — all to carry a set that can never
+/// hold more than four elements. Four bits carry it instead, and nothing else
+/// changes.
+///
+/// The empty set is representable, and that is deliberate: a `const fn` cannot
+/// build a type whose non-emptiness is enforced by a constructor that fails, so
+/// the invariant is enforced where the item is assembled. [`Action::new`]
+/// refuses a [`ActionCategory::RequiredForGoal`] that names nothing, which is
+/// exactly the defect this type exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct ReportGoals(u8);
+
+impl ReportGoals {
+    /// No goal at all. Never admissible on [`ActionCategory::RequiredForGoal`].
+    pub const NONE: Self = Self(0);
+
+    /// Every goal there is: the item stands in the way of all four reports.
+    pub const ALL: Self = Self::of(&ReportGoal::ALL);
+
+    /// The set holding exactly the listed goals.
+    #[must_use]
+    pub const fn of(goals: &[ReportGoal]) -> Self {
+        let mut bits = 0;
+        let mut index = 0;
+        while index < goals.len() {
+            bits |= goals[index].bit();
+            index += 1;
+        }
+        Self(bits)
+    }
+
+    #[must_use]
+    pub const fn contains(self, goal: ReportGoal) -> bool {
+        self.0 & goal.bit() != 0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The goals in this set, in [`ReportGoal::ALL`] order.
+    pub fn iter(self) -> impl Iterator<Item = ReportGoal> {
+        ReportGoal::ALL
+            .into_iter()
+            .filter(move |goal| self.contains(*goal))
+    }
 }
 
 /// The policy category assigned to an action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `Copy` still, and the goal set is why that was in doubt: see [`ReportGoals`].
+/// `PartialOrd`/`Ord` are **not** derived any more. A derived order over a
+/// variant carrying a payload would have ordered two required items by their
+/// bit patterns, which is a meaningless order that [`sort_actions`] would have
+/// silently adopted for the queue. Urgency is [`Self::rank`], written out, and
+/// it is the only order this type has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionCategory {
     /// Work that prevents the system from accepting another action.
     Blocking,
-    /// Work required for a named goal.
-    RequiredForGoal,
+    /// Work required for the named goals, and for no others.
+    ///
+    /// The set is never empty. Before it existed this variant named no goal at
+    /// all, and a reader walking the queue could not tell an item that stops one
+    /// report from an item that stops every report there is — so the whole queue
+    /// read as a precondition on the entire import, which is not what any of it
+    /// does.
+    RequiredForGoal(ReportGoals),
     /// Work that improves quality but is not required.
     Recommended,
     /// A fact that requires no action.
     Informational,
+}
+
+impl ActionCategory {
+    /// The required-for-goal category of a kind, read from the one table.
+    ///
+    /// Every producer goes through this rather than writing a set beside the
+    /// kind it is building: two statements of «what this kind blocks» would
+    /// eventually disagree, and the queue is the place where a disagreement is
+    /// invisible.
+    #[must_use]
+    pub const fn required_for(kind: ActionKind) -> Self {
+        Self::RequiredForGoal(kind.goals())
+    }
+
+    /// Urgency, most urgent first. The queue's order, and nothing else.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Blocking => 0,
+            Self::RequiredForGoal(_) => 1,
+            Self::Recommended => 2,
+            Self::Informational => 3,
+        }
+    }
+
+    /// The goals this category names, which is none unless it is required work.
+    #[must_use]
+    pub const fn goals(self) -> ReportGoals {
+        match self {
+            Self::RequiredForGoal(goals) => goals,
+            Self::Blocking | Self::Recommended | Self::Informational => ReportGoals::NONE,
+        }
+    }
 }
 
 /// Whether an action can be invoked without asking the owner.
@@ -205,8 +448,33 @@ pub enum OperationKey {
     CreateCategoryRule,
     /// Record the owner's statement about one account's transfer partners.
     RecordAccountTransferPartners,
+    /// Rule an account outside the reporting perimeter, with a reason.
+    ///
+    /// The half of the scope decision that a contour cannot express: membership
+    /// is a contour's composition, and «this account is deliberately not in any
+    /// of them» is a fact about the account itself.
+    RecordAccountScope,
+    /// Open the import session a document's rows are held in before commit.
+    ///
+    /// The first of the two ways into an account that holds nothing, and the one
+    /// that takes a statement the owner fetched himself.
+    OpenImportSession,
+    /// Synchronise one broker channel over an interval.
+    ///
+    /// The second, and the only one that needs no document: the channel fetches
+    /// and records in a single call, which is why it is a remedy entire rather
+    /// than the first step of one.
+    SyncBroker,
     /// Answer one classification question held open by an import session.
     AnswerImportQuestion,
+    /// Retract or supersede events the owner names, one correction fact each.
+    ///
+    /// The only operation that acts on a reconciliation discrepancy, and it acts
+    /// on both of its sides: `ReconciliationLedger::build_with` resolves
+    /// corrections before it collects assertion groups, so retracting a
+    /// `ControlAssertion` removes the claim, and `observe` runs over the same
+    /// effective set, so superseding a journal event changes what was observed.
+    SubmitCorrections,
 }
 impl OperationKey {
     /// The route operation identifier declared by the transport.
@@ -219,19 +487,96 @@ impl OperationKey {
             Self::RecordOwnerBalance => "record_owner_balance",
             Self::CreateCategoryRule => "create_category_rule",
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
+            Self::RecordAccountScope => "record_account_scope",
+            Self::OpenImportSession => "open_import_session",
+            Self::SyncBroker => "sync_broker",
             Self::AnswerImportQuestion => "answer_import_question",
+            Self::SubmitCorrections => "submit_corrections",
         }
     }
 }
 
+/// One admissible way to close an action: an operation and the call that ends it.
+///
+/// Carries a [`RequestPlan`] of its own, which is the whole reason a set of
+/// resolutions cannot be a `Vec<OperationKey>`. Two ways out of the same state
+/// are two different calls with different fields — putting an account in a
+/// contour needs the composition, ruling it outside needs a reason — and a bare
+/// list of keys would publish the second operation while leaving the caller to
+/// discover, from the specification, that it asks for anything at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionOption {
+    pub operation: OperationKey,
+    pub request: RequestPlan,
+}
+
 /// The only target shapes an action may have.
+///
+/// [`Self::Options`] exists because `reason` and `target` were able to disagree.
+/// An action whose sentence named two ways to close it — add this account to a
+/// contour, or record that it is deliberately outside the perimeter — could
+/// publish only one, and an agent that reads `target` as the contract, which is
+/// what `target` is for, could act on that one and no other. The second route
+/// existed and was reachable only by reading prose and searching the
+/// specification for it.
+///
+/// A third variant rather than turning every target into a list: most actions
+/// genuinely have one way out or none, and saying «here is a set of one» about
+/// them would make every consumer index into a list to find the fact it already
+/// had.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionTarget {
     Operation {
         operation: OperationKey,
         request: RequestPlan,
     },
+    /// Two or more admissible resolutions, each with its own request plan.
+    ///
+    /// In the order the item wants them considered: the first is the ordinary
+    /// answer, the rest are the alternatives, and none of them is the only one.
+    Options(Vec<ResolutionOption>),
     None,
+}
+
+impl ActionTarget {
+    /// Build the target for a computed set of resolutions, in the given order.
+    ///
+    /// Normalising, so that «one way out» has a single encoding no matter which
+    /// side computed it: a set of one is a plain [`Self::Operation`] and not a
+    /// list holding one element. Without this a builder whose options collapse
+    /// at run time would publish a different transport shape for the same
+    /// situation depending on how it happened to be reached.
+    #[must_use]
+    pub fn from_options(mut options: Vec<ResolutionOption>) -> Self {
+        match options.len() {
+            0 => Self::None,
+            1 => {
+                let only = options.remove(0);
+                Self::Operation {
+                    operation: only.operation,
+                    request: only.request,
+                }
+            }
+            _ => Self::Options(options),
+        }
+    }
+
+    /// Every resolution this target publishes, in order.
+    ///
+    /// The reading side of the same normalisation: a consumer asking "what may I
+    /// call to close this?" gets one answer shape whichever variant carries it,
+    /// and an empty answer only where nothing in this API closes the item.
+    #[must_use]
+    pub fn resolutions(&self) -> Vec<(OperationKey, &RequestPlan)> {
+        match self {
+            Self::Operation { operation, request } => vec![(*operation, request)],
+            Self::Options(options) => options
+                .iter()
+                .map(|option| (option.operation, &option.request))
+                .collect(),
+            Self::None => Vec::new(),
+        }
+    }
 }
 
 /// One invalid combination of action availability and target.
@@ -241,6 +586,22 @@ pub enum ActionInvariantError {
     BlockedWithOperation,
     BlockedWithScope,
     NonBlockedWithoutScope,
+    /// A set of resolutions holding fewer than two of them.
+    ///
+    /// One way out is [`ActionTarget::Operation`] and none is
+    /// [`ActionTarget::None`]; a list of one would be a second encoding of a
+    /// state that already has one, and the two would publish different transport
+    /// shapes for the same fact. [`ActionTarget::from_options`] normalises, so
+    /// reaching this means the variant was built by hand.
+    OptionsWithoutChoice,
+    /// Work graded required for a goal, naming no goal.
+    ///
+    /// The defect this whole vocabulary exists to remove, refused at the point
+    /// an item is assembled. A required item that names nothing tells a client
+    /// only that something stands in its way, and a queue of those reads as a
+    /// precondition on everything — which is how the frontier was read, and it
+    /// was never what any of it did.
+    RequiredForNoGoal,
 }
 
 /// What an action is, apart from its prose and its target.
@@ -288,15 +649,24 @@ impl Action {
         }
         if matches!(
             (facts.state, &target),
-            (ActionState::Blocked, ActionTarget::Operation { .. })
+            (
+                ActionState::Blocked,
+                ActionTarget::Operation { .. } | ActionTarget::Options(_)
+            )
         ) {
             return Err(ActionInvariantError::BlockedWithOperation);
+        }
+        if matches!(&target, ActionTarget::Options(options) if options.len() < 2) {
+            return Err(ActionInvariantError::OptionsWithoutChoice);
         }
         if facts.state == ActionState::Blocked && facts.required_scope.is_some() {
             return Err(ActionInvariantError::BlockedWithScope);
         }
         if facts.state != ActionState::Blocked && facts.required_scope.is_none() {
             return Err(ActionInvariantError::NonBlockedWithoutScope);
+        }
+        if matches!(facts.category, ActionCategory::RequiredForGoal(goals) if goals.is_empty()) {
+            return Err(ActionInvariantError::RequiredForNoGoal);
         }
         Ok(Self {
             id: facts.id,
@@ -476,52 +846,19 @@ fn diagnostics(
         let category = ledger
             .statuses()
             .find(|status| status.account() == gap.account && status.period() == gap.period)
-            .map_or(ActionCategory::RequiredForGoal, |status| {
-                if gap.dimensions.iter().all(|dimension| {
-                    status.dimension(*dimension) == DimensionStatus::AcceptedIndependent
-                }) {
-                    ActionCategory::Informational
-                } else {
-                    ActionCategory::RequiredForGoal
-                }
-            });
-        let rows = if gap.rows.is_empty() {
-            "the legacy record cannot name the refused rows".to_owned()
-        } else {
-            let names = gap
-                .rows
-                .iter()
-                .map(|row| format!("{}:{}", row.key.source.inner(), row_name_text(&row.key.row)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("refused rows: {names}")
-        };
-        actions.push(blocked_action(
-            format!(
-                "{}:{}:{}:{}:{}",
-                ActionKind::CoverageGapUnrepaired.id(),
-                gap.account.inner(),
-                gap.period.from,
-                gap.period.to,
-                gap.source.inner()
-            ),
-            ActionKind::CoverageGapUnrepaired,
-            category,
-            Some(ActionSubject::Account(gap.account)),
-            format!(
-                "Account {} has a coverage gap from {} through {} in dimensions {}; {} ({} rows refused); no repair operation exists in this API.",
-                gap.account.inner(),
-                gap.period.from,
-                gap.period.to,
-                gap.dimensions
-                    .iter()
-                    .map(|dimension| dimension.code())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                rows,
-                gap.refused
-            ),
-        ));
+            .map_or(
+                ActionCategory::required_for(ActionKind::CoverageGapUnrepaired),
+                |status| {
+                    if gap.dimensions.iter().all(|dimension| {
+                        status.dimension(*dimension) == DimensionStatus::AcceptedIndependent
+                    }) {
+                        ActionCategory::Informational
+                    } else {
+                        ActionCategory::required_for(ActionKind::CoverageGapUnrepaired)
+                    }
+                },
+            );
+        actions.push(coverage_gap_action(gap, category));
     }
     for status in ledger
         .statuses()
@@ -529,25 +866,10 @@ fn diagnostics(
     {
         for dimension in Dimension::all() {
             if status.dimension(dimension) == DimensionStatus::AcceptedInternal {
-                actions.push(blocked_action(
-                    format!(
-                        "{}:{}:{}:{}:{}",
-                        ActionKind::IndependentConfirmationMissing.id(),
-                        status.account().inner(),
-                        status.period().from,
-                        status.period().to,
-                        dimension.code()
-                    ),
-                    ActionKind::IndependentConfirmationMissing,
-                    ActionCategory::RequiredForGoal,
-                    Some(ActionSubject::Account(status.account())),
-                    format!(
-                        "Account {} reached internal confirmation for {} from {} through {} but has no confirmation from a different parser and document; no acquisition operation exists in this API.",
-                        status.account().inner(),
-                        dimension.code(),
-                        status.period().from,
-                        status.period().to
-                    ),
+                actions.push(independent_confirmation_action(
+                    status.account(),
+                    status.period(),
+                    dimension,
                 ));
             }
         }
@@ -555,34 +877,282 @@ fn diagnostics(
             let ClaimOutcome::Discrepant(discrepancy) = check.outcome else {
                 continue;
             };
-            actions.push(blocked_action(
-                format!(
-                    "{}:{}:{}:{}:{}:{}",
-                    ActionKind::DiscrepancyUnresolved.id(),
-                    status.account().inner(),
-                    status.period().from,
-                    status.period().to,
-                    discrepancy.field,
-                    index
-                ),
-                ActionKind::DiscrepancyUnresolved,
-                ActionCategory::RequiredForGoal,
-                Some(ActionSubject::Account(status.account())),
-                format!(
-                    "Account {} has an unresolved {} discrepancy from {} through {}: claimed {}, observed {}, delta {}; the system cannot identify which side is wrong and no resolution operation exists in this API.",
-                    status.account().inner(),
-                    discrepancy.field,
-                    status.period().from,
-                    status.period().to,
-                    claim_value_text(discrepancy.claimed),
-                    claim_value_text(discrepancy.observed),
-                    claim_value_text(discrepancy.delta)
-                ),
+            actions.push(discrepancy_action(
+                status.account(),
+                status.period(),
+                discrepancy,
+                index,
             ));
         }
     }
     sort_actions(&mut actions);
     actions
+}
+
+/// A refused row stays refused, and this record stays as the account of it.
+///
+/// `Blocked` still, and the sentence now says why the two routes a reader
+/// reaches for first are not the remedy — which is the half a reader previously
+/// had to supply from nothing.
+///
+/// - `POST /v1/accounts/{account}/repairs/custody` retracts `EventKind::Trade`
+///   events whose quantity leg carries a custody identifier equal to the
+///   account's own; `sync::is_affected_trade` is the whole of its predicate. It
+///   never reads or writes an `ImportCoverageGap`, and retracting a trade cannot
+///   record a row that was never parsed.
+/// - `POST /v1/corrections/imports` selects the effective journal by provenance
+///   alone — `ImportTarget::covers` matches on the import identity or the source,
+///   with no filter on the kind — so it retracts this very coverage-gap event
+///   along with every row of that import which *did* arrive. The item would stop
+///   being published because the record of the refusal was withdrawn, which is
+///   the one outcome worse than the gap.
+///
+/// What changes this item is not an operation addressed to it. Importing the
+/// interval again through a channel that reads these rows leaves the record
+/// where it is — `EventKind::ImportCoverageGap` is a statement about one attempt
+/// — and the `category` computed by the caller drops it to `Informational` once
+/// the period reaches independent confirmation in the gap's own dimensions.
+fn coverage_gap_action(gap: &Taint, category: ActionCategory) -> Action {
+    let rows = if gap.rows.is_empty() {
+        "the legacy record cannot name the refused rows".to_owned()
+    } else {
+        let names = gap
+            .rows
+            .iter()
+            .map(|row| format!("{}:{}", row.key.source.inner(), row_name_text(&row.key.row)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("refused rows: {names}")
+    };
+    blocked_action(
+        format!(
+            "{}:{}:{}:{}:{}",
+            ActionKind::CoverageGapUnrepaired.id(),
+            gap.account.inner(),
+            gap.period.from,
+            gap.period.to,
+            gap.source.inner()
+        ),
+        ActionKind::CoverageGapUnrepaired,
+        category,
+        Some(ActionSubject::Account(gap.account)),
+        format!(
+            "Account {} has a coverage gap from {} through {} in dimensions {}; {} ({} rows \
+             refused). No operation in this API records a refused row, and neither obvious \
+             route is one: retracting the import withdraws the rows that did arrive and this \
+             record of the refusal with them, and the custody repair acts only on trades whose \
+             custody was fabricated from the account identifier. Import the interval again \
+             through a channel that reads these rows; this record stays, because it is a \
+             statement about one attempt and not about the interval.",
+            gap.account.inner(),
+            gap.period.from,
+            gap.period.to,
+            gap.dimensions
+                .iter()
+                .map(|dimension| dimension.code())
+                .collect::<Vec<_>>()
+                .join(", "),
+            rows,
+            gap.refused
+        ),
+    )
+}
+
+/// Confirmation of one dimension by a channel that is not the one already used.
+///
+/// Promoted for cash and positions and still blocked for the other two, and the
+/// split is read off the core rather than chosen. `ground_three` is the only
+/// ground that reaches `AcceptedIndependent` from a second channel over the same
+/// interval; it files its finding under `Ground::BrokerApiAgreesWithStatement`;
+/// and `Ground::dimensions` lets that ground promote `Cash` and `Positions`
+/// only. For tax basis and income the grounds that reach them — a depository
+/// report, a tax-agent certificate, a payout confirming a schedule — enter
+/// through `ReconciliationLedger::with_external_evidence`, which no handler
+/// calls, so for those two the old claim is true and is kept.
+///
+/// For cash and positions, `POST /v1/brokers/{broker}/sync` closes the item.
+/// `scenarios::sync` records a `ControlAssertion` per claim under the channel's
+/// own source and parser version, with a document hash derived from the
+/// assertion's identity rather than from a file, so it is independent of a
+/// statement channel by `SourceChannel::is_independent_of` — a different parser
+/// version **and** a different document, which is the whole conjunction. The
+/// account and the interval are this item's own and are preset; the broker code
+/// is not, because nothing in the ledger says which channel an account is held
+/// at.
+///
+/// A second **document** closes it too — `scenarios::documents` records control
+/// assertions under a source, a parser version and the file's hash — and it is
+/// deliberately not published as a second resolution. `POST /v1/documents` takes
+/// a binary workbook and declares no `application/json` request body, so
+/// `ActionCatalog::from_openapi` refuses it with `MissingRequestSchema` and
+/// registering it would fail the server's start rather than help a caller. It
+/// stays in the reason, beside the honest half `start_account_import_action`
+/// also keeps: fetching a document out of an institution is a step outside this
+/// API, and a step outside this API is not a missing route.
+///
+/// **Not** `POST /v1/reconciliation/balance`. An owner-stated balance is
+/// `Ground::OwnerStatedBalance`, capped at `AcceptedInternal` by design — the
+/// owner may have read the same figure in the same report that was parsed — so
+/// it cannot raise a dimension past the level this item reports.
+///
+/// `Scope::Agent` on the promoted half, for the reason
+/// `start_account_import_action` gives: `sync_broker` checks `may_submit`, which
+/// an agent token satisfies, and marking the item owner-only would tell an agent
+/// it may not send a request the server would accept.
+fn independent_confirmation_action(
+    account: AccountId,
+    period: AssertionPeriod,
+    dimension: Dimension,
+) -> Action {
+    let id = format!(
+        "{}:{}:{}:{}:{}",
+        ActionKind::IndependentConfirmationMissing.id(),
+        account.inner(),
+        period.from,
+        period.to,
+        dimension.code()
+    );
+    let observed = format!(
+        "Account {} reached internal confirmation for {} from {} through {} but has no \
+         confirmation from a different parser and document",
+        account.inner(),
+        dimension.code(),
+        period.from,
+        period.to
+    );
+    if !matches!(dimension, Dimension::Cash | Dimension::Positions) {
+        return blocked_action(
+            id,
+            ActionKind::IndependentConfirmationMissing,
+            ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
+            Some(ActionSubject::Account(account)),
+            format!(
+                "{observed}. No operation in this API confirms this dimension from a second \
+                 channel: a broker channel agreeing with a statement raises cash and positions \
+                 and nothing else, and the grounds that reach tax basis and income — a \
+                 depository report, a tax-agent certificate, a payout confirming a schedule — \
+                 are recorded as external evidence, which no route accepts."
+            ),
+        );
+    }
+    let mut preset = BTreeMap::new();
+    preset.insert("account".to_owned(), account.inner().to_string().into());
+    preset.insert("from".to_owned(), period.from.to_string().into());
+    preset.insert("to".to_owned(), period.to.to_string().into());
+    Action::new(
+        ActionFacts {
+            id,
+            kind: ActionKind::IndependentConfirmationMissing,
+            category: ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Agent),
+            subject: Some(ActionSubject::Account(account)),
+        },
+        format!(
+            "{observed}. Synchronise a broker channel over this same interval: its assertions \
+             carry the channel's own parser version and a document that is not the statement's, \
+             which is what independence means here. A second statement from another institution \
+             confirms it as well, and no operation here fetches one — the owner obtains the \
+             document himself, and uploading it is not a call the queue can name. Restating the \
+             balance yourself does not confirm it: an owner-stated figure is capped at internal \
+             confirmation on purpose.",
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::SyncBroker,
+            request: RequestPlan {
+                preset,
+                // A path segment, published as a missing field exactly as
+                // `start_account_import_action` publishes it: which broker holds
+                // this account is the owner's to name, and the ledger does not
+                // record it.
+                missing: vec![MissingInput::plain("/broker", ProvidedBy::Owner)],
+            },
+        },
+    )
+    .expect("an independent confirmation item names the channel that supplies it")
+}
+
+/// Which side is wrong is the owner's to say, and one operation says it.
+///
+/// The old sentence stopped after its true half. The system genuinely cannot
+/// tell a claim that is wrong from a journal that is; it does not follow that
+/// nothing in this API acts on the item, and `POST /v1/corrections` acts on it
+/// from either side:
+///
+/// - the claim side — `ReconciliationLedger::build_with` resolves corrections
+///   before it collects groups, so a retracted `ControlAssertion` forms no group
+///   and the check reported here goes with it;
+/// - the journal side — `observe` runs over that same effective set, so an event
+///   superseded or retracted changes what was observed and `check_claim` is
+///   asked again.
+///
+/// **Not** `POST /v1/reconciliation/balance`. Recording another balance appends
+/// a group: `merge_status` extends `outcomes` and keeps `Discrepant` from either
+/// side on purpose, because confirmation from a second document must not
+/// override a problem already detected. The discrepant check this item reads
+/// would sit in the status exactly where it was, and the item would be published
+/// again after the call.
+///
+/// Nothing is preset. A `Discrepancy` carries a field name and three figures and
+/// no event identifier, so the target of a correction cannot be proposed from it
+/// — the reasoning `undecomposed_outflows_action` states about a matcher, for
+/// the same reason: the diagnostic deliberately does not retain what it would
+/// take to fill the field.
+///
+/// `Scope::Owner`: `submit_corrections` is behind `require_admin`, and it is
+/// there so that an agent token cannot retract the owner's history.
+fn discrepancy_action(
+    account: AccountId,
+    period: AssertionPeriod,
+    discrepancy: Discrepancy,
+    index: usize,
+) -> Action {
+    Action::new(
+        ActionFacts {
+            id: format!(
+                "{}:{}:{}:{}:{}:{}",
+                ActionKind::DiscrepancyUnresolved.id(),
+                account.inner(),
+                period.from,
+                period.to,
+                discrepancy.field,
+                index
+            ),
+            kind: ActionKind::DiscrepancyUnresolved,
+            category: ActionCategory::required_for(ActionKind::DiscrepancyUnresolved),
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Owner),
+            subject: Some(ActionSubject::Account(account)),
+        },
+        format!(
+            "Account {} has an unresolved {} discrepancy from {} through {}: claimed {}, \
+             observed {}, delta {}. The system cannot identify which side is wrong; you can, \
+             and one operation settles either — retract the control assertion that claimed \
+             wrongly, or supersede the journal event that recorded wrongly. Recording another \
+             balance does not settle it: a detected discrepancy is kept through every later \
+             confirmation, by design.",
+            account.inner(),
+            discrepancy.field,
+            period.from,
+            period.to,
+            claim_value_text(discrepancy.claimed),
+            claim_value_text(discrepancy.observed),
+            claim_value_text(discrepancy.delta)
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::SubmitCorrections,
+            request: RequestPlan {
+                // Nothing: this item names an account, an interval and three
+                // figures, and the request names events.
+                preset: BTreeMap::new(),
+                missing: vec![
+                    MissingInput::plain("/corrections", ProvidedBy::Owner),
+                    MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+                ],
+            },
+        },
+    )
+    .expect("a discrepancy item names the correction operation that settles it")
 }
 
 /// Find undecomposed outflows and unexplained account residuals in a flow report.
@@ -609,26 +1179,54 @@ pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
         .residuals_by_account()
         .expect("money flow residual breakdown")
     {
-        actions.push(blocked_action(
-            format!(
-                "{}:{}:{}",
-                ActionKind::UnexplainedResidual.id(),
-                account.inner(),
-                amount.currency().code()
-            ),
-            ActionKind::UnexplainedResidual,
-            ActionCategory::Informational,
-            Some(ActionSubject::Account(account)),
-            format!(
-                "Account {} has an unexplained residual of {} {}; the report quantities do not explain its cash change and no report operation can resolve it.",
-                account.inner(),
-                amount.to_calc_dec().inner(),
-                amount.currency().code()
-            ),
-        ));
+        actions.push(unexplained_residual_action(account, amount));
     }
     sort_actions(&mut actions);
     actions
+}
+
+/// The cash an account's own quantities do not account for.
+///
+/// `Blocked` stands; the sentence that earned it did not. It said no **report**
+/// operation can resolve the residual, which is verbatim the phrasing
+/// `undecomposed_outflows_action` records as having been wrong for the same
+/// reason a few lines below: the action catalogue resolves a target against the
+/// whole completed contract, not a report-local namespace, so «no report
+/// operation» grades nothing at all. Left there it read as the sentence that had
+/// already bought `Blocked` wrongly once.
+///
+/// The true reason is narrower, and it is now the one published. A residual is
+/// `MoneyFlow::residual_of` — an account's cash delta less the seven quantities
+/// that explain it — aggregated over one account and one currency. It names no
+/// event. Every operation that could move it is addressed to an event the caller
+/// names: `POST /v1/corrections` supersedes or retracts one, and this figure
+/// identifies none, so publishing that route here would name a request whose
+/// only required field this item cannot fill.
+///
+/// `Informational` is unchanged and is right: nothing is hidden. The figure is
+/// published as its own line rather than folded into a bucket, which is what
+/// makes it a fact worth stating rather than work waiting to be done.
+fn unexplained_residual_action(account: AccountId, amount: Money) -> Action {
+    blocked_action(
+        format!(
+            "{}:{}:{}",
+            ActionKind::UnexplainedResidual.id(),
+            account.inner(),
+            amount.currency().code()
+        ),
+        ActionKind::UnexplainedResidual,
+        ActionCategory::Informational,
+        Some(ActionSubject::Account(account)),
+        format!(
+            "Account {} has an unexplained residual of {} {}: the seven report quantities do \
+             not add up to its cash change. This is an aggregate over one account and one \
+             currency and it names no event, so no operation in this API is addressed to it — \
+             a correction acts on an event the caller names, and this figure names none.",
+            account.inner(),
+            amount.to_calc_dec().inner(),
+            amount.currency().code()
+        ),
+    )
 }
 
 /// The owner's remedy for outflow rows no category rule matched.
@@ -777,7 +1375,7 @@ pub fn verdict_diagnostics(verdict: &Verdict) -> Option<Action> {
             level.number()
         ),
         ActionKind::PossibleDuplicateUndecided,
-        ActionCategory::RequiredForGoal,
+        ActionCategory::required_for(ActionKind::PossibleDuplicateUndecided),
         Some(ActionSubject::Event(*event)),
         format!(
             "Event {} may duplicate event {} at deduplication level {}; the owner must decide and no decision operation exists in this API.",
@@ -824,8 +1422,11 @@ fn blocked_action(
 
 fn sort_actions(actions: &mut [Action]) {
     actions.sort_by(|left, right| {
+        // By urgency, never by the category value: two required items differ
+        // only in which goals they name, and that is not an order.
         left.category()
-            .cmp(&right.category())
+            .rank()
+            .cmp(&right.category().rank())
             .then_with(|| left.id().cmp(right.id()))
     });
 }
@@ -1063,7 +1664,7 @@ fn answer_classification_question_action(
                 question.view.id.inner()
             ),
             kind: ActionKind::AnswerClassificationQuestion,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::AnswerClassificationQuestion),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Agent),
             subject: Some(ActionSubject::Account(account)),
@@ -1162,13 +1763,11 @@ fn actions_from_views(
             actions.push(account_scope_action(account, accounts, contours));
         }
     }
-    if transfer_relationships_eligibility(accounts) {
-        for account in accounts
-            .iter()
-            .filter(|account| transfer_relationships_gap(account.id, transfers))
-        {
-            actions.push(transfer_relationships_action(account, accounts));
-        }
+    for account in accounts.iter().filter(|account| {
+        transfer_relationships_eligibility(account.id, accounts, contours, exclusions)
+            && transfer_relationships_gap(account.id, transfers)
+    }) {
+        actions.push(transfer_relationships_action(account, accounts));
     }
     actions
 }
@@ -1261,13 +1860,38 @@ fn account_scope_completion(
     account_scope(account, contours, exclusions) != AccountScope::Undecided
 }
 
-/// The question exists once the owner has a second account to move money to.
+/// The question exists once the owner has a second account to move money to,
+/// and only for an account he has not ruled outside the perimeter.
 ///
 /// With one account there is no «other side»: an internal transfer needs two,
 /// and asking about a relationship that cannot exist is the kind of item a
 /// queue is learned to ignore for.
-fn transfer_relationships_eligibility(accounts: &[AccountView]) -> bool {
-    accounts.len() > 1
+///
+/// The scope condition is the same argument made twice over. A transfer has two
+/// ends and at least one of them is inside the perimeter — a pair of accounts
+/// both outside it appears in no contour's report, so relating them changes no
+/// reported number — and the inside end is asked which of the owner's accounts
+/// money moves between it and, with every other account offered as a candidate,
+/// the outside one included. Asking the outside account the same thing a second
+/// time therefore discovers nothing the first question could not, and it costs
+/// the owner a `RequiredForGoal` item about an account he has already ruled out
+/// of every report, with a reason. Two institutions imported at once produced
+/// one such question per account and no way to tell which were obligatory.
+///
+/// [`AccountScope::Undecided`] is *not* suppressed. The owner has not ruled on
+/// those accounts, and silencing a question because an earlier question is
+/// unanswered is a queue that goes quiet exactly when it should not.
+///
+/// Nothing is lost for good either way: the scope is read from the contours and
+/// the exclusions on every call rather than recorded beside the statement, so
+/// bringing an account back inside a contour reopens the question.
+fn transfer_relationships_eligibility(
+    account: AccountId,
+    accounts: &[AccountView],
+    contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
+) -> bool {
+    accounts.len() > 1 && account_scope(account, contours, exclusions) != AccountScope::Outside
 }
 
 fn transfer_relationships_gap(
@@ -1326,7 +1950,7 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
                 account.id.inner()
             ),
             kind: ActionKind::ResolveTransferRelationships,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::ResolveTransferRelationships),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(account.id)),
@@ -1374,40 +1998,129 @@ fn activity_period(activity: &AccountActivityView) -> Option<AssertionPeriod> {
     )
 }
 
-/// The owner has to fetch a statement, and no operation in this API does it.
+/// Both ways into an account that holds nothing, and the one step that is not
+/// a route.
 ///
-/// `Blocked`, not `NeedsOwnerInput`. Both readings were true of this item — the
-/// owner must act, and there is nothing to call — but the two states do not mean
-/// the same thing to the agent reading the queue. `NeedsOwnerInput` everywhere
-/// else accompanies a real operation with a list of fields the policy cannot
-/// fill: collect these, then call this. Here there is no `this`. `Blocked`'s own
-/// documentation is exactly the second reading — "no operation in this API is
-/// available for this item" — and the queue's states are the only map an agent
-/// has of what it may call.
+/// `NeedsOwnerInput`, not `Blocked`, and `undecomposed_outflows_action` is the
+/// precedent — the same substitution, made for the same reason. There, `Blocked`
+/// had been earned by the sentence «no *report* operation can provide a rule»,
+/// which was true and irrelevant: the state means «no operation in this API is
+/// available for this item», the rule route was in this same API, and the
+/// action catalogue resolves a target against the whole completed contract and
+/// not a caller-local namespace. Here the narrower true sentence was «no
+/// operation in this API fetches the document», and it bought the same wrong
+/// state. Two operations begin an import: `POST /v1/import-sessions` opens the
+/// session a statement's rows are fed into, and `POST /v1/brokers/{broker}/sync`
+/// is the second remedy entire.
 ///
-/// The invariant then removes `required_scope` as well, and that is right rather
-/// than a loss: a scope answers "who may call it", a question that does not
-/// arise when nothing can be called.
+/// The cost was not theoretical. An agent walking the queue reads `state` as its
+/// map of what it may call; told that nothing here helps with the single most
+/// important next step, it stopped. A reviewer who reached the session routes by
+/// reading the OpenAPI document instead ran a whole import that the queue had
+/// disowned.
+///
+/// The sentence about the document stays in the reason, because it is the honest
+/// half and it is the half the state was never making: getting the statement out
+/// of the bank is a step outside this API, and a step outside this API is not a
+/// missing route. So the reason now says both — what the owner must do himself,
+/// and what to call once he has done it.
+///
+/// Two options rather than one, ordered and not ranked, which is what
+/// `account_scope_action` established `Options` for: a statement is the ordinary
+/// answer and a broker channel is the answer for the accounts that have one, and
+/// publishing either alone would leave the other reachable only by reading the
+/// specification.
+///
+/// `Scope::Agent`, for the reason `answer_classification_question_action` gives:
+/// both routes check `may_submit`, which an agent token satisfies, and an item
+/// marked `owner` would tell an agent it may not send a request the server would
+/// accept.
 fn start_account_import_action(account: AccountId) -> Action {
-    blocked_action(
-        // Scoped to the account: this action is emitted once per account with no
-        // facts, and an unscoped id would give every one of them the same
-        // identity — which is what an agent deduplicates by.
-        format!(
-            "{}:{}",
-            ActionKind::StartAccountImport.id(),
-            account.inner()
-        ),
-        ActionKind::StartAccountImport,
-        ActionCategory::RequiredForGoal,
-        Some(ActionSubject::Account(account)),
+    // The session's `source` is what names the account these rows belong to, and
+    // it is the whole of what the policy knows here: the account is the subject
+    // of this item. Preset as the object the pointers below write into, so a
+    // caller merges rather than reassembles.
+    let mut session_preset = BTreeMap::new();
+    session_preset.insert(
+        "source".to_owned(),
+        serde_json::json!({ "account": account.inner().to_string() }),
+    );
+
+    let session = ResolutionOption {
+        operation: OperationKey::OpenImportSession,
+        request: RequestPlan {
+            preset: session_preset,
+            missing: vec![
+                // How the rows arrived — `file`, `paste`, `manual` — is a fact
+                // about the transmission and not about the owner's money, so it
+                // is the caller's to state. No alternatives: the route takes any
+                // short name, and publishing three would claim a closed set the
+                // server does not enforce.
+                MissingInput::plain("/source/channel", ProvidedBy::Caller),
+                // The label is what makes this import retractable on its own,
+                // and it is a statement period or an export file name — it is
+                // read off the document the owner fetched, which is why this is
+                // the first field marked `ExternalDocument`. Optional in the
+                // schema and published as missing anyway, on the same ground as
+                // `/cash` in the control assertion: `missing` states what the
+                // plan needs supplied, and a plan that quietly omitted it would
+                // produce unlabelled rows retractable only together with every
+                // other unlabelled row of the same account and channel.
+                MissingInput::plain("/source/label", ProvidedBy::ExternalDocument),
+            ],
+        },
+    };
+
+    // The broker sync knows the account and nothing else. `broker` is a path
+    // segment and is not preset: which channel this account is held at is the
+    // owner's to name, and the queue cannot read it off an account that has no
+    // facts. The interval is his too — with no business fact there is no first
+    // or last effective date to propose one from, and a window invented here
+    // would decide how much of his history gets imported.
+    let mut sync_preset = BTreeMap::new();
+    sync_preset.insert("account".to_owned(), account.inner().to_string().into());
+    let sync = ResolutionOption {
+        operation: OperationKey::SyncBroker,
+        request: RequestPlan {
+            preset: sync_preset,
+            missing: vec![
+                MissingInput::plain("/broker", ProvidedBy::Owner),
+                MissingInput::plain("/from", ProvidedBy::Owner),
+                MissingInput::plain("/to", ProvidedBy::Owner),
+            ],
+        },
+    };
+
+    Action::new(
+        ActionFacts {
+            // Scoped to the account: this action is emitted once per account with
+            // no facts, and an unscoped id would give every one of them the same
+            // identity — which is what an agent deduplicates by.
+            id: format!(
+                "{}:{}",
+                ActionKind::StartAccountImport.id(),
+                account.inner()
+            ),
+            kind: ActionKind::StartAccountImport,
+            category: ActionCategory::required_for(ActionKind::StartAccountImport),
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Agent),
+            subject: Some(ActionSubject::Account(account)),
+        },
         format!(
             "Account {} has no business facts; import a statement or connect a broker. \
-             Import is continuous and never complete. No operation in this API fetches \
-             the document.",
+             Fetching the statement out of the bank is a step outside this API — no \
+             operation here downloads the document, and the owner obtains it himself. \
+             Recording it is not: open an import session for this account, feed it the \
+             rows, read the assessment the session publishes to see what committing would \
+             record and what it would not, and commit under the revision that assessment \
+             carries; or synchronise a broker channel over an interval. Import is \
+             continuous and never complete.",
             account.inner()
         ),
+        ActionTarget::from_options(vec![session, sync]),
     )
+    .expect("account import action publishes both of its resolutions")
 }
 
 /// The request for one control assertion, at the point it is wanted for.
@@ -1446,7 +2159,7 @@ fn provide_control_assertion_action(
                 dimension.code()
             ),
             kind: ActionKind::ProvideControlAssertion,
-            // Required for the goal, at either point, not `Recommended`.
+            // Required for a goal, at either point, not `Recommended`.
             //
             // Without the opening assertion the cash figure is a movement over
             // the imported interval and not a balance at all, so the assertion
@@ -1459,7 +2172,12 @@ fn provide_control_assertion_action(
             // point is recommended-only, and the queue stops telling the owner
             // that the one thing which would make his numbers trustworthy is
             // his to skip.
-            category: ActionCategory::RequiredForGoal,
+            //
+            // Which goals, at either point, is `ActionKind::goals`: the snapshot
+            // and the reconciliation. Both requests are the same operation with
+            // the same fields, so a per-point set would be a second table saying
+            // the same thing.
+            category: ActionCategory::required_for(ActionKind::ProvideControlAssertion),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(account)),
@@ -1532,12 +2250,23 @@ fn first_account_action() -> Action {
 /// `first_contour_action` out of the agent's hands — and a fully formed request
 /// does not change who may send it.
 ///
-/// The target offers the membership half of the answer. The other half — «this
-/// account is outside the perimeter, deliberately» — is a different operation
-/// and an action carries one target; the sentence names it so the agent is not
-/// left believing membership is the only way out of this state.
+/// The target publishes both halves of the answer, because there are two and
+/// the sentence says so. Membership is one — put the account in a contour — and
+/// «this account is outside the perimeter, deliberately, and here is why» is the
+/// other, which is a different route with a different body. While the item could
+/// carry a single target it published membership alone, and the second way out
+/// was reachable only by a caller who read the prose and then went looking
+/// through the specification for a route no queue item mentioned. An agent that
+/// treats `target` as the contract, which is what `target` is for, could put the
+/// account inside a contour and do nothing else — including for an account that
+/// belongs in no contour at all.
 ///
-/// The operation is [`OperationKey::AddContourVersion`], not
+/// The two options are ordered, and membership comes first: an account the owner
+/// is being asked about is usually one he means to report on, and the exclusion
+/// is the answer for the ones he does not. Ordered, not ranked — neither is a
+/// default, and the item stays `NeedsOwnerInput` for both.
+///
+/// The membership operation is [`OperationKey::AddContourVersion`], not
 /// [`OperationKey::CreateContour`]. This item exists because an account is in no
 /// contour while contours exist, so the act it wants is «put it in one of
 /// those» — and while the only operation the queue could name was the one that
@@ -1554,7 +2283,7 @@ fn account_scope_action(
     // account. With several, choosing for the owner would be choosing where his
     // money is reported from, so the choice is his and the composition cannot be
     // proposed without it.
-    let (preset, missing) = match contours {
+    let (membership_preset, membership_missing) = match contours {
         [only] => {
             let mut members: Vec<AccountId> = only.accounts.clone();
             if !members.contains(&account.id) {
@@ -1599,6 +2328,25 @@ fn account_scope_action(
         ),
     };
 
+    // The other way out, and everything about it is known except the judgement.
+    // The account is a path segment of the route and is preset; the disposition
+    // is what this option *is*, so it is preset too — an option that left the
+    // caller to guess `outside` would publish a route and not a resolution. The
+    // reason is the owner's and is the only field asked for: an account ruled
+    // out without one is indistinguishable, a year later, from an overlooked
+    // one, which is why the route refuses it and why it is published as missing
+    // rather than quietly omitted.
+    let mut exclusion_preset = BTreeMap::new();
+    exclusion_preset.insert("id".to_owned(), account.id.inner().to_string().into());
+    exclusion_preset.insert("disposition".to_owned(), "outside".into());
+    let exclusion = ResolutionOption {
+        operation: OperationKey::RecordAccountScope,
+        request: RequestPlan {
+            preset: exclusion_preset,
+            missing: vec![MissingInput::plain("/reason", ProvidedBy::Owner)],
+        },
+    };
+
     Action::new(
         ActionFacts {
             id: format!(
@@ -1607,7 +2355,7 @@ fn account_scope_action(
                 account.id.inner()
             ),
             kind: ActionKind::AccountScopeUndecided,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::AccountScopeUndecided),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(account.id)),
@@ -1620,12 +2368,18 @@ fn account_scope_action(
             account.id.inner(),
             account.title
         ),
-        ActionTarget::Operation {
-            operation: OperationKey::AddContourVersion,
-            request: RequestPlan { preset, missing },
-        },
+        ActionTarget::from_options(vec![
+            ResolutionOption {
+                operation: OperationKey::AddContourVersion,
+                request: RequestPlan {
+                    preset: membership_preset,
+                    missing: membership_missing,
+                },
+            },
+            exclusion,
+        ]),
     )
-    .expect("account scope action has an operation target")
+    .expect("account scope action publishes both of its resolutions")
 }
 
 /// Every account the owner has, as contour-membership candidates.
@@ -1649,7 +2403,7 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
         ActionFacts {
             id: identity(ActionKind::CreateFirstContour),
             kind: ActionKind::CreateFirstContour,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::CreateFirstContour),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
             // Existential: no contour exists, so the item names no one account.
@@ -1705,6 +2459,186 @@ mod tests {
 
     fn store() -> SqliteAdapter {
         SqliteAdapter::new(SqliteStore::open_in_memory().expect("in-memory store"))
+    }
+
+    /// Every kind is in [`ActionKind::ALL`] exactly once.
+    ///
+    /// The walk below is only as complete as this array, so the array is checked
+    /// first and separately: `id()` is exhaustive, so two kinds sharing an
+    /// identity or a kind repeated here is caught, and the count is stated so
+    /// that a kind added to the enum and to `goals` but forgotten here does not
+    /// quietly shrink the walk.
+    #[test]
+    fn every_kind_is_listed_once_in_all() {
+        let ids: BTreeSet<&str> = ActionKind::ALL.iter().map(|kind| kind.id()).collect();
+        assert_eq!(
+            ids.len(),
+            ActionKind::ALL.len(),
+            "two kinds share an identity, or one is listed twice: {:?}",
+            ActionKind::ALL.map(ActionKind::id)
+        );
+        assert_eq!(ActionKind::ALL.len(), 14, "a kind was added without a goal");
+    }
+
+    /// Every kind graded `RequiredForGoal` names at least one goal, and every
+    /// goal it names is one of the four.
+    ///
+    /// The expected sets are restated here rather than read back from
+    /// [`ActionKind::goals`]: a test that asked the table what the table says
+    /// would pass for any table, including the one that names nothing. This is
+    /// the mapping, written a second time, from what the reports actually read.
+    ///
+    /// The `match` is exhaustive on purpose, and that is what keeps this from
+    /// going stale. A fifteenth kind does not slip through — it stops the test
+    /// from compiling, so whoever adds it answers, here, which reports their new
+    /// item stands in the way of, before the queue can publish an item that
+    /// names none.
+    ///
+    /// Each kind is also run through [`Action::new`], so the invariant is
+    /// asserted on an item and not only on a table: a required category that
+    /// names nothing is refused at construction, and a kind the queue never
+    /// grades required is refused if someone grades it.
+    #[test]
+    fn every_required_action_names_at_least_one_of_the_four_goals() {
+        use ReportGoal::{AssetSnapshot, MoneyFlow, Reconciliation, Returns};
+
+        for kind in ActionKind::ALL {
+            let expected: &[ReportGoal] = match kind {
+                // Blocking: it stops the next call, not a report.
+                ActionKind::CreateFirstAccount => &[],
+                // An account in no contour is outside `report_population`'s
+                // covered set. Not reconciliation: `reconciliation::report`
+                // takes an account and resolves no contour.
+                ActionKind::CreateFirstContour | ActionKind::AccountScopeUndecided => {
+                    &[AssetSnapshot, MoneyFlow, Returns]
+                }
+                // An unpaired leg is counted as money crossing the perimeter by
+                // `MoneyFlow::apply` and by `FlowLog`. Not the snapshot: the leg
+                // lands on its own account's cash either way. Not
+                // reconciliation: pairing keeps both legs, so observed cash and
+                // turnover per account do not move.
+                ActionKind::ResolveTransferRelationships => &[MoneyFlow, Returns],
+                // A row in no journal is in no report; an account with no facts
+                // has nothing for any of the four to say; and a possible
+                // duplicate **is** recorded, so it may be the same money twice.
+                ActionKind::StartAccountImport
+                | ActionKind::AnswerClassificationQuestion
+                | ActionKind::PossibleDuplicateUndecided => {
+                    &[AssetSnapshot, MoneyFlow, Returns, Reconciliation]
+                }
+                // The closing assertion is reconciliation's claim side; the
+                // opening one is what makes the snapshot's cash a balance, which
+                // `account_balances` publishes as `CashOpening`. It has no legs,
+                // so it moves no number in flow or returns.
+                ActionKind::ProvideControlAssertion => &[AssetSnapshot, Reconciliation],
+                // All three are about whether a period is confirmed.
+                ActionKind::CoverageGapUnrepaired
+                | ActionKind::IndependentConfirmationMissing
+                | ActionKind::DiscrepancyUnresolved => &[Reconciliation],
+                // Recommended and informational: never required work.
+                ActionKind::UndecomposedOutflows
+                | ActionKind::ExternalTransfersUncategorised
+                | ActionKind::UnexplainedResidual => &[],
+            };
+
+            let goals: Vec<ReportGoal> = kind.goals().iter().collect();
+            assert_eq!(
+                goals,
+                expected.to_vec(),
+                "the goals of {} are not what the reports read",
+                kind.id()
+            );
+            assert!(
+                goals.iter().all(|goal| ReportGoal::ALL.contains(goal)),
+                "{} names a goal outside the four",
+                kind.id()
+            );
+
+            let built = Action::new(
+                ActionFacts {
+                    id: kind.id().to_owned(),
+                    kind,
+                    category: ActionCategory::required_for(kind),
+                    state: ActionState::NeedsOwnerInput,
+                    required_scope: Some(Scope::Owner),
+                    subject: None,
+                },
+                "a reason",
+                ActionTarget::Operation {
+                    operation: OperationKey::CreateAccount,
+                    request: RequestPlan {
+                        preset: BTreeMap::new(),
+                        missing: Vec::new(),
+                    },
+                },
+            );
+
+            if expected.is_empty() {
+                assert_eq!(
+                    built.err(),
+                    Some(ActionInvariantError::RequiredForNoGoal),
+                    "{} is never required for a goal, so grading it required must be refused",
+                    kind.id()
+                );
+            } else {
+                let action =
+                    built.unwrap_or_else(|error| panic!("{} was refused: {error:?}", kind.id()));
+                assert!(
+                    !action.category().goals().is_empty(),
+                    "{} is required for a goal and names none",
+                    kind.id()
+                );
+                assert_eq!(
+                    action.category().goals().iter().collect::<Vec<_>>(),
+                    expected.to_vec(),
+                    "{} publishes goals other than the ones it carries",
+                    kind.id()
+                );
+            }
+        }
+    }
+
+    /// The four names, spelled once, because two spellings is the whole defect.
+    #[test]
+    fn the_goal_vocabulary_is_the_four_agreed_names() {
+        assert_eq!(
+            ReportGoal::ALL.map(ReportGoal::code),
+            ["asset_snapshot", "money_flow", "returns", "reconciliation"]
+        );
+        assert_eq!(ReportGoals::ALL.iter().count(), ReportGoal::ALL.len());
+        assert!(ReportGoals::NONE.is_empty());
+    }
+
+    /// Asking for the snapshot returns a shorter list than asking for the queue.
+    ///
+    /// The point of the whole change, asserted rather than described: a
+    /// reconciliation-only item is not something that stands between the owner
+    /// and a statement of what he holds, and before this it was indistinguishable
+    /// from one that is.
+    #[test]
+    fn the_snapshot_is_blocked_by_fewer_items_than_everything() {
+        let required: Vec<ActionKind> = ActionKind::ALL
+            .into_iter()
+            .filter(|kind| !kind.goals().is_empty())
+            .collect();
+        let for_snapshot: Vec<ActionKind> = required
+            .iter()
+            .copied()
+            .filter(|kind| kind.goals().contains(ReportGoal::AssetSnapshot))
+            .collect();
+
+        assert!(
+            for_snapshot.len() < required.len(),
+            "every required item still blocks the snapshot: {for_snapshot:?}"
+        );
+        assert!(
+            !for_snapshot.contains(&ActionKind::ResolveTransferRelationships),
+            "a leg folds into its own account's balance whether or not its partner is known"
+        );
+        assert!(
+            !for_snapshot.contains(&ActionKind::CoverageGapUnrepaired),
+            "a coverage gap is a statement about one import attempt's confirmation"
+        );
     }
 
     fn with_id(id: AccountId) -> AccountView {
@@ -1798,7 +2732,10 @@ mod tests {
             .iter()
             .find(|action| action.kind() == ActionKind::CreateFirstContour)
             .expect("first contour action");
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::CreateFirstContour)
+        );
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
         let ActionTarget::Operation { operation, request } = action.target() else {
             panic!("first contour needs an operation target");
@@ -1895,13 +2832,11 @@ mod tests {
 
         let actions = frontier(owner, &store).await.expect("frontier");
         assert!(
-            actions.iter().any(|action| matches!(
-                action.target(),
-                ActionTarget::Operation {
-                    operation: OperationKey::AddContourVersion,
-                    ..
-                }
-            )),
+            actions.iter().any(|action| action
+                .target()
+                .resolutions()
+                .iter()
+                .any(|(operation, _)| *operation == OperationKey::AddContourVersion)),
             "nothing in the queue offers contour membership for the account that has none: {actions:?}"
         );
 
@@ -1918,16 +2853,20 @@ mod tests {
         // The subject is a typed field, not a substring of the sentence: a
         // caller narrowing the queue to one account must not have to parse prose.
         assert_eq!(action.subject(), Some(ActionSubject::Account(orphan.id)));
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::AccountScopeUndecided)
+        );
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
         assert_eq!(action.required_scope(), Some(Scope::Owner));
-        let ActionTarget::Operation { operation, request } = action.target() else {
-            panic!("the account scope action must name an operation");
-        };
         // The act is «add it to one of the contours that exist», not «create a
         // contour»: naming the creating operation here is what let an agent
         // answer this item with a second perimeter.
-        assert_eq!(*operation, OperationKey::AddContourVersion);
+        let published = action.target().resolutions();
+        let (_, request) = published
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::AddContourVersion)
+            .expect("the account scope action offers contour membership");
         // Two contours exist, so which one the account belongs in is the owner's
         // choice and the composition cannot be written out without it.
         assert!(
@@ -1992,10 +2931,11 @@ mod tests {
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
             .expect("the orphaned account is named");
-        let ActionTarget::Operation { operation, request } = action.target() else {
-            panic!("the account scope action must name an operation");
-        };
-        assert_eq!(*operation, OperationKey::AddContourVersion);
+        let published = action.target().resolutions();
+        let (_, request) = published
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::AddContourVersion)
+            .expect("the account scope action offers contour membership");
         assert_eq!(
             request.preset.get("contour"),
             Some(&serde_json::Value::from(contour.0.to_string()))
@@ -2015,6 +2955,95 @@ mod tests {
             request.missing.is_empty(),
             "the owner is asked for a judgement, not for a title he already gave: {:?}",
             request.missing
+        );
+    }
+
+    /// The reason names two ways out, so the contract must publish two.
+    ///
+    /// The invariant this pins is that the sentence and the target cannot drift:
+    /// an agent reads `target` as the contract — that is what `target` is for —
+    /// and while the item offered contour membership alone, the only way it
+    /// could act on «or record that it is outside the perimeter» was to read the
+    /// prose and go hunting through the specification for a route no queue item
+    /// mentioned. Prose cannot be asserted mechanically; two published
+    /// operations, each with the request that closes the item its own way, can.
+    #[tokio::test]
+    async fn the_scope_item_publishes_both_ways_it_can_be_closed() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let member = named("Main");
+        let orphan = named("Savings");
+        for account in [&member, &orphan] {
+            store
+                .upsert_account(owner, account.clone())
+                .await
+                .expect("account");
+        }
+        let contour = ContourId::new_random();
+        store
+            .insert_contour_version(
+                owner,
+                ContourDefinition::new(contour, ContourVersion(1), [member.id]),
+                "Household".into(),
+                vec![member.id],
+            )
+            .await
+            .expect("contour");
+
+        let actions = frontier(owner, &store).await.expect("frontier");
+        let action = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
+            .expect("the orphaned account is named");
+
+        let published = action.target().resolutions();
+        assert_eq!(
+            published.len(),
+            2,
+            "the sentence names two ways to close this item and the contract publishes {}: {:?}",
+            published.len(),
+            action.target()
+        );
+
+        // Each option carries its own plan, and the two plans are not the same
+        // plan: what a contour version wants is a composition, and what an
+        // exclusion wants is a reason.
+        let (_, membership) = published
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::AddContourVersion)
+            .expect("contour membership is one way out");
+        assert_eq!(
+            membership.preset.get("contour"),
+            Some(&serde_json::Value::from(contour.0.to_string())),
+            "the membership option keeps its own written-out request"
+        );
+        assert!(
+            membership
+                .missing
+                .iter()
+                .all(|missing| missing.pointer != "/reason"),
+            "a reason is not a field of the membership call: {:?}",
+            membership.missing
+        );
+
+        let (_, exclusion) = published
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::RecordAccountScope)
+            .expect("ruling the account outside the perimeter is the other way out");
+        assert_eq!(
+            exclusion.preset.get("disposition"),
+            Some(&serde_json::Value::from("outside")),
+            "an option that left the disposition to be guessed publishes a route, not a resolution"
+        );
+        let reason = exclusion
+            .missing
+            .iter()
+            .find(|missing| missing.pointer == "/reason")
+            .expect("the reason is a required field of the exclusion option");
+        assert_eq!(
+            reason.provided_by,
+            ProvidedBy::Owner,
+            "why an account is outside the perimeter is the owner's to say"
         );
     }
 
@@ -2162,6 +3191,55 @@ mod tests {
         assert!(account_scope_eligibility(&contours));
     }
 
+    /// One way out has one encoding, whichever side computed the set.
+    ///
+    /// A list holding a single resolution would publish a transport shape that
+    /// `operation` already publishes, and the two would drift: a consumer would
+    /// have to read both to answer the same question.
+    #[test]
+    fn a_set_of_resolutions_holding_one_is_the_single_operation_shape() {
+        let only = ResolutionOption {
+            operation: OperationKey::CreateAccount,
+            request: RequestPlan {
+                preset: BTreeMap::new(),
+                missing: vec![MissingInput::plain("/title", ProvidedBy::Owner)],
+            },
+        };
+        assert!(matches!(
+            ActionTarget::from_options(vec![only.clone()]),
+            ActionTarget::Operation {
+                operation: OperationKey::CreateAccount,
+                ..
+            }
+        ));
+        assert_eq!(ActionTarget::from_options(Vec::new()), ActionTarget::None);
+        assert_eq!(
+            ActionTarget::from_options(vec![only.clone(), only.clone()])
+                .resolutions()
+                .len(),
+            2
+        );
+
+        // Built by hand, the invariant still holds: a choice of one is not a
+        // choice, and the constructor is the only thing that normalises.
+        assert_eq!(
+            Action::new(
+                ActionFacts {
+                    id: "made_up".to_owned(),
+                    kind: ActionKind::CreateFirstAccount,
+                    category: ActionCategory::Blocking,
+                    state: ActionState::NeedsOwnerInput,
+                    required_scope: Some(Scope::Owner),
+                    subject: None,
+                },
+                "invented for this test",
+                ActionTarget::Options(vec![only]),
+            )
+            .unwrap_err(),
+            ActionInvariantError::OptionsWithoutChoice
+        );
+    }
+
     /// An item with no operation is `blocked`, whatever else is true of it.
     #[test]
     fn an_item_the_agent_cannot_call_says_so_in_its_state() {
@@ -2184,7 +3262,7 @@ mod tests {
                     "{} has nothing to call and must say so",
                     action.id()
                 ),
-                ActionTarget::Operation { .. } => assert_ne!(
+                ActionTarget::Operation { .. } | ActionTarget::Options(_) => assert_ne!(
                     action.state(),
                     ActionState::Blocked,
                     "{} names an operation and cannot be blocked",
@@ -2192,11 +3270,16 @@ mod tests {
                 ),
             }
         }
+        // The witness this sweep keeps is the item that once got the state
+        // wrong. It is no longer blocked — two operations begin an import — so
+        // what it witnesses now is the other half of the same rule: an item that
+        // names operations must not say `blocked`.
         let import = actions
             .iter()
             .find(|action| action.kind() == ActionKind::StartAccountImport)
             .expect("account import action");
-        assert_eq!(import.state(), ActionState::Blocked);
+        assert_ne!(import.state(), ActionState::Blocked);
+        assert_eq!(import.target().resolutions().len(), 2);
         assert_eq!(import.subject(), Some(ActionSubject::Account(account.id)));
     }
 
@@ -2308,9 +3391,12 @@ mod tests {
     #[test]
     fn one_account_is_not_asked_what_it_transfers_with() {
         let only = account();
-        assert!(!transfer_relationships_eligibility(std::slice::from_ref(
-            &only
-        )));
+        assert!(!transfer_relationships_eligibility(
+            only.id,
+            std::slice::from_ref(&only),
+            &[],
+            &[]
+        ));
         assert!(
             actions_from_views(std::slice::from_ref(&only), &[], &[], &[])
                 .iter()
@@ -2385,6 +3471,96 @@ mod tests {
         );
     }
 
+    /// A transfer has two ends, and at least one of them is inside the
+    /// perimeter. The inside end's question already lets the owner name the
+    /// outside one, so asking the outside account the same thing a second time
+    /// gathers nothing and costs him a `RequiredForGoal` question about an
+    /// account he has already ruled out of every report, with a reason.
+    ///
+    /// Nothing is lost for good: the scope is read from the contours and the
+    /// exclusions on every call, never recorded beside the statement, so
+    /// bringing the account back inside a contour reopens the question.
+    #[test]
+    fn an_account_ruled_outside_the_perimeter_is_not_asked_about_transfers() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let shop = named("Shop One");
+        let accounts = [main.clone(), savings.clone(), shop.clone()];
+        let contours = [ContourView {
+            id: ContourId::new_random(),
+            version: ContourVersion(1),
+            title: "Household".into(),
+            accounts: vec![main.id],
+        }];
+        let exclusions = [AccountScopeExclusionView {
+            account: shop.id,
+            reason: "A counterparty's account, not the owner's money.".into(),
+        }];
+
+        let asked: Vec<_> = actions_from_views(&accounts, &contours, &exclusions, &[])
+            .into_iter()
+            .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+            .map(|action| action.subject())
+            .collect();
+
+        assert!(
+            !asked.contains(&Some(ActionSubject::Account(shop.id))),
+            "an account ruled outside every contour is not asked: {asked:?}"
+        );
+        // Inside and undecided both still raise it. The owner has ruled on one
+        // and not on the other, and suppressing a question because an earlier
+        // one is unanswered is a queue that goes quiet exactly when it should
+        // not: the account nobody has placed is the one nobody has looked at.
+        assert!(
+            asked.contains(&Some(ActionSubject::Account(main.id))),
+            "an account inside a contour is asked: {asked:?}"
+        );
+        assert!(
+            asked.contains(&Some(ActionSubject::Account(savings.id))),
+            "an account awaiting a scope decision is asked: {asked:?}"
+        );
+    }
+
+    /// The outside account stays on the inside account's list of candidates.
+    ///
+    /// This is what makes the suppression lossless rather than a discovery
+    /// thrown away: a movement between an inside account and an outside one is
+    /// still nameable, from the end that is inside the perimeter — which is the
+    /// end whose report a pair of unrelated legs would distort.
+    #[test]
+    fn an_outside_account_is_still_offered_as_the_far_side_of_an_inside_one() {
+        let main = named("Main");
+        let shop = named("Shop One");
+        let accounts = [main.clone(), shop.clone()];
+        let contours = [ContourView {
+            id: ContourId::new_random(),
+            version: ContourVersion(1),
+            title: "Household".into(),
+            accounts: vec![main.id],
+        }];
+        let exclusions = [AccountScopeExclusionView {
+            account: shop.id,
+            reason: "Closed years ago.".into(),
+        }];
+
+        let asked = actions_from_views(&accounts, &contours, &exclusions, &[])
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+            .expect("the inside account is asked");
+        assert_eq!(asked.subject(), Some(ActionSubject::Account(main.id)));
+        let ActionTarget::Operation { request, .. } = asked.target() else {
+            panic!("the transfer item names an operation");
+        };
+        let candidates = request.missing[0]
+            .candidates
+            .as_ref()
+            .expect("the owner is offered his other accounts");
+        assert!(
+            candidates.iter().any(|candidate| candidate.id == shop.id),
+            "the outside account is still a possible far side: {candidates:#?}"
+        );
+    }
+
     /// Structure is asked about before an import is offered.
     #[test]
     fn the_structural_question_is_ordered_before_the_import() {
@@ -2449,6 +3625,98 @@ mod tests {
                 .all(|actions| actions[0].kind() <= actions[1].kind())
         );
     }
+
+    /// An account with nothing in it is offered both routes that begin an import.
+    ///
+    /// The item used to be `Blocked`, on a sentence that was true of fetching the
+    /// document and of nothing else. An agent reads `state` as its map of what it
+    /// may call, so the queue disowned the two routes that do exist.
+    #[test]
+    fn an_account_awaiting_its_first_import_names_both_routes_that_begin_one() {
+        let account = account();
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[no_facts(account.id)],
+            assertions: &[],
+            questions: &[],
+        });
+        let import = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::StartAccountImport)
+            .expect("account import action");
+
+        assert_eq!(import.state(), ActionState::NeedsOwnerInput);
+        // Both routes check `may_submit`, so an agent may send either.
+        assert_eq!(import.required_scope(), Some(Scope::Agent));
+
+        let resolutions = import.target().resolutions();
+        assert_eq!(
+            resolutions
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            vec![OperationKey::OpenImportSession, OperationKey::SyncBroker],
+            "the statement is the ordinary answer and the broker channel the other"
+        );
+
+        // The session is opened for this account and nothing else is known: the
+        // channel is the caller's, the label is read off the fetched document.
+        let session = resolutions[0].1;
+        assert_eq!(
+            session.preset.get("source"),
+            Some(&serde_json::json!({ "account": account.id.inner().to_string() }))
+        );
+        assert_eq!(
+            session
+                .missing
+                .iter()
+                .map(|input| (input.pointer.as_str(), input.provided_by))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/source/channel", ProvidedBy::Caller),
+                ("/source/label", ProvidedBy::ExternalDocument),
+            ]
+        );
+
+        // The sync knows the account; which broker, and over what interval, are
+        // the owner's to name.
+        let sync = resolutions[1].1;
+        assert_eq!(
+            sync.preset.get("account"),
+            Some(&serde_json::Value::from(account.id.inner().to_string()))
+        );
+        assert_eq!(
+            sync.missing
+                .iter()
+                .map(|input| (input.pointer.as_str(), input.provided_by))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/broker", ProvidedBy::Owner),
+                ("/from", ProvidedBy::Owner),
+                ("/to", ProvidedBy::Owner),
+            ]
+        );
+
+        // The honest half of the old sentence survives: the document is still
+        // the owner's to fetch, and the reason says so without claiming the API
+        // is inert.
+        assert!(
+            import
+                .reason()
+                .contains("no operation here downloads the document"),
+            "{}",
+            import.reason()
+        );
+        assert!(
+            import.reason().contains("open an import session"),
+            "{}",
+            import.reason()
+        );
+    }
+
     #[test]
     fn an_account_without_business_facts_gets_a_continuous_import_action() {
         let account = account();
@@ -2468,11 +3736,14 @@ mod tests {
             assertions: &[],
             questions: &[],
         });
-        let import = actions
-            .iter()
-            .find(|action| action.kind() == ActionKind::StartAccountImport)
-            .expect("account import action");
-        assert_eq!(import.target(), &ActionTarget::None);
+        // What this test is about is the gap and its closing. The target is
+        // asserted in full by the test above, which is where the old
+        // `ActionTarget::None` assertion sat and where it was wrong.
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.kind() == ActionKind::StartAccountImport)
+        );
         assert!(!account_import_completion(&activity));
 
         let completed = AccountActivityView {
@@ -2797,11 +4068,26 @@ mod tests {
             .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
             .expect("coverage gap diagnostic");
 
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::CoverageGapUnrepaired)
+        );
         assert_eq!(action.state(), ActionState::Blocked);
         assert_eq!(action.required_scope(), None);
         assert_eq!(action.target(), &ActionTarget::None);
         assert!(action.reason().contains("given:row-17"));
+        // The half a reader had to supply from nothing: why the two routes that
+        // look like a repair are not one.
+        assert!(
+            action.reason().contains("retracting the import"),
+            "{}",
+            action.reason()
+        );
+        assert!(
+            action.reason().contains("custody repair"),
+            "{}",
+            action.reason()
+        );
     }
 
     #[test]
@@ -2809,7 +4095,8 @@ mod tests {
         let actions = ledger_diagnostics(&gap_ledger(AccountId::new_random()));
         assert!(actions.iter().any(|action| {
             action.kind() == ActionKind::CoverageGapUnrepaired
-                && action.category() == ActionCategory::RequiredForGoal
+                && action.category()
+                    == ActionCategory::required_for(ActionKind::CoverageGapUnrepaired)
         }));
     }
 
@@ -2855,10 +4142,83 @@ mod tests {
             .find(|action| action.kind() == ActionKind::IndependentConfirmationMissing)
             .expect("independence diagnostic");
 
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
-        assert_eq!(action.state(), ActionState::Blocked);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::IndependentConfirmationMissing)
+        );
         assert!(action.reason().contains("different parser and document"));
+        // Cash is one of the two dimensions a second channel can raise, so the
+        // item names the call that supplies one instead of claiming there is
+        // none. `Scope::Agent`, because `sync_broker` checks `may_submit`.
+        assert_eq!(action.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(action.required_scope(), Some(Scope::Agent));
+        let ActionTarget::Operation { operation, request } = action.target() else {
+            panic!("an internally confirmed cash dimension names the broker sync");
+        };
+        assert_eq!(*operation, OperationKey::SyncBroker);
+        assert_eq!(
+            request
+                .preset
+                .get("account")
+                .and_then(|value| value.as_str()),
+            Some(account.inner().to_string().as_str())
+        );
+        assert_eq!(
+            request.preset.get("from").and_then(|value| value.as_str()),
+            Some("2026-08-01")
+        );
+        assert_eq!(
+            request.preset.get("to").and_then(|value| value.as_str()),
+            Some("2026-08-31")
+        );
+        let missing: Vec<&str> = request
+            .missing
+            .iter()
+            .map(|input| input.pointer.as_str())
+            .collect();
+        assert_eq!(missing, vec!["/broker"]);
+    }
+
+    /// The half of the same item that has no route, and must keep saying so.
+    ///
+    /// `Ground::BrokerApiAgreesWithStatement` promotes cash and positions only,
+    /// and the grounds that reach tax basis and income enter through
+    /// `with_external_evidence`, which no handler calls. Promoting this half
+    /// would name a call that cannot raise the dimension it is offered for.
+    #[test]
+    fn an_internally_confirmed_tax_dimension_still_has_no_operation() {
+        let account = AccountId::new_random();
+        let channel = SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("same".to_owned()),
+            document: RawHash::parse(&"d".repeat(64)),
+        };
+        let ledger = ReconciliationLedger::default().with_external_evidence(vec![(
+            account,
+            august(),
+            Evidence::from_match(
+                Ground::TaxAgentCertificate,
+                channel.clone(),
+                channel,
+                BTreeSet::from([Dimension::TaxBasis]),
+            )
+            .expect("evidence"),
+        )]);
+
+        let action = ledger_diagnostics(&ledger)
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::IndependentConfirmationMissing)
+            .expect("independence diagnostic");
+
+        assert_eq!(action.state(), ActionState::Blocked);
         assert_eq!(action.target(), &ActionTarget::None);
+        assert_eq!(action.required_scope(), None);
+        assert!(action.id().ends_with(":tax_basis"), "{}", action.id());
+        assert!(
+            action.reason().contains("external evidence"),
+            "{}",
+            action.reason()
+        );
     }
 
     #[test]
@@ -2894,8 +4254,10 @@ mod tests {
             .find(|action| action.kind() == ActionKind::DiscrepancyUnresolved)
             .expect("discrepancy diagnostic");
 
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
-        assert_eq!(action.state(), ActionState::Blocked);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::DiscrepancyUnresolved)
+        );
         assert!(
             action.reason().contains("claimed 10.00 RUB"),
             "{}",
@@ -2903,7 +4265,32 @@ mod tests {
         );
         assert!(action.reason().contains("observed 5.00 RUB"));
         assert!(action.reason().contains("delta 5.00 RUB"));
-        assert_eq!(action.target(), &ActionTarget::None);
+        // The system still cannot say which side is wrong. One operation settles
+        // either side once the owner has, and it is in this same API.
+        assert_eq!(action.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(action.required_scope(), Some(Scope::Owner));
+        let ActionTarget::Operation { operation, request } = action.target() else {
+            panic!("a discrepancy names the correction that settles it");
+        };
+        assert_eq!(*operation, OperationKey::SubmitCorrections);
+        assert!(
+            request.preset.is_empty(),
+            "a discrepancy names no event, so it proposes no correction: {:?}",
+            request.preset
+        );
+        let missing: Vec<&str> = request
+            .missing
+            .iter()
+            .map(|input| input.pointer.as_str())
+            .collect();
+        assert_eq!(missing, vec!["/corrections", "/acknowledge_retraction"]);
+        assert!(
+            action
+                .reason()
+                .contains("Recording another balance does not"),
+            "{}",
+            action.reason()
+        );
     }
 
     #[test]
@@ -2997,7 +4384,10 @@ mod tests {
         .expect("duplicate diagnostic");
 
         assert_eq!(action.kind(), ActionKind::PossibleDuplicateUndecided);
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::PossibleDuplicateUndecided)
+        );
         assert_eq!(action.state(), ActionState::Blocked);
         assert!(action.id().contains(&event.inner().to_string()));
         assert!(action.id().contains(&of.inner().to_string()));
@@ -3011,7 +4401,7 @@ mod tests {
             ActionFacts {
                 id: "blocked".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
-                category: ActionCategory::RequiredForGoal,
+                category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
                 required_scope: None,
                 subject: None,
@@ -3031,7 +4421,7 @@ mod tests {
             ActionFacts {
                 id: "blocked-operation".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
-                category: ActionCategory::RequiredForGoal,
+                category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
                 required_scope: None,
                 subject: None,
@@ -3051,7 +4441,7 @@ mod tests {
             ActionFacts {
                 id: "blocked-scope".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
-                category: ActionCategory::RequiredForGoal,
+                category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
                 required_scope: Some(Scope::Owner),
                 subject: None,
@@ -3375,7 +4765,10 @@ mod tests {
             .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
             .expect("coverage gap diagnostic");
 
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::CoverageGapUnrepaired)
+        );
     }
 
     /// One ledger, one flow report and one verdict that between them produce every
@@ -3453,12 +4846,16 @@ mod tests {
                     "{} is not blocked and must name the operation that answers it",
                     action.id()
                 );
-                assert_eq!(
-                    action.required_scope(),
-                    Some(Scope::Owner),
-                    "{}",
-                    action.id()
-                );
+                // Some scope, and the scope the named route actually checks:
+                // `create_category_rule` and `submit_corrections` are owner-only,
+                // `sync_broker` admits an agent token, and an item that named the
+                // wrong one would tell a caller it may not send a request the
+                // server would accept.
+                let expected = match action.kind() {
+                    ActionKind::IndependentConfirmationMissing => Scope::Agent,
+                    _ => Scope::Owner,
+                };
+                assert_eq!(action.required_scope(), Some(expected), "{}", action.id());
             }
         }
 
@@ -3674,7 +5071,10 @@ mod tests {
             )
         );
         assert_eq!(item.subject(), Some(ActionSubject::Account(main.id)));
-        assert_eq!(item.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            item.category(),
+            ActionCategory::required_for(ActionKind::AnswerClassificationQuestion)
+        );
         assert_eq!(item.state(), ActionState::NeedsOwnerInput);
         assert_eq!(item.required_scope(), Some(Scope::Agent));
     }

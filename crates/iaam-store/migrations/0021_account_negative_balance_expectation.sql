@@ -1,0 +1,24 @@
+-- What the owner expects a negative balance on one account to mean (iaam-d41s).
+--
+-- An expectation, not a rule. A first draft had the owner record that an
+-- account «cannot be overdrawn» and he corrected it: a technical overdraft on a
+-- debit card is real and ordinary. What is recorded here produces a warning
+-- about a probable error; nothing refuses, suppresses or invalidates anything
+-- on the strength of it.
+--
+-- NULL is «he has not said», never a placeholder and never a guess. Every
+-- account that exists today is in that state, and the migration invents nothing
+-- (§4.9). An account with NULL here behaves exactly as it did before.
+--
+-- This is a SECOND column beside `cash_class`, and deliberately so. Decision
+-- 0004 §3 forbids by name the merge that would put both in one enum: «a savings
+-- account cannot be overdrawn, therefore warn» is the branch iaam-d41s refuses,
+-- and it is wrong on the first ordinary technical overdraft. Two values, two
+-- consumers — the class is a report heading, this is a warning on a figure —
+-- and neither is ever derived from the other.
+--
+-- No CHECK constraint, following `accounts.cash_class` and `instruments.kind`:
+-- the set of codes is the Rust enum, and a second copy of it in SQL would be a
+-- second truth to keep in step. A code this build does not know is rejected on
+-- the way out rather than becoming a statement the owner never made.
+ALTER TABLE accounts ADD COLUMN negative_balance_expectation TEXT;

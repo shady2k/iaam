@@ -74,11 +74,14 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
             routes::get_account_scope,
             routes::record_account_scope
         ))
+        .routes(routes!(routes::replace_account_aliases))
+        .routes(routes!(routes::replace_account_declarations))
         .routes(routes!(
             routes::get_account_transfer_partners,
             routes::record_account_transfer_partners,
             routes::clear_account_transfer_partners
         ))
+        .routes(routes!(routes::record_account_transfer_partners_batch))
         .routes(routes!(routes::list_instruments, routes::create_instrument))
         .routes(routes!(routes::get_instrument))
         .routes(routes!(routes::resolve_instrument))
@@ -145,6 +148,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         ))
         .routes(routes!(routes::flow_report))
         .routes(routes!(routes::balances_report))
+        .routes(routes!(routes::asset_snapshot_report))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,

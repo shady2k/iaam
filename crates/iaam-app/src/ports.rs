@@ -18,6 +18,10 @@ use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_store::documents::BrokerCode;
+// The grouping label deliberately does not live in `iaam-core`: the core is
+// where rules live, and nothing may branch on it.
+pub use iaam_core::report::balances::NegativeBalanceExpectation;
+pub use iaam_store::reference::CashAssetClass;
 use serde_json::Value;
 use std::sync::Arc;
 use time::Date;
@@ -77,11 +81,197 @@ pub struct Principal {
     pub scope: Scope,
 }
 
+/// An account as everything that reasons about one sees it: who it is, what it
+/// is called, and where it is held.
+///
+/// **The summary, and deliberately not the whole account.** [`AccountDetailView`]
+/// beside it carries these same three fields plus the identity its source
+/// prints, its aliases, its cash class and the owner's negative-balance
+/// expectation. Two views of one noun look like duplication to be merged, and
+/// merging them is the one change this pair exists to prevent, so the reason is
+/// written on both of them rather than on one.
+///
+/// The reason is `cash_class`. Decision 0004 §3 makes it a grouping label that
+/// **no rule, no classification, no validation, no invariant and no refusal may
+/// branch on**, with exactly one consumer: a report heading. This view is what
+/// the action policy (`actions.rs`) and the reports (`scenarios/reports.rs`)
+/// read, and it is built at more than a dozen sites. Keeping the label off it
+/// means a rule written here cannot reach the label by accident — the
+/// prohibition is enforced by what is in scope rather than by a comment somebody
+/// has to remember to obey, which is precisely the condition decision 0004 asks
+/// a later reviewer to check against the code rather than against anyone's
+/// memory of intent.
+///
+/// So: a caller that reasons takes this one. A caller that renders or maintains
+/// an account's declarations — the account routes, the import session's
+/// resolution — takes the detail view. Unifying them is not a tidy-up; it is a
+/// decision to give every future rule reach over a label that must have none,
+/// and it needs an amendment to decision 0004, not a refactor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountView {
     pub id: AccountId,
     pub title: String,
     pub institution: Option<String>,
+}
+
+/// An account together with the identity its source prints, the further
+/// identifiers that reach it, the class of cash the owner says it holds, and
+/// what he expects a negative balance on it to mean (decision 0004).
+///
+/// **A view of its own rather than four more fields on [`AccountView`], and the
+/// separation is the decision rather than a convenience.** `AccountView` is the
+/// summary the action policy and the reports read; this is the full account,
+/// read only by the account routes and by the import session's resolution — the
+/// two places that render an account's declarations or match a printed
+/// identifier against them.
+///
+/// `cash_class` is why. It is a grouping label that **nothing may branch on**
+/// (decision 0004 §3), so keeping it out of the summary means a rule cannot
+/// reach it by accident: the prohibition holds structurally rather than by a
+/// comment somebody must obey. `AccountView` carries the same reasoning from the
+/// other side, and neither comment stands without the other — a reader who finds
+/// two account views and merges them as duplication is undoing the guard, not
+/// the duplication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDetailView {
+    pub id: AccountId,
+    pub title: String,
+    pub institution: Option<String>,
+    /// The client's own label for the source. Present exactly when
+    /// `provider_account_id` is: one half alone is not an identity.
+    pub provider: Option<String>,
+    /// What the source prints for this account. **Opaque to iaam**: not parsed,
+    /// not shape-checked, not validated against a register, and never rendered
+    /// where a title belongs. Equality and uniqueness are the whole contract.
+    pub provider_account_id: Option<String>,
+    /// The owner's grouping label. See [`CashAssetClass`]: report grouping reads
+    /// it and nothing else may.
+    pub cash_class: Option<CashAssetClass>,
+    /// What the owner says a negative balance on this account would mean
+    /// (`iaam-d41s`). `None` is «he has not said», and it is never inferred.
+    ///
+    /// A **second, independent** declaration beside `cash_class`. Decision 0004
+    /// §3 forbids deriving one from the other by name — «a savings account
+    /// cannot be overdrawn, therefore warn» is wrong on the first ordinary
+    /// technical overdraft — so the two travel as two fields with two
+    /// consumers: the class reaches a report heading, and this reaches the
+    /// warning on a negative-cash entry.
+    pub negative_balance_expectation: Option<NegativeBalanceExpectation>,
+    /// Further identifiers for this same account, each with a validity
+    /// interval. Two cards over one underlying account are one account with two
+    /// aliases, so the balance is counted once.
+    pub aliases: Vec<AccountAliasView>,
+}
+
+/// One alias of an account, valid over a half-open interval.
+///
+/// `valid_to` is `None` for an open-ended interval. A card that stopped working
+/// is an alias whose `valid_to` is set, and there is no binding lifecycle
+/// beyond that: decision 0004 records what is lost by refusing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAliasView {
+    pub value: String,
+    pub valid_from: Date,
+    pub valid_to: Option<Date>,
+}
+
+/// What [`Store::create_account`] did.
+///
+/// `Existing` is the upsert by external identity working, not a failure: a
+/// create carrying an identity already known returns the account created last
+/// time. It is a separate variant so the transport can say which happened
+/// instead of announcing a creation that did not occur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountCreated {
+    Created(AccountDetailView),
+    Existing(AccountDetailView),
+}
+
+/// Both halves of the identity a source prints, travelling together.
+///
+/// [`AccountDetailView`] keeps them as two flat `Option`s because that is the
+/// shape its readers were built around and an account may legitimately carry
+/// neither. A *statement* about an identity is different: half of one is not an
+/// identity, and the pair is where the compiler can say so once rather than
+/// every caller checking it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountIdentityView {
+    pub provider: String,
+    pub provider_account_id: String,
+}
+
+/// One declaration in a replacement: the owner's word, his withdrawal of it, or
+/// his silence.
+///
+/// Three states, not two. A replacement that spelled «leave this alone» and «he
+/// states none» the same way would clear, on every call, every declaration the
+/// caller did not happen to mention — and one of them decides which account a
+/// later import lands on.
+///
+/// [`AccountTransferStatementView`] draws the same line one noun away: an empty
+/// partner list is «money moves between this account and none of my others»,
+/// and having said nothing at all is a different fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declared<T> {
+    /// Not mentioned. The stored value stands exactly as it stood.
+    Untouched,
+    /// Stated as none. The stored value is cleared, back to «he has not said».
+    Cleared,
+    /// Stated as this.
+    Stated(T),
+}
+
+impl<T> Declared<T> {
+    /// Map the stated value, leaving the other two states as they are.
+    ///
+    /// The two silences are not values and must not become one: a transport that
+    /// mapped them by hand at each of three call sites would have three chances
+    /// to turn a withdrawal into «he said nothing», which reads as harmless and
+    /// keeps a statement the owner withdrew.
+    pub fn map_stated<U>(self, value: impl FnOnce(T) -> U) -> Declared<U> {
+        match self {
+            Self::Untouched => Declared::Untouched,
+            Self::Cleared => Declared::Cleared,
+            Self::Stated(stated) => Declared::Stated(value(stated)),
+        }
+    }
+}
+
+/// The declarations an account carries beside its title, as the owner now states
+/// them.
+///
+/// Three independent statements rather than one set, so each carries its own
+/// [`Declared`]. Aliases are not among them: they are a set the owner replaces
+/// whole, and they have a route of their own for that reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeclarations {
+    pub identity: Declared<AccountIdentityView>,
+    pub cash_class: Declared<CashAssetClass>,
+    pub negative_balance_expectation: Declared<NegativeBalanceExpectation>,
+}
+
+/// What [`Store::replace_account_declarations`] recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeclarationsRecorded {
+    pub account: AccountDetailView,
+    /// The identity the account carried until this call, when the call replaced
+    /// it with a different one or withdrew it.
+    ///
+    /// `None` in the three cases that need no announcement: the account carried
+    /// none, the call did not mention the identity, or the identity stated is
+    /// the one already recorded. Giving an identity to an account that had none
+    /// is an ordinary first statement; re-pointing one is not, and this is how
+    /// the caller is told which of the two happened.
+    pub previous_identity: Option<AccountIdentityView>,
+}
+
+impl AccountCreated {
+    #[must_use]
+    pub const fn account(&self) -> &AccountDetailView {
+        match self {
+            Self::Created(account) | Self::Existing(account) => account,
+        }
+    }
 }
 
 /// The current version of an owner's contour, with the accounts it covers.
@@ -353,6 +543,51 @@ pub trait Store: Send + Sync {
     ) -> Result<(), AppError>;
 
     async fn upsert_account(&self, owner: OwnerId, account: AccountView) -> Result<(), AppError>;
+
+    /// Create an account, upserting by external identity (decision 0004).
+    ///
+    /// A create carrying an identity that already exists returns the account
+    /// created last time and changes nothing about it. An account carrying no
+    /// identity is always created: two accounts that state none are not the
+    /// same account.
+    async fn create_account(
+        &self,
+        owner: OwnerId,
+        account: AccountDetailView,
+    ) -> Result<AccountCreated, AppError>;
+
+    /// Every account of the owner, with its identity, aliases and class.
+    async fn list_account_details(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountDetailView>, AppError>;
+
+    /// Replace one account's aliases with the set the owner now states.
+    async fn replace_account_aliases(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        aliases: Vec<AccountAliasView>,
+    ) -> Result<(), AppError>;
+
+    /// Replace the declarations one account carries: its external identity, its
+    /// cash class, and what the owner expects a negative balance on it to mean.
+    ///
+    /// The three could previously be stated only at creation, and
+    /// [`Store::create_account`] ignores them once the identity is known,
+    /// because it is an upsert rather than an update. Without this, every
+    /// account the owner already had could never acquire any of the three.
+    ///
+    /// Per field, so a declaration the owner does not mention is left alone:
+    /// see [`Declared`]. Re-pointing an identity is recorded rather than
+    /// refused, and the previous one comes back in
+    /// [`AccountDeclarationsRecorded::previous_identity`].
+    async fn replace_account_declarations(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        declarations: AccountDeclarations,
+    ) -> Result<AccountDeclarationsRecorded, AppError>;
     async fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourView>, AppError>;
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;
     async fn list_account_activity(
@@ -396,6 +631,21 @@ pub trait Store: Send + Sync {
         &self,
         owner: OwnerId,
         statement: AccountTransferStatementView,
+    ) -> Result<(), AppError>;
+
+    /// Record, or replace, several of those statements at once.
+    ///
+    /// Not a loop over [`Self::record_account_transfer_statement`], and it must
+    /// not be implemented as one: that method commits per call, so a failure
+    /// part-way through would leave some statements replaced and the rest
+    /// standing as they were. Each entry still means exactly what the single
+    /// form means — one account's complete enumeration of its partners — and
+    /// naming one account inside another's list says nothing about that
+    /// account's own. Only the transport is shared.
+    async fn record_account_transfer_statements(
+        &self,
+        owner: OwnerId,
+        statements: Vec<AccountTransferStatementView>,
     ) -> Result<(), AppError>;
 
     /// Withdraw it, returning the account to awaiting the owner's decision.

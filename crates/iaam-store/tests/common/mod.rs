@@ -19,6 +19,11 @@ pub fn apply_migrations_through(conn: &Connection, through: u32) {
         include_str!("../../migrations/0012_account_scoped_source_operation.sql"),
         include_str!("../../migrations/0013_event_source_time.sql"),
         include_str!("../../migrations/0014_securities_transfer_kinds.sql"),
+        include_str!("../../migrations/0015_categories.sql"),
+        include_str!("../../migrations/0016_category_group_is_income.sql"),
+        include_str!("../../migrations/0017_account_scope_dispositions.sql"),
+        include_str!("../../migrations/0018_account_transfer_partners.sql"),
+        include_str!("../../migrations/0019_import_sessions.sql"),
     ];
     assert!(
         through <= migrations.len() as u32,

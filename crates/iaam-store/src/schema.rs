@@ -9,9 +9,9 @@ use rusqlite::Connection;
 use crate::StoreError;
 
 /// Schema version understood by this build.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 21;
 
-const MIGRATIONS: [(u32, &str); 19] = [
+const MIGRATIONS: [(u32, &str); 21] = [
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_sources_and_rules.sql")),
     (3, include_str!("../migrations/0003_broker_access.sql")),
@@ -58,6 +58,14 @@ const MIGRATIONS: [(u32, &str); 19] = [
         include_str!("../migrations/0018_account_transfer_partners.sql"),
     ),
     (19, include_str!("../migrations/0019_import_sessions.sql")),
+    (
+        20,
+        include_str!("../migrations/0020_account_external_identity.sql"),
+    ),
+    (
+        21,
+        include_str!("../migrations/0021_account_negative_balance_expectation.sql"),
+    ),
 ];
 
 /// Apply missing migrations.
@@ -76,9 +84,44 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
         if version <= current {
             continue;
         }
-        conn.execute_batch(&format!(
-            "BEGIN; {sql} PRAGMA user_version = {version}; COMMIT;"
-        ))?;
+        apply(conn, version, sql)?;
     }
     Ok(())
+}
+
+/// Apply one migration, unless another connection got there first.
+///
+/// The version read at the top of `migrate` is only a hint: between that read and this
+/// call another process—the server starting, a CLI command run a moment later—may have
+/// applied the very same migration. So the transaction opens with `BEGIN IMMEDIATE`,
+/// taking the write lock at once rather than at the first write, and the version is read
+/// again inside it. The loser of the race then sees the work already done and commits
+/// nothing, instead of failing halfway through with `table … already exists`.
+fn apply(conn: &Connection, version: u32, sql: &str) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let outcome = apply_inside_transaction(conn, version, sql);
+    match outcome {
+        Ok(true) => conn.execute_batch("COMMIT;")?,
+        Ok(false) | Err(_) => {
+            // Rolling back a transaction SQLite has already unwound itself is harmless,
+            // and leaving one open would poison every later statement on this connection.
+            let _ = conn.execute_batch("ROLLBACK;");
+            outcome?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs the migration and reports whether anything was written.
+fn apply_inside_transaction(
+    conn: &Connection,
+    version: u32,
+    sql: &str,
+) -> Result<bool, StoreError> {
+    let current: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current >= version {
+        return Ok(false);
+    }
+    conn.execute_batch(&format!("{sql} PRAGMA user_version = {version};"))?;
+    Ok(true)
 }

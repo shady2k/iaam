@@ -16,13 +16,14 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
     AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
-    ActionTarget, MissingInput, ProvidedBy, account_scope,
+    ActionTarget, MissingInput, OperationKey, ProvidedBy, RequestPlan, account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{
-    AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Principal,
+    AccountAliasView, AccountCreated, AccountDeclarations, AccountDetailView, AccountIdentityView,
+    AccountScopeExclusionView, AccountTransferStatementView, ContourView, Declared, Principal,
     Scope,
 };
 use iaam_app::scenarios::categories::{
@@ -41,7 +42,7 @@ use iaam_app::scenarios::market_reference::{
 };
 use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, report, statuses};
 use iaam_app::scenarios::reports::{
-    MoneyFlowQuery, ReturnsQuery, account_balances, money_flow, returns,
+    MoneyFlowQuery, ReturnsQuery, account_balances, asset_snapshot, money_flow, returns,
 };
 use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
@@ -70,21 +71,26 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
-    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto, ActionsResponseDto,
-    AddContourVersionRequest, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto,
-    CategoryGroupDto, CategoryGroupRequest, CategoryRequest, CategoryRuleDto,
-    CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
-    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
-    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
-    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
-    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
-    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
-    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
-    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
-    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
-    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest,
-    RecordAccountTransferPartnersRequest, RequestPlanDto, RequiredInputDto,
+    AccountAliasDto, AccountCandidateDto, AccountCashClassStatementDto, AccountDeclarationsDto,
+    AccountDto, AccountIdentityNotDoneDto, AccountIdentityRepointedDto, AccountIdentityStatedDto,
+    AccountIdentityStatementDto, AccountNegativeBalanceExpectationStatementDto,
+    AccountScopeDispositionDto, AccountScopeDto, AccountTransferPartnersBatchDto,
+    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto,
+    AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto, BrokerAccessDto,
+    BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto, CategoryGroupRequest,
+    CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest,
+    ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
+    ContourVersionDto, CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
+    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
+    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
+    ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto,
+    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
+    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
+    MoneyFlowReportDto, NegativeBalanceExpectationDto, OwnerBalanceRequest, QuotationBasisDto,
+    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
+    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
+    RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
+    ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
     ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
     SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
     VerdictDto,
@@ -104,7 +110,14 @@ pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
 pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
+pub const REPLACE_ACCOUNT_ALIASES_OPERATION_ID: &str = "replace_account_aliases";
+pub const REPLACE_ACCOUNT_DECLARATIONS_OPERATION_ID: &str = "replace_account_declarations";
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
+/// The batch form. Deliberately absent from [`OperationKey`]: the action queue
+/// names the per-account operation, one item per account, and this is the
+/// transport a caller holding several of those items may use instead.
+pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_BATCH_OPERATION_ID: &str =
+    "record_account_transfer_partners_batch";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 
@@ -112,40 +125,44 @@ pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 #[utoipa::path(
     get,
     path = "/v1/actions",
-    responses((status = 200, description = "Computed owner actions", body = ActionsResponseDto)),
+    responses((status = 200, description = "Computed owner actions", body = Vec<ActionDto>)),
     security(("bearer" = []))
 )]
 pub async fn list_actions(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
-) -> Result<Json<ActionsResponseDto>, ApiFailure> {
+) -> Result<Json<Vec<ActionDto>>, ApiFailure> {
     let actions =
         iaam_app::actions::frontier(principal.owner, state.services.store.as_ref()).await?;
-    Ok(Json(ActionsResponseDto {
-        policy_version: 1,
-        items: actions
+    Ok(Json(
+        actions
             .iter()
             .map(|action| action_dto(action, &catalog))
             .collect(),
-    }))
+    ))
 }
 
 fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
     let target = match action.target() {
         ActionTarget::Operation { operation, request } => {
-            let resolved = catalog.operation(*operation);
+            let resolved = resolution_option_dto(*operation, request, catalog);
             ActionTargetDto::Operation {
-                operation_id: resolved.operation_id.clone(),
-                method: resolved.method.clone(),
-                path: resolved.path.clone(),
-                request_schema: resolved.request_schema.clone(),
-                request: RequestPlanDto {
-                    preset: request.preset.clone(),
-                    missing: request.missing.iter().map(missing_input_dto).collect(),
-                },
+                operation_id: resolved.operation_id,
+                method: resolved.method,
+                path: resolved.path,
+                request_schema: resolved.request_schema,
+                request: resolved.request,
             }
         }
+        // Every option is resolved through the same catalogue as a sole target,
+        // so an alternative way out is addressed exactly as well as the first.
+        ActionTarget::Options(options) => ActionTargetDto::Options {
+            options: options
+                .iter()
+                .map(|option| resolution_option_dto(option.operation, &option.request, catalog))
+                .collect(),
+        },
         ActionTarget::None => ActionTargetDto::None,
     };
     ActionDto {
@@ -153,11 +170,20 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
         kind: action.kind().id().to_owned(),
         category: match action.category() {
             ActionCategory::Blocking => "blocking",
-            ActionCategory::RequiredForGoal => "required_for_goal",
+            ActionCategory::RequiredForGoal(_) => "required_for_goal",
             ActionCategory::Recommended => "recommended",
             ActionCategory::Informational => "informational",
         }
         .to_owned(),
+        // Empty for every category but the required one, which is where
+        // `ActionCategory::goals` puts the emptiness rather than this mapping
+        // repeating the case analysis one line below the one above.
+        goals: action
+            .category()
+            .goals()
+            .iter()
+            .map(|goal| goal.code().to_owned())
+            .collect(),
         state: match action.state() {
             ActionState::Ready => "ready",
             ActionState::NeedsOwnerInput => "needs_owner_input",
@@ -173,6 +199,25 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
             ActionSubject::Event(event) => ActionSubjectDto::Event { id: event.inner() },
         }),
         target,
+    }
+}
+
+/// One way to close an action, addressed against the completed contract.
+fn resolution_option_dto(
+    operation: OperationKey,
+    request: &RequestPlan,
+    catalog: &ActionCatalog,
+) -> ResolutionOptionDto {
+    let resolved = catalog.operation(operation);
+    ResolutionOptionDto {
+        operation_id: resolved.operation_id.clone(),
+        method: resolved.method.clone(),
+        path: resolved.path.clone(),
+        request_schema: resolved.request_schema.clone(),
+        request: RequestPlanDto {
+            preset: request.preset.clone(),
+            missing: request.missing.iter().map(missing_input_dto).collect(),
+        },
     }
 }
 
@@ -1431,17 +1476,12 @@ pub async fn list_accounts(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<AccountDto>>, ApiFailure> {
-    let accounts = state.services.store.list_accounts(principal.owner).await?;
-    Ok(Json(
-        accounts
-            .into_iter()
-            .map(|account| AccountDto {
-                id: account.id.inner(),
-                title: account.title,
-                institution: account.institution,
-            })
-            .collect(),
-    ))
+    let accounts = state
+        .services
+        .store
+        .list_account_details(principal.owner)
+        .await?;
+    Ok(Json(accounts.into_iter().map(account_dto).collect()))
 }
 
 /// Create an account.
@@ -1452,6 +1492,8 @@ pub async fn list_accounts(
     request_body = CreateAccountRequest,
     responses(
         (status = 201, description = "Account created", body = AccountDto),
+        (status = 200, description = "The external identity was already known: this is the \
+                                      account created last time, unchanged", body = AccountDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -1466,24 +1508,433 @@ pub async fn create_account(
     ApiJson(request): ApiJson<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<AccountDto>), ApiFailure> {
     require_admin(&principal)?;
-    let account = AccountView {
+    // The pair is the identity, so half of it is refused rather than silently
+    // stored as no identity at all. This is a check on the shape of the pair and
+    // never on the value: `provider_account_id` stays opaque, and the refusal
+    // does not echo it back.
+    let (provider, provider_account_id) = match (request.provider, request.provider_account_id) {
+        (Some(provider), Some(provider_account_id)) => (Some(provider), Some(provider_account_id)),
+        (None, None) => (None, None),
+        (Some(_), None) => {
+            return Err(unprocessable(
+                "provider_account_id",
+                "both halves of the external identity, or neither",
+                "provider alone",
+                "an account identified at a source is identified by the pair: a \
+                 request naming only the source would be stored as naming no \
+                 identity, and the next import would mint a second account",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(unprocessable(
+                "provider",
+                "both halves of the external identity, or neither",
+                "provider_account_id alone",
+                "an identifier without the source that printed it has no scope: \
+                 two sources printing short sequential identifiers would collide \
+                 on values neither of them controls",
+            ));
+        }
+    };
+
+    let aliases = alias_views(request.aliases)?;
+
+    let account = AccountDetailView {
         id: AccountId::new_random(),
         title: request.title,
         institution: request.institution,
+        provider,
+        provider_account_id,
+        cash_class: request.cash_class.map(CashAssetClassDto::to_domain),
+        negative_balance_expectation: request
+            .negative_balance_expectation
+            .map(NegativeBalanceExpectationDto::to_domain),
+        aliases,
     };
+    let created = state
+        .services
+        .store
+        .create_account(principal.owner, account)
+        .await?;
+
+    // `200 OK` when the identity was already known: nothing was created, and
+    // reporting `201` for an account minted on an earlier call would be a lie a
+    // client cannot check.
+    let status = match created {
+        AccountCreated::Created(_) => StatusCode::CREATED,
+        AccountCreated::Existing(_) => StatusCode::OK,
+    };
+    let account = match created {
+        AccountCreated::Created(account) | AccountCreated::Existing(account) => account,
+    };
+    Ok((status, Json(account_dto(account))))
+}
+
+/// State an account's aliases.
+///
+/// The route decision 0004 asks for by name: an account's further identifiers
+/// must be addable, closable and readable after it exists, because the case the
+/// decision was written about — a second card over one underlying account —
+/// usually arrives after the account does.
+///
+/// The whole set is replaced, following the transfer statement: the owner says
+/// what is true now, and a diff against what he said last time is a second thing
+/// to get wrong. A card that stopped working is sent as an alias whose
+/// `valid_to` is set, beside whichever alias replaced it.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/{id}/aliases",
+    operation_id = REPLACE_ACCOUNT_ALIASES_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = ReplaceAccountAliasesRequest,
+    responses(
+        (status = 200, description = "Aliases recorded", body = AccountDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn replace_account_aliases(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<ReplaceAccountAliasesRequest>,
+) -> Result<Json<AccountDto>, ApiFailure> {
+    // Which printed identifier reaches which account decides which account a row
+    // lands on: the owner's judgement, by the rule that keeps account creation
+    // out of the agent's hands.
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+
+    let aliases = alias_views(request.aliases)?;
     state
         .services
         .store
-        .upsert_account(principal.owner, account.clone())
+        .replace_account_aliases(principal.owner, account, aliases)
         .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(AccountDto {
-            id: account.id.inner(),
-            title: account.title,
-            institution: account.institution,
-        }),
-    ))
+
+    let stored = state
+        .services
+        .store
+        .list_account_details(principal.owner)
+        .await?
+        .into_iter()
+        .find(|held| held.id == account)
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                ApiError::simple("not_found", format!("not found: account {id}")),
+            )
+        })?;
+    Ok(Json(account_dto(stored)))
+}
+
+/// State an account's declarations: its external identity, its cash class, and
+/// what a negative balance on it would mean.
+///
+/// **The three could previously be stated only at creation.** `POST /v1/accounts`
+/// is an upsert by external identity: a create repeating a known identity
+/// returns the account made last time and deliberately changes nothing about it,
+/// because it is idempotent rather than an update. `PUT
+/// /v1/accounts/{id}/aliases` maintains the alias set and nothing else. So every
+/// account the owner already had — which is every account created before
+/// decision 0004 — could never acquire an identity, a class or an expectation.
+///
+/// Shaped like the alias route: a replacement, not a patch. What differs is that
+/// these are three separate statements rather than one set, so the replacement
+/// is per field and an **absent** field is left exactly as it stands. A present
+/// field carries `stated`, and `stated: false` clears it — the distinction
+/// `AccountTransferPartnersDto` already draws between «he says none» and «he has
+/// not said».
+///
+/// **Two of the three change freely.** The cash class is a grouping label read
+/// by one report heading, which decision 0004 §3 forbids any rule from branching
+/// on; the negative-balance expectation is a warning that sets a flag beside a
+/// figure the report states either way (`iaam-d41s`). Neither invalidates
+/// anything recorded, so neither is guarded by anything beyond the owner's word.
+///
+/// **Re-pointing an identity is recorded and reported, not refused.** The
+/// response's `identity_repointed` block says what the call did not do, and
+/// [`AccountIdentityRepointedDto`] records why a refusal is not available here:
+/// the journal does not know which identity a fact arrived under.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/{id}/declarations",
+    operation_id = REPLACE_ACCOUNT_DECLARATIONS_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = ReplaceAccountDeclarationsRequest,
+    responses(
+        (status = 200, description = "Declarations recorded", body = AccountDeclarationsDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 409, description = "Another of the owner's accounts already answers to that identity", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn replace_account_declarations(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<ReplaceAccountDeclarationsRequest>,
+) -> Result<Json<AccountDeclarationsDto>, ApiFailure> {
+    // Which source an account answers to decides which account a row lands on,
+    // by the same rule that keeps account creation and aliases out of the
+    // agent's hands. The class and the expectation are the owner's word about
+    // his own money, and there is nobody else to take it from.
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+
+    let declarations = AccountDeclarations {
+        identity: identity_statement(request.identity)?,
+        cash_class: statement(
+            request.cash_class,
+            |stated| stated.class,
+            "cash_class.class",
+        )?
+        .map_stated(CashAssetClassDto::to_domain),
+        negative_balance_expectation: statement(
+            request.negative_balance_expectation,
+            |stated| stated.expectation,
+            "negative_balance_expectation.expectation",
+        )?
+        .map_stated(NegativeBalanceExpectationDto::to_domain),
+    };
+
+    let recorded = state
+        .services
+        .store
+        .replace_account_declarations(principal.owner, account, declarations)
+        .await?;
+
+    let identity_repointed = match recorded.previous_identity {
+        None => None,
+        Some(previous) => {
+            // Asked only when an identity was displaced: the answer is about the
+            // account, not about the identity, and it is the most the journal
+            // can say.
+            let facts_recorded = state
+                .services
+                .store
+                .list_account_activity(principal.owner)
+                .await?
+                .into_iter()
+                .find(|activity| activity.account == account)
+                .is_some_and(|activity| activity.has_business_fact);
+            Some(AccountIdentityRepointedDto {
+                previous: AccountIdentityStatedDto {
+                    provider: previous.provider,
+                    provider_account_id: previous.provider_account_id,
+                },
+                facts_recorded,
+                not_done: identity_repointed_not_done(),
+            })
+        }
+    };
+
+    Ok(Json(AccountDeclarationsDto {
+        account: account_dto(recorded.account),
+        identity_repointed,
+    }))
+}
+
+/// What re-pointing an identity did not do.
+///
+/// A constant register, in the shape `CaveatDto` uses and for its reason: each
+/// entry names one thing, and its `detail` interpolates nothing, so this block
+/// can never contradict the rest of the response by restating a value wrongly.
+fn identity_repointed_not_done() -> Vec<AccountIdentityNotDoneDto> {
+    [
+        (
+            "facts_not_moved",
+            "The facts already recorded against this account stay on it. \
+             Re-pointing the identity changes which account a later import \
+             addresses; it moves nothing already journalled.",
+        ),
+        (
+            "previous_identity_not_reserved",
+            "The identity this account has stopped answering to is now free. A \
+             create carrying it mints a new account, and this account's earlier \
+             facts do not follow it there.",
+        ),
+        (
+            "no_fact_records_the_identity_it_arrived_under",
+            "The journal records a fact against an account, never against the \
+             identity in force at the time. Neither you nor iaam can now tell \
+             which of this account's facts arrived under the previous identity.",
+        ),
+    ]
+    .into_iter()
+    .map(|(kind, detail)| AccountIdentityNotDoneDto {
+        kind: kind.to_owned(),
+        detail: detail.to_owned(),
+    })
+    .collect()
+}
+
+/// One declaration from the wire, with the one check the `stated` flag carries.
+///
+/// A statement is refused when it disagrees with itself: `stated: true` with
+/// nothing stated says two things, and so does `stated: false` beside a value.
+/// Storing either would record a statement the owner did not make.
+fn statement<S, T>(
+    statement: Option<S>,
+    value: impl FnOnce(S) -> Option<T>,
+    field: &str,
+) -> Result<Declared<T>, ApiFailure>
+where
+    S: HasStated,
+{
+    let Some(statement) = statement else {
+        return Ok(Declared::Untouched);
+    };
+    let stated = statement.stated();
+    match (stated, value(statement)) {
+        (true, Some(value)) => Ok(Declared::Stated(value)),
+        (false, None) => Ok(Declared::Cleared),
+        (true, None) => Err(unprocessable(
+            field,
+            "a value, because stated is true",
+            "nothing",
+            "a declaration stated without a value says two things at once; omit \
+             the whole field to leave it alone, or send stated: false to \
+             withdraw it",
+        )),
+        (false, Some(_)) => Err(unprocessable(
+            field,
+            "nothing, because stated is false",
+            "a value",
+            "stated: false withdraws the declaration; sending a value beside it \
+             says two things at once",
+        )),
+    }
+}
+
+/// The `stated` flag, so [`statement`] can read it off any of the three.
+trait HasStated {
+    fn stated(&self) -> bool;
+}
+
+impl HasStated for AccountCashClassStatementDto {
+    fn stated(&self) -> bool {
+        self.stated
+    }
+}
+
+impl HasStated for AccountNegativeBalanceExpectationStatementDto {
+    fn stated(&self) -> bool {
+        self.stated
+    }
+}
+
+/// The identity statement from the wire.
+///
+/// Not routed through [`statement`], because this value has two halves and the
+/// pair is what makes it an identity. Half of one is refused in the words the
+/// create route already uses: it is a check on the shape of the pair and never
+/// on the value, and the refusal does not echo `provider_account_id` back.
+fn identity_statement(
+    statement: Option<AccountIdentityStatementDto>,
+) -> Result<Declared<AccountIdentityView>, ApiFailure> {
+    let Some(statement) = statement else {
+        return Ok(Declared::Untouched);
+    };
+    match (
+        statement.stated,
+        statement.provider,
+        statement.provider_account_id,
+    ) {
+        (true, Some(provider), Some(provider_account_id)) => {
+            Ok(Declared::Stated(AccountIdentityView {
+                provider,
+                provider_account_id,
+            }))
+        }
+        (false, None, None) => Ok(Declared::Cleared),
+        (true, Some(_), None) => Err(unprocessable(
+            "identity.provider_account_id",
+            "both halves of the external identity",
+            "provider alone",
+            "an account identified at a source is identified by the pair: a \
+             statement naming only the source would be stored as naming no \
+             identity, and the next import would mint a second account",
+        )),
+        (true, None, _) => Err(unprocessable(
+            "identity.provider",
+            "both halves of the external identity",
+            "provider_account_id alone, or neither",
+            "an identifier without the source that printed it has no scope: two \
+             sources printing short sequential identifiers would collide on \
+             values neither of them controls",
+        )),
+        (false, _, _) => Err(unprocessable(
+            "identity",
+            "nothing beside stated: false",
+            "a half of an identity",
+            "stated: false withdraws the identity; sending a half of one beside \
+             it says two things at once",
+        )),
+    }
+}
+
+/// Aliases from the wire, with the one check the dates carry.
+///
+/// The value is never inspected: it is opaque for the same reason
+/// `provider_account_id` is. Only the interval around it is checked, and only
+/// for being an interval at all.
+fn alias_views(aliases: Vec<AccountAliasDto>) -> Result<Vec<AccountAliasView>, ApiFailure> {
+    let mut views = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        // The interval is half-open, so an end on the start day covers nothing.
+        if alias.valid_to.is_some_and(|end| end <= alias.valid_from) {
+            return Err(unprocessable(
+                "aliases.valid_to",
+                "a date after valid_from, or nothing for an open interval",
+                "a date on or before valid_from",
+                "the interval is half-open, so an alias that ends on or before \
+                 the day it begins is valid on no day at all",
+            ));
+        }
+        views.push(AccountAliasView {
+            value: alias.value,
+            valid_from: alias.valid_from,
+            valid_to: alias.valid_to,
+        });
+    }
+    Ok(views)
+}
+
+/// One account on the wire.
+fn account_dto(account: AccountDetailView) -> AccountDto {
+    AccountDto {
+        id: account.id.inner(),
+        title: account.title,
+        institution: account.institution,
+        provider: account.provider,
+        provider_account_id: account.provider_account_id,
+        cash_class: account.cash_class.map(CashAssetClassDto::from_domain),
+        negative_balance_expectation: account
+            .negative_balance_expectation
+            .map(NegativeBalanceExpectationDto::from_domain),
+        aliases: account
+            .aliases
+            .into_iter()
+            .map(|alias| AccountAliasDto {
+                value: alias.value,
+                valid_from: alias.valid_from,
+                valid_to: alias.valid_to,
+            })
+            .collect(),
+    }
 }
 
 /// An account's scope disposition.
@@ -1658,14 +2109,136 @@ pub async fn record_account_transfer_partners(
     // out of the agent's hands.
     require_admin(&principal)?;
     let account = AccountId(id);
-    owned_account(&state, &principal, account).await?;
+    let statement =
+        validated_transfer_statement(&state, &principal, account, request.partners, "partners")
+            .await?;
 
-    let mut partners = Vec::with_capacity(request.partners.len());
-    for partner in request.partners {
+    state
+        .services
+        .store
+        .record_account_transfer_statement(principal.owner, statement)
+        .await?;
+
+    Ok(Json(
+        account_transfer_partners_dto(&state, &principal, account).await?,
+    ))
+}
+
+/// Record those statements for several accounts in one call.
+///
+/// Transport only, and the shape says so. The batch is one entry per account,
+/// each carrying that account's whole enumeration, because the relation is not
+/// what is being recorded — the closure is. Naming `B` inside `A`'s list
+/// establishes that money moves between them and says nothing about whether `B`
+/// also moves money with `C`; closing `B`'s question from `A`'s answer would
+/// assert that `B` has no partners beyond those already named, which is a
+/// fabricated fact about the owner's money. The completeness statement is
+/// irreducible per account, so the count of statements cannot shrink. The count
+/// of round trips can, and this is that.
+///
+/// Every check the single-account route makes is made here, by calling the same
+/// function it calls, once per entry. A partial failure refuses everything: the
+/// route the owner would otherwise have called twelve times refuses one bad call
+/// outright, and a batch that wrote eleven and refused the twelfth would leave
+/// him having said something he was saying all at once.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/transfer-partners",
+    operation_id = RECORD_ACCOUNT_TRANSFER_PARTNERS_BATCH_OPERATION_ID,
+    request_body = RecordAccountTransferPartnersBatchRequest,
+    responses(
+        (status = 200, description = "Every statement recorded", body = AccountTransferPartnersBatchDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "An account named in the batch does not exist or belongs to someone else; nothing was recorded", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_transfer_partners_batch(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiJson(request): ApiJson<RecordAccountTransferPartnersBatchRequest>,
+) -> Result<Json<AccountTransferPartnersBatchDto>, ApiFailure> {
+    require_admin(&principal)?;
+
+    let mut accounts: Vec<AccountId> = Vec::with_capacity(request.statements.len());
+    let mut statements = Vec::with_capacity(request.statements.len());
+    for (index, entry) in request.statements.into_iter().enumerate() {
+        let account = AccountId(entry.account);
+        // Two enumerations for one account cannot both be the complete one, and
+        // last-write-wins would discard a statement the owner made without
+        // telling him which.
+        if accounts.contains(&account) {
+            return Err(unprocessable(
+                &format!("/statements/{index}/account"),
+                "an account named at most once in the batch",
+                &format!("a second statement for account {}", account.inner()),
+                "an account's transfer partners are one complete enumeration, and a batch naming \
+                 the same account twice does not say which of the two is it",
+            ));
+        }
+        accounts.push(account);
+        statements.push(
+            validated_transfer_statement(
+                &state,
+                &principal,
+                account,
+                entry.partners,
+                &format!("/statements/{index}/partners"),
+            )
+            .await?,
+        );
+    }
+
+    // Nothing is written until every entry has passed, and then all of it is
+    // written in one transaction: validation refuses a bad batch before the
+    // first row, and the store's batch method keeps a failure below this layer
+    // from leaving half the statements behind.
+    state
+        .services
+        .store
+        .record_account_transfer_statements(principal.owner, statements)
+        .await?;
+
+    let mut recorded = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        recorded.push(account_transfer_partners_dto(&state, &principal, account).await?);
+    }
+    Ok(Json(AccountTransferPartnersBatchDto {
+        statements: recorded,
+    }))
+}
+
+/// The checks that stand between a request and a recorded transfer statement.
+///
+/// One function, called by the single-account route and once per entry by the
+/// batch, so that the two cannot drift into accepting different things. The
+/// `field` is the only thing that varies: it names `partners` for the single
+/// form and the JSON pointer of the offending entry for the batch, and it
+/// changes what the refusal points at, never what is refused.
+///
+/// An account the owner does not hold — in either position — leaves through
+/// [`owned_account`]'s `404`, unchanged by the batching. A batch is a cheaper
+/// way to make the same twelve calls, and a caller must be able to read the
+/// answer the same way whichever way it made them.
+async fn validated_transfer_statement(
+    state: &ServerState,
+    principal: &Principal,
+    account: AccountId,
+    named: Vec<Uuid>,
+    field: &str,
+) -> Result<AccountTransferStatementView, ApiFailure> {
+    owned_account(state, principal, account).await?;
+
+    let mut partners = Vec::with_capacity(named.len());
+    for partner in named {
         let partner = AccountId(partner);
         if partner == account {
             return Err(unprocessable(
-                "partners",
+                field,
                 "the owner's other accounts",
                 "the account itself",
                 "a transfer has two sides, and an account is not the other side of itself",
@@ -1674,24 +2247,13 @@ pub async fn record_account_transfer_partners(
         // Refused rather than ignored: a named account that does not exist is a
         // mistake in the statement, and silently dropping it would record a
         // statement the owner did not make.
-        owned_account(&state, &principal, partner).await?;
+        owned_account(state, principal, partner).await?;
         if !partners.contains(&partner) {
             partners.push(partner);
         }
     }
 
-    state
-        .services
-        .store
-        .record_account_transfer_statement(
-            principal.owner,
-            AccountTransferStatementView { account, partners },
-        )
-        .await?;
-
-    Ok(Json(
-        account_transfer_partners_dto(&state, &principal, account).await?,
-    ))
+    Ok(AccountTransferStatementView { account, partners })
 }
 
 /// Withdraw the statement, returning the account to awaiting a decision.
@@ -2716,11 +3278,17 @@ pub async fn commit_import_session(
 /// rests on — amount, currency, both dates, what each source printed — and the
 /// owner confirms. Legs nothing paired with are published too: a leg dropped
 /// from the answer is a leg read as external flow by default.
+///
+/// `unmatched` is therefore most of the journal, permanently, and is not work
+/// waiting to be done: every cash movement with a posting date is offered to the
+/// matcher, and a payment in a shop has no counterpart to propose and never
+/// will. An empty `candidates` beside a long `unmatched` is this route's
+/// ordinary answer, not an error.
 #[utoipa::path(
     get,
     path = "/v1/transfer-pairings",
     responses(
-        (status = 200, description = "Candidate pairs and the legs nothing matched", body = CrossSourceMatchingDto),
+        (status = 200, description = "Candidate pairs, and the cash movements nothing was proposed against", body = CrossSourceMatchingDto),
         (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
@@ -2979,7 +3547,7 @@ pub async fn flow_report(
         .iter()
         .map(|action| action_dto(action, &catalog))
         .collect();
-    let dto = MoneyFlowReportDto::from_domain(&outcome.report, &outcome.population, actions)
+    let dto = MoneyFlowReportDto::from_domain(&outcome, actions)
         .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
 }
@@ -3025,6 +3593,54 @@ pub async fn balances_report(
     )
     .await?;
     Ok(Json(BalancesReportDto::from_domain(&report)))
+}
+
+/// What the owner holds at a date.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct AssetSnapshotParams {
+    /// Scope identifier.
+    pub contour: Uuid,
+    /// Scope composition version. By default — the latest.
+    #[serde(default)]
+    pub contour_version: Option<u32>,
+    /// Report date in YYYY-MM-DD format.
+    pub as_of: String,
+}
+
+/// What the owner holds at a date, grouped by the class of cash he declared.
+///
+/// The same fold as `/v1/reports/balances`, regrouped: the rows in `accounts`
+/// are that report's rows, and every total is folded from them in the core.
+/// A second path to a total could disagree with the rows it summarises.
+#[utoipa::path(
+    get,
+    path = "/v1/reports/assets",
+    params(AssetSnapshotParams),
+    responses(
+        (status = 200, description = "Cash by class, positions at the prices the journal holds, \
+                                      and the whole", body = AssetSnapshotDto),
+        (status = 404, description = "Scope not found", body = ApiError),
+        (status = 422, description = "Invalid report date", body = ApiError),
+        (status = 500, description = "Snapshot could not be built", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn asset_snapshot_report(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<AssetSnapshotParams>,
+) -> Result<Json<AssetSnapshotDto>, ApiFailure> {
+    let as_of = parse_query_date("as_of", &params.as_of)?;
+    let snapshot = asset_snapshot(
+        &state.services,
+        &principal,
+        ContourId(params.contour),
+        params.contour_version.map(ContourVersion),
+        as_of,
+    )
+    .await?;
+    Ok(Json(AssetSnapshotDto::from_domain(&snapshot)))
 }
 
 /// Returns report parameters.

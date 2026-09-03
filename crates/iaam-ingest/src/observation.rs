@@ -245,12 +245,15 @@ impl ObservedRow {
     /// [`Classification::ExternalFlow`] does not say which way the money went,
     /// and a direction does not say whether the outflow was a fee.
     ///
-    /// `InternalTransfer { to }` is read against this row's own account: the
-    /// account a rule names is the far side of the movement, so `to` equal to
-    /// this account means the money arrived from the counterparty, and `to`
-    /// different from it means the money left for `to`. An internal transfer
-    /// whose far side is this very account is refused rather than recorded as a
-    /// transfer to itself.
+    /// `InternalTransfer { to }` names the **far side** of the movement and not
+    /// a destination, so it is read against `movement` rather than against this
+    /// row's own account: outgoing, the money left for `to`; incoming, it
+    /// arrived from `to` and the operation is submitted from there. Comparing
+    /// `to` with this account instead would answer for both cases at once and be
+    /// wrong for one of them, which is iaam-xf49 — see
+    /// [`Classification::implied_movement`]. An internal transfer whose far side
+    /// is this very account is refused rather than recorded as a transfer to
+    /// itself.
     pub fn resolve(
         &self,
         classification: Classification,

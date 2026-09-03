@@ -783,3 +783,151 @@ fn a_transfer_statement_distinguishes_naming_none_from_saying_nothing() {
     // the state being asked for.
     store.clear_account_transfer_statement(owner, main).unwrap();
 }
+
+/// Many statements in one transaction, and a batch that fails writes nothing.
+///
+/// The batch exists because the queue asks the question once per account and
+/// twelve accounts were twelve round trips. What it may not become is a partial
+/// answer: a batch that wrote the statements before the bad one would leave the
+/// owner having said something he did not say, about accounts he was answering
+/// together.
+#[test]
+fn a_batch_of_transfer_statements_is_all_or_nothing() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let other_owner = OwnerId::new_random();
+    let main = AccountId::new_random();
+    let savings = AccountId::new_random();
+    let term = AccountId::new_random();
+    let foreign = AccountId::new_random();
+
+    for (id, holder, title) in [
+        (main, owner, "Main"),
+        (savings, owner, "Savings"),
+        (term, owner, "Term Deposit"),
+        (foreign, other_owner, "Main"),
+    ] {
+        store
+            .upsert_account(&AccountRecord {
+                id,
+                owner: holder,
+                title: title.into(),
+                institution: None,
+            })
+            .unwrap();
+    }
+
+    store
+        .record_account_transfer_statements(
+            owner,
+            &[
+                AccountTransferStatementRecord {
+                    account: main,
+                    partners: vec![savings, term],
+                },
+                AccountTransferStatementRecord {
+                    account: savings,
+                    partners: vec![main],
+                },
+                // «None of my others» travels in a batch like any other answer.
+                AccountTransferStatementRecord {
+                    account: term,
+                    partners: Vec::new(),
+                },
+            ],
+        )
+        .unwrap();
+
+    let listed = store.list_account_transfer_statements(owner).unwrap();
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    let mut expected = vec![savings, term];
+    expected.sort_by_key(AccountId::inner);
+    assert_eq!(
+        listed
+            .iter()
+            .find(|statement| statement.account == main)
+            .unwrap()
+            .partners,
+        expected
+    );
+    assert!(
+        listed
+            .iter()
+            .find(|statement| statement.account == term)
+            .unwrap()
+            .partners
+            .is_empty()
+    );
+
+    // A batch whose last entry names an account this owner does not hold is
+    // refused entire: the earlier entries, which would have replaced statements
+    // already standing, are not written.
+    assert!(
+        store
+            .record_account_transfer_statements(
+                owner,
+                &[
+                    AccountTransferStatementRecord {
+                        account: main,
+                        partners: Vec::new(),
+                    },
+                    AccountTransferStatementRecord {
+                        account: foreign,
+                        partners: vec![savings],
+                    },
+                ],
+            )
+            .is_err()
+    );
+
+    let listed = store.list_account_transfer_statements(owner).unwrap();
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    assert_eq!(
+        listed
+            .iter()
+            .find(|statement| statement.account == main)
+            .unwrap()
+            .partners,
+        expected,
+        "the refused batch must not have replaced the statement standing for main"
+    );
+
+    // The same holds when the offending identifier is in the partner position.
+    assert!(
+        store
+            .record_account_transfer_statements(
+                owner,
+                &[
+                    AccountTransferStatementRecord {
+                        account: savings,
+                        partners: Vec::new(),
+                    },
+                    AccountTransferStatementRecord {
+                        account: term,
+                        partners: vec![foreign],
+                    },
+                ],
+            )
+            .is_err()
+    );
+    let listed = store.list_account_transfer_statements(owner).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|statement| statement.account == savings)
+            .unwrap()
+            .partners,
+        vec![main],
+        "the refused batch must not have emptied the statement standing for savings"
+    );
+
+    // An empty batch is a no-op rather than an error: a queue with nothing left
+    // to answer must not have to special-case the call it does not make.
+    store
+        .record_account_transfer_statements(owner, &[])
+        .unwrap();
+    assert_eq!(
+        store.list_account_transfer_statements(owner).unwrap().len(),
+        3
+    );
+}

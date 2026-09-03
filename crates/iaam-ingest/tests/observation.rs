@@ -64,9 +64,12 @@ fn a_row_with_no_direction_is_asked_about_rather_than_guessed() {
 }
 
 #[test]
-fn a_counterparty_the_directory_recognises_settles_the_row_with_no_question() {
+fn a_counterparty_the_directory_recognises_settles_what_the_row_is() {
     // This is the seam `Counterparty::OwnAccount` was written for and that
     // nothing reached: a recognised counterparty is a derived internal transfer.
+    //
+    // It settles **what** the row is and not which way it ran. The row below
+    // states no direction, and recognising the counterparty does not supply one.
     let account = AccountId::new_random();
     let savings = AccountId::new_random();
     let row = ObservedRow {
@@ -114,10 +117,11 @@ fn a_rule_the_owner_already_wrote_settles_the_row_without_asking_again() {
 }
 
 #[test]
-fn the_far_side_of_an_internal_transfer_says_which_way_the_money_went() {
+fn the_far_side_of_an_internal_transfer_is_read_against_the_rows_own_account() {
     // `InternalTransfer { to }` names the far side of the movement, whichever
-    // way it went. Read against this row's own account, that is a direction: a
-    // received transfer is submitted from the account it left.
+    // way it went — so the direction has to be supplied, and is a separate
+    // argument here. Given one, the far side says which account the operation is
+    // submitted from: a received transfer is submitted from the account it left.
     let account = AccountId::new_random();
     let savings = AccountId::new_random();
     let row = inner_row(account);
@@ -148,6 +152,65 @@ fn the_far_side_of_an_internal_transfer_says_which_way_the_money_went() {
         received.kind,
         OperationKind::Transfer { to, .. } if to == account
     ));
+}
+
+#[test]
+fn an_internal_transfer_states_no_direction_of_its_own() {
+    // The account an internal transfer names is the **far side**, and a far
+    // side is not a direction. Reading `to != row.account` as "the money left"
+    // was wrong in both directions at once, because
+    // `Answer::ReceivedFromOwnAccount { from }` records the far side in that
+    // same field for money that arrived.
+    //
+    // Two of the four outcomes do state a direction, and they state it because
+    // the classification *is* the direction: a fee leaves and income arrives.
+    let savings = AccountId::new_random();
+    assert_eq!(
+        Classification::InternalTransfer { to: savings }.implied_movement(),
+        None,
+        "the far side is not a direction"
+    );
+    assert_eq!(
+        Classification::ExternalFlow.implied_movement(),
+        None,
+        "money crossing the perimeter can cross it either way"
+    );
+    assert_eq!(
+        Classification::Fee {
+            origin: FeeOrigin::Brokerage
+        }
+        .implied_movement(),
+        Some(Movement::Out)
+    );
+    assert_eq!(
+        Classification::Income.implied_movement(),
+        Some(Movement::In)
+    );
+}
+
+#[test]
+fn the_two_own_account_answers_differ_by_direction_and_not_by_far_side() {
+    // Why `Answer` is left alone. The direction is already structural — two
+    // variants, and `movement()` is total over them. What both collapse into is
+    // the *rule* vocabulary, and a rule must carry no direction: it will fire on
+    // rows the owner has never seen, and a replayed direction is the same guess
+    // in new clothing.
+    let far = AccountId::new_random();
+    let sent = Answer::SentToOwnAccount { to: far };
+    let received = Answer::ReceivedFromOwnAccount { from: far };
+
+    assert_eq!(sent.movement(), Movement::Out);
+    assert_eq!(received.movement(), Movement::In);
+    assert_eq!(
+        sent.classification(),
+        received.classification(),
+        "the same pair of accounts, and the rule that recognises them again          says nothing about which way the next row runs"
+    );
+    assert_eq!(
+        sent.classification().implied_movement(),
+        None,
+        "so nothing downstream can recover a direction from the rule alone"
+    );
 }
 
 #[test]

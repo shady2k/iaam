@@ -3154,14 +3154,19 @@ impl CashAssetClassDto {
     }
 }
 
-/// The computed action policy returned for an owner.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ActionsResponseDto {
-    pub policy_version: u32,
-    pub items: Vec<ActionDto>,
-}
-
 /// One computed action.
+///
+/// `GET /v1/actions` returns a bare array of these, and there is no envelope
+/// around it. There was one, holding a `policy_version`, and §1.5 of
+/// `docs/api/conventions.md` asks the question that removed it: is there a fact
+/// about the answer as a whole that no item can carry? The version would have
+/// been such a fact if anything moved it, and nothing did — it was the literal
+/// `1`, written at the one place the response was built, derived from nothing
+/// and bumped by nothing. A client invited to branch on it would have branched
+/// never. Three further responses already embed `Vec<ActionDto>` with no version
+/// beside it — the reconciliation answer, the broker sync outcome, the money-flow
+/// report — so the field was also absent from three quarters of the surface that
+/// publishes these items.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ActionDto {
     pub id: String,
@@ -6409,6 +6414,31 @@ pub struct ImportSessionDto {
     pub opened_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<String>,
+    /// Where to read what committing this session would do, before it does it.
+    ///
+    /// A path on the session rather than a line of prose somewhere, and the
+    /// reason is that the action queue **cannot** carry it. An item's target is
+    /// an `OperationKey` resolved through `ActionCatalog::from_openapi`, which
+    /// requires an `application/json` request schema of every key it registers;
+    /// `assess_import_session` is a GET with no request body, so registering it
+    /// would fail the catalog build at start-up rather than lead anybody
+    /// anywhere. A client that reads `target` as its map of what to call could
+    /// never have been brought here by any action, however the queue was worded.
+    ///
+    /// The cost was not theoretical. A reviewer ran a whole import without
+    /// finding this route and wrote out, as a wishlist, the seven sections it
+    /// already answers. Nothing named it: not the queue, not the session
+    /// responses, and not the commit route, which takes a `revision` whose only
+    /// source is this answer.
+    ///
+    /// It is here rather than on one response because `ImportSessionDto` is what
+    /// the open response, the list, the session contents, the commit outcome and
+    /// the assessment itself are all built from, so one field puts the route in
+    /// front of every client that holds a session at all. It is valid whatever
+    /// the state: `plan_session` reads a committed or abandoned session as
+    /// readily as an open one, and what it would have recorded is exactly what a
+    /// caller asks about after the fact.
+    pub assessment: String,
 }
 
 impl ImportSessionDto {
@@ -6421,6 +6451,7 @@ impl ImportSessionDto {
             import: session.import.map(|id| id.inner()),
             opened_at: session.opened_at.clone(),
             closed_at: session.closed_at.clone(),
+            assessment: format!("/v1/import-sessions/{}/assessment", session.id.inner()),
         }
     }
 }

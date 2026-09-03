@@ -10,9 +10,9 @@ use iaam_core::event::source_row::RowName;
 use iaam_core::ids::{AccountId, EventId, OwnerId};
 use iaam_core::money::{CurrencyCode, Money};
 use iaam_core::projection::money_flow::UndecomposedCause;
-use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
+use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue, Discrepancy};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
-use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
+use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger, Taint};
 use iaam_ingest::Verdict;
 use iaam_ingest::classification::Question;
 
@@ -467,6 +467,14 @@ pub enum OperationKey {
     SyncBroker,
     /// Answer one classification question held open by an import session.
     AnswerImportQuestion,
+    /// Retract or supersede events the owner names, one correction fact each.
+    ///
+    /// The only operation that acts on a reconciliation discrepancy, and it acts
+    /// on both of its sides: `ReconciliationLedger::build_with` resolves
+    /// corrections before it collects assertion groups, so retracting a
+    /// `ControlAssertion` removes the claim, and `observe` runs over the same
+    /// effective set, so superseding a journal event changes what was observed.
+    SubmitCorrections,
 }
 impl OperationKey {
     /// The route operation identifier declared by the transport.
@@ -483,6 +491,7 @@ impl OperationKey {
             Self::OpenImportSession => "open_import_session",
             Self::SyncBroker => "sync_broker",
             Self::AnswerImportQuestion => "answer_import_question",
+            Self::SubmitCorrections => "submit_corrections",
         }
     }
 }
@@ -849,43 +858,7 @@ fn diagnostics(
                     }
                 },
             );
-        let rows = if gap.rows.is_empty() {
-            "the legacy record cannot name the refused rows".to_owned()
-        } else {
-            let names = gap
-                .rows
-                .iter()
-                .map(|row| format!("{}:{}", row.key.source.inner(), row_name_text(&row.key.row)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("refused rows: {names}")
-        };
-        actions.push(blocked_action(
-            format!(
-                "{}:{}:{}:{}:{}",
-                ActionKind::CoverageGapUnrepaired.id(),
-                gap.account.inner(),
-                gap.period.from,
-                gap.period.to,
-                gap.source.inner()
-            ),
-            ActionKind::CoverageGapUnrepaired,
-            category,
-            Some(ActionSubject::Account(gap.account)),
-            format!(
-                "Account {} has a coverage gap from {} through {} in dimensions {}; {} ({} rows refused); no repair operation exists in this API.",
-                gap.account.inner(),
-                gap.period.from,
-                gap.period.to,
-                gap.dimensions
-                    .iter()
-                    .map(|dimension| dimension.code())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                rows,
-                gap.refused
-            ),
-        ));
+        actions.push(coverage_gap_action(gap, category));
     }
     for status in ledger
         .statuses()
@@ -893,25 +866,10 @@ fn diagnostics(
     {
         for dimension in Dimension::all() {
             if status.dimension(dimension) == DimensionStatus::AcceptedInternal {
-                actions.push(blocked_action(
-                    format!(
-                        "{}:{}:{}:{}:{}",
-                        ActionKind::IndependentConfirmationMissing.id(),
-                        status.account().inner(),
-                        status.period().from,
-                        status.period().to,
-                        dimension.code()
-                    ),
-                    ActionKind::IndependentConfirmationMissing,
-                    ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
-                    Some(ActionSubject::Account(status.account())),
-                    format!(
-                        "Account {} reached internal confirmation for {} from {} through {} but has no confirmation from a different parser and document; no acquisition operation exists in this API.",
-                        status.account().inner(),
-                        dimension.code(),
-                        status.period().from,
-                        status.period().to
-                    ),
+                actions.push(independent_confirmation_action(
+                    status.account(),
+                    status.period(),
+                    dimension,
                 ));
             }
         }
@@ -919,34 +877,282 @@ fn diagnostics(
             let ClaimOutcome::Discrepant(discrepancy) = check.outcome else {
                 continue;
             };
-            actions.push(blocked_action(
-                format!(
-                    "{}:{}:{}:{}:{}:{}",
-                    ActionKind::DiscrepancyUnresolved.id(),
-                    status.account().inner(),
-                    status.period().from,
-                    status.period().to,
-                    discrepancy.field,
-                    index
-                ),
-                ActionKind::DiscrepancyUnresolved,
-                ActionCategory::required_for(ActionKind::DiscrepancyUnresolved),
-                Some(ActionSubject::Account(status.account())),
-                format!(
-                    "Account {} has an unresolved {} discrepancy from {} through {}: claimed {}, observed {}, delta {}; the system cannot identify which side is wrong and no resolution operation exists in this API.",
-                    status.account().inner(),
-                    discrepancy.field,
-                    status.period().from,
-                    status.period().to,
-                    claim_value_text(discrepancy.claimed),
-                    claim_value_text(discrepancy.observed),
-                    claim_value_text(discrepancy.delta)
-                ),
+            actions.push(discrepancy_action(
+                status.account(),
+                status.period(),
+                discrepancy,
+                index,
             ));
         }
     }
     sort_actions(&mut actions);
     actions
+}
+
+/// A refused row stays refused, and this record stays as the account of it.
+///
+/// `Blocked` still, and the sentence now says why the two routes a reader
+/// reaches for first are not the remedy — which is the half a reader previously
+/// had to supply from nothing.
+///
+/// - `POST /v1/accounts/{account}/repairs/custody` retracts `EventKind::Trade`
+///   events whose quantity leg carries a custody identifier equal to the
+///   account's own; `sync::is_affected_trade` is the whole of its predicate. It
+///   never reads or writes an `ImportCoverageGap`, and retracting a trade cannot
+///   record a row that was never parsed.
+/// - `POST /v1/corrections/imports` selects the effective journal by provenance
+///   alone — `ImportTarget::covers` matches on the import identity or the source,
+///   with no filter on the kind — so it retracts this very coverage-gap event
+///   along with every row of that import which *did* arrive. The item would stop
+///   being published because the record of the refusal was withdrawn, which is
+///   the one outcome worse than the gap.
+///
+/// What changes this item is not an operation addressed to it. Importing the
+/// interval again through a channel that reads these rows leaves the record
+/// where it is — `EventKind::ImportCoverageGap` is a statement about one attempt
+/// — and the `category` computed by the caller drops it to `Informational` once
+/// the period reaches independent confirmation in the gap's own dimensions.
+fn coverage_gap_action(gap: &Taint, category: ActionCategory) -> Action {
+    let rows = if gap.rows.is_empty() {
+        "the legacy record cannot name the refused rows".to_owned()
+    } else {
+        let names = gap
+            .rows
+            .iter()
+            .map(|row| format!("{}:{}", row.key.source.inner(), row_name_text(&row.key.row)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("refused rows: {names}")
+    };
+    blocked_action(
+        format!(
+            "{}:{}:{}:{}:{}",
+            ActionKind::CoverageGapUnrepaired.id(),
+            gap.account.inner(),
+            gap.period.from,
+            gap.period.to,
+            gap.source.inner()
+        ),
+        ActionKind::CoverageGapUnrepaired,
+        category,
+        Some(ActionSubject::Account(gap.account)),
+        format!(
+            "Account {} has a coverage gap from {} through {} in dimensions {}; {} ({} rows \
+             refused). No operation in this API records a refused row, and neither obvious \
+             route is one: retracting the import withdraws the rows that did arrive and this \
+             record of the refusal with them, and the custody repair acts only on trades whose \
+             custody was fabricated from the account identifier. Import the interval again \
+             through a channel that reads these rows; this record stays, because it is a \
+             statement about one attempt and not about the interval.",
+            gap.account.inner(),
+            gap.period.from,
+            gap.period.to,
+            gap.dimensions
+                .iter()
+                .map(|dimension| dimension.code())
+                .collect::<Vec<_>>()
+                .join(", "),
+            rows,
+            gap.refused
+        ),
+    )
+}
+
+/// Confirmation of one dimension by a channel that is not the one already used.
+///
+/// Promoted for cash and positions and still blocked for the other two, and the
+/// split is read off the core rather than chosen. `ground_three` is the only
+/// ground that reaches `AcceptedIndependent` from a second channel over the same
+/// interval; it files its finding under `Ground::BrokerApiAgreesWithStatement`;
+/// and `Ground::dimensions` lets that ground promote `Cash` and `Positions`
+/// only. For tax basis and income the grounds that reach them — a depository
+/// report, a tax-agent certificate, a payout confirming a schedule — enter
+/// through `ReconciliationLedger::with_external_evidence`, which no handler
+/// calls, so for those two the old claim is true and is kept.
+///
+/// For cash and positions, `POST /v1/brokers/{broker}/sync` closes the item.
+/// `scenarios::sync` records a `ControlAssertion` per claim under the channel's
+/// own source and parser version, with a document hash derived from the
+/// assertion's identity rather than from a file, so it is independent of a
+/// statement channel by `SourceChannel::is_independent_of` — a different parser
+/// version **and** a different document, which is the whole conjunction. The
+/// account and the interval are this item's own and are preset; the broker code
+/// is not, because nothing in the ledger says which channel an account is held
+/// at.
+///
+/// A second **document** closes it too — `scenarios::documents` records control
+/// assertions under a source, a parser version and the file's hash — and it is
+/// deliberately not published as a second resolution. `POST /v1/documents` takes
+/// a binary workbook and declares no `application/json` request body, so
+/// `ActionCatalog::from_openapi` refuses it with `MissingRequestSchema` and
+/// registering it would fail the server's start rather than help a caller. It
+/// stays in the reason, beside the honest half `start_account_import_action`
+/// also keeps: fetching a document out of an institution is a step outside this
+/// API, and a step outside this API is not a missing route.
+///
+/// **Not** `POST /v1/reconciliation/balance`. An owner-stated balance is
+/// `Ground::OwnerStatedBalance`, capped at `AcceptedInternal` by design — the
+/// owner may have read the same figure in the same report that was parsed — so
+/// it cannot raise a dimension past the level this item reports.
+///
+/// `Scope::Agent` on the promoted half, for the reason
+/// `start_account_import_action` gives: `sync_broker` checks `may_submit`, which
+/// an agent token satisfies, and marking the item owner-only would tell an agent
+/// it may not send a request the server would accept.
+fn independent_confirmation_action(
+    account: AccountId,
+    period: AssertionPeriod,
+    dimension: Dimension,
+) -> Action {
+    let id = format!(
+        "{}:{}:{}:{}:{}",
+        ActionKind::IndependentConfirmationMissing.id(),
+        account.inner(),
+        period.from,
+        period.to,
+        dimension.code()
+    );
+    let observed = format!(
+        "Account {} reached internal confirmation for {} from {} through {} but has no \
+         confirmation from a different parser and document",
+        account.inner(),
+        dimension.code(),
+        period.from,
+        period.to
+    );
+    if !matches!(dimension, Dimension::Cash | Dimension::Positions) {
+        return blocked_action(
+            id,
+            ActionKind::IndependentConfirmationMissing,
+            ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
+            Some(ActionSubject::Account(account)),
+            format!(
+                "{observed}. No operation in this API confirms this dimension from a second \
+                 channel: a broker channel agreeing with a statement raises cash and positions \
+                 and nothing else, and the grounds that reach tax basis and income — a \
+                 depository report, a tax-agent certificate, a payout confirming a schedule — \
+                 are recorded as external evidence, which no route accepts."
+            ),
+        );
+    }
+    let mut preset = BTreeMap::new();
+    preset.insert("account".to_owned(), account.inner().to_string().into());
+    preset.insert("from".to_owned(), period.from.to_string().into());
+    preset.insert("to".to_owned(), period.to.to_string().into());
+    Action::new(
+        ActionFacts {
+            id,
+            kind: ActionKind::IndependentConfirmationMissing,
+            category: ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Agent),
+            subject: Some(ActionSubject::Account(account)),
+        },
+        format!(
+            "{observed}. Synchronise a broker channel over this same interval: its assertions \
+             carry the channel's own parser version and a document that is not the statement's, \
+             which is what independence means here. A second statement from another institution \
+             confirms it as well, and no operation here fetches one — the owner obtains the \
+             document himself, and uploading it is not a call the queue can name. Restating the \
+             balance yourself does not confirm it: an owner-stated figure is capped at internal \
+             confirmation on purpose.",
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::SyncBroker,
+            request: RequestPlan {
+                preset,
+                // A path segment, published as a missing field exactly as
+                // `start_account_import_action` publishes it: which broker holds
+                // this account is the owner's to name, and the ledger does not
+                // record it.
+                missing: vec![MissingInput::plain("/broker", ProvidedBy::Owner)],
+            },
+        },
+    )
+    .expect("an independent confirmation item names the channel that supplies it")
+}
+
+/// Which side is wrong is the owner's to say, and one operation says it.
+///
+/// The old sentence stopped after its true half. The system genuinely cannot
+/// tell a claim that is wrong from a journal that is; it does not follow that
+/// nothing in this API acts on the item, and `POST /v1/corrections` acts on it
+/// from either side:
+///
+/// - the claim side — `ReconciliationLedger::build_with` resolves corrections
+///   before it collects groups, so a retracted `ControlAssertion` forms no group
+///   and the check reported here goes with it;
+/// - the journal side — `observe` runs over that same effective set, so an event
+///   superseded or retracted changes what was observed and `check_claim` is
+///   asked again.
+///
+/// **Not** `POST /v1/reconciliation/balance`. Recording another balance appends
+/// a group: `merge_status` extends `outcomes` and keeps `Discrepant` from either
+/// side on purpose, because confirmation from a second document must not
+/// override a problem already detected. The discrepant check this item reads
+/// would sit in the status exactly where it was, and the item would be published
+/// again after the call.
+///
+/// Nothing is preset. A `Discrepancy` carries a field name and three figures and
+/// no event identifier, so the target of a correction cannot be proposed from it
+/// — the reasoning `undecomposed_outflows_action` states about a matcher, for
+/// the same reason: the diagnostic deliberately does not retain what it would
+/// take to fill the field.
+///
+/// `Scope::Owner`: `submit_corrections` is behind `require_admin`, and it is
+/// there so that an agent token cannot retract the owner's history.
+fn discrepancy_action(
+    account: AccountId,
+    period: AssertionPeriod,
+    discrepancy: Discrepancy,
+    index: usize,
+) -> Action {
+    Action::new(
+        ActionFacts {
+            id: format!(
+                "{}:{}:{}:{}:{}:{}",
+                ActionKind::DiscrepancyUnresolved.id(),
+                account.inner(),
+                period.from,
+                period.to,
+                discrepancy.field,
+                index
+            ),
+            kind: ActionKind::DiscrepancyUnresolved,
+            category: ActionCategory::required_for(ActionKind::DiscrepancyUnresolved),
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Owner),
+            subject: Some(ActionSubject::Account(account)),
+        },
+        format!(
+            "Account {} has an unresolved {} discrepancy from {} through {}: claimed {}, \
+             observed {}, delta {}. The system cannot identify which side is wrong; you can, \
+             and one operation settles either — retract the control assertion that claimed \
+             wrongly, or supersede the journal event that recorded wrongly. Recording another \
+             balance does not settle it: a detected discrepancy is kept through every later \
+             confirmation, by design.",
+            account.inner(),
+            discrepancy.field,
+            period.from,
+            period.to,
+            claim_value_text(discrepancy.claimed),
+            claim_value_text(discrepancy.observed),
+            claim_value_text(discrepancy.delta)
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::SubmitCorrections,
+            request: RequestPlan {
+                // Nothing: this item names an account, an interval and three
+                // figures, and the request names events.
+                preset: BTreeMap::new(),
+                missing: vec![
+                    MissingInput::plain("/corrections", ProvidedBy::Owner),
+                    MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+                ],
+            },
+        },
+    )
+    .expect("a discrepancy item names the correction operation that settles it")
 }
 
 /// Find undecomposed outflows and unexplained account residuals in a flow report.
@@ -973,26 +1179,54 @@ pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
         .residuals_by_account()
         .expect("money flow residual breakdown")
     {
-        actions.push(blocked_action(
-            format!(
-                "{}:{}:{}",
-                ActionKind::UnexplainedResidual.id(),
-                account.inner(),
-                amount.currency().code()
-            ),
-            ActionKind::UnexplainedResidual,
-            ActionCategory::Informational,
-            Some(ActionSubject::Account(account)),
-            format!(
-                "Account {} has an unexplained residual of {} {}; the report quantities do not explain its cash change and no report operation can resolve it.",
-                account.inner(),
-                amount.to_calc_dec().inner(),
-                amount.currency().code()
-            ),
-        ));
+        actions.push(unexplained_residual_action(account, amount));
     }
     sort_actions(&mut actions);
     actions
+}
+
+/// The cash an account's own quantities do not account for.
+///
+/// `Blocked` stands; the sentence that earned it did not. It said no **report**
+/// operation can resolve the residual, which is verbatim the phrasing
+/// `undecomposed_outflows_action` records as having been wrong for the same
+/// reason a few lines below: the action catalogue resolves a target against the
+/// whole completed contract, not a report-local namespace, so «no report
+/// operation» grades nothing at all. Left there it read as the sentence that had
+/// already bought `Blocked` wrongly once.
+///
+/// The true reason is narrower, and it is now the one published. A residual is
+/// `MoneyFlow::residual_of` — an account's cash delta less the seven quantities
+/// that explain it — aggregated over one account and one currency. It names no
+/// event. Every operation that could move it is addressed to an event the caller
+/// names: `POST /v1/corrections` supersedes or retracts one, and this figure
+/// identifies none, so publishing that route here would name a request whose
+/// only required field this item cannot fill.
+///
+/// `Informational` is unchanged and is right: nothing is hidden. The figure is
+/// published as its own line rather than folded into a bucket, which is what
+/// makes it a fact worth stating rather than work waiting to be done.
+fn unexplained_residual_action(account: AccountId, amount: Money) -> Action {
+    blocked_action(
+        format!(
+            "{}:{}:{}",
+            ActionKind::UnexplainedResidual.id(),
+            account.inner(),
+            amount.currency().code()
+        ),
+        ActionKind::UnexplainedResidual,
+        ActionCategory::Informational,
+        Some(ActionSubject::Account(account)),
+        format!(
+            "Account {} has an unexplained residual of {} {}: the seven report quantities do \
+             not add up to its cash change. This is an aggregate over one account and one \
+             currency and it names no event, so no operation in this API is addressed to it — \
+             a correction acts on an event the caller names, and this figure names none.",
+            account.inner(),
+            amount.to_calc_dec().inner(),
+            amount.currency().code()
+        ),
+    )
 }
 
 /// The owner's remedy for outflow rows no category rule matched.
@@ -1878,8 +2112,10 @@ fn start_account_import_action(account: AccountId) -> Action {
              Fetching the statement out of the bank is a step outside this API — no \
              operation here downloads the document, and the owner obtains it himself. \
              Recording it is not: open an import session for this account, feed it the \
-             rows and commit, or synchronise a broker channel over an interval. Import \
-             is continuous and never complete.",
+             rows, read the assessment the session publishes to see what committing would \
+             record and what it would not, and commit under the revision that assessment \
+             carries; or synchronise a broker channel over an interval. Import is \
+             continuous and never complete.",
             account.inner()
         ),
         ActionTarget::from_options(vec![session, sync]),
@@ -3840,6 +4076,18 @@ mod tests {
         assert_eq!(action.required_scope(), None);
         assert_eq!(action.target(), &ActionTarget::None);
         assert!(action.reason().contains("given:row-17"));
+        // The half a reader had to supply from nothing: why the two routes that
+        // look like a repair are not one.
+        assert!(
+            action.reason().contains("retracting the import"),
+            "{}",
+            action.reason()
+        );
+        assert!(
+            action.reason().contains("custody repair"),
+            "{}",
+            action.reason()
+        );
     }
 
     #[test]
@@ -3898,9 +4146,79 @@ mod tests {
             action.category(),
             ActionCategory::required_for(ActionKind::IndependentConfirmationMissing)
         );
-        assert_eq!(action.state(), ActionState::Blocked);
         assert!(action.reason().contains("different parser and document"));
+        // Cash is one of the two dimensions a second channel can raise, so the
+        // item names the call that supplies one instead of claiming there is
+        // none. `Scope::Agent`, because `sync_broker` checks `may_submit`.
+        assert_eq!(action.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(action.required_scope(), Some(Scope::Agent));
+        let ActionTarget::Operation { operation, request } = action.target() else {
+            panic!("an internally confirmed cash dimension names the broker sync");
+        };
+        assert_eq!(*operation, OperationKey::SyncBroker);
+        assert_eq!(
+            request
+                .preset
+                .get("account")
+                .and_then(|value| value.as_str()),
+            Some(account.inner().to_string().as_str())
+        );
+        assert_eq!(
+            request.preset.get("from").and_then(|value| value.as_str()),
+            Some("2026-08-01")
+        );
+        assert_eq!(
+            request.preset.get("to").and_then(|value| value.as_str()),
+            Some("2026-08-31")
+        );
+        let missing: Vec<&str> = request
+            .missing
+            .iter()
+            .map(|input| input.pointer.as_str())
+            .collect();
+        assert_eq!(missing, vec!["/broker"]);
+    }
+
+    /// The half of the same item that has no route, and must keep saying so.
+    ///
+    /// `Ground::BrokerApiAgreesWithStatement` promotes cash and positions only,
+    /// and the grounds that reach tax basis and income enter through
+    /// `with_external_evidence`, which no handler calls. Promoting this half
+    /// would name a call that cannot raise the dimension it is offered for.
+    #[test]
+    fn an_internally_confirmed_tax_dimension_still_has_no_operation() {
+        let account = AccountId::new_random();
+        let channel = SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("same".to_owned()),
+            document: RawHash::parse(&"d".repeat(64)),
+        };
+        let ledger = ReconciliationLedger::default().with_external_evidence(vec![(
+            account,
+            august(),
+            Evidence::from_match(
+                Ground::TaxAgentCertificate,
+                channel.clone(),
+                channel,
+                BTreeSet::from([Dimension::TaxBasis]),
+            )
+            .expect("evidence"),
+        )]);
+
+        let action = ledger_diagnostics(&ledger)
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::IndependentConfirmationMissing)
+            .expect("independence diagnostic");
+
+        assert_eq!(action.state(), ActionState::Blocked);
         assert_eq!(action.target(), &ActionTarget::None);
+        assert_eq!(action.required_scope(), None);
+        assert!(action.id().ends_with(":tax_basis"), "{}", action.id());
+        assert!(
+            action.reason().contains("external evidence"),
+            "{}",
+            action.reason()
+        );
     }
 
     #[test]
@@ -3940,7 +4258,6 @@ mod tests {
             action.category(),
             ActionCategory::required_for(ActionKind::DiscrepancyUnresolved)
         );
-        assert_eq!(action.state(), ActionState::Blocked);
         assert!(
             action.reason().contains("claimed 10.00 RUB"),
             "{}",
@@ -3948,7 +4265,32 @@ mod tests {
         );
         assert!(action.reason().contains("observed 5.00 RUB"));
         assert!(action.reason().contains("delta 5.00 RUB"));
-        assert_eq!(action.target(), &ActionTarget::None);
+        // The system still cannot say which side is wrong. One operation settles
+        // either side once the owner has, and it is in this same API.
+        assert_eq!(action.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(action.required_scope(), Some(Scope::Owner));
+        let ActionTarget::Operation { operation, request } = action.target() else {
+            panic!("a discrepancy names the correction that settles it");
+        };
+        assert_eq!(*operation, OperationKey::SubmitCorrections);
+        assert!(
+            request.preset.is_empty(),
+            "a discrepancy names no event, so it proposes no correction: {:?}",
+            request.preset
+        );
+        let missing: Vec<&str> = request
+            .missing
+            .iter()
+            .map(|input| input.pointer.as_str())
+            .collect();
+        assert_eq!(missing, vec!["/corrections", "/acknowledge_retraction"]);
+        assert!(
+            action
+                .reason()
+                .contains("Recording another balance does not"),
+            "{}",
+            action.reason()
+        );
     }
 
     #[test]
@@ -4504,12 +4846,16 @@ mod tests {
                     "{} is not blocked and must name the operation that answers it",
                     action.id()
                 );
-                assert_eq!(
-                    action.required_scope(),
-                    Some(Scope::Owner),
-                    "{}",
-                    action.id()
-                );
+                // Some scope, and the scope the named route actually checks:
+                // `create_category_rule` and `submit_corrections` are owner-only,
+                // `sync_broker` admits an agent token, and an item that named the
+                // wrong one would tell a caller it may not send a request the
+                // server would accept.
+                let expected = match action.kind() {
+                    ActionKind::IndependentConfirmationMissing => Scope::Agent,
+                    _ => Scope::Owner,
+                };
+                assert_eq!(action.required_scope(), Some(expected), "{}", action.id());
             }
         }
 

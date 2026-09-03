@@ -71,7 +71,7 @@ use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
     AccountAliasDto, AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
-    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto, ActionsResponseDto,
+    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto,
     AddContourVersionRequest, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest,
     CashAssetClassDto, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest,
     CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
@@ -113,23 +113,22 @@ pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 #[utoipa::path(
     get,
     path = "/v1/actions",
-    responses((status = 200, description = "Computed owner actions", body = ActionsResponseDto)),
+    responses((status = 200, description = "Computed owner actions", body = Vec<ActionDto>)),
     security(("bearer" = []))
 )]
 pub async fn list_actions(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
-) -> Result<Json<ActionsResponseDto>, ApiFailure> {
+) -> Result<Json<Vec<ActionDto>>, ApiFailure> {
     let actions =
         iaam_app::actions::frontier(principal.owner, state.services.store.as_ref()).await?;
-    Ok(Json(ActionsResponseDto {
-        policy_version: 1,
-        items: actions
+    Ok(Json(
+        actions
             .iter()
             .map(|action| action_dto(action, &catalog))
             .collect(),
-    }))
+    ))
 }
 
 fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {

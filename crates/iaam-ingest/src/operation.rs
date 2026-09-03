@@ -273,6 +273,14 @@ pub struct SubmittedOperation {
     #[serde(default)]
     pub source_time: Option<time::Time>,
     /// Client idempotency key (§10.6).
+    ///
+    /// It names the **fact**, not the submission slot. The key is matched
+    /// before the operation is compared to anything, so a row re-sent under a
+    /// key already recorded is a duplicate however its values changed: a
+    /// corrected amount under a used key is discarded, and the journal keeps
+    /// the number that was wrong. Nothing on this path retracts anything — a
+    /// wrong fact is corrected through the correction scenario, and re-sending
+    /// is not a retract-and-add.
     pub idempotency_key: Option<String>,
     /// Operation identifier in the source, if present.
     pub source_operation_id: Option<String>,

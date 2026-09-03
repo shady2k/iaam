@@ -325,6 +325,25 @@ that is the right answer, not an error. Without a key, sending again creates a
 second event: two identical purchases on one day are a legitimate situation,
 and the system has no right to merge them.
 
+**A key names a fact, not a slot, and this is where agents lose an afternoon.**
+The key is matched before anything in the body is looked at. So a row you
+**corrected** and resent under the key you used the first time is answered
+`duplicate` and writes nothing: the journal keeps the wrong number, and the
+answer looks like success. Re-sending is not a retraction — nothing on the
+import path retracts anything, so it is a no-op rather than a
+retract-and-add.
+
+A fact that turned out wrong is **corrected, never resent.** The correction is
+a replacement: it retracts the recorded fact and states what should have stood
+instead. It is the owner's act, not yours — find the affected events, tell him
+what is wrong, and prepare the request. Advising him to "send it again with the
+right numbers" wastes the afternoon and leaves the journal exactly as it was.
+
+Keys are scoped to the **owner**, not to the account or the import. Two
+unrelated statements whose rows are both keyed `row-1` are one fact as far as
+this is concerned, and the second is silently discarded. Build a key from the
+document and the row within it, never from the row alone.
+
 ## What to assert for a reconstructed opening
 
 A position-opening operation has an optional block of assertions — what the

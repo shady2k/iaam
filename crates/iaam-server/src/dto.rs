@@ -527,6 +527,36 @@ pub struct OperationDto {
     pub kind: OperationKindDto,
     #[serde(default)]
     pub dates: OperationDatesDto,
+    /// A name the caller gives **the fact**, so sending it twice records it
+    /// once (§10.6, level two).
+    ///
+    /// A key names a fact, not a slot. Re-sending under a key the journal
+    /// already holds is answered `duplicate` with the identifier of the first
+    /// event, whatever the rest of the body says — the key is matched before
+    /// the operation is compared to anything, so a **corrected** row under a
+    /// key already used writes nothing and the journal keeps the wrong number.
+    /// The response is a success, and it is easy to read as "the correction
+    /// landed".
+    ///
+    /// This is the natural first move of an agent client — "the numbers were
+    /// wrong, so I fixed them and resent" — and it is precisely the one that
+    /// does nothing. **A fact that turned out wrong is corrected, never
+    /// resent**: `POST /v1/corrections` with a `replacement` retracts the
+    /// recorded event and states what should have stood instead, and it is the
+    /// only thing that changes a number already in the journal. Re-use is not
+    /// reversal: nothing on the ingest path writes a retraction, so a repeated
+    /// submission is a no-op rather than a retract-and-add.
+    ///
+    /// The key is scoped to the **owner**, not to the account, the source or
+    /// the import: two unrelated statements whose rows are keyed `row-1` are
+    /// one fact as far as this field is concerned. Construct keys that are
+    /// unique across everything the owner will ever import — the document and
+    /// the row within it, rather than the row alone.
+    ///
+    /// Omitting it is not a lesser version of sending it. Without a key a
+    /// second submission of the same row is a second event, because two
+    /// identical purchases on one day are an ordinary thing and the system has
+    /// no right to merge them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6848,6 +6878,9 @@ pub struct JournalEventDto {
     /// inside a nested object.
     #[serde(flatten)]
     pub fact: JournalFactDto,
+    /// As on [`OperationDto::idempotency_key`], including the failure it makes
+    /// easy: a corrected fact re-sent under a key already recorded is answered
+    /// `duplicate` and changes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

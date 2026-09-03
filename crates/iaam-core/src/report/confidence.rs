@@ -70,6 +70,18 @@ pub enum ReportGoal {
 }
 
 impl ReportGoal {
+    /// Every goal, in the order this vocabulary is published.
+    ///
+    /// Listed so that a caller enumerating the four cannot publish three: the
+    /// discovery catalog names the route that answers each goal, and it walks
+    /// this array rather than a list of its own.
+    pub const ALL: [Self; 4] = [
+        Self::AssetSnapshot,
+        Self::MoneyFlow,
+        Self::Returns,
+        Self::Reconciliation,
+    ];
+
     /// The machine-readable name carried to a caller.
     #[must_use]
     pub const fn code(self) -> &'static str {

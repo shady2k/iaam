@@ -777,12 +777,14 @@ async fn the_two_legs_of_the_cross_bank_transfer_can_be_related() {
         accounts.everyday.to_string(),
         "{proposals}"
     );
-    // The month's other one-sided movements are reported as unmatched rather
-    // than dropped: a leg that vanished from the answer is a leg the owner reads
-    // as external flow by default.
-    let unmatched = proposals["unmatched"].as_array().expect("unmatched legs");
+    // The month's other one-sided movements are reported as having no
+    // counterpart rather than dropped: a leg that vanished from the answer is a
+    // leg the owner reads as external flow by default.
+    let without_counterpart = proposals["without_counterpart"]
+        .as_array()
+        .expect("legs with no counterpart");
     assert_eq!(
-        unmatched.len(),
+        without_counterpart.len(),
         2,
         "the pay and the expense pair with nothing: {proposals}"
     );

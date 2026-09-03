@@ -17,7 +17,13 @@ Three steps, in order:
 
 1. `/.well-known/api-catalog` (RFC 9727) returns a linkset (RFC 9264). Its
    `service-desc` link addresses the machine-readable contract; its `status`
-   link addresses the health resource.
+   link addresses the health resource. Its `related` links address the rest of
+   the way in: the outstanding-work queue, the scopes a report is computed over,
+   and the four questions this system answers about money — each of those four
+   tagged with the `goal` name that the queue's items and every report's
+   confidence register also use, so a caveat naming a goal leads to the resource
+   that answers it. Take addresses from that document, never from this file,
+   which deliberately holds none.
 2. The document behind `service-desc` is the contract: the routes, methods,
    request and response schemas and status codes this instance actually serves,
    generated from its handlers. Read it instead of asking a human which routes

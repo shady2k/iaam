@@ -5655,6 +5655,8 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
                     "folded_from": null,
                     "folded_through": null,
                     "start": "no_recorded_movement",
+                    "compared": "level",
+                    "compared_since": null,
                 },
             }],
             "taints": [],

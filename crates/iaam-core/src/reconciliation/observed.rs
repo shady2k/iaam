@@ -17,7 +17,7 @@ use thiserror::Error;
 use time::Date;
 
 use super::anchor::{OpeningAnchor, OpeningAnchors};
-use super::claim::{AssertionPeriod, BalancePoint};
+use super::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use crate::event::Event;
 use crate::event::correction::CorrectionError;
 use crate::event::kind::EventKind;
@@ -106,6 +106,98 @@ impl FoldSpan {
     }
 }
 
+/// A moment a balance can be stated at: a date, and whether the balance is the
+/// state before that day's movements or after them.
+///
+/// Ordered by date first and by inclusion second, which is what makes «the
+/// latest stated balance earlier than this claim» well defined when one
+/// statement closes on the day the next one opens. Without the second field
+/// those two statements would be the same moment, and picking between them
+/// would be arbitrary — while they are in fact one day apart in what they
+/// include.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BalanceMoment {
+    pub date: Date,
+    /// Whether that day's own movements are inside the balance.
+    pub inclusive: bool,
+}
+
+impl BalanceMoment {
+    /// The moment a claim over `period` speaks about.
+    ///
+    /// An opening balance is the state **before** the first event of the
+    /// interval, and a closing balance includes the last one (§10.3), so the
+    /// two points of one interval are its two ends and never the same moment.
+    #[must_use]
+    pub const fn of(period: AssertionPeriod, at: BalancePoint) -> Self {
+        match at {
+            BalancePoint::Opening => Self {
+                date: period.from,
+                inclusive: false,
+            },
+            BalancePoint::Closing => Self {
+                date: period.to,
+                inclusive: true,
+            },
+        }
+    }
+
+    /// Whether an event dated `date` is inside the balance at this moment.
+    #[must_use]
+    pub fn covers(self, date: Date) -> bool {
+        if self.inclusive {
+            date <= self.date
+        } else {
+            date < self.date
+        }
+    }
+}
+
+/// An earlier balance a source stated, and what the journal's own fold said at
+/// the same moment.
+///
+/// This is what lets a balance be checked over a history nothing anchors
+/// (`iaam-c6f0`). The level cannot be compared — the fold began from an
+/// invented zero — but the **change** can: the unknown start is present in both
+/// folds and cancels out of their difference. So `claimed − claimed_before` is
+/// compared against `observed − observed_before`, and what that answers is
+/// exactly what reconciliation is for (§10.3): whether the movements recorded
+/// between two stated balances account for the distance between them.
+///
+/// `observed` is a fold from zero like every other figure here, and it is not a
+/// balance either. It is not published as one and never leaves this comparison.
+///
+/// **The stated balance is not folded into the observed side.** Seeding the
+/// projection with a source's own figure would put the claim side into the
+/// observed side, and this module exists to keep them apart: a shared value
+/// between them turns the check into a tautology. Differencing two independent
+/// folds keeps both sides the journal's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Baseline {
+    /// The moment the earlier balance speaks about.
+    pub at: BalanceMoment,
+    /// What the source said was there.
+    pub claimed: PostedMinor,
+    /// What the journal's fold said at the same moment.
+    pub observed: PostedMinor,
+}
+
+/// The moment picked as a claim's baseline, and the figure stated there when
+/// the sources agree about it.
+#[derive(Debug, Clone, Copy)]
+struct Chosen {
+    at: BalanceMoment,
+    claimed: Option<PostedMinor>,
+}
+
+/// One cash balance a source stated somewhere in the journal.
+#[derive(Debug, Clone, Copy)]
+struct StatedBalance {
+    at: BalanceMoment,
+    currency: CurrencyCode,
+    claimed: PostedMinor,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ObserveError {
     #[error("event {event:?} has no date and falls within no period")]
@@ -140,6 +232,9 @@ pub struct ObservedTotals {
     position_anchor: BTreeMap<(InstrumentId, CustodyId), OpeningAnchor>,
     before: FoldSpan,
     within: FoldSpan,
+    /// The earlier stated balance each of this interval's two balance points can
+    /// be measured from, where there is one.
+    cash_baseline: BTreeMap<(BalancePoint, CurrencyCode), Baseline>,
 }
 
 impl ObservedTotals {
@@ -228,6 +323,14 @@ impl ObservedTotals {
         self.within
     }
 
+    /// The earlier stated cash balance a claim at this point can be measured
+    /// from. `None` where no source has stated one earlier than that point, or
+    /// where two disagree about the same moment and neither can serve.
+    #[must_use]
+    pub fn cash_baseline(&self, at: BalancePoint, currency: CurrencyCode) -> Option<Baseline> {
+        self.cash_baseline.get(&(at, currency)).copied()
+    }
+
     /// How many account events the journal saw during and before the interval.
     /// Zero means there is nothing to verify: no history exists.
     #[must_use]
@@ -253,12 +356,25 @@ pub fn observe(
     let mut opening = Balances::new();
     let mut closing = Balances::new();
     let mut totals = ObservedTotals::default();
+    // Chosen before the fold, because a baseline is a moment to cut the fold at
+    // and the cut has to be known while the events are going past.
+    let chosen = choose_baselines(&stated_cash_balances(events, account), period);
+    let mut baseline_folds: Vec<(BalanceMoment, Balances)> = distinct_moments(&chosen)
+        .into_iter()
+        .map(|moment| (moment, Balances::new()))
+        .collect();
 
     for event in events {
         let date = event
             .dates
             .effective_date()
             .ok_or(ObserveError::EventWithoutDate { event: event.id })?;
+
+        for (moment, fold) in &mut baseline_folds {
+            if moment.covers(date) {
+                fold.apply(event)?;
+            }
+        }
 
         let touches_us = event.legs.iter().any(|leg| leg.account == account);
         if date < period.from {
@@ -287,7 +403,144 @@ pub fn observe(
     // account, and asking it per interval would make a March figure anchored
     // and the same account's April figure not.
     record_anchors(&OpeningAnchors::of(events), account, &mut totals);
+    record_baselines(&chosen, &baseline_folds, account, &mut totals);
     Ok(totals)
+}
+
+/// Every cash balance any source stated about this account, anywhere in the
+/// journal.
+///
+/// Read from the event's own account and not from legs, because an assertion has
+/// none: it moves no money (§10.3).
+fn stated_cash_balances(events: &[&Event], account: AccountId) -> Vec<StatedBalance> {
+    let mut stated = Vec::new();
+    for event in events {
+        if event.account != account {
+            continue;
+        }
+        let EventKind::ControlAssertion { period, claim } = event.kind else {
+            continue;
+        };
+        let ControlClaim::CashBalance {
+            currency,
+            amount,
+            at,
+        } = claim
+        else {
+            continue;
+        };
+        stated.push(StatedBalance {
+            at: BalanceMoment::of(period, at),
+            currency,
+            claimed: amount,
+        });
+    }
+    stated
+}
+
+/// For each of this interval's two balance points and each currency, the latest
+/// stated balance strictly earlier than that point.
+///
+/// **Strictly earlier**, so a claim is never its own baseline: comparing a
+/// figure against itself confirms nothing and would report `matched` for every
+/// assertion ever recorded.
+///
+/// Where two statements name the same moment and disagree about the amount,
+/// neither is chosen. Picking one would be arbitrary, and the contradiction is
+/// already reported: each of the two is compared in its own right.
+fn choose_baselines(
+    stated: &[StatedBalance],
+    period: AssertionPeriod,
+) -> BTreeMap<(BalancePoint, CurrencyCode), Chosen> {
+    let mut latest: BTreeMap<(BalancePoint, CurrencyCode), BalanceMoment> = BTreeMap::new();
+    for at in [BalancePoint::Opening, BalancePoint::Closing] {
+        let point = BalanceMoment::of(period, at);
+        for candidate in stated.iter().filter(|candidate| candidate.at < point) {
+            latest
+                .entry((at, candidate.currency))
+                .and_modify(|known| {
+                    if candidate.at > *known {
+                        *known = candidate.at;
+                    }
+                })
+                .or_insert(candidate.at);
+        }
+    }
+    latest
+        .into_iter()
+        .map(|((at, currency), moment)| {
+            let mut agreed: Option<PostedMinor> = None;
+            let mut contradicted = false;
+            for candidate in stated
+                .iter()
+                .filter(|candidate| candidate.currency == currency && candidate.at == moment)
+            {
+                match agreed {
+                    Some(claimed) if claimed != candidate.claimed => contradicted = true,
+                    Some(_) => {}
+                    None => agreed = Some(candidate.claimed),
+                }
+            }
+            (
+                (at, currency),
+                Chosen {
+                    at: moment,
+                    // A contradiction is carried as the absence of a figure, not
+                    // as one of the two. `None` here means «no baseline», which
+                    // is what two sources disagreeing about one moment leaves
+                    // behind; the disagreement itself is reported where each of
+                    // them is checked.
+                    claimed: if contradicted { None } else { agreed },
+                },
+            )
+        })
+        .collect()
+}
+
+fn distinct_moments(chosen: &BTreeMap<(BalancePoint, CurrencyCode), Chosen>) -> Vec<BalanceMoment> {
+    let mut moments: Vec<BalanceMoment> = chosen
+        .values()
+        .filter(|chosen| chosen.claimed.is_some())
+        .map(|chosen| chosen.at)
+        .collect();
+    moments.sort_unstable();
+    moments.dedup();
+    moments
+}
+
+/// Pair each chosen baseline with what the journal's fold said at its moment.
+///
+/// A currency absent from the fold contributes zero, and that zero is exact:
+/// the fold is defined from zero, so «no legs yet» is precisely zero *of the
+/// fold*, whatever the account really held. Only the difference of two such
+/// folds is ever used, and the unknown start cancels out of it.
+fn record_baselines(
+    chosen: &BTreeMap<(BalancePoint, CurrencyCode), Chosen>,
+    folds: &[(BalanceMoment, Balances)],
+    account: AccountId,
+    totals: &mut ObservedTotals,
+) {
+    for ((at, currency), chosen) in chosen {
+        let Some(claimed) = chosen.claimed else {
+            continue;
+        };
+        let Some((_, fold)) = folds.iter().find(|(moment, _)| *moment == chosen.at) else {
+            continue;
+        };
+        let mut snapshot = BTreeMap::new();
+        snapshot_cash(fold, account, &mut snapshot);
+        totals.cash_baseline.insert(
+            (*at, *currency),
+            Baseline {
+                at: chosen.at,
+                claimed,
+                observed: snapshot
+                    .get(currency)
+                    .copied()
+                    .unwrap_or(PostedMinor::new(0)),
+            },
+        );
+    }
 }
 
 /// Record, for every key a fold produced a figure for, whether its start is

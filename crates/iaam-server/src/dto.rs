@@ -5348,6 +5348,7 @@ mod tests {
                     last: Some(time::macros::date!(2026 - 03 - 10)),
                 },
                 start: iaam_core::reconciliation::check::ObservedStart::Asserted,
+                compared: iaam_core::reconciliation::check::Compared::Level,
             },
         }
     }
@@ -5725,6 +5726,31 @@ pub struct ObservationBasisDto {
     /// `not_a_balance` — the claim is an interval total, which starts from no
     /// state at all.
     pub start: String,
+    /// Which quantity was actually put against the claim.
+    ///
+    /// `level` — the figure itself. `change_since_stated_balance` — the change
+    /// since an earlier balance a source stated, which is comparable even where
+    /// `start` is `unasserted`, because the unknown start is in both folds and
+    /// cancels out of their difference.
+    ///
+    /// **Read it before reporting a `matched`.** A matched change says the
+    /// movements recorded since that earlier statement account exactly for the
+    /// distance to this one; it says nothing about the level, which is still
+    /// unknown. A matched change and a matched level are different findings and
+    /// must not be reported alike.
+    pub compared: String,
+    /// The date of the stated balance a change is measured from. Null where
+    /// `compared` is `level`.
+    ///
+    /// It narrows the window above rather than replacing it: `folded_from` and
+    /// `events_folded` describe the whole fold the observed figure came out of,
+    /// and the movements that had to account for the change are the part of it
+    /// after this date. Both are stated because both are asked — the first
+    /// says how much history the figure rests on, the second what the verdict
+    /// is actually about.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub compared_since: Option<Date>,
 }
 
 impl ObservationBasisDto {
@@ -5734,6 +5760,8 @@ impl ObservationBasisDto {
             folded_from: basis.folded.first,
             folded_through: basis.folded.last,
             start: basis.start.code().to_owned(),
+            compared: basis.compared.code().to_owned(),
+            compared_since: basis.compared.since(),
         }
     }
 }

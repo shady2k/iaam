@@ -352,6 +352,19 @@ report the second as an error he made. What lifts it is an opening assertion
 reaching back to the start of the recorded history, or the import of the
 history before it.
 
+**A balance can be checked without being known.** Where nothing anchors the
+start of a history, the system cannot say what an account holds — but between
+two balances a source stated it can say whether the recorded movements account
+for the distance. Such an outcome carries `compared` =
+`change_since_stated_balance` and the date it is measured from. A `matched`
+there is a statement about the interval, not about the holding: report it as
+"the movements since that date add up", never as "the balance is confirmed".
+A `discrepant` there is the strongest finding reconciliation makes over an
+unanchored history, and it means the two stated balances and the movements
+between them do not join. It is a discrepancy and not a correction: a later
+statement does not overwrite an earlier one, and correcting a recorded
+assertion is an explicit act with its own operation.
+
 **Never reconstruct what the system compared.** Every reconciliation outcome
 carries a `basis`: how many of the account's events were folded into the
 observed figure, the first and last dates folded, and what the fold started

@@ -7,7 +7,7 @@ use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::{Event, EventValidationError, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
-use iaam_core::reconciliation::check::ClaimOutcome;
+use iaam_core::reconciliation::check::{ClaimOutcome, Discrepancy};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use time::macros::date;
@@ -1103,5 +1103,94 @@ fn an_anchor_over_an_unanchored_history_leaves_the_dimension_provisional() {
             }
         )),
         "and the reason is named rather than left to be guessed: {outcomes:?}"
+    );
+}
+
+#[test]
+fn two_statements_over_an_unanchored_history_catch_the_gap_between_them() {
+    // `iaam-c6f0`. The journal begins in January and nothing states what came
+    // before, so no level can be compared — and the owner is not thereby
+    // beyond checking. Between two stated balances the change is comparable
+    // whatever the start was: it is in both folds and cancels out of their
+    // difference. March's figures join up over March's movements; April's do
+    // not, and that is reported.
+    //
+    // What is caught here is exactly what reconciliation is for (§10.3):
+    // whether the interval's recorded movements account for the distance
+    // between two balances the source stands behind.
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let april = AssertionPeriod::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30)).unwrap();
+
+    let inflow = |day, sequence, minor| {
+        event_on(
+            &TestChannel::new("bank/1", "movements"),
+            Posting {
+                owner,
+                account,
+                day,
+                sequence,
+            },
+            EventKind::CashIn { amount: rub(minor) },
+            vec![Leg::cash(account, rub(minor))],
+        )
+    };
+    let mut events = vec![
+        inflow(date!(2026 - 01 - 15), 1, 100_000),
+        inflow(date!(2026 - 03 - 10), 2, 50_000),
+        inflow(date!(2026 - 04 - 10), 3, 30_000),
+    ];
+    events.extend(full_sections(
+        &TestChannel::new("statement/1", "march"),
+        owner,
+        account,
+        march(),
+        Sections {
+            opening: 900_000,
+            closing: 950_000,
+            debit: 50_000,
+            credit: 0,
+        },
+    ));
+    // April's own turnover is stated correctly; only the two balances disagree
+    // with it, which is what isolates the finding to the change between them.
+    events.extend(full_sections(
+        &TestChannel::new("statement/1", "april"),
+        owner,
+        account,
+        april,
+        Sections {
+            opening: 950_000,
+            closing: 990_000,
+            debit: 30_000,
+            credit: 0,
+        },
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    assert_ne!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        DimensionStatus::Discrepant,
+        "March's stated balances are exactly a month of recorded movements apart"
+    );
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 04 - 15), Dimension::Cash),
+        DimensionStatus::Discrepant,
+        "April's are not, and an unanchored history is no reason to stay silent"
+    );
+
+    let discrepant: Vec<&Discrepancy> = ledger
+        .statuses()
+        .filter(|status| status.period() == april)
+        .flat_map(|status| status.outcomes())
+        .filter_map(|check| match &check.outcome {
+            ClaimOutcome::Discrepant(discrepancy) => Some(discrepancy),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(discrepant.len(), 1, "{discrepant:?}");
+    assert_eq!(
+        discrepant[0].field, "change_since_stated_balance",
+        "the field names the quantity, so a change is never read as a holding"
     );
 }

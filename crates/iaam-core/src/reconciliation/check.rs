@@ -8,9 +8,10 @@
 
 use super::anchor::OpeningAnchor;
 use super::claim::{BalancePoint, ControlClaim};
-use super::observed::{FoldSpan, ObservedTotals, Turnover};
+use super::observed::{Baseline, FoldSpan, ObservedTotals, Turnover};
 use crate::money::{CurrencyCode, PostedMinor, Quantity};
 use crate::numeric::decimal::Dec;
+use time::Date;
 
 /// Value on one side of the comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +122,47 @@ pub struct ObservationBasis {
     pub folded: FoldSpan,
     /// What the fold began from.
     pub start: ObservedStart,
+    /// Which quantity was put against the claim.
+    pub compared: Compared,
+}
+
+/// What was actually put against the claim.
+///
+/// A level and a change are different findings and must not be reported alike.
+/// «Your closing balance matches» and «the movements since your August
+/// statement account exactly for the distance to it» are both `matched`, and
+/// only this field tells them apart — the second says nothing about the level,
+/// which remains unknown while the fold's start is unasserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compared {
+    /// The figure itself, against the fold.
+    Level,
+    /// The change since an earlier balance a source stated, carrying the date
+    /// of that statement. Comparable over a fold nothing anchors, because the
+    /// unknown start is in both figures and cancels out of their difference
+    /// (`iaam-c6f0`).
+    ChangeSince(Date),
+}
+
+impl Compared {
+    /// Machine-readable code for the API (§13).
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Level => "level",
+            Self::ChangeSince(_) => "change_since_stated_balance",
+        }
+    }
+
+    /// The date of the stated balance a change is measured from, where there is
+    /// one.
+    #[must_use]
+    pub const fn since(self) -> Option<Date> {
+        match self {
+            Self::Level => None,
+            Self::ChangeSince(date) => Some(date),
+        }
+    }
 }
 
 /// What the observed figure was accumulated from.
@@ -176,6 +218,7 @@ pub fn observation_basis(claim: &ControlClaim, observed: &ObservedTotals) -> Obs
         ControlClaim::CashBalance { currency, at, .. } => ObservationBasis {
             folded: folded_to(at, observed),
             start: start_of(observed.cash_anchor(currency)),
+            compared: cash_compared(observed, at, currency),
         },
         ControlClaim::PositionQuantity {
             instrument,
@@ -185,6 +228,7 @@ pub fn observation_basis(claim: &ControlClaim, observed: &ObservedTotals) -> Obs
         } => ObservationBasis {
             folded: folded_to(at, observed),
             start: start_of(observed.position_anchor(instrument, custody)),
+            compared: Compared::Level,
         },
         ControlClaim::CashTurnover { .. }
         | ControlClaim::FeesTotal { .. }
@@ -192,6 +236,7 @@ pub fn observation_basis(claim: &ControlClaim, observed: &ObservedTotals) -> Obs
         | ControlClaim::TaxWithheldTotal { .. } => ObservationBasis {
             folded: observed.folded_within(),
             start: ObservedStart::NotABalance,
+            compared: Compared::Level,
         },
     }
 }
@@ -203,6 +248,37 @@ fn folded_to(at: BalancePoint, observed: &ObservedTotals) -> FoldSpan {
         BalancePoint::Opening => observed.folded_before(),
         BalancePoint::Closing => observed.folded_before().merge(observed.folded_within()),
     }
+}
+
+/// A level where the fold's start is asserted; the change since an earlier
+/// stated balance where it is not and there is one.
+///
+/// The two are decided here and read by [`check_claim`] through
+/// [`cash_baseline_for`], so what the outcome compared and what the basis says
+/// it compared cannot come apart.
+fn cash_compared(observed: &ObservedTotals, at: BalancePoint, currency: CurrencyCode) -> Compared {
+    cash_baseline_for(observed, at, currency).map_or(Compared::Level, |baseline| {
+        Compared::ChangeSince(baseline.at.date)
+    })
+}
+
+/// The earlier stated balance this claim is measured from, where the level
+/// cannot be compared and one exists.
+///
+/// `None` where the fold's start **is** asserted: there the level is the better
+/// comparison, and falling back to a change would discard the stronger finding
+/// for the weaker one.
+fn cash_baseline_for(
+    observed: &ObservedTotals,
+    at: BalancePoint,
+    currency: CurrencyCode,
+) -> Option<Baseline> {
+    if observed.cash_at(at, currency).is_none()
+        || observed.cash_anchor(currency) != Some(OpeningAnchor::Unasserted)
+    {
+        return None;
+    }
+    observed.cash_baseline(at, currency)
 }
 
 const fn start_of(anchor: Option<OpeningAnchor>) -> ObservedStart {
@@ -272,10 +348,17 @@ pub fn check_claim(claim: &ControlClaim, observed: &ObservedTotals) -> ClaimOutc
             amount,
             at,
         } => match observed.cash_at(at, currency) {
-            Some(_) if observed.cash_anchor(currency) == Some(OpeningAnchor::Unasserted) => {
-                ClaimOutcome::NotComparable {
-                    reason: NotComparable::OpeningNotAsserted,
-                }
+            // The level rests on an invented start. The change since an earlier
+            // stated balance does not — the same unknown start is in both folds
+            // and cancels out of their difference — so where a source has
+            // stated one, that is compared instead of nothing (`iaam-c6f0`).
+            Some(seen) if observed.cash_anchor(currency) == Some(OpeningAnchor::Unasserted) => {
+                cash_baseline_for(observed, at, currency).map_or(
+                    ClaimOutcome::NotComparable {
+                        reason: NotComparable::OpeningNotAsserted,
+                    },
+                    |baseline| compare_change(currency, amount, seen, baseline),
+                )
             }
             seen => compare_money(
                 "amount",
@@ -350,6 +433,33 @@ pub fn check_claim(claim: &ControlClaim, observed: &ObservedTotals) -> ClaimOutc
             }
         }
     }
+}
+
+/// Comparison of the change since an earlier stated balance.
+///
+/// Both differences are taken the same way — later minus earlier — so the
+/// unknown start the two folds share cancels out of the observed side exactly
+/// as the source's own unstated history cancels out of the claimed side.
+///
+/// The field is named for what it is. Reporting `amount` here would print two
+/// numbers that are neither side's balance under the name the level comparison
+/// uses, and the reader would take a change for a holding.
+///
+/// An overflow in either difference is reported by saturation, for the reason
+/// [`compare_money`] gives: a gap wider than the monetary type is a discrepancy
+/// in any case, and a panic here would refuse the answer instead of stating it.
+fn compare_change(
+    currency: CurrencyCode,
+    claimed: PostedMinor,
+    observed: PostedMinor,
+    baseline: Baseline,
+) -> ClaimOutcome {
+    compare_money(
+        "change_since_stated_balance",
+        currency,
+        PostedMinor::new(claimed.raw().saturating_sub(baseline.claimed.raw())),
+        PostedMinor::new(observed.raw().saturating_sub(baseline.observed.raw())),
+    )
 }
 
 /// Comparison of posted amounts. Exact: no tolerance.
@@ -578,6 +688,248 @@ mod tests {
             ClaimOutcome::NotComparable {
                 reason: NotComparable::OpeningNotAsserted
             }
+        );
+    }
+
+    /// A journal that begins mid-history: one inflow in February, nothing
+    /// stating what preceded it.
+    fn unanchored_history(account: AccountId) -> Vec<crate::event::Event> {
+        vec![
+            event_with(
+                account,
+                date!(2026 - 02 - 20),
+                1,
+                EventKind::CashIn {
+                    amount: rub(100_000),
+                },
+                vec![Leg::cash(account, rub(100_000))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 10),
+                1,
+                EventKind::CashIn {
+                    amount: rub(50_000),
+                },
+                vec![Leg::cash(account, rub(50_000))],
+            ),
+        ]
+    }
+
+    /// A source stating a cash balance at one point of one interval.
+    fn stated_balance(
+        account: AccountId,
+        period: AssertionPeriod,
+        at: BalancePoint,
+        minor: i64,
+    ) -> crate::event::Event {
+        event_with(
+            account,
+            match at {
+                BalancePoint::Opening => period.from,
+                BalancePoint::Closing => period.to,
+            },
+            5,
+            EventKind::ControlAssertion {
+                period,
+                claim: ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(minor),
+                    at,
+                },
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_stated_balance_becomes_the_baseline_for_what_follows_it() {
+        // `iaam-c6f0`. Nothing anchors the start of this journal, so no level can
+        // be compared — but the source states the balance at the start of March
+        // as well as at its end, and the *change* between two stated balances is
+        // comparable over any history: the unknown start is in both folds and
+        // cancels out of their difference.
+        //
+        // Here March records one inflow of 500.00, and the source says the
+        // balance rose from 9 000.00 to 9 500.00. The system knows neither
+        // figure and can still say the movements account for the distance.
+        let account = AccountId::new_random();
+        let mut events = unanchored_history(account);
+        events.push(stated_balance(
+            account,
+            march(),
+            BalancePoint::Opening,
+            900_000,
+        ));
+        let observed = observe(&events, account, march()).unwrap();
+
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(950_000),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(check_claim(&closing, &observed), ClaimOutcome::Matched);
+
+        let basis = observation_basis(&closing, &observed);
+        assert_eq!(
+            basis.compared,
+            Compared::ChangeSince(date!(2026 - 03 - 01)),
+            "the outcome says what it compared and from when"
+        );
+        assert_eq!(
+            basis.start,
+            ObservedStart::Unasserted,
+            "and does not thereby claim the level is known"
+        );
+
+        // The stated opening itself is measured from nothing earlier, so it
+        // stays incomparable: an anchor explains what follows it, never what
+        // precedes it.
+        let opening = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(900_000),
+            at: BalancePoint::Opening,
+        };
+        assert_eq!(
+            check_claim(&opening, &observed),
+            ClaimOutcome::NotComparable {
+                reason: NotComparable::OpeningNotAsserted
+            }
+        );
+        assert_eq!(
+            observation_basis(&opening, &observed).compared,
+            Compared::Level
+        );
+    }
+
+    #[test]
+    fn a_balance_that_contradicts_an_earlier_one_is_a_discrepancy() {
+        // The third question `iaam-c6f0` asks. Two stated balances a month
+        // apart, and recorded movements of 500.00 between them; the source says
+        // the distance is 700.00. Neither figure can be checked on its own and
+        // the contradiction between them is certain, so it is reported as one —
+        // not silently resolved by treating the later statement as a correction
+        // of the earlier. A correction is an explicit act, and the journal has
+        // `Relation` for saying so.
+        let account = AccountId::new_random();
+        let mut events = unanchored_history(account);
+        events.push(stated_balance(
+            account,
+            march(),
+            BalancePoint::Opening,
+            900_000,
+        ));
+        let observed = observe(&events, account, march()).unwrap();
+
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(970_000),
+            at: BalancePoint::Closing,
+        };
+        let ClaimOutcome::Discrepant(discrepancy) = check_claim(&closing, &observed) else {
+            panic!("two stated balances the movements do not join are a discrepancy");
+        };
+        assert_eq!(
+            discrepancy.field, "change_since_stated_balance",
+            "the field names the quantity, so a change is never read as a holding"
+        );
+        assert_eq!(
+            discrepancy.delta,
+            ClaimValue::Money {
+                amount: PostedMinor::new(20_000),
+                currency: CurrencyCode::Rub
+            },
+            "the source claims 200.00 more movement than the journal recorded"
+        );
+    }
+
+    #[test]
+    fn an_anchored_history_is_still_compared_at_the_level() {
+        // The change is the weaker finding and is used only where the level
+        // cannot be had. Falling back to it on an anchored history would discard
+        // a confirmation of the holding for a confirmation of the movement.
+        let account = AccountId::new_random();
+        let mut events = journal_with_one_deposit(account, 100_000);
+        events.push(stated_balance(
+            account,
+            march(),
+            BalancePoint::Opening,
+            900_000,
+        ));
+        let observed = observe(&events, account, march()).unwrap();
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(100_000),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(check_claim(&closing, &observed), ClaimOutcome::Matched);
+        assert_eq!(
+            observation_basis(&closing, &observed).compared,
+            Compared::Level
+        );
+    }
+
+    #[test]
+    fn two_sources_disagreeing_about_one_moment_are_no_baseline() {
+        // A baseline has to be a fact the journal can lean on. Two statements
+        // about the same moment with different figures are not one; picking
+        // either would be arbitrary, and the disagreement is already reported
+        // where each of them is checked.
+        let account = AccountId::new_random();
+        let mut events = unanchored_history(account);
+        events.push(stated_balance(
+            account,
+            march(),
+            BalancePoint::Opening,
+            900_000,
+        ));
+        events.push(stated_balance(
+            account,
+            march(),
+            BalancePoint::Opening,
+            800_000,
+        ));
+        let observed = observe(&events, account, march()).unwrap();
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(950_000),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(
+            check_claim(&closing, &observed),
+            ClaimOutcome::NotComparable {
+                reason: NotComparable::OpeningNotAsserted
+            }
+        );
+    }
+
+    #[test]
+    fn a_baseline_from_an_earlier_interval_reaches_across_statements() {
+        // The owner's case: a balance he can prove for one date, and everything
+        // after it measured from there. February's statement closes at 9 000.00;
+        // March's closing figure is checked against it over March's movements,
+        // although nothing anchors the journal's start.
+        let account = AccountId::new_random();
+        let february =
+            AssertionPeriod::between(date!(2026 - 02 - 01), date!(2026 - 02 - 28)).unwrap();
+        let mut events = unanchored_history(account);
+        events.push(stated_balance(
+            account,
+            february,
+            BalancePoint::Closing,
+            900_000,
+        ));
+        let observed = observe(&events, account, march()).unwrap();
+
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(950_000),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(check_claim(&closing, &observed), ClaimOutcome::Matched);
+        assert_eq!(
+            observation_basis(&closing, &observed).compared,
+            Compared::ChangeSince(date!(2026 - 02 - 28))
         );
     }
 

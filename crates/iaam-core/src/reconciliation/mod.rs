@@ -828,6 +828,7 @@ mod internals {
                 last: Some(date!(2026 - 03 - 10)),
             },
             start: check::ObservedStart::Asserted,
+            compared: check::Compared::Level,
         }
     }
 

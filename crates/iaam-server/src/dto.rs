@@ -7192,6 +7192,43 @@ fn format_source_time(time: time::Time) -> String {
 /// opening a parallel one holding half the answers.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OpenImportSessionRequest {
+    /// Declaring it and omitting it open **two different products**, and the
+    /// choice cannot be revised afterwards: a session's identity is fixed when
+    /// it opens.
+    ///
+    /// **Declared** — a named import. The account is resolved once, here, by
+    /// whatever identifier the caller has (see [`DeclaredSourceDto::account`]),
+    /// and the response echoes it back. Everything the session later commits is
+    /// stamped with a source derived from that account and channel, and with an
+    /// import identity when a `label` was given. What this buys is retraction as
+    /// a unit: `POST /v1/corrections/imports`, given the same three fields,
+    /// retracts exactly this import and leaves the account's other imports in
+    /// force. A labelled declaration also reaches the session it already
+    /// opened, rather than opening a second one holding half the answers —
+    /// **that reuse is keyed on the label**, so a declaration without one opens
+    /// a fresh session on every call.
+    ///
+    /// **Absent** — a free session. Nothing scopes it to an account, and rows
+    /// for several accounts sit in it together. This is the shape for an export
+    /// that covers a whole institution: one session, questions answered once,
+    /// one commit. Reading the account requirement on `DeclaredSourceDto` as a
+    /// property of sessions is what turns such an export into four staged
+    /// imports, and it is not one.
+    ///
+    /// What a free session costs is the handle. Its rows are committed under a
+    /// source minted for the occasion, which is neither declared nor reported
+    /// back — the session's own `source` stays absent — and under no import at
+    /// all. `POST /v1/corrections/imports` keys on a declaration and so cannot
+    /// reach them: a free session's rows are corrected one event at a time
+    /// through `POST /v1/corrections`, having been found in the journal first.
+    ///
+    /// One thing a declaration does **not** buy: the session does not check that
+    /// the rows fed to it name the declared account, and cannot. It stores the
+    /// source and import, both one-way derivations, and the account itself is
+    /// gone by the time rows arrive. A row for another account is held, and
+    /// committed, under this import's identity. (The batch route does check it,
+    /// because there the declaration and the rows are in one request.) Feed a
+    /// declared session only the account it was declared for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DeclaredSourceDto>,
 }

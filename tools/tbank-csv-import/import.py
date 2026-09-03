@@ -419,8 +419,15 @@ def main():
             "/v1/ingest/operations",
             token,
             {
-                "source_label": f"tbank-export {os.path.basename(args.export)}",
-                "source": {"account": account_id, "channel": args.channel},
+                # The label names this import within the account and channel.
+                # The export's file name is what distinguishes one month from
+                # the next, and it is the label the operator repeats to
+                # POST /v1/corrections/imports to retract exactly this run.
+                "source": {
+                    "account": account_id,
+                    "channel": args.channel,
+                    "label": f"tbank-export {os.path.basename(args.export)}",
+                },
                 "operations": batch,
             },
         )

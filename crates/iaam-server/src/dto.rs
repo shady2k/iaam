@@ -16,8 +16,12 @@ use iaam_app::ports::{
     IssuedToken, Scope, TokenView,
 };
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
+use iaam_app::scenarios::classification::{ClassifiedAs, PlannedCorrection, RuleChange};
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
-use iaam_app::scenarios::reports::{AccountBalanceRow, BalancesReport, MoneyFlowReport};
+use iaam_app::scenarios::reports::{
+    AccountBalanceRow, BalancesReport, MoneyFlowReport, PopulationAccount, ReportPopulation,
+    ReturnsOutcome,
+};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -663,24 +667,39 @@ impl OperationDto {
     }
 }
 
-/// The source the caller declares for this batch.
+/// The source the caller declares for this batch, and the import within it.
 ///
 /// Without it the server mints a random source per request, and nothing
 /// deduplicates across requests: a corrected re-submission would add a second
 /// set of rows rather than replace the first (spec §6).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeclaredSourceDto {
-    /// Account the rows belong to.
+    /// Account the rows belong to. Every operation in the batch must name this
+    /// same account: the declaration says whose rows these are, and a row that
+    /// disagreed would be recorded against one account while carrying the
+    /// import identity of another.
     pub account: Uuid,
     /// How the rows arrived: `file`, `paste`, `manual`.
     pub channel: String,
+    /// What names this import within the account and channel — a statement
+    /// period, an export file name, a run identifier.
+    ///
+    /// Two submissions carrying the same label are one import: re-sending a
+    /// batch under its own label retracts and adds nothing. Two submissions
+    /// labelled differently are two imports, and
+    /// `POST /v1/corrections/imports` retracts exactly the one it names.
+    ///
+    /// Optional, and omitting it has a meaning rather than being a default:
+    /// the rows belong to no named import, and they are retracted together
+    /// with every other unnamed row of the same account and channel. Every
+    /// import worth retracting on its own should be labelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Intake request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitOperationsRequest {
-    /// Source label: manual input, a specific agent, a specific file.
-    pub source_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DeclaredSourceDto>,
     pub operations: Vec<OperationDto>,
@@ -730,23 +749,34 @@ pub struct SubmitCorrectionsRequest {
     pub corrections: Vec<CorrectionDto>,
 }
 
-/// Correct a whole import, keyed on the source the caller declared for it.
+/// Correct one import, keyed on the declaration the caller made for it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CorrectImportRequest {
     /// Acknowledge that the retracted facts stop counting in every report, and
     /// that re-submitting the same rows does not bring them back.
     #[serde(default)]
     pub acknowledge_retraction: bool,
-    /// The declared source of the import to retract — the same account and
-    /// channel that were submitted with it.
+    /// The declaration the import was submitted under — the same account,
+    /// channel and label.
+    ///
+    /// With the label, exactly that import is retracted and other imports
+    /// through the same account and channel are left in force. Without it,
+    /// what is retracted is every row of that account and channel that named
+    /// no import — which is what rows recorded before imports could be named
+    /// look like, and is the only way to reach them.
     pub source: DeclaredSourceDto,
 }
 
 /// Outcome of correcting one whole declared import.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 pub struct ImportCorrectionDto {
-    /// The source identity the correction was keyed on.
+    /// The source the retracted rows arrived through.
     pub source: Uuid,
+    /// The import identity the correction was keyed on. Absent when the
+    /// request named no label, in which case the unnamed rows of `source`
+    /// were the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<Uuid>,
     /// Effective events this import still had in the journal.
     pub affected: usize,
     /// Reversed by an earlier correction: a repeat run reports these and writes
@@ -780,6 +810,12 @@ impl ImportCorrectionDto {
     pub const fn from_domain(outcome: ImportCorrectionOutcome) -> Self {
         Self {
             source: outcome.source.inner(),
+            // `Option::map` is not a const function, and this conversion is
+            // worth keeping const beside its neighbours.
+            import: match outcome.import {
+                Some(import) => Some(import.inner()),
+                None => None,
+            },
             affected: outcome.affected,
             already_reversed: outcome.already_reversed,
             written: outcome.written,
@@ -2023,6 +2059,82 @@ fn issue(value: &MaterialIssue) -> String {
     }
 }
 
+/// The population a report answered about.
+///
+/// Every report carries one. The quality fields of a report — data quality,
+/// uncovered positions, unproven bases — all concern defects **inside** the
+/// calculation, and each of them can be clean while the accounts selected for
+/// it were the wrong ones: selection happens before the fold, so nothing
+/// computed afterwards can see what was left out. This block is the second
+/// statement, and without it a report over part of the owner's money reads as
+/// an answer about all of it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PopulationDto {
+    /// The scope the report was computed over.
+    pub contour: Uuid,
+    pub contour_version: u32,
+    /// `whole` — every account the system knows of is covered. `bounded` —
+    /// accounts are outside, and each of them is in a scope the owner drew.
+    /// `undecided` — accounts are outside that no scope claims, so the report
+    /// answers about a part of the owner's money that nobody has delimited.
+    ///
+    /// `undecided` outranks `bounded`: one account nobody has ruled on is
+    /// enough, however many deliberate omissions stand beside it.
+    pub completeness: String,
+    /// The accounts inside the report's scope — the population the figures were
+    /// folded over. Always present; the same set the report's own rows are
+    /// built from.
+    pub covered: Vec<PopulationAccountDto>,
+    /// The accounts the system knows about that this report did not cover.
+    /// Always present: an empty array says the report covered everything known,
+    /// while an absent key is indistinguishable from a report that never asked.
+    pub outside: Vec<PopulationAccountDto>,
+}
+
+/// One account in a report's population.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PopulationAccountDto {
+    pub account: Uuid,
+    /// The account's title, so that an owner asked to rule on an omission is
+    /// not asked about a bare identifier.
+    pub title: String,
+    /// `covered` — inside the report's scope. `outside_placed_elsewhere` —
+    /// outside it, and the owner has placed the account in a scope of his own.
+    /// `outside_undecided` — outside it and in no scope at all: **nobody has
+    /// ruled on whether it belongs**, which is a different statement from a
+    /// deliberate omission and must not be read as one.
+    pub standing: String,
+}
+
+impl PopulationDto {
+    #[must_use]
+    pub fn from_domain(population: &ReportPopulation) -> Self {
+        Self {
+            contour: population.contour.0,
+            contour_version: population.version.0,
+            completeness: population.completeness().code().to_owned(),
+            covered: population
+                .covered()
+                .map(PopulationAccountDto::from_domain)
+                .collect(),
+            outside: population
+                .outside()
+                .map(PopulationAccountDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+impl PopulationAccountDto {
+    fn from_domain(entry: &PopulationAccount) -> Self {
+        Self {
+            account: entry.account.inner(),
+            title: entry.title.clone(),
+            standing: entry.standing.code().to_owned(),
+        }
+    }
+}
+
 /// Cash movement report over an inclusive interval.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MoneyFlowReportDto {
@@ -2042,6 +2154,8 @@ pub struct MoneyFlowReportDto {
     /// the report was examined and found nothing, while an absent key would be
     /// indistinguishable from a bug to the agent reading it.
     pub actions: Vec<ActionDto>,
+    /// The accounts this report covered, and the known accounts it did not.
+    pub population: PopulationDto,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2114,6 +2228,7 @@ impl MoneyFlowReportDto {
     /// carrier that could be built without them would eventually be.
     pub fn from_domain(
         report: &MoneyFlowReport,
+        population: &ReportPopulation,
         actions: Vec<ActionDto>,
     ) -> Result<Self, MoneyFlowError> {
         let currencies = report
@@ -2236,6 +2351,7 @@ impl MoneyFlowReportDto {
             currencies,
             unexplained,
             actions,
+            population: PopulationDto::from_domain(population),
         })
     }
 }
@@ -2260,6 +2376,12 @@ pub struct BalancesReportDto {
     /// cannot be overdrawn is a reason to read `accounts[].cash[].opening`
     /// before reading the number as a balance at all.
     pub negative_cash: Vec<NegativeCashDto>,
+    /// The accounts this report covered, and the known accounts it did not.
+    ///
+    /// On the answer, beside `negative_cash`, for the same reason: it is a fact
+    /// about the set. No row can carry it — there is no row for an account the
+    /// report left out, and that silence is what this block breaks.
+    pub population: PopulationDto,
 }
 
 /// One account-and-currency carrying a negative cash balance at the report
@@ -2391,6 +2513,7 @@ impl BalancesReportDto {
                     }),
                 })
                 .collect(),
+            population: PopulationDto::from_domain(&report.population),
         }
     }
 }
@@ -2497,6 +2620,33 @@ pub struct ReturnsReportDto {
     pub xirr_pre_tax: RateDto,
     pub applied_rules: AppliedRulesDto,
     pub data_quality: DataQualityDto,
+}
+
+/// The returns answer: the report, and the population it answered about.
+///
+/// The report's fields sit at the top level, exactly where they have always
+/// sat, and `population` joins them. It is a separate type rather than a field
+/// on `ReturnsReportDto` because the report is a conversion of
+/// `iaam_core::returns::ReturnsReport`, which knows only the scope it was
+/// folded over and cannot know what the owner has outside it. Constructing the
+/// answer therefore **requires** the manifest: a response carrying the figures
+/// without the population it computed them over cannot be built.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReturnsAnswerDto {
+    #[serde(flatten)]
+    pub report: ReturnsReportDto,
+    /// The accounts this report covered, and the known accounts it did not.
+    pub population: PopulationDto,
+}
+
+impl ReturnsAnswerDto {
+    #[must_use]
+    pub fn from_domain(outcome: &ReturnsOutcome) -> Self {
+        Self {
+            report: ReturnsReportDto::from_domain(&outcome.report),
+            population: PopulationDto::from_domain(&outcome.population),
+        }
+    }
 }
 
 /// Applied rules (§3.2, §6.1).
@@ -2612,7 +2762,24 @@ pub struct ActionDto {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_scope: Option<String>,
+    /// What the item is about, when it is about one thing. Absent on the
+    /// existential items — «no account exists», «no contour exists» — which name
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<ActionSubjectDto>,
     pub target: ActionTargetDto,
+}
+
+/// The typed subject of an action.
+///
+/// A field of its own rather than a name buried in `reason`: `id` is opaque by
+/// contract and `reason` is a sentence, so a client that wants the items about
+/// one account had no way to select them without parsing prose.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActionSubjectDto {
+    Account { id: Uuid },
+    Event { id: Uuid },
 }
 
 /// The tagged target of an action.
@@ -2655,6 +2822,51 @@ pub struct AccountCandidateDto {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub institution: Option<String>,
+}
+
+/// Where an account stands relative to the owner's reporting perimeter.
+///
+/// Three values, because two are not enough. An account may be inside a
+/// contour, outside every contour on purpose — a counterparty's, a closed one,
+/// one the owner does not want reported — or waiting for him to say which. The
+/// third is the state a newly created account is in, and the one the action
+/// queue asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountScopeDispositionDto {
+    Inside,
+    Outside,
+    Undecided,
+}
+
+/// An account's current disposition.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountScopeDto {
+    pub account: Uuid,
+    pub disposition: AccountScopeDispositionDto,
+    /// The owner's reason, present only for `outside`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The contours naming this account. Empty unless the disposition is
+    /// `inside`, and the reason it is returned: «inside» is not a stored flag
+    /// but a fact of the contour composition, and the answer says whose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contours: Vec<Uuid>,
+}
+
+/// Recording the owner's decision about one account.
+///
+/// `inside` is not accepted here. Membership is the contour's composition, and
+/// writing it twice — once as a version and once as a flag on the account —
+/// would create two answers to one question. The route says so rather than
+/// silently accepting a value it cannot honour.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecordAccountScopeRequest {
+    pub disposition: AccountScopeDispositionDto,
+    /// Required for `outside` and refused for `undecided`. A perimeter decision
+    /// without a reason is indistinguishable, a year later, from an oversight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Account creation.
@@ -4545,6 +4757,88 @@ impl ClassificationRuleDto {
             created_at: rule.created_at,
             retired_at: rule.retired_at,
             replaces: rule.replaces,
+        }
+    }
+}
+
+/// A classification named in the vocabulary a rule outcome uses.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClassifiedAsDto {
+    pub kind: String,
+    /// Receiving account, for `internal_transfer` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<Uuid>,
+    /// Fee origin, for `fee` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+impl ClassifiedAsDto {
+    fn from_domain(classification: ClassifiedAs) -> Self {
+        Self {
+            kind: classification.kind.to_owned(),
+            to: classification.to.map(|account| account.inner()),
+            origin: classification.origin.map(str::to_owned),
+        }
+    }
+}
+
+/// One event a rule change requires correcting.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlannedCorrectionDto {
+    pub event: Uuid,
+    pub was: ClassifiedAsDto,
+    pub becomes: ClassifiedAsDto,
+}
+
+impl PlannedCorrectionDto {
+    fn from_domain(correction: PlannedCorrection) -> Self {
+        Self {
+            event: correction.event.inner(),
+            was: ClassifiedAsDto::from_domain(correction.was),
+            becomes: ClassifiedAsDto::from_domain(correction.becomes),
+        }
+    }
+}
+
+/// What a rule change would correct, and the fact that it has not been applied.
+///
+/// `applied: false` is stated rather than implied: an empty `corrections` list
+/// and a list nobody acted on look the same to a client that has to guess.
+/// Applying is a separate, acknowledged act — `POST /v1/corrections`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RecomputePlanDto {
+    pub applied: bool,
+    pub corrections: Vec<PlannedCorrectionDto>,
+}
+
+impl RecomputePlanDto {
+    #[must_use]
+    pub fn from_domain(plan: Vec<PlannedCorrection>) -> Self {
+        Self {
+            applied: false,
+            corrections: plan
+                .into_iter()
+                .map(PlannedCorrectionDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+/// A stored rule together with the history its arrival or retirement corrects.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClassificationRuleChangeDto {
+    #[serde(flatten)]
+    pub rule: ClassificationRuleDto,
+    pub plan: RecomputePlanDto,
+}
+
+impl ClassificationRuleChangeDto {
+    #[must_use]
+    pub fn from_domain(change: RuleChange) -> Self {
+        Self {
+            rule: ClassificationRuleDto::from_port(change.rule),
+            plan: RecomputePlanDto::from_domain(change.plan),
         }
     }
 }

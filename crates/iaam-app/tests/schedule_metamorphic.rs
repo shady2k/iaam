@@ -342,11 +342,13 @@ async fn resyncing_changes_no_bond_attribute_at_a_fixed_coordinate() {
     };
     let before = returns(&services, &principal(owner), &query)
         .await
-        .expect("first report");
+        .expect("first report")
+        .report;
     sync_fixture_schedule(&services, instrument).await;
     let after = returns(&services, &principal(owner), &query)
         .await
-        .expect("second report");
+        .expect("second report")
+        .report;
 
     assert_eq!(before.bond_attributes, after.bond_attributes);
     assert_eq!(before.bond_attributes.len(), 1);

@@ -48,6 +48,20 @@ typed_id!(
     SourceId
 );
 typed_id!(
+    /// One act of importing: the rows one declared submission brought in.
+    ///
+    /// Distinct from [`SourceId`] on purpose. The source answers «where do
+    /// these rows come from», and deduplication is scoped by it: a source
+    /// operation identifier is unique within a source, so comparing two of
+    /// them across sources would suppress a legitimate fact (§10.6). The
+    /// import answers «which submission carried this row», which is finer —
+    /// two months of one account exported the same way are one source and two
+    /// imports. Folding the second question into the first would make every
+    /// import its own source, and the same bank's operation identifiers would
+    /// stop being compared across two of its own exports.
+    ImportId
+);
+typed_id!(
     /// Journal event.
     EventId
 );
@@ -82,6 +96,14 @@ typed_id!(
 /// across builds and machines.
 const DECLARED_SOURCE_NAMESPACE: uuid::Uuid = uuid::uuid!("6f2b1c4e-6f8a-5a1d-9d0e-2c7f4a3b8e11");
 
+/// Namespace for declared imports.
+///
+/// A namespace of its own rather than a longer name in the source namespace:
+/// two derivations sharing a namespace can collide whenever one derived name
+/// happens to spell another, and an import identity is the key of a
+/// destructive operation.
+const DECLARED_IMPORT_NAMESPACE: uuid::Uuid = uuid::uuid!("2a7d5b90-4c31-5f28-8b6a-1e9c0d47f532");
+
 impl SourceId {
     /// A source identity the caller declares rather than one we mint.
     ///
@@ -100,6 +122,43 @@ impl SourceId {
         let name = format!("{}/{}/{}", owner.inner(), account.inner(), channel);
         Self(uuid::Uuid::new_v5(
             &DECLARED_SOURCE_NAMESPACE,
+            name.as_bytes(),
+        ))
+    }
+}
+
+impl ImportId {
+    /// The identity of one declared import.
+    ///
+    /// Derived rather than minted, for the same reason [`SourceId::declared`]
+    /// is: the caller holds no server-assigned handle after a submission — the
+    /// event identifiers were minted here and the row identifiers belong to the
+    /// file — so the only key it can name an import by afterwards is the one it
+    /// declared.
+    ///
+    /// The label is what separates two imports the rest of the declaration
+    /// cannot: two months of one account, exported the same way, differ in
+    /// nothing else. It is caller-supplied text, so two imports the caller
+    /// labels alike are one import — which is the deduplicating half of the
+    /// same property, and is why re-sending a batch under its own label
+    /// replaces nothing and adds nothing.
+    ///
+    /// The channel's length is part of the derived name so that the pair
+    /// (channel, label) can be read back out of it. Without it, a channel
+    /// `file/x` with label `y` and a channel `file` with label `x/y` would
+    /// spell one name and share one identity.
+    #[must_use]
+    pub fn declared(owner: OwnerId, account: AccountId, channel: &str, label: &str) -> Self {
+        let name = format!(
+            "{}/{}/{}/{}/{}",
+            owner.inner(),
+            account.inner(),
+            channel.len(),
+            channel,
+            label
+        );
+        Self(uuid::Uuid::new_v5(
+            &DECLARED_IMPORT_NAMESPACE,
             name.as_bytes(),
         ))
     }
@@ -170,6 +229,76 @@ mod tests {
         assert_ne!(
             SourceId::declared(owner, account, "file"),
             SourceId::declared(other_owner, account, "file")
+        );
+    }
+
+    #[test]
+    fn a_declared_import_separates_two_labels_of_one_channel() {
+        let owner = OwnerId(uuid::Uuid::from_u128(1));
+        let account = AccountId(uuid::Uuid::from_u128(2));
+        // The reported defect: two months of one account exported the same way
+        // differ in nothing but the label, and retracting one must not retract
+        // the other.
+        assert_ne!(
+            ImportId::declared(owner, account, "file", "january"),
+            ImportId::declared(owner, account, "file", "february")
+        );
+        assert_eq!(
+            ImportId::declared(owner, account, "file", "january"),
+            ImportId::declared(owner, account, "file", "january"),
+            "re-declaring one import must name that import, not a second one"
+        );
+    }
+
+    #[test]
+    fn a_declared_import_separates_channels_accounts_and_owners() {
+        let owner = OwnerId(uuid::Uuid::from_u128(1));
+        let other_owner = OwnerId(uuid::Uuid::from_u128(9));
+        let account = AccountId(uuid::Uuid::from_u128(2));
+        let other_account = AccountId(uuid::Uuid::from_u128(3));
+        let import = ImportId::declared(owner, account, "file", "january");
+        assert_ne!(
+            import,
+            ImportId::declared(owner, account, "paste", "january")
+        );
+        assert_ne!(
+            import,
+            ImportId::declared(owner, other_account, "file", "january")
+        );
+        assert_ne!(
+            import,
+            ImportId::declared(other_owner, account, "file", "january")
+        );
+    }
+
+    #[test]
+    fn a_declared_import_cannot_be_spelled_by_another_split_of_its_parts() {
+        let owner = OwnerId(uuid::Uuid::from_u128(1));
+        let account = AccountId(uuid::Uuid::from_u128(2));
+        // Channel and label are both free text, so without the length in the
+        // derived name these two would be one identity — and retracting one
+        // would retract an import the caller never named.
+        assert_ne!(
+            ImportId::declared(owner, account, "file/x", "y"),
+            ImportId::declared(owner, account, "file", "x/y")
+        );
+    }
+
+    #[test]
+    fn a_declared_import_is_not_the_source_it_arrived_through() {
+        let owner = OwnerId(uuid::Uuid::from_u128(1));
+        let account = AccountId(uuid::Uuid::from_u128(2));
+        // Two questions, two identities: deduplication is scoped by the source,
+        // and it must not narrow to one import.
+        assert_ne!(
+            ImportId::declared(owner, account, "file", "january").inner(),
+            SourceId::declared(owner, account, "file").inner()
+        );
+        assert_eq!(
+            ImportId::declared(owner, account, "file", "january")
+                .inner()
+                .get_version_num(),
+            5
         );
     }
 

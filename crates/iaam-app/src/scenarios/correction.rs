@@ -20,7 +20,7 @@ use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::correction::{CorrectionError, resolve};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{EventId, SourceId};
+use iaam_core::ids::{EventId, ImportId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{SubmittedOperation, Verdict, normalize};
@@ -64,11 +64,66 @@ pub enum CorrectionRequest {
     },
 }
 
+/// Which import a correction retracts.
+///
+/// Two variants rather than one identity, because the journal holds two kinds
+/// of row. A submission that named its import stamped that name on every row
+/// it carried, and is retracted by name. A submission that named none — every
+/// row recorded before an import could be named, and every channel that
+/// declares no source at all — left nothing finer than the source it arrived
+/// through, so the only honest thing to retract is all of it. Saying that in
+/// the type stops the second case from being reached by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportTarget {
+    /// One named import, and nothing else that came through its source.
+    Named { source: SourceId, import: ImportId },
+    /// Everything that arrived through one source without naming an import.
+    Unnamed { source: SourceId },
+}
+
+impl ImportTarget {
+    /// The source the rows arrived through, whether or not they named an
+    /// import. Reported back to the caller, never the thing matched on.
+    #[must_use]
+    pub const fn source(self) -> SourceId {
+        match self {
+            Self::Named { source, .. } | Self::Unnamed { source } => source,
+        }
+    }
+
+    #[must_use]
+    const fn import(self) -> Option<ImportId> {
+        match self {
+            Self::Named { import, .. } => Some(import),
+            Self::Unnamed { .. } => None,
+        }
+    }
+
+    /// Does this event belong to the import being retracted?
+    ///
+    /// A named target matches on the import alone: the import already implies
+    /// its source, and a row cannot carry one import under two sources. An
+    /// unnamed target matches rows that named no import **and** arrived through
+    /// the named source — without the first half it would sweep every named
+    /// import of that source as well, which is the defect this replaced.
+    fn covers(self, event: &Event) -> bool {
+        match self {
+            Self::Named { import, .. } => event.provenance.import() == Some(import),
+            Self::Unnamed { source } => {
+                event.provenance.import().is_none() && event.provenance.source() == source
+            }
+        }
+    }
+}
+
 /// Outcome of correcting one whole declared import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImportCorrectionOutcome {
-    /// The source identity the correction was keyed on.
+    /// The source identity the retracted rows arrived through.
     pub source: SourceId,
+    /// The import identity the correction was keyed on, absent when the
+    /// correction named the unnamed rows of a source.
+    pub import: Option<ImportId>,
     /// Effective events this import still had in the journal.
     pub affected: usize,
     /// Reversed by an earlier correction: a repeat run reports these and
@@ -127,22 +182,26 @@ pub async fn correct_events(
 
 /// Retract every effective event one declared import left in the journal.
 ///
-/// The key is the declared source, because that is the handle a caller actually
+/// The key is the declared import, because that is the handle a caller actually
 /// holds after submitting a batch: the event identifiers were minted by the
 /// server and the row identifiers belong to the file. Deriving that identity
-/// from the account and channel belongs to the caller, which is where the
-/// declaration was made; this takes the identity itself, so nothing here can
-/// disagree with what ingestion wrote.
+/// from the account, the channel and the label belongs to the caller, which is
+/// where the declaration was made; this takes the identity itself, so nothing
+/// here can disagree with what ingestion wrote.
+///
+/// It is the import and not the source, because a source is not an import: two
+/// months of one account exported the same way arrive through one source, and
+/// keying on it would retract both when the caller named one.
 ///
 /// One request, and one reversal **fact** per reversed event: a flag
-/// saying «this source is retracted» would be a second, non-journal notion of
+/// saying «this import is retracted» would be a second, non-journal notion of
 /// what is effective, and the append-only journal would no longer be the whole
 /// account of what the owner knows.
 pub async fn correct_import(
     services: &AppServices,
     principal: &Principal,
     acknowledge_retraction: bool,
-    source: SourceId,
+    target: ImportTarget,
 ) -> Result<ImportCorrectionOutcome, AppError> {
     may_correct(principal)?;
     acknowledged(acknowledge_retraction)?;
@@ -153,7 +212,7 @@ pub async fn correct_import(
         let effective = resolve(&events).map_err(AppError::Correction)?;
         let targets: Vec<Event> = effective
             .into_iter()
-            .filter(|event| event.provenance.source() == source)
+            .filter(|event| target.covers(event))
             .cloned()
             .collect();
 
@@ -172,10 +231,10 @@ pub async fn correct_import(
             .collect();
         let already_reversed = reversed
             .iter()
-            .filter(|target| {
+            .filter(|target_event| {
                 by_id
-                    .get(target)
-                    .is_some_and(|event| event.provenance.source() == source)
+                    .get(target_event)
+                    .is_some_and(|event| target.covers(event))
             })
             .count();
         (targets, already_reversed)
@@ -184,7 +243,8 @@ pub async fn correct_import(
     let affected = targets.len();
     if targets.is_empty() {
         return Ok(ImportCorrectionOutcome {
-            source,
+            source: target.source(),
+            import: target.import(),
             affected,
             already_reversed,
             written: 0,
@@ -210,7 +270,8 @@ pub async fn correct_import(
     }
 
     Ok(ImportCorrectionOutcome {
-        source,
+        source: target.source(),
+        import: target.import(),
         affected,
         already_reversed,
         written,
@@ -636,6 +697,56 @@ mod tests {
             matches!(error, AppError::Conflict { .. }),
             "expected a conflict, got {error:?}"
         );
+    }
+
+    #[test]
+    fn a_named_import_covers_its_own_rows_and_no_others() {
+        let source = SourceId::declared(owner(), account(), "file");
+        let january = ImportId::declared(owner(), account(), "file", "january");
+        let february = ImportId::declared(owner(), account(), "file", "february");
+
+        let mut in_january = deposit(1, source);
+        in_january.provenance = in_january.provenance.clone().with_import(january);
+        let mut in_february = deposit(2, source);
+        in_february.provenance = in_february.provenance.clone().with_import(february);
+        let unnamed = deposit(3, source);
+
+        let target = ImportTarget::Named {
+            source,
+            import: february,
+        };
+        assert!(target.covers(&in_february));
+        assert!(
+            !target.covers(&in_january),
+            "retracting one import must not reach another through the same source"
+        );
+        assert!(
+            !target.covers(&unnamed),
+            "rows that named no import are not part of a named one"
+        );
+        assert_eq!(target.source(), source);
+        assert_eq!(target.import(), Some(february));
+    }
+
+    #[test]
+    fn the_unnamed_target_takes_only_rows_that_named_no_import() {
+        let source = SourceId::declared(owner(), account(), "file");
+        let other_source = SourceId::declared(owner(), account(), "paste");
+        let import = ImportId::declared(owner(), account(), "file", "january");
+
+        let mut named = deposit(1, source);
+        named.provenance = named.provenance.clone().with_import(import);
+        let unnamed = deposit(2, source);
+        let elsewhere = deposit(3, other_source);
+
+        let target = ImportTarget::Unnamed { source };
+        assert!(target.covers(&unnamed));
+        assert!(
+            !target.covers(&named),
+            "an unlabelled retraction must not sweep the imports that were labelled"
+        );
+        assert!(!target.covers(&elsewhere));
+        assert_eq!(target.import(), None);
     }
 
     #[test]

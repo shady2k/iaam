@@ -13,16 +13,19 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
-use iaam_app::actions::{Action, ActionCategory, ActionState, ActionTarget, ProvidedBy};
+use iaam_app::actions::{
+    AccountScope, Action, ActionCategory, ActionState, ActionSubject, ActionTarget, ProvidedBy,
+    account_scope,
+};
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
-use iaam_app::ports::{AccountView, Principal, Scope};
+use iaam_app::ports::{AccountScopeExclusionView, AccountView, Principal, Scope};
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
     list_category_rules, list_groups, preview_category_rule, retire_category,
 };
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
-use iaam_app::scenarios::correction::correct_events;
+use iaam_app::scenarios::correction::{ImportTarget, correct_events};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
 use iaam_app::scenarios::journal::{DeclaredSource, JournalReadQuery, read_journal};
@@ -40,7 +43,9 @@ use iaam_app::sync::{
 };
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{AccountId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, SourceId};
+use iaam_core::ids::{
+    AccountId, CategoryId, CategoryRuleId, CustodyId, ImportId, InstrumentId, SourceId,
+};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -58,19 +63,20 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountCandidateDto, AccountDto, ActionDto, ActionTargetDto, ActionsResponseDto,
-    BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
-    CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
-    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
-    ImportCorrectionDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto, JournalPageDto,
-    MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
-    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
-    ReconciliationResponseDto, ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsReportDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
+    AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto, ActionDto,
+    ActionSubjectDto, ActionTargetDto, ActionsResponseDto, BalancesReportDto, BrokerAccessDto,
+    BrokerSyncRequest, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest,
+    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
+    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto, CorrectImportRequest,
+    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
+    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
+    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InstrumentDto, IssuedTokenDto,
+    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
+    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
+    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
+    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
+    ReconciliationStatusDto, RecordAccountScopeRequest, RequestPlanDto, ResolveInstrumentRequest,
+    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
     SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
@@ -79,6 +85,7 @@ use iaam_app::scenarios::documents::UploadedDocument;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
+pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 
@@ -157,6 +164,12 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
         .to_owned(),
         reason: action.reason().to_owned(),
         required_scope: action.required_scope().map(|scope| scope.code().to_owned()),
+        subject: action.subject().map(|subject| match subject {
+            ActionSubject::Account(account) => ActionSubjectDto::Account {
+                id: account.inner(),
+            },
+            ActionSubject::Event(event) => ActionSubjectDto::Event { id: event.inner() },
+        }),
         target,
     }
 }
@@ -488,15 +501,28 @@ pub async fn submit_corrections(
     ))
 }
 
-/// Retract a whole import, keyed on the source that was declared for it.
+/// Retract one import, keyed on the declaration that was made for it.
 ///
 /// The remedy for a month imported against the wrong account map: one request,
-/// and one reversal fact per event the import left effective. Nothing is deleted
-/// and nothing is mutated — the originals stay in the journal and stop counting,
-/// which is what §4.8 means by a correction.
+/// and one reversal fact per event that import left effective. Nothing is
+/// deleted and nothing is mutated — the originals stay in the journal and stop
+/// counting, which is what §4.8 means by a correction.
+///
+/// What it retracts, exactly: the rows of the account, channel **and label**
+/// named in the request. Other imports through the same account and channel,
+/// under other labels, are left in force. A request that names no label
+/// retracts instead every row of that account and channel which named no
+/// import — the rows recorded before an import could be named, and the only
+/// way to reach them.
 #[utoipa::path(
     post,
     path = "/v1/corrections/imports",
+    description = "Retract one import: the rows submitted under the account, \
+                   channel and label named here. Other imports through the same \
+                   account and channel, under other labels, keep counting. A \
+                   request without a label retracts every row of that account \
+                   and channel that named no import. One reversal fact per \
+                   retracted event; nothing is deleted and nothing is mutated.",
     request_body = CorrectImportRequest,
     responses(
         (status = 200, description = "What the correction retracted", body = ImportCorrectionDto),
@@ -518,11 +544,15 @@ pub async fn correct_import(
         invalid_field("body", "import correction JSON object", error.to_string())
     })?;
     let source = declared_source(principal.owner, &request.source)?;
+    let target = match declared_import(principal.owner, &request.source)? {
+        Some(import) => ImportTarget::Named { source, import },
+        None => ImportTarget::Unnamed { source },
+    };
     let outcome = iaam_app::scenarios::correction::correct_import(
         &state.services,
         &principal,
         request.acknowledge_retraction,
-        source,
+        target,
     )
     .await?;
     Ok(Json(ImportCorrectionDto::from_domain(outcome)))
@@ -693,12 +723,20 @@ pub async fn list_classification_rules(
     ))
 }
 
+/// Store a rule and answer with what it would correct.
+///
+/// The plan is returned rather than applied. Correcting the journal writes
+/// reversal and replacement facts that stop counting in every report the owner
+/// has already read, and this codebase demands an explicit acknowledgement for
+/// exactly that — see `POST /v1/corrections`, which is the operation that
+/// applies the plan. A rule creation carries no such acknowledgement, so it
+/// says what it would do and does not pretend to have done it.
 #[utoipa::path(
     post,
     path = "/v1/classification-rules",
     request_body = ClassificationRuleRequest,
     responses(
-        (status = 201, description = "Rule added", body = ClassificationRuleDto),
+        (status = 201, description = "Rule added, with the history it would correct", body = ClassificationRuleChangeDto),
         (status = 403, description = "Owner only", body = ApiError),
         (status = 422, description = "Invalid rule", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
@@ -711,9 +749,9 @@ pub async fn create_classification_rule(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<ClassificationRuleRequest>,
-) -> Result<(StatusCode, Json<ClassificationRuleDto>), ApiFailure> {
+) -> Result<(StatusCode, Json<ClassificationRuleChangeDto>), ApiFailure> {
     require_admin(&principal)?;
-    let rule = create_rule(
+    let change = create_rule(
         &state.services,
         &principal,
         request.matcher,
@@ -723,16 +761,21 @@ pub async fn create_classification_rule(
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(ClassificationRuleDto::from_port(rule)),
+        Json(ClassificationRuleChangeDto::from_domain(change)),
     ))
 }
 
+/// Retire a rule and answer with what its absence would correct.
+///
+/// `200` with the plan, not `204`: retirement recomputes exactly what creation
+/// does, and a body-less response would discard it — which is the defect this
+/// route had. Symmetry with [`create_classification_rule`] is the point.
 #[utoipa::path(
     delete,
     path = "/v1/classification-rules/{id}",
     params(("id" = Uuid, Path, description = "Rule identifier")),
     responses(
-        (status = 204, description = "Rule retired"),
+        (status = 200, description = "Rule retired, with the history its absence would correct", body = RecomputePlanDto),
         (status = 403, description = "Owner only", body = ApiError),
         (status = 404, description = "Rule not found", body = ApiError),
         (status = 422, description = "Request could not be read", body = ApiError)
@@ -743,10 +786,10 @@ pub async fn delete_classification_rule(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
-) -> Result<StatusCode, ApiFailure> {
+) -> Result<Json<RecomputePlanDto>, ApiFailure> {
     require_admin(&principal)?;
-    retire_rule(&state.services, &principal, id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let plan = retire_rule(&state.services, &principal, id).await?;
+    Ok(Json(RecomputePlanDto::from_domain(plan)))
 }
 /// Active and retired owner category groups.
 #[utoipa::path(
@@ -1392,6 +1435,192 @@ pub async fn create_account(
     ))
 }
 
+/// An account's scope disposition.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{id}/scope",
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    responses(
+        (status = 200, description = "The account's disposition", body = AccountScopeDto),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_account_scope(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<AccountScopeDto>, ApiFailure> {
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+    Ok(Json(account_scope_dto(&state, &principal, account).await?))
+}
+
+/// Record the owner's decision about an account's place in the perimeter.
+///
+/// The route that makes the third state resolvable. Without it the queue could
+/// name an account belonging to no contour and the owner had exactly one way to
+/// silence it — put the account inside a contour — which is the answer he may
+/// not have.
+#[utoipa::path(
+    post,
+    path = "/v1/accounts/{id}/scope",
+    operation_id = RECORD_ACCOUNT_SCOPE_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = RecordAccountScopeRequest,
+    responses(
+        (status = 200, description = "Disposition recorded", body = AccountScopeDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_scope(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<RecordAccountScopeRequest>,
+) -> Result<Json<AccountScopeDto>, ApiFailure> {
+    // Drawing the perimeter is the owner's judgement, in either direction: the
+    // same rule that keeps contour composition out of the agent's hands.
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+
+    match request.disposition {
+        AccountScopeDispositionDto::Inside => {
+            return Err(unprocessable(
+                "disposition",
+                "outside or undecided",
+                "inside",
+                "membership is a contour's composition and is recorded by creating                  a contour version, not by a flag on the account",
+            ));
+        }
+        AccountScopeDispositionDto::Outside => {
+            let reason = request
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .ok_or_else(|| {
+                    unprocessable(
+                        "reason",
+                        "a non-empty reason",
+                        "nothing",
+                        "an account ruled outside the perimeter without a reason is                          indistinguishable, a year later, from one that was overlooked",
+                    )
+                })?;
+            state
+                .services
+                .store
+                .record_account_scope_exclusion(
+                    principal.owner,
+                    AccountScopeExclusionView {
+                        account,
+                        reason: reason.to_owned(),
+                    },
+                )
+                .await?;
+        }
+        AccountScopeDispositionDto::Undecided => {
+            if request.reason.is_some() {
+                return Err(unprocessable(
+                    "reason",
+                    "no reason",
+                    "a reason",
+                    "withdrawing a decision leaves nothing for a reason to explain",
+                ));
+            }
+            state
+                .services
+                .store
+                .clear_account_scope_exclusion(principal.owner, account)
+                .await?;
+        }
+    }
+
+    Ok(Json(account_scope_dto(&state, &principal, account).await?))
+}
+
+/// Refuse an account identifier the owner does not hold.
+///
+/// A missing account and someone else's return the same `404` for the reason
+/// token revocation does: a different answer would tell an outsider that such a
+/// record exists (§14).
+async fn owned_account(
+    state: &ServerState,
+    principal: &Principal,
+    account: AccountId,
+) -> Result<(), ApiFailure> {
+    let accounts = state.services.store.list_accounts(principal.owner).await?;
+    if accounts.iter().any(|held| held.id == account) {
+        Ok(())
+    } else {
+        Err(ApiFailure::new(
+            StatusCode::NOT_FOUND,
+            ApiError::simple(
+                "not_found",
+                format!("not found: account {}", account.inner()),
+            ),
+        ))
+    }
+}
+
+/// Read the disposition back from the two places that hold one.
+async fn account_scope_dto(
+    state: &ServerState,
+    principal: &Principal,
+    account: AccountId,
+) -> Result<AccountScopeDto, ApiFailure> {
+    let contours = state.services.store.list_contours(principal.owner).await?;
+    let exclusions = state
+        .services
+        .store
+        .list_account_scope_exclusions(principal.owner)
+        .await?;
+    let naming: Vec<Uuid> = contours
+        .iter()
+        .filter(|contour| contour.accounts.contains(&account))
+        .map(|contour| contour.id.0)
+        .collect();
+    let (disposition, reason) = match account_scope(account, &contours, &exclusions) {
+        AccountScope::Inside => (AccountScopeDispositionDto::Inside, None),
+        AccountScope::Outside => (
+            AccountScopeDispositionDto::Outside,
+            exclusions
+                .iter()
+                .find(|exclusion| exclusion.account == account)
+                .map(|exclusion| exclusion.reason.clone()),
+        ),
+        AccountScope::Undecided => (AccountScopeDispositionDto::Undecided, None),
+    };
+    Ok(AccountScopeDto {
+        account: account.inner(),
+        disposition,
+        reason,
+        contours: naming,
+    })
+}
+
+fn unprocessable(field: &str, expected: &str, actual: &str, message: &str) -> ApiFailure {
+    ApiFailure::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ApiError {
+            code: "invalid_request".into(),
+            message: message.to_owned(),
+            field: Some(field.to_owned()),
+            expected: Some(expected.to_owned()),
+            actual: Some(actual.to_owned()),
+            correlation_id: None,
+        },
+    )
+}
+
 /// List of broker access entries.
 ///
 /// Revoked entries are also shown: «when the system stopped contacting
@@ -1646,11 +1875,33 @@ pub async fn ingest_operations(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let source = match &request.source {
-        Some(declared) => declared_source(principal.owner, declared)?,
+    let (source, import) = match &request.source {
+        Some(declared) => (
+            declared_source(principal.owner, declared)?,
+            declared_import(principal.owner, declared)?,
+        ),
         // No declaration: today's behaviour, so existing callers keep working.
-        None => SourceId::new_random(),
+        None => (SourceId::new_random(), None),
     };
+
+    // The declaration says whose rows these are, and the rows must say the
+    // same. This is checked before anything is written and refuses the whole
+    // batch rather than the row, unlike an unreadable operation: an
+    // unreadable row is one row the caller got wrong, while a row for another
+    // account contradicts the declaration the caller made over all of them,
+    // and writing the agreeing half would leave a half-import recorded under
+    // an identity that names the wrong account.
+    if let Some(declared) = &request.source {
+        for (index, operation) in request.operations.iter().enumerate() {
+            if operation.account != declared.account {
+                return Err(invalid_field(
+                    format!("operations[{index}].account"),
+                    &declared.account.to_string(),
+                    operation.account.to_string(),
+                ));
+            }
+        }
+    }
 
     // Parsing the DTO yields a verdict for each row: one unrecognised operation
     // does not invalidate the others (§10.1).
@@ -1670,7 +1921,7 @@ pub async fn ingest_operations(
         .iter()
         .map(|(_, operation)| operation.clone())
         .collect();
-    let outcomes = submit_operations(&state.services, &principal, source, &domain).await?;
+    let outcomes = submit_operations(&state.services, &principal, source, import, &domain).await?;
     for ((row, _), verdict) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(VerdictDto::from_domain(*row, verdict));
     }
@@ -1766,12 +2017,16 @@ pub async fn ingest_csv(
         }
     }
 
+    // A CSV body declares no source, so it names no import either: its rows
+    // arrive under a source minted for this request alone, and
+    // `POST /v1/corrections/imports` cannot reach them. Declaring a source for
+    // this route is a separate change to its request shape.
     let source = SourceId::new_random();
     let domain: Vec<SubmittedOperation> = accepted
         .iter()
         .map(|(_, operation)| operation.clone())
         .collect();
-    let outcomes = submit_operations(&state.services, &principal, source, &domain).await?;
+    let outcomes = submit_operations(&state.services, &principal, source, None, &domain).await?;
     for ((row, _), verdict) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(VerdictDto::from_domain(*row, verdict));
     }
@@ -1819,14 +2074,14 @@ pub async fn flow_report(
         from: parse_query_date("from", &params.from)?,
         to: parse_query_date("to", &params.to)?,
     };
-    let report = money_flow(&state.services, &principal, &query).await?;
+    let outcome = money_flow(&state.services, &principal, &query).await?;
     // No scoping: the projection admits no leg from outside the contour, so the
     // report cannot name an account it does not cover.
-    let actions = iaam_app::actions::flow_diagnostics(&report)
+    let actions = iaam_app::actions::flow_diagnostics(&outcome.report)
         .iter()
         .map(|action| action_dto(action, &catalog))
         .collect();
-    let dto = MoneyFlowReportDto::from_domain(&report, actions)
+    let dto = MoneyFlowReportDto::from_domain(&outcome.report, &outcome.population, actions)
         .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
 }
@@ -1897,7 +2152,7 @@ pub struct ReturnsParams {
     path = "/v1/reports/returns",
     params(ReturnsParams),
     responses(
-        (status = 200, description = "Report", body = ReturnsReportDto),
+        (status = 200, description = "Report", body = ReturnsAnswerDto),
         (status = 404, description = "Scope not found", body = ApiError),
         (status = 500, description = "Invariant violated", body = ApiError),
         (status = 422, description = "Request could not be read", body = ApiError)
@@ -1908,7 +2163,7 @@ pub async fn returns_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiQuery(params): ApiQuery<ReturnsParams>,
-) -> Result<Json<ReturnsReportDto>, ApiFailure> {
+) -> Result<Json<ReturnsAnswerDto>, ApiFailure> {
     let query = ReturnsQuery {
         contour: ContourId(params.contour),
         contour_version: params.contour_version.map(ContourVersion),
@@ -1919,8 +2174,8 @@ pub async fn returns_report(
         fx: FxTable::new(FxSource::CbrOfficial),
         lot_rule: LotRuleVersion(1),
     };
-    let report = returns(&state.services, &principal, &query).await?;
-    Ok(Json(ReturnsReportDto::from_domain(&report)))
+    let outcome = returns(&state.services, &principal, &query).await?;
+    Ok(Json(ReturnsAnswerDto::from_domain(&outcome)))
 }
 
 /// Exchange rates supplied with the report request.
@@ -1933,7 +2188,7 @@ pub async fn returns_report(
     params(ReturnsParams),
     request_body = Vec<FxRateDto>,
     responses(
-        (status = 200, description = "Report using the specified exchange rates", body = ReturnsReportDto),
+        (status = 200, description = "Report using the specified exchange rates", body = ReturnsAnswerDto),
         (status = 422, description = "Invalid exchange rate", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -1946,7 +2201,7 @@ pub async fn returns_report_with_rates(
     Extension(principal): Extension<Principal>,
     ApiQuery(params): ApiQuery<ReturnsParams>,
     ApiJson(rates): ApiJson<Vec<FxRateDto>>,
-) -> Result<Json<ReturnsReportDto>, ApiFailure> {
+) -> Result<Json<ReturnsAnswerDto>, ApiFailure> {
     let mut fx = FxTable::new(FxSource::OwnerSupplied);
     for rate in &rates {
         let parsed = rate.rate.parse::<Decimal>().map_err(|_| {
@@ -1978,8 +2233,8 @@ pub async fn returns_report_with_rates(
         fx,
         lot_rule: LotRuleVersion(1),
     };
-    let report = returns(&state.services, &principal, &query).await?;
-    Ok(Json(ReturnsReportDto::from_domain(&report)))
+    let outcome = returns(&state.services, &principal, &query).await?;
+    Ok(Json(ReturnsAnswerDto::from_domain(&outcome)))
 }
 
 fn instrument_dto(instrument: iaam_app::ports::InstrumentView) -> InstrumentDto {
@@ -2371,16 +2626,12 @@ fn parse_as_of(value: Option<&str>) -> Result<Option<Date>, ApiFailure> {
     })
 }
 
-/// The source identity a declared source names, refused when it names none.
+/// The channel a declaration names, refused when it names none.
 ///
-/// Shared by ingestion and by the import correction on purpose: the correction
-/// is keyed on the very identity the import was written under, and two copies
-/// of this derivation would eventually disagree about which import a correction
-/// retracts.
-fn declared_source(
-    owner: iaam_core::ids::OwnerId,
-    declared: &DeclaredSourceDto,
-) -> Result<SourceId, ApiFailure> {
+/// Shared by every derivation below on purpose: the source and the import are
+/// both built from this text, and two copies of the bound would eventually
+/// admit a channel one derivation accepted and the other refused.
+fn declared_channel(declared: &DeclaredSourceDto) -> Result<&str, ApiFailure> {
     let channel = declared.channel.trim();
     if channel.is_empty() || channel.len() > 32 {
         return Err(ApiFailure::new(
@@ -2395,11 +2646,60 @@ fn declared_source(
             },
         ));
     }
+    Ok(channel)
+}
+
+/// The source identity a declared source names, refused when it names none.
+///
+/// Shared by ingestion and by the import correction on purpose: the correction
+/// reports the very source the import was written under, and two copies of this
+/// derivation would eventually disagree about it.
+///
+/// The label is deliberately **not** part of it. Deduplication is scoped by the
+/// source — a source operation identifier is unique within a source (§10.6) —
+/// so a source that narrowed to one submission would stop one bank's
+/// identifiers being compared across two of its own exports. What a retraction
+/// needs is [`declared_import`], beside this and not inside it.
+fn declared_source(
+    owner: iaam_core::ids::OwnerId,
+    declared: &DeclaredSourceDto,
+) -> Result<SourceId, ApiFailure> {
+    let channel = declared_channel(declared)?;
     Ok(SourceId::declared(
         owner,
         AccountId(declared.account),
         channel,
     ))
+}
+
+/// The import identity a declaration names, or `None` when it names no import.
+///
+/// The single place the import key is derived, used by ingestion to stamp rows
+/// and by the correction to find them again. Two copies of it would eventually
+/// disagree about which import a retraction takes, and a retraction that took
+/// the wrong rows cannot be undone by re-sending them.
+fn declared_import(
+    owner: iaam_core::ids::OwnerId,
+    declared: &DeclaredSourceDto,
+) -> Result<Option<ImportId>, ApiFailure> {
+    let channel = declared_channel(declared)?;
+    let Some(label) = declared.label.as_deref().map(str::trim) else {
+        return Ok(None);
+    };
+    if label.is_empty() || label.len() > 128 {
+        return Err(invalid_field(
+            "source.label",
+            "a label of 1 to 128 characters naming this import, such as a \
+             statement period or an export file name",
+            declared.label.clone().unwrap_or_default(),
+        ));
+    }
+    Ok(Some(ImportId::declared(
+        owner,
+        AccountId(declared.account),
+        channel,
+        label,
+    )))
 }
 
 fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {

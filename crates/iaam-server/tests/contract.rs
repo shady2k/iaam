@@ -2944,7 +2944,10 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    // 200 with the plan, not 204: retiring a rule recomputes what history it
+    // leaves needing correction, and a body-less answer would discard it.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["applied"], false, "{body}");
 
     let (status, history) = call(
         &harness.router,
@@ -7390,7 +7393,17 @@ async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
         .collect();
     assert_eq!(
         keys,
-        std::collections::BTreeSet::from(["id", "kind", "category", "state", "reason", "target"]),
+        // `subject` joined the envelope with the coverage goal: a blocked
+        // diagnostic still names the account it is about, in a typed field
+        // rather than only in its sentence.
+        std::collections::BTreeSet::from([
+            "id", "kind", "category", "state", "reason", "subject", "target",
+        ]),
+        "{item}"
+    );
+    assert_eq!(
+        item["subject"],
+        json!({ "type": "account", "id": harness.account.inner() }),
         "{item}"
     );
     assert_eq!(item["category"], "required_for_goal", "{item}");
@@ -7655,10 +7668,15 @@ async fn actions_of_one_category_come_back_in_id_order() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The flow projection admits no leg from outside the contour, so the report
-/// cannot name an account it does not cover — and neither may the items riding
-/// along with it. An account with its own unexplained residual, left out of the
-/// contour, is what proves that.
+/// The flow projection admits no leg from outside the contour, so no figure and
+/// no action may name an account the report does not cover. An account with its
+/// own unexplained residual, left out of the contour, is what proves that.
+///
+/// `population` is the one deliberate exception, and the assertion below
+/// excludes it: that block exists to name the known accounts the report left
+/// out, because a report that could not say so reads as an answer about all of
+/// the owner's money (iaam-si5v). Naming them there is the opposite of letting
+/// them ride along in the figures.
 #[tokio::test]
 async fn flow_report_actions_name_only_accounts_in_the_contour() {
     let harness = harness();
@@ -7732,8 +7750,13 @@ async fn flow_report_actions_name_only_accounts_in_the_contour() {
             .contains(&harness.account.inner().to_string()),
         "{body}"
     );
+    let mut figures = body.clone();
+    figures
+        .as_object_mut()
+        .expect("report object")
+        .remove("population");
     assert!(
-        !body.to_string().contains(&outside),
+        !figures.to_string().contains(&outside),
         "an account outside the contour must not ride along: {body}"
     );
 }
@@ -9103,4 +9126,899 @@ async fn every_documented_parameter_sits_where_the_route_reads_it() {
         "a parameter is documented somewhere the route does not read it:\n{}",
         wrong.join("\n")
     );
+}
+
+/// Two imports through one account and one channel are two imports.
+///
+/// The ordinary case: two months of the same account, exported the same way.
+/// Retracting the second must leave the first in force — a route published as
+/// «retract a whole import» that swept both would be a destructive operation
+/// keyed more coarsely than its own description.
+#[tokio::test]
+async fn two_labelled_imports_through_one_channel_retract_separately() {
+    let (harness, path) = harness_on_disk();
+    let account = harness.account.inner();
+
+    let import = |label: &str, key: &str, amount: &str, day: &str| {
+        json!({
+            "source": { "account": account, "channel": "file", "label": label },
+            "operations": [{
+                "account": account,
+                "type": "deposit",
+                "amount": amount,
+                "currency": "RUB",
+                "dates": { "cash_posted": day },
+                "idempotency_key": key
+            }]
+        })
+    };
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &import("statement-january", "import-jan-1", "100.00", "2026-01-05"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let january = first[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("the January fact");
+
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &import("statement-february", "import-feb-1", "200.00", "2026-02-05"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let february = second[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("the February fact");
+
+    let (status, corrected) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": {
+                    "account": account,
+                    "channel": "file",
+                    "label": "statement-february"
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{corrected}");
+    assert_eq!(
+        corrected["affected"], 1,
+        "only the February import was named: {corrected}"
+    );
+    assert_eq!(corrected["written"], 1, "{corrected}");
+
+    let reversed: std::collections::BTreeSet<Uuid> = journal_of(&path, harness.owner)
+        .iter()
+        .filter_map(|event| match event.relation {
+            iaam_core::event::Relation::Reversal { target } => Some(target.inner()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reversed.contains(&february),
+        "the named import was not retracted"
+    );
+    assert!(
+        !reversed.contains(&january),
+        "retracting one import retracted another one made through the same channel"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+/// A batch declares the account its rows belong to, and the rows must agree.
+///
+/// Otherwise rows for one account are recorded against it while carrying the
+/// import identity of another, and retracting that import reaches into an
+/// account the caller never named.
+#[tokio::test]
+async fn an_operation_disagreeing_with_the_declared_account_is_refused() {
+    let harness = harness();
+    let declared = harness.account.inner();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let other = created["id"]
+        .as_str()
+        .expect("account identifier")
+        .to_owned();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                    "source": { "account": declared, "channel": "file", "label": "statement" },
+                "operations": [{
+                    "account": other,
+                    "type": "deposit",
+                    "amount": "100.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-05" },
+                    "idempotency_key": "disagreeing-row"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+    assert_eq!(body["field"], "operations[0].account", "{body}");
+    assert_eq!(body["expected"], declared.to_string(), "{body}");
+    assert_eq!(body["actual"], other, "{body}");
+}
+
+/// The route says what it retracts, in the document an external agent reads.
+///
+/// The published description is the only account of the key an agent has: one
+/// that promised «a whole import» while retracting every import of an account
+/// and channel is how a destructive operation gets called on the wrong rows.
+#[tokio::test]
+async fn the_import_correction_publishes_the_key_it_actually_retracts_on() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = spec["paths"]["/v1/corrections/imports"]["post"]["description"]
+        .as_str()
+        .expect("the import correction route carries a description")
+        .to_owned();
+    for word in ["label", "without a label"] {
+        assert!(
+            described.contains(word),
+            "the description does not say what it retracts on ({word}): {described}"
+        );
+    }
+
+    let declared = &spec["components"]["schemas"]["DeclaredSourceDto"]["properties"];
+    for field in ["account", "channel", "label"] {
+        assert!(
+            declared[field].is_object(),
+            "a declared source no longer publishes {field}: {spec}"
+        );
+    }
+    // A field accepted and ignored is worse than one that is absent: the label
+    // that names an import now lives inside the declaration, and the old
+    // free-text one, which reached no production path, is gone.
+    assert!(
+        spec["components"]["schemas"]["SubmitOperationsRequest"]["properties"]["source_label"]
+            .is_null(),
+        "the ignored source_label is still published: {spec}"
+    );
+}
+
+/// A rule written on what the source printed reaches history, and says so.
+///
+/// Three things at once, because they are one behaviour: the rebuilt
+/// classification subject carries the description and the source's own word
+/// (without them two thirds of the matcher are dead on the recompute path), and
+/// the plan the rule change computes is returned instead of being discarded.
+#[tokio::test]
+async fn a_classification_rule_reports_the_history_it_would_correct() {
+    let harness = harness();
+    let operations = json!({
+        "source_label": "test",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "withdrawal",
+            "amount": "1200.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-12" },
+            "source_category": "Card operation",
+            "description": "Shop One",
+            "idempotency_key": "reclass-withdrawal"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    let event = verdicts[0]["event_id"]
+        .as_str()
+        .expect("the recorded event")
+        .to_owned();
+
+    // A rule on the description the source printed. Matching it requires the
+    // subject rebuilt from the event to carry that description.
+    let by_description = json!({
+        "matcher": r#"{"description_contains":"shop one"}"#,
+        "outcome": r#"{"kind":"fee","origin":"account_maintenance"}"#,
+    });
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &by_description,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["plan"]["applied"], false, "{first}");
+    let corrections = first["plan"]["corrections"]
+        .as_array()
+        .expect("a plan, not silence");
+    assert_eq!(corrections.len(), 1, "{first}");
+    assert_eq!(corrections[0]["event"], event, "{first}");
+    assert_eq!(corrections[0]["was"]["kind"], "external_flow", "{first}");
+    assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{first}");
+    assert_eq!(
+        corrections[0]["becomes"]["origin"], "account_maintenance",
+        "{first}"
+    );
+
+    // A rule on the word the source used for the row — not on `cash_out`,
+    // which is the classification this rule exists to revise.
+    let by_source_kind = json!({
+        "matcher": r#"{"kind":"Card operation"}"#,
+        "outcome": r#"{"kind":"income"}"#,
+    });
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &by_source_kind,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let corrections = second["plan"]["corrections"]
+        .as_array()
+        .expect("a plan, not silence");
+    assert_eq!(corrections.len(), 1, "{second}");
+    assert_eq!(corrections[0]["event"], event, "{second}");
+    // The later decision wins: the rule naming the source's own word is the
+    // owner's most recent answer about this row.
+    assert_eq!(corrections[0]["becomes"]["kind"], "income", "{second}");
+    let newest = second["id"].as_str().expect("identifier").to_owned();
+
+    // Retiring is symmetric: it recomputes and answers with the plan too,
+    // here the one the surviving earlier rule produces.
+    let (status, plan) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/classification-rules/{newest}"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["applied"], false, "{plan}");
+    let corrections = plan["corrections"].as_array().expect("a plan, not silence");
+    assert_eq!(corrections.len(), 1, "{plan}");
+    assert_eq!(corrections[0]["event"], event, "{plan}");
+    assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{plan}");
+}
+
+/// A rule matching nothing says so, rather than saying nothing.
+#[tokio::test]
+async fn a_classification_rule_that_matches_nothing_returns_an_empty_plan() {
+    let harness = harness();
+    let rule = json!({
+        "matcher": r#"{"description_contains":"nothing here"}"#,
+        "outcome": r#"{"kind":"income"}"#,
+    });
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/classification-rules", &harness.owner_token, &rule),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["plan"]["applied"], false, "{created}");
+    assert!(
+        created["plan"]["corrections"]
+            .as_array()
+            .expect("an empty plan is still a plan")
+            .is_empty(),
+        "{created}"
+    );
+}
+
+/// Two contours exist and one account belongs to neither.
+///
+/// The queue was silent about this for the whole life of an instance after its
+/// first contour: `create_first_contour` fires once, and nothing afterwards said
+/// anything about membership. An account created later — a second bank —
+/// imported every row correctly and was absent from every report.
+#[tokio::test]
+async fn an_account_in_no_contour_is_named_by_the_queue() {
+    let harness = harness();
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let second = second["id"].as_str().expect("account id").to_owned();
+
+    let (status, orphan) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Second Bank Current" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{orphan}");
+    let orphan = orphan["id"].as_str().expect("account id").to_owned();
+
+    for (title, member) in [
+        ("Household", harness.account.inner().to_string()),
+        ("Reserve", second),
+    ] {
+        let (status, created) = call(
+            &harness.router,
+            post(
+                "/v1/contours",
+                &harness.owner_token,
+                &json!({ "title": title, "accounts": [member] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+    }
+
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+
+    let named: Vec<&Value> = actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .filter(|item| item["kind"] == "account_scope_undecided")
+        .collect();
+    assert_eq!(named.len(), 1, "{actions}");
+    let item = named[0];
+    assert_eq!(
+        item["subject"],
+        json!({ "type": "account", "id": orphan }),
+        "the account is named in a typed field, not only in prose: {item}"
+    );
+    assert_eq!(item["category"], "required_for_goal", "{item}");
+    assert_eq!(item["state"], "needs_owner_input", "{item}");
+    assert_eq!(item["required_scope"], "owner", "{item}");
+    assert_eq!(
+        item["target"]["operationId"], "create_contour_version",
+        "the item must offer membership of an existing contour: {item}"
+    );
+    assert_eq!(item["target"]["method"], "POST", "{item}");
+    assert_eq!(item["target"]["path"], "/v1/contours", "{item}");
+    let candidates = item["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing inputs")
+        .iter()
+        .find(|missing| missing["pointer"] == "/accounts")
+        .expect("account selection input");
+    assert!(
+        candidates["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .any(|candidate| candidate["id"] == orphan),
+        "{item}"
+    );
+}
+
+/// The third state, reachable through the API.
+///
+/// An account can be outside the perimeter on purpose — a counterparty's, a
+/// closed one — and the queue must stop asking once the owner has said so. If
+/// the only way to silence the item were to put the account inside a contour,
+/// the fix would have replaced a silent omission with a permanent nag.
+#[tokio::test]
+async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
+    let harness = harness();
+    let (status, outside) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Shop One" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{outside}");
+    let outside = outside["id"].as_str().expect("account id").to_owned();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Household",
+                "accounts": [harness.account.inner()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let scope_path = format!("/v1/accounts/{outside}/scope");
+    let (status, before) = call(
+        &harness.router,
+        get(&scope_path, Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["disposition"], "undecided", "{before}");
+
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({
+                "disposition": "outside",
+                "reason": "A counterparty's account, not the owner's money.",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["disposition"], "outside", "{recorded}");
+    assert_eq!(
+        recorded["reason"], "A counterparty's account, not the owner's money.",
+        "{recorded}"
+    );
+
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    assert!(
+        actions["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .all(|item| item["kind"] != "account_scope_undecided"),
+        "a decided account raises nothing: {actions}"
+    );
+
+    // Withdrawing the decision reopens the goal rather than leaving the account
+    // silently settled for ever.
+    let (status, cleared) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({ "disposition": "undecided" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["disposition"], "undecided", "{cleared}");
+
+    let (status, reopened) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reopened}");
+    assert!(
+        reopened["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .any(|item| item["kind"] == "account_scope_undecided"
+                && item["subject"] == json!({ "type": "account", "id": outside })),
+        "{reopened}"
+    );
+}
+
+/// The disposition route refuses what it cannot honour, and says why.
+#[tokio::test]
+async fn a_scope_decision_needs_a_reason_and_cannot_claim_membership() {
+    let harness = harness();
+    let scope_path = format!("/v1/accounts/{}/scope", harness.account.inner());
+
+    let (status, inside) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({ "disposition": "inside" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{inside}");
+    assert_eq!(inside["field"], "disposition", "{inside}");
+
+    let (status, unreasoned) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({ "disposition": "outside" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{unreasoned}");
+    assert_eq!(unreasoned["field"], "reason", "{unreasoned}");
+
+    let (status, blank) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({ "disposition": "outside", "reason": "   " }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{blank}");
+
+    // The perimeter is the owner's judgement in either direction.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.agent_token,
+            &json!({ "disposition": "outside", "reason": "Closed years ago." }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+
+    // A missing account and someone else's are the same answer.
+    let (status, unknown) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts/{}/scope", Uuid::new_v4()),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+}
+
+/// An item the agent cannot call says so in its state, not only in its target.
+///
+/// The queue's states are the agent's map of what it may do. `needs_owner_input`
+/// elsewhere accompanies a real operation with a list of fields to collect;
+/// carrying it on an item with no operation at all made «collect these and call
+/// this» indistinguishable from «there is nothing here for you to call».
+#[tokio::test]
+async fn no_queue_item_promises_a_call_it_does_not_have() {
+    let harness = harness();
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+
+    let items = actions["items"].as_array().expect("action items");
+    assert!(
+        !items.is_empty(),
+        "the fixture must produce a queue to sweep"
+    );
+    for item in items {
+        if item["target"]["type"] == "none" {
+            assert_eq!(item["state"], "blocked", "{item}");
+            assert!(item["required_scope"].is_null(), "{item}");
+        } else {
+            assert_ne!(item["state"], "blocked", "{item}");
+        }
+    }
+    assert!(
+        items
+            .iter()
+            .any(|item| item["kind"] == "start_account_import" && item["state"] == "blocked"),
+        "{actions}"
+    );
+}
+
+/// Every report states the population it answered about, and says when that
+/// population omits an account nobody has ruled on.
+///
+/// The quality fields of a report all concern defects inside the calculation
+/// and can every one be clean while the wrong accounts were selected —
+/// selection happens before the fold, so nothing computed afterwards can see
+/// what was left out. That is the shape of the failure an importer hit with two
+/// banks: every verdict positive, quality clean, and half the money outside the
+/// scope the figures were computed over. Without this block the response reads
+/// as an answer about all of it.
+#[tokio::test]
+async fn every_report_names_the_population_it_answered_about() {
+    let harness = harness();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    // A second bank, known to the system and in no scope at all: nobody has
+    // ruled on whether it belongs in the answer.
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let balances = format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31");
+    let flow = format!("/v1/reports/flow?contour={contour_id}&from=2026-01-01&to=2026-01-31");
+    let returns = format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-01-31");
+    for path in [balances, flow, returns] {
+        let (status, report) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {report}");
+
+        let population = &report["population"];
+        assert_eq!(population["contour"], contour_id, "{path}: {report}");
+        assert_eq!(
+            population["completeness"], "undecided",
+            "{path}: an account in no scope is one nobody has ruled on: {report}"
+        );
+
+        let covered = population["covered"].as_array().expect("covered accounts");
+        assert_eq!(covered.len(), 1, "{path}: {report}");
+        assert_eq!(covered[0]["account"], harness.account.inner().to_string());
+        assert_eq!(covered[0]["standing"], "covered");
+
+        let outside = population["outside"].as_array().expect("outside accounts");
+        assert_eq!(outside.len(), 1, "{path}: {report}");
+        assert_eq!(outside[0]["account"], savings, "{path}: {report}");
+        // Named, not merely counted: an owner asked to rule on an omission
+        // cannot act on a bare identifier.
+        assert_eq!(outside[0]["title"], "Savings", "{path}: {report}");
+        assert_eq!(
+            outside[0]["standing"], "outside_undecided",
+            "{path}: {report}"
+        );
+    }
+}
+
+/// The manifest follows the scope the figures were folded over: a report over a
+/// scope that covers everything says so, in the same field.
+///
+/// This is the pair to the test above. A block that said `undecided` whatever
+/// the scope contained would pass that test and mean nothing.
+#[tokio::test]
+async fn a_report_over_every_known_account_says_its_population_is_whole() {
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Everything",
+                "accounts": [harness.account.inner().to_string(), savings],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["population"]["completeness"], "whole", "{report}");
+    assert_eq!(
+        report["population"]["covered"]
+            .as_array()
+            .expect("covered accounts")
+            .len(),
+        2,
+        "{report}"
+    );
+    assert_eq!(
+        report["population"]["outside"]
+            .as_array()
+            .expect("outside accounts")
+            .len(),
+        0,
+        "{report}"
+    );
+    // The manifest and the rows are one selection: what the report covered is
+    // what it computed over.
+    assert_eq!(
+        report["accounts"].as_array().expect("rows").len(),
+        2,
+        "{report}"
+    );
+}
+
+/// An account the owner has placed in another scope is outside on a decision,
+/// and the response says which of the two kinds of omission it is.
+#[tokio::test]
+async fn an_account_placed_in_another_scope_is_not_reported_as_undecided() {
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let (status, reported) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reported}");
+    let contour_id = reported["contour"].as_str().expect("scope").to_owned();
+
+    let (status, elsewhere) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Elsewhere", "accounts": [savings] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{elsewhere}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["population"]["completeness"], "bounded", "{report}");
+    let outside = report["population"]["outside"]
+        .as_array()
+        .expect("outside accounts");
+    assert_eq!(outside.len(), 1, "{report}");
+    assert_eq!(
+        outside[0]["standing"], "outside_placed_elsewhere",
+        "{report}"
+    );
+}
+
+/// The returns report keeps every field it had, with the population beside
+/// them.
+///
+/// The manifest is added to that response through a wrapper, so this checks the
+/// wrapper did not move the figures: a client reading `data_quality` at the top
+/// level goes on reading it there.
+#[tokio::test]
+async fn the_population_joins_the_returns_report_without_moving_its_fields() {
+    let harness = harness();
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert!(report["data_quality"]["status"].is_string(), "{report}");
+    assert!(report["applied_rules"]["contour"].is_string(), "{report}");
+    assert!(report["xirr_pre_tax"].is_object(), "{report}");
+    assert!(report["population"]["covered"].is_array(), "{report}");
+}
+
+/// The vocabulary a client must switch on is published, and it is the
+/// vocabulary the server sends.
+#[tokio::test]
+async fn the_openapi_document_declares_the_population_a_report_covered() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for schema in ["PopulationDto", "PopulationAccountDto"] {
+        assert!(
+            spec["components"]["schemas"][schema].is_object(),
+            "schema {schema} must be in OpenAPI"
+        );
+    }
+    let population = &spec["components"]["schemas"]["PopulationDto"]["properties"];
+    assert!(population["completeness"].is_object(), "{population}");
+    assert!(population["covered"].is_object(), "{population}");
+    assert!(population["outside"].is_object(), "{population}");
+
+    let balances = &spec["components"]["schemas"]["BalancesReportDto"]["properties"];
+    assert!(balances["population"].is_object(), "{balances}");
+    let flow = &spec["components"]["schemas"]["MoneyFlowReportDto"]["properties"];
+    assert!(flow["population"].is_object(), "{flow}");
 }

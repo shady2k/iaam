@@ -28,6 +28,17 @@ pub struct ContourRecord {
     pub version: ContourVersion,
 }
 
+/// The owner's recorded statement that an account sits outside every contour.
+///
+/// Only the deliberate exclusion is a record. Membership is read from the
+/// contour composition, and an account with neither is awaiting a decision —
+/// a state expressed by the absence of a row rather than by a third value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountScopeExclusionRecord {
+    pub account: AccountId,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentRecord {
     pub id: InstrumentId,
@@ -568,6 +579,75 @@ impl SqliteStore {
             return Ok(None);
         }
         Ok(Some(ContourDefinition::new(contour, version, accounts)))
+    }
+
+    /// Record, or replace, the owner's decision that an account is outside every
+    /// contour.
+    ///
+    /// An upsert rather than an insert: a disposition is a current statement,
+    /// not a history, and the owner restating it with a better reason must not
+    /// fail. The `WHERE` clause on the conflict branch is the one accounts and
+    /// custody places already carry — without it a request naming a guessed
+    /// identifier would overwrite another owner's statement (§14).
+    pub fn record_account_scope_exclusion(
+        &self,
+        owner: OwnerId,
+        exclusion: &AccountScopeExclusionRecord,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO account_scope_exclusions (owner, account, reason, recorded_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (owner, account) DO UPDATE SET
+                 reason = excluded.reason,
+                 recorded_at = excluded.recorded_at
+             WHERE account_scope_exclusions.owner = excluded.owner",
+            params![
+                owner.inner().to_string(),
+                exclusion.account.inner().to_string(),
+                exclusion.reason,
+                now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Withdraw the statement, returning the account to «awaiting a decision».
+    ///
+    /// Deleting the row rather than writing a third value: the absence of a row
+    /// is what «undecided» means everywhere else in this table, and two ways of
+    /// spelling one state is how they disagree.
+    pub fn clear_account_scope_exclusion(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM account_scope_exclusions WHERE owner = ?1 AND account = ?2",
+            params![owner.inner().to_string(), account.inner().to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_account_scope_exclusions(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountScopeExclusionRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT account, reason FROM account_scope_exclusions
+             WHERE owner = ?1 ORDER BY account",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut exclusions = Vec::new();
+        for row in rows {
+            let (account, reason) = row?;
+            exclusions.push(AccountScopeExclusionRecord {
+                account: AccountId(parse_uuid(&account, "account")?),
+                reason,
+            });
+        }
+        Ok(exclusions)
     }
 
     /// Highest circuit version. Report without an explicitly specified version

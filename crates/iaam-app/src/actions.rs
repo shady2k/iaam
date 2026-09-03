@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountActivityView, AccountView, ContourView, ControlAssertionView, Scope, Store,
+    AccountActivityView, AccountScopeExclusionView, AccountView, ContourView, ControlAssertionView,
+    Scope, Store,
 };
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::source_row::RowName;
-use iaam_core::ids::{AccountId, OwnerId};
+use iaam_core::ids::{AccountId, EventId, OwnerId};
 use iaam_core::money::{CurrencyCode, Money};
 use iaam_core::projection::money_flow::UndecomposedCause;
 use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
@@ -19,6 +20,7 @@ use iaam_ingest::Verdict;
 pub enum ActionKind {
     CreateFirstAccount,
     CreateFirstContour,
+    AccountScopeUndecided,
     StartAccountImport,
     ProvideControlAssertion,
     CoverageGapUnrepaired,
@@ -37,6 +39,7 @@ impl ActionKind {
         match self {
             Self::CreateFirstAccount => "create_first_account",
             Self::CreateFirstContour => "create_first_contour",
+            Self::AccountScopeUndecided => "account_scope_undecided",
             Self::StartAccountImport => "start_account_import",
             Self::ProvideControlAssertion => "provide_control_assertion",
             Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
@@ -70,6 +73,22 @@ pub enum ActionState {
     NeedsOwnerInput,
     /// No operation in this API is available for this item.
     Blocked,
+}
+
+/// The typed thing an action is about.
+///
+/// Published beside the prose rather than only inside it. An action's `id` is
+/// opaque by design and its `reason` is a sentence; a caller answering a
+/// question about one account — a report scoping its diagnostics, an agent
+/// deciding which item its next call would resolve — could previously narrow
+/// the queue by neither, and had to be handed a separately scoped list instead.
+///
+/// Not every action has one: «no account exists» and «no contour exists» are
+/// existential and name nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionSubject {
+    Account(AccountId),
+    Event(EventId),
 }
 
 /// A source from which the value of a missing request field must come.
@@ -156,6 +175,8 @@ pub struct ActionFacts {
     pub category: ActionCategory,
     pub state: ActionState,
     pub required_scope: Option<Scope>,
+    /// The account or event this item is about, when it is about one.
+    pub subject: Option<ActionSubject>,
 }
 
 /// One outstanding item in the owner's computed policy frontier.
@@ -167,6 +188,7 @@ pub struct Action {
     state: ActionState,
     reason: String,
     required_scope: Option<Scope>,
+    subject: Option<ActionSubject>,
     target: ActionTarget,
 }
 
@@ -202,6 +224,7 @@ impl Action {
             state: facts.state,
             reason: reason.into(),
             required_scope: facts.required_scope,
+            subject: facts.subject,
             target,
         })
     }
@@ -235,6 +258,12 @@ impl Action {
         self.required_scope
     }
 
+    /// The account or event this item is about, when it is about one.
+    #[must_use]
+    pub const fn subject(&self) -> Option<ActionSubject> {
+        self.subject
+    }
+
     #[must_use]
     pub const fn target(&self) -> &ActionTarget {
         &self.target
@@ -255,6 +284,7 @@ fn identity(kind: ActionKind) -> String {
 pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, AppError> {
     let accounts = store.list_accounts(owner).await?;
     let contours = store.list_contours(owner).await?;
+    let exclusions = store.list_account_scope_exclusions(owner).await?;
     let activity = store.list_account_activity(owner).await?;
     let mut assertions = Vec::new();
     for account in activity
@@ -270,6 +300,7 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
     Ok(actions_from_state(
         &accounts,
         &contours,
+        &exclusions,
         &activity,
         &assertions,
     ))
@@ -282,12 +313,14 @@ pub fn ledger_diagnostics(ledger: &ReconciliationLedger) -> Vec<Action> {
 
 /// The same facts, restricted to one account and the periods meeting one range.
 ///
-/// A scoped sibling rather than a filter over the returned items: an `Action`
-/// publishes no typed subject, only an opaque `id` and prose, so a caller
-/// answering about one account can narrow the set only here, on the ledger's own
-/// typed gaps and statuses. The predicate is the one
-/// `scenarios::reconciliation::report` already applies to its statuses and gaps
-/// — the same account, and periods that intersect the requested range.
+/// A scoped sibling rather than a filter over the returned items. An `Action`
+/// now publishes its account in [`Action::subject`], so half of this predicate
+/// could be applied afterwards; the period cannot. A diagnostic's interval is
+/// not on the envelope — it is in the ledger's own typed gaps and statuses — and
+/// filtering here keeps one predicate rather than splitting it across two
+/// places. It is the one `scenarios::reconciliation::report` already applies to
+/// its statuses and gaps: the same account, and periods that intersect the
+/// requested range.
 pub fn ledger_diagnostics_for(
     ledger: &ReconciliationLedger,
     account: AccountId,
@@ -351,6 +384,7 @@ fn diagnostics(
             ),
             ActionKind::CoverageGapUnrepaired,
             category,
+            Some(ActionSubject::Account(gap.account)),
             format!(
                 "Account {} has a coverage gap from {} through {} in dimensions {}; {} ({} rows refused); no repair operation exists in this API.",
                 gap.account.inner(),
@@ -383,6 +417,7 @@ fn diagnostics(
                     ),
                     ActionKind::IndependentConfirmationMissing,
                     ActionCategory::RequiredForGoal,
+                    Some(ActionSubject::Account(status.account())),
                     format!(
                         "Account {} reached internal confirmation for {} from {} through {} but has no confirmation from a different parser and document; no acquisition operation exists in this API.",
                         status.account().inner(),
@@ -409,6 +444,7 @@ fn diagnostics(
                 ),
                 ActionKind::DiscrepancyUnresolved,
                 ActionCategory::RequiredForGoal,
+                Some(ActionSubject::Account(status.account())),
                 format!(
                     "Account {} has an unresolved {} discrepancy from {} through {}: claimed {}, observed {}, delta {}; the system cannot identify which side is wrong and no resolution operation exists in this API.",
                     status.account().inner(),
@@ -459,6 +495,7 @@ pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
             ),
             ActionKind::UnexplainedResidual,
             ActionCategory::Informational,
+            Some(ActionSubject::Account(account)),
             format!(
                 "Account {} has an unexplained residual of {} {}; the report quantities do not explain its cash change and no report operation can resolve it.",
                 account.inner(),
@@ -522,6 +559,7 @@ fn undecomposed_outflows_action(
             category: ActionCategory::Recommended,
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
+            subject: Some(ActionSubject::Account(account)),
         },
         format!(
             "Account {} has {} outflow rows totaling {} {} that no category rule matched; \
@@ -584,6 +622,7 @@ fn external_transfers_action(
         ),
         ActionKind::ExternalTransfersUncategorised,
         ActionCategory::Informational,
+        Some(ActionSubject::Account(account)),
         format!(
             "Account {} has {} transfer rows totaling {} {} that left the contour and \
              carry no category; a category rule cannot decompose them, because category \
@@ -614,6 +653,7 @@ pub fn verdict_diagnostics(verdict: &Verdict) -> Option<Action> {
         ),
         ActionKind::PossibleDuplicateUndecided,
         ActionCategory::RequiredForGoal,
+        Some(ActionSubject::Event(*event)),
         format!(
             "Event {} may duplicate event {} at deduplication level {}; the owner must decide and no decision operation exists in this API.",
             event.inner(),
@@ -639,6 +679,7 @@ fn blocked_action(
     id: String,
     kind: ActionKind,
     category: ActionCategory,
+    subject: Option<ActionSubject>,
     reason: String,
 ) -> Action {
     Action::new(
@@ -648,6 +689,7 @@ fn blocked_action(
             category,
             state: ActionState::Blocked,
             required_scope: None,
+            subject,
         },
         reason,
         ActionTarget::None,
@@ -683,10 +725,11 @@ fn row_name_text(name: &RowName) -> String {
 fn actions_from_state(
     accounts: &[AccountView],
     contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
     activity: &[AccountActivityView],
     assertions: &[ControlAssertionView],
 ) -> Vec<Action> {
-    let mut actions = actions_from_views(accounts, contours);
+    let mut actions = actions_from_views(accounts, contours, exclusions);
     actions.reserve(activity.len() + assertions.len());
     for account in activity
         .iter()
@@ -772,7 +815,11 @@ fn control_assertion_completion(
     })
 }
 
-fn actions_from_views(accounts: &[AccountView], contours: &[ContourView]) -> Vec<Action> {
+fn actions_from_views(
+    accounts: &[AccountView],
+    contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
+) -> Vec<Action> {
     let account_completion = account_completion(accounts);
     let contour_eligibility = !accounts.is_empty();
     let contour_completion = contour_completion(contours);
@@ -785,6 +832,14 @@ fn actions_from_views(accounts: &[AccountView], contours: &[ContourView]) -> Vec
     if contour_eligibility && contour_gap {
         actions.push(first_contour_action(accounts));
     }
+    if account_scope_eligibility(contours) {
+        for account in accounts
+            .iter()
+            .filter(|account| account_scope_gap(account.id, contours, exclusions))
+        {
+            actions.push(account_scope_action(account, accounts, contours));
+        }
+    }
     actions
 }
 
@@ -792,8 +847,88 @@ fn account_completion(accounts: &[AccountView]) -> bool {
     !accounts.is_empty()
 }
 
+/// Whether the owner has any contour at all.
+///
+/// The goal this satisfies is "a contour exists", and that is all it ever meant.
+/// It is deliberately no longer asked about an individual account: the coverage
+/// question is [`account_scope_completion`], and conflating the two is how "any
+/// contour exists" came to stand in for "every account has been placed".
 fn contour_completion(contours: &[ContourView]) -> bool {
     !contours.is_empty()
+}
+
+/// Where an account stands relative to the owner's reporting perimeter.
+///
+/// Three states, not two. "Every account must belong to a contour" is as wrong
+/// as "any contour exists": an account may be outside the perimeter on purpose —
+/// a counterparty's, a closed one, one the owner does not want reported — and a
+/// queue that nags about it forever is a queue the owner learns to ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountScope {
+    /// Named by the latest version of at least one contour.
+    Inside,
+    /// The owner has ruled it outside every contour, and said why.
+    Outside,
+    /// Neither. The state a newly created account is in.
+    Undecided,
+}
+
+/// Read an account's disposition from the two places that can hold one.
+///
+/// `Inside` is derived from the contour composition rather than stored beside
+/// the exclusions: membership is already a versioned fact of the contour, and a
+/// second copy of it would be a second truth to keep in step. `Outside` cannot
+/// be derived from anything — it is a statement, and it is not a statement any
+/// single contour owns, which is why it is recorded per owner and account.
+#[must_use]
+pub fn account_scope(
+    account: AccountId,
+    contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
+) -> AccountScope {
+    if contours
+        .iter()
+        .any(|contour| contour.accounts.contains(&account))
+    {
+        return AccountScope::Inside;
+    }
+    if exclusions
+        .iter()
+        .any(|exclusion| exclusion.account == account)
+    {
+        return AccountScope::Outside;
+    }
+    AccountScope::Undecided
+}
+
+/// An account can be placed once there is a contour to place it in.
+///
+/// Without one, `first_contour_action` already asks the same question of every
+/// account at once and offers every one of them as a candidate; raising a second
+/// item per account beside it would say the same thing twice.
+const fn account_scope_eligibility(contours: &[ContourView]) -> bool {
+    !contours.is_empty()
+}
+
+fn account_scope_gap(
+    account: AccountId,
+    contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
+) -> bool {
+    !account_scope_completion(account, contours, exclusions)
+}
+
+/// The goal is satisfied by a decision, not by membership.
+///
+/// This is the property `!contours.is_empty()` could not have: it is asked of
+/// each account, so a newly created account reopens it however many contours
+/// already exist.
+fn account_scope_completion(
+    account: AccountId,
+    contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
+) -> bool {
+    account_scope(account, contours, exclusions) != AccountScope::Undecided
 }
 
 /// Use the inclusive first and last business effective dates: they are the
@@ -805,30 +940,40 @@ fn activity_period(activity: &AccountActivityView) -> Option<AssertionPeriod> {
     )
 }
 
+/// The owner has to fetch a statement, and no operation in this API does it.
+///
+/// `Blocked`, not `NeedsOwnerInput`. Both readings were true of this item — the
+/// owner must act, and there is nothing to call — but the two states do not mean
+/// the same thing to the agent reading the queue. `NeedsOwnerInput` everywhere
+/// else accompanies a real operation with a list of fields the policy cannot
+/// fill: collect these, then call this. Here there is no `this`. `Blocked`'s own
+/// documentation is exactly the second reading — "no operation in this API is
+/// available for this item" — and the queue's states are the only map an agent
+/// has of what it may call.
+///
+/// The invariant then removes `required_scope` as well, and that is right rather
+/// than a loss: a scope answers "who may call it", a question that does not
+/// arise when nothing can be called.
 fn start_account_import_action(account: AccountId) -> Action {
-    Action::new(
-        ActionFacts {
-            // Scoped to the account: this action is emitted once per account
-            // with no facts, and an unscoped id would give every one of them the
-            // same identity — which is what an agent deduplicates by.
-            id: format!(
-                "{}:{}",
-                ActionKind::StartAccountImport.id(),
-                account.inner()
-            ),
-            kind: ActionKind::StartAccountImport,
-            category: ActionCategory::RequiredForGoal,
-            state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
-        },
+    blocked_action(
+        // Scoped to the account: this action is emitted once per account with no
+        // facts, and an unscoped id would give every one of them the same
+        // identity — which is what an agent deduplicates by.
         format!(
-            "Account {} has no business facts; import a statement or connect a broker. \
-             Import is continuous and never complete.",
+            "{}:{}",
+            ActionKind::StartAccountImport.id(),
             account.inner()
         ),
-        ActionTarget::None,
+        ActionKind::StartAccountImport,
+        ActionCategory::RequiredForGoal,
+        Some(ActionSubject::Account(account)),
+        format!(
+            "Account {} has no business facts; import a statement or connect a broker. \
+             Import is continuous and never complete. No operation in this API fetches \
+             the document.",
+            account.inner()
+        ),
     )
-    .expect("account import action needs owner input")
 }
 
 /// The request for one control assertion, at the point it is wanted for.
@@ -883,6 +1028,7 @@ fn provide_control_assertion_action(
             category: ActionCategory::RequiredForGoal,
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
+            subject: Some(ActionSubject::Account(account)),
         },
         match point {
             BalancePoint::Opening => format!(
@@ -927,6 +1073,8 @@ fn first_account_action() -> Action {
             category: ActionCategory::Blocking,
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
+            // Existential: no account exists, so the item names none.
+            subject: None,
         },
         "No account exists; create one before portfolio actions can be offered.",
         ActionTarget::Operation {
@@ -944,7 +1092,119 @@ fn first_account_action() -> Action {
     .expect("first account action has an operation target")
 }
 
-fn first_contour_action(accounts: &[AccountView]) -> Action {
+/// The account no contour names and the owner has not ruled out.
+///
+/// One item per undecided account, identified by that account and naming it in
+/// [`ActionSubject`] rather than only in the sentence. It is `RequiredForGoal`
+/// because an account in this state is the mechanism by which a correct import
+/// produces a silently incomplete report: every operation lands, every verdict
+/// is positive, and the report leaves the account out because it is in no
+/// contour, with nothing anywhere saying so.
+///
+/// `NeedsOwnerInput`, not `Ready`, even when every field is preset. Drawing the
+/// reporting perimeter is the owner's judgement — the same rule that keeps
+/// `first_contour_action` out of the agent's hands — and a fully formed request
+/// does not change who may send it.
+///
+/// The target offers the membership half of the answer. The other half — «this
+/// account is outside the perimeter, deliberately» — is a different operation
+/// and an action carries one target; the sentence names it so the agent is not
+/// left believing membership is the only way out of this state.
+fn account_scope_action(
+    account: &AccountView,
+    accounts: &[AccountView],
+    contours: &[ContourView],
+) -> Action {
+    // A contour version is a complete composition, so «add this account» can be
+    // written out only when there is no doubt which contour is meant. With one
+    // contour there is none: the request is its current members plus this
+    // account. With several, choosing for the owner would be choosing where his
+    // money is reported from, so the choice is his and the composition cannot be
+    // proposed without it.
+    let (preset, missing) = match contours {
+        [only] => {
+            let mut members: Vec<AccountId> = only.accounts.clone();
+            if !members.contains(&account.id) {
+                members.push(account.id);
+            }
+            members.sort_by_key(AccountId::inner);
+            let mut preset = BTreeMap::new();
+            preset.insert("contour".to_owned(), only.id.0.to_string().into());
+            preset.insert(
+                "accounts".to_owned(),
+                serde_json::Value::Array(
+                    members
+                        .iter()
+                        .map(|member| member.inner().to_string().into())
+                        .collect(),
+                ),
+            );
+            (
+                preset,
+                // The title is asked for because this API has one route for
+                // creating a contour and for versioning one, and it requires a
+                // title either way; the existing contour already has one and the
+                // owner should not have to retype it.
+                vec![MissingInput {
+                    pointer: "/title".into(),
+                    provided_by: ProvidedBy::Owner,
+                    candidates: None,
+                }],
+            )
+        }
+        _ => (
+            BTreeMap::new(),
+            vec![
+                MissingInput {
+                    pointer: "/contour".into(),
+                    provided_by: ProvidedBy::Owner,
+                    candidates: None,
+                },
+                MissingInput {
+                    pointer: "/title".into(),
+                    provided_by: ProvidedBy::Owner,
+                    candidates: None,
+                },
+                MissingInput {
+                    pointer: "/accounts".into(),
+                    provided_by: ProvidedBy::Owner,
+                    candidates: Some(account_candidates(accounts)),
+                },
+            ],
+        ),
+    };
+
+    Action::new(
+        ActionFacts {
+            id: format!(
+                "{}:{}",
+                ActionKind::AccountScopeUndecided.id(),
+                account.id.inner()
+            ),
+            kind: ActionKind::AccountScopeUndecided,
+            category: ActionCategory::RequiredForGoal,
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Owner),
+            subject: Some(ActionSubject::Account(account.id)),
+        },
+        format!(
+            "Account {} ({}) belongs to no contour and has not been ruled outside one; \
+             until it is placed, its operations are absent from every report and nothing \
+             else says so. Add it to an existing contour, or record that it is outside \
+             the perimeter and why.",
+            account.id.inner(),
+            account.title
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::CreateContour,
+            request: RequestPlan { preset, missing },
+        },
+    )
+    .expect("account scope action has an operation target")
+}
+
+/// Every account the owner has, as contour-membership candidates.
+fn account_candidates(accounts: &[AccountView]) -> Vec<AccountCandidate> {
     let mut candidates: Vec<_> = accounts
         .iter()
         .map(|account| AccountCandidate {
@@ -954,6 +1214,11 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
         })
         .collect();
     candidates.sort_by_key(|candidate| candidate.id.inner());
+    candidates
+}
+
+fn first_contour_action(accounts: &[AccountView]) -> Action {
+    let candidates = account_candidates(accounts);
 
     Action::new(
         ActionFacts {
@@ -962,6 +1227,8 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
             category: ActionCategory::RequiredForGoal,
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
+            // Existential: no contour exists, so the item names no one account.
+            subject: None,
         },
         "No contour exists; report boundaries cannot be computed until one is created.",
         ActionTarget::Operation {
@@ -1025,6 +1292,14 @@ mod tests {
             has_business_fact: false,
             first_effective_date: None,
             last_effective_date: None,
+        }
+    }
+
+    fn named(title: &str) -> AccountView {
+        AccountView {
+            id: AccountId::new_random(),
+            title: title.into(),
+            institution: None,
         }
     }
 
@@ -1157,11 +1432,338 @@ mod tests {
         );
     }
 
+    /// Two contours already exist and a third account belongs to neither.
+    ///
+    /// The queue has to name that account. `!contours.is_empty()` cannot: it is
+    /// satisfied by the first contour and says nothing for the rest of the
+    /// instance's life, which is how a second bank's accounts import correctly
+    /// and stay out of every report with nothing anywhere saying so.
+    #[tokio::test]
+    async fn an_account_in_no_contour_is_named_even_though_contours_exist() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let first = named("Main");
+        let second = named("Savings");
+        let orphan = named("Second Bank Current");
+        for account in [&first, &second, &orphan] {
+            store
+                .upsert_account(owner, account.clone())
+                .await
+                .expect("account");
+        }
+        for (index, member) in [first.id, second.id].into_iter().enumerate() {
+            let contour = ContourId::new_random();
+            store
+                .insert_contour_version(
+                    owner,
+                    ContourDefinition::new(contour, ContourVersion(1), [member]),
+                    format!("Contour {index}"),
+                    vec![member],
+                )
+                .await
+                .expect("contour");
+        }
+
+        let actions = frontier(owner, &store).await.expect("frontier");
+        assert!(
+            actions.iter().any(|action| matches!(
+                action.target(),
+                ActionTarget::Operation {
+                    operation: OperationKey::CreateContour,
+                    ..
+                }
+            )),
+            "nothing in the queue offers contour membership for the account that has none: {actions:?}"
+        );
+
+        let named: Vec<&Action> = actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::AccountScopeUndecided)
+            .collect();
+        assert_eq!(
+            named.len(),
+            1,
+            "exactly the account in no contour is named: {actions:?}"
+        );
+        let action = named[0];
+        // The subject is a typed field, not a substring of the sentence: a
+        // caller narrowing the queue to one account must not have to parse prose.
+        assert_eq!(action.subject(), Some(ActionSubject::Account(orphan.id)));
+        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(action.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(action.required_scope(), Some(Scope::Owner));
+        let ActionTarget::Operation { operation, request } = action.target() else {
+            panic!("the account scope action must name an operation");
+        };
+        assert_eq!(*operation, OperationKey::CreateContour);
+        // Two contours exist, so which one the account belongs in is the owner's
+        // choice and the composition cannot be written out without it.
+        assert!(
+            request.preset.is_empty(),
+            "the contour cannot be chosen for the owner: {:?}",
+            request.preset
+        );
+        assert!(
+            request
+                .missing
+                .iter()
+                .any(|missing| missing.pointer == "/contour")
+        );
+        let accounts = request
+            .missing
+            .iter()
+            .find(|missing| missing.pointer == "/accounts")
+            .expect("account selection input");
+        assert!(
+            accounts
+                .candidates
+                .as_ref()
+                .expect("candidates")
+                .iter()
+                .any(|candidate| candidate.id == orphan.id)
+        );
+    }
+
+    /// The one-contour case, which is the one the reporter actually hit.
+    ///
+    /// With a single contour there is no doubt which one «add this account»
+    /// means, so the call is written out in full and only the title — which this
+    /// API demands of a new version and the owner should not have to retype —
+    /// is left to him.
+    #[tokio::test]
+    async fn with_one_contour_the_membership_call_is_written_out() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let member = named("Main");
+        let orphan = named("Second Bank Current");
+        for account in [&member, &orphan] {
+            store
+                .upsert_account(owner, account.clone())
+                .await
+                .expect("account");
+        }
+        let contour = ContourId::new_random();
+        store
+            .insert_contour_version(
+                owner,
+                ContourDefinition::new(contour, ContourVersion(1), [member.id]),
+                "Household".into(),
+                vec![member.id],
+            )
+            .await
+            .expect("contour");
+
+        let actions = frontier(owner, &store).await.expect("frontier");
+        let action = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
+            .expect("the orphaned account is named");
+        let ActionTarget::Operation { request, .. } = action.target() else {
+            panic!("the account scope action must name an operation");
+        };
+        assert_eq!(
+            request.preset.get("contour"),
+            Some(&serde_json::Value::from(contour.0.to_string()))
+        );
+        // The whole composition, not just the new account: a contour version is
+        // a complete membership list, and sending only the account being added
+        // would drop every existing member from the contour.
+        let mut expected = vec![member.id.inner().to_string(), orphan.id.inner().to_string()];
+        expected.sort();
+        assert_eq!(
+            request.preset.get("accounts"),
+            Some(&serde_json::Value::Array(
+                expected.into_iter().map(serde_json::Value::from).collect()
+            ))
+        );
+        assert_eq!(request.missing.len(), 1);
+        assert_eq!(request.missing[0].pointer, "/title");
+    }
+
+    /// A new account reopens the goal, which `!contours.is_empty()` cannot.
+    #[tokio::test]
+    async fn a_new_account_reopens_the_goal_although_contours_exist() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let member = named("Main");
+        store
+            .upsert_account(owner, member.clone())
+            .await
+            .expect("account");
+        let contour = ContourId::new_random();
+        store
+            .insert_contour_version(
+                owner,
+                ContourDefinition::new(contour, ContourVersion(1), [member.id]),
+                "Household".into(),
+                vec![member.id],
+            )
+            .await
+            .expect("contour");
+        assert!(
+            frontier(owner, &store)
+                .await
+                .expect("frontier")
+                .iter()
+                .all(|action| action.kind() != ActionKind::AccountScopeUndecided),
+            "the placed account must not be nagged about"
+        );
+
+        let arrival = named("Second Bank Current");
+        store
+            .upsert_account(owner, arrival.clone())
+            .await
+            .expect("account");
+
+        let reopened = frontier(owner, &store).await.expect("frontier");
+        assert_eq!(
+            reopened
+                .iter()
+                .filter(|action| action.kind() == ActionKind::AccountScopeUndecided)
+                .map(Action::subject)
+                .collect::<Vec<_>>(),
+            vec![Some(ActionSubject::Account(arrival.id))]
+        );
+    }
+
+    /// The third state, and the reason «every account must be in a contour» is
+    /// the wrong predicate: an account can be outside the perimeter on purpose.
+    #[tokio::test]
+    async fn an_account_ruled_outside_the_perimeter_raises_nothing() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let member = named("Main");
+        let outside = named("Shop One");
+        for account in [&member, &outside] {
+            store
+                .upsert_account(owner, account.clone())
+                .await
+                .expect("account");
+        }
+        let contour = ContourId::new_random();
+        store
+            .insert_contour_version(
+                owner,
+                ContourDefinition::new(contour, ContourVersion(1), [member.id]),
+                "Household".into(),
+                vec![member.id],
+            )
+            .await
+            .expect("contour");
+        store
+            .record_account_scope_exclusion(
+                owner,
+                AccountScopeExclusionView {
+                    account: outside.id,
+                    reason: "A counterparty's account, not the owner's money.".into(),
+                },
+            )
+            .await
+            .expect("exclusion");
+
+        let actions = frontier(owner, &store).await.expect("frontier");
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.kind() != ActionKind::AccountScopeUndecided),
+            "a decided account raises nothing: {actions:?}"
+        );
+
+        // Withdrawing the statement returns it to awaiting a decision, rather
+        // than leaving it silently decided for ever.
+        store
+            .clear_account_scope_exclusion(owner, outside.id)
+            .await
+            .expect("cleared");
+        assert_eq!(
+            frontier(owner, &store)
+                .await
+                .expect("frontier")
+                .iter()
+                .filter(|action| action.kind() == ActionKind::AccountScopeUndecided)
+                .map(Action::subject)
+                .collect::<Vec<_>>(),
+            vec![Some(ActionSubject::Account(outside.id))]
+        );
+    }
+
+    #[test]
+    fn the_three_scope_states_are_read_from_the_two_places_that_hold_them() {
+        let inside = AccountId::new_random();
+        let outside = AccountId::new_random();
+        let undecided = AccountId::new_random();
+        let contours = [ContourView {
+            id: ContourId::new_random(),
+            version: ContourVersion(1),
+            accounts: vec![inside],
+        }];
+        let exclusions = [AccountScopeExclusionView {
+            account: outside,
+            reason: "Closed years ago.".into(),
+        }];
+
+        assert_eq!(
+            account_scope(inside, &contours, &exclusions),
+            AccountScope::Inside
+        );
+        assert_eq!(
+            account_scope(outside, &contours, &exclusions),
+            AccountScope::Outside
+        );
+        assert_eq!(
+            account_scope(undecided, &contours, &exclusions),
+            AccountScope::Undecided
+        );
+        assert!(account_scope_gap(undecided, &contours, &exclusions));
+        assert!(!account_scope_gap(inside, &contours, &exclusions));
+        assert!(!account_scope_gap(outside, &contours, &exclusions));
+        // Eligibility is separate from the gap: with no contour to place it in,
+        // `first_contour_action` already asks the question for every account.
+        assert!(!account_scope_eligibility(&[]));
+        assert!(account_scope_eligibility(&contours));
+    }
+
+    /// An item with no operation is `blocked`, whatever else is true of it.
+    #[test]
+    fn an_item_the_agent_cannot_call_says_so_in_its_state() {
+        let account = account();
+        let actions = actions_from_state(
+            std::slice::from_ref(&account),
+            &[],
+            &[],
+            &[no_facts(account.id)],
+            &[],
+        );
+
+        for action in &actions {
+            match action.target() {
+                ActionTarget::None => assert_eq!(
+                    action.state(),
+                    ActionState::Blocked,
+                    "{} has nothing to call and must say so",
+                    action.id()
+                ),
+                ActionTarget::Operation { .. } => assert_ne!(
+                    action.state(),
+                    ActionState::Blocked,
+                    "{} names an operation and cannot be blocked",
+                    action.id()
+                ),
+            }
+        }
+        let import = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::StartAccountImport)
+            .expect("account import action");
+        assert_eq!(import.state(), ActionState::Blocked);
+        assert_eq!(import.subject(), Some(ActionSubject::Account(account.id)));
+    }
+
     #[test]
     fn losing_contour_eligibility_is_not_contour_completion() {
         let account = account();
-        let eligible = actions_from_views(&[account], &[]);
-        let ineligible = actions_from_views(&[], &[]);
+        let eligible = actions_from_views(&[account], &[], &[]);
+        let ineligible = actions_from_views(&[], &[], &[]);
 
         assert!(
             eligible
@@ -1185,6 +1787,7 @@ mod tests {
         let actions = actions_from_state(
             &[with_id(first), with_id(second)],
             &[],
+            &[],
             &[no_facts(first), no_facts(second)],
             &[],
         );
@@ -1207,6 +1810,7 @@ mod tests {
                 category: ActionCategory::Blocking,
                 state: ActionState::Ready,
                 required_scope: Some(Scope::Owner),
+                subject: None,
             },
             "invalid",
             ActionTarget::None,
@@ -1246,6 +1850,7 @@ mod tests {
         let actions = actions_from_state(
             std::slice::from_ref(&account),
             &[],
+            &[],
             std::slice::from_ref(&activity),
             &[],
         );
@@ -1264,7 +1869,7 @@ mod tests {
         };
         assert!(account_import_completion(&completed));
         assert!(
-            actions_from_state(&[account], &[], &[completed], &[])
+            actions_from_state(&[account], &[], &[], &[completed], &[])
                 .iter()
                 .all(|action| action.kind() != ActionKind::StartAccountImport)
         );
@@ -1284,6 +1889,7 @@ mod tests {
         };
         actions_from_state(
             std::slice::from_ref(account),
+            &[],
             &[],
             std::slice::from_ref(&activity),
             recorded,
@@ -1446,7 +2052,7 @@ mod tests {
             },
         ];
 
-        let actions = actions_from_state(&[first, second], &[], &activity, &[]);
+        let actions = actions_from_state(&[first, second], &[], &[], &activity, &[]);
         let ids: Vec<_> = actions
             .iter()
             .filter(|action| action.kind() == ActionKind::ProvideControlAssertion)
@@ -1465,14 +2071,15 @@ mod tests {
             first_effective_date: Some(time::macros::date!(2026 - 03 - 01)),
             last_effective_date: Some(time::macros::date!(2026 - 03 - 31)),
         };
-        let actions = actions_from_state(std::slice::from_ref(&account), &[], &[activity], &[]);
+        let actions =
+            actions_from_state(std::slice::from_ref(&account), &[], &[], &[activity], &[]);
         assert!(
             actions
                 .iter()
                 .any(|action| action.kind() == ActionKind::ProvideControlAssertion)
         );
         assert!(
-            actions_from_state(&[], &[], &[], &[])
+            actions_from_state(&[], &[], &[], &[], &[])
                 .iter()
                 .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
         );
@@ -1760,6 +2367,7 @@ mod tests {
                 category: ActionCategory::RequiredForGoal,
                 state: ActionState::Blocked,
                 required_scope: None,
+                subject: None,
             },
             "nothing can call this",
             ActionTarget::None,
@@ -1779,6 +2387,7 @@ mod tests {
                 category: ActionCategory::RequiredForGoal,
                 state: ActionState::Blocked,
                 required_scope: None,
+                subject: None,
             },
             "nothing can call this",
             ActionTarget::Operation {
@@ -1798,6 +2407,7 @@ mod tests {
                 category: ActionCategory::RequiredForGoal,
                 state: ActionState::Blocked,
                 required_scope: Some(Scope::Owner),
+                subject: None,
             },
             "nothing can call this",
             ActionTarget::None,
@@ -1814,6 +2424,7 @@ mod tests {
                 category: ActionCategory::Blocking,
                 state: ActionState::NeedsOwnerInput,
                 required_scope: None,
+                subject: None,
             },
             "invalid",
             ActionTarget::Operation {

@@ -58,7 +58,12 @@ IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
 
 On submission, account titles are resolved at runtime with `GET /v1/accounts`.
 Operations are sent to `POST /v1/ingest/operations`, batched by resolved
-account, with the declared source `{account, channel}`.
+account, with the declared source `{account, channel, label}`. The label is
+`tbank-export <file name>`: it names this import within the account and
+channel, so `POST /v1/corrections/imports` repeating the same three values
+retracts exactly this run and leaves other months imported through the same
+account and channel in force. Two runs of the same export file are one import
+and the second adds nothing.
 
 ## Checking the tool
 

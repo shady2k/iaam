@@ -217,7 +217,8 @@ async fn report_values_position_from_market_observation() {
         },
     )
     .await
-    .unwrap_or_else(|error| panic!("report: {error}"));
+    .unwrap_or_else(|error| panic!("report: {error}"))
+    .report;
 
     let selected = report
         .data_quality
@@ -308,7 +309,8 @@ async fn contradictory_price_leaves_only_its_position_uncovered() {
         },
     )
     .await
-    .unwrap_or_else(|error| panic!("report: {error}"));
+    .unwrap_or_else(|error| panic!("report: {error}"))
+    .report;
 
     let coverage = &report.data_quality.position_coverage;
     assert_eq!(coverage.total_positions, 2);

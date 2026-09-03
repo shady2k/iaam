@@ -77,6 +77,15 @@ impl ContourDefinition {
     pub fn contains(&self, account: AccountId) -> bool {
         self.accounts.contains(&account)
     }
+
+    /// The accounts covered at this version, in identifier order.
+    ///
+    /// An iterator rather than the set itself: the membership is stored as a
+    /// `BTreeSet` because a composition is a set, and handing that container out
+    /// would publish the choice and invite a caller to depend on it.
+    pub fn accounts(&self) -> impl ExactSizeIterator<Item = AccountId> + '_ {
+        self.accounts.iter().copied()
+    }
 }
 
 /// An event's relation to the contour boundary.

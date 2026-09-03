@@ -106,7 +106,9 @@ is how you match a term in them to the code.
 |---|---|---|
 | выгрузка (банка) | bank export | the file or page the institution hands the owner |
 | канал | channel | `SourceChannel`; how a fact reached us, not who stated it |
-| объявленный источник | declared source | `SourceId::declared(owner, account, channel)` |
+| объявленный источник | declared source | `SourceId::declared(owner, account, channel)`; what deduplication is scoped by |
+| объявленный импорт | declared import | `ImportId::declared(owner, account, channel, label)`; one submission, and what an import correction is keyed on |
+| метка импорта | import label | the caller's name for one import within an account and channel |
 | маппинг колонок | column mapping | which export column feeds which field |
 | ключ строки | row key | the stable identity that makes a re-import idempotent |
 | нога (перевода) | leg | one of the two rows an internal transfer produces |

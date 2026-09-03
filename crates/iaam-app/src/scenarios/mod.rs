@@ -10,6 +10,7 @@ pub mod journal;
 pub mod market_reference;
 pub mod reports;
 pub mod schedule;
+pub mod transfer_pairing;
 
 pub mod broker_dictionary;
 pub mod classification;

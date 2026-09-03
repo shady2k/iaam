@@ -100,8 +100,13 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::get_import_session))
         .routes(routes!(routes::add_import_rows))
         .routes(routes!(routes::answer_import_question))
+        .routes(routes!(routes::assess_import_session))
         .routes(routes!(routes::commit_import_session))
         .routes(routes!(routes::abandon_import_session))
+        .routes(routes!(
+            routes::list_transfer_pairings,
+            routes::confirm_transfer_pairing
+        ))
         .routes(routes!(routes::ingest_journal_events))
         .routes(routes!(routes::ingest_csv))
         .routes(routes!(routes::list_journal_events))

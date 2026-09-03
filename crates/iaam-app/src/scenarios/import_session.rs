@@ -155,6 +155,13 @@ pub struct AnswerableQuestion {
     /// the one the row is already on, which is a true statement about his
     /// directory and not a missing lookup.
     pub accounts: Vec<AccountCandidate>,
+    /// What became of the chance to turn this answer into a standing rule.
+    ///
+    /// Paired here rather than published beside the question for the reason the
+    /// account list is paired here: a caller reading a question reads one
+    /// object, and two objects assembled by two functions are two readings of
+    /// one answer that can come to disagree.
+    pub generalisation: Generalisation,
 }
 
 /// Pair each question with the accounts an answer to it may name.
@@ -177,6 +184,7 @@ pub struct AnswerableQuestion {
 pub async fn answerable_questions(
     services: &AppServices,
     principal: &Principal,
+    contents: &SessionContents,
     questions: &[ImportQuestionView],
 ) -> Result<Vec<AnswerableQuestion>, AppError> {
     let asked: Vec<Option<Question>> = questions
@@ -207,6 +215,7 @@ pub async fn answerable_questions(
             accounts: asked.map_or_else(Vec::new, |asked| {
                 answer_account_candidates(&asked, &accounts)
             }),
+            generalisation: generalisation_of(contents, question),
         })
         .collect())
 }
@@ -303,7 +312,12 @@ pub async fn submit_intake(
             })
         })
         .collect();
-    let mut recorded = submit_candidates(services, principal, "operation", candidates)
+    // No session, even where one was opened above. A session was opened only to
+    // hold the rows this batch could **not** settle; these are the ones it
+    // could, and they reach the journal without ever having been in it.
+    // Stamping the session on them would say the commit wrote what the
+    // conclusive route did.
+    let mut recorded = submit_candidates(services, principal, "operation", None, candidates)
         .await?
         .into_iter();
 
@@ -668,6 +682,128 @@ pub async fn add_rows(
     Ok(outcomes)
 }
 
+/// One question, and what its answer did — or could still do — to the owner's
+/// standing rules.
+///
+/// The pair exists because the rule identifier alone cannot say why it is
+/// absent, and since the answering scope narrowed (`iaam-hnod`) it has been
+/// absent for two unrelated reasons: the row offered nothing a matcher could
+/// match on, or the answer arrived under a token that may not generalise. A
+/// client can tell those apart, because it knows what token it holds. The owner
+/// reading the session back cannot — he sees a question answered and no rule —
+/// and he is the one for whom the difference is actionable.
+/// The pairing lives on [`AnswerableQuestion`], beside the accounts an answer
+/// may name: a caller reading a question reads one object, and one object
+/// assembled by one function is one reading of the answer.
+
+/// What became of the chance to turn one answer into a standing rule.
+///
+/// Four states, and only three of them can be true of an answered question.
+///
+/// **Why this and not a column on `import_questions`.** A column would record
+/// the reason at answer time, and the reason is not what the owner needs: he
+/// needs the rule. Recording «the answerer could not generalise» tells him a
+/// rule is missing and leaves him to reconstruct it from the row — read the
+/// observation, work out what a matcher would have asked, restate the
+/// classification the answer implies. That is the expensive path, and an agent
+/// that settles rows correctly while leaving it as the only way to keep those
+/// settlements has made the honest path the losing one. So the state carries the
+/// rule itself, and the reason falls out of which state it is.
+///
+/// **Why it is derived and not stored.** Every input already lives in the
+/// session: the observed row is the observation's payload and the classification
+/// is the stored answer, and [`matcher_for`] is the same function
+/// [`answer_question`] built the written rule with. A stored copy would be a
+/// second place recording one decision, and the two can disagree — the stored
+/// one silently, because nothing would ever compare them. Derived, the proposal
+/// is also the rule that would be created **now**, which is what a caller about
+/// to post it needs; a copy frozen at answer time would offer a matcher this
+/// build no longer writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Generalisation {
+    /// The question is still waiting on an answer, so there is nothing to
+    /// generalise yet.
+    Unanswered,
+    /// The answer created a standing rule, and this is its identifier.
+    Recorded { rule: String },
+    /// A rule was possible and none was written, because the answerer may not
+    /// generalise (`iaam-hnod`). This is the rule it would have been, and the
+    /// owner makes it stand with one call under his own token.
+    ///
+    /// It says what **this answer** wrote, not what rules now exist, and it goes
+    /// on saying `available` after the owner adopts the proposal. That is
+    /// deliberate: the rule he creates is his own act, recorded in his rule
+    /// listing where he reads, edits and retires it, and claiming the question
+    /// wrote it would attribute his decision to the import. The cost is that a
+    /// second adoption writes a second identical rule, which classifies
+    /// identically; the alternative — reading his rules here to see whether one
+    /// now covers the row — answers a different question, since a row a rule
+    /// matches is never asked about in the first place.
+    Available {
+        matcher: RuleMatcher,
+        outcome: Classification,
+    },
+    /// No rule can be built from this row, under any token. A matcher that asks
+    /// nothing matches nothing, and an "everything" rule would silently
+    /// reclassify the portfolio — so a row carrying no counterparty, no
+    /// description and no word from the source generalises into nothing, and
+    /// there is no call the owner could make that would change that.
+    Impossible,
+}
+
+impl Generalisation {
+    /// Wire code. One place, so two routes cannot spell it differently.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Unanswered => "unanswered",
+            Self::Recorded { .. } => "recorded",
+            Self::Available { .. } => "available",
+            Self::Impossible => "impossible",
+        }
+    }
+}
+
+/// Every question the session holds, each with what its answer generalised into.
+///
+/// A free function over what [`read_session`] already returned rather than a
+/// field on [`SessionContents`], because it reads no store and decides nothing
+/// the session holds: it is a second view of the same rows, and the callers that
+/// need only the questions — the refusals, the commit planner — must not pay for
+/// it.
+
+/// What one question's answer did, or could still do, to the standing rules.
+///
+/// The order of the three tests is the decision. A written rule settles it
+/// whatever the row says, because that rule exists and the row is no longer the
+/// evidence. Then an open question, which has no answer to generalise. Only then
+/// is the row consulted, and a row this build cannot read falls to `Impossible`
+/// beside a row that asks nothing — which is not a fudge: «no rule can be built
+/// from this» is true of both, and the assessment is where an unreadable row is
+/// reported as unreadable.
+fn generalisation_of(contents: &SessionContents, question: &ImportQuestionView) -> Generalisation {
+    if let Some(rule) = question.rule.clone() {
+        return Generalisation::Recorded { rule };
+    }
+    if question.is_open() {
+        return Generalisation::Unanswered;
+    }
+    observed_row(contents, question.row)
+        .ok()
+        .and_then(|observed| {
+            let matcher = matcher_for(&observed)?;
+            let answer: Answer = question
+                .answer
+                .as_deref()
+                .and_then(|stored| serde_json::from_str(stored).ok())?;
+            Some(Generalisation::Available {
+                matcher,
+                outcome: answer.classification(),
+            })
+        })
+        .unwrap_or(Generalisation::Impossible)
+}
+
 /// Record the owner's answer to one question.
 ///
 /// Three things happen, in this order and for these reasons:
@@ -687,6 +823,12 @@ pub async fn add_rows(
 ///
 /// The journal is not touched. The answer settles what the row is; commit is
 /// what records it.
+///
+/// What comes back is an [`AnswerableQuestion`] rather than the stored question,
+/// and the difference is the whole of `iaam-ngwn`: an answerer that could not
+/// write a rule is told, in the same response, what rule its answer would have
+/// made. Otherwise the agent's own reply is the one place that knows a
+/// generalisation was possible, and it is the place that cannot act on it.
 pub async fn answer_question(
     services: &AppServices,
     principal: &Principal,
@@ -789,18 +931,27 @@ pub async fn answer_question(
         )
         .await?;
     // Through the same pairing every other reading of a question goes through,
-    // rather than an empty list written out here. The answered question offers
-    // no candidates *because it is answered*, and that is one rule; stated in
-    // two places it is a rule that can come to disagree with itself.
-    Ok(
-        answerable_questions(services, principal, std::slice::from_ref(&answered))
-            .await?
-            .pop()
-            .unwrap_or(AnswerableQuestion {
-                view: answered,
-                accounts: Vec::new(),
-            }),
+    // rather than an empty list and a generalisation written out here. The
+    // answered question offers no candidates *because it is answered*, and what
+    // its answer generalised into is one derivation; stated in two places they
+    // are rules that can come to disagree with themselves.
+    //
+    // `contents` was read before the answer was written, and that is harmless:
+    // what the generalisation consults it for is the observed row, which an
+    // answer does not change.
+    Ok(answerable_questions(
+        services,
+        principal,
+        &contents,
+        std::slice::from_ref(&answered),
     )
+    .await?
+    .pop()
+    .unwrap_or(AnswerableQuestion {
+        view: answered,
+        accounts: Vec::new(),
+        generalisation: Generalisation::Unanswered,
+    }))
 }
 
 /// Record what the source printed about itself in its own control section.
@@ -980,7 +1131,14 @@ pub async fn commit_session(
         return Err(refusal);
     }
 
-    let verdicts = submit_candidates(services, principal, "operation", planned.candidates).await?;
+    let verdicts = submit_candidates(
+        services,
+        principal,
+        "operation",
+        Some(session),
+        planned.candidates,
+    )
+    .await?;
     // The assertions go in **after** the rows, and the order is not arbitrary:
     // an assertion is a statement about a period, and one written over a journal
     // that does not yet hold the period's rows is a discrepancy against an empty
@@ -2122,6 +2280,13 @@ fn control_assertion_key(
 /// never sees the file — it receives rows and figures over HTTP — and a
 /// fabricated file hash would be a claim about a document nobody read.
 ///
+/// The session is stamped on the assertion as it is on the rows, and it names
+/// the session that **wrote** it. [`control_assertion_key`] deliberately keeps
+/// the session out of the key, so a second import of the same statement states
+/// the same fact and deduplicates against the first; the assertion in the
+/// journal therefore names the session that first recorded the figure, which is
+/// the act that put it there.
+///
 /// [`ControlClaim::CashBalance`]: iaam_core::reconciliation::claim::ControlClaim::CashBalance
 /// [`ControlClaim::CashTurnover`]: iaam_core::reconciliation::claim::ControlClaim::CashTurnover
 fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event::Event> {
@@ -2157,7 +2322,8 @@ fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event
             source,
             section_hash(section),
             ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
-        );
+        )
+        .with_import_session(plan.session.id);
         for claim in claims {
             events.push(iaam_core::event::Event {
                 id: EventId::new_random(),
@@ -3527,5 +3693,165 @@ mod tests {
             resolver.assess(&row(main, "Savings", None)),
             Assessment::Ambiguous { .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // What an answered question generalised into (iaam-ngwn)
+    // -----------------------------------------------------------------------
+
+    /// A session holding exactly one row and one question about it.
+    ///
+    /// Built by hand rather than through the store, because what is under test
+    /// is a pure reading of what a session holds: the store's part is fetching
+    /// these three strings, and a fake of it would only be able to hand back the
+    /// same ones.
+    fn session_with(
+        observed: ObservedRow,
+        answer: Option<Answer>,
+        rule: Option<&str>,
+    ) -> SessionContents {
+        let session = ImportSessionId::new_random();
+        let intake = Intake::Observed {
+            row: Box::new(observed),
+        };
+        let answered = answer.map(|answer| serde_json::to_string(&answer).expect("an answer"));
+        SessionContents {
+            session: ImportSessionView {
+                id: session,
+                state: ImportSessionState::Open,
+                source: None,
+                import: None,
+                opened_at: "2026-03-01T00:00:00Z".to_owned(),
+                closed_at: None,
+            },
+            observations: vec![ImportObservationView {
+                row: 1,
+                row_key: None,
+                concluded: false,
+                payload: serde_json::to_string(&intake).expect("an intake"),
+                answer: answered.clone(),
+            }],
+            questions: vec![ImportQuestionView {
+                id: ImportQuestionId::new_random(),
+                session,
+                row: 1,
+                question: "{}".to_owned(),
+                alternatives: "[]".to_owned(),
+                prompt: "Which of your accounts is Savings?".to_owned(),
+                asked_at: "2026-03-01T00:00:00Z".to_owned(),
+                answered_at: answered
+                    .is_some()
+                    .then(|| "2026-03-02T00:00:00Z".to_owned()),
+                answer: answered,
+                rule: rule.map(str::to_owned),
+            }],
+            control_figures: Vec::new(),
+        }
+    }
+
+    /// A row the source printed nothing matchable on: no counterparty, no
+    /// description, no word of its own.
+    fn unmatchable(on: AccountId) -> ObservedRow {
+        let mut row = row(on, "Savings", None);
+        row.counterparty = ObservedCounterparty::Unknown;
+        row.source_kind = None;
+        row.description = None;
+        row
+    }
+
+    #[test]
+    fn an_open_question_has_generalised_nothing_yet() {
+        let contents = session_with(row(account(1), "Savings", None), None, None);
+        assert_eq!(
+            generalisation_of(&contents, &contents.questions[0]),
+            Generalisation::Unanswered
+        );
+    }
+
+    #[test]
+    fn an_answer_that_created_a_rule_names_it() {
+        let contents = session_with(
+            row(account(1), "Savings", None),
+            Some(Answer::Paid),
+            Some("11111111-1111-4111-8111-111111111111"),
+        );
+        assert_eq!(
+            generalisation_of(&contents, &contents.questions[0]),
+            Generalisation::Recorded {
+                rule: "11111111-1111-4111-8111-111111111111".to_owned()
+            }
+        );
+    }
+
+    /// The defect this bead is about: an answered question with no rule, on a
+    /// row that could perfectly well have made one.
+    ///
+    /// Before this, that state and «this row can never make a rule» were one
+    /// absent field. Here it carries the rule itself, so the owner posts it
+    /// rather than reconstructing it from the row.
+    #[test]
+    fn an_answer_the_answerer_could_not_generalise_carries_the_rule_it_would_have_made() {
+        let contents = session_with(row(account(1), "Savings", None), Some(Answer::Paid), None);
+        let Generalisation::Available { matcher, outcome } =
+            generalisation_of(&contents, &contents.questions[0])
+        else {
+            panic!("a row naming a counterparty generalises");
+        };
+        assert_eq!(
+            matcher.counterparty_account.as_deref(),
+            Some("Savings"),
+            "the matcher asks what the row printed"
+        );
+        assert_eq!(matcher.kind.as_deref(), Some("transfer"));
+        assert_eq!(
+            outcome,
+            Classification::ExternalFlow,
+            "the outcome is the classification the answer settled the row as"
+        );
+    }
+
+    #[test]
+    fn an_answer_on_a_row_with_nothing_to_match_on_can_never_generalise() {
+        // The other half of the absence, and the one no call of the owner's can
+        // change: a matcher that asks nothing matches nothing, so there is no
+        // rule to offer him.
+        let contents = session_with(unmatchable(account(1)), Some(Answer::Paid), None);
+        assert_eq!(
+            generalisation_of(&contents, &contents.questions[0]),
+            Generalisation::Impossible
+        );
+    }
+
+    #[test]
+    fn every_generalisation_state_has_its_own_word() {
+        // The four words are what a client branches on, and two of them
+        // colliding would put the owner back where the absent field left him.
+        let words: BTreeSet<&str> = [
+            Generalisation::Unanswered.code(),
+            Generalisation::Recorded {
+                rule: String::new(),
+            }
+            .code(),
+            Generalisation::Available {
+                matcher: RuleMatcher {
+                    counterparty_account: None,
+                    description_contains: None,
+                    kind: None,
+                },
+                outcome: Classification::ExternalFlow,
+            }
+            .code(),
+            Generalisation::Impossible.code(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(words.len(), 4);
+    }
+
+    #[test]
+    fn describing_a_session_answers_for_every_question_it_holds() {
+        let contents = session_with(row(account(1), "Savings", None), Some(Answer::Paid), None);
+        let described = generalisation_of(&contents, &contents.questions[0]);
+        assert_eq!(described.code(), "available");
     }
 }

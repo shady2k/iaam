@@ -432,15 +432,29 @@ That is the same act `POST /v1/classification-rules` performs, so it is gated th
 same way, and the agent's answer now settles the row and writes no rule.
 
 The route was not closed to the agent, because the agent's half of it is
-legitimate and closing it would stop the import. `rule` simply comes back absent.
-A client cannot tell that absence from the other one — a row that offered nothing
-a matcher could match on — and does not need to: it knows which token it holds.
+legitimate and closing it would stop the import. What comes back instead of a
+bare `rule` identifier is `generalisation`, which names its own state:
+`recorded` when the answer created a rule, `available` when one was possible and
+the answerer may not write it, `impossible` when the row offers nothing a matcher
+could match on, and `unanswered` while the question is open.
 
-The cost is real and is the point. An agent relaying the owner's answers is asked
-about the same counterparty again next month, because nobody recorded that the
-answer generalises. Recording it is one call the owner makes with his own token,
-and what he gets is a decision in his own vocabulary that he can read back, edit
-and retire.
+The identifier alone could not separate the middle two. Both were an absent
+field, and only a client could tell which applied, because only a client knows
+which token it holds. The owner reading a session back could not — he saw a
+question answered and no rule — and he is the one for whom the difference is
+actionable.
+
+`available` therefore carries the rule itself, in the exact body
+`POST /v1/classification-rules` takes, so adopting the agent's settlement is one
+call with an object copied unedited. The cost of the split is still real — the
+same counterparty is asked about again next month until the owner adopts it — but
+it is a call rather than a reconstruction, and what he gets is a decision in his
+own vocabulary that he can read back, edit and retire.
+
+Nothing links the adopted rule back to the question. `generalisation` says what
+*this answer* wrote, so it goes on saying `available` after the owner posts the
+proposal: the rule he created is his own act, and it is read back from
+`GET /v1/classification-rules` like any other.
 
 ### 4.5 Retracting an import, and retracting anything else
 

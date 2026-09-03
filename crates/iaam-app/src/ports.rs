@@ -459,6 +459,11 @@ pub struct JournalQuery {
     pub idempotency_key: Option<String>,
     pub account: Option<AccountId>,
     pub source: Option<iaam_core::ids::SourceId>,
+    /// Only facts committed out of this import session. The session is stamped
+    /// on the event's provenance at commit, so this narrows to what one act of
+    /// importing put in — which the declared source cannot, since a source
+    /// covers every import that ever came through the same channel.
+    pub import_session: Option<iaam_core::ids::ImportSessionId>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.

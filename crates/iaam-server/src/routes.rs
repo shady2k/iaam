@@ -3193,6 +3193,7 @@ pub async fn get_import_session(
     let questions = iaam_app::scenarios::import_session::answerable_questions(
         &state.services,
         &principal,
+        &contents,
         &contents.questions,
     )
     .await?;
@@ -3272,8 +3273,11 @@ pub async fn add_import_rows(
 /// `POST /v1/classification-rules` performs under an owner-only gate — so an
 /// agent that could do it here would be making the decision through a route
 /// whose name does not mention rules. Under an agent token the row settles and
-/// `rule` comes back absent; the owner turns the answer into a rule with his own
-/// token if he wants it to stand.
+/// no rule is written — but the response says so in a word and hands back the
+/// rule that would have been written, so the owner makes the settlement stand by
+/// posting `generalisation.proposal` under his own token, unedited (`iaam-ngwn`).
+/// Without that, the one party who knew a generalisation was possible is the one
+/// that could not perform it.
 ///
 /// The two answers that name one of the owner's accounts take an identifier, and
 /// the question published only that an account was needed — so answering one
@@ -4239,6 +4243,12 @@ pub struct JournalParams {
     /// Channel of the declared source: `file`, `paste`, `manual`.
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// The import session whose commit wrote the rows. Narrower than the
+    /// declared source, which covers every import that came through one
+    /// channel: this names one act of importing, and it is the identifier
+    /// `POST /v1/import-sessions` returned and every row here carries back.
+    #[serde(default)]
+    pub import_session: Option<Uuid>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.
     #[serde(default)]
     #[param(value_type = Option<String>, format = Date)]
@@ -4306,6 +4316,7 @@ pub async fn list_journal_events(
             idempotency_key: params.idempotency_key,
             account: params.account.map(AccountId),
             source,
+            import_session: params.import_session.map(ImportSessionId),
             from,
             to,
             after: params.after,

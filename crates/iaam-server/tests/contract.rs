@@ -9306,6 +9306,115 @@ async fn the_journal_narrows_by_the_source_the_caller_declared() {
     assert_eq!(body["code"], "invalid_request");
     assert_eq!(body["field"], "source_channel");
 }
+/// A figure leads back to the act that produced it, not merely to its source.
+///
+/// The declared source answers «which channel of which account», and covers
+/// every import that ever arrived that way. This is the question the owner
+/// actually asks when a figure surprises him — *which import put this here* —
+/// and until the session was stamped on the fact nothing in the journal could
+/// answer it: the import label is derived from the declaration, one label opens
+/// a new session every time it is committed and declared again, and a row
+/// carrying a label need never have passed through a session at all.
+#[tokio::test]
+async fn a_journal_row_names_the_import_session_that_committed_it() {
+    let harness = harness();
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "1000.00",
+        "2026-03-01",
+        "straight-to-the-journal",
+        Some("file"),
+    )
+    .await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({
+                "source": {
+                    "account": harness.account.inner(),
+                    "channel": "file",
+                    "label": "march",
+                },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": "2000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-03-02" },
+                    "idempotency_key": "committed-by-a-session",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    // Both rows arrived through one declared source, so the source cannot tell
+    // them apart. The session can.
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    let by_key = |key: &str| {
+        rows.iter()
+            .find(|row| row["idempotency_key"] == key)
+            .unwrap_or_else(|| panic!("{key} is in the journal: {page}"))
+            .clone()
+    };
+    assert_eq!(
+        by_key("committed-by-a-session")["import_session"],
+        id,
+        "the fact names the act that admitted it: {page}"
+    );
+    assert!(
+        by_key("straight-to-the-journal")
+            .get("import_session")
+            .is_none(),
+        "a row that passed through no session invents none: {page}"
+    );
+
+    let narrowed = format!("/v1/journal/events?import_session={id}");
+    let (status, page) = call(&harness.router, get(&narrowed, Some(&harness.agent_token))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["idempotency_key"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("committed-by-a-session")],
+        "the filter answers what that one import put in: {page}"
+    );
+}
 #[tokio::test]
 async fn the_journal_lists_without_any_narrowing() {
     // Reading the list is not a privilege beyond reading the aggregates: every
@@ -9953,7 +10062,11 @@ async fn a_classification_rule_round_trips_through_the_shape_it_is_read_in() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answered}");
-    let learned = answered["rule"]
+    assert_eq!(
+        answered["generalisation"]["state"], "recorded",
+        "{answered}"
+    );
+    let learned = answered["generalisation"]["rule"]
         .as_str()
         .expect("the rule the answer wrote");
 
@@ -13186,10 +13299,11 @@ async fn answering_the_question_writes_a_rule_that_settles_what_the_next_row_is(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answered}");
-    assert!(
-        answered["rule"].is_string(),
+    assert_eq!(
+        answered["generalisation"]["state"], "recorded",
         "the answer must be recorded as a rule: {answered}"
     );
+    assert!(answered["generalisation"]["rule"].is_string(), "{answered}");
 
     let (status, rules) = call(
         &harness.router,
@@ -17599,9 +17713,15 @@ async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
         StatusCode::OK,
         "the row still settles under an agent token: {answered}"
     );
+    assert_eq!(
+        answered["generalisation"]["state"], "available",
+        "an agent's answer must not become a standing rule, and must say why \
+         no rule stands rather than leaving an absent field to be guessed at: \
+         {answered}"
+    );
     assert!(
-        answered["rule"].is_null(),
-        "an agent's answer must not become a standing rule: {answered}"
+        answered["generalisation"]["rule"].is_null(),
+        "no rule was written: {answered}"
     );
     assert!(
         answered["answered_at"].is_string(),
@@ -17639,11 +17759,112 @@ async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answered}");
-    assert!(
-        answered["rule"].is_string(),
+    assert_eq!(
+        answered["generalisation"]["state"], "recorded",
         "the owner's answer is still recorded as a rule: {answered}"
     );
+    assert!(answered["generalisation"]["rule"].is_string(), "{answered}");
     assert_eq!(classification_rule_count(&harness).await, 1);
+}
+
+/// The rule an agent's answer could not write comes back with the answer
+/// (iaam-ngwn).
+///
+/// The scope split above is right and it left the owner a bill: he reads a
+/// session back, sees a question answered and no rule, and nothing tells him
+/// whether a rule was impossible or merely not the answerer's to make. Both look
+/// like an absent field, and only one of them is worth acting on.
+///
+/// So the question carries what it *would* have generalised into, in the exact
+/// body `POST /v1/classification-rules` takes. This test posts it back
+/// unedited: if the published proposal were a look-alike rather than the request
+/// type itself, this is the call that would fail.
+#[tokio::test]
+async fn an_answer_that_could_not_generalise_publishes_the_rule_it_would_have_made() {
+    let harness = harness();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (session, question) = ask_one_question(&harness, &harness.agent_token, "agent-inner").await;
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.agent_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(
+        answered["generalisation"]["state"], "available",
+        "a rule was possible here and was not written: {answered}"
+    );
+    let proposal = answered["generalisation"]["proposal"].clone();
+    assert_eq!(
+        proposal["outcome"]["kind"], "internal_transfer",
+        "the proposal states the classification the answer settled the row as: {answered}"
+    );
+    assert_eq!(proposal["outcome"]["to"], json!(savings), "{answered}");
+    assert_eq!(
+        proposal["matcher"]["kind"], "INNER",
+        "the matcher asks what the source printed on the row: {answered}"
+    );
+    assert_eq!(classification_rule_count(&harness).await, 0);
+
+    // Read back off the session, the owner sees the same thing the answerer was
+    // told — which is the half he could not see before.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["questions"][0]["generalisation"], answered["generalisation"],
+        "the session says what the answer said: {contents}"
+    );
+
+    // One call, with the object exactly as it was published.
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/classification-rules", &harness.owner_token, &proposal),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the proposal is the request body, not a description of one: {created}"
+    );
+    assert_eq!(classification_rule_count(&harness).await, 1);
+}
+
+/// A question waiting on an answer says so, rather than looking like an answer
+/// that generalised nothing.
+#[tokio::test]
+async fn an_unanswered_question_names_its_own_state() {
+    let harness = harness();
+    let (session, _) = ask_one_question(&harness, &harness.agent_token, "still-open").await;
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["questions"][0]["generalisation"]["state"], "unanswered",
+        "{contents}"
+    );
+    assert!(
+        contents["questions"][0]["generalisation"]["proposal"].is_null(),
+        "there is no answer yet to generalise: {contents}"
+    );
 }
 
 /// Ingest one deposit under a declared import and report what the journal holds.

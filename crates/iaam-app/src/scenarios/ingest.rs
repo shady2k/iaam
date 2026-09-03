@@ -2,7 +2,7 @@
 
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::{Event, SCHEMA_VERSION};
-use iaam_core::ids::{ImportId, PrincipalId, SourceId};
+use iaam_core::ids::{ImportId, ImportSessionId, PrincipalId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{
@@ -58,7 +58,9 @@ pub async fn submit_operations(
             })
         })
         .collect();
-    submit_candidates(services, principal, "operation", candidates).await
+    // No session: this route writes straight to the journal, and a session
+    // identifier stamped here would name an act that never happened.
+    submit_candidates(services, principal, "operation", None, candidates).await
 }
 
 /// Ingestion of journal facts with schedule-based depreciation enrichment.
@@ -126,7 +128,7 @@ pub async fn submit_journal_events(
         );
     }
 
-    submit_candidates(services, principal, "fact", candidates).await
+    submit_candidates(services, principal, "fact", None, candidates).await
 }
 
 /// Ingestion of prepared candidates: submission permission, form, writing, verdict.
@@ -157,10 +159,21 @@ pub async fn submit_journal_events(
 /// no less real for a batch that declared no label. Narrowing it to the case
 /// the retraction rule needs would make the journal's answer depend on what one
 /// rule happens to ask.
+///
+/// `session` names the import session this write is the commit of, and is
+/// `None` for every route that writes without one. It is a **parameter** rather
+/// than something each input stamps onto its own candidates, and that is the
+/// difference between a fact somebody remembered to record and one the compiler
+/// asked for: a fifth route added tomorrow cannot reach the journal without
+/// saying which act it is performing. The import beside it is still stamped by
+/// each input, because the import is decided while a row is being read and the
+/// session is decided by the call — see [`crate::scenarios::import_session::commit_session`],
+/// the only caller that passes `Some`.
 pub async fn submit_candidates(
     services: &AppServices,
     principal: &Principal,
     field: &'static str,
+    session: Option<ImportSessionId>,
     candidates: Vec<Result<Event, Rejection>>,
 ) -> Result<Vec<Verdict>, AppError> {
     if !principal.scope.may_submit() {
@@ -185,6 +198,9 @@ pub async fn submit_candidates(
             }
         };
         event.provenance = event.provenance.with_declared_by(declared_by);
+        if let Some(session) = session {
+            event.provenance = event.provenance.with_import_session(session);
+        }
         verdicts.push(record_candidate(services, event, field).await?);
     }
     Ok(verdicts)

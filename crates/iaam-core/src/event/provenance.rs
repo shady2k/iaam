@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ImportId, PrincipalId, SourceId};
+use crate::ids::{ImportId, ImportSessionId, PrincipalId, SourceId};
 
 /// Hash of the raw source record. A hexadecimal SHA-256 string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -114,6 +114,36 @@ pub struct Provenance {
     /// is that a missing declaration is not evidence of one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     declared_by: Option<PrincipalId>,
+    /// The import session this fact was committed out of.
+    ///
+    /// Beside [`Provenance::import`] rather than derived from it, because the
+    /// import does not name a session and cannot be made to. The import is
+    /// derived from the declaration — owner, account, channel, label — while a
+    /// session identifier is minted per session, and the store admits one
+    /// **open** session per import rather than one session per import: a label
+    /// committed and then declared again opens a second session, so an import
+    /// names as many sessions as it was ever imported under. Rows carrying an
+    /// import need not have passed through a session at all — `/v1/ingest/operations`
+    /// stamps the import and opens nothing — and a session opened without a
+    /// declared import commits rows that carry no import whatsoever. There is
+    /// no half of the question the import answers.
+    ///
+    /// What it buys is the step [`crate::event::Event::provenance`] could not
+    /// take before: a figure in a report leads back to the rows it was folded
+    /// from, the rows lead back to the source that printed them, and this leads
+    /// back to the act that admitted them — the assessment that was read, the
+    /// questions that were answered, the control figures that were compared.
+    /// Those are stored beside the session and were reachable from nothing the
+    /// journal held.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field. `None` therefore means «no
+    /// session is recorded», which covers both a fact that came through no
+    /// session and a fact committed by one before this field existed. The two
+    /// are not separable and a rule must not try: as with [`Self::declared_by`],
+    /// a missing session is not evidence of its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import_session: Option<ImportSessionId>,
     row: Option<RowLocator>,
 }
 
@@ -133,6 +163,7 @@ impl Provenance {
             description: None,
             import: None,
             declared_by: None,
+            import_session: None,
             row: None,
         }
     }
@@ -172,6 +203,17 @@ impl Provenance {
         self
     }
 
+    /// Stamp the import session this fact is being committed out of.
+    ///
+    /// Applied after normalisation for the reason the import and the declaring
+    /// principal are: normalisation decides what a row *is*, and the act that
+    /// admitted it decides nothing about that.
+    #[must_use]
+    pub const fn with_import_session(mut self, session: ImportSessionId) -> Self {
+        self.import_session = Some(session);
+        self
+    }
+
     #[must_use]
     pub fn with_row(mut self, row: RowLocator) -> Self {
         self.row = Some(row);
@@ -199,6 +241,19 @@ impl Provenance {
     #[must_use]
     pub const fn declared_by(&self) -> Option<PrincipalId> {
         self.declared_by
+    }
+
+    /// The import session this fact was committed out of, when one is
+    /// recorded.
+    ///
+    /// `None` for every path that appends without a session behind it — a
+    /// direct operation submission, a broker synchronisation, a correction
+    /// minted by this code — and for everything written before the field
+    /// existed. A caller that read `None` as «no session exists» would be
+    /// stating something the journal never said.
+    #[must_use]
+    pub const fn import_session(&self) -> Option<ImportSessionId> {
+        self.import_session
     }
 
     #[must_use]
@@ -237,6 +292,7 @@ impl Provenance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{AccountId, OwnerId};
 
     fn hash(seed: &str) -> RawHash {
         RawHash::parse(&seed.repeat(64)).unwrap()
@@ -359,6 +415,64 @@ mod tests {
         let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
 
         assert_eq!(provenance.declared_by(), None);
+    }
+
+    #[test]
+    fn the_committing_import_session_is_kept_and_read_back() {
+        let session = ImportSessionId::new_random();
+        let provenance = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_import_session(session);
+
+        assert_eq!(provenance.import_session(), Some(session));
+    }
+
+    #[test]
+    fn an_import_session_is_recorded_apart_from_the_import() {
+        // The two answer different questions and neither implies the other: an
+        // import may be imported under several sessions, and a session need not
+        // declare an import at all. A fact carrying one and not the other is
+        // therefore an ordinary fact, not a half-written one.
+        let import = ImportId::declared(
+            OwnerId::new_random(),
+            AccountId::new_random(),
+            "file",
+            "january",
+        );
+        let with_import_only = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_import(import);
+        assert_eq!(with_import_only.import(), Some(import));
+        assert_eq!(with_import_only.import_session(), None);
+
+        let session = ImportSessionId::new_random();
+        let with_session_only = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_import_session(session);
+        assert_eq!(with_session_only.import(), None);
+        assert_eq!(with_session_only.import_session(), Some(session));
+    }
+
+    #[test]
+    fn provenance_written_before_an_import_session_was_recorded_names_none() {
+        // The load-bearing half: an event from before the field existed must
+        // read as «no session recorded», so a caller asking what produced a
+        // figure is told nothing rather than told the wrong session.
+        let stored = r#"{"source":"00000000-0000-0000-0000-000000000000",
+        "raw_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "parser_version":"test"}"#;
+        let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
+
+        assert_eq!(provenance.import_session(), None);
     }
 
     #[test]

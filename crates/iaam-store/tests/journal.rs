@@ -5,13 +5,13 @@ use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId, TransferId};
+use iaam_core::ids::{AccountId, EventId, ImportSessionId, OwnerId, SourceId, TransferId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
-use iaam_store::events::{AccountActivityRecord, Appended};
+use iaam_store::events::{AccountActivityRecord, Appended, JournalQuery};
 use iaam_store::reference::AccountRecord;
 use std::collections::BTreeSet;
 use std::fs;
@@ -110,6 +110,79 @@ fn an_event_survives_a_write_and_a_read() {
     );
     let loaded = store.load_events(ctx.owner).unwrap();
     assert_eq!(loaded, vec![event]);
+}
+
+/// A page of the journal can be narrowed to the one import session that wrote
+/// it.
+///
+/// The session travels inside the payload as part of the event's provenance,
+/// and a filter applied after the page was selected would return short pages
+/// and a cursor that skips rows — so the value is lifted into a column and
+/// bound here. What is being checked is that the column agrees with the
+/// provenance: an event stamped with a session is found by it, and an event
+/// stamped with none is not swept in beside it.
+#[test]
+fn the_journal_narrows_to_the_import_session_that_wrote_it() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    let session = ImportSessionId::new_random();
+
+    let committed = {
+        let mut event = ctx.deposit(1, 100_000);
+        event.provenance = event.provenance.with_import_session(session);
+        event
+    };
+    let free = ctx.deposit(2, 200_000);
+    for event in [&committed, &free] {
+        store.append_event(event, IdentityScope::Source).unwrap();
+    }
+
+    let narrowed = store
+        .list_journal_events(
+            ctx.owner,
+            &JournalQuery {
+                import_session: Some(session),
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        narrowed.iter().map(|event| event.id).collect::<Vec<_>>(),
+        vec![committed.id],
+        "only the rows that session committed"
+    );
+    assert_eq!(
+        narrowed[0].provenance.import_session(),
+        Some(session),
+        "the column and the provenance name one session"
+    );
+
+    let another = store
+        .list_journal_events(
+            ctx.owner,
+            &JournalQuery {
+                import_session: Some(ImportSessionId::new_random()),
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        another.is_empty(),
+        "a session that wrote nothing here matches nothing: {another:?}"
+    );
+
+    let everything = store
+        .list_journal_events(
+            ctx.owner,
+            &JournalQuery {
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(everything.len(), 2, "the unnarrowed page still holds both");
 }
 
 #[test]

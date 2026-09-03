@@ -17,7 +17,7 @@
 use iaam_core::dates::EventDates;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::{Confidence, Relation};
-use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, EventId, ImportSessionId, OwnerId, SourceId};
 use time::{Date, Time};
 
 use crate::error::AppError;
@@ -51,6 +51,16 @@ pub struct JournalReadQuery {
     pub idempotency_key: Option<String>,
     pub account: Option<AccountId>,
     pub source: Option<DeclaredSource>,
+    /// The import session whose commit wrote these rows.
+    ///
+    /// The finest handle this route offers, and the only one that names an
+    /// **act**. The declared source names a channel and answers «everything
+    /// that ever arrived this way»; this answers «what that one import put in»,
+    /// which is the question an owner asks when a figure surprises him — and
+    /// the session identifier is one he already holds, because
+    /// `POST /v1/import-sessions` handed it to him and every row returned here
+    /// carries it back.
+    pub import_session: Option<ImportSessionId>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -106,6 +116,19 @@ pub struct JournalEventView {
     pub source_category: Option<String>,
     /// The description or counterparty the source printed on the row.
     pub description: Option<String>,
+    /// The import session this fact was committed out of, when one is recorded.
+    ///
+    /// Published where the raw hash and the parser version are not, and the
+    /// difference is what a caller can do with it: those name a line of a
+    /// document nobody here can open, while this is an identifier that
+    /// addresses `GET /v1/import-sessions/{session}` and its assessment — the
+    /// rows that were held, the questions that were answered, the control
+    /// figures the source printed. It is the step from «this is the fact» to
+    /// «this is the act that admitted it».
+    ///
+    /// `None` covers both a fact that came through no session and one committed
+    /// before the field existed, and a reader must not resolve it either way.
+    pub import_session: Option<ImportSessionId>,
 }
 
 /// Read one page of the owner's journal.
@@ -139,6 +162,7 @@ pub async fn read_journal(
                 idempotency_key: query.idempotency_key.clone(),
                 account: query.account,
                 source,
+                import_session: query.import_session,
                 from: range.0,
                 to: range.1,
                 after,
@@ -188,6 +212,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         source_operation_id: event.provenance.source_operation_id().map(str::to_owned),
         source_category: event.provenance.source_category().map(str::to_owned),
         description: event.provenance.description().map(str::to_owned),
+        import_session: event.provenance.import_session(),
     }
 }
 

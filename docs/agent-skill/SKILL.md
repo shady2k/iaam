@@ -152,14 +152,23 @@ rows nobody has looked at yet — including months not yet imported, and includi
 rows that will never be shown to anyone, because a row a rule matches is never
 asked about. That second half is the owner's, it is the same act as writing a
 rule directly, and under your credential the system now does only the first.
-Nothing is refused and nothing goes wrong: the answer simply comes back with no
-rule on it, the row is settled, and the import goes on.
+Nothing is refused and nothing goes wrong: the answer comes back saying in a
+word that no rule stands, and carrying the rule it would have made, the row is
+settled, and the import goes on.
 
-The consequence is worth telling the owner rather than hiding. The same
-counterparty will be asked about again next month, once per import, until he
-records the decision as a rule with his own credential. When you notice a
-question you have relayed before, that is the thing to say — not a second guess
-at the answer.
+That word is worth reading, because it distinguishes two things an absent rule
+used to hide. A rule may have been impossible — the row named no counterparty,
+carried no description and printed no word of its own, and a condition that asks
+nothing matches nothing, so there is no rule for anyone to write. Or a rule was
+perfectly possible and simply is not yours to write. Only the second is worth
+telling the owner about, and only the second comes with the rule attached.
+
+Say it, and hand him the remedy with it. The same counterparty will be asked
+about again next month, once per import, until he records the decision with his
+own credential — and the answer you relayed already holds exactly what he would
+record, so he can adopt it as it stands instead of reconstructing it from the
+row. When you notice a question you have relayed before, that is the thing to
+say: which rule is waiting to be adopted, not a second guess at the answer.
 
 A rule the owner does write is kept in his own vocabulary, and he can see it,
 change it, and retire it afterwards like any other.

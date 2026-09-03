@@ -56,7 +56,7 @@ use crate::dto::{
     ControlSectionDto, RecordedEventDto, StateImportControlFiguresRequest, StatedControlFiguresDto,
 };
 // Wave K's own names, in a block of their own for the reason stated above.
-use crate::dto::OwnerBalanceOutcomeDto;
+use crate::dto::{OwnerBalanceOutcomeDto, QuestionGeneralisationDto};
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -268,6 +268,7 @@ impl Modify for BearerSecurity {
         ControlCheckDto,
         RecordedEventDto,
         OwnerBalanceOutcomeDto,
+        QuestionGeneralisationDto,
         // The published vocabularies: every code the API can return, each with
         // the sentence that explains it (§13).
         VerdictCodeDto,

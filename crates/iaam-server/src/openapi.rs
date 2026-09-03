@@ -55,6 +55,10 @@ use crate::dto::{
     BatchTotalDto, ControlCheckDto, ControlComparisonDto, ControlReconciliationDto,
     ControlSectionDto, RecordedEventDto, StateImportControlFiguresRequest, StatedControlFiguresDto,
 };
+// Added in a block of its own, per the note above: this name belongs to a
+// change made in parallel with others, and merging it into the wrapped list
+// would reflow lines nobody touched.
+use crate::dto::IntervalFitDto;
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -264,6 +268,7 @@ impl Modify for BearerSecurity {
         ControlReconciliationDto,
         ControlComparisonDto,
         ControlCheckDto,
+        IntervalFitDto,
         RecordedEventDto,
         // The published vocabularies: every code the API can return, each with
         // the sentence that explains it (§13).

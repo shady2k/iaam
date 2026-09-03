@@ -14,7 +14,9 @@
 
 use std::collections::BTreeSet;
 
-use iaam_core::batch::{self, BatchTotal, ControlCheck, ControlComparison, ControlSection};
+use iaam_core::batch::{
+    self, BatchMovement, BatchTotal, ControlCheck, ControlComparison, ControlSection,
+};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
@@ -890,7 +892,12 @@ pub async fn state_control_figures(
 /// is at least told what it committed.
 ///
 /// `accept_control_mismatch` is how a batch that does not agree with its own
-/// source's control figures is committed anyway.
+/// source's control section is committed anyway. Two disagreements pass through
+/// it: a figure the rows do not come to, and — since iaam-mnv0 — rows the
+/// interval that section states does not cover. One flag for both, because the
+/// remedy is the same and because the second is the one that would be waved
+/// through: a figure that disagrees announces itself, while a comparison folded
+/// over rows the figures are not about comes out matched.
 ///
 /// **Refusing outright was rejected.** A source's control section can itself be
 /// wrong — a misprinted statement, a bank's own correction issued a week later,
@@ -990,7 +997,7 @@ pub async fn commit_session(
 /// a hundred of them would be a hundred requests, while here the remedy is one
 /// flag on this same call, and the list is what the flag is about.
 fn control_mismatch_refusal(control: &ControlReconciliation) -> Option<AppError> {
-    let mismatched: Vec<String> = control
+    let mut disagreements: Vec<String> = control
         .comparisons
         .iter()
         .flat_map(|comparison| {
@@ -1017,18 +1024,48 @@ fn control_mismatch_refusal(control: &ControlReconciliation) -> Option<AppError>
                 })
         })
         .collect();
-    if mismatched.is_empty() {
+    // Beside the figures, and in the same list, the rows the stated interval
+    // does not cover (iaam-mnv0). It belongs here rather than in a refusal of
+    // its own because the remedy is the same flag on the same call, and a
+    // caller shown one list and refused over another would set the flag without
+    // having read what it was about. The sentence names both numbers for the
+    // same reason the figures do: the flag says «I have read these».
+    disagreements.extend(control.comparisons.iter().filter_map(|comparison| {
+        let (fit, stated) = (comparison.fit?, comparison.stated?);
+        if fit.fits() {
+            return None;
+        }
+        let mut how = Vec::new();
+        if let Some((from, to)) = fit.span {
+            how.push(format!("{} dated {from} to {to}", fit.outside));
+        }
+        if fit.undated > 0 {
+            how.push(format!("{} carrying no date", fit.undated));
+        }
+        Some(format!(
+            "account {} in {}: the source states {} to {}, and {} of the rows folded into \
+             that comparison are not covered by it — {}",
+            comparison.account.inner(),
+            comparison.currency.code(),
+            stated.period.from,
+            stated.period.to,
+            fit.misplaced(),
+            how.join(", "),
+        ))
+    }));
+    if disagreements.is_empty() {
         return None;
     }
     Some(AppError::Invalid {
         field: "accept_control_mismatch".to_owned(),
-        expected: "rows that add up to the control figures the source printed, or \
-                       accept_control_mismatch: true to record them as they are"
+        expected: "rows that add up to the control figures the source printed and fall \
+                       inside the interval it states, or accept_control_mismatch: true to \
+                       record them as they are"
             .to_owned(),
         actual: format!(
-            "{} figure(s) disagree: {}",
-            mismatched.len(),
-            mismatched.join("; ")
+            "{} disagreement(s) with the source's own control section: {}",
+            disagreements.len(),
+            disagreements.join("; ")
         ),
     })
 }
@@ -1241,6 +1278,27 @@ impl ControlReconciliation {
             .filter(|check| check.is_mismatch())
             .count()
     }
+
+    /// How many folded rows the stated intervals do not place inside themselves
+    /// (iaam-mnv0).
+    ///
+    /// Counted apart from [`Self::mismatches`] because it is a different fault,
+    /// and reported beside it because it reaches the same door. A mismatch says
+    /// two numbers disagree; this says the numbers were computed over rows the
+    /// figures are not about — and a comparison folded over the wrong set of
+    /// rows is worse than one that disagrees, because it comes out clean.
+    ///
+    /// A comparison the source stated nothing for contributes nothing: with no
+    /// interval there is nothing for a row to be outside of, exactly as a
+    /// figure nobody stated is not a figure that failed.
+    #[must_use]
+    pub fn misplaced_rows(&self) -> usize {
+        self.comparisons
+            .iter()
+            .filter_map(|comparison| comparison.fit)
+            .map(|fit| fit.misplaced())
+            .sum()
+    }
 }
 
 /// The plan, and the events it would append.
@@ -1432,7 +1490,23 @@ pub enum Readiness {
     /// statement its bank misprinted would be a system that cannot record what
     /// happened. What it does is make committing a stated act — see
     /// [`commit_session`].
-    DoesNotReconcile { mismatched_figures: usize },
+    ///
+    /// **Two disagreements, one word** (iaam-mnv0). A figure that disagrees and
+    /// a row the stated interval does not cover are reported together because
+    /// they reach the same remedy: one flag on the commit call, set by somebody
+    /// who has read the list. Splitting them would mean a caller lifting one and
+    /// being refused for the other, and the second is exactly the kind that gets
+    /// waved through. `misplaced_rows` is not the lesser of the two: a figure
+    /// that disagrees announces itself, while a comparison folded over rows the
+    /// figures are not about comes out **clean** — the turnover matches because
+    /// the same rows were folded on both sides of nothing.
+    DoesNotReconcile {
+        mismatched_figures: usize,
+        /// Rows folded into a comparison that the interval its source stated
+        /// does not place inside itself: dated outside it, or carrying no date
+        /// to be placed by.
+        misplaced_rows: usize,
+    },
 }
 
 impl Readiness {
@@ -1639,14 +1713,14 @@ pub async fn plan_session(
     let control_reconciliation = ControlReconciliation {
         comparisons: batch::compare(
             &stated,
-            &batch_totals(
+            &movements(
                 &commit_delta
                     .facts
                     .iter()
                     .chain(commit_delta.duplicates.iter())
                     .cloned()
                     .collect::<Vec<_>>(),
-            )?,
+            ),
         )
         .map_err(AppError::BatchTotal)?,
     };
@@ -1658,14 +1732,18 @@ pub async fn plan_session(
     // commit — and which are also a complete explanation of a shortfall, since
     // an unread row is a row missing from every total; naming a mismatch here
     // would send the owner to check arithmetic when what is missing is an
-    // answer. Then the mismatch, which commits only deliberately. Last the
-    // unconfirmed transfer candidates, which commit by default and change what
-    // the journal *relates*, not what it holds.
+    // answer. Then the mismatch, which commits only deliberately — and beside
+    // it, on the same word, a row the stated interval does not cover: it is the
+    // same finding wearing another shape, that the figures and the rows are not
+    // about the same thing, and it reaches the same flag on the same call. Last
+    // the unconfirmed transfer candidates, which commit by default and change
+    // what the journal *relates*, not what it holds.
     //
     // Nothing is hidden by the ordering: every section is published whatever the
     // readiness says, and `control_reconciliation` states both numbers of every
     // comparison it made. What the ordering decides is the one word.
     let mismatched_figures = control_reconciliation.mismatches();
+    let misplaced_rows = control_reconciliation.misplaced_rows();
     let readiness = if contents.session.state != ImportSessionState::Open {
         Readiness::Blocked {
             reason: format!(
@@ -1678,8 +1756,11 @@ pub async fn plan_session(
             unanswered_questions: open_questions.len(),
             transfer_candidates: cross_source_matching.candidates.len(),
         }
-    } else if mismatched_figures > 0 {
-        Readiness::DoesNotReconcile { mismatched_figures }
+    } else if mismatched_figures > 0 || misplaced_rows > 0 {
+        Readiness::DoesNotReconcile {
+            mismatched_figures,
+            misplaced_rows,
+        }
     } else if !cross_source_matching.candidates.is_empty() {
         Readiness::RequiresOwnerDecision {
             unanswered_questions: 0,
@@ -1865,17 +1946,31 @@ fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact 
 /// for «no cash» — and folding it would open a rouble total on an account that
 /// has never held roubles, and count a row against a currency it never named.
 fn batch_totals(facts: &[PlannedFact]) -> Result<Vec<BatchTotal>, AppError> {
-    let movements: Vec<(AccountId, Money)> = facts
+    batch::total(&movements(facts)).map_err(AppError::BatchTotal)
+}
+
+/// The cash movements a list of planned facts is, in the core's own vocabulary.
+///
+/// Written once and used by both the totals and the control comparison, because
+/// the two must be about the same rows: the comparison's `observed` is folded
+/// from exactly what is passed here, and a second selection beside this one
+/// could come to fold a row this one drops.
+///
+/// The date travels with the movement, and that is iaam-mnv0: it is what lets
+/// [`batch::compare`] ask whether the rows it folded are the rows the source's
+/// figures are about. It is [`PlannedFact::date`], the day the fact will be
+/// posted on, because that is the day a statement's period is printed in terms
+/// of; `None` where the row states none, which no interval places either way.
+fn movements(facts: &[PlannedFact]) -> Vec<BatchMovement> {
+    facts
         .iter()
         .filter(|fact| fact.amount_minor != 0)
-        .map(|fact| {
-            (
-                fact.account,
-                Money::new(PostedMinor::new(fact.amount_minor), fact.currency),
-            )
+        .map(|fact| BatchMovement {
+            account: fact.account,
+            amount: Money::new(PostedMinor::new(fact.amount_minor), fact.currency),
+            date: fact.date,
         })
-        .collect();
-    batch::total(&movements).map_err(AppError::BatchTotal)
+        .collect()
 }
 
 /// The stamp a plan carries, and commit refuses when it no longer matches.

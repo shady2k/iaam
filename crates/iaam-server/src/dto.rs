@@ -38,7 +38,7 @@ use iaam_app::scenarios::reports::{
     MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
-use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection};
+use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection, IntervalFit};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -8119,6 +8119,16 @@ pub struct ControlReconciliationDto {
     /// be checked is not one of them: §10.4 keeps «nothing to compare against»
     /// apart from «the numbers do not match».
     pub mismatched_figures: usize,
+    /// How many rows the intervals the source stated do not cover — dated
+    /// outside one, or carrying no date to be placed by.
+    ///
+    /// A second number beside `mismatched_figures` because it is a second kind
+    /// of disagreement, and one that does **not** show up in the figures: a
+    /// statement whose rows spill past its own period agrees with itself, since
+    /// the same rows are folded on both sides of nothing. It refuses the commit
+    /// through the same `accept_control_mismatch` flag, and for the stronger
+    /// reason — a mismatch announces itself, this comes out matched.
+    pub rows_outside_interval: usize,
 }
 
 /// One account and one currency: what the source said, what the rows say.
@@ -8137,6 +8147,71 @@ pub struct ControlComparisonDto {
     pub observed: BatchTotalDto,
     /// One entry per figure the source stated. Empty where it stated none.
     pub checks: Vec<ControlCheckDto>,
+    /// Whether the rows folded into `observed` fall inside the interval
+    /// `stated` declares. Absent where nothing was stated: with no interval
+    /// there is nothing for a row to be outside of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fit: Option<IntervalFitDto>,
+}
+
+/// Whether the rows a comparison folded are the rows its figures are about.
+///
+/// The check that was missing (iaam-mnv0). Every figure of a section is
+/// compared against a total, and nothing asked whether the rows in that total
+/// belong to the period the section prints — so a statement whose rows spill
+/// past its own period came out **matched**, the same rows folded on both sides
+/// of nothing.
+///
+/// Not a `checks` entry, because a check is about one figure the source
+/// printed and this is about the set of rows every figure was checked against.
+/// A reader who sees `matched` beside a non-empty fit is being told that the
+/// arithmetic came out over rows the figures do not cover, and that is a
+/// different sentence from «the numbers disagree».
+///
+/// A row outside the interval is folded into `observed` anyway. Dropping it
+/// would make the arithmetic agree by removing the row that disagrees with it;
+/// what is published instead is the total as it stands and this, saying what it
+/// is worth.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct IntervalFitDto {
+    /// Rows dated outside the interval, and folded in regardless.
+    pub outside: usize,
+    /// Rows carrying no date, which no interval places either way. A separate
+    /// number because «I cannot tell» is not «this is not in your period».
+    pub undated: usize,
+    /// The earliest of the rows dated outside. Absent when none is.
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub outside_from: Option<Date>,
+    /// The latest of them. Absent when none is.
+    ///
+    /// Published beside `outside_from` rather than as a count alone, because a
+    /// day either side of a month boundary is a posting-date convention and
+    /// three months out is a converter reading the wrong file, and the reader
+    /// deciding whether to record the batch anyway has to tell them apart.
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub outside_to: Option<Date>,
+}
+
+impl IntervalFitDto {
+    #[must_use]
+    pub const fn from_domain(fit: IntervalFit) -> Self {
+        Self {
+            outside: fit.outside,
+            undated: fit.undated,
+            // `Option::map` is not a const function, and this conversion is
+            // worth keeping const beside its neighbours.
+            outside_from: match fit.span {
+                Some((from, _)) => Some(from),
+                None => None,
+            },
+            outside_to: match fit.span {
+                Some((_, to)) => Some(to),
+                None => None,
+            },
+        }
+    }
 }
 
 /// One stated figure, checked — with both numbers on the page.
@@ -8183,6 +8258,7 @@ impl ControlReconciliationDto {
                 .map(ControlComparisonDto::from_domain)
                 .collect(),
             mismatched_figures: control.mismatches(),
+            rows_outside_interval: control.misplaced_rows(),
         }
     }
 }
@@ -8204,6 +8280,7 @@ impl ControlComparisonDto {
                 .iter()
                 .map(|check| ControlCheckDto::from_domain(check, currency))
                 .collect(),
+            fit: comparison.fit.map(IntervalFitDto::from_domain),
         }
     }
 }
@@ -8600,10 +8677,14 @@ impl ImportPlanDto {
                 )),
                 plan.readiness.code(),
             ),
-            Readiness::DoesNotReconcile { mismatched_figures } => (
+            Readiness::DoesNotReconcile {
+                mismatched_figures,
+                misplaced_rows,
+            } => (
                 Some(format!(
                     "{mismatched_figures} control figure(s) the source printed do not \
-                     agree with the rows; see control_reconciliation"
+                     agree with the rows, and {misplaced_rows} row(s) fall outside the \
+                     interval it states; see control_reconciliation"
                 )),
                 plan.readiness.code(),
             ),

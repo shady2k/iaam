@@ -14664,6 +14664,226 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
     );
 }
 
+/// A statement whose rows spill past its own period no longer compares cleanly
+/// (iaam-mnv0).
+///
+/// The defect: `compare` put the source's stated figures beside the rows' own
+/// totals and never asked whether those rows were dated inside the interval the
+/// section declares. So a batch whose rows fall in three different months
+/// matched its own turnover — the same rows were folded on both sides of
+/// nothing — and every figure came out `matched` with `readiness: ready`.
+///
+/// That is worse than a mismatch, and the assertion below says why: the two
+/// turnover figures still agree, and `readiness` is nevertheless
+/// `does_not_reconcile`. A mismatch announces itself; a comparison folded over
+/// the wrong set of rows does not.
+///
+/// It refuses through the flag rather than outright, for the same reason a
+/// mismatched figure does: a document can print a period its own rows spill out
+/// of, and a system that cannot record what happened because a bank's period
+/// line is off is a system that cannot record what happened.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn rows_dated_outside_the_stated_interval_refuse_a_commit_that_otherwise_adds_up() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "spilling",
+        json!([
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-06-10" },
+                "idempotency_key": "spilling-inside",
+            },
+            // The converter read the neighbouring months into the same file.
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-05-20" },
+                "idempotency_key": "spilling-before",
+            },
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-07-02" },
+                "idempotency_key": "spilling-after",
+            },
+        ]),
+    )
+    .await;
+
+    // The figures are the ones the rows come to, which is the whole trouble:
+    // every check below matches.
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "300.00",
+                "debit_turnover": "300.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(
+        plan["control_reconciliation"]["mismatched_figures"], 0,
+        "the arithmetic comes out: {plan}"
+    );
+    assert_eq!(
+        check_of(&plan, "debit_turnover")["outcome"],
+        "matched",
+        "{plan}"
+    );
+    assert_eq!(
+        check_of(&plan, "closing_balance")["outcome"],
+        "matched",
+        "{plan}"
+    );
+
+    // And it is still not a batch that was checked.
+    assert_eq!(
+        plan["control_reconciliation"]["rows_outside_interval"], 2,
+        "{plan}"
+    );
+    assert_eq!(
+        plan["readiness"], "does_not_reconcile",
+        "every figure agrees and the rows are not the period's: {plan}"
+    );
+
+    let fit = &plan["control_reconciliation"]["comparisons"][0]["fit"];
+    assert_eq!(fit["outside"], 2, "{plan}");
+    assert_eq!(fit["undated"], 0, "{plan}");
+    assert_eq!(
+        fit["outside_from"], "2025-05-20",
+        "where they went, not only how many: {plan}"
+    );
+    assert_eq!(fit["outside_to"], "2025-07-02", "{plan}");
+
+    // The commit is refused, and the refusal names the interval and the rows
+    // rather than saying something is wrong somewhere.
+    let before = journal_rows(&harness).await;
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    let detail = refusal.to_string();
+    assert!(detail.contains("2025-06-01"), "{refusal}");
+    assert!(detail.contains("2025-05-20"), "{refusal}");
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "a refused commit writes nothing: {refusal}"
+    );
+
+    // And it stays possible as a stated act, because the document itself can be
+    // the thing that is wrong.
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({ "accept_control_mismatch": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+}
+
+/// A batch whose rows all fall inside the stated interval says so, and commits
+/// without the flag (iaam-mnv0).
+///
+/// The other half of the property above: the fit is published whether or not it
+/// found anything, because «every row is in the period» and «nobody looked» are
+/// different answers, and the check must not make an ordinary import harder to
+/// commit than it was.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_batch_inside_its_stated_interval_reports_a_fit_and_needs_no_flag() {
+    let harness = harness();
+    let account = another_account(&harness, "Savings").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "fitting",
+        json!([{
+            "account": account,
+            "type": "deposit",
+            "amount": "100.00",
+            "currency": "RUB",
+            // The last day of the interval: it is inclusive at both ends.
+            "dates": { "cash_posted": "2025-06-30" },
+            "idempotency_key": "fitting-in",
+        }]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "100.00",
+                "debit_turnover": "100.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(plan["readiness"], "ready", "{plan}");
+    assert_eq!(
+        plan["control_reconciliation"]["rows_outside_interval"], 0,
+        "{plan}"
+    );
+    let fit = &plan["control_reconciliation"]["comparisons"][0]["fit"];
+    assert_eq!(fit["outside"], 0, "{plan}");
+    assert_eq!(fit["undated"], 0, "{plan}");
+    assert!(
+        fit.get("outside_from").is_none(),
+        "no row went outside, so there is no span to report: {plan}"
+    );
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+}
+
 /// The commit delta totals its rows, per account and currency (iaam-o1ni).
 ///
 /// The defect: `commit_delta` published three lists, each row carrying a signed

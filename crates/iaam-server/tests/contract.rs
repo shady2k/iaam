@@ -41,6 +41,7 @@ use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
+use iaam_core::report::confidence::ReportGoal;
 use iaam_core::returns::{
     KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
 };
@@ -881,20 +882,82 @@ async fn api_catalog_is_public_state_independent_and_route_complete() {
             .and_then(|value| value.to_str().ok()),
         Some("application/linkset+json")
     );
-    assert_eq!(
-        provisioned_body,
-        iaam_server::routes::API_CATALOG_BODY.to_vec()
-    );
+    // The bytes are the same on both instances, which is the disclosure property:
+    // the document is resolved from the generated contract and reads no state, so
+    // it cannot say whether an owner exists here.
 
     let catalog: Value = serde_json::from_slice(&provisioned_body).expect("catalog JSON");
-    let linkset = catalog["linkset"].as_array().expect("linkset array");
-    for relation in ["service-desc", "status"] {
-        for link in linkset[0][relation].as_array().expect("link relation") {
+    let context = catalog["linkset"][0].as_object().expect("link context");
+    // Every relation the document carries, not a list of the ones it carried when
+    // this test was written: a test enumerating relations by hand drifts from the
+    // catalog exactly as the catalog used to drift from the router.
+    for (relation, links) in context.iter().filter(|(key, _)| key.as_str() != "anchor") {
+        for link in links.as_array().expect("link relation") {
             let href = link["href"].as_str().expect("catalog href");
-            let (status, _, _) = call_raw(&provisioned.router, get(href, None)).await;
-            assert_eq!(status, StatusCode::OK, "{relation} href {href}");
+            assert!(
+                link["title"]
+                    .as_str()
+                    .is_some_and(|title| !title.is_empty()),
+                "{relation} href {href} is published without saying what it is"
+            );
+            let request = Request::builder()
+                .uri(href)
+                .method("GET")
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", provisioned.owner_token),
+                )
+                .body(Body::empty())
+                .expect("request");
+            let (status, body) = call(&provisioned.router, request).await;
+            // A linked route may refuse the call — most of them require a scope
+            // this request does not carry. What it may not do is not exist: an
+            // empty `404` is axum reporting no route at all, which is the dead
+            // link the entry point must never publish.
+            assert!(
+                status != StatusCode::NOT_FOUND || body.get("code").is_some(),
+                "{relation} href {href} addresses no route"
+            );
         }
     }
+}
+
+#[tokio::test]
+async fn the_catalog_names_the_four_goals_in_the_vocabulary_the_reports_use() {
+    // The catalog is built from `ReportGoal::code`, so the two cannot disagree at
+    // runtime. This is the guard against the change that would make them able to:
+    // a `goal` spelled into the catalog by hand, which reads identically today and
+    // drifts the first time the vocabulary moves.
+    let harness = harness();
+    let (_, _, body) = call_raw(&harness.router, get("/.well-known/api-catalog", None)).await;
+    let catalog: Value = serde_json::from_slice(&body).expect("catalog JSON");
+
+    let goals: Vec<&str> = catalog["linkset"][0]["related"]
+        .as_array()
+        .expect("related links")
+        .iter()
+        .filter_map(|link| link["goal"].as_str())
+        .collect();
+    assert_eq!(
+        goals,
+        ReportGoal::ALL.map(ReportGoal::code).to_vec(),
+        "the catalog's goals are not the four the reports publish: {catalog}"
+    );
+
+    // And each of them addresses a different route: two goals sharing an href
+    // would tell a client the API answers three questions, not four.
+    let hrefs: std::collections::BTreeSet<&str> = catalog["linkset"][0]["related"]
+        .as_array()
+        .expect("related links")
+        .iter()
+        .filter(|link| link["goal"].is_string())
+        .filter_map(|link| link["href"].as_str())
+        .collect();
+    assert_eq!(
+        hrefs.len(),
+        goals.len(),
+        "two goals share a route: {catalog}"
+    );
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
@@ -70,6 +70,7 @@ use uuid::Uuid;
 
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
+use crate::api_catalog::ApiCatalog;
 use crate::dto::{
     AccountAliasDto, AccountCandidateDto, AccountCashClassStatementDto, AccountDeclarationsDto,
     AccountDto, AccountIdentityNotDoneDto, AccountIdentityRepointedDto, AccountIdentityStatedDto,
@@ -1432,23 +1433,29 @@ fn market_source(source: MarketSourceDto) -> MarketSource {
     }
 }
 /// The standards discovery document for this API.
-pub const API_CATALOG_BODY: &[u8] = br#"{"linkset":[{"anchor":"/v1","service-desc":[{"href":"/v1/openapi.json","type":"application/json"}],"status":[{"href":"/v1/health","type":"application/json"}]}]}"#;
-
+///
+/// Not a directory of the sixty-six routes — the contract behind `service-desc`
+/// is that, and it is generated. This document is the ordering the contract has
+/// no way to express: the four goals this API answers and the route that answers
+/// each, the queue that says which of them this instance cannot answer yet, and
+/// the scopes every goal route takes an id from. See [`crate::api_catalog`] for
+/// why it is resolved from the router rather than written out.
 #[utoipa::path(
     get,
     path = "/.well-known/api-catalog",
     responses((
         status = 200,
-        description = "API discovery links",
+        description = "The contract, the health resource, the outstanding-work queue, the scopes, \
+                       and the route answering each of the four report goals",
         content_type = "application/linkset+json"
     ))
 )]
-pub async fn api_catalog() -> Response {
+pub async fn api_catalog(Extension(catalog): Extension<Arc<ApiCatalog>>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/linkset+json")
-        .body(Body::from(Bytes::from_static(API_CATALOG_BODY)))
-        .expect("static catalog response is valid")
+        .body(Body::from(catalog.body()))
+        .expect("catalog response is valid")
 }
 
 /// Service status.

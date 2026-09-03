@@ -2607,6 +2607,17 @@ mod tests {
         );
         assert_eq!(ReportGoals::ALL.iter().count(), ReportGoal::ALL.len());
         assert!(ReportGoals::NONE.is_empty());
+        // Two enums spell these four names: this one, which grades queue items,
+        // and the one a report's confidence register carries, which the
+        // discovery catalog also publishes. They are joined on the wire — an
+        // item saying `money_flow` and a report saying `money_flow` are meant to
+        // be the same word — and nothing but this assertion joins them in code.
+        assert_eq!(
+            ReportGoal::ALL.map(ReportGoal::code),
+            iaam_core::report::confidence::ReportGoal::ALL
+                .map(iaam_core::report::confidence::ReportGoal::code),
+            "the queue and the reports no longer agree on what a goal is called"
+        );
     }
 
     /// Asking for the snapshot returns a shorter list than asking for the queue.

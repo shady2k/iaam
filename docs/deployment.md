@@ -403,7 +403,7 @@ $ curl -sS -i http://127.0.0.1:8080/.well-known/api-catalog
 HTTP/1.1 200 OK
 content-type: application/linkset+json
 …
-{"linkset":[{"anchor":"/v1","service-desc":[{"href":"/v1/openapi.json","type":"application/json"}],"status":[{"href":"/v1/health","type":"application/json"}]}]}
+{"linkset":[{"anchor":"/v1","related":[{"href":"/v1/actions",…},{"href":"/v1/contours",…},{"goal":"asset_snapshot","href":"/v1/reports/assets",…},{"goal":"money_flow","href":"/v1/reports/flow",…},{"goal":"returns","href":"/v1/reports/returns",…},{"goal":"reconciliation","href":"/v1/reconciliation",…}],"service-desc":[{"href":"/v1/openapi.json",…}],"status":[{"href":"/v1/health",…}]}]}
 
 $ curl -sS http://127.0.0.1:8080/v1/health
 {"status":"ok","schema_version":11,"projection_version":8}
@@ -413,8 +413,13 @@ $ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/actions
 ```
 
 The first call is the discovery document (RFC 9727) and the entry point for an
-arriving agent: it links the machine-readable contract at `/v1/openapi.json` and
-the status route. The second proves the process is up; check `"status":"ok"`
+arriving agent. It links the machine-readable contract at `/v1/openapi.json` and
+the status route, and beside them the ordering the contract cannot express: the
+outstanding-work queue, the scopes every report takes an id from, and the route
+answering each of the four goals, each tagged with the goal name the reports and
+the queue use. Every `title` is elided above; every address is resolved from the
+generated contract when the process starts, so a link here cannot outlive the
+route it names. The second proves the process is up; check `"status":"ok"`
 rather than the version numbers, which move with the build.
 
 The third is the proof. It authenticated a token that only a console could have

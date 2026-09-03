@@ -268,6 +268,39 @@ the figure, and it is not about the rest of the portfolio — every other accoun
 in the scope is calculated as usual. Saying "the report failed" or "the balance
 is unavailable" describes neither.
 
+## A report answers about a population, and names it
+
+Every report — balances, flow, returns — carries a `population` block: the
+accounts inside the scope it was computed over, and the accounts the system
+knows about that were outside it.
+
+Read it before reading any figure. The report's own quality fields —
+`data_quality`, uncovered positions, unproven bases — are about defects **inside**
+the calculation. They can every one be clean while the wrong accounts were
+selected, because selection happens before the calculation and nothing in it can
+see what was left out. Completeness of a calculation and completeness of its
+population are two statements, and only the second one says whose money was
+counted.
+
+`population.completeness` is the summary:
+
+- `whole` — every account the system knows of is inside the report.
+- `bounded` — accounts are outside it, and each of them sits in a scope the
+  owner drew.
+- `undecided` — accounts are outside it that no scope claims at all.
+
+**`undecided` is not a milder `bounded`.** "Four accounts are outside this report
+and nobody has decided whether they belong" is a different sentence from "four
+accounts are outside this report on purpose", and only the second makes the
+figures an answer about a boundary the owner chose. Each entry in
+`population.outside` carries the same distinction per account, as
+`outside_placed_elsewhere` or `outside_undecided`, with the account's title so
+the owner can be asked about it by name.
+
+So a report whose `population.completeness` is `undecided` is reported as what
+it is: an answer about part of the owner's money, with the undecided accounts
+named. Never as "the portfolio returned X".
+
 ## How to read the return report
 
 The report returns what was contributed and withdrawn over the whole history,

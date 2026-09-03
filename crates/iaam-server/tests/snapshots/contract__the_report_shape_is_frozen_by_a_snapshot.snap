@@ -65,6 +65,19 @@ expression: report
       "value": "50000.00"
     }
   },
+  "population": {
+    "completeness": "whole",
+    "contour": "[uuid]",
+    "contour_version": 1,
+    "covered": [
+      {
+        "account": "[uuid]",
+        "standing": "covered",
+        "title": "Brokerage"
+      }
+    ],
+    "outside": []
+  },
   "report_currency": "RUB",
   "terminal_value": {
     "value": "50000.00"

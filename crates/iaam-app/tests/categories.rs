@@ -207,7 +207,8 @@ async fn the_flow_report_decomposes_by_the_owners_rules() {
         },
     )
     .await
-    .expect("report");
+    .expect("report")
+    .report;
 
     let by_category = report
         .flow
@@ -246,7 +247,8 @@ async fn a_rule_outside_the_month_does_not_touch_it() {
         },
     )
     .await
-    .expect("report");
+    .expect("report")
+    .report;
 
     assert!(
         report

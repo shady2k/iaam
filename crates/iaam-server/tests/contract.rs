@@ -7668,10 +7668,15 @@ async fn actions_of_one_category_come_back_in_id_order() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The flow projection admits no leg from outside the contour, so the report
-/// cannot name an account it does not cover — and neither may the items riding
-/// along with it. An account with its own unexplained residual, left out of the
-/// contour, is what proves that.
+/// The flow projection admits no leg from outside the contour, so no figure and
+/// no action may name an account the report does not cover. An account with its
+/// own unexplained residual, left out of the contour, is what proves that.
+///
+/// `population` is the one deliberate exception, and the assertion below
+/// excludes it: that block exists to name the known accounts the report left
+/// out, because a report that could not say so reads as an answer about all of
+/// the owner's money (iaam-si5v). Naming them there is the opposite of letting
+/// them ride along in the figures.
 #[tokio::test]
 async fn flow_report_actions_name_only_accounts_in_the_contour() {
     let harness = harness();
@@ -7745,8 +7750,13 @@ async fn flow_report_actions_name_only_accounts_in_the_contour() {
             .contains(&harness.account.inner().to_string()),
         "{body}"
     );
+    let mut figures = body.clone();
+    figures
+        .as_object_mut()
+        .expect("report object")
+        .remove("population");
     assert!(
-        !body.to_string().contains(&outside),
+        !figures.to_string().contains(&outside),
         "an account outside the contour must not ride along: {body}"
     );
 }
@@ -9740,4 +9750,275 @@ async fn no_queue_item_promises_a_call_it_does_not_have() {
             .any(|item| item["kind"] == "start_account_import" && item["state"] == "blocked"),
         "{actions}"
     );
+}
+
+/// Every report states the population it answered about, and says when that
+/// population omits an account nobody has ruled on.
+///
+/// The quality fields of a report all concern defects inside the calculation
+/// and can every one be clean while the wrong accounts were selected —
+/// selection happens before the fold, so nothing computed afterwards can see
+/// what was left out. That is the shape of the failure an importer hit with two
+/// banks: every verdict positive, quality clean, and half the money outside the
+/// scope the figures were computed over. Without this block the response reads
+/// as an answer about all of it.
+#[tokio::test]
+async fn every_report_names_the_population_it_answered_about() {
+    let harness = harness();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    // A second bank, known to the system and in no scope at all: nobody has
+    // ruled on whether it belongs in the answer.
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let balances = format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31");
+    let flow = format!("/v1/reports/flow?contour={contour_id}&from=2026-01-01&to=2026-01-31");
+    let returns = format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-01-31");
+    for path in [balances, flow, returns] {
+        let (status, report) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {report}");
+
+        let population = &report["population"];
+        assert_eq!(population["contour"], contour_id, "{path}: {report}");
+        assert_eq!(
+            population["completeness"], "undecided",
+            "{path}: an account in no scope is one nobody has ruled on: {report}"
+        );
+
+        let covered = population["covered"].as_array().expect("covered accounts");
+        assert_eq!(covered.len(), 1, "{path}: {report}");
+        assert_eq!(covered[0]["account"], harness.account.inner().to_string());
+        assert_eq!(covered[0]["standing"], "covered");
+
+        let outside = population["outside"].as_array().expect("outside accounts");
+        assert_eq!(outside.len(), 1, "{path}: {report}");
+        assert_eq!(outside[0]["account"], savings, "{path}: {report}");
+        // Named, not merely counted: an owner asked to rule on an omission
+        // cannot act on a bare identifier.
+        assert_eq!(outside[0]["title"], "Savings", "{path}: {report}");
+        assert_eq!(
+            outside[0]["standing"], "outside_undecided",
+            "{path}: {report}"
+        );
+    }
+}
+
+/// The manifest follows the scope the figures were folded over: a report over a
+/// scope that covers everything says so, in the same field.
+///
+/// This is the pair to the test above. A block that said `undecided` whatever
+/// the scope contained would pass that test and mean nothing.
+#[tokio::test]
+async fn a_report_over_every_known_account_says_its_population_is_whole() {
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Everything",
+                "accounts": [harness.account.inner().to_string(), savings],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["population"]["completeness"], "whole", "{report}");
+    assert_eq!(
+        report["population"]["covered"]
+            .as_array()
+            .expect("covered accounts")
+            .len(),
+        2,
+        "{report}"
+    );
+    assert_eq!(
+        report["population"]["outside"]
+            .as_array()
+            .expect("outside accounts")
+            .len(),
+        0,
+        "{report}"
+    );
+    // The manifest and the rows are one selection: what the report covered is
+    // what it computed over.
+    assert_eq!(
+        report["accounts"].as_array().expect("rows").len(),
+        2,
+        "{report}"
+    );
+}
+
+/// An account the owner has placed in another scope is outside on a decision,
+/// and the response says which of the two kinds of omission it is.
+#[tokio::test]
+async fn an_account_placed_in_another_scope_is_not_reported_as_undecided() {
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let (status, reported) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reported}");
+    let contour_id = reported["contour"].as_str().expect("scope").to_owned();
+
+    let (status, elsewhere) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Elsewhere", "accounts": [savings] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{elsewhere}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["population"]["completeness"], "bounded", "{report}");
+    let outside = report["population"]["outside"]
+        .as_array()
+        .expect("outside accounts");
+    assert_eq!(outside.len(), 1, "{report}");
+    assert_eq!(
+        outside[0]["standing"], "outside_placed_elsewhere",
+        "{report}"
+    );
+}
+
+/// The returns report keeps every field it had, with the population beside
+/// them.
+///
+/// The manifest is added to that response through a wrapper, so this checks the
+/// wrapper did not move the figures: a client reading `data_quality` at the top
+/// level goes on reading it there.
+#[tokio::test]
+async fn the_population_joins_the_returns_report_without_moving_its_fields() {
+    let harness = harness();
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert!(report["data_quality"]["status"].is_string(), "{report}");
+    assert!(report["applied_rules"]["contour"].is_string(), "{report}");
+    assert!(report["xirr_pre_tax"].is_object(), "{report}");
+    assert!(report["population"]["covered"].is_array(), "{report}");
+}
+
+/// The vocabulary a client must switch on is published, and it is the
+/// vocabulary the server sends.
+#[tokio::test]
+async fn the_openapi_document_declares_the_population_a_report_covered() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for schema in ["PopulationDto", "PopulationAccountDto"] {
+        assert!(
+            spec["components"]["schemas"][schema].is_object(),
+            "schema {schema} must be in OpenAPI"
+        );
+    }
+    let population = &spec["components"]["schemas"]["PopulationDto"]["properties"];
+    assert!(population["completeness"].is_object(), "{population}");
+    assert!(population["covered"].is_object(), "{population}");
+    assert!(population["outside"].is_object(), "{population}");
+
+    let balances = &spec["components"]["schemas"]["BalancesReportDto"]["properties"];
+    assert!(balances["population"].is_object(), "{balances}");
+    let flow = &spec["components"]["schemas"]["MoneyFlowReportDto"]["properties"];
+    assert!(flow["population"].is_object(), "{flow}");
 }

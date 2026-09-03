@@ -6,6 +6,7 @@
 use crate::AppServices;
 use crate::error::AppError;
 use crate::ports::{BrokerChannel, PortfolioAsOf, Principal, Recorded};
+use crate::scenarios::coverage_gap;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
@@ -17,7 +18,7 @@ use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId};
 use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::SourceChannel};
 use iaam_http::HttpRequest;
 use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, KnownRecord};
-use iaam_ingest::operation::{NormalizationContext, OperationKind};
+use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{Verdict, normalize};
 use iaam_market::cbr::key_rate::key_rate_request;
 use iaam_market::cbr::{daily_request, dynamic_request};
@@ -206,21 +207,19 @@ pub async fn sync_broker(
         expected: "at most u32::MAX rows".to_owned(),
         actual: refusals.len().to_string(),
     })?;
-    let gap_dimensions: BTreeSet<Dimension> = refusals
-        .iter()
-        .flat_map(|row| row.dimensions.iter().copied())
-        .collect();
-    if !gap_dimensions.is_empty() {
-        let gap = coverage_gap_event(
-            AssertionTarget {
-                owner: principal.owner,
-                account,
-                from,
-                to,
-            },
-            refusals,
-            &channel,
-        );
+    // `None` where the refusals taint nothing — an attempt that refused only
+    // valuations withheld no confirmation from anybody — and the whole block is
+    // then skipped, because a gap that taints nothing is not a fact.
+    if let Some(gap) = coverage_gap_event(
+        AssertionTarget {
+            owner: principal.owner,
+            account,
+            from,
+            to,
+        },
+        refusals,
+        &channel,
+    ) {
         let key = gap.idempotency_key.clone();
         if let Some(existing) = known.iter().find_map(|record| {
             (record.idempotency_key.as_deref() == key.as_deref()).then_some(record.event)
@@ -336,28 +335,6 @@ fn with_channel_provenance(mut event: Event, channel: &SourceChannel) -> Event {
     event.provenance = provenance;
     event
 }
-fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> {
-    match kind {
-        OperationKind::Buy { .. } | OperationKind::Sell { .. } => {
-            [Dimension::Cash, Dimension::Positions]
-                .into_iter()
-                .collect()
-        }
-        OperationKind::Income { .. } => [Dimension::Cash, Dimension::Income].into_iter().collect(),
-        // Tax payments move cash without changing any position's basis; use Cash, not TaxBasis.
-        OperationKind::Deposit { .. }
-        | OperationKind::Withdrawal { .. }
-        | OperationKind::Refund { .. }
-        | OperationKind::Transfer { .. }
-        | OperationKind::Fee { .. }
-        | OperationKind::Tax { .. }
-        | OperationKind::OpeningCash { .. } => [Dimension::Cash].into_iter().collect(),
-        OperationKind::OpeningPosition { .. } => [Dimension::Positions].into_iter().collect(),
-        // Valuation changes no control dimension, so refusing it cannot taint
-        // cash, positions, income, or tax-basis assertions.
-        OperationKind::Valuation { .. } => BTreeSet::new(),
-    }
-}
 
 /// Fingerprint of a raw source row, for a row the source did not identify.
 ///
@@ -391,35 +368,47 @@ fn refused_row(
     };
     RefusedRow {
         key: SourceRowKey { source, row },
-        dimensions: operation_dimensions(&operation.kind),
+        dimensions: coverage_gap::operation_dimensions(&operation.kind),
     }
 }
 
+/// This channel's refusals, as the gap that says so.
+///
+/// The event itself is built by [`coverage_gap::gap_event`], which both writers
+/// share: what a gap **is** — dimensions derived from its rows, a count that is
+/// the number of rows, nothing written where nothing is tainted — must not
+/// differ between the sync path and an import commit. What is decided here is
+/// the pair that legitimately does differ: how this attempt is named, and the
+/// provenance it stands under.
+///
+/// The identity deliberately uses the channel's source and parser version,
+/// while omitting the document, because each assertion is a separate singleton
+/// document group. It also carries only the **count** of refused rows and not
+/// which ones they were, which is the defect iaam-lg4q names: a row refused,
+/// repaired, and a different row refused later collide on this key and the
+/// second gap is dropped as a duplicate. It is left as it is here on purpose —
+/// iaam-rnmd is the task that fixes it, and changing this key in passing would
+/// silently re-record every gap the journal already holds under a new identity.
 fn coverage_gap_event(
     target: AssertionTarget,
     rows: Vec<RefusedRow>,
     channel: &SourceChannel,
-) -> Event {
+) -> Option<Event> {
     let AssertionTarget {
         owner,
         account,
         from,
         to,
     } = target;
-    // Derived, never passed in: structural validation requires the union to
-    // equal `dimensions` and the count to equal `refused`, and two sources of
-    // truth for the same numbers would eventually disagree.
     let dimensions: BTreeSet<Dimension> = rows
         .iter()
         .flat_map(|row| row.dimensions.iter().copied())
         .collect();
-    let refused = u32::try_from(rows.len()).unwrap_or(u32::MAX);
-    // Correlation deliberately uses the channel's source and parser version
-    // in provenance, while omitting document because each assertion is a
-    // separate singleton document group.
     let identity = format!(
-        "sync-coverage-gap/{account:?}/{from}/{to}/{:?}/{:?}/{dimensions:?}/{refused}",
-        channel.source, channel.parser_version
+        "sync-coverage-gap/{account:?}/{from}/{to}/{:?}/{:?}/{dimensions:?}/{}",
+        channel.source,
+        channel.parser_version,
+        rows.len()
     );
     let digest = Sha256::digest(identity.as_bytes());
     let hex = digest
@@ -428,25 +417,16 @@ fn coverage_gap_event(
         .collect::<String>();
     let raw_hash = RawHash::parse(&hex)
         .unwrap_or_else(|| unreachable!("hexadecimal SHA-256 is always a valid RawHash"));
-    Event {
-        id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
-        owner,
-        account,
-        kind: EventKind::ImportCoverageGap {
+    coverage_gap::gap_event(
+        coverage_gap::GapTarget {
+            owner,
+            account,
             period: iaam_core::reconciliation::claim::AssertionPeriod { from, to },
-            dimensions,
-            refused,
-            rows,
         },
-        dates: EventDates::for_cash(CashPostedDate(to)),
-        order: EffectiveOrder::new(to, 0),
-        legs: Vec::new(),
-        provenance: Provenance::new(channel.source, raw_hash, channel.parser_version.clone()),
-        relation: Relation::None,
-        confidence: Confidence::Known,
-        idempotency_key: Some(identity),
-    }
+        rows,
+        Provenance::new(channel.source, raw_hash, channel.parser_version.clone()),
+        identity,
+    )
 }
 
 fn known_records(events: &[Event]) -> Vec<KnownRecord> {

@@ -14,15 +14,19 @@
 
 use std::collections::BTreeSet;
 
-use iaam_core::batch::{self, BatchTotal, ControlCheck, ControlComparison, ControlSection};
+use iaam_core::batch::{
+    self, BatchMovement, BatchTotal, ControlCheck, ControlComparison, ControlSection,
+};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{
     AccountId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId,
 };
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule, Movement,
@@ -47,6 +51,7 @@ use crate::ports::{
     NewImportQuestion, Principal, Recorded,
 };
 use crate::scenarios::classification::{matcher_json, outcome_json};
+use crate::scenarios::coverage_gap;
 use crate::scenarios::ingest::{RowOrigin, submit_candidates};
 use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
 
@@ -238,6 +243,7 @@ pub async fn answerable_questions(
 pub async fn submit_intake(
     services: &AppServices,
     principal: &Principal,
+    account: Option<AccountId>,
     source: SourceId,
     import: Option<ImportId>,
     rows: &[Intake],
@@ -283,7 +289,13 @@ pub async fn submit_intake(
         Some(
             services
                 .store
-                .open_import_session(principal.owner, Some(source), import)
+                // The declared account travels into the session with the source
+                // and the import. This route has already checked every row
+                // against it, but the session it opens outlives the request:
+                // the caller is handed its identifier and may feed it further
+                // rows, and those go through [`add_rows`], which can only check
+                // what the session recorded.
+                .open_import_session(principal.owner, account, Some(source), import)
                 .await?,
         )
     } else {
@@ -470,9 +482,17 @@ pub async fn resolve_declared_account(
 /// need to be: the store's unique index still admits one open session per
 /// import, so the worst a race produces is the old answer — a session handed
 /// back that acquired its first row in between.
+///
+/// `account` is what the declaration resolved to, and it is stored on the
+/// session rather than left in this request. `source` and `import` are both
+/// one-way hashes of it, so a session that kept only those could not say
+/// afterwards which account it was declared for, and [`add_rows`] therefore
+/// could not refuse a row for another one (iaam-tmvz). `None` opens a free
+/// session, which holds rows for as many accounts as its export covers.
 pub async fn open_session(
     services: &AppServices,
     principal: &Principal,
+    account: Option<AccountId>,
     source: Option<SourceId>,
     import: Option<ImportId>,
 ) -> Result<ImportSessionView, AppError> {
@@ -485,7 +505,7 @@ pub async fn open_session(
     }
     services
         .store
-        .open_import_session(principal.owner, source, import)
+        .open_import_session(principal.owner, account, source, import)
         .await
 }
 
@@ -701,6 +721,43 @@ pub async fn list_sessions(
 /// row the caller concluded. That is the difference between this and
 /// [`submit_intake`]: a session defers **everything** to commit, which is what
 /// lets both legs of one transfer sit in it before either is recorded.
+///
+/// **A declared session takes rows for the account it declared and no other**
+/// (iaam-tmvz). The batch route has always checked this because its declaration
+/// and its rows arrive together; a session could not, because it stored only
+/// `source` and `import`, which are one-way hashes of the account, and by the
+/// time the rows arrived the account was gone. It stores the account now, and
+/// this is the check that account was stored for: a row for another account
+/// would be held and then committed under **this** import's identity —
+/// recorded against one account while carrying the import identity of another,
+/// so that retracting either import takes the wrong rows.
+///
+/// The check is against the account the declaration **resolved** to, not the
+/// text it was written as: a caller may declare by the number its bank prints
+/// while its rows name the account by its iaam identifier, which is the one
+/// thing both sides can state.
+///
+/// It applies only where a declaration was made, and that is not a gap. A free
+/// session is opened without one precisely so that an institution-wide export
+/// is one session rather than four, and its rows legitimately name several
+/// accounts; there is nothing for them to disagree with. A session opened
+/// before the account was recorded is in the same position and is left there:
+/// giving it the account of whoever feeds it next would be inventing the
+/// declaration it never made.
+///
+/// The whole call is refused rather than the row, exactly as on the batch
+/// route, and for its reason: an unreadable row is one row the caller got
+/// wrong, while a row for another account contradicts the declaration the
+/// session was opened under, and holding the agreeing half would leave a
+/// half-import staged under an identity that names the wrong account. It is
+/// refused **before** the first observation is written, so a refused call
+/// leaves the session exactly as it found it.
+///
+/// The refusal names no request index. The rows this function receives are the
+/// ones the transport could read, so a position here is a position in that
+/// list and not in the caller's body; naming the offending row in prose says
+/// what is true instead of an index that is off by however many rows above it
+/// were unreadable.
 pub async fn add_rows(
     services: &AppServices,
     principal: &Principal,
@@ -708,6 +765,33 @@ pub async fn add_rows(
     rows: &[Intake],
 ) -> Result<Vec<HeldRow>, AppError> {
     require_submit(principal)?;
+    // A session that cannot be found declares nothing, and the refusal for that
+    // is `add_import_observation`'s own: reporting it here as well would give
+    // one mistake two answers.
+    let declared = services
+        .store
+        .load_import_session(principal.owner, session)
+        .await?
+        .and_then(|view| view.account);
+    if let Some(declared) = declared {
+        for (index, intake) in rows.iter().enumerate() {
+            let named = intake.account();
+            if named != declared {
+                return Err(AppError::Invalid {
+                    field: "operations".to_owned(),
+                    expected: format!(
+                        "rows for account {}, which this session was declared for",
+                        declared.inner()
+                    ),
+                    actual: format!(
+                        "row {} of this batch names account {}",
+                        index + 1,
+                        named.inner()
+                    ),
+                });
+            }
+        }
+    }
     let resolver = Resolver::load(services, principal.owner).await?;
     let mut outcomes: Vec<HeldRow> = Vec::with_capacity(rows.len());
     for intake in rows {
@@ -1149,7 +1233,12 @@ pub async fn state_control_figures(
 /// is at least told what it committed.
 ///
 /// `accept_control_mismatch` is how a batch that does not agree with its own
-/// source's control figures is committed anyway.
+/// source's control section is committed anyway. Two disagreements pass through
+/// it: a figure the rows do not come to, and — since iaam-mnv0 — rows the
+/// interval that section states does not cover. One flag for both, because the
+/// remedy is the same and because the second is the one that would be waved
+/// through: a figure that disagrees announces itself, while a comparison folded
+/// over rows the figures are not about comes out matched.
 ///
 /// **Refusing outright was rejected.** A source's control section can itself be
 /// wrong — a misprinted statement, a bank's own correction issued a week later,
@@ -1227,13 +1316,29 @@ pub async fn commit_session(
     // interval. A failure between the two leaves the session open, so committing
     // again re-submits the rows — which their idempotency keys answer with
     // `duplicate` — and retries the assertions, whose own keys do the same.
+    //
+    // The coverage gaps go in **with** the assertions and not after them, in one
+    // call. A gap says what this commit was handed and declined, and an
+    // assertion recorded without the gap that qualifies it is the one
+    // intermediate state that misleads: for as long as it stands alone, the
+    // figures look confirmable against a journal that is short the very rows
+    // this attempt dropped.
     let assertions = control_assertions(principal.owner, &planned.plan);
-    let control_assertions = if assertions.is_empty() {
+    let stated = assertions.len();
+    let mut writing = assertions;
+    writing.extend(coverage_gaps(
+        principal.owner,
+        &planned.plan,
+        &planned.declined,
+    ));
+    let mut recorded = if writing.is_empty() {
         Vec::new()
     } else {
-        crate::scenarios::ingest::append_checked(services, assertions, IdentityScope::Source)
-            .await?
-    };
+        crate::scenarios::ingest::append_checked(services, writing, IdentityScope::Source).await?
+    }
+    .into_iter();
+    let control_assertions: Vec<Recorded> = recorded.by_ref().take(stated).collect();
+    let coverage_gaps: Vec<Recorded> = recorded.collect();
     services
         .store
         .close_import_session(principal.owner, session, ImportSessionState::Committed)
@@ -1242,6 +1347,7 @@ pub async fn commit_session(
         revision: planned.plan.revision,
         verdicts,
         control_assertions,
+        coverage_gaps,
     })
 }
 
@@ -1256,7 +1362,7 @@ pub async fn commit_session(
 /// a hundred of them would be a hundred requests, while here the remedy is one
 /// flag on this same call, and the list is what the flag is about.
 fn control_mismatch_refusal(control: &ControlReconciliation) -> Option<AppError> {
-    let mismatched: Vec<String> = control
+    let mut disagreements: Vec<String> = control
         .comparisons
         .iter()
         .flat_map(|comparison| {
@@ -1283,18 +1389,48 @@ fn control_mismatch_refusal(control: &ControlReconciliation) -> Option<AppError>
                 })
         })
         .collect();
-    if mismatched.is_empty() {
+    // Beside the figures, and in the same list, the rows the stated interval
+    // does not cover (iaam-mnv0). It belongs here rather than in a refusal of
+    // its own because the remedy is the same flag on the same call, and a
+    // caller shown one list and refused over another would set the flag without
+    // having read what it was about. The sentence names both numbers for the
+    // same reason the figures do: the flag says «I have read these».
+    disagreements.extend(control.comparisons.iter().filter_map(|comparison| {
+        let (fit, stated) = (comparison.fit?, comparison.stated?);
+        if fit.fits() {
+            return None;
+        }
+        let mut how = Vec::new();
+        if let Some((from, to)) = fit.span {
+            how.push(format!("{} dated {from} to {to}", fit.outside));
+        }
+        if fit.undated > 0 {
+            how.push(format!("{} carrying no date", fit.undated));
+        }
+        Some(format!(
+            "account {} in {}: the source states {} to {}, and {} of the rows folded into \
+             that comparison are not covered by it — {}",
+            comparison.account.inner(),
+            comparison.currency.code(),
+            stated.period.from,
+            stated.period.to,
+            fit.misplaced(),
+            how.join(", "),
+        ))
+    }));
+    if disagreements.is_empty() {
         return None;
     }
     Some(AppError::Invalid {
         field: "accept_control_mismatch".to_owned(),
-        expected: "rows that add up to the control figures the source printed, or \
-                       accept_control_mismatch: true to record them as they are"
+        expected: "rows that add up to the control figures the source printed and fall \
+                       inside the interval it states, or accept_control_mismatch: true to \
+                       record them as they are"
             .to_owned(),
         actual: format!(
-            "{} figure(s) disagree: {}",
-            mismatched.len(),
-            mismatched.join("; ")
+            "{} disagreement(s) with the source's own control section: {}",
+            disagreements.len(),
+            disagreements.join("; ")
         ),
     })
 }
@@ -1433,6 +1569,19 @@ pub struct CommitOutcome {
     /// list would give the last row of every import a neighbour that is not a
     /// row.
     pub control_assertions: Vec<Recorded>,
+    /// The gaps recording what this commit was handed and did not take
+    /// (iaam-bufs).
+    ///
+    /// Empty on the ordinary commit, which declines nothing, and empty on a
+    /// commit whose source printed no control section — see [`coverage_gaps`]
+    /// for why a gap needs a stated interval to be dated by.
+    ///
+    /// Reported apart from `control_assertions` because they are opposite
+    /// statements written together: an assertion is what the source claims, a
+    /// gap is what this attempt could not stand behind, and the whole point of
+    /// writing both is that a reader of the journal later sees the second
+    /// beside the first.
+    pub coverage_gaps: Vec<Recorded>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,6 +1656,27 @@ impl ControlReconciliation {
             .filter(|check| check.is_mismatch())
             .count()
     }
+
+    /// How many folded rows the stated intervals do not place inside themselves
+    /// (iaam-mnv0).
+    ///
+    /// Counted apart from [`Self::mismatches`] because it is a different fault,
+    /// and reported beside it because it reaches the same door. A mismatch says
+    /// two numbers disagree; this says the numbers were computed over rows the
+    /// figures are not about — and a comparison folded over the wrong set of
+    /// rows is worse than one that disagrees, because it comes out clean.
+    ///
+    /// A comparison the source stated nothing for contributes nothing: with no
+    /// interval there is nothing for a row to be outside of, exactly as a
+    /// figure nobody stated is not a figure that failed.
+    #[must_use]
+    pub fn misplaced_rows(&self) -> usize {
+        self.comparisons
+            .iter()
+            .filter_map(|comparison| comparison.fit)
+            .map(|fit| fit.misplaced())
+            .sum()
+    }
 }
 
 /// The plan, and the events it would append.
@@ -1518,6 +1688,35 @@ impl ControlReconciliation {
 pub struct PlannedSession {
     pub plan: ImportPlan,
     candidates: Vec<Result<iaam_core::event::Event, Rejection>>,
+    /// The rows the commit will decline, named as a coverage gap names them.
+    ///
+    /// Private for `candidates`' reason and one more of its own. The names
+    /// carry the session's source, which a caller holding them would read as
+    /// an identity it can address; and what these rows *are* is already
+    /// published, per row and with the reason each was declined, as
+    /// `commit_delta.retained_unrecorded`. This is that same fact in the shape
+    /// the journal records it, not a second finding.
+    declined: Vec<DeclinedRow>,
+}
+
+// No source is held here. It was, while a session that declared none had one
+// minted for the occasion and three writers minting it separately would have
+// given one commit three sources. `session_origin` derives it instead, from the
+// owner, the session and the account a row names (`iaam-zv54`), so the rows, the
+// control assertions and the coverage gaps reach the same identity without
+// anybody carrying it between them — and a refused row is named under the
+// identity it would itself have been written under.
+
+/// One row a commit was handed and will not take.
+///
+/// The account is beside the row rather than inside it because a gap is an
+/// event, and an event names an account: the rows are grouped by it. `None`
+/// where the stored payload does not parse, which is the one case in which a
+/// row names nothing this build can read.
+#[derive(Debug, Clone)]
+struct DeclinedRow {
+    account: Option<AccountId>,
+    row: RefusedRow,
 }
 
 /// What the session's own source named.
@@ -1698,7 +1897,23 @@ pub enum Readiness {
     /// statement its bank misprinted would be a system that cannot record what
     /// happened. What it does is make committing a stated act — see
     /// [`commit_session`].
-    DoesNotReconcile { mismatched_figures: usize },
+    ///
+    /// **Two disagreements, one word** (iaam-mnv0). A figure that disagrees and
+    /// a row the stated interval does not cover are reported together because
+    /// they reach the same remedy: one flag on the commit call, set by somebody
+    /// who has read the list. Splitting them would mean a caller lifting one and
+    /// being refused for the other, and the second is exactly the kind that gets
+    /// waved through. `misplaced_rows` is not the lesser of the two: a figure
+    /// that disagrees announces itself, while a comparison folded over rows the
+    /// figures are not about comes out **clean** — the turnover matches because
+    /// the same rows were folded on both sides of nothing.
+    DoesNotReconcile {
+        mismatched_figures: usize,
+        /// Rows folded into a comparison that the interval its source stated
+        /// does not place inside itself: dated outside it, or carrying no date
+        /// to be placed by.
+        misplaced_rows: usize,
+    },
 }
 
 impl Readiness {
@@ -1795,11 +2010,15 @@ pub async fn plan_session(
     let mut read_rows = Vec::with_capacity(contents.observations.len());
     for observation in &contents.observations {
         let intake = parse_intake(&observation.payload).ok();
-        let candidate = operation_of(observation, &resolver).and_then(|operation| {
-            // Derived from the session and the account this row names, so that
-            // this function called twice — which is exactly what committing
-            // does — plans the same provenance both times. See
-            // [`session_origin`].
+        let operation = operation_of(observation, &resolver);
+        // The origin is derived from the session and the account this row names,
+        // so that this function called twice — which is exactly what committing
+        // does — plans the same provenance both times. See [`session_origin`].
+        // The operation itself is kept beside the candidate because a row this
+        // commit declines is named in the coverage gap by what it would have
+        // moved (iaam-bufs), and a candidate that failed to normalise no longer
+        // says.
+        let candidate = operation.clone().and_then(|operation| {
             let origin = session_origin(principal.owner, &contents.session, operation.account);
             normalize(
                 &operation,
@@ -1819,6 +2038,9 @@ pub async fn plan_session(
         read_rows.push(ReadRow {
             row: observation.row,
             intake,
+            operation: operation.ok(),
+            row_key: observation.row_key.clone(),
+            payload: observation.payload.clone(),
             candidate: candidate.clone(),
         });
         candidates.push(candidate);
@@ -1841,6 +2063,11 @@ pub async fn plan_session(
     let mut facts = Vec::new();
     let mut duplicates = Vec::new();
     let mut retained = Vec::new();
+    // Rows this commit was handed and will not take, in the shape a coverage
+    // gap names them (iaam-bufs). Collected in the same pass as everything
+    // else, for the reason the whole planner is one function: a second walk
+    // over the rows would describe a different import from the one that runs.
+    let mut declined: Vec<DeclinedRow> = Vec::new();
     for read in &read_rows {
         match &read.candidate {
             Ok(event) => {
@@ -1855,22 +2082,30 @@ pub async fn plan_session(
                     facts.push(fact);
                 }
             }
-            Err(rejection) => retained.push(RetainedRow {
-                row: read.row,
-                reason: open_questions
-                    .iter()
-                    .find(|open| open.row == read.row)
-                    .map_or_else(
-                        || RetentionReason::Unreadable {
+            Err(rejection) => {
+                let open = open_questions.iter().find(|open| open.row == read.row);
+                let reason = match open {
+                    Some(open) => RetentionReason::Unanswered {
+                        question: open.question,
+                    },
+                    None => {
+                        // Only an unreadable row is declined. An unanswered one
+                        // refuses the commit outright, so no commit ever
+                        // declines it — recording a gap for it would be a
+                        // statement about an attempt that did not happen.
+                        declined.push(declined_row(principal.owner, &contents.session, read));
+                        RetentionReason::Unreadable {
                             field: rejection.field.clone(),
                             expected: rejection.expected.clone(),
                             actual: rejection.actual.clone(),
-                        },
-                        |open| RetentionReason::Unanswered {
-                            question: open.question,
-                        },
-                    ),
-            }),
+                        }
+                    }
+                };
+                retained.push(RetainedRow {
+                    row: read.row,
+                    reason,
+                });
+            }
         }
     }
 
@@ -1908,14 +2143,14 @@ pub async fn plan_session(
     let control_reconciliation = ControlReconciliation {
         comparisons: batch::compare(
             &stated,
-            &batch_totals(
+            &movements(
                 &commit_delta
                     .facts
                     .iter()
                     .chain(commit_delta.duplicates.iter())
                     .cloned()
                     .collect::<Vec<_>>(),
-            )?,
+            ),
         )
         .map_err(AppError::BatchTotal)?,
     };
@@ -1927,14 +2162,18 @@ pub async fn plan_session(
     // commit — and which are also a complete explanation of a shortfall, since
     // an unread row is a row missing from every total; naming a mismatch here
     // would send the owner to check arithmetic when what is missing is an
-    // answer. Then the mismatch, which commits only deliberately. Last the
-    // unconfirmed transfer candidates, which commit by default and change what
-    // the journal *relates*, not what it holds.
+    // answer. Then the mismatch, which commits only deliberately — and beside
+    // it, on the same word, a row the stated interval does not cover: it is the
+    // same finding wearing another shape, that the figures and the rows are not
+    // about the same thing, and it reaches the same flag on the same call. Last
+    // the unconfirmed transfer candidates, which commit by default and change
+    // what the journal *relates*, not what it holds.
     //
     // Nothing is hidden by the ordering: every section is published whatever the
     // readiness says, and `control_reconciliation` states both numbers of every
     // comparison it made. What the ordering decides is the one word.
     let mismatched_figures = control_reconciliation.mismatches();
+    let misplaced_rows = control_reconciliation.misplaced_rows();
     let readiness = if contents.session.state != ImportSessionState::Open {
         Readiness::Blocked {
             reason: format!(
@@ -1947,8 +2186,11 @@ pub async fn plan_session(
             unanswered_questions: open_questions.len(),
             transfer_candidates: cross_source_matching.candidates.len(),
         }
-    } else if mismatched_figures > 0 {
-        Readiness::DoesNotReconcile { mismatched_figures }
+    } else if mismatched_figures > 0 || misplaced_rows > 0 {
+        Readiness::DoesNotReconcile {
+            mismatched_figures,
+            misplaced_rows,
+        }
     } else if !cross_source_matching.candidates.is_empty() {
         Readiness::RequiresOwnerDecision {
             unanswered_questions: 0,
@@ -1974,6 +2216,7 @@ pub async fn plan_session(
     );
 
     Ok(PlannedSession {
+        declined,
         plan: ImportPlan {
             session: contents.session,
             revision,
@@ -1995,16 +2238,33 @@ struct ReadRow {
     row: u32,
     /// `None` when the stored payload cannot be parsed by this build.
     intake: Option<Intake>,
+    /// The operation the row read as, where it read as one at all.
+    ///
+    /// Kept beside `candidate` rather than recovered from it, because the two
+    /// fail at different steps and the difference is what a coverage gap can
+    /// say: a row that reached an operation and then failed normalisation
+    /// states what it would have moved, and a row that never reached one does
+    /// not (iaam-bufs).
+    operation: Option<SubmittedOperation>,
+    /// The stable key the caller's row identity yielded, when it yielded one.
+    row_key: Option<String>,
+    /// The stored payload, so a row the caller named nothing by can still be
+    /// named by a fingerprint of what it sent — as the sync path fingerprints
+    /// a row its source did not identify.
+    payload: String,
     candidate: Result<iaam_core::event::Event, Rejection>,
 }
 
 impl ReadRow {
     /// The account the row is on, as the caller stated it.
+    ///
+    /// `None` only where the stored payload does not parse: a row this build
+    /// cannot read names nothing it can be trusted about. The answer for every
+    /// row it can read is [`Intake::account`]'s, so that the account this
+    /// assessment reports and the account [`add_rows`] checked are read the
+    /// same way.
     fn account(&self) -> Option<AccountId> {
-        match self.intake.as_ref()? {
-            Intake::Observed { row } => Some(row.account),
-            Intake::Concluded { operation } => Some(operation.account),
-        }
+        Some(self.intake.as_ref()?.account())
     }
 
     /// The document the row names, when it names one.
@@ -2131,17 +2391,31 @@ fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact 
 /// for «no cash» — and folding it would open a rouble total on an account that
 /// has never held roubles, and count a row against a currency it never named.
 fn batch_totals(facts: &[PlannedFact]) -> Result<Vec<BatchTotal>, AppError> {
-    let movements: Vec<(AccountId, Money)> = facts
+    batch::total(&movements(facts)).map_err(AppError::BatchTotal)
+}
+
+/// The cash movements a list of planned facts is, in the core's own vocabulary.
+///
+/// Written once and used by both the totals and the control comparison, because
+/// the two must be about the same rows: the comparison's `observed` is folded
+/// from exactly what is passed here, and a second selection beside this one
+/// could come to fold a row this one drops.
+///
+/// The date travels with the movement, and that is iaam-mnv0: it is what lets
+/// [`batch::compare`] ask whether the rows it folded are the rows the source's
+/// figures are about. It is [`PlannedFact::date`], the day the fact will be
+/// posted on, because that is the day a statement's period is printed in terms
+/// of; `None` where the row states none, which no interval places either way.
+fn movements(facts: &[PlannedFact]) -> Vec<BatchMovement> {
+    facts
         .iter()
         .filter(|fact| fact.amount_minor != 0)
-        .map(|fact| {
-            (
-                fact.account,
-                Money::new(PostedMinor::new(fact.amount_minor), fact.currency),
-            )
+        .map(|fact| BatchMovement {
+            account: fact.account,
+            amount: Money::new(PostedMinor::new(fact.amount_minor), fact.currency),
+            date: fact.date,
         })
-        .collect();
-    batch::total(&movements).map_err(AppError::BatchTotal)
+        .collect()
 }
 
 /// The stamp a plan carries, and commit refuses when it no longer matches.
@@ -2301,6 +2575,13 @@ fn fingerprint(
 /// but are not, and [`SourceChannel::is_independent_of`] would be answering
 /// about a distinction that had been erased.
 ///
+/// It stamps the coverage gaps a commit writes as well as its assertions
+/// (iaam-bufs), and that is not a widening of what it means but the whole of
+/// what makes a gap work. Reconciliation correlates a gap with an assertion
+/// group by account, period, source **and parser version**; a gap written under
+/// any other version would taint nothing it was about, and the assertions this
+/// same commit wrote would go on to confirm a batch that had dropped rows.
+///
 /// [`Ground::OwnerStatedBalance`]: iaam_core::reconciliation::evidence::Ground::OwnerStatedBalance
 /// [`SourceChannel::is_independent_of`]: iaam_core::reconciliation::evidence::SourceChannel::is_independent_of
 const CONTROL_PARSER_VERSION: &str = "import-control/1";
@@ -2451,6 +2732,228 @@ fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event
         }
     }
     events
+}
+
+/// One declined row, named the way a coverage gap names rows.
+///
+/// The naming is the sync path's, deliberately: the identifier the caller gave
+/// the row where it gave one, and a fingerprint of what it actually sent where
+/// it did not. A later import of the same unchanged row reproduces the same
+/// name, which is what lets a gap be lifted by the row that repaired it —
+/// nothing lifts gaps today (iaam-dvki), and a name that could not survive to
+/// that point would have to be migrated when something does.
+///
+/// **The dimensions are what the system knows, and stop exactly there.** A row
+/// that reached an operation before being refused says what that operation
+/// would have moved. A row that never reached one is an observation, and the
+/// only thing an observation certainly is, is a cash line — it carries an
+/// account, an amount, a currency and a direction, and every classification of
+/// such a row moves cash. It is **not** widened to «cash and possibly income»:
+/// a row nobody could classify has not been shown to be income, and tainting
+/// `Income` on the strength of what a row might have been would make the taint
+/// mean less on every row that genuinely is one. The cost is the honest one —
+/// an unclassifiable coupon taints `Cash` and not `Income` — and it is the cost
+/// of not asserting what was never read.
+///
+/// A row whose stored payload this build cannot parse taints nothing: it is
+/// still named, so that a gap holding others reports it as refused, but nothing
+/// can be said about what it would have moved. Where such rows are the only
+/// ones, [`coverage_gap::gap_event`] writes nothing at all.
+fn declined_row(owner: OwnerId, session: &ImportSessionView, read: &ReadRow) -> DeclinedRow {
+    let row = match read.row_key.as_deref() {
+        // An empty identifier is not an identifier, as the sync path also says.
+        Some(key) if !key.is_empty() => RowName::Given(key.to_owned()),
+        _ => RowName::Fingerprint(digest_hex(&read.payload)),
+    };
+    let dimensions: BTreeSet<Dimension> = match (&read.operation, &read.intake) {
+        (Some(operation), _) => coverage_gap::operation_dimensions(&operation.kind),
+        (None, Some(Intake::Observed { .. })) => [Dimension::Cash].into_iter().collect(),
+        (None, _) => BTreeSet::new(),
+    };
+    // Named under the identity the row itself would have been written under, by
+    // the one derivation every other writer of this session uses. A row nobody
+    // could read names no account, and then the session's own source is the
+    // most this can honestly say — it is the identity the gap holding the row
+    // is written under either way.
+    let source = read
+        .account()
+        .map(|account| session_origin(owner, session, account).source)
+        .or(session.source)
+        .unwrap_or_else(SourceId::new_random);
+    DeclinedRow {
+        account: read.account(),
+        row: RefusedRow {
+            key: SourceRowKey { source, row },
+            dimensions,
+        },
+    }
+}
+
+/// Version of the key one import coverage gap is written under.
+///
+/// Part of the key for [`CONTROL_KEY_VERSION`]'s reason: keys have already been
+/// deduplicated against, so a change of form must be visible in the value
+/// rather than inferred from its shape.
+const IMPORT_GAP_KEY_VERSION: u8 = 1;
+
+/// The key under which one import's coverage gap is the same fact twice.
+///
+/// **Keyed on the rows it refused, not on how many there were.** That is the
+/// defect iaam-lg4q names on the sync path, which builds its identity from the
+/// dimension union and a count: refuse row A, repair it, later refuse a
+/// different row B in the same dimension, and the second gap collides with the
+/// first one's key and is dropped as a duplicate — leaving the journal holding
+/// a gap for a row that is now present and none for the row that is missing.
+/// A path written after that was found has no excuse for reproducing it, so
+/// this key digests the rows themselves.
+///
+/// Rendered field by field and sorted, never through `Debug`: a digest over a
+/// derived rendering is a digest that can change with the compiler, and this
+/// string is compared against keys already in the journal.
+///
+/// The session is **not** in the key, exactly as it is not in
+/// [`control_assertion_key`]: two commits of the same statement refusing the
+/// same rows state one fact and must write it once. What that costs is the
+/// counterpart of iaam-dvki — a later clean import through the same channel
+/// writes no gap, and so records nothing that could lift the old one — and it
+/// is the epic's to fix, not this key's.
+fn coverage_gap_key(account: AccountId, period: AssertionPeriod, rows: &[RefusedRow]) -> String {
+    let mut named: Vec<String> = rows
+        .iter()
+        .map(|refused| {
+            let (kind, value) = match &refused.key.row {
+                RowName::Given(id) => ("given", id.as_str()),
+                RowName::Fingerprint(hex) => ("fingerprint", hex.as_str()),
+            };
+            format!(
+                "{}:{kind}:{value}:{}",
+                refused.key.source.inner(),
+                refused
+                    .dimensions
+                    .iter()
+                    .map(|dimension| dimension.code())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect();
+    // Sorted, so that the same refusals fed in another order are one identity:
+    // the rows a commit declines are a set, and their order is the order the
+    // caller happened to send them in.
+    named.sort();
+    format!(
+        "import-coverage-gap:v{IMPORT_GAP_KEY_VERSION}:{}:{}:{}:{}",
+        account.inner(),
+        period.from,
+        period.to,
+        digest_hex(&named.join("\n"))
+    )
+}
+
+/// The coverage gaps this commit writes, one per account and stated interval.
+///
+/// **What this records, and the line it does not cross.** A commit must not
+/// record what the *document* contained: this system never sees the document,
+/// it receives the rows a client chose to send, and a field saying «the
+/// statement held forty rows» would republish the client's word as the
+/// system's knowledge. What it may record is what it **was handed and
+/// declined**, which is a fact it owns entirely — the rows are in its own
+/// session table and the refusal is its own. That is the whole of iaam-bufs,
+/// and the line runs exactly between those two sentences.
+///
+/// So the rows are `commit_delta.retained_unrecorded`, and only the unreadable
+/// ones. Three neighbouring lists were considered and each is excluded for the
+/// same reason — **the rows are recorded**:
+///
+/// - `duplicates` commit to a `duplicate` verdict because the journal already
+///   holds them under their key. A gap naming them would taint an interval
+///   whose rows are present, which is the false taint iaam-lg4q was filed
+///   about arriving by another door.
+/// - `account_resolution.missing` names accounts the owner has never
+///   described. Its rows are written all the same, against an account nobody
+///   has described — a directory problem, published as one, and not a coverage
+///   problem.
+/// - `scope_assessment.awaiting_disposition` names accounts in no contour.
+///   Those rows are in the journal and appear in no report, which is a
+///   perimeter question the queue already raises. A gap says «this attempt
+///   could not confirm», and this attempt recorded them.
+///
+/// **One gap per account and stated interval, and no section means no gap.**
+/// A gap is dated and scoped by an [`AssertionPeriod`], and the only interval
+/// this system has been *told* about is the one the source printed in its
+/// control section. Deriving one from the rows it managed to read would place a
+/// claim on an interval nobody asserted, computed from the rows that are not
+/// the problem. It also happens to be where the gap does its work: correlation
+/// is by account, period, source and parser version, so a gap carrying
+/// [`CONTROL_PARSER_VERSION`] taints exactly the control assertions this same
+/// commit is writing — which is what stops a batch that dropped rows from
+/// later *confirming* the figures it was allowed to commit against.
+///
+/// That leaves a session whose source printed no control section writing no
+/// gap. It is a real gap in the coverage, it is iaam-hj1o's, and it needs an
+/// interval this system can honestly state rather than a change here.
+///
+/// Where an account has two stated intervals, both are tainted by the same
+/// declined rows. Which of the two a declined row belonged to is precisely what
+/// could not be read, and «this attempt cannot confirm either» is the true
+/// statement.
+fn coverage_gaps(
+    owner: OwnerId,
+    plan: &ImportPlan,
+    declined: &[DeclinedRow],
+) -> Vec<iaam_core::event::Event> {
+    let mut written: BTreeSet<(AccountId, time::Date, time::Date)> = BTreeSet::new();
+    let mut events = Vec::new();
+    for section in plan
+        .control_reconciliation
+        .comparisons
+        .iter()
+        .filter_map(|comparison| comparison.stated.as_ref())
+    {
+        if !written.insert((section.account, section.period.from, section.period.to)) {
+            continue;
+        }
+        let rows: Vec<RefusedRow> = declined
+            .iter()
+            .filter(|declined| declined.account == Some(section.account))
+            .map(|declined| declined.row.clone())
+            .collect();
+        let key = coverage_gap_key(section.account, section.period, &rows);
+        // The same per-account derivation the rows and the assertions of this
+        // session get: a gap written under an identity nobody can name is as
+        // unreachable as a row written under one.
+        let provenance = Provenance::new(
+            session_origin(owner, &plan.session, section.account).source,
+            RawHash::parse(&digest_hex(&key))
+                .expect("a SHA-256 digest is 64 hexadecimal characters"),
+            ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
+        );
+        if let Some(event) = coverage_gap::gap_event(
+            coverage_gap::GapTarget {
+                owner,
+                account: section.account,
+                period: section.period,
+            },
+            rows,
+            provenance,
+            key,
+        ) {
+            events.push(event);
+        }
+    }
+    events
+}
+
+/// A SHA-256 of some text, in lower-case hexadecimal.
+fn digest_hex(input: &str) -> String {
+    use std::fmt::Write as _;
+
+    Sha256::digest(input.as_bytes())
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
 }
 
 /// The digest one control section stands under.

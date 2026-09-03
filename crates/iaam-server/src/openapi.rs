@@ -55,8 +55,10 @@ use crate::dto::{
     BatchTotalDto, ControlCheckDto, ControlComparisonDto, ControlReconciliationDto,
     ControlSectionDto, RecordedEventDto, StateImportControlFiguresRequest, StatedControlFiguresDto,
 };
-// Wave K's own names, in a block of their own for the reason stated above.
-use crate::dto::{OwnerBalanceOutcomeDto, QuestionGeneralisationDto};
+// Wave K's own names, in a block of their own for the reason stated above:
+// these belong to changes made in parallel, and merging them into the wrapped
+// list would reflow lines nobody touched.
+use crate::dto::{IntervalFitDto, OwnerBalanceOutcomeDto, QuestionGeneralisationDto};
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -266,6 +268,7 @@ impl Modify for BearerSecurity {
         ControlReconciliationDto,
         ControlComparisonDto,
         ControlCheckDto,
+        IntervalFitDto,
         RecordedEventDto,
         OwnerBalanceOutcomeDto,
         QuestionGeneralisationDto,

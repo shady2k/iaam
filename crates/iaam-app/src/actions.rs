@@ -5594,7 +5594,7 @@ mod tests {
             .await
             .expect("account");
         let session = store
-            .open_import_session(owner, None, None)
+            .open_import_session(owner, None, None, None)
             .await
             .expect("session");
         let question = unresolved(main.id);

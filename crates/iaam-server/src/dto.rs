@@ -43,7 +43,7 @@ use iaam_app::scenarios::reports::{
     MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
-use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection};
+use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection, IntervalFit};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -7752,13 +7752,21 @@ pub struct OpenImportSessionRequest {
     /// session's own `source` field still stays absent, and truthfully: the
     /// session declared none, and the identity is a property of the rows.
     ///
-    /// One thing a declaration does **not** buy: the session does not check that
-    /// the rows fed to it name the declared account, and cannot. It stores the
-    /// source and import, both one-way derivations, and the account itself is
-    /// gone by the time rows arrive. A row for another account is held, and
-    /// committed, under this import's identity. (The batch route does check it,
-    /// because there the declaration and the rows are in one request.) Feed a
-    /// declared session only the account it was declared for.
+    /// A declared session takes rows for the account it declared and no other.
+    /// Feeding it a row that names a different one refuses the whole call
+    /// before anything is held: a row for another account would otherwise be
+    /// committed under **this** import's identity — recorded against one
+    /// account while carrying the import identity of another, so that
+    /// retracting either import takes the wrong rows. A free session has no
+    /// such check and needs none: nothing scopes it to an account, which is
+    /// the point of opening one.
+    ///
+    /// Sessions opened before the account was recorded are the exception, and
+    /// they keep the old behaviour rather than acquiring the check: such a
+    /// session stored only the source and import, both one-way derivations, so
+    /// there is no account to compare a row with and inventing one from
+    /// whoever feeds it next would be inventing the declaration it never
+    /// made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DeclaredSourceDto>,
 }
@@ -7829,12 +7837,13 @@ pub struct ImportSessionDto {
     /// The account the declaration named, resolved.
     ///
     /// Present on the response that opened the session, and absent everywhere
-    /// else — which is a fact about the session rather than an oversight. A
-    /// session stores its `source` and `import`, and both are one-way
-    /// derivations from the account: nothing read back later can recover it.
-    /// The moment the server holds the account is the moment it resolved the
-    /// declaration, so that is the response that carries it, and a caller
-    /// wanting it afterwards asks the directory as it always did.
+    /// else. The session does now record which account it was declared for —
+    /// that is what lets it refuse a row for another one — but this field
+    /// carries the account's title beside its identifier, and the title comes
+    /// from the directory, not from the session. Filling it in on the list
+    /// would put a directory read behind a route that reads no accounts, to
+    /// answer a question the open response has already answered and the
+    /// refusal answers again when it matters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<DeclaredAccountDto>,
 }
@@ -8214,6 +8223,29 @@ pub struct ImportCommitDto {
     /// end of the period they speak about, and every later reconciliation report
     /// compares them with what the rows actually came to.
     pub control_assertions: Vec<RecordedEventDto>,
+    /// What this commit was handed and did not take, written into the journal.
+    ///
+    /// One `import_coverage_gap` event per account and stated interval, naming
+    /// the rows the commit declined and what each of them would have moved.
+    /// Empty on the ordinary import, which declines nothing.
+    ///
+    /// **Not a statement about the document.** This system never sees the
+    /// document; it receives the rows a client chose to send, and a field
+    /// saying what the statement contained would republish the client's word as
+    /// the server's knowledge. What a gap records is the other half: the rows
+    /// this server was given and refused, which is a fact it owns.
+    ///
+    /// What it buys is that reconciliation cannot afterwards *confirm* the
+    /// dimensions those rows would have moved on the strength of this import.
+    /// The commit was still allowed — a batch that does not add up commits with
+    /// `accept_control_mismatch` — and this is what keeps that permission from
+    /// turning into a confirmation.
+    ///
+    /// Empty also where the source printed no control section: a gap is dated
+    /// and scoped by an interval, and the only interval this server has been
+    /// told about is the one printed beside the rows. Deriving one from the
+    /// rows it could read would claim an interval nobody stated.
+    pub coverage_gaps: Vec<RecordedEventDto>,
 }
 
 /// One journal event a commit wrote, or found already written.
@@ -8446,6 +8478,16 @@ pub struct ControlReconciliationDto {
     /// be checked is not one of them: §10.4 keeps «nothing to compare against»
     /// apart from «the numbers do not match».
     pub mismatched_figures: usize,
+    /// How many rows the intervals the source stated do not cover — dated
+    /// outside one, or carrying no date to be placed by.
+    ///
+    /// A second number beside `mismatched_figures` because it is a second kind
+    /// of disagreement, and one that does **not** show up in the figures: a
+    /// statement whose rows spill past its own period agrees with itself, since
+    /// the same rows are folded on both sides of nothing. It refuses the commit
+    /// through the same `accept_control_mismatch` flag, and for the stronger
+    /// reason — a mismatch announces itself, this comes out matched.
+    pub rows_outside_interval: usize,
 }
 
 /// One account and one currency: what the source said, what the rows say.
@@ -8464,6 +8506,71 @@ pub struct ControlComparisonDto {
     pub observed: BatchTotalDto,
     /// One entry per figure the source stated. Empty where it stated none.
     pub checks: Vec<ControlCheckDto>,
+    /// Whether the rows folded into `observed` fall inside the interval
+    /// `stated` declares. Absent where nothing was stated: with no interval
+    /// there is nothing for a row to be outside of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fit: Option<IntervalFitDto>,
+}
+
+/// Whether the rows a comparison folded are the rows its figures are about.
+///
+/// The check that was missing (iaam-mnv0). Every figure of a section is
+/// compared against a total, and nothing asked whether the rows in that total
+/// belong to the period the section prints — so a statement whose rows spill
+/// past its own period came out **matched**, the same rows folded on both sides
+/// of nothing.
+///
+/// Not a `checks` entry, because a check is about one figure the source
+/// printed and this is about the set of rows every figure was checked against.
+/// A reader who sees `matched` beside a non-empty fit is being told that the
+/// arithmetic came out over rows the figures do not cover, and that is a
+/// different sentence from «the numbers disagree».
+///
+/// A row outside the interval is folded into `observed` anyway. Dropping it
+/// would make the arithmetic agree by removing the row that disagrees with it;
+/// what is published instead is the total as it stands and this, saying what it
+/// is worth.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct IntervalFitDto {
+    /// Rows dated outside the interval, and folded in regardless.
+    pub outside: usize,
+    /// Rows carrying no date, which no interval places either way. A separate
+    /// number because «I cannot tell» is not «this is not in your period».
+    pub undated: usize,
+    /// The earliest of the rows dated outside. Absent when none is.
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub outside_from: Option<Date>,
+    /// The latest of them. Absent when none is.
+    ///
+    /// Published beside `outside_from` rather than as a count alone, because a
+    /// day either side of a month boundary is a posting-date convention and
+    /// three months out is a converter reading the wrong file, and the reader
+    /// deciding whether to record the batch anyway has to tell them apart.
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub outside_to: Option<Date>,
+}
+
+impl IntervalFitDto {
+    #[must_use]
+    pub const fn from_domain(fit: IntervalFit) -> Self {
+        Self {
+            outside: fit.outside,
+            undated: fit.undated,
+            // `Option::map` is not a const function, and this conversion is
+            // worth keeping const beside its neighbours.
+            outside_from: match fit.span {
+                Some((from, _)) => Some(from),
+                None => None,
+            },
+            outside_to: match fit.span {
+                Some((_, to)) => Some(to),
+                None => None,
+            },
+        }
+    }
 }
 
 /// One stated figure, checked — with both numbers on the page.
@@ -8510,6 +8617,7 @@ impl ControlReconciliationDto {
                 .map(ControlComparisonDto::from_domain)
                 .collect(),
             mismatched_figures: control.mismatches(),
+            rows_outside_interval: control.misplaced_rows(),
         }
     }
 }
@@ -8531,6 +8639,7 @@ impl ControlComparisonDto {
                 .iter()
                 .map(|check| ControlCheckDto::from_domain(check, currency))
                 .collect(),
+            fit: comparison.fit.map(IntervalFitDto::from_domain),
         }
     }
 }
@@ -8927,10 +9036,14 @@ impl ImportPlanDto {
                 )),
                 plan.readiness.code(),
             ),
-            Readiness::DoesNotReconcile { mismatched_figures } => (
+            Readiness::DoesNotReconcile {
+                mismatched_figures,
+                misplaced_rows,
+            } => (
                 Some(format!(
                     "{mismatched_figures} control figure(s) the source printed do not \
-                     agree with the rows; see control_reconciliation"
+                     agree with the rows, and {misplaced_rows} row(s) fall outside the \
+                     interval it states; see control_reconciliation"
                 )),
                 plan.readiness.code(),
             ),

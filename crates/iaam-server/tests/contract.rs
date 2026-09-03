@@ -14290,6 +14290,123 @@ async fn a_declared_import_that_already_holds_rows_is_refused_and_the_refusal_na
     );
 }
 
+/// A declared session takes rows for the account it declared and no other
+/// (iaam-tmvz).
+///
+/// The batch route has always refused this, because its declaration and its
+/// rows arrive in one request. A session could not: it stored `source` and
+/// `import`, both one-way hashes of the account, so by the time rows arrived
+/// the account was gone — and a row for another account was held and then
+/// committed under **this** import's identity, recorded against one account
+/// while carrying the import identity of another. Retracting either import
+/// then takes the wrong rows.
+///
+/// Three properties, and the third is what keeps the fix from being a
+/// regression: the wrong account is refused, the right one is taken, and a free
+/// session — one opened with no declaration — still holds rows for several
+/// accounts, which is the whole reason for opening one.
+///
+/// Every account, label and amount below is invented for this test (CLAUDE.md).
+#[tokio::test]
+async fn a_declared_session_refuses_a_row_for_an_account_it_did_not_declare() {
+    let harness = harness();
+    let main = another_account(&harness, "Main").await;
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, opened) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": main, "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    // One row for the declared account and one for another. The whole call is
+    // refused rather than the row: a row for another account contradicts the
+    // declaration the session was opened under, and holding the agreeing half
+    // would leave a half-import staged under an identity naming the wrong
+    // account.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [
+                unresolved_row(main, "march-1"),
+                unresolved_row(savings, "march-2"),
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let detail = refused.to_string();
+    assert!(
+        detail.contains(&main.to_string()) && detail.contains(&savings.to_string()),
+        "the refusal must name the account declared and the one the row named: {refused}"
+    );
+
+    // And nothing was held: the check runs before the first observation is
+    // written, so a refused call leaves the session as it found it.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["row_count"], 0,
+        "a refused call must hold none of its rows: {contents}"
+    );
+
+    // The declared account is taken exactly as before.
+    let (status, held) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(main, "march-1")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+
+    // A free session declares no account, so there is nothing for its rows to
+    // disagree with. This is the shape for an export covering a whole
+    // institution: one session, questions answered once, one commit.
+    let (status, free) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{free}");
+    let free = free["session"].as_str().expect("session").to_owned();
+    let (status, both) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{free}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [
+                unresolved_row(main, "free-1"),
+                unresolved_row(savings, "free-2"),
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a session with no declaration holds rows for several accounts: {both}"
+    );
+    assert_eq!(both.as_array().expect("held rows").len(), 2, "{both}");
+}
+
 /// With every question answered, committing is what the refusal leads with.
 #[tokio::test]
 async fn a_settled_import_under_way_is_refused_with_the_commit_that_ends_it() {
@@ -15695,6 +15812,16 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
             .all(|assertion| assertion["outcome"] == json!("inserted")),
         "{committed}"
     );
+    // Nothing was declined, so nothing is recorded as declined: a gap is a
+    // statement about rows an attempt did not take, and this one took them all
+    // (iaam-bufs).
+    assert!(
+        committed["coverage_gaps"]
+            .as_array()
+            .expect("coverage gaps")
+            .is_empty(),
+        "{committed}"
+    );
 
     let (status, reconciliation) = call(
         &harness.router,
@@ -15719,6 +15846,408 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
             .all(|outcome| outcome["outcome"]["code"] == json!("matched")),
         "{reconciliation}"
     );
+}
+
+/// A commit that declines a row records what it declined (iaam-bufs).
+///
+/// The assessment has always computed, from facts the system derived itself,
+/// what an import was offered and did not take. `commit_session` then threw the
+/// plan away: the rows the caller had sent and the server had refused left no
+/// trace in the journal at all, so reconciliation could afterwards **confirm**
+/// the very dimensions those rows would have moved.
+///
+/// The line this holds, and it is the point of the bead: the gap is not a
+/// statement about the document. This server never sees the document — it
+/// receives the rows a client chose to send — so a field saying what the
+/// statement contained would republish the client's word as the server's
+/// knowledge. What the gap records is what the server **was handed and
+/// declined**, which is a fact it owns entirely.
+///
+/// Note what the flag does and does not do: `accept_control_mismatch` lets the
+/// batch be committed, and the gap is what keeps that permission from becoming
+/// a confirmation later.
+///
+/// Every account, amount and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_commit_that_declines_a_row_writes_the_coverage_gap_that_says_so() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "declining",
+        json!([
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-06-10" },
+                "idempotency_key": "declining-good",
+            },
+            // A row the server cannot read into a fact: it states no date at
+            // all, so nothing places it in a period. It is held by the session
+            // and declined by the commit.
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "200.00",
+                "currency": "RUB",
+                "idempotency_key": "declining-dateless",
+            },
+        ]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "300.00",
+                "debit_turnover": "300.00",
+            }],
+        }),
+    )
+    .await;
+
+    // The plan already says the row will not be recorded. What was missing is
+    // that the journal never learned it.
+    let plan = assessment_of(&harness, &session).await;
+    let retained = plan["commit_delta"]["retained_unrecorded"]
+        .as_array()
+        .expect("retained rows");
+    assert_eq!(retained.len(), 1, "{plan}");
+    assert_eq!(plan["readiness"], "does_not_reconcile", "{plan}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({ "accept_control_mismatch": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    let gaps = committed["coverage_gaps"]
+        .as_array()
+        .expect("coverage gaps");
+    assert_eq!(
+        gaps.len(),
+        1,
+        "one account, one stated interval: {committed}"
+    );
+    assert_eq!(gaps[0]["outcome"], "inserted", "{committed}");
+
+    // And it is readable where it matters: beside the statuses the assertions
+    // this same commit wrote would otherwise confirm.
+    let (status, reconciliation) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reconciliation?account={account}&from=2025-06-01&to=2025-06-30"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reconciliation}");
+    let reported = reconciliation["gaps"].as_array().expect("gaps");
+    assert_eq!(reported.len(), 1, "{reconciliation}");
+    assert_eq!(reported[0]["refused"], 1, "{reconciliation}");
+    assert_eq!(
+        reported[0]["dimensions"],
+        json!(["cash"]),
+        "a deposit the server could not read is a cash line, and nothing more \
+         is claimed about it: {reconciliation}"
+    );
+    assert_eq!(
+        reported[0]["rows"][0]["row"],
+        json!({ "given": "idempotency/declining-dateless" }),
+        "the gap names the row it refused, not merely how many: {reconciliation}"
+    );
+
+    // Committing the same session again is refused — it is closed — so the key
+    // is exercised where it can be: the gap names its rows, so two different
+    // refusals cannot collide on one identity the way iaam-lg4q describes.
+    assert_eq!(
+        reported[0]["parser_version"], "import-control/1",
+        "the gap stands under the parser version its assertions do, or it \
+         taints nothing it is about: {reconciliation}"
+    );
+}
+
+/// A source that printed no control section leaves no gap, deliberately
+/// (iaam-bufs).
+///
+/// A gap is dated and scoped by an interval, and the only interval this server
+/// has been told about is the one the source printed beside the rows. Deriving
+/// one from the rows it managed to read would place a claim on an interval
+/// nobody asserted, computed from the rows that are not the problem.
+///
+/// This is a real limitation and it is iaam-hj1o's to close; it is asserted
+/// here so that closing it is a deliberate act rather than an accident.
+///
+/// Every account, amount and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_commit_with_no_stated_control_section_writes_no_coverage_gap() {
+    let harness = harness();
+    let account = another_account(&harness, "Savings").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "silent",
+        json!([{
+            "account": account,
+            "type": "deposit",
+            "amount": "200.00",
+            "currency": "RUB",
+            "idempotency_key": "silent-dateless",
+        }]),
+    )
+    .await;
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert!(
+        committed["coverage_gaps"]
+            .as_array()
+            .expect("coverage gaps")
+            .is_empty(),
+        "{committed}"
+    );
+}
+
+/// A statement whose rows spill past its own period no longer compares cleanly
+/// (iaam-mnv0).
+///
+/// The defect: `compare` put the source's stated figures beside the rows' own
+/// totals and never asked whether those rows were dated inside the interval the
+/// section declares. So a batch whose rows fall in three different months
+/// matched its own turnover — the same rows were folded on both sides of
+/// nothing — and every figure came out `matched` with `readiness: ready`.
+///
+/// That is worse than a mismatch, and the assertion below says why: the two
+/// turnover figures still agree, and `readiness` is nevertheless
+/// `does_not_reconcile`. A mismatch announces itself; a comparison folded over
+/// the wrong set of rows does not.
+///
+/// It refuses through the flag rather than outright, for the same reason a
+/// mismatched figure does: a document can print a period its own rows spill out
+/// of, and a system that cannot record what happened because a bank's period
+/// line is off is a system that cannot record what happened.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn rows_dated_outside_the_stated_interval_refuse_a_commit_that_otherwise_adds_up() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "spilling",
+        json!([
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-06-10" },
+                "idempotency_key": "spilling-inside",
+            },
+            // The converter read the neighbouring months into the same file.
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-05-20" },
+                "idempotency_key": "spilling-before",
+            },
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-07-02" },
+                "idempotency_key": "spilling-after",
+            },
+        ]),
+    )
+    .await;
+
+    // The figures are the ones the rows come to, which is the whole trouble:
+    // every check below matches.
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "300.00",
+                "debit_turnover": "300.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(
+        plan["control_reconciliation"]["mismatched_figures"], 0,
+        "the arithmetic comes out: {plan}"
+    );
+    assert_eq!(
+        check_of(&plan, "debit_turnover")["outcome"],
+        "matched",
+        "{plan}"
+    );
+    assert_eq!(
+        check_of(&plan, "closing_balance")["outcome"],
+        "matched",
+        "{plan}"
+    );
+
+    // And it is still not a batch that was checked.
+    assert_eq!(
+        plan["control_reconciliation"]["rows_outside_interval"], 2,
+        "{plan}"
+    );
+    assert_eq!(
+        plan["readiness"], "does_not_reconcile",
+        "every figure agrees and the rows are not the period's: {plan}"
+    );
+
+    let fit = &plan["control_reconciliation"]["comparisons"][0]["fit"];
+    assert_eq!(fit["outside"], 2, "{plan}");
+    assert_eq!(fit["undated"], 0, "{plan}");
+    assert_eq!(
+        fit["outside_from"], "2025-05-20",
+        "where they went, not only how many: {plan}"
+    );
+    assert_eq!(fit["outside_to"], "2025-07-02", "{plan}");
+
+    // The commit is refused, and the refusal names the interval and the rows
+    // rather than saying something is wrong somewhere.
+    let before = journal_rows(&harness).await;
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    let detail = refusal.to_string();
+    assert!(detail.contains("2025-06-01"), "{refusal}");
+    assert!(detail.contains("2025-05-20"), "{refusal}");
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "a refused commit writes nothing: {refusal}"
+    );
+
+    // And it stays possible as a stated act, because the document itself can be
+    // the thing that is wrong.
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({ "accept_control_mismatch": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+}
+
+/// A batch whose rows all fall inside the stated interval says so, and commits
+/// without the flag (iaam-mnv0).
+///
+/// The other half of the property above: the fit is published whether or not it
+/// found anything, because «every row is in the period» and «nobody looked» are
+/// different answers, and the check must not make an ordinary import harder to
+/// commit than it was.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_batch_inside_its_stated_interval_reports_a_fit_and_needs_no_flag() {
+    let harness = harness();
+    let account = another_account(&harness, "Savings").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "fitting",
+        json!([{
+            "account": account,
+            "type": "deposit",
+            "amount": "100.00",
+            "currency": "RUB",
+            // The last day of the interval: it is inclusive at both ends.
+            "dates": { "cash_posted": "2025-06-30" },
+            "idempotency_key": "fitting-in",
+        }]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "100.00",
+                "debit_turnover": "100.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(plan["readiness"], "ready", "{plan}");
+    assert_eq!(
+        plan["control_reconciliation"]["rows_outside_interval"], 0,
+        "{plan}"
+    );
+    let fit = &plan["control_reconciliation"]["comparisons"][0]["fit"];
+    assert_eq!(fit["outside"], 0, "{plan}");
+    assert_eq!(fit["undated"], 0, "{plan}");
+    assert!(
+        fit.get("outside_from").is_none(),
+        "no row went outside, so there is no span to report: {plan}"
+    );
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
 }
 
 /// The commit delta totals its rows, per account and currency (iaam-o1ni).

@@ -155,6 +155,7 @@ fn import_session_view(session: StoredSession) -> ImportSessionView {
     ImportSessionView {
         id: session.id,
         state: session_state_from_store(session.state),
+        account: session.account,
         source: session.source,
         import: session.import,
         opened_at: session.opened_at,
@@ -876,12 +877,13 @@ impl Store for SqliteAdapter {
     async fn open_import_session(
         &self,
         owner: OwnerId,
+        account: Option<AccountId>,
         source: Option<SourceId>,
         import: Option<ImportId>,
     ) -> Result<ImportSessionView, AppError> {
         self.blocking(move |store| {
             store
-                .open_import_session(owner, source, import)
+                .open_import_session(owner, account, source, import)
                 .map(import_session_view)
                 .map_err(store_error)
         })

@@ -446,28 +446,70 @@ Read it before reading any figure. The report's own quality fields —
 `data_quality`, uncovered positions, unproven bases — are about defects **inside**
 the calculation. They can every one be clean while the wrong accounts were
 selected, because selection happens before the calculation and nothing in it can
-see what was left out. Completeness of a calculation and completeness of its
+see what was left out. Completeness of a calculation and coverage of its
 population are two statements, and only the second one says whose money was
 counted.
 
-`population.completeness` is the summary:
+`population.known_account_coverage` is the summary:
 
 - `whole` — every account the system knows of is inside the report.
-- `bounded` — accounts are outside it, and each of them sits in a scope the
-  owner drew.
-- `undecided` — accounts are outside it that no scope claims at all.
+- `bounded` — accounts are outside it, and the owner has ruled on every one of
+  them.
+- `undecided` — accounts are outside it that he has not ruled on at all.
 
 **`undecided` is not a milder `bounded`.** "Four accounts are outside this report
 and nobody has decided whether they belong" is a different sentence from "four
 accounts are outside this report on purpose", and only the second makes the
 figures an answer about a boundary the owner chose. Each entry in
-`population.outside` carries the same distinction per account, as
-`outside_placed_elsewhere` or `outside_undecided`, with the account's title so
-the owner can be asked about it by name.
+`population.outside` carries the distinction per account, with the account's
+title and institution so the owner can be asked about it by name:
 
-So a report whose `population.completeness` is `undecided` is reported as what
-it is: an answer about part of the owner's money, with the undecided accounts
-named. Never as "the portfolio returned X".
+- `outside_by_decision` — he ruled the account outside every scope and gave a
+  reason. Report it as a boundary he drew, and do not ask him again.
+- `outside_placed_elsewhere` — the account sits in another scope of his. He said
+  where it belongs; he did **not** say it does not belong here, so this is
+  weaker than the line above and must not be reported as the same thing.
+- `outside_undecided` — no scope claims it and he has ruled nothing. Nobody has
+  decided whether its money belongs in these figures.
+
+A deliberate exclusion never makes the population `whole`. `whole` says the
+figures cover every account the system knows of; money he ruled out is still
+money he has, and the honest report is "these figures cover the part he chose".
+
+So a report whose `population.known_account_coverage` is `undecided` is reported
+as what it is: an answer about part of the owner's money, with the undecided
+accounts named. Never as "the portfolio returned X".
+
+### `whole` is not "everything he has"
+
+**Read the field's name, and report the value it actually carries.** The
+denominator is the accounts this instance has been told about — `covered` and
+`outside` together, published in full, by title and institution. An account of
+the owner's that was never created here is in neither list, and it is not
+reported as missing: it is invisible to the fold, not omitted by it.
+
+This is not a defect that a field could fix. The system never sees a source
+document. An import sends it the rows a client chose to send, so a statement of
+what the document held would be that client's word republished as the system's
+knowledge — and a client that silently dropped three accounts is the same client
+that would supply the total. The one place the system does compare both sides is
+a channel it fetched itself, and there it records the shortfall as a fact of its
+own: a coverage gap, naming the refused rows and the dimensions they would have
+moved.
+
+So the check belongs to whoever holds the source, and it is a comparison, not a
+lookup:
+
+- Before reporting coverage, read `covered` and `outside` against the accounts
+  the source actually holds. Seven accounts in an export and four in the two
+  lists is a report that will answer `whole` and mean four.
+- An account in the source that is in neither list has never been created here.
+  Say so as that — "the system holds no account for this one" — and offer to
+  create it. It is a different sentence from any of the three `outside`
+  standings, and the report cannot make it for you.
+- Never report `known_account_coverage: whole` as "this covers everything he
+  has". It covers everything the system was told about, which is the claim the
+  field's name makes and the only one it can support.
 
 ## How to read the return report
 

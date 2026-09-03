@@ -2276,7 +2276,7 @@ fn issue(value: &MaterialIssue) -> String {
 /// **First in every report that carries it**, before the accounts, the
 /// currencies and the population. A caveat published after the figures has
 /// already lost to the reader who stopped at the figures — which is the
-/// difficulty this block answers: `population.completeness` was the last
+/// difficulty this block answers: `population` was the last
 /// top-level field of the balances answer, and a run that read `covered=3,
 /// outside=15` as an ordinary complete result never got that far.
 ///
@@ -2310,6 +2310,12 @@ pub struct ConfidenceDto {
     /// Exactly `caveats == []`, and derived from it rather than stated beside
     /// it: there is no way to build this block asserting completeness over a
     /// non-empty register.
+    ///
+    /// Bounded by what the report can see. Every caveat is read off a
+    /// computation the report itself performed, so `true` says "nothing the
+    /// fold could check is missing" — and for the population half of the
+    /// register, what the fold can check is the accounts this instance has been
+    /// told about. See `population.known_account_coverage`.
     pub complete: bool,
     /// The specific things that are not. Always present; empty exactly when
     /// `complete` is true.
@@ -2320,10 +2326,10 @@ pub struct ConfidenceDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CaveatDto {
     /// What sort of gap this is — `account_in_no_scope`,
-    /// `account_in_another_scope`, `running_cash_sum`, `period_reports_refused`,
-    /// `undecomposed_movements`, `unexplained_cash_change`, `unpriced_position`,
-    /// `holding_not_valued`, `terminal_value_not_computed`,
-    /// `return_not_computed`.
+    /// `account_in_another_scope`, `account_ruled_outside`, `running_cash_sum`,
+    /// `period_reports_refused`, `undecomposed_movements`,
+    /// `unexplained_cash_change`, `unpriced_position`, `holding_not_valued`,
+    /// `terminal_value_not_computed`, `return_not_computed`.
     ///
     /// A closed set. Every one of them is read off a computation the report
     /// already performs: nothing here folds the journal a second time.
@@ -2478,19 +2484,43 @@ impl CaveatSubjectDto {
 /// computed afterwards can see what was left out. This block is the second
 /// statement, and without it a report over part of the owner's money reads as
 /// an answer about all of it.
+///
+/// **`covered` and `outside` together are the whole denominator, and it is the
+/// accounts this instance has been told about.** An account of the owner's that
+/// was never created here appears in neither list, and it is not reported as
+/// missing: it is invisible to the fold rather than omitted by it. That bound
+/// is why the verdict below is called `known_account_coverage` and not
+/// `completeness` — the old name invited a client to read `whole` as "these
+/// figures are all of his money", which this API cannot know and does not say.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PopulationDto {
     /// The scope the report was computed over.
     pub contour: Uuid,
     pub contour_version: u32,
+    /// How much of what the system knows about this report answered about.
+    ///
     /// `whole` — every account the system knows of is covered. `bounded` —
-    /// accounts are outside, and each of them is in a scope the owner drew.
-    /// `undecided` — accounts are outside that no scope claims, so the report
-    /// answers about a part of the owner's money that nobody has delimited.
+    /// accounts are outside, and the owner has ruled on each of them, whether
+    /// by placing it in a scope of his own or by ruling it outside every scope.
+    /// `undecided` — accounts are outside that nobody has ruled on at all, so
+    /// the report answers about a part of the owner's money that nobody has
+    /// delimited.
     ///
     /// `undecided` outranks `bounded`: one account nobody has ruled on is
-    /// enough, however many deliberate omissions stand beside it.
-    pub completeness: String,
+    /// enough, however many deliberate omissions stand beside it. And an
+    /// account he ruled outside deliberately is `bounded`, never `whole`: this
+    /// field says what the figures cover, not how tidy his decisions are.
+    ///
+    /// **Read the name before reporting the value.** `whole` says "every
+    /// account we know of", never "everything he has". Nothing in this API sees
+    /// a source document — the import path receives the rows a client chose to
+    /// send it — so an export holding seven accounts of which four were ever
+    /// created here produces `whole` over the four, and a client that reports
+    /// that as complete coverage is making a claim this API did not make. The
+    /// check is not in this field: it is comparing `covered` and `outside`
+    /// against the accounts the source actually holds, which only the holder of
+    /// the source can do.
+    pub known_account_coverage: String,
     /// The accounts inside the report's scope — the population the figures were
     /// folded over. Always present; the same set the report's own rows are
     /// built from.
@@ -2508,11 +2538,18 @@ pub struct PopulationAccountDto {
     /// The account's title, so that an owner asked to rule on an omission is
     /// not asked about a bare identifier.
     pub title: String,
-    /// `covered` — inside the report's scope. `outside_placed_elsewhere` —
-    /// outside it, and the owner has placed the account in a scope of his own.
-    /// `outside_undecided` — outside it and in no scope at all: **nobody has
-    /// ruled on whether it belongs**, which is a different statement from a
-    /// deliberate omission and must not be read as one.
+    /// The institution he said holds it, when he said. Absent, never null and
+    /// never guessed: two accounts he calls one word, at two banks, are one
+    /// line apart in `outside` and are not the same question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
+    /// `covered` — inside the report's scope. `outside_by_decision` — outside
+    /// it because the owner ruled the account outside every scope and said why.
+    /// `outside_placed_elsewhere` — outside it, and he has placed the account
+    /// in a scope of his own: he said where it belongs, not that it does not
+    /// belong here. `outside_undecided` — outside it and in no scope at all:
+    /// **nobody has ruled on whether it belongs**, which is a different
+    /// statement from a deliberate omission and must not be read as one.
     pub standing: String,
 }
 
@@ -2522,7 +2559,7 @@ impl PopulationDto {
         Self {
             contour: population.contour.0,
             contour_version: population.version.0,
-            completeness: population.completeness().code().to_owned(),
+            known_account_coverage: population.known_account_coverage().code().to_owned(),
             covered: population
                 .covered()
                 .map(PopulationAccountDto::from_domain)
@@ -2540,6 +2577,7 @@ impl PopulationAccountDto {
         Self {
             account: entry.account.inner(),
             title: entry.title.clone(),
+            institution: entry.institution.clone(),
             standing: entry.standing.code().to_owned(),
         }
     }

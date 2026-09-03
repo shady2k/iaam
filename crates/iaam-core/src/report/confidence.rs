@@ -2,12 +2,12 @@
 //! of those things are not.
 //!
 //! Every fact this module publishes is already published somewhere in the
-//! report it summarises. `population.completeness`, `accounts[].cash[].kind`
-//! and the rest are each correct and each in the right place; the difficulty
-//! reported from a run through the whole flow was that a reader had to
-//! reconstruct "how much of this answer do I believe" from four fields in three
-//! shapes, and a reader who stopped at the numbers got a confident wrong
-//! impression. So this is a **register**, published first, of the specific
+//! report it summarises. `population.known_account_coverage`,
+//! `accounts[].cash[].kind` and the rest are each correct and each in the right
+//! place; the difficulty reported from a run through the whole flow was that a
+//! reader had to reconstruct "how much of this answer do I believe" from four
+//! fields in three shapes, and a reader who stopped at the numbers got a
+//! confident wrong impression. So this is a **register**, published first, of the specific
 //! things the report is silent or partial about.
 //!
 //! **There is no score.** No number, no percentage, no grade. A confidence
@@ -106,9 +106,13 @@ pub enum CaveatKind {
     /// all. Nobody has ruled on whether it belongs.
     AccountInNoScope,
     /// One of the owner's accounts is outside this report because he placed it
-    /// in a scope of his own. The omission is a decision, and it is still an
-    /// omission.
+    /// in a scope of his own. Something has ruled on where it belongs; nothing
+    /// has ruled that it does not belong here.
     AccountInAnotherScope,
+    /// One of the owner's accounts is outside this report because he ruled it
+    /// outside every scope and said why. The omission is his decision, and it
+    /// is still an omission.
+    AccountRuledOutside,
     /// A cash figure accumulated from a start nothing asserts, so it is a
     /// running sum and not a balance.
     RunningCashSum,
@@ -140,9 +144,10 @@ impl CaveatKind {
     /// Iterated by the guard that resolves [`Self::closed_by`] against the
     /// published contract: a table checked for the kinds someone remembered to
     /// list is a table with a hole in it exactly where the mistake is.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::AccountInNoScope,
         Self::AccountInAnotherScope,
+        Self::AccountRuledOutside,
         Self::RunningCashSum,
         Self::PeriodReportsRefused,
         Self::UndecomposedMovements,
@@ -159,6 +164,7 @@ impl CaveatKind {
         match self {
             Self::AccountInNoScope => "account_in_no_scope",
             Self::AccountInAnotherScope => "account_in_another_scope",
+            Self::AccountRuledOutside => "account_ruled_outside",
             Self::RunningCashSum => "running_cash_sum",
             Self::PeriodReportsRefused => "period_reports_refused",
             Self::UndecomposedMovements => "undecomposed_movements",
@@ -180,7 +186,9 @@ impl CaveatKind {
     #[must_use]
     pub const fn see(self) -> &'static str {
         match self {
-            Self::AccountInNoScope | Self::AccountInAnotherScope => "population.outside[]",
+            Self::AccountInNoScope | Self::AccountInAnotherScope | Self::AccountRuledOutside => {
+                "population.outside[]"
+            }
             Self::RunningCashSum => "accounts[].cash[].kind",
             Self::PeriodReportsRefused => "accounts[].period_reports",
             Self::UndecomposedMovements => "currencies[].not_decomposed.by_account[]",
@@ -201,7 +209,7 @@ impl CaveatKind {
     /// a remedy of the caller's choosing could point at one that does nothing.
     ///
     /// **Empty means nothing in this API acts on it**, and never "not yet
-    /// decided". The match is exhaustive over a closed set, so an eleventh kind
+    /// decided". The match is exhaustive over a closed set, so a twelfth kind
     /// does not compile until someone has answered this question for it, and
     /// `&[]` is that answer written down rather than the question unasked. The
     /// same arrangement, and the same reason, as `ReportGoals::NONE` on the
@@ -219,11 +227,24 @@ impl CaveatKind {
     ///
     /// - `AccountInNoScope` — the two resolutions `account_scope_undecided`
     ///   publishes, in its order: place the account in a contour, or rule it
-    ///   deliberately outside and say why.
+    ///   deliberately outside and say why. Both close this line, and the second
+    ///   closes it by producing a different one: the disposition it records
+    ///   moves the account to `AccountRuledOutside`. For one wave it did not —
+    ///   the population read contour membership and nothing else, so the owner
+    ///   made the call this table named, was answered `200`, and the caveat
+    ///   saying nobody had ruled stood over his ruling.
     /// - `AccountInAnotherScope` — one only. The account is already in a
     ///   contour of the owner's, so there is nothing to rule outside; what
     ///   closes the caveat is adding it to the contour **this** report was
     ///   folded over, which is a new version of that contour.
+    /// - `AccountRuledOutside` — the same one, and the same reason read from
+    ///   the other end: the owner has already ruled, so `record_account_scope`
+    ///   has nothing left to record, and the only call that would put this
+    ///   account's money into these figures is adding it to the contour they
+    ///   were folded over. Naming it is not advice that he should. This column
+    ///   answers "what call acts on this line", and for a decision he is
+    ///   entitled to keep for good the answer is still not `&[]` — which would
+    ///   say no call reaches it.
     /// - `RunningCashSum` — the opening control assertion, which is exactly
     ///   what turns the figure from a movement into a balance. The queue's
     ///   `provide_control_assertion` names the same operation.
@@ -256,7 +277,9 @@ impl CaveatKind {
                 OperationKey::AddContourVersion,
                 OperationKey::RecordAccountScope,
             ],
-            Self::AccountInAnotherScope => &[OperationKey::AddContourVersion],
+            Self::AccountInAnotherScope | Self::AccountRuledOutside => {
+                &[OperationKey::AddContourVersion]
+            }
             Self::RunningCashSum => &[OperationKey::RecordOwnerBalance],
             Self::UndecomposedMovements => &[OperationKey::CreateCategoryRule],
             Self::PeriodReportsRefused
@@ -280,7 +303,10 @@ impl CaveatKind {
                 "This account is outside the report and in no scope at all: nobody has ruled on whether its money belongs in these figures, so its absence is an open question and not a decision."
             }
             Self::AccountInAnotherScope => {
-                "This account is outside the report because it sits in another scope the owner drew. The figures are partial by decision, and still partial."
+                "This account is outside the report because it sits in another scope the owner drew. He has said where it belongs; he has not said it does not belong here."
+            }
+            Self::AccountRuledOutside => {
+                "This account is outside the report because the owner ruled it outside every scope and gave a reason. The figures are partial by his decision, and still partial."
             }
             Self::RunningCashSum => {
                 "Nothing asserts what this account held in this currency before its first recorded movement, so the figure is the movement since an unknown start and is not a balance."

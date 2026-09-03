@@ -7,6 +7,7 @@
 //! an external agent, a syntactically valid but behaviourally incorrect spec
 //! means the agent will fix itself based on incorrect guidance.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::Router;
@@ -10318,7 +10319,7 @@ async fn every_report_names_the_population_it_answered_about() {
         let population = &report["population"];
         assert_eq!(population["contour"], contour_id, "{path}: {report}");
         assert_eq!(
-            population["completeness"], "undecided",
+            population["known_account_coverage"], "undecided",
             "{path}: an account in no scope is one nobody has ruled on: {report}"
         );
 
@@ -10388,7 +10389,10 @@ async fn a_report_over_every_known_account_says_its_population_is_whole() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{report}");
-    assert_eq!(report["population"]["completeness"], "whole", "{report}");
+    assert_eq!(
+        report["population"]["known_account_coverage"], "whole",
+        "{report}"
+    );
     assert_eq!(
         report["population"]["covered"]
             .as_array()
@@ -10412,6 +10416,90 @@ async fn a_report_over_every_known_account_says_its_population_is_whole() {
         2,
         "{report}"
     );
+}
+
+/// The verdict names what it counted, and the thing it counted is published
+/// beside it in full.
+///
+/// The field was `population.completeness`, and a report over four accounts of
+/// a source that held seven answered `whole` — correctly, over the accounts the
+/// instance had been told about, and read by a client as "these figures are all
+/// of his money". Nothing here can see a source document: the import path
+/// receives the rows a client chose to send it, so the second claim is one this
+/// API cannot make and must not appear to.
+///
+/// So the fix is not a new field asserting source coverage. It is the name, and
+/// the denominator published whole: `covered` and `outside` together are
+/// exactly the accounts this instance knows of, which is what makes the
+/// comparison against a source possible for the one party that holds it.
+#[tokio::test]
+async fn the_population_verdict_names_its_denominator_and_publishes_it() {
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let population = &report["population"];
+
+    // The word that claimed more than the fold can know is gone from the wire.
+    assert!(
+        population.get("completeness").is_none(),
+        "the population still publishes a verdict whose name outruns it: {population}"
+    );
+    assert!(
+        population["known_account_coverage"].is_string(),
+        "{population}"
+    );
+
+    // And the denominator is the account list, entire: nothing is counted that
+    // a reader cannot see, and nothing a reader can see is left uncounted.
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    let known: BTreeSet<String> = accounts
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .map(|account| account["id"].as_str().expect("identifier").to_owned())
+        .collect();
+    let counted: BTreeSet<String> = ["covered", "outside"]
+        .iter()
+        .flat_map(|side| population[side].as_array().expect("a side of the manifest"))
+        .map(|entry| entry["account"].as_str().expect("identifier").to_owned())
+        .collect();
+    assert_eq!(known, counted, "{report}");
 }
 
 /// An account the owner has placed in another scope is outside on a decision,
@@ -10464,7 +10552,10 @@ async fn an_account_placed_in_another_scope_is_not_reported_as_undecided() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{report}");
-    assert_eq!(report["population"]["completeness"], "bounded", "{report}");
+    assert_eq!(
+        report["population"]["known_account_coverage"], "bounded",
+        "{report}"
+    );
     let outside = report["population"]["outside"]
         .as_array()
         .expect("outside accounts");
@@ -10472,6 +10563,126 @@ async fn an_account_placed_in_another_scope_is_not_reported_as_undecided() {
     assert_eq!(
         outside[0]["standing"], "outside_placed_elsewhere",
         "{report}"
+    );
+}
+
+/// The owner rules an account outside, in as many words and with a reason, and
+/// the report stops calling it an account nobody has ruled on.
+///
+/// This is the promise `closed_by` makes for `account_in_no_scope`: the
+/// register names `record_account_scope` as one of the two calls that close it.
+/// It was published before the report read the disposition, so a caller could
+/// make the call, be answered `200`, fetch the report again and find the same
+/// caveat over its own ruling — a silent gap turned into a broken promise. The
+/// assertions below are the promise: the standing changes, the completeness
+/// changes, and the line that offered the call is gone.
+#[tokio::test]
+async fn an_account_the_owner_ruled_outside_stops_being_one_nobody_ruled_on() {
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let (status, reported) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reported}");
+    let contour_id = reported["contour"].as_str().expect("scope").to_owned();
+
+    let path = format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31");
+
+    // Before the ruling: nobody has decided, and the register says so and says
+    // which call would settle it.
+    let (status, before) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(
+        before["population"]["known_account_coverage"], "undecided",
+        "{before}"
+    );
+    assert!(
+        before["confidence"]["caveats"]
+            .as_array()
+            .expect("caveats")
+            .iter()
+            .any(|caveat| caveat["kind"] == "account_in_no_scope"),
+        "{before}"
+    );
+
+    let (status, ruled) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{savings}/scope"),
+            &harness.owner_token,
+            &json!({ "disposition": "outside", "reason": "held for somebody else" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ruled}");
+    assert_eq!(ruled["disposition"], "outside", "{ruled}");
+
+    let (status, after) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(
+        after["population"]["known_account_coverage"], "bounded",
+        "a ruling makes the omission deliberate: {after}"
+    );
+    let outside = after["population"]["outside"]
+        .as_array()
+        .expect("outside accounts");
+    assert_eq!(outside.len(), 1, "{after}");
+    assert_eq!(outside[0]["account"], savings, "{after}");
+    assert_eq!(outside[0]["standing"], "outside_by_decision", "{after}");
+    // Named and located: this is the list the owner is read back, and two
+    // accounts he calls one word are one line apart in it.
+    assert_eq!(outside[0]["title"], "Savings", "{after}");
+    assert_eq!(outside[0]["institution"], "Second Bank", "{after}");
+
+    let caveats = after["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .clone();
+    assert!(
+        !caveats
+            .iter()
+            .any(|caveat| caveat["kind"] == "account_in_no_scope"),
+        "the report still says nobody ruled on an account the owner ruled on: {after}"
+    );
+    let ruled_out = caveats
+        .iter()
+        .find(|caveat| caveat["kind"] == "account_ruled_outside")
+        .unwrap_or_else(|| panic!("no caveat about the account ruled outside: {after}"));
+    assert_eq!(
+        ruled_out["subject"],
+        json!({ "type": "account", "id": savings }),
+        "{ruled_out}"
+    );
+    assert_eq!(ruled_out["see"], "population.outside[]", "{ruled_out}");
+    // The figures are still partial — deliberately — so the caveat stands. What
+    // it must not do is offer him the call he has already made.
+    assert_eq!(
+        ruled_out["closed_by"],
+        json!([{
+            "operationId": "add_contour_version",
+            "method": "POST",
+            "path": "/v1/contours/{contour}/versions",
+            "requestSchema": "#/components/schemas/AddContourVersionRequest",
+        }]),
+        "{ruled_out}"
     );
 }
 
@@ -10526,7 +10737,10 @@ async fn the_openapi_document_declares_the_population_a_report_covered() {
         );
     }
     let population = &spec["components"]["schemas"]["PopulationDto"]["properties"];
-    assert!(population["completeness"].is_object(), "{population}");
+    assert!(
+        population["known_account_coverage"].is_object(),
+        "{population}"
+    );
     assert!(population["covered"].is_object(), "{population}");
     assert!(population["outside"].is_object(), "{population}");
 
@@ -10735,7 +10949,10 @@ async fn a_running_cash_sum_is_named_by_account_and_currency() {
 
     // The population is whole here, so the register can only be speaking about
     // the figure itself.
-    assert_eq!(report["population"]["completeness"], "whole", "{report}");
+    assert_eq!(
+        report["population"]["known_account_coverage"], "whole",
+        "{report}"
+    );
     assert_eq!(
         report["accounts"][0]["cash"][0]["kind"],
         "movement_since_unknown_start"

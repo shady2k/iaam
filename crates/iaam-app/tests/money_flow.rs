@@ -4,7 +4,7 @@ use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{AccountView, Clock, Principal, Scope};
 use iaam_app::scenarios::reports::{
-    AccountStanding, MoneyFlowQuery, PopulationCompleteness, account_balances, money_flow,
+    AccountStanding, KnownAccountCoverage, MoneyFlowQuery, account_balances, money_flow,
 };
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, InstrumentId, OwnerId, SourceId};
@@ -372,8 +372,8 @@ async fn balances_name_the_account_left_outside_that_nobody_has_ruled_on() {
     assert_eq!(outside[0].title, "Savings");
     assert_eq!(outside[0].standing, AccountStanding::OutsideUndecided);
     assert_eq!(
-        population.completeness(),
-        PopulationCompleteness::Undecided,
+        population.known_account_coverage(),
+        KnownAccountCoverage::Undecided,
         "an account in no contour at all is one nobody has ruled on"
     );
 }
@@ -406,8 +406,8 @@ async fn an_account_placed_in_another_contour_is_outside_on_a_decision() {
     assert_eq!(outside[0].account, savings);
     assert_eq!(outside[0].standing, AccountStanding::OutsidePlacedElsewhere);
     assert_eq!(
-        report.population.completeness(),
-        PopulationCompleteness::Bounded,
+        report.population.known_account_coverage(),
+        KnownAccountCoverage::Bounded,
         "every account outside this report has been placed in a contour"
     );
 }
@@ -441,8 +441,8 @@ async fn changing_the_contour_changes_the_population_the_report_names() {
     assert!(covered.contains(&main) && covered.contains(&savings));
     assert_eq!(report.population.outside().count(), 0);
     assert_eq!(
-        report.population.completeness(),
-        PopulationCompleteness::Whole
+        report.population.known_account_coverage(),
+        KnownAccountCoverage::Whole
     );
     assert_eq!(
         covered.len(),
@@ -486,7 +486,7 @@ async fn the_flow_report_names_the_population_it_covered() {
     assert_eq!(outside[0].account, savings);
     assert_eq!(outside[0].standing, AccountStanding::OutsideUndecided);
     assert_eq!(
-        report.population.completeness(),
-        PopulationCompleteness::Undecided
+        report.population.known_account_coverage(),
+        KnownAccountCoverage::Undecided
     );
 }

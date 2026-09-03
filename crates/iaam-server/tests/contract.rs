@@ -2487,6 +2487,223 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
     assert_eq!(verdicts[2]["verdict"], "provisional");
 }
 
+/// The header of iaam's own row format, without the optional
+/// `idempotency_key` column.
+///
+/// Omitted rather than left blank on purpose: these tests are about the key the
+/// parser *derives* when the row names none, and a blank column would leave it
+/// to the CSV reader whether that is `None` or an empty string.
+const CSV_HEADER: &str = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,\
+     accrued_interest,currency";
+
+/// Submit a CSV document under the owner's token, with the given query string.
+async fn post_csv(harness: &Harness, query: &str, document: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(format!("/v1/ingest/csv{query}"))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from(document.to_owned()))
+        .expect("request");
+    call(&harness.router, request).await
+}
+
+/// Retract what one CSV label brought in, or the unlabelled rows when none is
+/// given.
+///
+/// The declaration is built here exactly as a caller would build it, out of
+/// nothing but what it already knew: the account its rows named, the channel
+/// this route fixes, and the label it submitted under. That is the whole claim
+/// the fix makes — the identity is re-derivable — so the test states it by
+/// re-deriving it rather than by reading anything back.
+async fn retract_csv_import(harness: &Harness, label: Option<&str>) -> (StatusCode, Value) {
+    let mut source = json!({ "account": harness.account.inner(), "channel": "csv" });
+    if let Some(label) = label {
+        source["label"] = json!(label);
+    }
+    call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({ "acknowledge_retraction": true, "source": source }),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn rows_submitted_as_csv_are_retractable_as_an_import() {
+    // iaam-0f8f / iaam-ewcl. The route minted `SourceId::new_random()` per
+    // request, so `POST /v1/corrections/imports` — which is keyed on a
+    // declaration the caller can re-derive — could never reach these rows.
+    // Every other channel's rows were retractable as a group; this one's were
+    // not, and the caller was left reversing them one event at a time.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-01-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
+         2025-01-02,withdrawal,Brokerage,,,,,50.00,,,RUB\n"
+    );
+
+    let (status, body) = post_csv(&harness, "?label=january", &document).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let verdicts = body.as_array().expect("verdicts");
+    assert_eq!(verdicts.len(), 2, "{body}");
+    for verdict in verdicts {
+        assert_eq!(verdict["verdict"], "provisional", "{body}");
+    }
+
+    let (status, retracted) = retract_csv_import(&harness, Some("january")).await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["affected"], 2, "{retracted}");
+    assert_eq!(retracted["written"], 2, "{retracted}");
+}
+
+#[tokio::test]
+async fn re_sending_one_csv_document_writes_nothing_the_second_time() {
+    // The other half of the same defect. A row of this format carries no source
+    // operation identifier, so a row that named no key of its own was identified
+    // by nothing at all and a re-import wrote every one of them a second time.
+    // The digest of the document plus the row's own line number is what §10.6
+    // calls a level-4 identity, and the broker-report path already states it the
+    // same way.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-02-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
+         2025-02-02,deposit,Brokerage,,,,,110.00,,,RUB\n"
+    );
+
+    let (status, first) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first = first.as_array().expect("verdicts").clone();
+    assert_eq!(first.len(), 2, "{first:?}");
+    for verdict in &first {
+        assert_eq!(verdict["verdict"], "provisional", "{verdict}");
+    }
+
+    let (status, second) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let second = second.as_array().expect("verdicts");
+    assert_eq!(second.len(), 2, "{second:?}");
+    for (repeat, original) in second.iter().zip(first.iter()) {
+        assert_eq!(repeat["verdict"], "duplicate", "{repeat}");
+        assert_eq!(
+            repeat["event_id"], original["event_id"],
+            "a repeat must be answered with the event it repeats"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_identical_csv_rows_stay_two_operations() {
+    // The bound on the derived key, and §10.6 states it outright: two
+    // legitimate identical purchases on the same day must not be folded into
+    // one. The document is the evidence that there were two, because the parser
+    // saw two rows — which is why the key is the document plus the locator and
+    // never the row's contents.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-03-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
+         2025-03-01,deposit,Brokerage,,,,,100.00,,,RUB\n"
+    );
+
+    let (status, body) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let verdicts = body.as_array().expect("verdicts");
+    assert_eq!(verdicts.len(), 2, "{body}");
+    for verdict in verdicts {
+        assert_eq!(verdict["verdict"], "provisional", "{body}");
+    }
+    assert_ne!(
+        verdicts[0]["event_id"], verdicts[1]["event_id"],
+        "two rows at two locators are two facts"
+    );
+}
+
+#[tokio::test]
+async fn one_csv_label_is_retracted_without_touching_another() {
+    // What the label is worth here, and it is what it is worth on the
+    // conclusive route: two months of one account through one channel are one
+    // source and two imports, and retracting one must leave the other counting.
+    let harness = harness();
+    let january = format!(
+        "{CSV_HEADER}\n\
+         2025-01-05,deposit,Brokerage,,,,,100.00,,,RUB\n"
+    );
+    let february = format!(
+        "{CSV_HEADER}\n\
+         2025-02-05,deposit,Brokerage,,,,,200.00,,,RUB\n"
+    );
+
+    for (label, document) in [("january", &january), ("february", &february)] {
+        let (status, body) = post_csv(&harness, &format!("?label={label}"), document).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body[0]["verdict"], "provisional", "{body}");
+    }
+
+    let (status, first) = retract_csv_import(&harness, Some("january")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["affected"], 1, "{first}");
+    assert_eq!(first["written"], 1, "{first}");
+
+    let (status, second) = retract_csv_import(&harness, Some("february")).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["source"], first["source"],
+        "one account and one channel are one source, whatever the label"
+    );
+    assert_eq!(
+        second["affected"], 1,
+        "retracting January must not have swept February"
+    );
+    assert_eq!(second["written"], 1, "{second}");
+}
+
+#[tokio::test]
+async fn unlabelled_csv_rows_are_retracted_as_the_unnamed_group() {
+    // Omitting the label has a meaning rather than being a default: the rows
+    // belong to no named import and are retracted together with every other
+    // unlabelled row of the same account and channel. Before the fix they
+    // belonged to a source nobody could name, which is not the same thing.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-04-01,deposit,Brokerage,,,,,100.00,,,RUB\n"
+    );
+
+    let (status, body) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    let (status, retracted) = retract_csv_import(&harness, None).await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["affected"], 1, "{retracted}");
+    assert_eq!(retracted["written"], 1, "{retracted}");
+    assert!(
+        retracted["import"].is_null(),
+        "an unnamed group names no import: {retracted}"
+    );
+}
+
+#[tokio::test]
+async fn a_csv_label_the_derivation_cannot_mean_is_refused() {
+    // The same bound the conclusive route puts on `source.label`, reported
+    // against the field the caller actually wrote — `label`, because a request
+    // with no `source` object has nothing called `source.label` in it.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-05-01,deposit,Brokerage,,,,,100.00,,,RUB\n"
+    );
+
+    let (status, body) = post_csv(&harness, "?label=%20", &document).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "label", "{body}");
+}
+
 #[tokio::test]
 async fn ambiguous_account_name_is_rejected_when_resolving_row() {
     let (harness, path) = harness_on_disk();

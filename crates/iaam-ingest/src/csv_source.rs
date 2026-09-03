@@ -20,6 +20,7 @@ use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::PriceQuality;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use time::Date;
 use time::macros::format_description;
 
@@ -244,18 +245,74 @@ pub enum ParsedRow {
     Rejected(Rejection),
 }
 
+/// Version of the derived row key's form.
+///
+/// Part of the key itself, as `CANONICAL_VERSION` is part of the deduplication
+/// fingerprint: keys have already been deduplicated against, so a change of
+/// form must be visible in the value rather than inferred from its shape.
+const DERIVED_ROW_KEY_VERSION: u8 = 1;
+
+/// The key under which one row of one document is the same submission twice.
+///
+/// **Why the document and the locator, and not the row's contents.** §10.6
+/// forbids treating two legitimate identical purchases on the same day as
+/// duplicates, and a key over the row text would do exactly that: the document
+/// is the evidence that there were two operations, because the parser saw two
+/// rows. So this is level 4 — «document **and** row locator are known» — and
+/// the two identical rows keep two keys because they sit at two locators.
+///
+/// Written as an idempotency key rather than as a `RowLocator`, because the
+/// store's duplicate lookup reads `source_operation_id` and
+/// `idempotency_key` and nothing else. The broker-report path states the same
+/// level-4 identity the same way, as `report:{document}:row:{n}`; a second
+/// mechanism here would mean two answers to one question.
+///
+/// **A re-parsed document writes nothing; a corrected one writes everything.**
+/// The digest is over the whole content, so a file re-sent unchanged carries the
+/// same keys and is answered `duplicate` row by row, while a file with one row
+/// fixed is a different document and every row of it is new. That is the
+/// broker-report path's behaviour too, and it is now survivable in a way it was
+/// not: the rows arrive under a derivable source, so the superseded import can
+/// be retracted through `POST /v1/corrections/imports`.
+fn derived_row_key(document: &str, row: usize) -> String {
+    format!("csv:v{DERIVED_ROW_KEY_VERSION}:{document}:row:{row}")
+}
+
+/// Digest of the whole document, in the hexadecimal form a `RawHash` takes.
+fn document_digest(content: &str) -> String {
+    Sha256::digest(content.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Parse the entire document. Returns one item per row, including
 /// rejected rows: the row number is the result index plus one.
+///
+/// A row that named no `idempotency_key` is given one derived from the document
+/// and its own locator — see [`derived_row_key`]. It is stamped here rather than
+/// by the caller because it is a statement about *this format*: rows in a file
+/// are ordered and located, which is what makes the locator an identity, and a
+/// caller holding only the parsed operations can no longer see either. A row
+/// that named its own key keeps it: the caller naming a submission is level 2
+/// and outranks anything derived.
 #[must_use]
 pub fn parse(content: &str, directory: &Directory) -> Vec<ParsedRow> {
+    let document = document_digest(content);
     let mut reader = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         .from_reader(content.as_bytes());
     let mut parsed = Vec::new();
     for record in reader.deserialize::<Row>() {
+        let row = parsed.len() + 1;
         parsed.push(match record {
-            Ok(row) => match row_to_operation(&row, directory) {
-                Ok(operation) => ParsedRow::Operation(Box::new(operation)),
+            Ok(entry) => match row_to_operation(&entry, directory) {
+                Ok(mut operation) => {
+                    if operation.idempotency_key.is_none() {
+                        operation.idempotency_key = Some(derived_row_key(&document, row));
+                    }
+                    ParsedRow::Operation(Box::new(operation))
+                }
                 Err(rejection) => ParsedRow::Rejected(rejection),
             },
             Err(error) => ParsedRow::Rejected(Rejection {

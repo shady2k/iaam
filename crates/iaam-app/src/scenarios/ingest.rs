@@ -17,6 +17,31 @@ use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::{Principal, Recorded};
 
+/// Where one row came from and which submission carried it.
+///
+/// The two travel together because they are one answer: the source says «where
+/// do these rows come from» and is what deduplication is scoped by, the import
+/// says «which submission carried this one» and is what a retraction is keyed
+/// on. Both are derived from a declaration — see [`SourceId::declared`] and
+/// [`ImportId::declared`] — and neither is ever minted at random, because a
+/// caller holds no server-assigned handle after a submission and could then
+/// never name its own rows again.
+///
+/// **Carried per row rather than hoisted over the batch.** A source is keyed on
+/// one account, and a channel may name an account per row: the CSV format does,
+/// so one file can carry two of the owner's accounts. Folding them into one
+/// source would let a row of the first deduplicate against a row of the second.
+/// A channel whose declaration names one account for the whole batch builds this
+/// once and repeats it, which costs it nothing.
+///
+/// [`SourceId::declared`]: iaam_core::ids::SourceId::declared
+/// [`ImportId::declared`]: iaam_core::ids::ImportId::declared
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowOrigin {
+    pub source: SourceId,
+    pub import: Option<ImportId>,
+}
+
 /// Submitting a batch of operations.
 ///
 /// A verdict is issued **for each line**: one unrecognised operation
@@ -27,31 +52,29 @@ use crate::ports::{Principal, Recorded};
 /// Parsing lives here, writing is below, in [`submit_candidates`]: the input
 /// for journal facts has its own parser, while the journal and its safeguards are shared.
 ///
-/// `import` names the submission these rows arrived in, when the caller
-/// declared one. It is stamped after normalisation rather than carried in
-/// [`NormalizationContext`], because normalisation decides what a row *is* and
-/// the import decides nothing about that: it is the handle a later retraction
-/// is keyed on, and nothing in the shape of an event depends on it.
+/// Each row arrives with its own [`RowOrigin`]. The import in it is stamped
+/// after normalisation rather than carried in [`NormalizationContext`], because
+/// normalisation decides what a row *is* and the import decides nothing about
+/// that: it is the handle a later retraction is keyed on, and nothing in the
+/// shape of an event depends on it.
 pub async fn submit_operations(
     services: &AppServices,
     principal: &Principal,
-    source: SourceId,
-    import: Option<ImportId>,
-    operations: &[SubmittedOperation],
+    operations: &[(RowOrigin, SubmittedOperation)],
 ) -> Result<Vec<Verdict>, AppError> {
     let candidates = operations
         .iter()
-        .map(|operation| {
+        .map(|(origin, operation)| {
             normalize(
                 operation,
                 NormalizationContext {
                     owner: principal.owner,
-                    source,
+                    source: origin.source,
                 },
             )
             .map(|normalized| {
                 let mut event = normalized.event;
-                if let Some(import) = import {
+                if let Some(import) = origin.import {
                     event.provenance = event.provenance.with_import(import);
                 }
                 event

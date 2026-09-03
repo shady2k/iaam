@@ -35,6 +35,7 @@ use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::correction::{ImportTarget, correct_events};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::import_session::{HeldRow, IntakeOutcome, SessionContents, submit_intake};
+use iaam_app::scenarios::ingest::RowOrigin;
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
 use iaam_app::scenarios::journal::{DeclaredSource, JournalReadQuery, read_journal};
 use iaam_app::scenarios::market_reference::{
@@ -3688,34 +3689,124 @@ pub async fn ingest_journal_events(
     Ok(Json(verdicts))
 }
 
-/// CSV ingestion.
+/// The channel every row submitted through `POST /v1/ingest/csv` arrives under.
+///
+/// Fixed by the route rather than chosen by the caller, and that is the whole
+/// difference from `POST /v1/ingest/operations`, where the channel is
+/// declaration text. A channel separates two ways the same account's rows
+/// reached the journal so that a paste does not deduplicate against an export;
+/// here the way *is* this route and its one format, so there is nothing for the
+/// caller to tell us. A caller that wants to say `file` or `paste` about rows it
+/// converted itself has the conclusive route, which takes a declaration.
+///
+/// The value is also the name a retraction must use: rows submitted here are
+/// reached by `POST /v1/corrections/imports` with this channel.
+const CSV_CHANNEL: &str = "csv";
+
+/// What a CSV submission may declare about itself.
+///
+/// The account is deliberately **not** here, unlike every other declaration.
+/// This format names an account per row, by name, through the directory — one
+/// file may legitimately carry two of the owner's accounts — so a batch-level
+/// account would either be a lie about half the rows or a capability removed
+/// from the format. Each row is therefore stamped with the identity derived from
+/// its own account, and one file spanning two accounts writes two sources and,
+/// under a label, two imports. That is the same granularity every other channel
+/// has; it just takes two retraction calls to undo instead of one.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct IngestCsvParams {
+    /// What names this import within the account and the `csv` channel — a
+    /// statement period, an export file name, a run identifier.
+    ///
+    /// Two submissions carrying the same label are one import, and
+    /// `POST /v1/corrections/imports` retracts exactly the one it names.
+    /// Omitting it has a meaning rather than being a default: the rows belong to
+    /// no named import and are retracted together with every other unlabelled
+    /// row of the same account and channel.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// CSV ingestion, in iaam's **own** row format.
+///
+/// **This route does not accept a bank's export**, and the path is the reason
+/// the mistake keeps being made: `csv` is the file extension of every statement
+/// any institution emits, while the columns here are `date`, `type`, `account`,
+/// `currency` and the optional rest, with accounts named by title and resolved
+/// through the owner's directory. A bank export sent here does not half-work; it
+/// rejects every row on the header. Converting an institution's format is the
+/// owner's converter's job and lives outside this repository — see
+/// `docs/import-boundary.md`, which says which channel writes what.
+///
+/// Renaming the path was considered and rejected for now: it would break every
+/// caller to fix a name, while the two changes that actually cost the owner
+/// something — rows that could never be retracted, and a re-import that wrote
+/// everything twice — are fixed here without touching it. What the name earns is
+/// documentation, in the description this route publishes and in the boundary
+/// document; if a bank export is still sent here after that, the answer is
+/// deleting the route rather than renaming it.
+///
+/// **Every row is retractable.** The source used to be
+/// `SourceId::new_random()`, minted per request, so `POST /v1/corrections/imports`
+/// — which is keyed on a declaration a caller can re-derive — could never reach
+/// these rows, and this was the only channel whose rows could not be taken back
+/// as a group. They are now derived from the owner, the row's own account and
+/// [`CSV_CHANNEL`], exactly as the conclusive route derives its own.
 #[utoipa::path(
     post,
     path = "/v1/ingest/csv",
+    description = "Submit rows in iaam's own CSV format: `date`, `type`, \
+                   `account`, `currency` and the optional rest, with accounts \
+                   named by title and resolved through the owner's directory. \
+                   It is **not** a bank export endpoint — an institution's own \
+                   file rejects every row here. Rows arrive under the `csv` \
+                   channel of the account each row names, so \
+                   `POST /v1/corrections/imports` retracts them by that account \
+                   and channel, under the label given here when one was. \
+                   Re-sending the identical document writes nothing the second \
+                   time: a row that named no `idempotency_key` is identified by \
+                   the document's digest and its own line number.",
+    params(IngestCsvParams),
     request_body(content = String, description = "CSV document", content_type = "text/csv"),
     responses(
         (status = 200, description = "Verdict for each row", body = Vec<VerdictDto>),
-        (status = 403, description = "Insufficient permissions", body = ApiError)
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "The label names an import it cannot mean", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn ingest_csv(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<IngestCsvParams>,
     body: String,
 ) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
+    // Bounded before the document is parsed: a label the derivation would refuse
+    // is a mistake about this request, and parsing first would report it after a
+    // hundred row verdicts the caller cannot use.
+    let label = declared_label("label", params.label.as_deref())?;
     let directory = build_directory(&state.services, &principal).await?;
     let rows = parse(&body, &directory);
 
     let mut verdicts = Vec::with_capacity(rows.len());
-    let mut accepted: Vec<(usize, SubmittedOperation)> = Vec::new();
+    let mut accepted: Vec<(usize, RowOrigin, SubmittedOperation)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         match row {
             ParsedRow::Operation(operation) => {
-                accepted.push((index + 1, (**operation).clone()));
+                // Per row, from the account that row names: see
+                // `IngestCsvParams` for why the account is not declared once
+                // for the batch.
+                let origin = RowOrigin {
+                    source: SourceId::declared(principal.owner, operation.account, CSV_CHANNEL),
+                    import: label.map(|label| {
+                        ImportId::declared(principal.owner, operation.account, CSV_CHANNEL, label)
+                    }),
+                };
+                accepted.push((index + 1, origin, (**operation).clone()));
             }
             ParsedRow::Rejected(rejection) => verdicts.push(VerdictDto::from_domain(
                 index + 1,
@@ -3726,17 +3817,12 @@ pub async fn ingest_csv(
         }
     }
 
-    // A CSV body declares no source, so it names no import either: its rows
-    // arrive under a source minted for this request alone, and
-    // `POST /v1/corrections/imports` cannot reach them. Declaring a source for
-    // this route is a separate change to its request shape.
-    let source = SourceId::new_random();
-    let domain: Vec<SubmittedOperation> = accepted
+    let domain: Vec<(RowOrigin, SubmittedOperation)> = accepted
         .iter()
-        .map(|(_, operation)| operation.clone())
+        .map(|(_, origin, operation)| (*origin, operation.clone()))
         .collect();
-    let outcomes = submit_operations(&state.services, &principal, source, None, &domain).await?;
-    for ((row, _), verdict) in accepted.iter().zip(outcomes.iter()) {
+    let outcomes = submit_operations(&state.services, &principal, &domain).await?;
+    for ((row, _, _), verdict) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(VerdictDto::from_domain(*row, verdict));
     }
     verdicts.sort_by_key(|verdict| verdict.row);
@@ -4479,18 +4565,36 @@ fn declared_import(
     declared: &DeclaredSourceDto,
 ) -> Result<Option<ImportId>, ApiFailure> {
     let channel = declared_channel(declared)?;
-    let Some(label) = declared.label.as_deref().map(str::trim) else {
+    let Some(label) = declared_label("source.label", declared.label.as_deref())? else {
         return Ok(None);
     };
-    if label.is_empty() || label.len() > 128 {
+    Ok(Some(ImportId::declared(owner, account, channel, label)))
+}
+
+/// The label an import is named by, refused when it names one it cannot mean.
+///
+/// Split out of [`declared_import`] for the reason [`declared_channel`] is
+/// shared: the CSV route carries its label as a query parameter rather than
+/// inside a declaration object, and two copies of the bound would eventually
+/// admit a label one derivation accepted and the other refused. The label is
+/// half the key of a destructive operation.
+///
+/// The field name is a parameter because it is the one thing that differs: the
+/// caller must be sent to the value it actually wrote, and `source.label` names
+/// nothing in a request that has no `source` object.
+fn declared_label<'a>(field: &str, label: Option<&'a str>) -> Result<Option<&'a str>, ApiFailure> {
+    let Some(trimmed) = label.map(str::trim) else {
+        return Ok(None);
+    };
+    if trimmed.is_empty() || trimmed.len() > 128 {
         return Err(invalid_field(
-            "source.label",
+            field,
             "a label of 1 to 128 characters naming this import, such as a \
              statement period or an export file name",
-            declared.label.clone().unwrap_or_default(),
+            label.unwrap_or_default().to_owned(),
         ));
     }
-    Ok(Some(ImportId::declared(owner, account, channel, label)))
+    Ok(Some(trimmed))
 }
 
 fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {

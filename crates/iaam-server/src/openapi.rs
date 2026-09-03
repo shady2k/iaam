@@ -51,7 +51,10 @@ use crate::dto::{
 // reflows a third of them, and this file is edited by several changes at once;
 // a second `use` of the same module is the shape `routes.rs` already uses for
 // the same reason.
-use crate::dto::BatchTotalDto;
+use crate::dto::{
+    BatchTotalDto, ControlCheckDto, ControlComparisonDto, ControlReconciliationDto,
+    ControlSectionDto, RecordedEventDto, StateImportControlFiguresRequest, StatedControlFiguresDto,
+};
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -253,6 +256,13 @@ impl Modify for BearerSecurity {
         UncoveredPositionDto,
         VerdictDto,
         BatchTotalDto,
+        StateImportControlFiguresRequest,
+        StatedControlFiguresDto,
+        ControlSectionDto,
+        ControlReconciliationDto,
+        ControlComparisonDto,
+        ControlCheckDto,
+        RecordedEventDto,
         // The published vocabularies: every code the API can return, each with
         // the sentence that explains it (§13).
         VerdictCodeDto,

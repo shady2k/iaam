@@ -26,6 +26,7 @@ use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::TinkoffClient;
+use iaam_core::batch::ControlSection;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::event::provenance::RawHash;
@@ -34,7 +35,9 @@ use iaam_core::ids::{
     ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, SourceId,
 };
 use iaam_core::instrument::{AliasInterval, AliasNamespace};
+use iaam_core::money::{CurrencyCode, PostedMinor};
 use iaam_core::projection::Snapshot;
+use iaam_core::reconciliation::claim::AssertionPeriod;
 use iaam_core::rules::LotRuleVersion;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_store::SqliteStore;
@@ -50,8 +53,8 @@ use iaam_store::events::{
     JournalQuery as StoredJournalQuery,
 };
 use iaam_store::import_session::{
-    NewQuestion as StoredNewQuestion, SessionState as StoredSessionState, StoredObservation,
-    StoredQuestion, StoredSession,
+    NewQuestion as StoredNewQuestion, SessionState as StoredSessionState, StoredControlFigures,
+    StoredObservation, StoredQuestion, StoredSession,
 };
 use iaam_store::reference::{
     AccountAliasRecord, AccountCreation, AccountDeclarations as StoredAccountDeclarations,
@@ -182,6 +185,70 @@ fn import_question_view(question: StoredQuestion) -> ImportQuestionView {
         answer: question.answer,
         rule: question.rule,
     }
+}
+
+/// The control section on its way into the store.
+///
+/// Amounts go down as raw minor units and the currency as its ISO code: the
+/// store keeps figures, and giving it a `PostedMinor` would make the storage
+/// adapter hold a monetary type it has no arithmetic for. The interval is
+/// rendered the way every other date column is.
+fn control_figures_record(figures: ControlSection) -> StoredControlFigures {
+    StoredControlFigures {
+        account: figures.account.inner().to_string(),
+        currency: figures.currency.code().to_owned(),
+        period_from: figures.period.from.to_string(),
+        period_to: figures.period.to.to_string(),
+        opening: figures.opening.map(PostedMinor::raw),
+        closing: figures.closing.map(PostedMinor::raw),
+        debit_turnover: figures.debit_turnover.map(PostedMinor::raw),
+        credit_turnover: figures.credit_turnover.map(PostedMinor::raw),
+    }
+}
+
+/// The control section on its way back out.
+///
+/// Every stored value is parsed rather than defaulted, and a row that does not
+/// parse fails the read. A section silently read with an unrecognised currency
+/// as roubles, or with an inverted interval repaired into a valid one, would be
+/// compared against the batch and would agree or disagree for a reason nobody
+/// stated.
+fn control_figures_view(record: StoredControlFigures) -> Result<ControlSection, AppError> {
+    let invalid = |field: &str, value: &str| {
+        AppError::Store(format!(
+            "stored import control figures could not be read: {field} is «{value}»"
+        ))
+    };
+    let account =
+        uuid::Uuid::parse_str(&record.account).map_err(|_| invalid("account", &record.account))?;
+    let currency = CurrencyCode::from_code(&record.currency)
+        .ok_or_else(|| invalid("currency", &record.currency))?;
+    let parse_date = |value: &str| {
+        Date::parse(
+            value,
+            &time::format_description::well_known::Iso8601::DEFAULT,
+        )
+        .map_err(|_| invalid("period", value))
+    };
+    let period = AssertionPeriod::between(
+        parse_date(&record.period_from)?,
+        parse_date(&record.period_to)?,
+    )
+    .ok_or_else(|| {
+        invalid(
+            "period",
+            &format!("{}..{}", record.period_from, record.period_to),
+        )
+    })?;
+    Ok(ControlSection {
+        account: AccountId(account),
+        currency,
+        period,
+        opening: record.opening.map(PostedMinor::new),
+        closing: record.closing.map(PostedMinor::new),
+        debit_turnover: record.debit_turnover.map(PostedMinor::new),
+        credit_turnover: record.credit_turnover.map(PostedMinor::new),
+    })
 }
 
 /// A session failure the caller can act on, kept apart from a store failure.
@@ -943,6 +1010,51 @@ impl Store for SqliteAdapter {
                 .answer_import_question(owner, session, question, &answer, rule.as_deref())
                 .map(import_question_view)
                 .map_err(import_session_error)
+        })
+        .await
+    }
+
+    async fn state_import_control_figures(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        figures: Vec<ControlSection>,
+    ) -> Result<Vec<ControlSection>, AppError> {
+        self.blocking(move |store| {
+            let records: Vec<StoredControlFigures> =
+                figures.into_iter().map(control_figures_record).collect();
+            store
+                .state_import_control_figures(owner, session, &records)
+                .map_err(import_session_error)?
+                .into_iter()
+                .map(control_figures_view)
+                .collect()
+        })
+        .await
+    }
+
+    async fn list_import_control_figures(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ControlSection>, AppError> {
+        self.blocking(move |store| {
+            // The owner is checked before the figures are read, as the rows are:
+            // a session identifier is not an access right (§14), and the
+            // figures themselves carry no owner to filter on.
+            store
+                .load_import_session(owner, session)
+                .map_err(store_error)?
+                .ok_or(AppError::NotFound {
+                    what: "an import session",
+                    id: session.inner().to_string(),
+                })?;
+            store
+                .list_import_control_figures(session)
+                .map_err(store_error)?
+                .into_iter()
+                .map(control_figures_view)
+                .collect()
         })
         .await
     }

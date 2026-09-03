@@ -112,6 +112,34 @@ impl StoredQuestion {
     }
 }
 
+/// The control section a source printed for one account and currency.
+///
+/// Opaque to this crate in the same way a payload is: the store keeps the four
+/// figures and the interval, and the application decides what they mean and what
+/// they are compared with. What the store does enforce is the key — one section
+/// per account and currency in a session — because two sections for one account
+/// would let the assessment compare against whichever it read first.
+///
+/// Every figure is separately nullable, and NULL means «the source did not print
+/// it», never zero (§4.9).
+///
+/// One type for both directions: nothing here is minted or derived by the store.
+/// `stated_at` is on the table and not on this struct, because it is the store's
+/// own clock reading and nothing above reads it — it is there for the same
+/// reason `asked_at` is, so that a session can be looked at afterwards and told
+/// in what order it was assembled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredControlFigures {
+    pub account: String,
+    pub currency: String,
+    pub period_from: String,
+    pub period_to: String,
+    pub opening: Option<i64>,
+    pub closing: Option<i64>,
+    pub debit_turnover: Option<i64>,
+    pub credit_turnover: Option<i64>,
+}
+
 impl SqliteStore {
     /// Open a session, or return the open one this import already has.
     ///
@@ -450,6 +478,74 @@ impl SqliteStore {
         Ok(stored)
     }
 
+    /// Record what a source printed about itself, replacing what it printed
+    /// before.
+    ///
+    /// Replacement rather than a second row, and rather than a refusal: a
+    /// section already stated and stated again is a transcription corrected, and
+    /// the correction is the figure the owner now wants checked. The alternative
+    /// — refusing the second — would leave a session pinned to a typo with no
+    /// way out but abandoning every row in it.
+    ///
+    /// All of a call's sections are written in one transaction. A statement's
+    /// control section is one thing; half of it written and half refused would
+    /// be compared against the rows as though the source had printed only half.
+    ///
+    /// A session that is no longer open refuses, exactly as adding a row does:
+    /// figures stated after the commit would be compared against nothing and
+    /// written nowhere.
+    pub fn state_import_control_figures(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        figures: &[StoredControlFigures],
+    ) -> Result<Vec<StoredControlFigures>, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_open(&transaction, owner, session)?;
+        let stated_at = now();
+        for figure in figures {
+            transaction.execute(
+                "INSERT INTO import_control_figures
+                     (session, account, currency, period_from, period_to,
+                      opening, closing, debit_turnover, credit_turnover, stated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (session, account, currency) DO UPDATE SET
+                     period_from = excluded.period_from,
+                     period_to = excluded.period_to,
+                     opening = excluded.opening,
+                     closing = excluded.closing,
+                     debit_turnover = excluded.debit_turnover,
+                     credit_turnover = excluded.credit_turnover,
+                     stated_at = excluded.stated_at",
+                params![
+                    session.inner().to_string(),
+                    figure.account,
+                    figure.currency,
+                    figure.period_from,
+                    figure.period_to,
+                    figure.opening,
+                    figure.closing,
+                    figure.debit_turnover,
+                    figure.credit_turnover,
+                    stated_at,
+                ],
+            )?;
+        }
+        let stated = control_figures(&transaction, session)?;
+        transaction.commit()?;
+        Ok(stated)
+    }
+
+    /// A session's control sections, in account and currency order.
+    pub fn list_import_control_figures(
+        &self,
+        session: ImportSessionId,
+    ) -> Result<Vec<StoredControlFigures>, StoreError> {
+        control_figures(&self.conn, session)
+    }
+
     /// Close a session, committed or abandoned.
     ///
     /// Only an open session closes, and the check is part of the same statement
@@ -499,6 +595,32 @@ impl SqliteStore {
                 id: session.inner().to_string(),
             })
     }
+}
+
+fn control_figures(
+    conn: &Connection,
+    session: ImportSessionId,
+) -> Result<Vec<StoredControlFigures>, StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT account, currency, period_from, period_to,
+                opening, closing, debit_turnover, credit_turnover
+         FROM import_control_figures WHERE session = ?1
+         ORDER BY account, currency",
+    )?;
+    let rows = statement.query_map([session.inner().to_string()], |row| {
+        Ok(StoredControlFigures {
+            account: row.get(0)?,
+            currency: row.get(1)?,
+            period_from: row.get(2)?,
+            period_to: row.get(3)?,
+            opening: row.get(4)?,
+            closing: row.get(5)?,
+            debit_turnover: row.get(6)?,
+            credit_turnover: row.get(7)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
 }
 
 /// The session an import already has open, when it has one.

@@ -13349,6 +13349,556 @@ async fn a_session_publishes_the_path_to_its_own_assessment() {
     assert_eq!(contents["assessment"], json!(link), "{contents}");
 }
 
+// ---------------------------------------------------------------------------
+// The source's own control section, checked before the commit (iaam-jc3y)
+// ---------------------------------------------------------------------------
+
+/// Open a session against `account` and feed it `rows`, returning its identifier.
+async fn session_holding(harness: &Harness, account: Uuid, label: &str, rows: Value) -> String {
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": label } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, held) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": rows }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    id
+}
+
+/// State one control section on a session and assert it was taken.
+async fn state_control_figures(harness: &Harness, session: &str, body: &Value) {
+    let (status, stated) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/control-figures"),
+            &harness.owner_token,
+            body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stated}");
+}
+
+async fn assessment_of(harness: &Harness, session: &str) -> Value {
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    plan
+}
+
+/// The check one figure of one comparison came to.
+fn check_of<'a>(plan: &'a Value, figure: &str) -> &'a Value {
+    plan["control_reconciliation"]["comparisons"]
+        .as_array()
+        .expect("comparisons")
+        .iter()
+        .flat_map(|comparison| comparison["checks"].as_array().expect("checks"))
+        .find(|check| check["figure"] == json!(figure))
+        .unwrap_or_else(|| panic!("no check for {figure}: {plan}"))
+}
+
+/// The transcription of a control section is refused where it is a transcription
+/// mistake, and taken where it is a finding (iaam-jc3y).
+///
+/// Four refusals, each because the transcriber is the only one who can fix it: a
+/// section stating nothing would read as «checked» to anybody skimming; one
+/// account and currency stated twice would let the store keep whichever came
+/// last and the caller never learn its two readings disagreed; a signed turnover
+/// is a sign convention misread, and every comparison built on it would be
+/// nonsense; an inverted interval reconciles with nothing, forever.
+///
+/// A **negative balance** is not among them: §11 says an overdrawn account is a
+/// valid state, and refusing one would refuse the statement that reports it.
+///
+/// Every account and amount is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_control_section_is_refused_where_it_is_a_transcription_mistake() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(&harness, account, "refusals", json!([])).await;
+
+    let refuse = async |body: Value, why: &str| {
+        let (status, refusal) = call(
+            &harness.router,
+            post(
+                &format!("/v1/import-sessions/{session}/control-figures"),
+                &harness.owner_token,
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{why}: {refusal}");
+    };
+
+    refuse(
+        json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{ "account": account, "currency": "RUB" }],
+        }),
+        "a section stating no figure",
+    )
+    .await;
+
+    refuse(
+        json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [
+                { "account": account, "currency": "RUB", "closing": "100.00" },
+                { "account": account, "currency": "RUB", "closing": "120.00" },
+            ],
+        }),
+        "one account and currency stated twice in one call",
+    )
+    .await;
+
+    refuse(
+        json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "credit_turnover": "-50.00",
+            }],
+        }),
+        "a turnover carries no sign, the side does",
+    )
+    .await;
+
+    refuse(
+        json!({
+            "from": "2025-06-30",
+            "to": "2025-06-01",
+            "figures": [{ "account": account, "currency": "RUB", "closing": "100.00" }],
+        }),
+        "an interval that ends before it starts",
+    )
+    .await;
+
+    // And the overdrawn account, which is a fact rather than a mistake.
+    let (status, stated) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/control-figures"),
+            &harness.owner_token,
+            &json!({
+                "from": "2025-06-01",
+                "to": "2025-06-30",
+                "figures": [{
+                    "account": account,
+                    "currency": "RUB",
+                    "opening": "0.00",
+                    "closing": "-40.00",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stated}");
+    assert_eq!(stated[0]["closing"], "-40.00", "{stated}");
+
+    // Restating it replaces it: a transcription corrected is a correction, not a
+    // second section for the assessment to choose between.
+    let (status, restated) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/control-figures"),
+            &harness.owner_token,
+            &json!({
+                "from": "2025-06-01",
+                "to": "2025-06-30",
+                "figures": [{
+                    "account": account,
+                    "currency": "RUB",
+                    "opening": "0.00",
+                    "closing": "-45.00",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{restated}");
+    assert_eq!(
+        restated.as_array().expect("sections").len(),
+        1,
+        "{restated}"
+    );
+    assert_eq!(restated[0]["closing"], "-45.00", "{restated}");
+
+    // And the session reports what it holds, so a caller that stated figures
+    // onto the wrong session finds out by reading it back.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["control_figures"]
+            .as_array()
+            .expect("control figures")
+            .len(),
+        1,
+        "{contents}"
+    );
+}
+
+/// A converter that mirrored both legs of an internal transfer is caught on the
+/// first attempt rather than the fifth (iaam-jc3y).
+///
+/// The real failure: an operator's converter emitted the far leg of every
+/// internal transfer onto the near account as well, so every account was
+/// inflated by the sum of its own transfers. Every verdict was positive, the
+/// journal took it all, and the discrepancy surfaced only when a report was read
+/// weeks later — because at commit nothing knew what right looked like, while
+/// the statement had printed its turnover on the same page as the rows.
+///
+/// Note which check catches it: the **turnover**. The mirrored leg here inflates
+/// only what arrived, so a system that compared closing balances alone and not
+/// both sides would have to see the net wrong before it saw anything at all.
+///
+/// Every account and amount is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_mirrored_transfer_leg_fails_the_turnover_the_statement_printed() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "mirrored",
+        json!([
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "1000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-03-05" },
+                "idempotency_key": "mirrored-in",
+            },
+            {
+                "account": account,
+                "type": "withdrawal",
+                "amount": "500.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-03-10" },
+                "idempotency_key": "mirrored-out",
+            },
+            // The far leg of an internal transfer, written onto this account as
+            // well: the whole of the defect, in one row.
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "300.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-03-12" },
+                "idempotency_key": "mirrored-far-leg",
+            },
+        ]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-03-01",
+            "to": "2025-03-31",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "500.00",
+                "debit_turnover": "1000.00",
+                "credit_turnover": "500.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(
+        plan["readiness"], "does_not_reconcile",
+        "neither an unreadable row nor a decision of the owner's: {plan}"
+    );
+    assert_eq!(
+        plan["control_reconciliation"]["mismatched_figures"], 2,
+        "{plan}"
+    );
+
+    let debit = check_of(&plan, "debit_turnover");
+    assert_eq!(debit["outcome"], "mismatched", "{plan}");
+    assert_eq!(debit["claimed"], "1000.00", "{plan}");
+    assert_eq!(debit["observed"], "1300.00", "the mirrored leg: {plan}");
+    assert_eq!(debit["delta"], "-300.00", "{plan}");
+
+    // The side the mirror did not touch still agrees, and says so with both
+    // numbers on the page: «matched» without them would not say what it
+    // compared.
+    let credit = check_of(&plan, "credit_turnover");
+    assert_eq!(credit["outcome"], "matched", "{plan}");
+    assert_eq!(credit["claimed"], "500.00", "{plan}");
+    assert_eq!(credit["observed"], "500.00", "{plan}");
+
+    let closing = check_of(&plan, "closing_balance");
+    assert_eq!(closing["outcome"], "mismatched", "{plan}");
+    assert_eq!(closing["observed"], "800.00", "{plan}");
+
+    // Committing is refused, and the refusal names the figures rather than
+    // saying that something is wrong somewhere.
+    let before = journal_rows(&harness).await;
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    let detail = refusal.to_string();
+    assert!(detail.contains("debit_turnover"), "{refusal}");
+    assert!(detail.contains("1000.00"), "{refusal}");
+    assert!(detail.contains("1300.00"), "{refusal}");
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "a refused commit writes nothing: {refusal}"
+    );
+
+    // And it stays possible, because a statement can itself be wrong — as a
+    // stated act rather than the default.
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({ "accept_control_mismatch": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(
+        committed["control_assertions"]
+            .as_array()
+            .expect("control assertions")
+            .len(),
+        3,
+        "two balances and one turnover, written as the assertions they are: {committed}"
+    );
+}
+
+/// A converter emitting minor units where the rest emit major misses the closing
+/// balance by three orders of magnitude, and is told so before it commits
+/// (iaam-jc3y).
+///
+/// The second real failure, and the one the assessment could not have caught by
+/// any means it already had: every row is well formed, every account is known,
+/// nothing is ambiguous, and the whole batch is a hundred times too large. The
+/// only thing in the world that knew otherwise was the figure printed at the
+/// bottom of the statement the rows came from.
+///
+/// Every account and amount is invented (CLAUDE.md).
+#[tokio::test]
+async fn an_import_off_by_a_factor_of_a_hundred_misses_the_closing_balance() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "minor-units",
+        json!([{
+            "account": account,
+            "type": "deposit",
+            // The converter sent the minor-unit figure through the major-unit
+            // field.
+            "amount": "150000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-04-05" },
+            "idempotency_key": "minor-units-in",
+        }]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-04-01",
+            "to": "2025-04-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "1500.00",
+                "debit_turnover": "1500.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(plan["readiness"], "does_not_reconcile", "{plan}");
+
+    let closing = check_of(&plan, "closing_balance");
+    assert_eq!(closing["outcome"], "mismatched", "{plan}");
+    assert_eq!(closing["claimed"], "1500.00", "{plan}");
+    assert_eq!(closing["observed"], "150000.00", "{plan}");
+    assert_eq!(closing["delta"], "-148500.00", "{plan}");
+
+    // The credit side was never printed, so nothing is claimed about it and
+    // nothing is reported: a figure the source did not state is not a figure
+    // that failed.
+    assert!(
+        plan["control_reconciliation"]["comparisons"][0]["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .all(|check| check["figure"] != json!("credit_turnover")),
+        "{plan}"
+    );
+}
+
+/// A batch that agrees with its source is ready, says what it compared, and
+/// leaves the reconciliation already made (iaam-jc3y).
+///
+/// Three properties in one scenario, because they are one property: the figures
+/// the assessment checked are the figures the commit writes. After it, the
+/// reconciliation the owner would otherwise have had to make separately — open a
+/// second route, retype the same numbers, against a journal that already holds
+/// whatever went wrong — is in the journal and reports `matched`.
+///
+/// Every account and amount is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it() {
+    let harness = harness();
+    let account = another_account(&harness, "Savings").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "agreeing",
+        json!([
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "200.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-05-04" },
+                "idempotency_key": "agreeing-in",
+            },
+            {
+                "account": account,
+                "type": "withdrawal",
+                "amount": "50.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-05-06" },
+                "idempotency_key": "agreeing-out",
+            },
+        ]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-05-01",
+            "to": "2025-05-31",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "150.00",
+                "debit_turnover": "200.00",
+                "credit_turnover": "50.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(plan["readiness"], "ready", "{plan}");
+    assert_eq!(
+        plan["control_reconciliation"]["mismatched_figures"], 0,
+        "{plan}"
+    );
+    for figure in ["debit_turnover", "credit_turnover", "closing_balance"] {
+        assert_eq!(check_of(&plan, figure)["outcome"], "matched", "{plan}");
+    }
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            // No flag: a batch that adds up commits the way it always did.
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    let assertions = committed["control_assertions"]
+        .as_array()
+        .expect("control assertions");
+    assert_eq!(assertions.len(), 3, "{committed}");
+    assert!(
+        assertions
+            .iter()
+            .all(|assertion| assertion["outcome"] == json!("inserted")),
+        "{committed}"
+    );
+
+    let (status, reconciliation) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reconciliation?account={account}&from=2025-05-01&to=2025-05-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reconciliation}");
+    let outcomes = reconciliation["statuses"][0]["outcomes"]
+        .as_array()
+        .expect("assertion outcomes");
+    assert_eq!(
+        outcomes.len(),
+        3,
+        "the section the import stated, reconciled against the journal it wrote: {reconciliation}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome["outcome"]["code"] == json!("matched")),
+        "{reconciliation}"
+    );
+}
+
 /// The commit delta totals its rows, per account and currency (iaam-o1ni).
 ///
 /// The defect: `commit_delta` published three lists, each row carrying a signed

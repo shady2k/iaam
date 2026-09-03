@@ -1,6 +1,7 @@
 //! Object-safe ports. The only place where they exist (§3.2).
 
 use async_trait::async_trait;
+use iaam_core::batch::ControlSection;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::event::provenance::{ParserVersion, RawHash};
@@ -773,6 +774,35 @@ pub trait Store: Send + Sync {
         answer: String,
         rule: Option<String>,
     ) -> Result<ImportQuestionView, AppError>;
+
+    /// Record the control figures the session's source printed about itself,
+    /// replacing any it printed before for the same account and currency.
+    ///
+    /// All of a call's sections are written together: a statement's control
+    /// section is one thing, and half of it stored would be compared against the
+    /// rows as though the source had printed only half.
+    async fn state_import_control_figures(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        figures: Vec<ControlSection>,
+    ) -> Result<Vec<ControlSection>, AppError>;
+
+    /// The control sections a session holds, in account and currency order.
+    ///
+    /// The core's own [`ControlSection`] crosses the port rather than a view of
+    /// its own, and this is the exception that proves the rule the other views
+    /// follow. A view exists where the store's shape and the domain's differ —
+    /// a session has a state the transport must not read as the adapter spells
+    /// it. Here nothing differs: the store mints nothing, derives nothing and
+    /// names nothing of its own, so a view would be `ControlSection` retyped,
+    /// and the retyping is where the two could come to disagree about which
+    /// figure is the debit side.
+    async fn list_import_control_figures(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ControlSection>, AppError>;
 
     /// Close a session, committed or abandoned.
     async fn close_import_session(

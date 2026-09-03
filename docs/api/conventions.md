@@ -275,6 +275,7 @@ And the types that print a bare identifier on purpose.
 | `AccountBalanceDto`, `NegativeCashDto`, `AssetAccountDto`, `CashClassTotalDto`, `NotDecomposedAccountDto`, `AccountResidualDto`, `EarningSourceAmountDto`, `CaveatSubjectDto` | `account` | the answer these sit in carries `population`, whose `covered` and `outside` name every account it mentions and every account it left out. The join table is in the same response, computed by the same fold, and one report row cannot disagree with it |
 | `ReconciliationStatusDto`, `TaintDto` | `account` | the caller named the account in the request; the response answers about that one and no other |
 | `JournalEventReadDto`, `JournalLegDto`, `OperationDto`, `VerdictDto` | `account` | a row-level echo of what the caller submitted or asked for |
+| `BatchTotalDto`, `ControlComparisonDto` | `account` | the import assessment they sit in carries `account_resolution`, whose `resolved` and `missing` name every account the rows are on and say which of them the owner's directory holds. The join table is in the same response, computed by the same fold. It is also why a name cannot simply be printed: a total over rows on an account the directory has never heard of is precisely what these sections must be able to publish |
 | every request body | — | §3.2 |
 
 Two things follow for a client. Where a response carries a `population` block, it

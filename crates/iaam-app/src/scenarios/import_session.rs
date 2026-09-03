@@ -30,8 +30,9 @@ use crate::AppServices;
 use crate::actions::{AccountScope, account_scope};
 use crate::error::AppError;
 use crate::ports::{
-    AccountScopeExclusionView, AccountView, ContourView, ImportObservationView, ImportQuestionView,
-    ImportSessionState, ImportSessionView, NewImportQuestion, Principal,
+    AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, ContourView,
+    ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionView,
+    NewImportQuestion, Principal,
 };
 use crate::scenarios::ingest::submit_candidates;
 use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
@@ -1031,7 +1032,7 @@ fn account_resolution(resolver: &Resolver, rows: &[ReadRow]) -> AccountResolutio
         }
         if let Some(Intake::Observed { row }) = read.intake.as_ref()
             && let Some(name) = row.counterparty_name()
-            && resolver.counterparty_matches(name) > 1
+            && resolver.counterparty_matches(name, row.dates.effective_date()) > 1
             && !conflicting.iter().any(|seen| seen == name)
         {
             conflicting.push(name.to_owned());
@@ -1237,47 +1238,118 @@ enum Assessment {
     },
 }
 
-/// The owner's accounts and rules, loaded once per batch.
+/// The owner's accounts, his statements about them, and his rules, loaded once
+/// per batch.
+///
+/// `accounts` is the detailed view rather than the summary because resolution
+/// reads the identity a source prints and the aliases that reach the same
+/// account (decision 0004), and neither is on the summary view. `cash_class`
+/// travels with them and **nothing here reads it**: it is a grouping label for
+/// reports, and a classifier that branched on it is the failure decision 0004
+/// asks a reviewer to check for.
 struct Resolver {
-    accounts: Vec<AccountView>,
+    accounts: Vec<AccountDetailView>,
+    /// What the owner said about which of his accounts money moves between.
+    ///
+    /// Three states, and the absence of a view is one of them — see
+    /// [`AccountTransferStatementView`]. Read by [`Self::denies`] and by nothing
+    /// else, because that is the only thing a statement is allowed to do here.
+    statements: Vec<AccountTransferStatementView>,
     rules: Vec<ClassificationRule>,
 }
 
 impl Resolver {
     async fn load(services: &AppServices, owner: OwnerId) -> Result<Self, AppError> {
-        let accounts = services.store.list_accounts(owner).await?;
+        let accounts = services.store.list_account_details(owner).await?;
+        let statements = services
+            .store
+            .list_account_transfer_statements(owner)
+            .await?;
         let stored = services.rules.list_rules(owner).await?;
         let mut rules = Vec::with_capacity(stored.len());
         for rule in stored.into_iter().filter(|rule| rule.retired_at.is_none()) {
             rules.push(crate::scenarios::classification::rule_from_view(rule)?);
         }
-        Ok(Self { accounts, rules })
+        Ok(Self {
+            accounts,
+            statements,
+            rules,
+        })
+    }
+
+    /// Every account a printed counterparty could be, from the strongest kind of
+    /// evidence that recognised anything.
+    ///
+    /// Three tiers, tried in order, and the search stops at the first that
+    /// matches at all rather than pooling them:
+    ///
+    /// 1. **iaam's own account identifier**, printed verbatim.
+    /// 2. **The identity the source prints** for the account, and the aliases
+    ///    that reach the same account — a card among them (decision 0004). An
+    ///    alias is read against the day of the row where the row carries one.
+    /// 3. **The account's title**, trimmed and case-insensitively.
+    ///
+    /// The order is the decision. A title is what the owner reads and may
+    /// rename at any moment; an identity is what a source repeats. So an
+    /// identity must not merely tie with a title — a rename would otherwise
+    /// silently re-point a resolution, which is the defect decision 0004 was
+    /// written about. Stopping at the first tier that matched is what makes it
+    /// beat rather than tie: an identity naming one account is not diluted by
+    /// another account whose title happens to agree, and — the other way round —
+    /// a title shared by two accounts is not settled by an identity somewhere
+    /// below it, because nothing below is consulted.
+    ///
+    /// **The title tier stays**, deliberately. Every account that existed before
+    /// decision 0004 states no identity and has no aliases, and dropping the
+    /// tier would stop recognising their transfers until each is back-filled —
+    /// a silent behaviour change bought for no correctness. Its one failure mode
+    /// is a collision, and a collision is refused here rather than guessed at.
+    fn candidates(&self, name: &str, on: Option<time::Date>) -> Vec<AccountId> {
+        let printed = name.trim();
+
+        if let Ok(id) = uuid::Uuid::parse_str(printed) {
+            let own: Vec<AccountId> = self
+                .accounts
+                .iter()
+                .filter(|account| account.id.inner() == id)
+                .map(|account| account.id)
+                .collect();
+            if !own.is_empty() {
+                return own;
+            }
+        }
+
+        let identified: Vec<AccountId> = self
+            .accounts
+            .iter()
+            .filter(|account| identifies(account, printed, on))
+            .map(|account| account.id)
+            .collect();
+        if !identified.is_empty() {
+            return identified;
+        }
+
+        let wanted = printed.to_lowercase();
+        self.accounts
+            .iter()
+            .filter(|account| account.title.trim().to_lowercase() == wanted)
+            .map(|account| account.id)
+            .collect()
     }
 
     /// The owner's own account a printed counterparty names, if it names one.
     ///
     /// This is the seam the derived internal transfer comes through: a
     /// counterparty recognised here reaches `classify` as
-    /// `Counterparty::OwnAccount` and settles without a question. Recognition is
-    /// by identifier or by exactly one account title, case-insensitively — a
-    /// title shared by two accounts recognises neither, because picking one
-    /// would be the guess this module exists to refuse.
-    fn resolve_counterparty(&self, name: &str) -> Option<AccountId> {
-        if let Ok(id) = uuid::Uuid::parse_str(name)
-            && let Some(account) = self
-                .accounts
-                .iter()
-                .find(|account| account.id.inner() == id)
-        {
-            return Some(account.id);
-        }
-        let wanted = name.trim().to_lowercase();
-        let mut matched = self
-            .accounts
-            .iter()
-            .filter(|account| account.title.trim().to_lowercase() == wanted);
-        let first = matched.next()?;
-        matched.next().is_none().then_some(first.id)
+    /// `Counterparty::OwnAccount` and settles without a question. Exactly one
+    /// candidate is a recognition; two are not, and picking between them would
+    /// be the guess this module exists to refuse. The refusal is per tier —
+    /// two accounts sharing an alias recognise neither, just as two sharing a
+    /// title do.
+    fn resolve_counterparty(&self, name: &str, on: Option<time::Date>) -> Option<AccountId> {
+        let mut candidates = self.candidates(name, on).into_iter();
+        let first = candidates.next()?;
+        candidates.next().is_none().then_some(first)
     }
 
     /// How many of the owner's accounts a printed counterparty could be.
@@ -1285,18 +1357,44 @@ impl Resolver {
     /// [`Self::resolve_counterparty`] answers `None` both for a name that
     /// matches nothing and for one that matches two accounts, and the two are
     /// not the same thing to report: the first is a stranger and the second is
-    /// an ambiguity the owner can clear up by renaming an account.
-    fn counterparty_matches(&self, name: &str) -> usize {
-        if uuid::Uuid::parse_str(name)
-            .is_ok_and(|id| self.accounts.iter().any(|account| account.id.inner() == id))
-        {
-            return 1;
+    /// an ambiguity the owner can clear up — by renaming an account, or now by
+    /// giving one of them the identifier its source prints.
+    fn counterparty_matches(&self, name: &str, on: Option<time::Date>) -> usize {
+        self.candidates(name, on).len()
+    }
+
+    /// Whether the owner's own words say money does not move between these two.
+    ///
+    /// This is the only thing his transfer statement is allowed to do here, and
+    /// the restriction is the decision rather than an unfinished implementation.
+    /// A statement is a general claim about which pairs of his accounts money
+    /// moves between; it says nothing about which account any printed string
+    /// names, and it carries no direction. So it can never **make** a
+    /// resolution, never break a tie between candidates, and never settle a row
+    /// whose direction is open. It can only **withdraw** a resolution reached
+    /// on other grounds, which is a restriction and not a conclusion.
+    ///
+    /// A pair is declared when either side's statement names the other: both
+    /// sides are asked separately ([`crate::actions`]), and the pair is the same
+    /// pair whichever side he was asked about. It is denied when neither names
+    /// it and at least one of the two statements exists — a statement is «these,
+    /// and no others», so an account it does not name is one he excluded. Where
+    /// neither account has a statement he has not spoken, and silence denies
+    /// nothing: that is the state every new account starts in.
+    fn denies(&self, account: AccountId, partner: AccountId) -> bool {
+        if account == partner {
+            return false;
         }
-        let wanted = name.trim().to_lowercase();
-        self.accounts
-            .iter()
-            .filter(|account| account.title.trim().to_lowercase() == wanted)
-            .count()
+        let names = |near: AccountId, far: AccountId| {
+            self.statements
+                .iter()
+                .find(|statement| statement.account == near)
+                .map(|statement| statement.partners.contains(&far))
+        };
+        match (names(account, partner), names(partner, account)) {
+            (Some(true), _) | (_, Some(true)) | (None, None) => false,
+            (Some(false), _) | (_, Some(false)) => true,
+        }
     }
 
     fn title(&self, account: AccountId) -> String {
@@ -1319,9 +1417,16 @@ impl Resolver {
     /// directionless row settled as an external flow is therefore still asked
     /// about — the alternative is picking `deposit`, which is the bug.
     fn assess(&self, row: &ObservedRow) -> Assessment {
+        // The owner's transfer statement reaches classification here, and only
+        // here. It is applied to the resolution rather than to the candidates
+        // that produced it — see [`Self::denies`] — so it can take a derived
+        // internal transfer back to being a question, and can do nothing else.
+        // A resolution his own words deny is one the system would otherwise
+        // record without asking him about a movement he said does not happen.
         let resolved = row
             .counterparty_name()
-            .and_then(|name| self.resolve_counterparty(name));
+            .and_then(|name| self.resolve_counterparty(name, row.dates.effective_date()))
+            .filter(|resolved| !self.denies(row.account, *resolved));
         let subject = row.subject(resolved);
         let classification = match classify(&subject, &self.rules) {
             ClassificationResult::Resolved { classification, .. } => classification,
@@ -1384,6 +1489,29 @@ impl Resolver {
             }
         }
     }
+}
+
+/// Whether an account is the one a source printed this identifier for.
+///
+/// The identity and the aliases are compared **verbatim**: decision 0004 defines
+/// `provider_account_id` as opaque to iaam, and equality is the whole contract.
+/// Case-folding it would be a claim about what the value means, and the first
+/// rule that depended on that claim would be depending on a parse.
+///
+/// An alias is read against the day of the row where there is one, so a card
+/// whose interval has closed stops recognising rows posted after it. Where the
+/// row carries no date the interval is not consulted: refusing the alias anyway
+/// would be a conclusion drawn from a field the row does not have.
+fn identifies(account: &AccountDetailView, printed: &str, on: Option<time::Date>) -> bool {
+    if account.provider_account_id.as_deref() == Some(printed) {
+        return true;
+    }
+    account.aliases.iter().any(|alias| {
+        alias.value == printed
+            && on.is_none_or(|day| {
+                day >= alias.valid_from && alias.valid_to.is_none_or(|until| day < until)
+            })
+    })
 }
 
 /// Which way the money went, when anything says so.
@@ -1544,5 +1672,365 @@ fn require_submit(principal: &Principal) -> Result<(), AppError> {
             expected: "permission to submit operations".into(),
             actual: principal.scope.code().to_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::AccountAliasView;
+    use iaam_ingest::observation::{ObservedCounterparty, ObservedDirection, RowIdentity};
+    use iaam_ingest::operation::OperationDates;
+    use time::macros::date;
+
+    fn account(byte: u8) -> AccountId {
+        AccountId(uuid::Uuid::from_bytes([byte; 16]))
+    }
+
+    fn detail(id: AccountId, title: &str) -> AccountDetailView {
+        AccountDetailView {
+            id,
+            title: title.to_owned(),
+            institution: None,
+            provider: None,
+            provider_account_id: None,
+            cash_class: None,
+            aliases: Vec::new(),
+        }
+    }
+
+    fn with_identity(mut view: AccountDetailView, printed: &str) -> AccountDetailView {
+        view.provider = Some("bank-one".to_owned());
+        view.provider_account_id = Some(printed.to_owned());
+        view
+    }
+
+    fn with_alias(
+        mut view: AccountDetailView,
+        value: &str,
+        valid_from: time::Date,
+        valid_to: Option<time::Date>,
+    ) -> AccountDetailView {
+        view.aliases.push(AccountAliasView {
+            value: value.to_owned(),
+            valid_from,
+            valid_to,
+        });
+        view
+    }
+
+    fn resolver(accounts: Vec<AccountDetailView>) -> Resolver {
+        Resolver {
+            accounts,
+            statements: Vec::new(),
+            rules: Vec::new(),
+        }
+    }
+
+    fn stating(
+        accounts: Vec<AccountDetailView>,
+        statements: Vec<(AccountId, Vec<AccountId>)>,
+    ) -> Resolver {
+        Resolver {
+            accounts,
+            statements: statements
+                .into_iter()
+                .map(|(account, partners)| AccountTransferStatementView { account, partners })
+                .collect(),
+            rules: Vec::new(),
+        }
+    }
+
+    /// An outgoing row on `on`, naming `counterparty`, posted on `posted`.
+    fn row(on: AccountId, counterparty: &str, posted: Option<time::Date>) -> ObservedRow {
+        ObservedRow {
+            account: on,
+            direction: ObservedDirection::Out,
+            amount_minor: -1_000,
+            currency: CurrencyCode::Rub,
+            counterparty: ObservedCounterparty::Named(counterparty.to_owned()),
+            source_kind: Some("transfer".to_owned()),
+            description: None,
+            dates: OperationDates {
+                cash_posted: posted,
+                ..OperationDates::default()
+            },
+            source_time: None,
+            identity: RowIdentity::default(),
+        }
+    }
+
+    // --- resolution -------------------------------------------------------
+
+    #[test]
+    fn the_identity_the_source_prints_resolves_a_counterparty() {
+        let main = account(1);
+        let resolver = resolver(vec![with_identity(detail(main, "Main"), "ACC-1")]);
+        assert_eq!(
+            resolver.resolve_counterparty("ACC-1", None),
+            Some(main),
+            "the counterparty is the identity the source prints for Main"
+        );
+    }
+
+    #[test]
+    fn an_alias_resolves_a_counterparty_no_title_matches() {
+        let main = account(1);
+        let resolver = resolver(vec![with_alias(
+            detail(main, "Main"),
+            "CARD-1",
+            date!(2026 - 01 - 01),
+            None,
+        )]);
+        assert_eq!(
+            resolver.resolve_counterparty("CARD-1", Some(date!(2026 - 06 - 01))),
+            Some(main),
+            "an alias is a further identifier for the same account"
+        );
+    }
+
+    #[test]
+    fn an_alias_whose_interval_closed_before_the_row_resolves_nothing() {
+        let main = account(1);
+        let resolver = resolver(vec![with_alias(
+            detail(main, "Main"),
+            "CARD-1",
+            date!(2026 - 01 - 01),
+            Some(date!(2026 - 03 - 01)),
+        )]);
+        assert_eq!(
+            resolver.resolve_counterparty("CARD-1", Some(date!(2026 - 06 - 01))),
+            None,
+            "the alias had stopped reaching the account by the day of the row"
+        );
+        assert_eq!(
+            resolver.resolve_counterparty("CARD-1", Some(date!(2026 - 02 - 01))),
+            Some(main),
+            "and it did reach it while the interval was open"
+        );
+    }
+
+    #[test]
+    fn an_alias_resolves_a_row_that_carries_no_date() {
+        let main = account(1);
+        let resolver = resolver(vec![with_alias(
+            detail(main, "Main"),
+            "CARD-1",
+            date!(2026 - 01 - 01),
+            Some(date!(2026 - 03 - 01)),
+        )]);
+        assert_eq!(
+            resolver.resolve_counterparty("CARD-1", None),
+            Some(main),
+            "there is no date to refuse the alias with, and refusing it anyway \
+             would be a conclusion drawn from a field the row does not carry"
+        );
+    }
+
+    #[test]
+    fn an_identity_match_beats_a_title_match() {
+        let by_title = account(1);
+        let by_identity = account(2);
+        let resolver = resolver(vec![
+            detail(by_title, "ACC-2"),
+            with_identity(detail(by_identity, "Savings"), "ACC-2"),
+        ]);
+        assert_eq!(
+            resolver.resolve_counterparty("ACC-2", None),
+            Some(by_identity),
+            "a title is a display name and an identity is what a source repeats"
+        );
+    }
+
+    #[test]
+    fn an_alias_match_beats_a_title_match() {
+        let by_title = account(1);
+        let by_alias = account(2);
+        let resolver = resolver(vec![
+            detail(by_title, "CARD-1"),
+            with_alias(
+                detail(by_alias, "Savings"),
+                "CARD-1",
+                date!(2026 - 01 - 01),
+                None,
+            ),
+        ]);
+        assert_eq!(
+            resolver.resolve_counterparty("CARD-1", Some(date!(2026 - 06 - 01))),
+            Some(by_alias),
+            "an alias is an identifier and a title is not"
+        );
+    }
+
+    #[test]
+    fn two_accounts_sharing_a_title_resolve_neither() {
+        let resolver = resolver(vec![
+            detail(account(1), "Savings"),
+            detail(account(2), "Savings"),
+        ]);
+        assert_eq!(resolver.resolve_counterparty("Savings", None), None);
+        assert_eq!(resolver.counterparty_matches("Savings", None), 2);
+    }
+
+    #[test]
+    fn two_accounts_sharing_an_identifier_resolve_neither() {
+        let resolver = resolver(vec![
+            with_identity(detail(account(1), "Main"), "ACC-1"),
+            with_alias(
+                detail(account(2), "Savings"),
+                "ACC-1",
+                date!(2026 - 01 - 01),
+                None,
+            ),
+        ]);
+        assert_eq!(
+            resolver.resolve_counterparty("ACC-1", None),
+            None,
+            "picking between them is the guess the resolver exists to refuse, \
+             and it is refused at every tier and not only at the title"
+        );
+        assert_eq!(resolver.counterparty_matches("ACC-1", None), 2);
+    }
+
+    #[test]
+    fn a_title_still_resolves_an_account_that_states_no_identity() {
+        let main = account(1);
+        let resolver = resolver(vec![detail(main, "Savings")]);
+        assert_eq!(resolver.resolve_counterparty(" savings ", None), Some(main));
+    }
+
+    // --- what the owner's transfer statement does -------------------------
+
+    #[test]
+    fn a_resolution_the_owners_statement_denies_is_withdrawn() {
+        let main = account(1);
+        let checking = account(2);
+        let savings = account(3);
+        let resolver = stating(
+            vec![
+                detail(main, "Main"),
+                detail(checking, "Checking"),
+                detail(savings, "Savings"),
+            ],
+            vec![(main, vec![savings])],
+        );
+        match resolver.assess(&row(main, "Checking", None)) {
+            Assessment::Ambiguous { question } => assert_eq!(
+                question,
+                Question::IsTransferInternal {
+                    account: main,
+                    counterparty: "Checking".to_owned(),
+                },
+                "the row goes back to being a question about a named counterparty"
+            ),
+            Assessment::Settled { classification, .. } => panic!(
+                "the owner said money does not move between these two, so this \
+                 must be asked and not derived: {classification:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_resolution_the_owners_statement_names_stands() {
+        let main = account(1);
+        let checking = account(2);
+        let resolver = stating(
+            vec![detail(main, "Main"), detail(checking, "Checking")],
+            vec![(main, vec![checking])],
+        );
+        match resolver.assess(&row(main, "Checking", None)) {
+            Assessment::Settled { classification, .. } => assert_eq!(
+                classification,
+                Classification::InternalTransfer { to: checking }
+            ),
+            Assessment::Ambiguous { question } => {
+                panic!("nothing here withdraws a declared pair: {question:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_statement_on_the_far_side_naming_this_account_leaves_the_resolution_standing() {
+        let main = account(1);
+        let checking = account(2);
+        let savings = account(3);
+        let resolver = stating(
+            vec![
+                detail(main, "Main"),
+                detail(checking, "Checking"),
+                detail(savings, "Savings"),
+            ],
+            vec![(main, vec![savings]), (checking, vec![main])],
+        );
+        match resolver.assess(&row(main, "Checking", None)) {
+            Assessment::Settled { classification, .. } => assert_eq!(
+                classification,
+                Classification::InternalTransfer { to: checking },
+                "he declared the pair from the other side, and the pair is the \
+                 same pair whichever side he was asked about"
+            ),
+            Assessment::Ambiguous { question } => panic!("{question:?}"),
+        }
+    }
+
+    #[test]
+    fn an_account_the_owner_has_not_spoken_about_withdraws_nothing() {
+        let main = account(1);
+        let checking = account(2);
+        let resolver = stating(
+            vec![detail(main, "Main"), detail(checking, "Checking")],
+            Vec::new(),
+        );
+        match resolver.assess(&row(main, "Checking", None)) {
+            Assessment::Settled { classification, .. } => assert_eq!(
+                classification,
+                Classification::InternalTransfer { to: checking },
+                "silence is not a denial, and it is the state a new account is in"
+            ),
+            Assessment::Ambiguous { question } => panic!("{question:?}"),
+        }
+    }
+
+    #[test]
+    fn a_statement_naming_no_partners_denies_every_own_account() {
+        let main = account(1);
+        let checking = account(2);
+        let resolver = stating(
+            vec![detail(main, "Main"), detail(checking, "Checking")],
+            vec![(main, Vec::new())],
+        );
+        assert!(
+            matches!(
+                resolver.assess(&row(main, "Checking", None)),
+                Assessment::Ambiguous { .. }
+            ),
+            "«none of my others» is an answer, and it answers this"
+        );
+    }
+
+    #[test]
+    fn a_statement_does_not_break_a_tie_between_two_accounts_of_one_title() {
+        let main = account(1);
+        let declared = account(2);
+        let other = account(3);
+        let resolver = stating(
+            vec![
+                detail(main, "Main"),
+                detail(declared, "Savings"),
+                detail(other, "Savings"),
+            ],
+            vec![(main, vec![declared])],
+        );
+        assert_eq!(
+            resolver.resolve_counterparty("Savings", None),
+            None,
+            "the statement says which pairs move money; it does not say which \
+             account the printed string names, and assembling one conclusion \
+             out of the two would be a fact about this row that neither states"
+        );
+        assert!(matches!(
+            resolver.assess(&row(main, "Savings", None)),
+            Assessment::Ambiguous { .. }
+        ));
     }
 }

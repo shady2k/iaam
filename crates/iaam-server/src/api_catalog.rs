@@ -55,7 +55,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use utoipa::openapi::OpenApi;
 
-use iaam_core::report::confidence::ReportGoal;
+use iaam_core::goal::ReportGoal;
 
 /// The address of the machine-readable contract.
 ///

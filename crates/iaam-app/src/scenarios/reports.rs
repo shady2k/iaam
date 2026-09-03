@@ -42,6 +42,7 @@ use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::{AccountView, NegativeBalanceExpectation, Principal};
 
+pub use iaam_core::goal::ReportGoal;
 /// The report vocabulary, in the core.
 ///
 /// These types were defined here, beside the scenario that fills them, and
@@ -58,8 +59,7 @@ pub use iaam_core::report::balances::{
     PeriodReports,
 };
 pub use iaam_core::report::confidence::{
-    Caveat, CaveatKind, CaveatSubject, ReportConfidence, ReportGoal, money_flow_confidence,
-    returns_confidence,
+    Caveat, CaveatKind, CaveatSubject, ReportConfidence, money_flow_confidence, returns_confidence,
 };
 pub use iaam_core::report::population::{
     AccountStanding, KnownAccountCoverage, PopulationAccount, ReportPopulation,

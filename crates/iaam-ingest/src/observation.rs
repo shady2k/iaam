@@ -408,4 +408,25 @@ impl Intake {
     pub const fn is_concluded(&self) -> bool {
         matches!(self, Self::Concluded { .. })
     }
+
+    /// The account the row is on, as the caller stated it.
+    ///
+    /// Both arms carry one and neither derives it: an observation names the
+    /// account whose statement printed the line, and a conclusion names the
+    /// account the operation is recorded against. It is one question — «whose
+    /// row is this» — so it is answered once here rather than by each caller
+    /// matching on the tag, which is how the two arms come to be read
+    /// differently.
+    ///
+    /// Not the event's account, which can differ: a transfer is submitted from
+    /// the sending side and the receiving statement's row still belongs to the
+    /// receiving account. What this answers is which statement the row came
+    /// off.
+    #[must_use]
+    pub const fn account(&self) -> AccountId {
+        match self {
+            Self::Concluded { operation } => operation.account,
+            Self::Observed { row } => row.account,
+        }
+    }
 }

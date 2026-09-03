@@ -3005,7 +3005,15 @@ pub async fn ingest_operations(
     }
 
     let domain: Vec<Intake> = accepted.iter().map(|(_, intake)| intake.clone()).collect();
-    let outcomes = submit_intake(&state.services, &principal, source, import, &domain).await?;
+    let outcomes = submit_intake(
+        &state.services,
+        &principal,
+        declared.map(|(_, account)| account),
+        source,
+        import,
+        &domain,
+    )
+    .await?;
     for ((row, _), outcome) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(intake_verdict_dto(*row, outcome));
     }
@@ -3100,6 +3108,7 @@ pub async fn open_import_session(
     let session = iaam_app::scenarios::import_session::open_session(
         &state.services,
         &principal,
+        account.as_ref().map(|account| account.id),
         source,
         import,
     )

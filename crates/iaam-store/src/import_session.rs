@@ -9,7 +9,7 @@
 //! and the application reads them. It validates that they parse, because a
 //! payload the application cannot read must not be written silently.
 
-use iaam_core::ids::{ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{SqliteStore, StoreError, now};
@@ -60,6 +60,13 @@ pub struct StoredSession {
     pub id: ImportSessionId,
     pub owner: OwnerId,
     pub state: SessionState,
+    /// The account the declaration named, when it named one.
+    ///
+    /// Stored beside `source` and `import` rather than derived from them: both
+    /// of those are one-way hashes of the account, so a session that kept only
+    /// them could not say afterwards which account it was declared for — and
+    /// therefore could not refuse a row for a different one.
+    pub account: Option<AccountId>,
     pub source: Option<SourceId>,
     pub import: Option<ImportId>,
     pub opened_at: String,
@@ -147,9 +154,18 @@ impl SqliteStore {
     /// declared import would split that statement's questions across two places
     /// and the owner would answer one of them. A batch that declared no import
     /// gets a session of its own every time: there is nothing to recognise it by.
+    ///
+    /// `account` is stored and nothing here derives from it, and it is stored
+    /// **as well as** `source` and `import` rather than instead of them: those
+    /// two are what the journal is stamped with, and both are one-way hashes of
+    /// this account together with the channel and the label. A reused session
+    /// keeps the account it was opened with, which cannot disagree with the one
+    /// passed here: an import identity is derived from an account, so two calls
+    /// naming one import name one account.
     pub fn open_import_session(
         &mut self,
         owner: OwnerId,
+        account: Option<AccountId>,
         source: Option<SourceId>,
         import: Option<ImportId>,
     ) -> Result<StoredSession, StoreError> {
@@ -166,18 +182,21 @@ impl SqliteStore {
             id: ImportSessionId::new_random(),
             owner,
             state: SessionState::Open,
+            account,
             source,
             import,
             opened_at: now(),
             closed_at: None,
         };
         transaction.execute(
-            "INSERT INTO import_sessions (id, owner, state, source, import, opened_at, closed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            "INSERT INTO import_sessions
+                 (id, owner, state, account, source, import, opened_at, closed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
             params![
                 session.id.inner().to_string(),
                 owner.inner().to_string(),
                 session.state.code(),
+                account.map(|id| id.inner().to_string()),
                 source.map(|id| id.inner().to_string()),
                 import.map(|id| id.inner().to_string()),
                 session.opened_at,
@@ -199,7 +218,7 @@ impl SqliteStore {
     ) -> Result<Option<StoredSession>, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, state, source, import, opened_at, closed_at
+                "SELECT id, state, account, source, import, opened_at, closed_at
                  FROM import_sessions WHERE owner = ?1 AND id = ?2",
                 params![owner.inner().to_string(), id.inner().to_string()],
                 |row| {
@@ -208,8 +227,9 @@ impl SqliteStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
@@ -225,7 +245,7 @@ impl SqliteStore {
     /// it.
     pub fn list_import_sessions(&self, owner: OwnerId) -> Result<Vec<StoredSession>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, state, source, import, opened_at, closed_at
+            "SELECT id, state, account, source, import, opened_at, closed_at
              FROM import_sessions WHERE owner = ?1
              ORDER BY opened_at DESC, id",
         )?;
@@ -235,8 +255,9 @@ impl SqliteStore {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut sessions = Vec::new();
@@ -630,7 +651,7 @@ fn open_session_for_import(
     import: ImportId,
 ) -> Result<Option<StoredSession>, StoreError> {
     conn.query_row(
-        "SELECT id, state, source, import, opened_at, closed_at
+        "SELECT id, state, account, source, import, opened_at, closed_at
          FROM import_sessions
          WHERE owner = ?1 AND import = ?2 AND state = 'open'",
         params![owner.inner().to_string(), import.inner().to_string()],
@@ -640,8 +661,9 @@ fn open_session_for_import(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         },
     )
@@ -769,16 +791,22 @@ type SessionColumns = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
     String,
     Option<String>,
 );
 
 fn session_from(owner: OwnerId, row: SessionColumns) -> Result<StoredSession, StoreError> {
-    let (id, state, source, import, opened_at, closed_at) = row;
+    let (id, state, account, source, import, opened_at, closed_at) = row;
     Ok(StoredSession {
         id: ImportSessionId(parse_uuid(&id, "import session")?),
         owner,
         state: SessionState::parse(&state)?,
+        account: account
+            .as_deref()
+            .map(|value| parse_uuid(value, "account"))
+            .transpose()?
+            .map(AccountId),
         source: source
             .as_deref()
             .map(|value| parse_uuid(value, "source"))

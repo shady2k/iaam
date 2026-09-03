@@ -13355,6 +13355,123 @@ async fn a_declared_import_that_already_holds_rows_is_refused_and_the_refusal_na
     );
 }
 
+/// A declared session takes rows for the account it declared and no other
+/// (iaam-tmvz).
+///
+/// The batch route has always refused this, because its declaration and its
+/// rows arrive in one request. A session could not: it stored `source` and
+/// `import`, both one-way hashes of the account, so by the time rows arrived
+/// the account was gone — and a row for another account was held and then
+/// committed under **this** import's identity, recorded against one account
+/// while carrying the import identity of another. Retracting either import
+/// then takes the wrong rows.
+///
+/// Three properties, and the third is what keeps the fix from being a
+/// regression: the wrong account is refused, the right one is taken, and a free
+/// session — one opened with no declaration — still holds rows for several
+/// accounts, which is the whole reason for opening one.
+///
+/// Every account, label and amount below is invented for this test (CLAUDE.md).
+#[tokio::test]
+async fn a_declared_session_refuses_a_row_for_an_account_it_did_not_declare() {
+    let harness = harness();
+    let main = another_account(&harness, "Main").await;
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, opened) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": main, "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    // One row for the declared account and one for another. The whole call is
+    // refused rather than the row: a row for another account contradicts the
+    // declaration the session was opened under, and holding the agreeing half
+    // would leave a half-import staged under an identity naming the wrong
+    // account.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [
+                unresolved_row(main, "march-1"),
+                unresolved_row(savings, "march-2"),
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let detail = refused.to_string();
+    assert!(
+        detail.contains(&main.to_string()) && detail.contains(&savings.to_string()),
+        "the refusal must name the account declared and the one the row named: {refused}"
+    );
+
+    // And nothing was held: the check runs before the first observation is
+    // written, so a refused call leaves the session as it found it.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["row_count"], 0,
+        "a refused call must hold none of its rows: {contents}"
+    );
+
+    // The declared account is taken exactly as before.
+    let (status, held) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(main, "march-1")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+
+    // A free session declares no account, so there is nothing for its rows to
+    // disagree with. This is the shape for an export covering a whole
+    // institution: one session, questions answered once, one commit.
+    let (status, free) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{free}");
+    let free = free["session"].as_str().expect("session").to_owned();
+    let (status, both) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{free}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [
+                unresolved_row(main, "free-1"),
+                unresolved_row(savings, "free-2"),
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a session with no declaration holds rows for several accounts: {both}"
+    );
+    assert_eq!(both.as_array().expect("held rows").len(), 2, "{both}");
+}
+
 /// With every question answered, committing is what the refusal leads with.
 #[tokio::test]
 async fn a_settled_import_under_way_is_refused_with_the_commit_that_ends_it() {

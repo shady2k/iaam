@@ -137,6 +137,7 @@ impl SessionContents {
 pub async fn submit_intake(
     services: &AppServices,
     principal: &Principal,
+    account: Option<AccountId>,
     source: SourceId,
     import: Option<ImportId>,
     rows: &[Intake],
@@ -182,7 +183,13 @@ pub async fn submit_intake(
         Some(
             services
                 .store
-                .open_import_session(principal.owner, Some(source), import)
+                // The declared account travels into the session with the source
+                // and the import. This route has already checked every row
+                // against it, but the session it opens outlives the request:
+                // the caller is handed its identifier and may feed it further
+                // rows, and those go through [`add_rows`], which can only check
+                // what the session recorded.
+                .open_import_session(principal.owner, account, Some(source), import)
                 .await?,
         )
     } else {
@@ -364,9 +371,17 @@ pub async fn resolve_declared_account(
 /// need to be: the store's unique index still admits one open session per
 /// import, so the worst a race produces is the old answer — a session handed
 /// back that acquired its first row in between.
+///
+/// `account` is what the declaration resolved to, and it is stored on the
+/// session rather than left in this request. `source` and `import` are both
+/// one-way hashes of it, so a session that kept only those could not say
+/// afterwards which account it was declared for, and [`add_rows`] therefore
+/// could not refuse a row for another one (iaam-tmvz). `None` opens a free
+/// session, which holds rows for as many accounts as its export covers.
 pub async fn open_session(
     services: &AppServices,
     principal: &Principal,
+    account: Option<AccountId>,
     source: Option<SourceId>,
     import: Option<ImportId>,
 ) -> Result<ImportSessionView, AppError> {
@@ -381,7 +396,7 @@ pub async fn open_session(
     }
     services
         .store
-        .open_import_session(principal.owner, source, import)
+        .open_import_session(principal.owner, account, source, import)
         .await
 }
 
@@ -513,6 +528,43 @@ pub async fn list_sessions(
 /// row the caller concluded. That is the difference between this and
 /// [`submit_intake`]: a session defers **everything** to commit, which is what
 /// lets both legs of one transfer sit in it before either is recorded.
+///
+/// **A declared session takes rows for the account it declared and no other**
+/// (iaam-tmvz). The batch route has always checked this because its declaration
+/// and its rows arrive together; a session could not, because it stored only
+/// `source` and `import`, which are one-way hashes of the account, and by the
+/// time the rows arrived the account was gone. It stores the account now, and
+/// this is the check that account was stored for: a row for another account
+/// would be held and then committed under **this** import's identity —
+/// recorded against one account while carrying the import identity of another,
+/// so that retracting either import takes the wrong rows.
+///
+/// The check is against the account the declaration **resolved** to, not the
+/// text it was written as: a caller may declare by the number its bank prints
+/// while its rows name the account by its iaam identifier, which is the one
+/// thing both sides can state.
+///
+/// It applies only where a declaration was made, and that is not a gap. A free
+/// session is opened without one precisely so that an institution-wide export
+/// is one session rather than four, and its rows legitimately name several
+/// accounts; there is nothing for them to disagree with. A session opened
+/// before the account was recorded is in the same position and is left there:
+/// giving it the account of whoever feeds it next would be inventing the
+/// declaration it never made.
+///
+/// The whole call is refused rather than the row, exactly as on the batch
+/// route, and for its reason: an unreadable row is one row the caller got
+/// wrong, while a row for another account contradicts the declaration the
+/// session was opened under, and holding the agreeing half would leave a
+/// half-import staged under an identity that names the wrong account. It is
+/// refused **before** the first observation is written, so a refused call
+/// leaves the session exactly as it found it.
+///
+/// The refusal names no request index. The rows this function receives are the
+/// ones the transport could read, so a position here is a position in that
+/// list and not in the caller's body; naming the offending row in prose says
+/// what is true instead of an index that is off by however many rows above it
+/// were unreadable.
 pub async fn add_rows(
     services: &AppServices,
     principal: &Principal,
@@ -520,6 +572,33 @@ pub async fn add_rows(
     rows: &[Intake],
 ) -> Result<Vec<HeldRow>, AppError> {
     require_submit(principal)?;
+    // A session that cannot be found declares nothing, and the refusal for that
+    // is `add_import_observation`'s own: reporting it here as well would give
+    // one mistake two answers.
+    let declared = services
+        .store
+        .load_import_session(principal.owner, session)
+        .await?
+        .and_then(|view| view.account);
+    if let Some(declared) = declared {
+        for (index, intake) in rows.iter().enumerate() {
+            let named = intake.account();
+            if named != declared {
+                return Err(AppError::Invalid {
+                    field: "operations".to_owned(),
+                    expected: format!(
+                        "rows for account {}, which this session was declared for",
+                        declared.inner()
+                    ),
+                    actual: format!(
+                        "row {} of this batch names account {}",
+                        index + 1,
+                        named.inner()
+                    ),
+                });
+            }
+        }
+    }
     let resolver = Resolver::load(services, principal.owner).await?;
     let mut outcomes: Vec<HeldRow> = Vec::with_capacity(rows.len());
     for intake in rows {
@@ -1652,11 +1731,14 @@ struct ReadRow {
 
 impl ReadRow {
     /// The account the row is on, as the caller stated it.
+    ///
+    /// `None` only where the stored payload does not parse: a row this build
+    /// cannot read names nothing it can be trusted about. The answer for every
+    /// row it can read is [`Intake::account`]'s, so that the account this
+    /// assessment reports and the account [`add_rows`] checked are read the
+    /// same way.
     fn account(&self) -> Option<AccountId> {
-        match self.intake.as_ref()? {
-            Intake::Observed { row } => Some(row.account),
-            Intake::Concluded { operation } => Some(operation.account),
-        }
+        Some(self.intake.as_ref()?.account())
     }
 
     /// The document the row names, when it names one.

@@ -7553,13 +7553,21 @@ pub struct OpenImportSessionRequest {
     /// reach them: a free session's rows are corrected one event at a time
     /// through `POST /v1/corrections`, having been found in the journal first.
     ///
-    /// One thing a declaration does **not** buy: the session does not check that
-    /// the rows fed to it name the declared account, and cannot. It stores the
-    /// source and import, both one-way derivations, and the account itself is
-    /// gone by the time rows arrive. A row for another account is held, and
-    /// committed, under this import's identity. (The batch route does check it,
-    /// because there the declaration and the rows are in one request.) Feed a
-    /// declared session only the account it was declared for.
+    /// A declared session takes rows for the account it declared and no other.
+    /// Feeding it a row that names a different one refuses the whole call
+    /// before anything is held: a row for another account would otherwise be
+    /// committed under **this** import's identity — recorded against one
+    /// account while carrying the import identity of another, so that
+    /// retracting either import takes the wrong rows. A free session has no
+    /// such check and needs none: nothing scopes it to an account, which is
+    /// the point of opening one.
+    ///
+    /// Sessions opened before the account was recorded are the exception, and
+    /// they keep the old behaviour rather than acquiring the check: such a
+    /// session stored only the source and import, both one-way derivations, so
+    /// there is no account to compare a row with and inventing one from
+    /// whoever feeds it next would be inventing the declaration it never
+    /// made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DeclaredSourceDto>,
 }
@@ -7630,12 +7638,13 @@ pub struct ImportSessionDto {
     /// The account the declaration named, resolved.
     ///
     /// Present on the response that opened the session, and absent everywhere
-    /// else — which is a fact about the session rather than an oversight. A
-    /// session stores its `source` and `import`, and both are one-way
-    /// derivations from the account: nothing read back later can recover it.
-    /// The moment the server holds the account is the moment it resolved the
-    /// declaration, so that is the response that carries it, and a caller
-    /// wanting it afterwards asks the directory as it always did.
+    /// else. The session does now record which account it was declared for —
+    /// that is what lets it refuse a row for another one — but this field
+    /// carries the account's title beside its identifier, and the title comes
+    /// from the directory, not from the session. Filling it in on the list
+    /// would put a directory read behind a route that reads no accounts, to
+    /// answer a question the open response has already answered and the
+    /// refusal answers again when it matters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<DeclaredAccountDto>,
 }

@@ -9059,3 +9059,48 @@ async fn the_two_routes_agree_about_a_financing_account() {
         "one account, one journal, two answers: {balances} / {reconciliation}"
     );
 }
+
+#[tokio::test]
+async fn every_documented_parameter_sits_where_the_route_reads_it() {
+    // `IntoParams` defaults a struct's parameters to `in: path` whenever the
+    // operation has any path parameter at all, and says nothing when it has
+    // none. Nine structs read by `ApiQuery` were therefore published as path
+    // parameters — 42 of them, every filter on every report, market,
+    // reconciliation and journal route — so a client generated from this
+    // document could not send a single one of them.
+    //
+    // The check is structural rather than a list of names: a parameter belongs
+    // in `path` exactly when the path template names it, and in `query`
+    // otherwise. That way a route added later is covered by the guard on the
+    // day it is written, which a list of known names would not do.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut wrong = Vec::new();
+    for (path, item) in spec["paths"].as_object().expect("OpenAPI paths") {
+        for (method, operation) in item.as_object().expect("path item") {
+            let Some(parameters) = operation["parameters"].as_array() else {
+                continue;
+            };
+            for parameter in parameters {
+                let name = parameter["name"].as_str().expect("parameter name");
+                let location = parameter["in"].as_str().expect("parameter location");
+                let templated = path.contains(&format!("{{{name}}}"));
+                let expected = if templated { "path" } else { "query" };
+                if location != expected {
+                    wrong.push(format!(
+                        "{method} {path}: `{name}` is documented in `{location}`, \
+                         but the path template {} it",
+                        if templated { "names" } else { "does not name" }
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a parameter is documented somewhere the route does not read it:\n{}",
+        wrong.join("\n")
+    );
+}

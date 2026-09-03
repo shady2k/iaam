@@ -1077,6 +1077,7 @@ pub async fn sync_market(
 
 /// Price series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct MarketPricesParams {
     /// Instrument identifier.
     pub instrument: Uuid,
@@ -1105,6 +1106,7 @@ pub struct MarketPricesParams {
 
 /// Exchange-rate series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct MarketFxParams {
     /// Base currency of the pair: the currency being priced.
     pub base: CurrencyDto,
@@ -1124,6 +1126,7 @@ pub struct MarketFxParams {
 
 /// Key-rate series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct MarketKeyRateParams {
     /// Inclusive start of the interval, YYYY-MM-DD.
     #[param(value_type = String, format = Date)]
@@ -1778,6 +1781,7 @@ pub async fn ingest_csv(
 
 /// Money flow report parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct MoneyFlowParams {
     /// Scope identifier.
     pub contour: Uuid,
@@ -1829,6 +1833,7 @@ pub async fn flow_report(
 
 /// Account balances at a date.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct BalancesParams {
     /// Scope identifier.
     pub contour: Uuid,
@@ -1871,6 +1876,7 @@ pub async fn balances_report(
 
 /// Returns report parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ReturnsParams {
     /// Scope identifier.
     pub contour: Uuid,
@@ -2160,6 +2166,7 @@ fn matcher_text(value: &serde_json::Value, field: &str) -> Result<String, ApiFai
 }
 /// Journal read parameters. Every filter is optional and they combine.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct JournalParams {
     /// The client key supplied at ingest. It addresses at most one event, so a
     /// key that matches nothing is reported as a missing resource rather than

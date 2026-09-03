@@ -3900,6 +3900,7 @@ mod tests {
 }
 /// Report upload parameters. The route body is the workbook's binary bytes.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DocumentParams {
     #[serde(default)]
     pub account: Option<Uuid>,
@@ -3924,6 +3925,7 @@ pub struct DocumentDto {
 
 /// Reconciliation range parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ReconciliationParams {
     pub account: Uuid,
     pub from: String,
@@ -4554,12 +4556,6 @@ pub struct ClassificationRuleRequest {
     pub outcome: String,
     #[serde(default)]
     pub replaces: Option<Uuid>,
-}
-
-/// Rule identifier in DELETE.
-#[derive(Debug, Clone, Deserialize, IntoParams)]
-pub struct ClassificationRuleParams {
-    pub id: Uuid,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]

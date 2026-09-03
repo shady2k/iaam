@@ -17,7 +17,7 @@ use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperat
 use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CashAssetClass, CategoryRuleView, CategoryView,
-    ClassificationRuleView, IssuedToken, Scope, TokenView,
+    ClassificationRuleView, IssuedToken, NegativeBalanceExpectation, Scope, TokenView,
 };
 use iaam_app::ports::{ImportQuestionView, ImportSessionView};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
@@ -27,8 +27,8 @@ use iaam_app::scenarios::import_session::{
     HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow, RetentionReason,
 };
 use iaam_app::scenarios::reports::{
-    AccountBalanceRow, BalancesReport, Caveat, CaveatSubject, MoneyFlowOutcome, PopulationAccount,
-    ReportConfidence, ReportPopulation, ReturnsOutcome,
+    AccountBalanceRow, AssetSnapshot, BalancesReport, Caveat, CaveatSubject, MoneyFlowOutcome,
+    PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
 use iaam_core::bond::offer::OfferChoice;
@@ -1304,7 +1304,7 @@ pub struct CalcMoneyDto {
 }
 
 impl CalcMoneyDto {
-    fn from_domain(value: &iaam_core::money::CalcMoney) -> Self {
+    pub(crate) fn from_domain(value: &iaam_core::money::CalcMoney) -> Self {
         Self {
             value: value.value().inner().to_string(),
             currency: CurrencyDto::from_domain(value.currency()),
@@ -2737,6 +2737,29 @@ pub struct NegativeCashDto {
     /// Why the balance is negative (§11). Null under the same unreachable
     /// condition as `from`.
     pub classification: Option<NegativeCashClassificationDto>,
+    /// What the owner said a negative balance on this account would mean. Null
+    /// where he has not said, which is most accounts.
+    ///
+    /// It is layered over `classification` rather than competing with it: the
+    /// classification is evidence about *why* this balance is negative, derived
+    /// from settlement terms and credit indicators and needing no owner input
+    /// (`iaam-sbht`); this is his prior about whether it should be negative at
+    /// all.
+    pub expectation: Option<NegativeBalanceExpectationDto>,
+    /// Whether this figure contradicts what the owner expected — true only
+    /// where he said a negative balance here would be unexpected.
+    ///
+    /// **A warning about a probable error, not a verdict and not a refusal.** A
+    /// technical overdraft on a debit card is real and ordinary, which is why
+    /// the owner records an expectation rather than a prohibition. Nothing is
+    /// refused, suppressed or recalculated when this is true: the figure above
+    /// stands, the report stays complete, and the reader is told where to look
+    /// first — usually at `accounts[].cash[].opening`, since the reported case
+    /// behind this was a missing opening assertion rather than an overdraft.
+    ///
+    /// Derived from `expectation`, never stored beside it: silence is not a
+    /// contradiction, and `ordinary` is the opposite of one.
+    pub contradicts_expectation: bool,
 }
 
 /// Cash and positions for one contour account.
@@ -2831,6 +2854,12 @@ impl BalancesReportDto {
                     classification: entry.span.map(|span| {
                         NegativeCashClassificationDto::from_domain(&span.classification)
                     }),
+                    expectation: entry
+                        .expectation
+                        .map(NegativeBalanceExpectationDto::from_domain),
+                    // Asked of the entry, not recomputed here: the transport
+                    // does not decide what contradicts what.
+                    contradicts_expectation: entry.contradicts_expectation(),
                 })
                 .collect(),
             population: PopulationDto::from_domain(&report.population),
@@ -2880,6 +2909,246 @@ impl AccountBalanceDto {
                 })
                 .collect(),
         }
+    }
+}
+
+/// What the owner holds at a date, grouped by the class of cash he declared.
+///
+/// The report the balances answer is not: `/v1/reports/balances` states a
+/// figure per account and currency, with no total and no grouping, so the
+/// owner's own question — how much is on deposit, how much on savings, how
+/// much is invested, what the whole is worth — could only be assembled by
+/// grouping accounts on their titles.
+///
+/// **The fields are in the order they must be read.** The register first, for
+/// the reason it is first on the balances answer. Then the two halves: `cash`
+/// is exact, and `positions` is worth what a quote said on the date it names.
+/// Only then `total`, which mixes them. A reader who met the total first could
+/// not tell which part of it a market can move overnight.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AssetSnapshotDto {
+    /// What would have to be true for these figures to be a complete statement
+    /// of what the owner holds, and which of those things are not.
+    pub confidence: ConfidenceDto,
+    /// The date the snapshot is taken at.
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub as_of: Date,
+    /// The exact half.
+    pub cash: CashSideDto,
+    /// The market-dependent half.
+    pub positions: PositionsSideDto,
+    /// Both halves added, per currency. Nothing is converted, so a currency
+    /// present in only one half appears here as that half alone.
+    ///
+    /// A calculated value rather than a posted amount: the moment a quote
+    /// enters a figure the figure stops being a bank balance, and the type says
+    /// so.
+    pub total: Vec<CalcMoneyDto>,
+    /// The rows every total above was folded from — the balances answer's own
+    /// rows. They are here so a total can be checked against them inside one
+    /// response rather than against a second request that may have read a
+    /// different journal.
+    pub accounts: Vec<AssetAccountDto>,
+    /// The accounts this answer covered, and the known accounts it did not. A
+    /// total that silently omits an account is worse than no total.
+    pub population: PopulationDto,
+}
+
+/// Cash, as the journal recorded it, grouped by the class the owner declared.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CashSideDto {
+    /// One entry per class present among the covered accounts, with the
+    /// unstated class first. Always present; empty when the scope holds no
+    /// account at all.
+    pub classes: Vec<CashClassTotalDto>,
+    /// Every class added up, per currency.
+    pub totals: Vec<AmountDto>,
+    /// `asserted` — every figure summed here rests on an opening assertion, so
+    /// the totals are balances. `unasserted` — at least one does not, so at
+    /// least part of the sum is movement since an unknown start. The register
+    /// names which account and currency.
+    pub opening: String,
+}
+
+/// One class of cash and what the accounts declared to be it hold.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CashClassTotalDto {
+    /// The class the owner declared, in the vocabulary `AccountDto.cash_class`
+    /// uses — `deposit`, `savings`, `card_account`, `wallet`. **Null is a
+    /// group, not a missing field**: it holds the accounts whose class the
+    /// owner has not stated, and nothing guesses one for them.
+    pub cash_class: Option<String>,
+    /// The accounts folded into these figures, so a heading can be traced to
+    /// the rows beneath it.
+    pub accounts: Vec<Uuid>,
+    /// One figure per currency. Nothing is converted.
+    pub totals: Vec<AmountDto>,
+    /// `asserted` or `unasserted`, for this class. One running sum makes the
+    /// class total a running sum.
+    pub opening: String,
+}
+
+/// Positions, at the prices the journal holds.
+///
+/// The prices are the ones the journal itself records, the same board the
+/// projection builds from `valuation` events. This report runs no market
+/// selection of its own: an instrument the journal never priced is reported as
+/// unvalued rather than valued from a source this report chose.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PositionsSideDto {
+    /// One entry per instrument held across the scope. Always present.
+    pub holdings: Vec<HoldingValueDto>,
+    /// The earliest date any price behind `totals` was for — the oldest link,
+    /// and the honest summary of «as of when». Null when nothing was priced.
+    ///
+    /// The per-holding dates are on `holdings[].price.as_of`: one summary date
+    /// cannot say that one instrument is a day stale and another a year.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub oldest_price_date: Option<Date>,
+    /// The priced holdings added up, per currency of the quote. An unvalued
+    /// holding is in no total.
+    pub totals: Vec<CalcMoneyDto>,
+}
+
+/// One instrument the owner holds, and what a quote said it was worth.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HoldingValueDto {
+    pub instrument: Uuid,
+    /// The quantity across every account and custody location in the scope. The
+    /// per-account keys stay on `accounts[].positions`.
+    pub quantity: String,
+    /// The quote used. Null when the journal holds none at or before the report
+    /// date.
+    pub price: Option<HoldingPriceDto>,
+    /// Null exactly when `price` is: an unvalued holding is **absent from the
+    /// total, not valued at zero**. Zero is a number the owner would add up;
+    /// null is a question, and `confidence` names it.
+    pub value: Option<CalcMoneyDto>,
+}
+
+/// The quote one holding was valued at.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HoldingPriceDto {
+    /// Price per unit, as a decimal string.
+    pub amount: String,
+    pub currency: CurrencyDto,
+    /// The date the price was observed for. It is part of the figure, not
+    /// metadata beside it.
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub as_of: Date,
+    /// `executable`, `previous_close`, `carried_forward`, `stale` or
+    /// `owner_estimate`.
+    pub quality: String,
+}
+
+/// One account inside the snapshot: the class it was grouped under, and what it
+/// holds.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AssetAccountDto {
+    pub account: Uuid,
+    /// The class the owner declared, or null where he has not.
+    pub cash_class: Option<String>,
+    pub cash: Vec<BalanceCashDto>,
+    pub positions: Vec<PositionQuantityDto>,
+}
+
+impl AssetSnapshotDto {
+    pub fn from_domain(snapshot: &AssetSnapshot) -> Self {
+        Self {
+            // Asked of the snapshot itself. The transport neither folds the
+            // rows nor decides what a caveat is: a register assembled here
+            // could disagree with the answer printed beside it.
+            confidence: ConfidenceDto::from_domain(&snapshot.confidence()),
+            as_of: snapshot.as_of,
+            cash: CashSideDto {
+                classes: snapshot
+                    .cash
+                    .classes
+                    .iter()
+                    .map(|class| CashClassTotalDto {
+                        cash_class: class.cash_class.clone(),
+                        accounts: class
+                            .accounts
+                            .iter()
+                            .map(|account| account.inner())
+                            .collect(),
+                        totals: class.totals.iter().map(amount_dto).collect(),
+                        opening: class.opening.code().to_owned(),
+                    })
+                    .collect(),
+                totals: snapshot.cash.totals.iter().map(amount_dto).collect(),
+                opening: snapshot.cash.opening.code().to_owned(),
+            },
+            positions: PositionsSideDto {
+                holdings: snapshot
+                    .positions
+                    .holdings
+                    .iter()
+                    .map(|holding| HoldingValueDto {
+                        instrument: holding.instrument.inner(),
+                        quantity: holding.quantity.0.inner().to_string(),
+                        price: holding.price.map(|price| HoldingPriceDto {
+                            amount: price.price.inner().to_string(),
+                            currency: CurrencyDto::from_domain(price.currency),
+                            as_of: price.as_of,
+                            quality: price.quality.code().to_owned(),
+                        }),
+                        value: holding.value.as_ref().map(CalcMoneyDto::from_domain),
+                    })
+                    .collect(),
+                oldest_price_date: snapshot.positions.oldest_price_date,
+                totals: snapshot
+                    .positions
+                    .totals
+                    .iter()
+                    .map(CalcMoneyDto::from_domain)
+                    .collect(),
+            },
+            total: snapshot
+                .total
+                .iter()
+                .map(CalcMoneyDto::from_domain)
+                .collect(),
+            accounts: snapshot
+                .accounts
+                .iter()
+                .map(|row| AssetAccountDto {
+                    account: row.account.inner(),
+                    cash_class: row.cash_class.clone(),
+                    cash: row
+                        .cash
+                        .iter()
+                        .map(|cash| BalanceCashDto {
+                            currency: CurrencyDto::from_domain(cash.money.currency()),
+                            amount: cash.money.to_calc_dec().inner().to_string(),
+                            opening: cash.opening.code().to_owned(),
+                        })
+                        .collect(),
+                    positions: row
+                        .positions
+                        .iter()
+                        .map(|(key, quantity)| PositionQuantityDto {
+                            instrument: key.instrument.inner(),
+                            custody: key.custody.map(|custody| custody.inner()),
+                            quantity: quantity.0.inner().to_string(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            population: PopulationDto::from_domain(&snapshot.population),
+        }
+    }
+}
+
+/// A posted amount on the wire, spelled the way every other cash figure in this
+/// module is spelled.
+fn amount_dto(money: &Money) -> AmountDto {
+    AmountDto {
+        amount: money.to_calc_dec().inner().to_string(),
+        currency: CurrencyDto::from_domain(money.currency()),
     }
 }
 
@@ -3083,6 +3352,11 @@ pub struct AccountDto {
     pub provider_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cash_class: Option<CashAssetClassDto>,
+    /// What the owner says a negative balance here would mean. Absent is «he
+    /// has not said», and that account behaves exactly as it did before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_balance_expectation: Option<NegativeBalanceExpectationDto>,
     /// Further identifiers reaching this same account. Two cards over one
     /// underlying account are one account with two aliases.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3152,6 +3426,58 @@ impl CashAssetClassDto {
             CashAssetClass::Wallet => Self::Wallet,
         }
     }
+}
+
+/// What the owner expects a negative balance on an account to mean.
+///
+/// **A warning, never a constraint.** A first draft of `iaam-d41s` had the
+/// owner record that an account *cannot be overdrawn*, and he corrected it: a
+/// technical overdraft on a debit card is real and ordinary. Nothing in iaam
+/// refuses a request, drops a row, suppresses a figure or fails a check on this
+/// value. The only thing it does is set `contradicts_expectation` beside a
+/// figure the report states either way.
+///
+/// **It is not derived from `cash_class`, and `cash_class` is not derived from
+/// it.** Decision 0004 §3 forbids that merge by name — «a savings account
+/// cannot be overdrawn, therefore warn» is wrong on the first ordinary
+/// technical overdraft. Two values, two consumers: the class reaches a report
+/// heading, this reaches a warning.
+///
+/// The field's absence is «the owner has not said», which is a third state and
+/// is never filled in by inference from a title, a class or a transaction
+/// pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NegativeBalanceExpectationDto {
+    /// A negative balance here would probably be an error.
+    Unexpected,
+    /// A negative balance here is ordinary — a credit line, a margin balance.
+    Ordinary,
+}
+
+impl NegativeBalanceExpectationDto {
+    #[must_use]
+    pub const fn to_domain(self) -> NegativeBalanceExpectation {
+        match self {
+            Self::Unexpected => NegativeBalanceExpectation::Unexpected,
+            Self::Ordinary => NegativeBalanceExpectation::Ordinary,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_domain(expectation: NegativeBalanceExpectation) -> Self {
+        match expectation {
+            NegativeBalanceExpectation::Unexpected => Self::Unexpected,
+            NegativeBalanceExpectation::Ordinary => Self::Ordinary,
+        }
+    }
+}
+
+/// The computed action policy returned for an owner.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ActionsResponseDto {
+    pub policy_version: u32,
+    pub items: Vec<ActionDto>,
 }
 
 /// One computed action.
@@ -3485,6 +3811,11 @@ pub struct CreateAccountRequest {
     pub provider_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cash_class: Option<CashAssetClassDto>,
+    /// What a negative balance on this account would mean. Optional, and
+    /// defaulting to no statement at all. It is the owner's, never inferred,
+    /// and never read off `cash_class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_balance_expectation: Option<NegativeBalanceExpectationDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<AccountAliasDto>,
 }

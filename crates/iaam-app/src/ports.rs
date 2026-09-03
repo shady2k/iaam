@@ -20,6 +20,7 @@ use iaam_ingest::dedup::IdentityScope;
 use iaam_store::documents::BrokerCode;
 // The grouping label deliberately does not live in `iaam-core`: the core is
 // where rules live, and nothing may branch on it.
+pub use iaam_core::report::balances::NegativeBalanceExpectation;
 pub use iaam_store::reference::CashAssetClass;
 use serde_json::Value;
 use std::sync::Arc;
@@ -113,6 +114,16 @@ pub struct AccountDetailView {
     /// The owner's grouping label. See [`CashAssetClass`]: report grouping reads
     /// it and nothing else may.
     pub cash_class: Option<CashAssetClass>,
+    /// What the owner says a negative balance on this account would mean
+    /// (`iaam-d41s`). `None` is «he has not said», and it is never inferred.
+    ///
+    /// A **second, independent** declaration beside `cash_class`. Decision 0004
+    /// §3 forbids deriving one from the other by name — «a savings account
+    /// cannot be overdrawn, therefore warn» is wrong on the first ordinary
+    /// technical overdraft — so the two travel as two fields with two
+    /// consumers: the class reaches a report heading, and this reaches the
+    /// warning on a negative-cash entry.
+    pub negative_balance_expectation: Option<NegativeBalanceExpectation>,
     /// Further identifiers for this same account, each with a validity
     /// interval. Two cards over one underlying account are one account with two
     /// aliases, so the balance is counted once.

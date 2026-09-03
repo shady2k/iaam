@@ -3,6 +3,7 @@
 
 use iaam_core::ids::{AccountId, OwnerId};
 use iaam_core::instrument::AliasInterval;
+use iaam_core::report::balances::NegativeBalanceExpectation;
 use iaam_store::SqliteStore;
 use iaam_store::reference::{
     AccountAliasRecord, AccountCreation, AccountDetailRecord, AccountIdentity, AccountRecord,
@@ -18,6 +19,7 @@ fn plain(owner: OwnerId, title: &str) -> AccountDetailRecord {
         institution: None,
         identity: None,
         cash_class: None,
+        negative_balance_expectation: None,
         aliases: Vec::new(),
     }
 }
@@ -222,6 +224,7 @@ fn an_account_created_before_decision_0004_keeps_working() {
             institution: Some("Bank One".into()),
             identity: None,
             cash_class: None,
+            negative_balance_expectation: None,
             aliases: Vec::new(),
         }]
     );
@@ -298,5 +301,106 @@ fn aliases_are_not_replaced_on_another_owners_account() {
         store.list_account_details(another).unwrap()[0]
             .aliases
             .is_empty()
+    );
+}
+
+/// The owner's expectation about a negative balance is stored and read back as
+/// he stated it, and an account he said nothing about reads back as having said
+/// nothing.
+#[test]
+fn a_negative_balance_expectation_round_trips_and_absence_stays_absence() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+
+    for expectation in NegativeBalanceExpectation::ALL {
+        store
+            .create_account(&AccountDetailRecord {
+                negative_balance_expectation: Some(expectation),
+                ..plain(owner, expectation.code())
+            })
+            .unwrap();
+    }
+    store.create_account(&plain(owner, "Silent")).unwrap();
+
+    let stored = store.list_account_details(owner).unwrap();
+    let silent = stored.iter().find(|a| a.title == "Silent").unwrap();
+    assert_eq!(
+        silent.negative_balance_expectation, None,
+        "silence is not a statement"
+    );
+    let mut stated: Vec<NegativeBalanceExpectation> = stored
+        .iter()
+        .filter_map(|a| a.negative_balance_expectation)
+        .collect();
+    stated.sort_unstable();
+    let mut expected = NegativeBalanceExpectation::ALL.to_vec();
+    expected.sort_unstable();
+    assert_eq!(stated, expected);
+}
+
+/// The expectation and the class are two independent declarations on one
+/// account. Neither is read to produce the other, and stating one says nothing
+/// about the other — which is what decision 0004 §3 forbids deriving.
+#[test]
+fn the_expectation_and_the_cash_class_are_independent_declarations() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+
+    // A savings account with nothing said about overdrafts: the class does not
+    // imply the expectation.
+    store
+        .create_account(&AccountDetailRecord {
+            cash_class: Some(CashAssetClass::Savings),
+            ..plain(owner, "Savings, no expectation")
+        })
+        .unwrap();
+    // A card account the owner does not expect to go negative: the expectation
+    // does not follow from the class either, and the pair is his to choose.
+    store
+        .create_account(&AccountDetailRecord {
+            cash_class: Some(CashAssetClass::CardAccount),
+            negative_balance_expectation: Some(NegativeBalanceExpectation::Unexpected),
+            ..plain(owner, "Card, unexpected")
+        })
+        .unwrap();
+    // And an expectation with no class at all.
+    store
+        .create_account(&AccountDetailRecord {
+            negative_balance_expectation: Some(NegativeBalanceExpectation::Ordinary),
+            ..plain(owner, "No class, ordinary")
+        })
+        .unwrap();
+
+    let stored = store.list_account_details(owner).unwrap();
+    let by_title = |title: &str| {
+        stored
+            .iter()
+            .find(|account| account.title == title)
+            .unwrap()
+            .clone()
+    };
+
+    let savings = by_title("Savings, no expectation");
+    assert_eq!(savings.cash_class, Some(CashAssetClass::Savings));
+    assert_eq!(
+        savings.negative_balance_expectation, None,
+        "a class never fills in an expectation"
+    );
+
+    let card = by_title("Card, unexpected");
+    assert_eq!(card.cash_class, Some(CashAssetClass::CardAccount));
+    assert_eq!(
+        card.negative_balance_expectation,
+        Some(NegativeBalanceExpectation::Unexpected)
+    );
+
+    let unclassed = by_title("No class, ordinary");
+    assert_eq!(
+        unclassed.cash_class, None,
+        "an expectation never fills in a class"
+    );
+    assert_eq!(
+        unclassed.negative_balance_expectation,
+        Some(NegativeBalanceExpectation::Ordinary)
     );
 }

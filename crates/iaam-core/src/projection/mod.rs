@@ -27,9 +27,7 @@ use crate::contour::{ContourDefinition, ContourId, ContourVersion};
 use crate::dates::EffectiveOrder;
 use crate::event::Event;
 use crate::event::correction::{CorrectionError, resolve};
-use crate::event::kind::EventKind;
 use crate::rules::{LotRuleVersion, RuleRegistry};
-use crate::valuation::InstrumentPrice;
 use balances::BalanceError;
 use flows::FlowError;
 use income::IncomeError;
@@ -354,23 +352,9 @@ fn fold(
             flows.apply(event, ctx.contour)?;
         }
         state.income_mut().apply(event)?;
-        if let EventKind::Valuation {
-            instrument,
-            price,
-            currency,
-            quality,
-        } = &event.kind
-        {
-            if let Some(as_of) = event.dates.effective_date() {
-                state.prices_mut().record(InstrumentPrice {
-                    instrument: *instrument,
-                    price: *price,
-                    currency: *currency,
-                    quality: *quality,
-                    as_of,
-                });
-            }
-        }
+        // The one definition of «this event carries a price», shared with the
+        // asset snapshot, which needs a board without needing a projection.
+        state.prices_mut().observe(event);
         state.observe(event);
         through = Some(event.order);
     }

@@ -1695,6 +1695,10 @@ mod tests {
             provider: None,
             provider_account_id: None,
             cash_class: None,
+            // Resolution reads identity, aliases and title. It has never read
+            // the owner's expectation about a minus, and iaam-d41s forbids
+            // anything but the balances report from reading it.
+            negative_balance_expectation: None,
             aliases: Vec::new(),
         }
     }

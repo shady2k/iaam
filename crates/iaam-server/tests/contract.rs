@@ -5671,6 +5671,10 @@ async fn a_negative_cash_balance_is_stated_by_the_answer_and_not_refused() {
             "from": "2026-08-06",
             "resolved": null,
             "classification": "unclassified_negative_cash",
+            // The owner has said nothing about this account, so there is
+            // nothing to contradict. Silence is not a statement.
+            "expectation": null,
+            "contradicts_expectation": false,
         }]),
         "{body}"
     );
@@ -5829,6 +5833,11 @@ async fn margin_financing_refuses_one_accounts_period_reports_and_no_others() {
             "from": "2026-08-06",
             "resolved": null,
             "classification": "unsupported_margin_liability",
+            // §11 classified this from evidence and needed no owner input. The
+            // owner's expectation is a separate, absent statement, and the two
+            // are layered rather than competing.
+            "expectation": null,
+            "contradicts_expectation": false,
         }]),
         "{body}"
     );
@@ -13164,4 +13173,530 @@ async fn an_agent_may_not_state_an_accounts_aliases() {
     .await;
 
     assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+}
+
+/// The owner's primary question, answered in one call: how much is on deposit,
+/// how much on savings, how much where he has not said, and what the whole is
+/// worth.
+///
+/// The defect this pins: `/v1/reports/balances` answers per account and
+/// currency with no total and no grouping, so assembling the answer meant
+/// grouping accounts by reading their titles — the guess this repository
+/// refuses everywhere else.
+#[tokio::test]
+async fn the_asset_snapshot_groups_cash_by_the_class_the_owner_declared() {
+    let harness = harness();
+
+    let mut created = Vec::new();
+    for (title, class) in [
+        ("Term", Some("deposit")),
+        ("Rainy day", Some("savings")),
+        ("Unlabelled", None),
+    ] {
+        let mut body = json!({ "title": title, "institution": "One Bank" });
+        if let Some(class) = class {
+            body["cash_class"] = json!(class);
+        }
+        let (status, account) = call(
+            &harness.router,
+            post("/v1/accounts", &harness.owner_token, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+        created.push(account["id"].as_str().expect("identifier").to_owned());
+    }
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Everything",
+                "accounts": [
+                    harness.account.inner().to_string(),
+                    created[0].clone(),
+                    created[1].clone(),
+                    created[2].clone(),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let deposit = |account: &str, amount: &str, key: &str| {
+        json!({
+            "account": account,
+            "type": "deposit",
+            "amount": amount,
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-01-05" },
+            "idempotency_key": key
+        })
+    };
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [
+                    deposit(&created[0], "1000.00", "snapshot-term"),
+                    deposit(&created[1], "250.00", "snapshot-rainy"),
+                    deposit(&created[2], "40.00", "snapshot-unlabelled"),
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+
+    let classes = snapshot["cash"]["classes"]
+        .as_array()
+        .expect("one entry per class");
+    let group = |code: Option<&str>| {
+        classes
+            .iter()
+            .find(|class| class["cash_class"] == json!(code))
+            .unwrap_or_else(|| panic!("no group for {code:?}: {snapshot}"))
+    };
+    assert_eq!(group(Some("deposit"))["totals"][0]["amount"], "1000.00");
+    assert_eq!(group(Some("savings"))["totals"][0]["amount"], "250.00");
+    // The account whose class the owner never stated is its own group. It is
+    // never folded into a default one, which would put his money under a
+    // heading he did not choose.
+    let unstated = group(None);
+    assert_eq!(unstated["totals"][0]["amount"], "40.00", "{snapshot}");
+    assert_eq!(
+        unstated["accounts"].as_array().expect("accounts").len(),
+        2,
+        "the harness account has no class either: {snapshot}"
+    );
+
+    // The whole, and it is the sum of the parts rather than a second reading.
+    assert_eq!(snapshot["cash"]["totals"][0]["amount"], "1290.00");
+    assert_eq!(snapshot["cash"]["totals"][0]["currency"], "RUB");
+    assert_eq!(snapshot["total"][0]["value"], "1290.00", "{snapshot}");
+
+    // The register the answer opens with, naming the goal the outstanding-work
+    // queue grades by.
+    assert_eq!(snapshot["confidence"]["goal"], "asset_snapshot");
+}
+
+/// Cash is exact; a position is worth what a quote said on a date. Both halves
+/// and the price behind the second are stated **before** the total, so a
+/// market-dependent figure cannot read as a bank figure.
+#[tokio::test]
+async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_total() {
+    let harness = harness();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Brokerage", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [
+                    {
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "500.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-05" },
+                        "idempotency_key": "halves-deposit"
+                    },
+                    {
+                        "account": harness.account.inner(),
+                        "type": "opening_position",
+                        "instrument": harness.instrument.inner(),
+                        "custody": harness.custody.inner(),
+                        "quantity": "10",
+                        "cost_basis": "100.00",
+                        "currency": "RUB",
+                        "dates": { "trade": "2026-01-01" },
+                        "idempotency_key": "halves-position"
+                    },
+                    {
+                        "account": harness.account.inner(),
+                        "type": "valuation",
+                        "instrument": harness.instrument.inner(),
+                        "price": "30",
+                        "currency": "RUB",
+                        "quality": "previous_close",
+                        "dates": { "cash_posted": "2026-01-29" },
+                        "idempotency_key": "halves-price"
+                    }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, _headers, bytes) = call_raw(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(bytes).expect("a JSON body");
+    let snapshot: Value = serde_json::from_str(&body).expect("a JSON body");
+
+    // The exact half does not move when a quote does.
+    assert_eq!(snapshot["cash"]["totals"][0]["amount"], "500.00", "{body}");
+    // The market-dependent half, and the date the price it used was for.
+    assert_eq!(snapshot["positions"]["totals"][0]["value"], "300", "{body}");
+    assert_eq!(
+        snapshot["positions"]["oldest_price_date"], "2026-01-29",
+        "{body}"
+    );
+    let holding = &snapshot["positions"]["holdings"][0];
+    assert_eq!(
+        holding["instrument"],
+        harness.instrument.inner().to_string(),
+        "{body}"
+    );
+    assert_eq!(holding["price"]["as_of"], "2026-01-29", "{body}");
+    assert_eq!(holding["value"]["value"], "300", "{body}");
+    // The whole, after the halves.
+    assert_eq!(snapshot["total"][0]["value"], "800.00", "{body}");
+
+    // Order on the wire, not merely presence: a reader who stops at the first
+    // figure must meet the two halves before the number that mixes them.
+    let at = |key: &str| body.find(key).unwrap_or_else(|| panic!("{key}: {body}"));
+    assert!(at("\"cash\"") < at("\"positions\""), "{body}");
+    assert!(at("\"positions\"") < at("\"total\""), "{body}");
+    assert!(at("\"oldest_price_date\"") < at("\"total\""), "{body}");
+    assert!(at("\"confidence\"") < at("\"cash\""), "{body}");
+}
+
+/// A holding no quote covers is absent from the total rather than valued at
+/// zero, and the register names it. Zero would be a number the owner could add
+/// up; absence is a question.
+#[tokio::test]
+async fn an_unvalued_holding_is_absent_from_the_snapshot_total_and_is_a_caveat() {
+    let harness = harness();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Brokerage", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "opening_position",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "10",
+                    "cost_basis": "100.00",
+                    "currency": "RUB",
+                    "dates": { "trade": "2026-01-01" },
+                    "idempotency_key": "unvalued-position"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+
+    let holding = &snapshot["positions"]["holdings"][0];
+    assert_eq!(holding["quantity"], "10", "{snapshot}");
+    assert!(holding["value"].is_null(), "absent, never zero: {snapshot}");
+    assert!(holding["price"].is_null(), "{snapshot}");
+    assert_eq!(
+        snapshot["positions"]["totals"],
+        json!([]),
+        "an unpriced holding is in no total: {snapshot}"
+    );
+    assert!(
+        snapshot["positions"]["oldest_price_date"].is_null(),
+        "{snapshot}"
+    );
+
+    assert_eq!(snapshot["confidence"]["complete"], false, "{snapshot}");
+    let caveat = snapshot["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .iter()
+        .find(|caveat| caveat["kind"] == "holding_not_valued")
+        .unwrap_or_else(|| panic!("the unvalued holding is named: {snapshot}"));
+    assert_eq!(caveat["see"], "positions.holdings[].value", "{snapshot}");
+    assert_eq!(
+        caveat["subject"]["id"],
+        harness.instrument.inner().to_string(),
+        "{snapshot}"
+    );
+}
+
+/// The owner can record that a negative balance on an account would be
+/// unexpected, and such a balance is then reported as contradicting that — as a
+/// warning, never as a refusal.
+///
+/// The defect this pins: `Balances::negative_cash` could only say «at stage 1
+/// this is not an error», because nothing recorded what the owner expected. A
+/// minus on an account he never expects to go negative passed unremarked beside
+/// a minus on a margin account, and the two mean opposite things.
+#[tokio::test]
+async fn a_negative_balance_the_owner_called_unexpected_is_reported_as_contradicting_him() {
+    let harness = harness();
+
+    let (status, account) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Rainy day",
+                "institution": "One Bank",
+                "negative_balance_expectation": "unexpected"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{account}");
+    assert_eq!(
+        account["negative_balance_expectation"], "unexpected",
+        "{account}"
+    );
+    // The class is a different declaration and was never asked for, so it is
+    // absent. Nothing infers one from the other.
+    assert!(account.get("cash_class").is_none(), "{account}");
+    let account_id = account["id"].as_str().expect("identifier").to_owned();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [account_id.clone()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": account_id,
+                    "type": "withdrawal",
+                    "amount": "80.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-07" },
+                    "idempotency_key": "expectation-withdrawal"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    // A warning, not a refusal: the request succeeds and the figure is stated.
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let entry = &report["negative_cash"][0];
+    assert_eq!(entry["account"], account_id, "{report}");
+    assert_eq!(entry["amount"], "-80.00", "{report}");
+    assert_eq!(entry["expectation"], "unexpected", "{report}");
+    assert_eq!(entry["contradicts_expectation"], true, "{report}");
+    // Nothing is suppressed: the row states the figure exactly as it would have
+    // without the expectation.
+    assert_eq!(
+        report["accounts"][0]["cash"][0]["amount"], "-80.00",
+        "{report}"
+    );
+    // And the expectation contributes no caveat. The register is about what the
+    // figures leave unsaid; a contradicted expectation is a warning about a
+    // figure the report does state, and one that fired on it would be a second
+    // completeness mechanism. §11 refuses this account's period reports for its
+    // own reason — an unclassified negative span — which is `iaam-sbht` working
+    // and is unrelated to what the owner expects.
+    let kinds: Vec<&str> = report["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .iter()
+        .map(|caveat| caveat["kind"].as_str().expect("a kind"))
+        .collect();
+    assert!(
+        kinds.iter().all(|kind| !kind.contains("expect")),
+        "a contradicted expectation is a warning on a figure, not a gap in the \
+         figures: {kinds:?}"
+    );
+}
+
+/// The pair to the test above, and the one that keeps it honest: an account the
+/// owner said nothing about behaves exactly as every account did before the
+/// expectation existed, and one he called ordinary is not a contradiction
+/// either.
+///
+/// **The class is not consulted.** Both accounts here are savings accounts, and
+/// a savings account is the very case that tempts «cannot be overdrawn,
+/// therefore warn». Decision 0004 §3 forbids that derivation by name, and this
+/// is where the code would show it.
+#[tokio::test]
+async fn a_savings_account_the_owner_said_nothing_about_is_not_warned_on() {
+    let harness = harness();
+
+    let mut ids = Vec::new();
+    for (title, expectation) in [
+        ("Silent savings", None),
+        ("Ordinary savings", Some("ordinary")),
+    ] {
+        let mut body = json!({
+            "title": title,
+            "institution": "One Bank",
+            "cash_class": "savings"
+        });
+        if let Some(expectation) = expectation {
+            body["negative_balance_expectation"] = json!(expectation);
+        }
+        let (status, account) = call(
+            &harness.router,
+            post("/v1/accounts", &harness.owner_token, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+        assert_eq!(account["cash_class"], "savings", "{account}");
+        ids.push(account["id"].as_str().expect("identifier").to_owned());
+    }
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [ids[0].clone(), ids[1].clone()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [
+                    {
+                        "account": ids[0],
+                        "type": "withdrawal",
+                        "amount": "30.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-07" },
+                        "idempotency_key": "silent-withdrawal"
+                    },
+                    {
+                        "account": ids[1],
+                        "type": "withdrawal",
+                        "amount": "40.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-07" },
+                        "idempotency_key": "ordinary-withdrawal"
+                    }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+
+    let entries = report["negative_cash"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2, "both figures are stated: {report}");
+    let entry = |account: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["account"] == account)
+            .unwrap_or_else(|| panic!("no entry for {account}: {report}"))
+    };
+
+    // Silence is not a statement, and a savings class does not become one.
+    let silent = entry(&ids[0]);
+    assert!(
+        silent["expectation"].is_null(),
+        "a class must never fill in an expectation: {report}"
+    );
+    assert_eq!(silent["contradicts_expectation"], false, "{report}");
+
+    // And the opposite statement is not a contradiction either.
+    let ordinary = entry(&ids[1]);
+    assert_eq!(ordinary["expectation"], "ordinary", "{report}");
+    assert_eq!(ordinary["contradicts_expectation"], false, "{report}");
 }

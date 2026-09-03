@@ -12,6 +12,7 @@
 //! summary assembled by the transport can disagree with the report it
 //! summarises.
 
+pub mod assets;
 pub mod balances;
 pub mod confidence;
 pub mod population;

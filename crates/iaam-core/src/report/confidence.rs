@@ -95,6 +95,14 @@ pub enum CaveatKind {
     UnexplainedCashChange,
     /// A position no price covers, so it is absent from the portfolio value.
     UnpricedPosition,
+    /// A holding the asset snapshot could value from no quote, so it is absent
+    /// from that report's position half.
+    ///
+    /// Distinct from [`Self::UnpricedPosition`] only in where the fact is
+    /// stated: [`Self::see`] is a constant of the kind, so a kind belongs to
+    /// the field it points at, and the two reports publish the same silence in
+    /// two different places.
+    HoldingNotValued,
     /// The portfolio value at the report date could not be computed.
     TerminalValueNotComputed,
     /// The rate of return could not be computed.
@@ -113,6 +121,7 @@ impl CaveatKind {
             Self::UndecomposedMovements => "undecomposed_movements",
             Self::UnexplainedCashChange => "unexplained_cash_change",
             Self::UnpricedPosition => "unpriced_position",
+            Self::HoldingNotValued => "holding_not_valued",
             Self::TerminalValueNotComputed => "terminal_value_not_computed",
             Self::ReturnNotComputed => "return_not_computed",
         }
@@ -134,6 +143,7 @@ impl CaveatKind {
             Self::UndecomposedMovements => "currencies[].not_decomposed.by_account[]",
             Self::UnexplainedCashChange => "unexplained[]",
             Self::UnpricedPosition => "data_quality.position_coverage.uncovered[]",
+            Self::HoldingNotValued => "positions.holdings[].value",
             Self::TerminalValueNotComputed => "terminal_value",
             Self::ReturnNotComputed => "xirr_pre_tax",
         }
@@ -167,6 +177,9 @@ impl CaveatKind {
             }
             Self::UnpricedPosition => {
                 "No price covers this position at the report date, so it is absent from the portfolio value rather than valued at zero."
+            }
+            Self::HoldingNotValued => {
+                "The journal holds no quote for this instrument at or before the report date, so the holding is absent from the position half of the snapshot rather than valued at zero."
             }
             Self::TerminalValueNotComputed => {
                 "The portfolio value at the report date could not be computed, so every figure derived from it is absent rather than approximate."
@@ -390,7 +403,7 @@ mod tests {
     /// Every kind must name a field, and no two kinds may share a name.
     #[test]
     fn every_kind_carries_a_pointer_and_a_sentence() {
-        const KINDS: [CaveatKind; 9] = [
+        const KINDS: [CaveatKind; 10] = [
             CaveatKind::AccountInNoScope,
             CaveatKind::AccountInAnotherScope,
             CaveatKind::RunningCashSum,
@@ -398,6 +411,7 @@ mod tests {
             CaveatKind::UndecomposedMovements,
             CaveatKind::UnexplainedCashChange,
             CaveatKind::UnpricedPosition,
+            CaveatKind::HoldingNotValued,
             CaveatKind::TerminalValueNotComputed,
             CaveatKind::ReturnNotComputed,
         ];

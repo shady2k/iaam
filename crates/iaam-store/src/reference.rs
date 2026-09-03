@@ -6,6 +6,7 @@ use iaam_core::instrument::{
     AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind, Lineage, LineageReason,
 };
 use iaam_core::money::CurrencyCode;
+use iaam_core::report::balances::NegativeBalanceExpectation;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use time::Date;
 use time::format_description::well_known::Iso8601;
@@ -136,6 +137,16 @@ pub struct AccountDetailRecord {
     /// by guesswork.
     pub identity: Option<AccountIdentity>,
     pub cash_class: Option<CashAssetClass>,
+    /// What the owner says a negative balance on this account would mean
+    /// (`iaam-d41s`). `None` is «he has not said».
+    ///
+    /// A **second** value beside `cash_class`, never derived from it. Decision
+    /// 0004 §3 forbids the merge by name: «a savings account cannot be
+    /// overdrawn, therefore warn» is wrong on the first ordinary technical
+    /// overdraft. The type comes from `iaam_core::report::balances` because
+    /// that is the one place that reads it — unlike [`CashAssetClass`], which
+    /// lives here precisely so no rule can reach it.
+    pub negative_balance_expectation: Option<NegativeBalanceExpectation>,
     pub aliases: Vec<AccountAliasRecord>,
 }
 
@@ -347,8 +358,9 @@ impl SqliteStore {
         transaction.execute(
             "INSERT INTO accounts
                  (id, owner, title, institution, created_at,
-                  provider, provider_account_id, cash_class)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  provider, provider_account_id, cash_class,
+                  negative_balance_expectation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 account.id.inner().to_string(),
                 account.owner.inner().to_string(),
@@ -361,6 +373,9 @@ impl SqliteStore {
                     .as_ref()
                     .map(|it| it.provider_account_id.as_str()),
                 account.cash_class.map(CashAssetClass::code),
+                account
+                    .negative_balance_expectation
+                    .map(NegativeBalanceExpectation::code),
             ],
         )?;
         for alias in &account.aliases {
@@ -448,7 +463,8 @@ impl SqliteStore {
         owner: OwnerId,
     ) -> Result<Vec<AccountDetailRecord>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, title, institution, provider, provider_account_id, cash_class
+            "SELECT id, title, institution, provider, provider_account_id, cash_class,
+                    negative_balance_expectation
              FROM accounts WHERE owner = ?1 ORDER BY title, id",
         )?;
         let rows = statement.query_map([owner.inner().to_string()], |row| {
@@ -459,11 +475,20 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut accounts = Vec::new();
         for row in rows {
-            let (id, title, institution, provider, provider_account_id, cash_class) = row?;
+            let (
+                id,
+                title,
+                institution,
+                provider,
+                provider_account_id,
+                cash_class,
+                negative_balance_expectation,
+            ) = row?;
             accounts.push(AccountDetailRecord {
                 id: AccountId(parse_uuid(&id, "account")?),
                 owner,
@@ -471,6 +496,9 @@ impl SqliteStore {
                 institution,
                 identity: external_identity(provider, provider_account_id),
                 cash_class: parse_cash_class(cash_class.as_deref())?,
+                negative_balance_expectation: parse_negative_balance_expectation(
+                    negative_balance_expectation.as_deref(),
+                )?,
                 aliases: Vec::new(),
             });
         }
@@ -1193,15 +1221,34 @@ fn parse_cash_class(code: Option<&str>) -> Result<Option<CashAssetClass>, StoreE
     .transpose()
 }
 
+/// A stored expectation code, refusing one this build does not know.
+///
+/// An unrecognised code is an error rather than `None`, for the reason
+/// [`parse_cash_class`] gives: `None` means «the owner has not said», and
+/// reading a statement he did make as one he did not would drop a warning he
+/// asked for.
+fn parse_negative_balance_expectation(
+    code: Option<&str>,
+) -> Result<Option<NegativeBalanceExpectation>, StoreError> {
+    code.map(|code| {
+        NegativeBalanceExpectation::from_code(code).ok_or_else(|| StoreError::InvalidValue {
+            field: "accounts.negative_balance_expectation",
+            value: code.to_owned(),
+        })
+    })
+    .transpose()
+}
+
 /// One account with its identity, class and aliases, read inside a transaction.
 fn read_account_detail(
     transaction: &rusqlite::Transaction<'_>,
     owner: OwnerId,
     id: AccountId,
 ) -> Result<AccountDetailRecord, StoreError> {
-    let (title, institution, provider, provider_account_id, cash_class) = transaction
+    let (title, institution, provider, provider_account_id, cash_class, expectation) = transaction
         .query_row(
-            "SELECT title, institution, provider, provider_account_id, cash_class
+            "SELECT title, institution, provider, provider_account_id, cash_class,
+                    negative_balance_expectation
              FROM accounts WHERE owner = ?1 AND id = ?2",
             params![owner.inner().to_string(), id.inner().to_string()],
             |row| {
@@ -1211,6 +1258,7 @@ fn read_account_detail(
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
@@ -1253,6 +1301,7 @@ fn read_account_detail(
         institution,
         identity: external_identity(provider, provider_account_id),
         cash_class: parse_cash_class(cash_class.as_deref())?,
+        negative_balance_expectation: parse_negative_balance_expectation(expectation.as_deref())?,
         aliases,
     })
 }

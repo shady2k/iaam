@@ -144,6 +144,64 @@ pub struct BalancesReport {
     pub population: ReportPopulation,
 }
 
+/// What the owner expects a negative balance on one account to mean.
+///
+/// **An expectation, not a rule.** A first draft of `iaam-d41s` had the owner
+/// record that an account *cannot be overdrawn*, and he corrected it: a
+/// technical overdraft on a debit card is real and ordinary. What survived the
+/// correction is a warning about a probable error, and nothing here refuses,
+/// suppresses, or invalidates anything. A balance that contradicts the
+/// expectation is stated with the expectation beside it, and the reader judges.
+///
+/// **It is a separate declaration, and it is never derived from the class of
+/// cash the account holds.** «A savings account cannot be overdrawn, therefore
+/// warn» is exactly the branch decision 0004 §3 forbids by name, and it is
+/// wrong on the first ordinary technical overdraft. `CashAssetClass` is a
+/// grouping label with one consumer — report headings — and this value is a
+/// second value with a second consumer. Nothing reads one to produce the other.
+///
+/// **Absence is a value.** `Option::None` is «the owner has not said», which is
+/// not the same as either variant, and it is never filled in by inference from
+/// a title, a class or a transaction pattern. An account with nothing asserted
+/// behaves exactly as every account did before this existed.
+///
+/// **It lives in the core because the core reads it**, which is the difference
+/// from `CashAssetClass`: that label is stored in the storage adapter precisely
+/// so no rule can reach it, while this value is read by one computation — the
+/// balances answer's negative-cash entries, in this module. Its home says where
+/// it may be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NegativeBalanceExpectation {
+    /// A negative balance here would probably be an error: a missing opening
+    /// assertion, an unimported month, a misfiled transfer.
+    Unexpected,
+    /// A negative balance here is ordinary — a credit line, a margin balance.
+    /// Recorded so that silence is not read as a statement.
+    Ordinary,
+}
+
+impl NegativeBalanceExpectation {
+    /// All variants, for table-driven tests: a list written by hand would
+    /// silently drift from the `enum`.
+    pub const ALL: [Self; 2] = [Self::Unexpected, Self::Ordinary];
+
+    /// The machine-readable name carried to a caller.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unexpected => "unexpected",
+            Self::Ordinary => "ordinary",
+        }
+    }
+
+    /// Parse a code. `None` rather than a default: an unrecognised code must
+    /// reach the caller instead of becoming a statement the owner never made.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.code() == code)
+    }
+}
+
 /// One account-and-currency whose cash balance is negative at the report date,
 /// with the perimeter span it is the tail of.
 ///
@@ -159,6 +217,38 @@ pub struct NegativeCash {
     pub account: AccountId,
     pub money: Money,
     pub span: Option<NegativeCashSpan>,
+    /// What the owner said a negative balance on this account would mean, if he
+    /// said anything. `None` is «he has not said», and an entry carrying it is
+    /// exactly the entry this report produced before the expectation existed.
+    ///
+    /// It rides on the entry rather than standing in a list of its own for the
+    /// reason the span does: `iaam-sbht` required one notion of negative cash,
+    /// not two keyed differently. The perimeter's classification is evidence
+    /// about *why* the balance is negative; this is the owner's prior about
+    /// whether it should be. They are layered, and both hang here.
+    pub expectation: Option<NegativeBalanceExpectation>,
+}
+
+impl NegativeCash {
+    /// Whether this figure contradicts what the owner expected of this account.
+    ///
+    /// True only where he said a negative balance would be unexpected. Silence
+    /// is not a contradiction, and `Ordinary` is the opposite of one.
+    ///
+    /// Derived, never stored: a flag set beside the expectation could disagree
+    /// with it, and then the answer would contradict itself about what the
+    /// owner said.
+    ///
+    /// **A warning, and nothing more.** Nothing refuses a request, drops a row,
+    /// suppresses a figure or fails an invariant on this. It is true or false
+    /// beside a number the report states either way.
+    #[must_use]
+    pub const fn contradicts_expectation(&self) -> bool {
+        matches!(
+            self.expectation,
+            Some(NegativeBalanceExpectation::Unexpected)
+        )
+    }
 }
 
 impl BalancesReport {
@@ -339,6 +429,55 @@ mod tests {
         assert_eq!(caveat.see(), "accounts[].period_reports");
     }
 
+    /// The owner's expectation is his statement about the account, and a
+    /// negative balance that contradicts it is reported as contradicting it —
+    /// as a warning, never as a refusal. An account he has said nothing about
+    /// behaves exactly as every account did before this existed.
+    #[test]
+    fn a_negative_balance_contradicts_only_an_expectation_that_was_stated() {
+        let cases = [
+            (None, false),
+            (Some(NegativeBalanceExpectation::Ordinary), false),
+            (Some(NegativeBalanceExpectation::Unexpected), true),
+        ];
+        for (expectation, contradicts) in cases {
+            let mut report = report(&[AccountStanding::Covered], CashOpening::Asserted);
+            let entry = NegativeCash {
+                account: account(10),
+                money: Money::new(PostedMinor::new(-500), CurrencyCode::Rub),
+                span: None,
+                expectation,
+            };
+            report.negative_cash = vec![entry];
+            assert_eq!(
+                entry.contradicts_expectation(),
+                contradicts,
+                "{expectation:?}"
+            );
+            // The figure is stated either way, and the report stays whole: a
+            // contradicted expectation is a fact the answer publishes, not a
+            // refusal and not an incompleteness.
+            assert_eq!(report.negative_cash[0].money.amount().raw(), -500);
+            assert!(
+                report.confidence().complete(),
+                "a contradicted expectation is not a gap in the figures: {expectation:?}"
+            );
+        }
+    }
+
+    /// The expectation is the owner's, and it is round-tripped through its code
+    /// rather than through a default. An unrecognised code is not a statement.
+    #[test]
+    fn an_expectation_survives_its_code_and_an_unknown_one_is_not_a_statement() {
+        for value in NegativeBalanceExpectation::ALL {
+            assert_eq!(
+                NegativeBalanceExpectation::from_code(value.code()),
+                Some(value)
+            );
+        }
+        assert_eq!(NegativeBalanceExpectation::from_code("savings"), None);
+        assert_eq!(NegativeBalanceExpectation::from_code(""), None);
+    }
     /// A negative balance is a fact the answer states and the reader judges,
     /// not an incompleteness. A register that fired on every overdraft would
     /// fire on almost every report.
@@ -349,6 +488,7 @@ mod tests {
             account: account(10),
             money: Money::new(PostedMinor::new(-500), CurrencyCode::Rub),
             span: None,
+            expectation: None,
         }];
         assert!(report.confidence().complete());
     }

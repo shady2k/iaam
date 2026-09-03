@@ -13175,6 +13175,452 @@ async fn an_agent_may_not_state_an_accounts_aliases() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
 }
 
+/// Create an account and return its identifier.
+async fn account_with(harness: &Harness, body: &serde_json::Value) -> String {
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/accounts", &harness.owner_token, body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    created["id"].as_str().expect("account id").to_owned()
+}
+
+async fn declare(
+    harness: &Harness,
+    id: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{id}/declarations"),
+            &harness.owner_token,
+            body,
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_account_that_states_no_identity_can_be_given_one_later() {
+    // The defect: `POST /v1/accounts` is an upsert by external identity, so a
+    // repeat create returns the account made last time and changes nothing about
+    // it — correctly, because it is idempotent rather than an update. Nothing
+    // else wrote these three. So every account created before decision 0004
+    // could never acquire an identity, a class or an expectation.
+    let harness = harness();
+    let id = account_with(&harness, &json!({ "title": "Main" })).await;
+
+    let (status, recorded) = declare(
+        &harness,
+        &id,
+        &json!({
+            "identity": {
+                "stated": true,
+                "provider": "bank-one",
+                "provider_account_id": "opaque-1",
+            },
+            "cash_class": { "stated": true, "class": "savings" },
+            "negative_balance_expectation": { "stated": true, "expectation": "unexpected" },
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["account"]["provider"], "bank-one", "{recorded}");
+    assert_eq!(recorded["account"]["provider_account_id"], "opaque-1");
+    assert_eq!(recorded["account"]["cash_class"], "savings");
+    assert_eq!(
+        recorded["account"]["negative_balance_expectation"],
+        "unexpected"
+    );
+    assert!(
+        recorded.get("identity_repointed").is_none(),
+        "a first statement displaces nothing: {recorded}"
+    );
+
+    // And the next import addresses it: a create carrying that identity now
+    // finds this account instead of minting a second.
+    let (status, repeated) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main",
+                "provider": "bank-one",
+                "provider_account_id": "opaque-1",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated["id"], id, "{repeated}");
+
+    // The route is discoverable, and the third state is discoverable with it:
+    // an agent reading the specification must be able to see that omitting a
+    // field is not the same as clearing it.
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK, "{spec}");
+    let route = &spec["paths"]["/v1/accounts/{id}/declarations"]["put"];
+    assert_eq!(
+        route["operationId"], "replace_account_declarations",
+        "{spec}"
+    );
+    let request = &spec["components"]["schemas"]["ReplaceAccountDeclarationsRequest"];
+    assert!(
+        request["required"].as_array().is_none_or(Vec::is_empty),
+        "every declaration is optional, and absent means «leave it alone»: {request}"
+    );
+    let identity = &spec["components"]["schemas"]["AccountIdentityStatementDto"];
+    assert_eq!(
+        identity["required"],
+        json!(["stated"]),
+        "a present statement must say whether he states one at all: {identity}"
+    );
+}
+
+#[tokio::test]
+async fn a_declaration_the_request_does_not_mention_is_left_alone() {
+    // Absence is the third state. A replacement that read an unmentioned field
+    // as «none» would withdraw, on every call, everything the caller did not
+    // happen to repeat — including the identity a later import resolves by.
+    let harness = harness();
+    let id = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "opaque-1",
+            "cash_class": "savings",
+            "negative_balance_expectation": "unexpected",
+        }),
+    )
+    .await;
+
+    let (status, recorded) = declare(
+        &harness,
+        &id,
+        &json!({ "cash_class": { "stated": true, "class": "deposit" } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["account"]["cash_class"], "deposit");
+    assert_eq!(
+        recorded["account"]["provider"], "bank-one",
+        "an identity nobody mentioned is not withdrawn: {recorded}"
+    );
+    assert_eq!(recorded["account"]["provider_account_id"], "opaque-1");
+    assert_eq!(
+        recorded["account"]["negative_balance_expectation"], "unexpected",
+        "an expectation nobody mentioned is not withdrawn: {recorded}"
+    );
+    assert!(recorded.get("identity_repointed").is_none(), "{recorded}");
+}
+
+#[tokio::test]
+async fn stating_none_clears_a_declaration_and_is_not_the_same_call_as_omitting_it() {
+    let harness = harness();
+    let id = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "cash_class": "savings",
+            "negative_balance_expectation": "unexpected",
+        }),
+    )
+    .await;
+
+    let (status, recorded) =
+        declare(&harness, &id, &json!({ "cash_class": { "stated": false } })).await;
+
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert!(
+        recorded["account"].get("cash_class").is_none(),
+        "cleared on his word: {recorded}"
+    );
+    assert_eq!(
+        recorded["account"]["negative_balance_expectation"], "unexpected",
+        "and only the one he cleared: {recorded}"
+    );
+}
+
+#[tokio::test]
+async fn re_pointing_an_identity_is_recorded_and_says_what_it_did_not_do() {
+    // The refusal one reaches for first — «facts were imported under the old
+    // identity, so refuse» — cannot be stated against this journal: an event
+    // records its account and a free source label, and nothing records the
+    // external identity in force when it arrived. So the change is made and the
+    // response says what it did not do.
+    let harness = harness();
+    let id = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "opaque-1",
+        }),
+    )
+    .await;
+
+    let (status, ingested) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "test",
+                "operations": [{
+                    "account": id,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-01-01" }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ingested}");
+    assert_ne!(ingested[0]["verdict"], "rejected", "{ingested}");
+
+    let (status, recorded) = declare(
+        &harness,
+        &id,
+        &json!({
+            "identity": {
+                "stated": true,
+                "provider": "bank-two",
+                "provider_account_id": "opaque-2",
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["account"]["provider"], "bank-two");
+    let repointed = &recorded["identity_repointed"];
+    assert_eq!(repointed["previous"]["provider"], "bank-one", "{recorded}");
+    assert_eq!(repointed["previous"]["provider_account_id"], "opaque-1");
+    assert_eq!(
+        repointed["facts_recorded"], true,
+        "the account is not empty, and that is the most the journal can say: {recorded}"
+    );
+    let kinds: Vec<&str> = repointed["not_done"]
+        .as_array()
+        .expect("not_done")
+        .iter()
+        .map(|entry| entry["kind"].as_str().expect("kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "facts_not_moved",
+            "previous_identity_not_reserved",
+            "no_fact_records_the_identity_it_arrived_under",
+        ]
+    );
+
+    // The displaced identity is not reserved, which is what the second entry
+    // says: a create carrying it now mints a second account.
+    let (status, minted) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main again",
+                "provider": "bank-one",
+                "provider_account_id": "opaque-1",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{minted}");
+    assert_ne!(minted["id"], json!(id), "{minted}");
+}
+
+#[tokio::test]
+async fn withdrawing_an_identity_reports_the_one_it_displaced() {
+    let harness = harness();
+    let id = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "opaque-1",
+        }),
+    )
+    .await;
+
+    let (status, recorded) =
+        declare(&harness, &id, &json!({ "identity": { "stated": false } })).await;
+
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert!(recorded["account"].get("provider").is_none(), "{recorded}");
+    assert_eq!(
+        recorded["identity_repointed"]["previous"]["provider"], "bank-one",
+        "{recorded}"
+    );
+    assert_eq!(
+        recorded["identity_repointed"]["facts_recorded"], false,
+        "this account has no facts, and the response says so: {recorded}"
+    );
+}
+
+#[tokio::test]
+async fn an_identity_another_account_already_answers_to_is_refused() {
+    // Two accounts under one identity would leave the next import's upsert
+    // picking between them.
+    let harness = harness();
+    account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "opaque-1",
+        }),
+    )
+    .await;
+    let other = account_with(&harness, &json!({ "title": "Savings" })).await;
+
+    let (status, refusal) = declare(
+        &harness,
+        &other,
+        &json!({
+            "identity": {
+                "stated": true,
+                "provider": "bank-one",
+                "provider_account_id": "opaque-1",
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["code"], "already_exists", "{refusal}");
+}
+
+#[tokio::test]
+async fn half_an_identity_is_refused_when_it_is_stated_as_it_is_at_creation() {
+    let harness = harness();
+    let id = account_with(&harness, &json!({ "title": "Main" })).await;
+
+    for body in [
+        json!({ "identity": { "stated": true, "provider": "bank-one" } }),
+        json!({ "identity": { "stated": true, "provider_account_id": "opaque-1" } }),
+        json!({ "identity": { "stated": true } }),
+        // A withdrawal beside a value says two things at once.
+        json!({ "identity": { "stated": false, "provider": "bank-one" } }),
+    ] {
+        let (status, refusal) = declare(&harness, &id, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}: {refusal}"
+        );
+        assert_eq!(refusal["code"], "invalid_request", "{refusal}");
+    }
+
+    let (status, account) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{account}");
+    let held = account
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .find(|held| held["id"] == json!(id))
+        .expect("the account");
+    assert!(
+        held.get("provider").is_none(),
+        "nothing was written: {held}"
+    );
+}
+
+#[tokio::test]
+async fn a_declaration_stated_without_a_value_is_refused() {
+    let harness = harness();
+    let id = account_with(&harness, &json!({ "title": "Main" })).await;
+
+    for body in [
+        json!({ "cash_class": { "stated": true } }),
+        json!({ "cash_class": { "stated": false, "class": "savings" } }),
+        json!({ "negative_balance_expectation": { "stated": true } }),
+        json!({ "negative_balance_expectation": { "stated": false, "expectation": "ordinary" } }),
+    ] {
+        let (status, refusal) = declare(&harness, &id, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}: {refusal}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn declarations_cannot_be_written_against_an_account_the_owner_does_not_hold() {
+    let harness = harness();
+
+    let (status, refusal) = declare(
+        &harness,
+        &Uuid::new_v4().to_string(),
+        &json!({ "cash_class": { "stated": true, "class": "savings" } }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+    assert_eq!(refusal["code"], "not_found");
+}
+
+#[tokio::test]
+async fn an_agent_may_not_state_an_accounts_declarations() {
+    // An identity decides which account a later import addresses, by the same
+    // rule that keeps account creation and aliases out of the agent's hands.
+    let harness = harness();
+
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{}/declarations", harness.account.inner()),
+            &harness.agent_token,
+            &json!({ "cash_class": { "stated": true, "class": "savings" } }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+}
+
+#[tokio::test]
+async fn an_empty_declaration_request_changes_nothing() {
+    // Every field absent is «he mentioned nothing», and the honest answer is the
+    // account exactly as it stood.
+    let harness = harness();
+    let id = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "opaque-1",
+            "cash_class": "savings",
+        }),
+    )
+    .await;
+
+    let (status, recorded) = declare(&harness, &id, &json!({})).await;
+
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["account"]["provider"], "bank-one");
+    assert_eq!(recorded["account"]["provider_account_id"], "opaque-1");
+    assert_eq!(recorded["account"]["cash_class"], "savings");
+    assert!(recorded.get("identity_repointed").is_none(), "{recorded}");
+}
+
 /// The owner's primary question, answered in one call: how much is on deposit,
 /// how much on savings, how much where he has not said, and what the whole is
 /// worth.

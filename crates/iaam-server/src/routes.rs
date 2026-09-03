@@ -22,8 +22,9 @@ use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{
-    AccountAliasView, AccountCreated, AccountDetailView, AccountScopeExclusionView,
-    AccountTransferStatementView, ContourView, Principal, Scope,
+    AccountAliasView, AccountCreated, AccountDeclarations, AccountDetailView, AccountIdentityView,
+    AccountScopeExclusionView, AccountTransferStatementView, ContourView, Declared, Principal,
+    Scope,
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
@@ -70,26 +71,29 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountAliasDto, AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
-    AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
-    ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto,
-    BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
-    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
-    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
-    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
-    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
-    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
-    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
-    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    NegativeBalanceExpectationDto, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
-    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
-    RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
-    RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest, RequestPlanDto,
-    RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    AccountAliasDto, AccountCandidateDto, AccountCashClassStatementDto, AccountDeclarationsDto,
+    AccountDto, AccountIdentityNotDoneDto, AccountIdentityRepointedDto, AccountIdentityStatedDto,
+    AccountIdentityStatementDto, AccountNegativeBalanceExpectationStatementDto,
+    AccountScopeDispositionDto, AccountScopeDto, AccountTransferPartnersBatchDto,
+    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto,
+    AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto, BrokerAccessDto,
+    BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto, CategoryGroupRequest,
+    CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest,
+    ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
+    ContourVersionDto, CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
+    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
+    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
+    ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto,
+    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
+    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
+    MoneyFlowReportDto, NegativeBalanceExpectationDto, OwnerBalanceRequest, QuotationBasisDto,
+    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
+    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
+    RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
+    ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -107,6 +111,7 @@ pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
 pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
 pub const REPLACE_ACCOUNT_ALIASES_OPERATION_ID: &str = "replace_account_aliases";
+pub const REPLACE_ACCOUNT_DECLARATIONS_OPERATION_ID: &str = "replace_account_declarations";
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
 /// The batch form. Deliberately absent from [`OperationKey`]: the action queue
 /// names the per-account operation, one item per account, and this is the
@@ -1627,6 +1632,258 @@ pub async fn replace_account_aliases(
             )
         })?;
     Ok(Json(account_dto(stored)))
+}
+
+/// State an account's declarations: its external identity, its cash class, and
+/// what a negative balance on it would mean.
+///
+/// **The three could previously be stated only at creation.** `POST /v1/accounts`
+/// is an upsert by external identity: a create repeating a known identity
+/// returns the account made last time and deliberately changes nothing about it,
+/// because it is idempotent rather than an update. `PUT
+/// /v1/accounts/{id}/aliases` maintains the alias set and nothing else. So every
+/// account the owner already had — which is every account created before
+/// decision 0004 — could never acquire an identity, a class or an expectation.
+///
+/// Shaped like the alias route: a replacement, not a patch. What differs is that
+/// these are three separate statements rather than one set, so the replacement
+/// is per field and an **absent** field is left exactly as it stands. A present
+/// field carries `stated`, and `stated: false` clears it — the distinction
+/// `AccountTransferPartnersDto` already draws between «he says none» and «he has
+/// not said».
+///
+/// **Two of the three change freely.** The cash class is a grouping label read
+/// by one report heading, which decision 0004 §3 forbids any rule from branching
+/// on; the negative-balance expectation is a warning that sets a flag beside a
+/// figure the report states either way (`iaam-d41s`). Neither invalidates
+/// anything recorded, so neither is guarded by anything beyond the owner's word.
+///
+/// **Re-pointing an identity is recorded and reported, not refused.** The
+/// response's `identity_repointed` block says what the call did not do, and
+/// [`AccountIdentityRepointedDto`] records why a refusal is not available here:
+/// the journal does not know which identity a fact arrived under.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/{id}/declarations",
+    operation_id = REPLACE_ACCOUNT_DECLARATIONS_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = ReplaceAccountDeclarationsRequest,
+    responses(
+        (status = 200, description = "Declarations recorded", body = AccountDeclarationsDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 409, description = "Another of the owner's accounts already answers to that identity", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn replace_account_declarations(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<ReplaceAccountDeclarationsRequest>,
+) -> Result<Json<AccountDeclarationsDto>, ApiFailure> {
+    // Which source an account answers to decides which account a row lands on,
+    // by the same rule that keeps account creation and aliases out of the
+    // agent's hands. The class and the expectation are the owner's word about
+    // his own money, and there is nobody else to take it from.
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+
+    let declarations = AccountDeclarations {
+        identity: identity_statement(request.identity)?,
+        cash_class: statement(
+            request.cash_class,
+            |stated| stated.class,
+            "cash_class.class",
+        )?
+        .map_stated(CashAssetClassDto::to_domain),
+        negative_balance_expectation: statement(
+            request.negative_balance_expectation,
+            |stated| stated.expectation,
+            "negative_balance_expectation.expectation",
+        )?
+        .map_stated(NegativeBalanceExpectationDto::to_domain),
+    };
+
+    let recorded = state
+        .services
+        .store
+        .replace_account_declarations(principal.owner, account, declarations)
+        .await?;
+
+    let identity_repointed = match recorded.previous_identity {
+        None => None,
+        Some(previous) => {
+            // Asked only when an identity was displaced: the answer is about the
+            // account, not about the identity, and it is the most the journal
+            // can say.
+            let facts_recorded = state
+                .services
+                .store
+                .list_account_activity(principal.owner)
+                .await?
+                .into_iter()
+                .find(|activity| activity.account == account)
+                .is_some_and(|activity| activity.has_business_fact);
+            Some(AccountIdentityRepointedDto {
+                previous: AccountIdentityStatedDto {
+                    provider: previous.provider,
+                    provider_account_id: previous.provider_account_id,
+                },
+                facts_recorded,
+                not_done: identity_repointed_not_done(),
+            })
+        }
+    };
+
+    Ok(Json(AccountDeclarationsDto {
+        account: account_dto(recorded.account),
+        identity_repointed,
+    }))
+}
+
+/// What re-pointing an identity did not do.
+///
+/// A constant register, in the shape `CaveatDto` uses and for its reason: each
+/// entry names one thing, and its `detail` interpolates nothing, so this block
+/// can never contradict the rest of the response by restating a value wrongly.
+fn identity_repointed_not_done() -> Vec<AccountIdentityNotDoneDto> {
+    [
+        (
+            "facts_not_moved",
+            "The facts already recorded against this account stay on it. \
+             Re-pointing the identity changes which account a later import \
+             addresses; it moves nothing already journalled.",
+        ),
+        (
+            "previous_identity_not_reserved",
+            "The identity this account has stopped answering to is now free. A \
+             create carrying it mints a new account, and this account's earlier \
+             facts do not follow it there.",
+        ),
+        (
+            "no_fact_records_the_identity_it_arrived_under",
+            "The journal records a fact against an account, never against the \
+             identity in force at the time. Neither you nor iaam can now tell \
+             which of this account's facts arrived under the previous identity.",
+        ),
+    ]
+    .into_iter()
+    .map(|(kind, detail)| AccountIdentityNotDoneDto {
+        kind: kind.to_owned(),
+        detail: detail.to_owned(),
+    })
+    .collect()
+}
+
+/// One declaration from the wire, with the one check the `stated` flag carries.
+///
+/// A statement is refused when it disagrees with itself: `stated: true` with
+/// nothing stated says two things, and so does `stated: false` beside a value.
+/// Storing either would record a statement the owner did not make.
+fn statement<S, T>(
+    statement: Option<S>,
+    value: impl FnOnce(S) -> Option<T>,
+    field: &str,
+) -> Result<Declared<T>, ApiFailure>
+where
+    S: HasStated,
+{
+    let Some(statement) = statement else {
+        return Ok(Declared::Untouched);
+    };
+    let stated = statement.stated();
+    match (stated, value(statement)) {
+        (true, Some(value)) => Ok(Declared::Stated(value)),
+        (false, None) => Ok(Declared::Cleared),
+        (true, None) => Err(unprocessable(
+            field,
+            "a value, because stated is true",
+            "nothing",
+            "a declaration stated without a value says two things at once; omit \
+             the whole field to leave it alone, or send stated: false to \
+             withdraw it",
+        )),
+        (false, Some(_)) => Err(unprocessable(
+            field,
+            "nothing, because stated is false",
+            "a value",
+            "stated: false withdraws the declaration; sending a value beside it \
+             says two things at once",
+        )),
+    }
+}
+
+/// The `stated` flag, so [`statement`] can read it off any of the three.
+trait HasStated {
+    fn stated(&self) -> bool;
+}
+
+impl HasStated for AccountCashClassStatementDto {
+    fn stated(&self) -> bool {
+        self.stated
+    }
+}
+
+impl HasStated for AccountNegativeBalanceExpectationStatementDto {
+    fn stated(&self) -> bool {
+        self.stated
+    }
+}
+
+/// The identity statement from the wire.
+///
+/// Not routed through [`statement`], because this value has two halves and the
+/// pair is what makes it an identity. Half of one is refused in the words the
+/// create route already uses: it is a check on the shape of the pair and never
+/// on the value, and the refusal does not echo `provider_account_id` back.
+fn identity_statement(
+    statement: Option<AccountIdentityStatementDto>,
+) -> Result<Declared<AccountIdentityView>, ApiFailure> {
+    let Some(statement) = statement else {
+        return Ok(Declared::Untouched);
+    };
+    match (
+        statement.stated,
+        statement.provider,
+        statement.provider_account_id,
+    ) {
+        (true, Some(provider), Some(provider_account_id)) => {
+            Ok(Declared::Stated(AccountIdentityView {
+                provider,
+                provider_account_id,
+            }))
+        }
+        (false, None, None) => Ok(Declared::Cleared),
+        (true, Some(_), None) => Err(unprocessable(
+            "identity.provider_account_id",
+            "both halves of the external identity",
+            "provider alone",
+            "an account identified at a source is identified by the pair: a \
+             statement naming only the source would be stored as naming no \
+             identity, and the next import would mint a second account",
+        )),
+        (true, None, _) => Err(unprocessable(
+            "identity.provider",
+            "both halves of the external identity",
+            "provider_account_id alone, or neither",
+            "an identifier without the source that printed it has no scope: two \
+             sources printing short sequential identifiers would collide on \
+             values neither of them controls",
+        )),
+        (false, _, _) => Err(unprocessable(
+            "identity",
+            "nothing beside stated: false",
+            "a half of an identity",
+            "stated: false withdraws the identity; sending a half of one beside \
+             it says two things at once",
+        )),
+    }
 }
 
 /// Aliases from the wire, with the one check the dates carry.

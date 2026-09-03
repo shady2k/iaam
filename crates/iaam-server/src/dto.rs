@@ -3830,6 +3830,151 @@ pub struct ReplaceAccountAliasesRequest {
     pub aliases: Vec<AccountAliasDto>,
 }
 
+/// The declarations an account carries beside its title, as the owner now
+/// states them.
+///
+/// Every field is optional, and **absent means «leave this one alone»**. That is
+/// the third state, and it is the reason each present field is an object with a
+/// `stated` flag rather than a bare value: a request shape where absence meant
+/// «none» would withdraw, on every call, every declaration the caller did not
+/// happen to repeat — and one of these decides which account a later import
+/// lands on.
+///
+/// `AccountTransferPartnersDto` carries the same `stated` flag for the same
+/// reason one noun away. So the three states of one field read:
+///
+/// - the key is absent — he has not mentioned it, and nothing changes;
+/// - `{"stated": false}` — he states none, and the stored value is cleared;
+/// - `{"stated": true, ...}` — he states this.
+///
+/// Aliases are not here. They are a set replaced whole, and
+/// [`ReplaceAccountAliasesRequest`] is their route.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReplaceAccountDeclarationsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<AccountIdentityStatementDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cash_class: Option<AccountCashClassStatementDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_balance_expectation: Option<AccountNegativeBalanceExpectationStatementDto>,
+}
+
+/// The owner's statement about the identity a source prints for this account.
+///
+/// The pair travels together, and a statement carrying one half is refused for
+/// the reason account creation refuses one: an identifier without the source
+/// that printed it has no scope, and a source without an identifier names no
+/// account. Both halves are absent exactly when `stated` is false.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountIdentityStatementDto {
+    /// Whether the account has an external identity at all. `false` withdraws
+    /// the one it carried, and is not the same call as omitting `identity`.
+    pub stated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Opaque, exactly as at creation: iaam does not parse it, does not check
+    /// its shape, and never renders it where a title belongs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_account_id: Option<String>,
+}
+
+/// The owner's statement about the class of cash this account holds.
+///
+/// A grouping label read by one report heading and by nothing else (decision
+/// 0004 §3). Changing it is safe by construction — no rule consults it — so it
+/// needs no ceremony beyond his word, and the route asks for none.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountCashClassStatementDto {
+    /// Whether he states a class at all. `false` returns the account to «not
+    /// stated», which groups under its own heading and is never guessed.
+    pub stated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<CashAssetClassDto>,
+}
+
+/// The owner's statement about what a negative balance on this account means.
+///
+/// A warning and never a constraint (`iaam-d41s`): the only thing that reads it
+/// sets `contradicts_expectation` beside a figure the report states either way.
+/// Changing it therefore invalidates nothing already recorded, and the route
+/// asks no more than it asks for a class.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountNegativeBalanceExpectationStatementDto {
+    /// Whether he has said anything about a minus here. `false` returns the
+    /// account to «he has not said», which is never filled in by inference.
+    pub stated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expectation: Option<NegativeBalanceExpectationDto>,
+}
+
+/// The account as its declarations now stand, with what the call did not do.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountDeclarationsDto {
+    pub account: AccountDto,
+    /// Present exactly when the call displaced an identity the account was
+    /// already carrying — replaced it with another, or withdrew it.
+    ///
+    /// Absent for the three cases that are ordinary: the account carried no
+    /// identity, the call did not mention the identity, or the identity stated
+    /// is the one already recorded. Giving an identity to an account that had
+    /// none is a first statement and needs no announcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_repointed: Option<AccountIdentityRepointedDto>,
+}
+
+/// An identity was re-pointed, and here is what that did not do.
+///
+/// **The change is recorded rather than refused, and this block is why that is
+/// safe to publish rather than a thing to hide.** The refusal one reaches for
+/// first — «facts were imported under the old identity, so refuse» — cannot be
+/// stated against this journal. An event records the account it belongs to and a
+/// free `source` label; no column and no event kind records the external
+/// identity in force when the row arrived, and the journal is append-only in the
+/// database, so nothing can be backfilled to make one. A refusal would have to
+/// be conditioned instead on «this account has facts at all», which refuses an
+/// account whose whole history was typed in by hand under no identity, and still
+/// does not answer the question anyone asked.
+///
+/// So the owner is told what happened and what did not, and he decides.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountIdentityRepointedDto {
+    /// The identity the account answered to until this call.
+    ///
+    /// Returned rather than withheld, for the reason decision 0004 §1 gives for
+    /// storing what a source prints at all: a mismatched import is debuggable by
+    /// reading the value, and an owner who has just re-pointed an account needs
+    /// to see which identity he displaced.
+    pub previous: AccountIdentityStatedDto,
+    /// Whether the journal holds any business fact recorded against this
+    /// account.
+    ///
+    /// About the **account**, not about the identity — the journal cannot answer
+    /// the second question, and this field is deliberately not named as though
+    /// it could. `true` is the case worth reading twice: those facts stayed
+    /// where they were.
+    pub facts_recorded: bool,
+    /// The specific things this call did not do. A closed set, and each `detail`
+    /// is a constant of its `kind` with nothing interpolated into it.
+    pub not_done: Vec<AccountIdentityNotDoneDto>,
+}
+
+/// Both halves of an identity, as a value rather than a statement.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountIdentityStatedDto {
+    pub provider: String,
+    pub provider_account_id: String,
+}
+
+/// One thing re-pointing an identity did not do.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountIdentityNotDoneDto {
+    /// Which of them: `facts_not_moved`, `previous_identity_not_reserved` or
+    /// `no_fact_records_the_identity_it_arrived_under`.
+    pub kind: String,
+    /// What that means, in one sentence, constant for the kind.
+    pub detail: String,
+}
+
 /// Broker environment in the transport layer. A separate type because
 /// the port's `BrokerEnvironment` knows nothing about OpenAPI and should not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

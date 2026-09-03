@@ -162,6 +162,60 @@ pub enum AccountCreation {
     Existing(AccountDetailRecord),
 }
 
+/// One declaration in a replacement: the owner's word, his withdrawal of it, or
+/// his silence.
+///
+/// Three states, not two, and the third is the whole reason this type exists. A
+/// replacement that spelled «leave this alone» and «he states none» the same way
+/// would clear, on every call, every field the caller did not happen to
+/// mention — and one of the fields it governs decides which account a later
+/// import lands on.
+///
+/// [`AccountTransferStatementRecord`] draws the same line one noun away: an
+/// empty partner list is «money moves between this account and none of my
+/// others», and having said nothing at all is a different fact. The distinction
+/// is borrowed rather than reinvented, because a second spelling of it is a
+/// second place for a silence to be read as an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declared<T> {
+    /// Not mentioned. The stored value stands exactly as it stood.
+    Untouched,
+    /// Stated as none. The stored value is cleared, and the account goes back to
+    /// «he has not said» — which is a thing he is allowed to say.
+    Cleared,
+    /// Stated as this.
+    Stated(T),
+}
+
+/// The declarations an account carries beside its title, as the owner now states
+/// them.
+///
+/// Three independent statements rather than one set, so each carries its own
+/// [`Declared`]. Folding them into a single replaced value would make stating a
+/// cash class withdraw an identity, which is exactly the accident the third
+/// state exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeclarations {
+    pub identity: Declared<AccountIdentity>,
+    pub cash_class: Declared<CashAssetClass>,
+    pub negative_balance_expectation: Declared<NegativeBalanceExpectation>,
+}
+
+/// What [`SqliteStore::replace_account_declarations`] recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeclarationsRecorded {
+    pub account: AccountDetailRecord,
+    /// The identity the account carried until this call, when the call replaced
+    /// it with a different one or withdrew it.
+    ///
+    /// `None` covers the three cases that need no announcement: the account
+    /// carried no identity, the call did not mention the identity, or the
+    /// identity stated is the one already recorded. Giving an identity to an
+    /// account that had none is an ordinary first statement; re-pointing one is
+    /// not, and this field is how the caller is told which of the two happened.
+    pub previous_identity: Option<AccountIdentity>,
+}
+
 /// The current version of a contour owned by one portfolio owner.
 ///
 /// The title travels with the identity because it is a property of the version,
@@ -450,6 +504,132 @@ impl SqliteStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Replace the declarations an account carries: the identity its source
+    /// prints, the class of cash the owner says it holds, and what he expects a
+    /// negative balance on it to mean.
+    ///
+    /// The three could previously be stated only at creation, and
+    /// [`Self::create_account`] deliberately ignores them when it finds the
+    /// identity already known — that call is an upsert by identity, not an
+    /// update of one. So every account that already existed could never acquire
+    /// any of the three, which is the defect this method closes.
+    ///
+    /// Replacement rather than a patch, following
+    /// [`Self::replace_account_aliases`]: the owner says what is true now. What
+    /// is different here is that the three are separate statements, so the
+    /// replacement is per field and [`Declared::Untouched`] is what leaves one
+    /// alone.
+    ///
+    /// **Re-pointing an identity is allowed, and is reported rather than
+    /// refused.** The tempting rule — refuse a change once facts were imported
+    /// under the old identity — cannot be stated against this schema. `events`
+    /// records a fact against an account id and a free `source` label; no
+    /// column and no event kind records the external identity in force when the
+    /// row arrived, and the journal is append-only in the database, so nothing
+    /// can be backfilled to make it. A refusal would therefore have to be
+    /// conditioned on «this account has facts at all», which is a different
+    /// claim: it refuses an account whose whole history was typed in by hand
+    /// under no identity, and it still does not answer the question anyone
+    /// asked. What the caller gets instead is [`previous_identity`], so a
+    /// re-pointing is visible as a re-pointing.
+    ///
+    /// [`previous_identity`]: AccountDeclarationsRecorded::previous_identity
+    ///
+    /// Immediate transaction: the collision check and the update are a
+    /// check-then-act, and two calls claiming one identity would otherwise both
+    /// find it free.
+    pub fn replace_account_declarations(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+        declarations: &AccountDeclarations,
+    ) -> Result<AccountDeclarationsRecorded, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Reading the account first establishes that it is this owner's: the
+        // update alone would report success having matched no row, and the
+        // caller would be told he had recorded a statement about someone else's
+        // account (§14).
+        let held = read_account_detail(&transaction, owner, account)?;
+
+        let identity = match &declarations.identity {
+            Declared::Untouched => held.identity.clone(),
+            Declared::Cleared => None,
+            Declared::Stated(identity) => Some(identity.clone()),
+        };
+        // The partial unique index would abort the update with a message naming
+        // two columns; the owner needs to be told that another of his accounts
+        // already answers to this identity. The check is skipped when the
+        // identity is unchanged, because a row does not collide with itself.
+        if let Some(wanted) = identity.as_ref() {
+            if held.identity.as_ref() != Some(wanted) {
+                let taken: Option<String> = transaction
+                    .query_row(
+                        "SELECT id FROM accounts
+                         WHERE owner = ?1 AND provider = ?2 AND provider_account_id = ?3",
+                        params![
+                            owner.inner().to_string(),
+                            wanted.provider,
+                            wanted.provider_account_id,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if taken.is_some() {
+                    return Err(StoreError::AlreadyExists {
+                        what: "an account with that external identity",
+                    });
+                }
+            }
+        }
+
+        let cash_class = match &declarations.cash_class {
+            Declared::Untouched => held.cash_class,
+            Declared::Cleared => None,
+            Declared::Stated(class) => Some(*class),
+        };
+        let expectation = match &declarations.negative_balance_expectation {
+            Declared::Untouched => held.negative_balance_expectation,
+            Declared::Cleared => None,
+            Declared::Stated(expectation) => Some(*expectation),
+        };
+
+        transaction.execute(
+            "UPDATE accounts
+                SET provider = ?3,
+                    provider_account_id = ?4,
+                    cash_class = ?5,
+                    negative_balance_expectation = ?6
+              WHERE owner = ?1 AND id = ?2",
+            params![
+                owner.inner().to_string(),
+                account.inner().to_string(),
+                identity.as_ref().map(|it| it.provider.as_str()),
+                identity.as_ref().map(|it| it.provider_account_id.as_str()),
+                cash_class.map(CashAssetClass::code),
+                expectation.map(NegativeBalanceExpectation::code),
+            ],
+        )?;
+
+        let stored = read_account_detail(&transaction, owner, account)?;
+        transaction.commit()?;
+
+        // Announced only when an identity was displaced. Giving one to an
+        // account that had none is ordinary, and restating the one already
+        // recorded displaced nothing.
+        let previous_identity = match &declarations.identity {
+            Declared::Untouched => None,
+            Declared::Cleared | Declared::Stated(_) => held
+                .identity
+                .filter(|previous| identity.as_ref() != Some(previous)),
+        };
+        Ok(AccountDeclarationsRecorded {
+            account: stored,
+            previous_identity,
+        })
     }
 
     /// Every account of one owner, with the identity, aliases and class it

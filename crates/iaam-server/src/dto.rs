@@ -527,6 +527,36 @@ pub struct OperationDto {
     pub kind: OperationKindDto,
     #[serde(default)]
     pub dates: OperationDatesDto,
+    /// A name the caller gives **the fact**, so sending it twice records it
+    /// once (§10.6, level two).
+    ///
+    /// A key names a fact, not a slot. Re-sending under a key the journal
+    /// already holds is answered `duplicate` with the identifier of the first
+    /// event, whatever the rest of the body says — the key is matched before
+    /// the operation is compared to anything, so a **corrected** row under a
+    /// key already used writes nothing and the journal keeps the wrong number.
+    /// The response is a success, and it is easy to read as "the correction
+    /// landed".
+    ///
+    /// This is the natural first move of an agent client — "the numbers were
+    /// wrong, so I fixed them and resent" — and it is precisely the one that
+    /// does nothing. **A fact that turned out wrong is corrected, never
+    /// resent**: `POST /v1/corrections` with a `replacement` retracts the
+    /// recorded event and states what should have stood instead, and it is the
+    /// only thing that changes a number already in the journal. Re-use is not
+    /// reversal: nothing on the ingest path writes a retraction, so a repeated
+    /// submission is a no-op rather than a retract-and-add.
+    ///
+    /// The key is scoped to the **owner**, not to the account, the source or
+    /// the import: two unrelated statements whose rows are keyed `row-1` are
+    /// one fact as far as this field is concerned. Construct keys that are
+    /// unique across everything the owner will ever import — the document and
+    /// the row within it, rather than the row alone.
+    ///
+    /// Omitting it is not a lesser version of sending it. Without a key a
+    /// second submission of the same row is a second event, because two
+    /// identical purchases on one day are an ordinary thing and the system has
+    /// no right to merge them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5529,6 +5559,92 @@ mod tests {
             "an absent document is omitted, not blank: {value}"
         );
     }
+
+    fn answer(word: &str) -> AnswerImportQuestionRequest {
+        AnswerImportQuestionRequest {
+            answer: word.to_owned(),
+            account: None,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn an_answer_that_names_no_account_refuses_one() {
+        // The mistake this catches is not untidiness. A caller that sends an
+        // account beside `received` believes it answered
+        // `received_from_own_account`, and the two say different things about
+        // where the money came from. Applying the answer it typed rather than
+        // the one it meant settles the row wrongly and says nothing.
+        for word in ["paid", "received", "fee", "income"] {
+            let request = AnswerImportQuestionRequest {
+                account: Some(Uuid::new_v4()),
+                ..answer(word)
+            };
+            let rejection = request
+                .to_domain()
+                .expect_err("an account the answer does not take is refused");
+            assert_eq!(rejection.field, "account");
+            assert!(
+                rejection.expected.contains(word),
+                "the refusal names the answer that was given: {rejection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_answers_that_name_an_account_still_take_one() {
+        for word in ["sent_to_own_account", "received_from_own_account"] {
+            let account = Uuid::new_v4();
+            let request = AnswerImportQuestionRequest {
+                account: Some(account),
+                ..answer(word)
+            };
+            let decision = request.to_domain().expect("the account is required here");
+            assert!(decision.shape().needs_account());
+            // And absence is still the malformed answer it always was.
+            let rejection = answer(word)
+                .to_domain()
+                .expect_err("this answer is incomplete without an account");
+            assert_eq!(rejection.field, "account");
+            assert_eq!(rejection.actual, "absent");
+        }
+    }
+
+    #[test]
+    fn only_the_fee_answer_carries_an_origin() {
+        for word in [
+            "sent_to_own_account",
+            "received_from_own_account",
+            "paid",
+            "received",
+            "income",
+        ] {
+            let request = AnswerImportQuestionRequest {
+                account: matches!(word, "sent_to_own_account" | "received_from_own_account")
+                    .then(Uuid::new_v4),
+                origin: Some(FeeOriginDto::Brokerage),
+                ..answer(word)
+            };
+            let rejection = request
+                .to_domain()
+                .expect_err("an origin the answer does not take is refused");
+            assert_eq!(rejection.field, "origin");
+            // The value is named as the caller spelled it, not as Rust spells it.
+            assert_eq!(rejection.actual, "brokerage");
+        }
+        let accepted = AnswerImportQuestionRequest {
+            origin: Some(FeeOriginDto::Depositary),
+            ..answer("fee")
+        }
+        .to_domain()
+        .expect("a fee carries its origin");
+        assert_eq!(
+            accepted,
+            Answer::Fee {
+                origin: FeeOrigin::Depositary
+            }
+        );
+    }
 }
 /// Report upload parameters. The route body is the workbook's binary bytes.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -6848,6 +6964,9 @@ pub struct JournalEventDto {
     /// inside a nested object.
     #[serde(flatten)]
     pub fact: JournalFactDto,
+    /// As on [`OperationDto::idempotency_key`], including the failure it makes
+    /// easy: a corrected fact re-sent under a key already recorded is answered
+    /// `duplicate` and changes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7159,6 +7278,43 @@ fn format_source_time(time: time::Time) -> String {
 /// opening a parallel one holding half the answers.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OpenImportSessionRequest {
+    /// Declaring it and omitting it open **two different products**, and the
+    /// choice cannot be revised afterwards: a session's identity is fixed when
+    /// it opens.
+    ///
+    /// **Declared** — a named import. The account is resolved once, here, by
+    /// whatever identifier the caller has (see [`DeclaredSourceDto::account`]),
+    /// and the response echoes it back. Everything the session later commits is
+    /// stamped with a source derived from that account and channel, and with an
+    /// import identity when a `label` was given. What this buys is retraction as
+    /// a unit: `POST /v1/corrections/imports`, given the same three fields,
+    /// retracts exactly this import and leaves the account's other imports in
+    /// force. A labelled declaration also reaches the session it already
+    /// opened, rather than opening a second one holding half the answers —
+    /// **that reuse is keyed on the label**, so a declaration without one opens
+    /// a fresh session on every call.
+    ///
+    /// **Absent** — a free session. Nothing scopes it to an account, and rows
+    /// for several accounts sit in it together. This is the shape for an export
+    /// that covers a whole institution: one session, questions answered once,
+    /// one commit. Reading the account requirement on `DeclaredSourceDto` as a
+    /// property of sessions is what turns such an export into four staged
+    /// imports, and it is not one.
+    ///
+    /// What a free session costs is the handle. Its rows are committed under a
+    /// source minted for the occasion, which is neither declared nor reported
+    /// back — the session's own `source` stays absent — and under no import at
+    /// all. `POST /v1/corrections/imports` keys on a declaration and so cannot
+    /// reach them: a free session's rows are corrected one event at a time
+    /// through `POST /v1/corrections`, having been found in the journal first.
+    ///
+    /// One thing a declaration does **not** buy: the session does not check that
+    /// the rows fed to it name the declared account, and cannot. It stores the
+    /// source and import, both one-way derivations, and the account itself is
+    /// gone by the time rows arrive. A row for another account is held, and
+    /// committed, under this import's identity. (The batch route does check it,
+    /// because there the declaration and the rows are in one request.) Feed a
+    /// declared session only the account it was declared for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DeclaredSourceDto>,
 }
@@ -7318,13 +7474,27 @@ pub struct ImportSessionContentsDto {
 /// `answer` is one of the words the question published in its alternatives.
 /// `account` is required by exactly the two that name one, and refused by the
 /// rest: an answer carrying an account the question does not take is a caller
-/// mistake worth naming rather than ignoring.
+/// mistake worth naming rather than ignoring. `origin` follows the same rule
+/// for the one answer that takes it.
+///
+/// The refusal is the point rather than tidiness. An LLM client resends fields
+/// it no longer needs, and a superfluous `account` beside `received` is the
+/// signature of a caller that believes it answered `received_from_own_account`
+/// — the difference between money arriving from outside the perimeter and money
+/// arriving from another of the owner's own accounts. Accepting it would settle
+/// the row as the answer it did not mean, silently, and every report would then
+/// be computed from that.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AnswerImportQuestionRequest {
     pub answer: String,
+    /// The owner's account on the other side, for `sent_to_own_account` and
+    /// `received_from_own_account` only. Required by those two, refused by the
+    /// other four.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<Uuid>,
-    /// Where a fee came from, for the `fee` answer only.
+    /// Where a fee came from, for the `fee` answer only. Refused on the other
+    /// five; optional on `fee` itself, where absence means the origin was not
+    /// stated and the fee is recorded as `other` rather than as a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<FeeOriginDto>,
 }
@@ -7335,6 +7505,11 @@ impl AnswerImportQuestionRequest {
     /// The account is checked here rather than deeper: a missing one is a
     /// malformed answer, and a superfluous one is a caller that believes it
     /// answered something else.
+    ///
+    /// Both checks read [`AnswerShape`] rather than re-listing which answers
+    /// take what. The list already exists — it is what a question publishes in
+    /// its alternatives — and a second copy here would eventually admit a field
+    /// the published alternative said nothing about.
     pub fn to_domain(&self) -> Result<Answer, Rejection> {
         let account = self.account.map(AccountId);
         let answer = match self.answer.as_str() {
@@ -7362,6 +7537,27 @@ impl AnswerImportQuestionRequest {
                 });
             }
         };
+        // A field the answer does not take, refused rather than dropped. The
+        // answer word is validated first, so the refusal can name the answer the
+        // caller actually gave instead of guessing at what it meant.
+        let shape = answer.shape();
+        if let Some(superfluous) = self.account.filter(|_| !shape.needs_account()) {
+            return Err(Rejection {
+                field: "account".into(),
+                expected: format!("no account: the `{}` answer names none", shape.code()),
+                actual: superfluous.to_string(),
+            });
+        }
+        if let Some(superfluous) = self.origin.filter(|_| shape != AnswerShape::Fee) {
+            return Err(Rejection {
+                field: "origin".into(),
+                expected: format!(
+                    "no origin: only the `{}` answer carries one",
+                    AnswerShape::Fee.code()
+                ),
+                actual: wire_word(superfluous),
+            });
+        }
         Ok(answer)
     }
 
@@ -7372,6 +7568,18 @@ impl AnswerImportQuestionRequest {
             actual: "absent".into(),
         }
     }
+}
+
+/// The word a serialisable value goes over the wire as.
+///
+/// Read back out of `serde` rather than written out again beside the type: a
+/// rejection must name the value the caller sent, and a hand-copied list of
+/// wire words drifts from the `rename_all` that produces them.
+fn wire_word<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|json| json.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "a value".to_owned())
 }
 
 /// What committing a session wrote.

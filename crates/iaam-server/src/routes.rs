@@ -3199,6 +3199,12 @@ pub async fn add_import_rows(
 /// row, so the next import of a matching row settles without asking. Nothing is
 /// recorded in the journal: the answer settles what the row is, and commit is
 /// what records it.
+///
+/// An answer carrying a field its own word does not take — an `account` beside
+/// `received`, an `origin` beside anything but `fee` — is refused rather than
+/// applied with the extra field dropped. Sending one is the signature of a
+/// caller that meant a different answer, and settling the row as the word it
+/// typed would record a decision nobody made.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions/{session}/questions/{question}/answer",
@@ -3214,7 +3220,7 @@ pub async fn add_import_rows(
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
-        (status = 422, description = "The answer is not one this question admits", body = ApiError)
+        (status = 422, description = "The answer is not one this question admits, or it carries a field its own word does not take", body = ApiError)
     ),
     security(("bearer" = []))
 )]

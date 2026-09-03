@@ -146,7 +146,17 @@ fn the_same_idempotency_key_returns_the_first_event() {
         store.append_event(&second, IdentityScope::Source).unwrap(),
         Appended::Duplicate { existing: first.id }
     );
-    assert_eq!(store.load_events(ctx.owner).unwrap().len(), 1);
+    let recorded = store.load_events(ctx.owner).unwrap();
+    assert_eq!(recorded.len(), 1);
+    // The key names the fact, and the amount is never compared: the second
+    // event is a *corrected* row under a key already used, and what survives is
+    // the first number rather than the right one. This is why re-sending a row
+    // does not fix it — a correction does, and nothing on this path writes one.
+    assert_eq!(
+        recorded[0].cash_effect(CurrencyCode::Rub).unwrap().amount(),
+        PostedMinor::new(100_000),
+        "the journal keeps the value it already held, not the corrected one"
+    );
 }
 
 #[test]

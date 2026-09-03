@@ -115,18 +115,39 @@ statement out of the bank is a step outside this API"* — and then says *"feed 
 the rows"*. Between those two clauses sits the conversion, and the item
 attributes it to nobody.
 
-It cannot, with what it has. `MissingInput` publishes who supplies a field in
+It could not, with what it had. `MissingInput` publishes who supplies a field in
 three words — the owner, an external document, the caller — and the rows are not
 a missing field at all: they are the body of a later call that the item does not
 describe. The two fields it does publish, the channel and the label, are exactly
-the two that *are* fields. So the item presupposes a converter, and the
+the two that *are* fields. So the item presupposed a converter, and the
 vocabulary it is written in has no word for one.
 
-For the owner running his tool the presupposition holds. For an agent holding
-pasted rows it holds only through the observation shape — a row submitted as
-what the source stated, with the source's own sign and direction word, which the
-server settles or asks about. The item never mentions that shape, and the only
+For the owner running his tool the presupposition held. For an agent holding
+pasted rows it held only through the observation shape — a row submitted as what
+the source stated, with the source's own sign and direction word, which the
+server settles or asks about. The item never mentioned that shape, and the only
 worked example in the repository, the tool, does not use it.
+
+**The item now names it, and no fourth word was added** (`iaam-tt71`). The reason
+says that deciding what a row was is not a step between fetching the document and
+feeding the session: a row whose direction or nature the reader cannot tell goes
+in as `unresolved_direction`, and the session settles it or asks the owner.
+
+The word was refused rather than forgotten, and the order of the two beads is the
+argument. The case for `ProvidedBy::Converter` rested on the parity defect of §6:
+while the observation channel could not express a refund or an income kind, a
+converter that concluded first was the only thing that could produce a complete
+import, and a contract that presupposes a participant should name it. §6 is
+closed, so the participant is no longer required, and writing the word now would
+record a workaround as the design at the moment it stopped being needed. Two
+smaller reasons hold independently of that: each word in `ProvidedBy` names *who
+supplies a value*, and a converter is a step rather than a source; and the rows
+are not a field of the request the item publishes, so a pointer at them could not
+be satisfied by filling that request in.
+
+Naming the shape is not naming the tool, which §8 rejects and still should.
+`unresolved_direction` is a value of this API's own contract, published in the
+document the same caller is already reading.
 
 ## 6. Where the line should be, and the two things that must move first
 
@@ -207,6 +228,13 @@ and the check it would buy is already bought by fixtures invented end to end.
 **Making the queue item name the tool.** Rejected: the queue is computed from
 the instance's own state and resolves its addresses from its own contract. An
 item that named a Python script in this repository would be a fact about the
-owner's laptop published by a server that cannot know it. What the item can
-honestly gain is a word for the converter in the vocabulary of §5, and that is a
-change to `MissingInput`, not to a sentence.
+owner's laptop published by a server that cannot know it.
+
+This paragraph used to end «what the item can honestly gain is a word for the
+converter in the vocabulary of §5, and that is a change to `MissingInput`, not to
+a sentence», and that was wrong on both halves. It was written while §6 stood, so
+it took the converter for a fixture of the arrangement rather than a symptom of
+the parity gap; and it treated *naming the tool* and *naming a shape this API
+publishes* as one move. `iaam-tt71` settled it the other way: the item gains a
+sentence naming `unresolved_direction`, and `MissingInput` is unchanged. §5
+carries the reasoning.

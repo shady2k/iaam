@@ -449,6 +449,31 @@ impl<'a> AccountNames<'a> {
 }
 
 /// A source from which the value of a missing request field must come.
+///
+/// **Three words, and there is deliberately no fourth for a converter**
+/// (`iaam-tt71`). The case for one was real while it stood: the queue's
+/// `start_account_import` item tells a caller to open a session and *feed it the
+/// rows*, and between "the owner obtains the statement" and that clause sat a
+/// conversion the item attributed to nobody. `docs/import-boundary.md` §8
+/// concluded that the item's honest gain was a word for the converter here.
+///
+/// That conclusion was conditional on a defect, and the defect is gone. It held
+/// because the observation channel could not express two of the outcomes the
+/// conclusive one could, so a converter that concluded first was the only thing
+/// that could produce a complete import — `iaam-7l7v` and decision 0005 closed
+/// that. A caller holding rows the owner pasted now transcribes them as
+/// observations and the server reaches the conclusions, so the conversion the
+/// item presupposed is no longer a step anybody has to take.
+///
+/// Writing the word anyway would record a workaround as the design at the moment
+/// it stopped being needed. It would also make this enum answer two questions:
+/// each word here names **who supplies a value**, and a converter is a step
+/// rather than a source. The half that was genuinely unattributed — the rows —
+/// is not a missing field of any request this type describes: it is the body of
+/// `POST /v1/import-sessions/{session}/rows`, a later call, and a pointer into
+/// it could not be satisfied by filling in the request it was published on. What
+/// the item gains instead is a sentence naming the shape a row is submitted in,
+/// which is a fact about this API and therefore something the queue may state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvidedBy {
     Owner,
@@ -2112,6 +2137,23 @@ fn activity_period(activity: &AccountActivityView) -> Option<AssertionPeriod> {
 /// both routes check `may_submit`, which an agent token satisfies, and an item
 /// marked `owner` would tell an agent it may not send a request the server would
 /// accept.
+///
+/// **The reason names the shape a row is submitted in, and that closes
+/// `iaam-tt71`.** «Feed it the rows» presupposed something that turns a
+/// statement into rows this API accepts, and named nobody: for the owner running
+/// his own converter the presupposition held, and for an agent holding rows he
+/// pasted it held only through the observation shape, which the item never
+/// mentioned. So an agent that read this item and knew only the conclusive kinds
+/// had to conclude — from a document it is not allowed to open — or stop.
+///
+/// The fix is a sentence rather than a fourth `ProvidedBy` word, and the
+/// argument for that is on [`ProvidedBy`] itself: the case for the word rested
+/// on a parity defect that `iaam-7l7v` removed, and the rows are not a field of
+/// this request in the first place. Naming the shape is not naming the tool,
+/// which `docs/import-boundary.md` §8 rejects and still should:
+/// `unresolved_direction` is a value of this API's own contract, published in
+/// the document the same caller is already reading, and the queue is entitled to
+/// say what its own calls accept.
 fn start_account_import_action(account: &AccountView) -> Action {
     // The session's `source` is what names the account these rows belong to, and
     // it is the whole of what the policy knows here: the account is the subject
@@ -2188,10 +2230,15 @@ fn start_account_import_action(account: &AccountView) -> Action {
             "Account {} ({}) has no business facts; import a statement or connect a broker. \
              Fetching the statement out of the bank is a step outside this API — no \
              operation here downloads the document, and the owner obtains it himself. \
-             Recording it is not: open an import session for this account, feed it the \
-             rows, read the assessment the session publishes to see what committing would \
-             record and what it would not, and commit under the revision that assessment \
-             carries; or synchronise a broker channel over an interval. An import already \
+             Recording it is not: open an import session for this account and feed it the \
+             rows the document printed. Deciding what a row was is not a step between \
+             those two — a row whose direction or nature the reader cannot tell is sent \
+             as `unresolved_direction`, carrying the source's own sign, its direction \
+             word and the party it named, and the session settles it against the owner's \
+             accounts and rules or asks him about it. Then read the assessment the \
+             session publishes to see what committing would record and what it would \
+             not, and commit under the revision that assessment carries; or synchronise \
+             a broker channel over an interval. An import already \
              under way for this account is not something this item can see — a session \
              records the source and the import it was opened for, and neither can be read \
              back as an account — so opening one again is what finds it: the call refuses, \
@@ -3867,6 +3914,16 @@ mod tests {
         assert!(
             import.reason().contains("open an import session"),
             "{}",
+            import.reason()
+        );
+        // And the half that was missing (`iaam-tt71`): «feed it the rows» named
+        // no way of producing them, so an agent that knew only the conclusive
+        // kinds had to conclude — from a document it may not open — or stop. The
+        // item now names the shape that lets it do neither.
+        assert!(
+            import.reason().contains("unresolved_direction"),
+            "the item must name the shape a row nobody has concluded is sent \
+             in, or it presupposes a converter it cannot address: {}",
             import.reason()
         );
     }

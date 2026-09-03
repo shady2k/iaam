@@ -14,8 +14,17 @@
 
 use std::collections::BTreeSet;
 
-use iaam_core::ids::{AccountId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
-use iaam_core::money::CurrencyCode;
+use iaam_core::batch::{self, BatchTotal, ControlCheck, ControlComparison, ControlSection};
+use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+use iaam_core::event::kind::EventKind;
+use iaam_core::event::kind::FeeOrigin;
+use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
+use iaam_core::ids::{
+    AccountId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId,
+};
+use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule, Movement,
     Question, RuleMatcher, classify,
@@ -30,10 +39,12 @@ use crate::actions::{
     AccountScope, OperationKey, RequestPlan, ResolutionOption, account_scope, answer_input,
 };
 use crate::error::{AppError, FieldRejection};
+use iaam_ingest::dedup::IdentityScope;
+
 use crate::ports::{
     AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, ContourView,
     ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionView,
-    NewImportQuestion, Principal,
+    NewImportQuestion, Principal, Recorded,
 };
 use crate::scenarios::classification::{matcher_json, outcome_json};
 use crate::scenarios::ingest::submit_candidates;
@@ -95,6 +106,10 @@ pub struct SessionContents {
     pub session: ImportSessionView,
     pub observations: Vec<ImportObservationView>,
     pub questions: Vec<ImportQuestionView>,
+    /// The control figures the source printed about itself, where the caller
+    /// transcribed them. Empty is the ordinary state of a session fed by a
+    /// converter that reads only the rows.
+    pub control_figures: Vec<ControlSection>,
 }
 
 impl SessionContents {
@@ -478,6 +493,10 @@ pub async fn read_session(
             .store
             .list_import_questions(principal.owner, session)
             .await?,
+        control_figures: services
+            .store
+            .list_import_control_figures(principal.owner, session)
+            .await?,
     })
 }
 
@@ -680,6 +699,97 @@ pub async fn answer_question(
         .await
 }
 
+/// Record what the source printed about itself in its own control section.
+///
+/// **This is the answer to «why are we allowed to commit an import that is
+/// knowably wrong».** Because at commit nothing knew what right looked like —
+/// while the source had printed it on the same page as the rows. A statement's
+/// control section is opening balance, closing balance and turnover each way,
+/// and the journal has had the vocabulary for exactly those since §10.3. It has
+/// only ever been able to receive them *after* the rows were written, through
+/// the owner-only reconciliation route, against a journal that already held
+/// whatever the import got wrong.
+///
+/// Four things are refused here rather than at commit, because each is a mistake
+/// in the transcription and the transcriber is the only one who can fix it:
+///
+/// 1. A section stating nothing. It would compare against nothing and publish a
+///    row of four absences, which reads as «checked» to anybody skimming.
+/// 2. A section stating a figure twice for one account and currency in one call.
+///    The store's upsert would silently keep whichever came last, and the caller
+///    would never learn that its two readings disagreed.
+/// 3. A negative turnover. Both sides are absolute values, as
+///    [`ControlClaim::CashTurnover`] carries them and as a statement prints them;
+///    a negative one is a sign convention misread, and letting it through would
+///    turn every subsequent comparison into nonsense. A **balance** may be
+///    negative and is not checked: §11 says an overdrawn account is a valid
+///    state.
+/// 4. An inverted interval, which [`AssertionPeriod::between`] refuses for the
+///    reason it always has: it reconciles with nothing and stays a discrepancy
+///    forever.
+///
+/// What is **not** refused is a section naming an account the owner's directory
+/// does not hold. That is a finding, not a malformed request, and the assessment
+/// already has a place to report it: a source printing a control section for an
+/// account nobody has described is exactly the case `account_resolution.missing`
+/// exists for, and refusing it here would hide it there.
+///
+/// Restating a section replaces it, per account and currency. A transcription
+/// corrected is a correction, and the alternative — refusing the second — pins a
+/// session to a typo with no way out but abandoning every row in it.
+///
+/// [`ControlClaim::CashTurnover`]: iaam_core::reconciliation::claim::ControlClaim::CashTurnover
+pub async fn state_control_figures(
+    services: &AppServices,
+    principal: &Principal,
+    session: ImportSessionId,
+    stated: Vec<ControlSection>,
+) -> Result<Vec<ControlSection>, AppError> {
+    require_submit(principal)?;
+    let mut seen: BTreeSet<(AccountId, CurrencyCode)> = BTreeSet::new();
+    for (index, section) in stated.iter().enumerate() {
+        if section.states_nothing() {
+            return Err(AppError::Invalid {
+                field: format!("figures[{index}]"),
+                expected: "at least one of opening, closing, debit_turnover or \
+                           credit_turnover"
+                    .to_owned(),
+                actual: "a section stating no figure".to_owned(),
+            });
+        }
+        if !seen.insert((section.account, section.currency)) {
+            return Err(AppError::Invalid {
+                field: format!("figures[{index}]"),
+                expected: "one section per account and currency".to_owned(),
+                actual: format!(
+                    "a second section for account {} in {}",
+                    section.account.inner(),
+                    section.currency.code()
+                ),
+            });
+        }
+        for (field, side) in [
+            ("debit_turnover", section.debit_turnover),
+            ("credit_turnover", section.credit_turnover),
+        ] {
+            if let Some(amount) = side
+                && amount.raw() < 0
+            {
+                return Err(AppError::Invalid {
+                    field: format!("figures[{index}].{field}"),
+                    expected: "an absolute value: a turnover carries no sign, the side does"
+                        .to_owned(),
+                    actual: amount.raw().to_string(),
+                });
+            }
+        }
+    }
+    services
+        .store
+        .state_import_control_figures(principal.owner, session, stated)
+        .await
+}
+
 /// Write everything the session holds into the journal, once.
 ///
 /// Refused while any question is unanswered. That refusal is the session's
@@ -700,11 +810,36 @@ pub async fn answer_question(
 /// approved is not what would be recorded. Omitted, the commit proceeds and the
 /// outcome carries the revision it wrote under, so a caller that committed blind
 /// is at least told what it committed.
+///
+/// `accept_control_mismatch` is how a batch that does not agree with its own
+/// source's control figures is committed anyway.
+///
+/// **Refusing outright was rejected.** A source's control section can itself be
+/// wrong — a misprinted statement, a bank's own correction issued a week later,
+/// a section covering a period the export does not — and a system that could not
+/// record what happened because a bank's arithmetic was wrong is a system that
+/// cannot record what happened. **Committing by default was rejected too**, and
+/// that is the whole bead: the two failures this exists for, both real, were a
+/// converter that mirrored every internal transfer and one that emitted minor
+/// units where the rest emitted major, and each of them committed silently
+/// because nothing had ever compared anything.
+///
+/// So the mismatch is neither a refusal nor a shrug: it is a flag whose absence
+/// refuses and whose presence is a sentence the caller had to write. The refusal
+/// names every figure that disagrees, with both numbers and the difference, so
+/// the flag is set by somebody who has read them.
+///
+/// The deliberation is not stored, and does not need to be. Committing writes
+/// the control figures into the journal as the assertions they are, beside the
+/// rows they disagree with; the disagreement becomes a permanent, readable fact
+/// that reconciliation will report as `discrepant` for as long as it stands. A
+/// boolean recorded in a session table would say less and be read by nobody.
 pub async fn commit_session(
     services: &AppServices,
     principal: &Principal,
     session: ImportSessionId,
     revision: Option<&SessionRevision>,
+    accept_control_mismatch: bool,
 ) -> Result<CommitOutcome, AppError> {
     require_submit(principal)?;
     let planned = plan_session(services, principal, session).await?;
@@ -735,7 +870,26 @@ pub async fn commit_session(
         .await);
     }
 
+    if !accept_control_mismatch
+        && let Some(refusal) = control_mismatch_refusal(&planned.plan.control_reconciliation)
+    {
+        return Err(refusal);
+    }
+
     let verdicts = submit_candidates(services, principal, "operation", planned.candidates).await?;
+    // The assertions go in **after** the rows, and the order is not arbitrary:
+    // an assertion is a statement about a period, and one written over a journal
+    // that does not yet hold the period's rows is a discrepancy against an empty
+    // interval. A failure between the two leaves the session open, so committing
+    // again re-submits the rows — which their idempotency keys answer with
+    // `duplicate` — and retries the assertions, whose own keys do the same.
+    let assertions = control_assertions(principal.owner, &planned.plan);
+    let control_assertions = if assertions.is_empty() {
+        Vec::new()
+    } else {
+        crate::scenarios::ingest::append_checked(services, assertions, IdentityScope::Source)
+            .await?
+    };
     services
         .store
         .close_import_session(principal.owner, session, ImportSessionState::Committed)
@@ -743,7 +897,75 @@ pub async fn commit_session(
     Ok(CommitOutcome {
         revision: planned.plan.revision,
         verdicts,
+        control_assertions,
     })
+}
+
+/// The refusal a mismatching batch earns, or nothing.
+///
+/// Every disagreeing figure is named with both numbers and the difference. One
+/// figure would have been shorter, and would have made the flag a guess: the
+/// caller sets it to say «I have read these and I still want them recorded»,
+/// and it cannot mean that about a list it was not shown. This is the opposite
+/// choice from [`unanswered_refusal`], which offers one question of many — and
+/// for the opposite reason: there the remedy is a separate call per question and
+/// a hundred of them would be a hundred requests, while here the remedy is one
+/// flag on this same call, and the list is what the flag is about.
+fn control_mismatch_refusal(control: &ControlReconciliation) -> Option<AppError> {
+    let mismatched: Vec<String> = control
+        .comparisons
+        .iter()
+        .flat_map(|comparison| {
+            comparison
+                .checks
+                .iter()
+                .filter_map(move |check| match check {
+                    ControlCheck::Mismatched {
+                        figure,
+                        claimed,
+                        observed,
+                        delta,
+                    } => Some(format!(
+                        "{} on account {} in {}: the source states {}, the rows come to {} \
+                     (difference {})",
+                        figure.code(),
+                        comparison.account.inner(),
+                        comparison.currency.code(),
+                        decimal(*claimed, comparison.currency),
+                        decimal(*observed, comparison.currency),
+                        decimal(*delta, comparison.currency),
+                    )),
+                    ControlCheck::Matched { .. } | ControlCheck::NotChecked { .. } => None,
+                })
+        })
+        .collect();
+    if mismatched.is_empty() {
+        return None;
+    }
+    Some(AppError::Invalid {
+        field: "accept_control_mismatch".to_owned(),
+        expected: "rows that add up to the control figures the source printed, or \
+                       accept_control_mismatch: true to record them as they are"
+            .to_owned(),
+        actual: format!(
+            "{} figure(s) disagree: {}",
+            mismatched.len(),
+            mismatched.join("; ")
+        ),
+    })
+}
+
+/// An amount in minor units as a decimal string.
+///
+/// [`Money::to_calc_dec`] and not arithmetic: the same value in a different
+/// representation, which is the one transition §3.4 allows. A refusal that
+/// printed raw minor units would be asking the reader to divide by a hundred
+/// before deciding whether to override a check.
+fn decimal(amount: PostedMinor, currency: CurrencyCode) -> String {
+    Money::new(amount, currency)
+        .to_calc_dec()
+        .inner()
+        .to_string()
 }
 
 /// The commit refusal, carrying the call that lifts it.
@@ -859,6 +1081,14 @@ pub struct CommitOutcome {
     pub revision: SessionRevision,
     /// A verdict per held row, in the order the rows were fed.
     pub verdicts: Vec<Verdict>,
+    /// The control assertions written out of the source's own control section.
+    ///
+    /// Reported apart from `verdicts` rather than appended to it, because
+    /// `verdicts` is a verdict **per row** and a caller reads it by position. An
+    /// assertion is not any row's outcome, and putting one at the end of that
+    /// list would give the last row of every import a neighbour that is not a
+    /// row.
+    pub control_assertions: Vec<Recorded>,
 }
 
 // ---------------------------------------------------------------------------
@@ -881,7 +1111,7 @@ pub struct SessionRevision(pub String);
 /// and part of them absent from the report he was shown, and nothing in between
 /// had ever said so.
 ///
-/// The seven sections are not a summary of the rows. Each answers a question the
+/// The eight sections are not a summary of the rows. Each answers a question the
 /// owner had no way to ask before committing, and they are separate because the
 /// answers can disagree — a row can be interpretable and outside the contour, or
 /// resolved and a duplicate.
@@ -896,7 +1126,43 @@ pub struct ImportPlan {
     pub interpretation: Interpretation,
     pub cross_source_matching: Proposals,
     pub commit_delta: CommitDelta,
+    /// The batch checked against the control figures its own source printed.
+    pub control_reconciliation: ControlReconciliation,
     pub readiness: Readiness,
+}
+
+/// What the source said about itself, and whether the rows agree.
+///
+/// The eighth section, and the only one that compares two numbers rather than
+/// describing one. Every other section reports what the import *is*; this one
+/// reports whether it *adds up*, against a figure the source printed itself.
+///
+/// Empty comparisons is the ordinary state of a session whose converter reads
+/// only rows, and it says exactly that: nothing was compared. That is worth
+/// publishing — «agreed» and «never checked» are different answers, and an
+/// import that could not be checked should not read like one that passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlReconciliation {
+    /// One entry per account and currency named by a control section or moved by
+    /// a row, in account and currency order.
+    pub comparisons: Vec<ControlComparison>,
+}
+
+impl ControlReconciliation {
+    /// How many stated figures disagree with the rows.
+    ///
+    /// A figure that could not be checked is not counted, for §10.4's reason:
+    /// «nothing to compare against» is not «the numbers do not match», and
+    /// counting it would refuse an import because its source printed less than
+    /// another source prints.
+    #[must_use]
+    pub fn mismatches(&self) -> usize {
+        self.comparisons
+            .iter()
+            .flat_map(|comparison| comparison.checks.iter())
+            .filter(|check| check.is_mismatch())
+            .count()
+    }
 }
 
 /// The plan, and the events it would append.
@@ -999,6 +1265,18 @@ pub struct PlannedFact {
 }
 
 /// What the journal gains, and what it does not.
+///
+/// Every list here is a list of rows, and beside two of them is what those rows
+/// come to. The totals answer the question the lists cannot: an operator
+/// checking a two-hundred-row import against the figure printed on his statement
+/// has one number on the statement and two hundred decimal strings here, and
+/// adding them up is arithmetic — which belongs in the core (§3.1, §13) and not
+/// in a client that is a language model.
+///
+/// They decide nothing and refuse nothing: they let a reader compare one number
+/// with one number, and what he does about a difference is his business. A
+/// source that printed no control section at all still leaves him a figure to
+/// check by hand against the statement in front of him.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitDelta {
     /// Facts that would be appended.
@@ -1010,6 +1288,16 @@ pub struct CommitDelta {
     pub duplicates: Vec<PlannedFact>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRow>,
+    /// What `facts` come to, per account and currency.
+    pub fact_totals: Vec<BatchTotal>,
+    /// What `duplicates` come to, per account and currency.
+    ///
+    /// Totalled separately rather than folded in with the facts, because the two
+    /// answer different questions. The facts' total is what the journal gains;
+    /// this one is what the source stated and the journal already holds, and it
+    /// is the figure that explains a statement whose turnover exceeds what the
+    /// import adds. Summed together they would be neither.
+    pub duplicate_totals: Vec<BatchTotal>,
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -1049,6 +1337,24 @@ pub enum Readiness {
         unanswered_questions: usize,
         transfer_candidates: usize,
     },
+    /// Every row is readable and answered, and the batch does not agree with the
+    /// control figures its own source printed.
+    ///
+    /// A third reason beside the other two because it is a third kind of thing.
+    /// `blocked` is a session that cannot commit at all; `requires_owner_decision`
+    /// is a question only the owner can settle. This is neither: every row was
+    /// read, nothing is waiting on anybody, and the arithmetic does not come out.
+    /// Reported as `requires_owner_decision` it would send the owner looking for
+    /// a question to answer, and there is none — what there is, is a batch that
+    /// does not add up, and either the reading of the document or the document
+    /// itself is wrong.
+    ///
+    /// It does **not** refuse the commit, and that is deliberate: a source's own
+    /// control section can itself be wrong, and a system that could not record a
+    /// statement its bank misprinted would be a system that cannot record what
+    /// happened. What it does is make committing a stated act — see
+    /// [`commit_session`].
+    DoesNotReconcile { mismatched_figures: usize },
 }
 
 impl Readiness {
@@ -1059,6 +1365,7 @@ impl Readiness {
             Self::Ready => "ready",
             Self::Blocked { .. } => "blocked",
             Self::RequiresOwnerDecision { .. } => "requires_owner_decision",
+            Self::DoesNotReconcile { .. } => "does_not_reconcile",
         }
     }
 }
@@ -1238,28 +1545,70 @@ pub async fn plan_session(
         .collect();
     let cross_source_matching = transfer_pairing::propose(&legs);
 
-    let readiness = if contents.session.state == ImportSessionState::Open {
-        if open_questions.is_empty() && cross_source_matching.candidates.is_empty() {
-            Readiness::Ready
-        } else {
-            Readiness::RequiresOwnerDecision {
-                unanswered_questions: open_questions.len(),
-                transfer_candidates: cross_source_matching.candidates.len(),
-            }
-        }
-    } else {
+    let commit_delta = CommitDelta {
+        fact_totals: batch_totals(&facts)?,
+        duplicate_totals: batch_totals(&duplicates)?,
+        facts,
+        duplicates,
+        retained_unrecorded: retained,
+    };
+    // Compared against the facts **and** the duplicates. A statement's turnover
+    // covers every row it printed, including the ones this journal already
+    // holds under their key; checking the facts alone would report a shortfall
+    // on every re-import of a statement that overlaps the last one, which is the
+    // ordinary shape of a monthly export.
+    let stated: Vec<ControlSection> = contents.control_figures.clone();
+    let control_reconciliation = ControlReconciliation {
+        comparisons: batch::compare(
+            &stated,
+            &batch_totals(
+                &commit_delta
+                    .facts
+                    .iter()
+                    .chain(commit_delta.duplicates.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )?,
+        )
+        .map_err(AppError::BatchTotal)?,
+    };
+
+    // The order is the decision, and it is by how firmly the door is shut.
+    //
+    // `blocked` first: a session that has left «open» commits nothing, whatever
+    // else is true of it. Then unanswered questions, which **refuse** the
+    // commit — and which are also a complete explanation of a shortfall, since
+    // an unread row is a row missing from every total; naming a mismatch here
+    // would send the owner to check arithmetic when what is missing is an
+    // answer. Then the mismatch, which commits only deliberately. Last the
+    // unconfirmed transfer candidates, which commit by default and change what
+    // the journal *relates*, not what it holds.
+    //
+    // Nothing is hidden by the ordering: every section is published whatever the
+    // readiness says, and `control_reconciliation` states both numbers of every
+    // comparison it made. What the ordering decides is the one word.
+    let mismatched_figures = control_reconciliation.mismatches();
+    let readiness = if contents.session.state != ImportSessionState::Open {
         Readiness::Blocked {
             reason: format!(
                 "the session is {}, and a session leaves «open» once",
                 contents.session.state.code()
             ),
         }
-    };
-
-    let commit_delta = CommitDelta {
-        facts,
-        duplicates,
-        retained_unrecorded: retained,
+    } else if !open_questions.is_empty() {
+        Readiness::RequiresOwnerDecision {
+            unanswered_questions: open_questions.len(),
+            transfer_candidates: cross_source_matching.candidates.len(),
+        }
+    } else if mismatched_figures > 0 {
+        Readiness::DoesNotReconcile { mismatched_figures }
+    } else if !cross_source_matching.candidates.is_empty() {
+        Readiness::RequiresOwnerDecision {
+            unanswered_questions: 0,
+            transfer_candidates: cross_source_matching.candidates.len(),
+        }
+    } else {
+        Readiness::Ready
     };
     let interpretation = Interpretation {
         resolved,
@@ -1273,6 +1622,7 @@ pub async fn plan_session(
         &interpretation,
         &cross_source_matching,
         &commit_delta,
+        &control_reconciliation,
         &readiness,
     );
 
@@ -1286,6 +1636,7 @@ pub async fn plan_session(
             interpretation,
             cross_source_matching,
             commit_delta,
+            control_reconciliation,
             readiness,
         },
         candidates,
@@ -1420,6 +1771,32 @@ fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact 
     }
 }
 
+/// What a list of planned facts comes to, per account and currency.
+///
+/// The fold itself is [`iaam_core::batch::total`]: summing money is arithmetic,
+/// and the architecture guard refuses it here (§3.1, §13). What this function
+/// decides is what counts as a movement, which the core deliberately leaves to
+/// its caller.
+///
+/// A fact whose cash effect on its own account is zero is left out. Its
+/// `currency` is a placeholder — [`planned_fact`] labels a zero `RUB` where the
+/// event moves no cash on that account, because the published shape has no room
+/// for «no cash» — and folding it would open a rouble total on an account that
+/// has never held roubles, and count a row against a currency it never named.
+fn batch_totals(facts: &[PlannedFact]) -> Result<Vec<BatchTotal>, AppError> {
+    let movements: Vec<(AccountId, Money)> = facts
+        .iter()
+        .filter(|fact| fact.amount_minor != 0)
+        .map(|fact| {
+            (
+                fact.account,
+                Money::new(PostedMinor::new(fact.amount_minor), fact.currency),
+            )
+        })
+        .collect();
+    batch::total(&movements).map_err(AppError::BatchTotal)
+}
+
 /// The stamp a plan carries, and commit refuses when it no longer matches.
 ///
 /// A digest of everything the plan says, and of nothing else. That is what makes
@@ -1442,6 +1819,7 @@ fn fingerprint(
     interpretation: &Interpretation,
     matching: &Proposals,
     delta: &CommitDelta,
+    control: &ControlReconciliation,
     readiness: &Readiness,
 ) -> SessionRevision {
     use std::fmt::Write as _;
@@ -1532,6 +1910,19 @@ fn fingerprint(
     for retained in &delta.retained_unrecorded {
         let _ = writeln!(rendered, "retained {retained:?}");
     }
+    // Derived from the lists above, and stamped anyway: the digest's contract is
+    // that it covers everything the plan says, and a section left out because it
+    // «cannot disagree» is the section that will, the day someone changes how it
+    // is folded.
+    for total in &delta.fact_totals {
+        let _ = writeln!(rendered, "fact total {total:?}");
+    }
+    for total in &delta.duplicate_totals {
+        let _ = writeln!(rendered, "duplicate total {total:?}");
+    }
+    for comparison in &control.comparisons {
+        let _ = writeln!(rendered, "control {comparison:?}");
+    }
     let _ = writeln!(rendered, "readiness {readiness:?}");
 
     let digest = Sha256::digest(rendered.as_bytes());
@@ -1539,6 +1930,196 @@ fn fingerprint(
         let _ = write!(text, "{byte:02x}");
         text
     }))
+}
+
+// ---------------------------------------------------------------------------
+// The source's control section, written as the assertions it is (iaam-jc3y)
+// ---------------------------------------------------------------------------
+
+/// The parser version every control assertion out of an import session carries.
+///
+/// **This is the whole of how a source's word is kept apart from the owner's.**
+/// `record_owner_balance` stamps `owner-stated/1`, and §10.4 caps anything
+/// resting on it at `accepted_internal` through
+/// [`Ground::OwnerStatedBalance`] — because the owner may well have read the
+/// figure in the very report the system parsed. A control section transcribed
+/// out of a statement is not that claim: it is what the document says, stated by
+/// whoever fed the document in, and the owner may never have looked at it.
+///
+/// Recording it under `owner-stated/1` would have been the easy path and would
+/// have been a forgery: an agent, which may open and commit a session, would be
+/// writing the owner's word about his own balance. Recording it under the row
+/// parser's version would have been the other forgery — the rows and the control
+/// section would then look like one parse of one document, which they nearly are
+/// but are not, and [`SourceChannel::is_independent_of`] would be answering
+/// about a distinction that had been erased.
+///
+/// [`Ground::OwnerStatedBalance`]: iaam_core::reconciliation::evidence::Ground::OwnerStatedBalance
+/// [`SourceChannel::is_independent_of`]: iaam_core::reconciliation::evidence::SourceChannel::is_independent_of
+const CONTROL_PARSER_VERSION: &str = "import-control/1";
+
+/// Version of the key one transcribed control assertion is written under.
+///
+/// Part of the key, as [`OWNER_BALANCE_KEY_VERSION`] is part of its own: keys
+/// have already been deduplicated against, so a change of form must be visible
+/// in the value rather than inferred from its shape.
+///
+/// [`OWNER_BALANCE_KEY_VERSION`]: crate::scenarios::reconciliation
+const CONTROL_KEY_VERSION: u8 = 1;
+
+/// The key under which one transcribed control figure is the same fact twice.
+///
+/// Deliberately the same shape as the owner-stated key — account, period,
+/// [`ControlClaim::subject_key`] — in its own namespace. The shape, because the
+/// subject is the question and not the answer: the same statement imported
+/// twice states one fact, and the second import must not append a second copy of
+/// it. The separate namespace, because these two facts are not the same fact:
+/// an agent transcribing what a bank printed cannot supersede, or be superseded
+/// by, the owner saying what he holds. Sharing a namespace would let either
+/// silently deduplicate the other away.
+///
+/// The session is **not** in the key, and that is the point of keying on the
+/// claim: two sessions importing the same statement — the ordinary shape of a
+/// retried import — state one fact and write it once.
+///
+/// [`ControlClaim::subject_key`]: iaam_core::reconciliation::claim::ControlClaim::subject_key
+fn control_assertion_key(
+    account: AccountId,
+    period: AssertionPeriod,
+    claim: &ControlClaim,
+) -> String {
+    format!(
+        "source-control:v{CONTROL_KEY_VERSION}:{}:{}:{}:{}",
+        account.inner(),
+        period.from,
+        period.to,
+        claim.subject_key()
+    )
+}
+
+/// The events one session's control sections become.
+///
+/// Built from the plan the commit is about to write, so what is asserted is
+/// exactly what was compared: a second read of the session here would be the
+/// drift iaam-k1xa exists to prevent, one section further along.
+///
+/// Every stated figure becomes a claim in the journal's own §10.3 vocabulary,
+/// and the mapping is fixed: the two balances are [`ControlClaim::CashBalance`]
+/// at their respective points, and the two turnover sides are one
+/// [`ControlClaim::CashTurnover`] — one claim, because a statement asserts a
+/// pair, and because the type carries both sides in one value. A section that
+/// prints only one side asserts the other as zero, which is what a statement
+/// with an empty column means and is checkable; splitting it into a claim the
+/// type cannot express is not an option the vocabulary offers.
+///
+/// The provenance is the session's own source with
+/// [`CONTROL_PARSER_VERSION`], and the document hash is a digest of the figures
+/// themselves. It is a digest rather than the file's hash because a session
+/// never sees the file — it receives rows and figures over HTTP — and a
+/// fabricated file hash would be a claim about a document nobody read.
+///
+/// [`ControlClaim::CashBalance`]: iaam_core::reconciliation::claim::ControlClaim::CashBalance
+/// [`ControlClaim::CashTurnover`]: iaam_core::reconciliation::claim::ControlClaim::CashTurnover
+fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event::Event> {
+    let source = plan.session.source.unwrap_or_else(SourceId::new_random);
+    let mut events = Vec::new();
+    for section in plan
+        .control_reconciliation
+        .comparisons
+        .iter()
+        .filter_map(|comparison| comparison.stated.as_ref())
+    {
+        let mut claims: Vec<ControlClaim> = Vec::new();
+        for (at, amount) in [
+            (BalancePoint::Opening, section.opening),
+            (BalancePoint::Closing, section.closing),
+        ] {
+            if let Some(amount) = amount {
+                claims.push(ControlClaim::CashBalance {
+                    currency: section.currency,
+                    amount,
+                    at,
+                });
+            }
+        }
+        if section.debit_turnover.is_some() || section.credit_turnover.is_some() {
+            claims.push(ControlClaim::CashTurnover {
+                currency: section.currency,
+                debit: section.debit_turnover.unwrap_or(PostedMinor::new(0)),
+                credit: section.credit_turnover.unwrap_or(PostedMinor::new(0)),
+            });
+        }
+        let provenance = Provenance::new(
+            source,
+            section_hash(section),
+            ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
+        );
+        for claim in claims {
+            events.push(iaam_core::event::Event {
+                id: EventId::new_random(),
+                schema_version: SCHEMA_VERSION,
+                owner,
+                account: section.account,
+                kind: EventKind::ControlAssertion {
+                    period: section.period,
+                    claim,
+                },
+                // Dated at the end of the interval it speaks about, as the
+                // owner-stated path dates its own and as the sync path dates the
+                // assertions it parses out of a report. An undated assertion
+                // makes every reconciliation, balances and returns report fail
+                // to build: `reconciliation::observe` refuses a journal holding
+                // an event that falls within no period.
+                dates: EventDates::for_cash(CashPostedDate(section.period.to)),
+                // The sequence within the day is assigned by the store; this is
+                // the temporary number every ingestion path passes.
+                order: EffectiveOrder::new(section.period.to, 1),
+                // No legs, as `Valuation` has none: an assertion does not move
+                // money, and a leg here would put the control section into the
+                // balance a second time.
+                legs: Vec::new(),
+                provenance: provenance.clone(),
+                relation: Relation::None,
+                // `Confidence` describes the value, not its verification (§4.9):
+                // the figure is the one the source printed.
+                confidence: Confidence::Known,
+                idempotency_key: Some(control_assertion_key(
+                    section.account,
+                    section.period,
+                    &claim,
+                )),
+            });
+        }
+    }
+    events
+}
+
+/// The digest one control section stands under.
+///
+/// Every figure and the interval, rendered in a fixed order. Two transcriptions
+/// of the same section therefore carry one hash, and a corrected transcription
+/// carries a different one — which is what a `raw_hash` is for: it says which
+/// reading of the source a fact came from.
+fn section_hash(section: &ControlSection) -> RawHash {
+    use std::fmt::Write as _;
+
+    let rendered = format!(
+        "control:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}",
+        section.account.inner(),
+        section.currency.code(),
+        section.period.from,
+        section.period.to,
+        section.opening.map(PostedMinor::raw),
+        section.closing.map(PostedMinor::raw),
+        section.debit_turnover.map(PostedMinor::raw),
+        section.credit_turnover.map(PostedMinor::raw),
+    );
+    let digest = Sha256::digest(rendered.as_bytes());
+    let hex = digest.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    });
+    RawHash::parse(&hex).expect("a SHA-256 digest is 64 hexadecimal characters")
 }
 
 /// Abandon the session.

@@ -23,20 +23,22 @@ use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CashAssetClass, CategoryRuleView, CategoryView,
     ClassificationRuleView, IssuedToken, NegativeBalanceExpectation, Scope, TokenView,
 };
-use iaam_app::ports::{ImportQuestionView, ImportSessionView};
+use iaam_app::ports::{ImportQuestionView, ImportSessionView, Recorded};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
 };
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
 use iaam_app::scenarios::import_session::{
-    HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow, RetentionReason,
+    ControlReconciliation, HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow,
+    RetentionReason,
 };
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
     MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
+use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -7627,6 +7629,12 @@ pub struct ImportSessionContentsDto {
     /// How many are still waiting on the owner. Commit refuses while this is
     /// not zero.
     pub unanswered: usize,
+    /// The control sections the source printed, as the session holds them.
+    ///
+    /// Empty is the ordinary state of a session fed by a converter that reads
+    /// only rows, and it is worth reading back: a caller that stated figures and
+    /// finds none here transcribed them onto a different session.
+    pub control_figures: Vec<ControlSectionDto>,
 }
 
 /// The owner's answer to one question.
@@ -7752,6 +7760,45 @@ pub struct ImportCommitDto {
     pub revision: String,
     /// A verdict per held row, in the order the rows were fed.
     pub rows: Vec<VerdictDto>,
+    /// The journal events the source's own control section became.
+    ///
+    /// Written at the same commit as the rows and reported apart from them,
+    /// because `rows` is a verdict per row read by position and an assertion is
+    /// not any row's outcome. Empty where the source stated no control section.
+    ///
+    /// This is the reconciliation the owner would otherwise have had to make
+    /// separately, already made: the figures are in the journal, dated to the
+    /// end of the period they speak about, and every later reconciliation report
+    /// compares them with what the rows actually came to.
+    pub control_assertions: Vec<RecordedEventDto>,
+}
+
+/// One journal event a commit wrote, or found already written.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecordedEventDto {
+    /// `inserted` or `duplicate`.
+    ///
+    /// `duplicate` is the ordinary answer to re-importing a statement whose
+    /// control section the journal already holds: the same source stating the
+    /// same figure for the same account and period is one fact, not two.
+    pub outcome: String,
+    pub event: Uuid,
+}
+
+impl RecordedEventDto {
+    #[must_use]
+    pub fn from_domain(recorded: &Recorded) -> Self {
+        match recorded {
+            Recorded::Inserted { id } => Self {
+                outcome: "inserted".to_owned(),
+                event: id.inner(),
+            },
+            Recorded::Duplicate { existing } => Self {
+                outcome: "duplicate".to_owned(),
+                event: existing.inner(),
+            },
+        }
+    }
 }
 
 /// One row a session is holding.
@@ -7840,6 +7887,251 @@ impl ImportRowDto {
 pub struct CommitImportSessionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    /// Record the rows even though they do not add up to the control figures the
+    /// source printed for itself.
+    ///
+    /// Absent or `false`, such a commit is refused, and the refusal names every
+    /// figure that disagrees with both numbers and the difference. `true` is a
+    /// sentence the caller had to write after reading them: a source's own
+    /// control section can be wrong, and this is how a batch is recorded anyway.
+    ///
+    /// It changes nothing about what is written. The figures are recorded as
+    /// assertions either way, so a disagreement the caller accepted is in the
+    /// journal, and reconciliation reports it as `discrepant` for as long as it
+    /// stands.
+    #[serde(default)]
+    pub accept_control_mismatch: bool,
+}
+
+/// The control figures a source printed for itself, as the caller transcribed
+/// them.
+///
+/// One statement, one interval: `from` and `to` are the period every figure in
+/// the call is about, because a control section belongs to the document it is
+/// printed on. A session importing two statements states them in two calls.
+///
+/// Every figure is optional and separately so. Absent means the source did not
+/// print it — never zero (§4.9): a zero is a figure a statement does print, and
+/// substituting one for silence would manufacture a mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StateImportControlFiguresRequest {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub to: Date,
+    pub figures: Vec<StatedControlFiguresDto>,
+}
+
+/// What one statement printed about one account in one currency.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StatedControlFiguresDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    /// What the account held before the first row of the period, as a decimal
+    /// string. May be negative: §11 says an overdrawn account is a valid state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening: Option<String>,
+    /// What it held after the last one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing: Option<String>,
+    /// Everything that arrived over the period, as a **positive** decimal
+    /// string: a turnover carries no sign, the side does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debit_turnover: Option<String>,
+    /// Everything that left, as a positive decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_turnover: Option<String>,
+}
+
+/// A control section as the session holds it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ControlSectionDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub period_from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub period_to: Date,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opening: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closing: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debit_turnover: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_turnover: Option<String>,
+}
+
+impl ControlSectionDto {
+    #[must_use]
+    pub fn from_domain(section: &ControlSection) -> Self {
+        let rendered = |amount: Option<PostedMinor>| {
+            amount.map(|amount| minor_amount(amount.raw(), section.currency))
+        };
+        Self {
+            account: section.account.inner(),
+            currency: CurrencyDto::from_domain(section.currency),
+            period_from: section.period.from,
+            period_to: section.period.to,
+            opening: rendered(section.opening),
+            closing: rendered(section.closing),
+            debit_turnover: rendered(section.debit_turnover),
+            credit_turnover: rendered(section.credit_turnover),
+        }
+    }
+}
+
+/// The batch, checked against the control figures its own source printed.
+///
+/// The one section of an assessment that compares two numbers rather than
+/// describing one. `mismatched_figures` is a fact about the whole comparison
+/// rather than about any row of it, which is why this is an object and not a
+/// bare array (conventions §1).
+///
+/// An empty `comparisons` says the source stated no control section and the
+/// rows were compared with nothing. That is not the same answer as «they
+/// agreed», and an import that could not be checked must not read like one that
+/// passed.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ControlReconciliationDto {
+    pub comparisons: Vec<ControlComparisonDto>,
+    /// How many stated figures disagree with the rows. A figure that could not
+    /// be checked is not one of them: §10.4 keeps «nothing to compare against»
+    /// apart from «the numbers do not match».
+    pub mismatched_figures: usize,
+}
+
+/// One account and one currency: what the source said, what the rows say.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ControlComparisonDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    /// The section the source printed here. Absent where the rows moved money
+    /// and nothing was stated about it — which refuses nothing, and is the
+    /// difference between «it agreed» and «it was never checked».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stated: Option<ControlSectionDto>,
+    /// What the rows come to. Zero over zero rows where the source stated
+    /// figures for an account and currency no row touched — which is not an
+    /// absence but the answer «nothing arrived».
+    pub observed: BatchTotalDto,
+    /// One entry per figure the source stated. Empty where it stated none.
+    pub checks: Vec<ControlCheckDto>,
+}
+
+/// One stated figure, checked — with both numbers on the page.
+///
+/// `observed` is printed even when the check matched. A result that said only
+/// «matched» would not say what it had compared, and the whole value of this
+/// section is that a reader can see the two figures that were put beside each
+/// other.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ControlCheckDto {
+    /// `closing_balance`, `debit_turnover` or `credit_turnover`.
+    ///
+    /// An opening balance is never checked and is not missing from the list: a
+    /// batch holds movements, not a starting position, so there is nothing to
+    /// compare one with. It is the term the closing check is built from.
+    pub figure: String,
+    /// `matched`, `mismatched` or `not_checked`.
+    pub outcome: String,
+    /// What the source stated.
+    pub claimed: String,
+    /// What the rows come to. Absent for `not_checked`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<String>,
+    /// `claimed` minus `observed`: positive where the source sees more than the
+    /// rows do. Absent for `not_checked`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    /// Why nothing was compared, for `not_checked`. Currently only
+    /// `opening_balance_not_stated`: a closing balance is checked as the opening
+    /// balance plus what the rows move, and the journal's own balance is
+    /// deliberately not substituted — the batch would then be checked against
+    /// facts that are not in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ControlReconciliationDto {
+    #[must_use]
+    pub fn from_domain(control: &ControlReconciliation) -> Self {
+        Self {
+            comparisons: control
+                .comparisons
+                .iter()
+                .map(ControlComparisonDto::from_domain)
+                .collect(),
+            mismatched_figures: control.mismatches(),
+        }
+    }
+}
+
+impl ControlComparisonDto {
+    #[must_use]
+    pub fn from_domain(comparison: &ControlComparison) -> Self {
+        let currency = comparison.currency;
+        Self {
+            account: comparison.account.inner(),
+            currency: CurrencyDto::from_domain(currency),
+            stated: comparison
+                .stated
+                .as_ref()
+                .map(ControlSectionDto::from_domain),
+            observed: BatchTotalDto::from_domain(&comparison.observed),
+            checks: comparison
+                .checks
+                .iter()
+                .map(|check| ControlCheckDto::from_domain(check, currency))
+                .collect(),
+        }
+    }
+}
+
+impl ControlCheckDto {
+    #[must_use]
+    pub fn from_domain(check: &ControlCheck, currency: CurrencyCode) -> Self {
+        let rendered = |amount: PostedMinor| minor_amount(amount.raw(), currency);
+        let base = Self {
+            figure: check.figure().code().to_owned(),
+            outcome: check.code().to_owned(),
+            claimed: String::new(),
+            observed: None,
+            delta: None,
+            reason: None,
+        };
+        match check {
+            ControlCheck::Matched {
+                claimed, observed, ..
+            } => Self {
+                claimed: rendered(*claimed),
+                observed: Some(rendered(*observed)),
+                ..base
+            },
+            ControlCheck::Mismatched {
+                claimed,
+                observed,
+                delta,
+                ..
+            } => Self {
+                claimed: rendered(*claimed),
+                observed: Some(rendered(*observed)),
+                delta: Some(rendered(*delta)),
+                ..base
+            },
+            ControlCheck::NotChecked {
+                claimed, reason, ..
+            } => Self {
+                claimed: rendered(*claimed),
+                reason: Some(reason.code().to_owned()),
+                ..base
+            },
+        }
+    }
 }
 
 /// What an import will and will not record.
@@ -7861,9 +8153,12 @@ pub struct ImportPlanDto {
     /// against — ordinarily most of the rows, and not pending work.
     pub cross_source_matching: CrossSourceMatchingDto,
     pub commit_delta: CommitDeltaDto,
-    /// `ready`, `blocked` or `requires_owner_decision`.
+    /// The rows, checked against the control figures the source printed for
+    /// itself.
+    pub control_reconciliation: ControlReconciliationDto,
+    /// `ready`, `blocked`, `requires_owner_decision` or `does_not_reconcile`.
     pub readiness: String,
-    /// Why, for `blocked` and `requires_owner_decision`.
+    /// Why, for everything but `ready`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readiness_detail: Option<String>,
 }
@@ -7951,6 +8246,67 @@ pub struct CommitDeltaDto {
     pub duplicates: Vec<PlannedFactDto>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRowDto>,
+    /// What `facts` come to, per account and currency.
+    ///
+    /// One number to compare with one number. Without it a client checking a
+    /// two-hundred-row import against the figure on the statement has to add up
+    /// two hundred decimal strings, and this API's client is a language model in
+    /// a system that deliberately keeps money arithmetic in the core.
+    pub fact_totals: Vec<BatchTotalDto>,
+    /// What `duplicates` come to, per account and currency.
+    ///
+    /// Separate from `fact_totals` because they answer different questions: one
+    /// is what the journal gains, the other is what the source restated and the
+    /// journal already holds. Their sum is neither, which is why it is not
+    /// published.
+    pub duplicate_totals: Vec<BatchTotalDto>,
+}
+
+/// What one account's rows in one currency come to.
+///
+/// `debit` and `credit` are **absolute values**, the way a statement's turnover
+/// section prints them: the side carries the sign. `net` is signed, because a
+/// month that spent more than it received is the ordinary case and a total
+/// without a sign could not say so.
+///
+/// The account is a bare identifier, and this is the one place in the API where
+/// that needs saying rather than assuming. The rule (conventions §3) is that a
+/// published identifier of a thing the owner named carries his name for it; the
+/// exemption it grants is for a response that carries its own join table,
+/// computed by the same fold. This response does: `account_resolution` names
+/// every account these rows are on, splitting them into the ones the owner's
+/// directory holds and the ones it does not. The second list is why a name
+/// cannot simply be printed here — a total over rows on an account the directory
+/// has never heard of is exactly what this section must be able to publish, and
+/// an invented or omitted title on those rows would be worse than the identifier
+/// that is right beside them in `facts`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BatchTotalDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    /// How many of the rows above this total folded. Rows that moved no cash on
+    /// the account are not among them.
+    pub rows: usize,
+    /// What arrived, as a positive decimal string.
+    pub debit: String,
+    /// What left, as a positive decimal string.
+    pub credit: String,
+    /// `debit` minus `credit`, signed.
+    pub net: String,
+}
+
+impl BatchTotalDto {
+    #[must_use]
+    pub fn from_domain(total: &BatchTotal) -> Self {
+        Self {
+            account: total.account.inner(),
+            currency: CurrencyDto::from_domain(total.currency),
+            rows: total.rows,
+            debit: minor_amount(total.debit.raw(), total.currency),
+            credit: minor_amount(total.credit.raw(), total.currency),
+            net: minor_amount(total.net.raw(), total.currency),
+        }
+    }
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -8128,6 +8484,13 @@ impl ImportPlanDto {
                 )),
                 plan.readiness.code(),
             ),
+            Readiness::DoesNotReconcile { mismatched_figures } => (
+                Some(format!(
+                    "{mismatched_figures} control figure(s) the source printed do not \
+                     agree with the rows; see control_reconciliation"
+                )),
+                plan.readiness.code(),
+            ),
         };
         Self {
             session: ImportSessionDto::from_domain(&plan.session),
@@ -8219,7 +8582,22 @@ impl ImportPlanDto {
                     .iter()
                     .map(RetainedRowDto::from_domain)
                     .collect(),
+                fact_totals: plan
+                    .commit_delta
+                    .fact_totals
+                    .iter()
+                    .map(BatchTotalDto::from_domain)
+                    .collect(),
+                duplicate_totals: plan
+                    .commit_delta
+                    .duplicate_totals
+                    .iter()
+                    .map(BatchTotalDto::from_domain)
+                    .collect(),
             },
+            control_reconciliation: ControlReconciliationDto::from_domain(
+                &plan.control_reconciliation,
+            ),
             readiness: readiness.to_owned(),
             readiness_detail,
         }

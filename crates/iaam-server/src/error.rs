@@ -412,6 +412,10 @@ impl ApiFailure {
             // a scope and a date, and neither of them can make two currencies
             // meet inside one figure.
             | AppError::AssetSnapshot(_)
+            // A batch whose rows will not add is the same case one fold along:
+            // the caller sent amounts the currency admits, and their sum does
+            // not fit. Nothing it could send instead would help.
+            | AppError::BatchTotal(_)
             // Failure of the randomness source is also a `500`: no secret was issued,
             // and this is a server failure, not a request error. Retrying the request
             // makes sense, but substituting a fallback generator does not,

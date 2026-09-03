@@ -101,13 +101,15 @@ use crate::dto::{
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
     CommitImportSessionRequest, ConfirmTransferPairingRequest, ConfirmedPairingDto,
-    CrossSourceMatchingDto, ImportCommitDto, ImportPlanDto, ImportQuestionDto, ImportRowDto,
-    ImportSessionContentsDto, ImportSessionDto, OpenImportSessionRequest,
+    ControlSectionDto, CrossSourceMatchingDto, ImportCommitDto, ImportPlanDto, ImportQuestionDto,
+    ImportRowDto, ImportSessionContentsDto, ImportSessionDto, OpenImportSessionRequest,
+    RecordedEventDto, StateImportControlFiguresRequest,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
 use iaam_app::scenarios::import_session::SessionRevision;
+use iaam_core::batch::ControlSection;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
@@ -3370,6 +3372,7 @@ pub async fn commit_import_session(
         &principal,
         ImportSessionId(id),
         revision.as_ref(),
+        request.accept_control_mismatch,
     )
     .await
     .map_err(|error| ApiFailure::from_app(error, &catalog))?;
@@ -3388,7 +3391,114 @@ pub async fn commit_import_session(
             .enumerate()
             .map(|(index, verdict)| VerdictDto::from_domain(index + 1, verdict))
             .collect(),
+        control_assertions: outcome
+            .control_assertions
+            .iter()
+            .map(RecordedEventDto::from_domain)
+            .collect(),
     }))
+}
+
+/// State the control figures this session's source printed for itself.
+///
+/// A bank statement prints its own arithmetic — opening balance, closing
+/// balance, and how much crossed the account each way — and until now a session
+/// could not take it. The figures went in afterwards, through the owner-only
+/// reconciliation route, against a journal that already held whatever the import
+/// got wrong. So the one moment a mismatch was cheap was the one moment nothing
+/// compared anything, while the source had printed the answer on the same page
+/// as the rows.
+///
+/// Stating them makes the assessment compare: `control_reconciliation` puts both
+/// numbers beside each other per account and currency, and a disagreement takes
+/// the readiness to `does_not_reconcile`. Committing over one stays possible —
+/// a statement can itself be wrong — but takes `accept_control_mismatch`.
+///
+/// One interval per call, because a control section belongs to the document it
+/// is printed on. Restating a section replaces it: a transcription corrected is
+/// a correction.
+///
+/// **This is not the owner stating his balance.** That is
+/// `POST /v1/reconciliation/balance`, which is owner-only and writes under the
+/// owner-stated parser version, capped at `accepted_internal` by §10.4. What is
+/// stated here is what a document says, by whoever fed the document in — an
+/// agent may do it, exactly as an agent may feed in the rows — and it is written
+/// under its own parser version and its own key namespace, so neither claim can
+/// supersede or deduplicate the other.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/control-figures",
+    params(("session" = Uuid, Path, description = "Import session identifier")),
+    request_body = StateImportControlFiguresRequest,
+    responses(
+        (status = 200, description = "Every control section the session now holds", body = Vec<ControlSectionDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such open session", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "A section states nothing, names an account and currency twice, gives a signed turnover, or names an inverted interval", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn state_import_control_figures(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<StateImportControlFiguresRequest>,
+) -> Result<Json<Vec<ControlSectionDto>>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let period = AssertionPeriod::between(request.from, request.to).ok_or_else(|| {
+        invalid_field(
+            "period",
+            "from no later than to",
+            format!("{}..{}", request.from, request.to),
+        )
+    })?;
+    let mut stated = Vec::with_capacity(request.figures.len());
+    for (index, figures) in request.figures.iter().enumerate() {
+        let currency = figures.currency.to_domain();
+        // Each figure is parsed under its own pointer. A batch of four rejected
+        // as «one of them is not a decimal» would send the caller to read all
+        // four.
+        let amount = |value: &Option<String>, field: &str| {
+            value
+                .as_ref()
+                .map(|amount| {
+                    let pointer = format!("figures[{index}].{field}");
+                    let decimal = amount.parse::<Decimal>().map_err(|_| {
+                        invalid_field(pointer.clone(), "decimal string", amount.clone())
+                    })?;
+                    iaam_app::ingest::operation::to_minor_units(decimal, currency, "amount")
+                        .map(PostedMinor::new)
+                        .map_err(|rejection| {
+                            invalid_field(pointer, &rejection.expected, rejection.actual)
+                        })
+                })
+                .transpose()
+        };
+        stated.push(ControlSection {
+            account: AccountId(figures.account),
+            currency,
+            period,
+            opening: amount(&figures.opening, "opening")?,
+            closing: amount(&figures.closing, "closing")?,
+            debit_turnover: amount(&figures.debit_turnover, "debit_turnover")?,
+            credit_turnover: amount(&figures.credit_turnover, "credit_turnover")?,
+        });
+    }
+    let held = iaam_app::scenarios::import_session::state_control_figures(
+        &state.services,
+        &principal,
+        ImportSessionId(id),
+        stated,
+    )
+    .await?;
+    Ok(Json(
+        held.iter().map(ControlSectionDto::from_domain).collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3520,6 +3630,11 @@ fn session_contents_dto(contents: &SessionContents) -> ImportSessionContentsDto 
             .iter()
             .filter(|question| question.is_open())
             .count(),
+        control_figures: contents
+            .control_figures
+            .iter()
+            .map(ControlSectionDto::from_domain)
+            .collect(),
     }
 }
 

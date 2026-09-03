@@ -696,9 +696,17 @@ async fn an_ambiguous_row_does_not_silently_become_a_deposit() {
         verdicts[0]["verdict"], "needs_classification",
         "a row with no direction must come back as a question, not a movement: {verdicts}"
     );
+    let detail = verdicts[0]["detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the verdict must carry the question: {verdicts}"));
+    // Which question, not merely that there is one. A row whose direction the
+    // source withheld must be asked about its direction; asking "is this
+    // income?" about it would settle the direction by assuming it, one step
+    // further along, and the owner's answer would record the guess as a rule.
+    // Asserting only that some question came back does not catch that.
     assert!(
-        verdicts[0]["detail"].is_string(),
-        "the verdict must carry the question the owner is to answer: {verdicts}"
+        detail.contains("INNER"),
+        "the question must quote what the source did state: {verdicts}"
     );
 
     // And nothing moved on the guess: the balance does not change until the

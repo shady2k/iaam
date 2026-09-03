@@ -23,8 +23,8 @@ use iaam_app::ingest::observation::Intake;
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     AccountAliasView, AccountCreated, AccountDeclarations, AccountDetailView, AccountIdentityView,
-    AccountScopeExclusionView, AccountTransferStatementView, ContourView, Declared, Principal,
-    Scope,
+    AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Declared,
+    Principal, Scope,
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
@@ -192,9 +192,14 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
         .to_owned(),
         reason: action.reason().to_owned(),
         required_scope: action.required_scope().map(|scope| scope.code().to_owned()),
+        // Copied, not looked up: the pairing of an account with what the owner
+        // calls it is made where the item is made, so the name here and the name
+        // inside `reason` are one reading of the store rather than two.
         subject: action.subject().map(|subject| match subject {
             ActionSubject::Account(account) => ActionSubjectDto::Account {
-                id: account.inner(),
+                id: account.id.inner(),
+                title: account.title.clone(),
+                institution: account.institution.clone(),
             },
             ActionSubject::Event(event) => ActionSubjectDto::Event { id: event.inner() },
         }),
@@ -1954,9 +1959,8 @@ pub async fn get_account_scope(
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<AccountScopeDto>, ApiFailure> {
-    let account = AccountId(id);
-    owned_account(&state, &principal, account).await?;
-    Ok(Json(account_scope_dto(&state, &principal, account).await?))
+    let account = owned_account(&state, &principal, AccountId(id)).await?;
+    Ok(Json(account_scope_dto(&state, &principal, &account).await?))
 }
 
 /// Record the owner's decision about an account's place in the perimeter.
@@ -1992,7 +1996,7 @@ pub async fn record_account_scope(
     // same rule that keeps contour composition out of the agent's hands.
     require_admin(&principal)?;
     let account = AccountId(id);
-    owned_account(&state, &principal, account).await?;
+    let named = owned_account(&state, &principal, account).await?;
 
     match request.disposition {
         AccountScopeDispositionDto::Inside => {
@@ -2046,7 +2050,7 @@ pub async fn record_account_scope(
         }
     }
 
-    Ok(Json(account_scope_dto(&state, &principal, account).await?))
+    Ok(Json(account_scope_dto(&state, &principal, &named).await?))
 }
 
 /// An account's stated transfer partners.
@@ -2325,27 +2329,29 @@ async fn owned_account(
     state: &ServerState,
     principal: &Principal,
     account: AccountId,
-) -> Result<(), ApiFailure> {
+) -> Result<AccountView, ApiFailure> {
     let accounts = state.services.store.list_accounts(principal.owner).await?;
-    if accounts.iter().any(|held| held.id == account) {
-        Ok(())
-    } else {
-        Err(ApiFailure::new(
-            StatusCode::NOT_FOUND,
-            ApiError::simple(
-                "not_found",
-                format!("not found: account {}", account.inner()),
-            ),
-        ))
-    }
+    accounts
+        .into_iter()
+        .find(|held| held.id == account)
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                ApiError::simple(
+                    "not_found",
+                    format!("not found: account {}", account.inner()),
+                ),
+            )
+        })
 }
 
 /// Read the disposition back from the two places that hold one.
 async fn account_scope_dto(
     state: &ServerState,
     principal: &Principal,
-    account: AccountId,
+    account: &AccountView,
 ) -> Result<AccountScopeDto, ApiFailure> {
+    let id = account.id;
     let contours = state.services.store.list_contours(principal.owner).await?;
     let exclusions = state
         .services
@@ -2354,22 +2360,24 @@ async fn account_scope_dto(
         .await?;
     let naming: Vec<Uuid> = contours
         .iter()
-        .filter(|contour| contour.accounts.contains(&account))
+        .filter(|contour| contour.accounts.contains(&id))
         .map(|contour| contour.id.0)
         .collect();
-    let (disposition, reason) = match account_scope(account, &contours, &exclusions) {
+    let (disposition, reason) = match account_scope(id, &contours, &exclusions) {
         AccountScope::Inside => (AccountScopeDispositionDto::Inside, None),
         AccountScope::Outside => (
             AccountScopeDispositionDto::Outside,
             exclusions
                 .iter()
-                .find(|exclusion| exclusion.account == account)
+                .find(|exclusion| exclusion.account == id)
                 .map(|exclusion| exclusion.reason.clone()),
         ),
         AccountScope::Undecided => (AccountScopeDispositionDto::Undecided, None),
     };
     Ok(AccountScopeDto {
-        account: account.inner(),
+        account: id.inner(),
+        title: account.title.clone(),
+        institution: account.institution.clone(),
         disposition,
         reason,
         contours: naming,
@@ -3542,8 +3550,10 @@ pub async fn flow_report(
     };
     let outcome = money_flow(&state.services, &principal, &query).await?;
     // No scoping: the projection admits no leg from outside the contour, so the
-    // report cannot name an account it does not cover.
-    let actions = iaam_app::actions::flow_diagnostics(&outcome.report)
+    // report cannot name an account it does not cover. The accounts are read for
+    // the names the items carry, not to narrow them.
+    let accounts = state.services.store.list_accounts(principal.owner).await?;
+    let actions = iaam_app::actions::flow_diagnostics(&outcome.report, &accounts)?
         .iter()
         .map(|action| action_dto(action, &catalog))
         .collect();

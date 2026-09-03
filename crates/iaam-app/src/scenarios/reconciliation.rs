@@ -70,9 +70,20 @@ pub async fn report(
     // one `discrepant` and one `excepted`, from the same journal.
     let perimeter = assess(&events, PerimeterPolicy::default())?;
     let ledger = ReconciliationLedger::build_with(&events, &perimeter.exceptions())?;
+    // The account itself, not only its identifier: every item this range emits
+    // says what the owner calls the account it is about, and the name is his
+    // and lives on the account.
+    let accounts = services.store.list_accounts(principal.owner).await?;
+    let named = accounts
+        .iter()
+        .find(|held| held.id == account)
+        .ok_or_else(|| AppError::NotFound {
+            what: "account",
+            id: account.inner().to_string(),
+        })?;
     Ok(ReconciliationReport {
         statuses: statuses_for_account(&ledger, account, period),
-        actions: ledger_diagnostics_for(&ledger, account, period),
+        actions: ledger_diagnostics_for(&ledger, named, period),
         gaps: ledger
             .gaps()
             .iter()

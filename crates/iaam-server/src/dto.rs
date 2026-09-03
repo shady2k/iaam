@@ -3595,11 +3595,38 @@ pub struct ActionDto {
 /// A field of its own rather than a name buried in `reason`: `id` is opaque by
 /// contract and `reason` is a sentence, so a client that wants the items about
 /// one account had no way to select them without parsing prose.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+///
+/// An account subject carries the owner's own name for the account beside the
+/// identifier, under the naming rule in `docs/api/conventions.md` §3. The queue
+/// is the surface that rule was written for: a client is handed a dozen items,
+/// one per account, and nothing else in the response says which account any of
+/// them is about. Before the name travelled with the item, reading the queue
+/// meant a second request to `GET /v1/accounts` and a join the client was left
+/// to perform — and an item the owner cannot name is an item he cannot act on.
+///
+/// The pair is built in `iaam_app::actions`, where the item is built, and not
+/// joined here. See `iaam_app::actions::AccountSubject` for why: `reason`
+/// already interpolates the title, and a name joined from a second read of the
+/// store could contradict the sentence printed beside it.
+///
+/// An event has no name. `Event` stays a bare identifier because nothing the
+/// owner said names one — the id is the whole of its identity, and the item's
+/// `reason` states what the event is.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionSubjectDto {
-    Account { id: Uuid },
-    Event { id: Uuid },
+    Account {
+        id: Uuid,
+        /// What the owner calls this account.
+        title: String,
+        /// The institution he said holds it, when he said. Absent means he has
+        /// not said, never that the account has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        institution: Option<String>,
+    },
+    Event {
+        id: Uuid,
+    },
 }
 
 /// The tagged target of an action.
@@ -3737,9 +3764,19 @@ pub enum AccountScopeDispositionDto {
 }
 
 /// An account's current disposition.
+///
+/// `title` and `institution` travel with `account` under the naming rule in
+/// `docs/api/conventions.md` §3. This answer exists to be read back to the
+/// owner — «is this one inside your perimeter, and if not, why» — and it names
+/// exactly one account, so nothing else in it says which.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccountScopeDto {
     pub account: Uuid,
+    /// What the owner calls this account.
+    pub title: String,
+    /// The institution he said holds it, when he said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
     pub disposition: AccountScopeDispositionDto,
     /// The owner's reason, present only for `outside`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

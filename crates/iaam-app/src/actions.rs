@@ -341,10 +341,110 @@ pub enum ActionState {
 ///
 /// Not every action has one: «no account exists» and «no contour exists» are
 /// existential and name nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionSubject {
-    Account(AccountId),
+    Account(AccountSubject),
     Event(EventId),
+}
+
+impl ActionSubject {
+    /// The account this item is about, when it is about an account.
+    ///
+    /// A reader that only wants to group the queue by account should not have to
+    /// destructure a struct it will then ignore.
+    #[must_use]
+    pub const fn account(&self) -> Option<AccountId> {
+        match self {
+            Self::Account(account) => Some(account.id),
+            Self::Event(_) => None,
+        }
+    }
+}
+
+/// The account an item is about, and the owner's own name for it.
+///
+/// **The name travels with the identifier**, for the reason
+/// [`crate::ports::AccountView`] is read here at all and the reason
+/// `PopulationAccount` in the core carries a title: the queue exists to be read
+/// by the owner, and an owner asked to record a balance cannot act on a bare
+/// UUID. One `record_owner_balance` item per account, each naming an identifier
+/// and nothing else, is a list he can only act on after a second request and a
+/// join he was left to perform.
+///
+/// **Paired here rather than at the transport**, and that is the decision this
+/// type exists to hold. An identifier and a name joined on the way out are
+/// joined from a second read of the store, so the sentence in `reason` — which
+/// already interpolates the title where the emitter holds one — and the name
+/// beside the identifier could come from two snapshots and disagree inside one
+/// response. Pairing them where the item is built makes that impossible: one
+/// item, one reading of what the owner calls the account.
+///
+/// Not [`AccountCandidate`], whose fields are the same three. That one is an
+/// account *offered as an answer* to a question the item asks; this one is the
+/// account the item is *about*. They are equal today by coincidence of the
+/// facts an account has a name by, and merging them would tie a change in what
+/// may be offered to a change in what may be named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSubject {
+    pub id: AccountId,
+    pub title: String,
+    /// The institution the owner said holds it, when he said. `None` is «he has
+    /// not said», never a guess: two accounts at one bank are told apart by the
+    /// title, and an invented institution would tell them apart by a fiction.
+    pub institution: Option<String>,
+}
+
+impl AccountSubject {
+    /// The subject of an item about this account.
+    #[must_use]
+    pub fn of(account: &AccountView) -> Self {
+        Self {
+            id: account.id,
+            title: account.title.clone(),
+            institution: account.institution.clone(),
+        }
+    }
+}
+
+/// The owner's accounts, indexed for the one question the queue asks of them.
+///
+/// Built from the accounts the caller already holds rather than from a store
+/// read of its own: the diagnostics are pure functions over a ledger or a
+/// report, and giving them a store would let a later rule read something else
+/// out of it.
+pub struct AccountNames<'a> {
+    by_id: BTreeMap<AccountId, &'a AccountView>,
+}
+
+impl<'a> AccountNames<'a> {
+    #[must_use]
+    pub fn new(accounts: &'a [AccountView]) -> Self {
+        Self {
+            by_id: accounts
+                .iter()
+                .map(|account| (account.id, account))
+                .collect(),
+        }
+    }
+
+    /// The account under this identifier.
+    ///
+    /// An error rather than an unnamed item. Every account a ledger, a flow or
+    /// an activity row names was created through this API and is one of the
+    /// owner's accounts — nothing deletes one — so a miss is the store
+    /// contradicting itself, and the queue refuses to answer over it for the
+    /// same reason [`frontier`] refuses over an unreadable stored question. The
+    /// alternative, publishing the item with no name or with a placeholder for
+    /// one, would hand the owner exactly the bare identifier this type exists to
+    /// abolish, at the one moment something is already wrong.
+    fn get(&self, account: AccountId) -> Result<&'a AccountView, AppError> {
+        self.by_id.get(&account).copied().ok_or_else(|| {
+            AppError::Store(format!(
+                "action queue names account {} which is not one of the owner's accounts",
+                account.inner()
+            ))
+        })
+    }
 }
 
 /// A source from which the value of a missing request field must come.
@@ -711,8 +811,8 @@ impl Action {
 
     /// The account or event this item is about, when it is about one.
     #[must_use]
-    pub const fn subject(&self) -> Option<ActionSubject> {
-        self.subject
+    pub const fn subject(&self) -> Option<&ActionSubject> {
+        self.subject.as_ref()
     }
 
     #[must_use]
@@ -739,10 +839,10 @@ fn identity(kind: ActionKind) -> String {
 /// session holding it is a different row entirely.
 ///
 /// Parsed in [`frontier`] rather than where the item is built: a stored question
-/// this build cannot read is a store failure, and [`actions_from_state`] returns
-/// a `Vec` and has no way to report one. Dropping such a row instead would put
-/// the queue back where this action found it — an outstanding question nothing
-/// mentions.
+/// this build cannot read is a store failure, and it is reported where the store
+/// is read rather than carried inwards as an unparsed string. Dropping such a
+/// row instead would put the queue back where this action found it — an
+/// outstanding question nothing mentions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassificationQuestion {
     /// The stored question, its wording, and its answer if it has one.
@@ -788,7 +888,7 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
                 .await?,
         );
     }
-    Ok(actions_from_state(&OwnerState {
+    actions_from_state(&OwnerState {
         accounts: &accounts,
         contours: &contours,
         exclusions: &exclusions,
@@ -796,12 +896,18 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
         activity: &activity,
         assertions: &assertions,
         questions: &questions,
-    }))
+    })
 }
 
 /// Find every unresolved or informational fact in a reconciliation ledger.
-pub fn ledger_diagnostics(ledger: &ReconciliationLedger) -> Vec<Action> {
-    diagnostics(ledger, None)
+///
+/// The owner's accounts are an argument because every item about one publishes
+/// what he calls it, and a ledger holds identifiers only.
+pub fn ledger_diagnostics(
+    ledger: &ReconciliationLedger,
+    accounts: &[AccountView],
+) -> Result<Vec<Action>, AppError> {
+    diagnostics(ledger, &AccountNames::new(accounts), None)
 }
 
 /// The same facts, restricted to one account and the periods meeting one range.
@@ -816,10 +922,15 @@ pub fn ledger_diagnostics(ledger: &ReconciliationLedger) -> Vec<Action> {
 /// requested range.
 pub fn ledger_diagnostics_for(
     ledger: &ReconciliationLedger,
-    account: AccountId,
+    account: &AccountView,
     period: AssertionPeriod,
 ) -> Vec<Action> {
-    diagnostics(ledger, Some((account, period)))
+    // Infallible where the unscoped sibling is not: every item this call can
+    // emit is about the one account the caller named and already holds, so the
+    // name is in hand rather than looked up.
+    let names = AccountNames::new(std::slice::from_ref(account));
+    diagnostics(ledger, &names, Some((account.id, period)))
+        .expect("a scoped diagnostic names only the account it was scoped to")
 }
 
 /// Whether one subject is in the requested scope. Everything is, unscoped.
@@ -835,8 +946,9 @@ fn in_scope(
 
 fn diagnostics(
     ledger: &ReconciliationLedger,
+    names: &AccountNames<'_>,
     scope: Option<(AccountId, AssertionPeriod)>,
-) -> Vec<Action> {
+) -> Result<Vec<Action>, AppError> {
     let mut actions = Vec::new();
     for gap in ledger
         .gaps()
@@ -858,7 +970,7 @@ fn diagnostics(
                     }
                 },
             );
-        actions.push(coverage_gap_action(gap, category));
+        actions.push(coverage_gap_action(names.get(gap.account)?, gap, category));
     }
     for status in ledger
         .statuses()
@@ -867,7 +979,7 @@ fn diagnostics(
         for dimension in Dimension::all() {
             if status.dimension(dimension) == DimensionStatus::AcceptedInternal {
                 actions.push(independent_confirmation_action(
-                    status.account(),
+                    names.get(status.account())?,
                     status.period(),
                     dimension,
                 ));
@@ -878,7 +990,7 @@ fn diagnostics(
                 continue;
             };
             actions.push(discrepancy_action(
-                status.account(),
+                names.get(status.account())?,
                 status.period(),
                 discrepancy,
                 index,
@@ -886,7 +998,7 @@ fn diagnostics(
         }
     }
     sort_actions(&mut actions);
-    actions
+    Ok(actions)
 }
 
 /// A refused row stays refused, and this record stays as the account of it.
@@ -912,7 +1024,7 @@ fn diagnostics(
 /// where it is — `EventKind::ImportCoverageGap` is a statement about one attempt
 /// — and the `category` computed by the caller drops it to `Informational` once
 /// the period reaches independent confirmation in the gap's own dimensions.
-fn coverage_gap_action(gap: &Taint, category: ActionCategory) -> Action {
+fn coverage_gap_action(account: &AccountView, gap: &Taint, category: ActionCategory) -> Action {
     let rows = if gap.rows.is_empty() {
         "the legacy record cannot name the refused rows".to_owned()
     } else {
@@ -935,9 +1047,9 @@ fn coverage_gap_action(gap: &Taint, category: ActionCategory) -> Action {
         ),
         ActionKind::CoverageGapUnrepaired,
         category,
-        Some(ActionSubject::Account(gap.account)),
+        Some(ActionSubject::Account(AccountSubject::of(account))),
         format!(
-            "Account {} has a coverage gap from {} through {} in dimensions {}; {} ({} rows \
+            "Account {} ({}) has a coverage gap from {} through {} in dimensions {}; {} ({} rows \
              refused). No operation in this API records a refused row, and neither obvious \
              route is one: retracting the import withdraws the rows that did arrive and this \
              record of the refusal with them, and the custody repair acts only on trades whose \
@@ -945,6 +1057,7 @@ fn coverage_gap_action(gap: &Taint, category: ActionCategory) -> Action {
              through a channel that reads these rows; this record stays, because it is a \
              statement about one attempt and not about the interval.",
             gap.account.inner(),
+            account.title,
             gap.period.from,
             gap.period.to,
             gap.dimensions
@@ -1000,22 +1113,23 @@ fn coverage_gap_action(gap: &Taint, category: ActionCategory) -> Action {
 /// an agent token satisfies, and marking the item owner-only would tell an agent
 /// it may not send a request the server would accept.
 fn independent_confirmation_action(
-    account: AccountId,
+    account: &AccountView,
     period: AssertionPeriod,
     dimension: Dimension,
 ) -> Action {
     let id = format!(
         "{}:{}:{}:{}:{}",
         ActionKind::IndependentConfirmationMissing.id(),
-        account.inner(),
+        account.id.inner(),
         period.from,
         period.to,
         dimension.code()
     );
     let observed = format!(
-        "Account {} reached internal confirmation for {} from {} through {} but has no \
+        "Account {} ({}) reached internal confirmation for {} from {} through {} but has no \
          confirmation from a different parser and document",
-        account.inner(),
+        account.id.inner(),
+        account.title,
         dimension.code(),
         period.from,
         period.to
@@ -1025,7 +1139,7 @@ fn independent_confirmation_action(
             id,
             ActionKind::IndependentConfirmationMissing,
             ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
-            Some(ActionSubject::Account(account)),
+            Some(ActionSubject::Account(AccountSubject::of(account))),
             format!(
                 "{observed}. No operation in this API confirms this dimension from a second \
                  channel: a broker channel agreeing with a statement raises cash and positions \
@@ -1036,7 +1150,7 @@ fn independent_confirmation_action(
         );
     }
     let mut preset = BTreeMap::new();
-    preset.insert("account".to_owned(), account.inner().to_string().into());
+    preset.insert("account".to_owned(), account.id.inner().to_string().into());
     preset.insert("from".to_owned(), period.from.to_string().into());
     preset.insert("to".to_owned(), period.to.to_string().into());
     Action::new(
@@ -1046,7 +1160,7 @@ fn independent_confirmation_action(
             category: ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Agent),
-            subject: Some(ActionSubject::Account(account)),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
             "{observed}. Synchronise a broker channel over this same interval: its assertions \
@@ -1102,7 +1216,7 @@ fn independent_confirmation_action(
 /// `Scope::Owner`: `submit_corrections` is behind `require_admin`, and it is
 /// there so that an agent token cannot retract the owner's history.
 fn discrepancy_action(
-    account: AccountId,
+    account: &AccountView,
     period: AssertionPeriod,
     discrepancy: Discrepancy,
     index: usize,
@@ -1112,7 +1226,7 @@ fn discrepancy_action(
             id: format!(
                 "{}:{}:{}:{}:{}:{}",
                 ActionKind::DiscrepancyUnresolved.id(),
-                account.inner(),
+                account.id.inner(),
                 period.from,
                 period.to,
                 discrepancy.field,
@@ -1122,16 +1236,17 @@ fn discrepancy_action(
             category: ActionCategory::required_for(ActionKind::DiscrepancyUnresolved),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
-            subject: Some(ActionSubject::Account(account)),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
-            "Account {} has an unresolved {} discrepancy from {} through {}: claimed {}, \
+            "Account {} ({}) has an unresolved {} discrepancy from {} through {}: claimed {}, \
              observed {}, delta {}. The system cannot identify which side is wrong; you can, \
              and one operation settles either — retract the control assertion that claimed \
              wrongly, or supersede the journal event that recorded wrongly. Recording another \
              balance does not settle it: a detected discrepancy is kept through every later \
              confirmation, by design.",
-            account.inner(),
+            account.id.inner(),
+            account.title,
             discrepancy.field,
             period.from,
             period.to,
@@ -1156,7 +1271,11 @@ fn discrepancy_action(
 }
 
 /// Find undecomposed outflows and unexplained account residuals in a flow report.
-pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
+pub fn flow_diagnostics(
+    report: &MoneyFlowReport,
+    accounts: &[AccountView],
+) -> Result<Vec<Action>, AppError> {
+    let names = AccountNames::new(accounts);
     let mut actions = Vec::new();
     for currency in report.flow.currencies() {
         let undecomposed = report
@@ -1164,12 +1283,13 @@ pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
             .not_decomposed_by_account_and_cause(currency)
             .expect("money flow undecomposed breakdown");
         for (account, cause, count, amount) in undecomposed {
+            let named = names.get(account)?;
             actions.push(match cause {
                 UndecomposedCause::NoRuleMatched => {
-                    undecomposed_outflows_action(account, currency, count, amount)
+                    undecomposed_outflows_action(named, currency, count, amount)
                 }
                 UndecomposedCause::ExternalTransfer => {
-                    external_transfers_action(account, currency, count, amount)
+                    external_transfers_action(named, currency, count, amount)
                 }
             });
         }
@@ -1179,10 +1299,10 @@ pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
         .residuals_by_account()
         .expect("money flow residual breakdown")
     {
-        actions.push(unexplained_residual_action(account, amount));
+        actions.push(unexplained_residual_action(names.get(account)?, amount));
     }
     sort_actions(&mut actions);
-    actions
+    Ok(actions)
 }
 
 /// The cash an account's own quantities do not account for.
@@ -1206,23 +1326,24 @@ pub fn flow_diagnostics(report: &MoneyFlowReport) -> Vec<Action> {
 /// `Informational` is unchanged and is right: nothing is hidden. The figure is
 /// published as its own line rather than folded into a bucket, which is what
 /// makes it a fact worth stating rather than work waiting to be done.
-fn unexplained_residual_action(account: AccountId, amount: Money) -> Action {
+fn unexplained_residual_action(account: &AccountView, amount: Money) -> Action {
     blocked_action(
         format!(
             "{}:{}:{}",
             ActionKind::UnexplainedResidual.id(),
-            account.inner(),
+            account.id.inner(),
             amount.currency().code()
         ),
         ActionKind::UnexplainedResidual,
         ActionCategory::Informational,
-        Some(ActionSubject::Account(account)),
+        Some(ActionSubject::Account(AccountSubject::of(account))),
         format!(
-            "Account {} has an unexplained residual of {} {}: the seven report quantities do \
-             not add up to its cash change. This is an aggregate over one account and one \
+            "Account {} ({}) has an unexplained residual of {} {}: the seven report quantities \
+             do not add up to its cash change. This is an aggregate over one account and one \
              currency and it names no event, so no operation in this API is addressed to it — \
              a correction acts on an event the caller names, and this figure names none.",
-            account.inner(),
+            account.id.inner(),
+            account.title,
             amount.to_calc_dec().inner(),
             amount.currency().code()
         ),
@@ -1263,7 +1384,7 @@ fn unexplained_residual_action(account: AccountId, amount: Money) -> Action {
 /// - The **category** is the owner's judgement by the same rule that forbids
 ///   inventing one anywhere else.
 fn undecomposed_outflows_action(
-    account: AccountId,
+    account: &AccountView,
     currency: CurrencyCode,
     count: u64,
     amount: Money,
@@ -1273,21 +1394,22 @@ fn undecomposed_outflows_action(
             id: format!(
                 "{}:{}:{}",
                 ActionKind::UndecomposedOutflows.id(),
-                account.inner(),
+                account.id.inner(),
                 currency.code()
             ),
             kind: ActionKind::UndecomposedOutflows,
             category: ActionCategory::Recommended,
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
-            subject: Some(ActionSubject::Account(account)),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
-            "Account {} has {} outflow rows totaling {} {} that no category rule matched; \
+            "Account {} ({}) has {} outflow rows totaling {} {} that no category rule matched; \
              create a rule that matches them and names what they were for. The rows are \
              not identified here, so neither the matcher nor the category is proposed, \
              and the interval a rule is valid over is not the interval of this report.",
-            account.inner(),
+            account.id.inner(),
+            account.title,
             count,
             amount.to_calc_dec().inner(),
             currency.code()
@@ -1331,7 +1453,7 @@ fn undecomposed_outflows_action(
 /// fact is worth emitting because without it the undecomposed total in the report
 /// has an unexplained remainder.
 fn external_transfers_action(
-    account: AccountId,
+    account: &AccountView,
     currency: CurrencyCode,
     count: u64,
     amount: Money,
@@ -1340,17 +1462,18 @@ fn external_transfers_action(
         format!(
             "{}:{}:{}",
             ActionKind::ExternalTransfersUncategorised.id(),
-            account.inner(),
+            account.id.inner(),
             currency.code()
         ),
         ActionKind::ExternalTransfersUncategorised,
         ActionCategory::Informational,
-        Some(ActionSubject::Account(account)),
+        Some(ActionSubject::Account(AccountSubject::of(account))),
         format!(
-            "Account {} has {} transfer rows totaling {} {} that left the contour and \
+            "Account {} ({}) has {} transfer rows totaling {} {} that left the contour and \
              carry no category; a category rule cannot decompose them, because category \
              assignment is never consulted for a transfer. Nothing in this API changes that.",
-            account.inner(),
+            account.id.inner(),
+            account.title,
             count,
             amount.to_calc_dec().inner(),
             currency.code()
@@ -1464,7 +1587,11 @@ struct OwnerState<'a> {
     questions: &'a [ClassificationQuestion],
 }
 
-fn actions_from_state(state: &OwnerState<'_>) -> Vec<Action> {
+/// Fallible for one reason: every item about an account publishes what the
+/// owner calls it, and the name is read from the account list handed in here.
+/// An activity row, a held question or an assertion naming an account that list
+/// does not hold is the store contradicting itself — see [`AccountNames::get`].
+fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
     let OwnerState {
         accounts,
         contours,
@@ -1474,13 +1601,14 @@ fn actions_from_state(state: &OwnerState<'_>) -> Vec<Action> {
         assertions,
         questions,
     } = *state;
+    let names = AccountNames::new(accounts);
     let mut actions = actions_from_views(accounts, contours, exclusions, transfers);
     actions.reserve(activity.len() + assertions.len() + questions.len());
     for account in activity
         .iter()
         .filter(|activity| account_import_eligibility(activity) && account_import_gap(activity))
     {
-        actions.push(start_account_import_action(account.account));
+        actions.push(start_account_import_action(names.get(account.account)?));
     }
     for account in activity
         .iter()
@@ -1502,7 +1630,7 @@ fn actions_from_state(state: &OwnerState<'_>) -> Vec<Action> {
             })
         {
             actions.push(provide_control_assertion_action(
-                account.account,
+                names.get(account.account)?,
                 period,
                 point,
             ));
@@ -1513,9 +1641,13 @@ fn actions_from_state(state: &OwnerState<'_>) -> Vec<Action> {
     for question in questions.iter().filter(|question| {
         classification_question_eligibility(question) && classification_question_gap(question)
     }) {
-        actions.push(answer_classification_question_action(question, accounts));
+        actions.push(answer_classification_question_action(
+            question,
+            names.get(question.asked.account())?,
+            accounts,
+        ));
     }
-    actions
+    Ok(actions)
 }
 
 /// An account is always eligible to be imported into.
@@ -1630,17 +1762,9 @@ fn classification_question_completion(question: &ClassificationQuestion) -> bool
 /// `NeedsOwnerInput` is where the first one is already answered.
 fn answer_classification_question_action(
     question: &ClassificationQuestion,
+    account: &AccountView,
     accounts: &[AccountView],
 ) -> Action {
-    let account = question.asked.account();
-    let title = accounts
-        .iter()
-        .find(|candidate| candidate.id == account)
-        .map_or_else(
-            || "an account that is no longer listed".to_owned(),
-            |candidate| candidate.title.clone(),
-        );
-
     let mut preset = BTreeMap::new();
     // Both are path segments of the answering route, and both are known: the
     // question is the subject of this item and the session is on its row.
@@ -1667,15 +1791,15 @@ fn answer_classification_question_action(
             category: ActionCategory::required_for(ActionKind::AnswerClassificationQuestion),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Agent),
-            subject: Some(ActionSubject::Account(account)),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
             "Account {} ({}) has row {} of import session {} held unclassified. {} Nothing else \
              is refused while it stands, but the row is in no journal and in no report, and the \
              session holding it will not commit until it is answered. The answer is written as a \
              rule, so a row matching it settles by itself next time.",
-            account.inner(),
-            title,
+            account.id.inner(),
+            account.title,
             question.view.row,
             question.view.session.inner(),
             question.view.prompt,
@@ -1953,7 +2077,7 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
             category: ActionCategory::required_for(ActionKind::ResolveTransferRelationships),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
-            subject: Some(ActionSubject::Account(account.id)),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
             "Account {} ({}) has no statement of which of your accounts money moves between it \
@@ -2035,7 +2159,7 @@ fn activity_period(activity: &AccountActivityView) -> Option<AssertionPeriod> {
 /// both routes check `may_submit`, which an agent token satisfies, and an item
 /// marked `owner` would tell an agent it may not send a request the server would
 /// accept.
-fn start_account_import_action(account: AccountId) -> Action {
+fn start_account_import_action(account: &AccountView) -> Action {
     // The session's `source` is what names the account these rows belong to, and
     // it is the whole of what the policy knows here: the account is the subject
     // of this item. Preset as the object the pointers below write into, so a
@@ -2043,7 +2167,7 @@ fn start_account_import_action(account: AccountId) -> Action {
     let mut session_preset = BTreeMap::new();
     session_preset.insert(
         "source".to_owned(),
-        serde_json::json!({ "account": account.inner().to_string() }),
+        serde_json::json!({ "account": account.id.inner().to_string() }),
     );
 
     let session = ResolutionOption {
@@ -2078,7 +2202,7 @@ fn start_account_import_action(account: AccountId) -> Action {
     // or last effective date to propose one from, and a window invented here
     // would decide how much of his history gets imported.
     let mut sync_preset = BTreeMap::new();
-    sync_preset.insert("account".to_owned(), account.inner().to_string().into());
+    sync_preset.insert("account".to_owned(), account.id.inner().to_string().into());
     let sync = ResolutionOption {
         operation: OperationKey::SyncBroker,
         request: RequestPlan {
@@ -2099,16 +2223,16 @@ fn start_account_import_action(account: AccountId) -> Action {
             id: format!(
                 "{}:{}",
                 ActionKind::StartAccountImport.id(),
-                account.inner()
+                account.id.inner()
             ),
             kind: ActionKind::StartAccountImport,
             category: ActionCategory::required_for(ActionKind::StartAccountImport),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Agent),
-            subject: Some(ActionSubject::Account(account)),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
-            "Account {} has no business facts; import a statement or connect a broker. \
+            "Account {} ({}) has no business facts; import a statement or connect a broker. \
              Fetching the statement out of the bank is a step outside this API — no \
              operation here downloads the document, and the owner obtains it himself. \
              Recording it is not: open an import session for this account, feed it the \
@@ -2116,7 +2240,8 @@ fn start_account_import_action(account: AccountId) -> Action {
              record and what it would not, and commit under the revision that assessment \
              carries; or synchronise a broker channel over an interval. Import is \
              continuous and never complete.",
-            account.inner()
+            account.id.inner(),
+            account.title
         ),
         ActionTarget::from_options(vec![session, sync]),
     )
@@ -2137,13 +2262,13 @@ fn start_account_import_action(account: AccountId) -> Action {
 /// request for the same account and interval are two identities and an agent
 /// deduplicating by id never collapses them into one.
 fn provide_control_assertion_action(
-    account: AccountId,
+    account: &AccountView,
     period: AssertionPeriod,
     point: BalancePoint,
 ) -> Action {
     let dimension = Dimension::Cash;
     let mut preset = BTreeMap::new();
-    preset.insert("account".to_owned(), account.inner().to_string().into());
+    preset.insert("account".to_owned(), account.id.inner().to_string().into());
     preset.insert("from".to_owned(), period.from.to_string().into());
     preset.insert("to".to_owned(), period.to.to_string().into());
     preset.insert("at".to_owned(), point.code().into());
@@ -2152,7 +2277,7 @@ fn provide_control_assertion_action(
             id: format!(
                 "{}:{}:{}:{}:{}:{}",
                 ActionKind::ProvideControlAssertion.id(),
-                account.inner(),
+                account.id.inner(),
                 period.from,
                 period.to,
                 point.code(),
@@ -2180,22 +2305,25 @@ fn provide_control_assertion_action(
             category: ActionCategory::required_for(ActionKind::ProvideControlAssertion),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
-            subject: Some(ActionSubject::Account(account)),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         match point {
             BalancePoint::Opening => format!(
-                "Account {} has business facts from {} through {}; record its opening cash balance. \
-                 Until it is recorded, the cash figure for this account is a sum accumulated from \
-                 an unasserted start, and a closing balance compared against it reports the missing \
-                 opening balance as a discrepancy.",
-                account.inner(),
+                "Account {} ({}) has business facts from {} through {}; record its opening cash \
+                 balance. Until it is recorded, the cash figure for this account is a sum \
+                 accumulated from an unasserted start, and a closing balance compared against it \
+                 reports the missing opening balance as a discrepancy.",
+                account.id.inner(),
+                account.title,
                 period.from,
                 period.to
             ),
             BalancePoint::Closing => format!(
-                "Account {} has business facts from {} through {}; record its closing cash balance. \
-                 An assertion is evidence to reconcile, not proof of a match; a discrepancy may remain.",
-                account.inner(),
+                "Account {} ({}) has business facts from {} through {}; record its closing cash \
+                 balance. An assertion is evidence to reconcile, not proof of a match; a \
+                 discrepancy may remain.",
+                account.id.inner(),
+                account.title,
                 period.from,
                 period.to
             ),
@@ -2358,7 +2486,7 @@ fn account_scope_action(
             category: ActionCategory::required_for(ActionKind::AccountScopeUndecided),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
-            subject: Some(ActionSubject::Account(account.id)),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
             "Account {} ({}) belongs to no contour and has not been ruled outside one; \
@@ -2649,6 +2777,50 @@ mod tests {
         }
     }
 
+    /// Every account a hand-built ledger names, as the owner's accounts.
+    ///
+    /// The diagnostics take the owner's accounts because every item they emit
+    /// says what he calls the account it is about. A test that assembles a
+    /// ledger from events holds identifiers and nothing else, so the accounts
+    /// are invented from them here rather than at every call site.
+    fn ledger_accounts(ledger: &ReconciliationLedger) -> Vec<AccountView> {
+        let mut ids: BTreeSet<AccountId> = ledger.gaps().iter().map(|gap| gap.account).collect();
+        ids.extend(ledger.statuses().map(|status| status.account()));
+        ids.into_iter().map(with_id).collect()
+    }
+
+    fn ledger_actions(ledger: &ReconciliationLedger) -> Vec<Action> {
+        ledger_diagnostics(ledger, &ledger_accounts(ledger))
+            .expect("every account the ledger names is one of the owner's")
+    }
+
+    /// The same, for a money flow: the accounts its own breakdowns name.
+    fn flow_accounts(report: &MoneyFlowReport) -> Vec<AccountView> {
+        let mut ids = BTreeSet::new();
+        for currency in report.flow.currencies() {
+            for (account, _, _, _) in report
+                .flow
+                .not_decomposed_by_account_and_cause(currency)
+                .expect("undecomposed breakdown")
+            {
+                ids.insert(account);
+            }
+        }
+        for (account, _) in report
+            .flow
+            .residuals_by_account()
+            .expect("residual breakdown")
+        {
+            ids.insert(account);
+        }
+        ids.into_iter().map(with_id).collect()
+    }
+
+    fn flow_actions(report: &MoneyFlowReport) -> Vec<Action> {
+        flow_diagnostics(report, &flow_accounts(report))
+            .expect("every account the flow names is one of the owner's")
+    }
+
     fn no_facts(account: AccountId) -> AccountActivityView {
         AccountActivityView {
             account,
@@ -2852,7 +3024,10 @@ mod tests {
         let action = named[0];
         // The subject is a typed field, not a substring of the sentence: a
         // caller narrowing the queue to one account must not have to parse prose.
-        assert_eq!(action.subject(), Some(ActionSubject::Account(orphan.id)));
+        assert_eq!(
+            action.subject().and_then(ActionSubject::account),
+            Some(orphan.id)
+        );
         assert_eq!(
             action.category(),
             ActionCategory::required_for(ActionKind::AccountScopeUndecided)
@@ -3087,9 +3262,9 @@ mod tests {
             reopened
                 .iter()
                 .filter(|action| action.kind() == ActionKind::AccountScopeUndecided)
-                .map(Action::subject)
+                .map(|action| action.subject().and_then(ActionSubject::account))
                 .collect::<Vec<_>>(),
-            vec![Some(ActionSubject::Account(arrival.id))]
+            vec![Some(arrival.id)]
         );
     }
 
@@ -3148,9 +3323,9 @@ mod tests {
                 .expect("frontier")
                 .iter()
                 .filter(|action| action.kind() == ActionKind::AccountScopeUndecided)
-                .map(Action::subject)
+                .map(|action| action.subject().and_then(ActionSubject::account))
                 .collect::<Vec<_>>(),
-            vec![Some(ActionSubject::Account(outside.id))]
+            vec![Some(outside.id)]
         );
     }
 
@@ -3252,7 +3427,8 @@ mod tests {
             activity: &[no_facts(account.id)],
             assertions: &[],
             questions: &[],
-        });
+        })
+        .expect("actions from state");
 
         for action in &actions {
             match action.target() {
@@ -3280,7 +3456,10 @@ mod tests {
             .expect("account import action");
         assert_ne!(import.state(), ActionState::Blocked);
         assert_eq!(import.target().resolutions().len(), 2);
-        assert_eq!(import.subject(), Some(ActionSubject::Account(account.id)));
+        assert_eq!(
+            import.subject().and_then(ActionSubject::account),
+            Some(account.id)
+        );
     }
 
     #[test]
@@ -3316,7 +3495,8 @@ mod tests {
             activity: &[no_facts(first), no_facts(second)],
             assertions: &[],
             questions: &[],
-        });
+        })
+        .expect("actions from state");
 
         let identities: Vec<_> = actions
             .iter()
@@ -3353,15 +3533,12 @@ mod tests {
         // One item per account, identified by it: an agent deduplicates by the
         // identity, and one shared identity would hide the second question.
         assert_ne!(asked[0].id(), asked[1].id());
-        let subjects: Vec<_> = asked.iter().filter_map(|action| action.subject()).collect();
-        assert!(
-            subjects.contains(&ActionSubject::Account(main.id)),
-            "{subjects:?}"
-        );
-        assert!(
-            subjects.contains(&ActionSubject::Account(savings.id)),
-            "{subjects:?}"
-        );
+        let subjects: Vec<_> = asked
+            .iter()
+            .filter_map(|action| action.subject().and_then(ActionSubject::account))
+            .collect();
+        assert!(subjects.contains(&main.id), "{subjects:?}");
+        assert!(subjects.contains(&savings.id), "{subjects:?}");
 
         // The candidates are proposed and the choice is not made: every *other*
         // account is offered, and the account itself is not among them.
@@ -3373,7 +3550,7 @@ mod tests {
         assert_eq!(request.missing[0].pointer, "/partners");
         assert_eq!(request.missing[0].provided_by, ProvidedBy::Owner);
         let subject = match asked[0].subject() {
-            Some(ActionSubject::Account(account)) => account,
+            Some(ActionSubject::Account(account)) => account.id,
             other => panic!("the item names the account it is about: {other:?}"),
         };
         let candidates = request.missing[0]
@@ -3438,7 +3615,10 @@ mod tests {
             .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
             .collect();
         assert_eq!(asked.len(), 1);
-        assert_eq!(asked[0].subject(), Some(ActionSubject::Account(savings.id)));
+        assert_eq!(
+            asked[0].subject().and_then(ActionSubject::account),
+            Some(savings.id)
+        );
     }
 
     /// The population is the accounts, so a new account reopens the goal.
@@ -3466,8 +3646,8 @@ mod tests {
                 .collect();
         assert_eq!(asked.len(), 1, "only the new account is asked again");
         assert_eq!(
-            asked[0].subject(),
-            Some(ActionSubject::Account(everyday.id))
+            asked[0].subject().and_then(ActionSubject::account),
+            Some(everyday.id)
         );
     }
 
@@ -3500,11 +3680,11 @@ mod tests {
         let asked: Vec<_> = actions_from_views(&accounts, &contours, &exclusions, &[])
             .into_iter()
             .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
-            .map(|action| action.subject())
+            .map(|action| action.subject().and_then(ActionSubject::account))
             .collect();
 
         assert!(
-            !asked.contains(&Some(ActionSubject::Account(shop.id))),
+            !asked.contains(&Some(shop.id)),
             "an account ruled outside every contour is not asked: {asked:?}"
         );
         // Inside and undecided both still raise it. The owner has ruled on one
@@ -3512,11 +3692,11 @@ mod tests {
         // one is unanswered is a queue that goes quiet exactly when it should
         // not: the account nobody has placed is the one nobody has looked at.
         assert!(
-            asked.contains(&Some(ActionSubject::Account(main.id))),
+            asked.contains(&Some(main.id)),
             "an account inside a contour is asked: {asked:?}"
         );
         assert!(
-            asked.contains(&Some(ActionSubject::Account(savings.id))),
+            asked.contains(&Some(savings.id)),
             "an account awaiting a scope decision is asked: {asked:?}"
         );
     }
@@ -3547,7 +3727,10 @@ mod tests {
             .into_iter()
             .find(|action| action.kind() == ActionKind::ResolveTransferRelationships)
             .expect("the inside account is asked");
-        assert_eq!(asked.subject(), Some(ActionSubject::Account(main.id)));
+        assert_eq!(
+            asked.subject().and_then(ActionSubject::account),
+            Some(main.id)
+        );
         let ActionTarget::Operation { request, .. } = asked.target() else {
             panic!("the transfer item names an operation");
         };
@@ -3574,7 +3757,8 @@ mod tests {
             activity: &[no_facts(main.id), no_facts(savings.id)],
             assertions: &[],
             questions: &[],
-        });
+        })
+        .expect("actions from state");
         let mut sorted = actions;
         sort_actions(&mut sorted);
         let kinds: Vec<_> = sorted.iter().map(Action::kind).collect();
@@ -3642,7 +3826,8 @@ mod tests {
             activity: &[no_facts(account.id)],
             assertions: &[],
             questions: &[],
-        });
+        })
+        .expect("actions from state");
         let import = actions
             .iter()
             .find(|action| action.kind() == ActionKind::StartAccountImport)
@@ -3735,7 +3920,8 @@ mod tests {
             activity: std::slice::from_ref(&activity),
             assertions: &[],
             questions: &[],
-        });
+        })
+        .expect("actions from state");
         // What this test is about is the gap and its closing. The target is
         // asserted in full by the test above, which is where the old
         // `ActionTarget::None` assertion sat and where it was wrong.
@@ -3763,6 +3949,7 @@ mod tests {
                 assertions: &[],
                 questions: &[]
             })
+            .expect("actions from state")
             .iter()
             .all(|action| action.kind() != ActionKind::StartAccountImport)
         );
@@ -3789,6 +3976,7 @@ mod tests {
             assertions: recorded,
             questions: &[],
         })
+        .expect("actions from state")
     }
 
     fn recorded_cash_assertion(
@@ -3955,7 +4143,8 @@ mod tests {
             activity: &activity,
             assertions: &[],
             questions: &[],
-        });
+        })
+        .expect("actions from state");
         let ids: Vec<_> = actions
             .iter()
             .filter(|action| action.kind() == ActionKind::ProvideControlAssertion)
@@ -3982,7 +4171,8 @@ mod tests {
             activity: &[activity],
             assertions: &[],
             questions: &[],
-        });
+        })
+        .expect("actions from state");
         assert!(
             actions
                 .iter()
@@ -3998,6 +4188,7 @@ mod tests {
                 assertions: &[],
                 questions: &[]
             })
+            .expect("actions from state")
             .iter()
             .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
         );
@@ -4063,7 +4254,7 @@ mod tests {
     #[test]
     fn a_coverage_gap_diagnostic_names_the_refused_row_and_has_no_call() {
         let ledger = gap_ledger(AccountId::new_random());
-        let action = ledger_diagnostics(&ledger)
+        let action = ledger_actions(&ledger)
             .into_iter()
             .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
             .expect("coverage gap diagnostic");
@@ -4092,7 +4283,7 @@ mod tests {
 
     #[test]
     fn a_gap_without_a_status_is_still_a_required_diagnostic() {
-        let actions = ledger_diagnostics(&gap_ledger(AccountId::new_random()));
+        let actions = ledger_actions(&gap_ledger(AccountId::new_random()));
         assert!(actions.iter().any(|action| {
             action.kind() == ActionKind::CoverageGapUnrepaired
                 && action.category()
@@ -4137,7 +4328,7 @@ mod tests {
             )
             .expect("evidence"),
         )]);
-        let action = ledger_diagnostics(&ledger)
+        let action = ledger_actions(&ledger)
             .into_iter()
             .find(|action| action.kind() == ActionKind::IndependentConfirmationMissing)
             .expect("independence diagnostic");
@@ -4205,7 +4396,7 @@ mod tests {
             .expect("evidence"),
         )]);
 
-        let action = ledger_diagnostics(&ledger)
+        let action = ledger_actions(&ledger)
             .into_iter()
             .find(|action| action.kind() == ActionKind::IndependentConfirmationMissing)
             .expect("independence diagnostic");
@@ -4249,7 +4440,7 @@ mod tests {
         );
         let ledger =
             ReconciliationLedger::build(&[observed, assertion]).expect("discrepant ledger");
-        let action = ledger_diagnostics(&ledger)
+        let action = ledger_actions(&ledger)
             .into_iter()
             .find(|action| action.kind() == ActionKind::DiscrepancyUnresolved)
             .expect("discrepancy diagnostic");
@@ -4332,7 +4523,7 @@ mod tests {
             category_rule_versions: Vec::new(),
             flow,
         };
-        let actions = flow_diagnostics(&report);
+        let actions = flow_actions(&report);
 
         let undecomposed = actions
             .iter()
@@ -4700,7 +4891,7 @@ mod tests {
             ReconciliationLedger::build(&[cash_gap_event(AccountId::new_random(), 3, Vec::new())])
                 .expect("legacy gap ledger");
 
-        let action = ledger_diagnostics(&ledger)
+        let action = ledger_actions(&ledger)
             .into_iter()
             .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
             .expect("legacy coverage gap diagnostic");
@@ -4737,7 +4928,7 @@ mod tests {
         .expect("confirmed gap ledger")
         .with_external_evidence(vec![(account, august(), independent_cash_evidence())]);
 
-        let action = ledger_diagnostics(&ledger)
+        let action = ledger_actions(&ledger)
             .into_iter()
             .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
             .expect("coverage gap diagnostic");
@@ -4760,7 +4951,7 @@ mod tests {
         .expect("internal gap ledger")
         .with_external_evidence(vec![(account, august(), internal_cash_evidence())]);
 
-        let action = ledger_diagnostics(&ledger)
+        let action = ledger_actions(&ledger)
             .into_iter()
             .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
             .expect("coverage gap diagnostic");
@@ -4786,11 +4977,11 @@ mod tests {
         .expect("diagnostic ledger")
         .with_external_evidence(vec![(internal, august(), internal_cash_evidence())]);
 
-        let mut actions = ledger_diagnostics(&ledger);
-        actions.extend(flow_diagnostics(&undecomposed_report(&[
+        let mut actions = ledger_actions(&ledger);
+        actions.extend(flow_actions(&undecomposed_report(&[
             AccountId::new_random(),
         ])));
-        actions.extend(flow_diagnostics(&external_transfer_report(&[
+        actions.extend(flow_actions(&external_transfer_report(&[
             AccountId::new_random(),
         ])));
         actions.extend(verdict_diagnostics(&Verdict::PossibleDuplicate {
@@ -4874,7 +5065,7 @@ mod tests {
     #[test]
     fn a_transfer_only_aggregate_offers_no_rule() {
         let account = AccountId::new_random();
-        let actions = flow_diagnostics(&external_transfer_report(&[account]));
+        let actions = flow_actions(&external_transfer_report(&[account]));
 
         assert!(
             !actions
@@ -4906,7 +5097,7 @@ mod tests {
     #[test]
     fn a_mixed_account_gets_a_remedy_for_the_rows_that_have_one() {
         let account = AccountId::new_random();
-        let actions = flow_diagnostics(&mixed_report(account));
+        let actions = flow_actions(&mixed_report(account));
 
         let outflows = actions
             .iter()
@@ -4943,7 +5134,7 @@ mod tests {
         ])
         .expect("two-account gap ledger");
 
-        let diagnostics = ledger_diagnostics(&ledger);
+        let diagnostics = ledger_actions(&ledger);
         let gaps: Vec<&Action> = diagnostics
             .iter()
             .filter(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
@@ -4951,7 +5142,7 @@ mod tests {
         assert_eq!(gaps.len(), 2);
         assert_ne!(gaps[0].id(), gaps[1].id());
 
-        let flow = flow_diagnostics(&undecomposed_report(&[first, second]));
+        let flow = flow_actions(&undecomposed_report(&[first, second]));
         let undecomposed: Vec<&Action> = flow
             .iter()
             .filter(|action| action.kind() == ActionKind::UndecomposedOutflows)
@@ -4972,15 +5163,15 @@ mod tests {
         .expect("matched ledger");
 
         assert!(
-            ledger_diagnostics(&ledger).is_empty(),
+            ledger_actions(&ledger).is_empty(),
             "{:?}",
-            ledger_diagnostics(&ledger)
+            ledger_actions(&ledger)
         );
         let report = decomposed_report(account);
         assert!(
-            flow_diagnostics(&report).is_empty(),
+            flow_actions(&report).is_empty(),
             "{:?}",
-            flow_diagnostics(&report)
+            flow_actions(&report)
         );
         assert!(
             verdict_diagnostics(&Verdict::Accepted {
@@ -5060,7 +5251,8 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
-        });
+        })
+        .expect("actions from state");
 
         let item = only_question_item(&actions);
         assert_eq!(
@@ -5070,7 +5262,10 @@ mod tests {
                 question.view.id.inner()
             )
         );
-        assert_eq!(item.subject(), Some(ActionSubject::Account(main.id)));
+        assert_eq!(
+            item.subject().and_then(ActionSubject::account),
+            Some(main.id)
+        );
         assert_eq!(
             item.category(),
             ActionCategory::required_for(ActionKind::AnswerClassificationQuestion)
@@ -5094,7 +5289,8 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
-        });
+        })
+        .expect("actions from state");
 
         let item = only_question_item(&actions);
         let ActionTarget::Operation { operation, request } = item.target() else {
@@ -5125,7 +5321,8 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
-        });
+        })
+        .expect("actions from state");
 
         let offered: Vec<&str> = answer_field(only_question_item(&actions))
             .alternatives
@@ -5158,7 +5355,8 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
-        });
+        })
+        .expect("actions from state");
 
         let offered: Vec<&str> = answer_field(only_question_item(&actions))
             .alternatives
@@ -5183,7 +5381,8 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
-        });
+        })
+        .expect("actions from state");
 
         for alternative in &answer_field(only_question_item(&actions)).alternatives {
             match alternative.value.as_str() {
@@ -5231,7 +5430,8 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
-        });
+        })
+        .expect("actions from state");
 
         assert!(
             actions
@@ -5258,7 +5458,8 @@ mod tests {
                 activity: &[],
                 assertions: &[],
                 questions: std::slice::from_ref(&question),
-            });
+            })
+            .expect("actions from state");
             assert!(
                 actions
                     .iter()
@@ -5287,7 +5488,8 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: &[first.clone(), second.clone()],
-        });
+        })
+        .expect("actions from state");
 
         let items: Vec<_> = actions
             .iter()
@@ -5298,10 +5500,7 @@ mod tests {
         assert_eq!(identities.len(), 2, "{identities:?}");
         let subjects: BTreeSet<_> = items
             .iter()
-            .filter_map(|item| match item.subject() {
-                Some(ActionSubject::Account(account)) => Some(account),
-                _ => None,
-            })
+            .filter_map(|item| item.subject().and_then(ActionSubject::account))
             .collect();
         assert_eq!(subjects, BTreeSet::from([main.id, savings.id]));
     }
@@ -5345,7 +5544,10 @@ mod tests {
             item.id(),
             format!("answer_classification_question:{}", recorded.id.inner())
         );
-        assert_eq!(item.subject(), Some(ActionSubject::Account(main.id)));
+        assert_eq!(
+            item.subject().and_then(ActionSubject::account),
+            Some(main.id)
+        );
 
         store
             .answer_import_question(

@@ -205,6 +205,12 @@ pub enum OperationKey {
     CreateCategoryRule,
     /// Record the owner's statement about one account's transfer partners.
     RecordAccountTransferPartners,
+    /// Rule an account outside the reporting perimeter, with a reason.
+    ///
+    /// The half of the scope decision that a contour cannot express: membership
+    /// is a contour's composition, and «this account is deliberately not in any
+    /// of them» is a fact about the account itself.
+    RecordAccountScope,
     /// Answer one classification question held open by an import session.
     AnswerImportQuestion,
 }
@@ -219,19 +225,93 @@ impl OperationKey {
             Self::RecordOwnerBalance => "record_owner_balance",
             Self::CreateCategoryRule => "create_category_rule",
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
+            Self::RecordAccountScope => "record_account_scope",
             Self::AnswerImportQuestion => "answer_import_question",
         }
     }
 }
 
+/// One admissible way to close an action: an operation and the call that ends it.
+///
+/// Carries a [`RequestPlan`] of its own, which is the whole reason a set of
+/// resolutions cannot be a `Vec<OperationKey>`. Two ways out of the same state
+/// are two different calls with different fields — putting an account in a
+/// contour needs the composition, ruling it outside needs a reason — and a bare
+/// list of keys would publish the second operation while leaving the caller to
+/// discover, from the specification, that it asks for anything at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionOption {
+    pub operation: OperationKey,
+    pub request: RequestPlan,
+}
+
 /// The only target shapes an action may have.
+///
+/// [`Self::Options`] exists because `reason` and `target` were able to disagree.
+/// An action whose sentence named two ways to close it — add this account to a
+/// contour, or record that it is deliberately outside the perimeter — could
+/// publish only one, and an agent that reads `target` as the contract, which is
+/// what `target` is for, could act on that one and no other. The second route
+/// existed and was reachable only by reading prose and searching the
+/// specification for it.
+///
+/// A third variant rather than turning every target into a list: most actions
+/// genuinely have one way out or none, and saying «here is a set of one» about
+/// them would make every consumer index into a list to find the fact it already
+/// had.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionTarget {
     Operation {
         operation: OperationKey,
         request: RequestPlan,
     },
+    /// Two or more admissible resolutions, each with its own request plan.
+    ///
+    /// In the order the item wants them considered: the first is the ordinary
+    /// answer, the rest are the alternatives, and none of them is the only one.
+    Options(Vec<ResolutionOption>),
     None,
+}
+
+impl ActionTarget {
+    /// Build the target for a computed set of resolutions, in the given order.
+    ///
+    /// Normalising, so that «one way out» has a single encoding no matter which
+    /// side computed it: a set of one is a plain [`Self::Operation`] and not a
+    /// list holding one element. Without this a builder whose options collapse
+    /// at run time would publish a different transport shape for the same
+    /// situation depending on how it happened to be reached.
+    #[must_use]
+    pub fn from_options(mut options: Vec<ResolutionOption>) -> Self {
+        match options.len() {
+            0 => Self::None,
+            1 => {
+                let only = options.remove(0);
+                Self::Operation {
+                    operation: only.operation,
+                    request: only.request,
+                }
+            }
+            _ => Self::Options(options),
+        }
+    }
+
+    /// Every resolution this target publishes, in order.
+    ///
+    /// The reading side of the same normalisation: a consumer asking "what may I
+    /// call to close this?" gets one answer shape whichever variant carries it,
+    /// and an empty answer only where nothing in this API closes the item.
+    #[must_use]
+    pub fn resolutions(&self) -> Vec<(OperationKey, &RequestPlan)> {
+        match self {
+            Self::Operation { operation, request } => vec![(*operation, request)],
+            Self::Options(options) => options
+                .iter()
+                .map(|option| (option.operation, &option.request))
+                .collect(),
+            Self::None => Vec::new(),
+        }
+    }
 }
 
 /// One invalid combination of action availability and target.
@@ -241,6 +321,14 @@ pub enum ActionInvariantError {
     BlockedWithOperation,
     BlockedWithScope,
     NonBlockedWithoutScope,
+    /// A set of resolutions holding fewer than two of them.
+    ///
+    /// One way out is [`ActionTarget::Operation`] and none is
+    /// [`ActionTarget::None`]; a list of one would be a second encoding of a
+    /// state that already has one, and the two would publish different transport
+    /// shapes for the same fact. [`ActionTarget::from_options`] normalises, so
+    /// reaching this means the variant was built by hand.
+    OptionsWithoutChoice,
 }
 
 /// What an action is, apart from its prose and its target.
@@ -288,9 +376,15 @@ impl Action {
         }
         if matches!(
             (facts.state, &target),
-            (ActionState::Blocked, ActionTarget::Operation { .. })
+            (
+                ActionState::Blocked,
+                ActionTarget::Operation { .. } | ActionTarget::Options(_)
+            )
         ) {
             return Err(ActionInvariantError::BlockedWithOperation);
+        }
+        if matches!(&target, ActionTarget::Options(options) if options.len() < 2) {
+            return Err(ActionInvariantError::OptionsWithoutChoice);
         }
         if facts.state == ActionState::Blocked && facts.required_scope.is_some() {
             return Err(ActionInvariantError::BlockedWithScope);
@@ -1532,12 +1626,23 @@ fn first_account_action() -> Action {
 /// `first_contour_action` out of the agent's hands — and a fully formed request
 /// does not change who may send it.
 ///
-/// The target offers the membership half of the answer. The other half — «this
-/// account is outside the perimeter, deliberately» — is a different operation
-/// and an action carries one target; the sentence names it so the agent is not
-/// left believing membership is the only way out of this state.
+/// The target publishes both halves of the answer, because there are two and
+/// the sentence says so. Membership is one — put the account in a contour — and
+/// «this account is outside the perimeter, deliberately, and here is why» is the
+/// other, which is a different route with a different body. While the item could
+/// carry a single target it published membership alone, and the second way out
+/// was reachable only by a caller who read the prose and then went looking
+/// through the specification for a route no queue item mentioned. An agent that
+/// treats `target` as the contract, which is what `target` is for, could put the
+/// account inside a contour and do nothing else — including for an account that
+/// belongs in no contour at all.
 ///
-/// The operation is [`OperationKey::AddContourVersion`], not
+/// The two options are ordered, and membership comes first: an account the owner
+/// is being asked about is usually one he means to report on, and the exclusion
+/// is the answer for the ones he does not. Ordered, not ranked — neither is a
+/// default, and the item stays `NeedsOwnerInput` for both.
+///
+/// The membership operation is [`OperationKey::AddContourVersion`], not
 /// [`OperationKey::CreateContour`]. This item exists because an account is in no
 /// contour while contours exist, so the act it wants is «put it in one of
 /// those» — and while the only operation the queue could name was the one that
@@ -1554,7 +1659,7 @@ fn account_scope_action(
     // account. With several, choosing for the owner would be choosing where his
     // money is reported from, so the choice is his and the composition cannot be
     // proposed without it.
-    let (preset, missing) = match contours {
+    let (membership_preset, membership_missing) = match contours {
         [only] => {
             let mut members: Vec<AccountId> = only.accounts.clone();
             if !members.contains(&account.id) {
@@ -1599,6 +1704,25 @@ fn account_scope_action(
         ),
     };
 
+    // The other way out, and everything about it is known except the judgement.
+    // The account is a path segment of the route and is preset; the disposition
+    // is what this option *is*, so it is preset too — an option that left the
+    // caller to guess `outside` would publish a route and not a resolution. The
+    // reason is the owner's and is the only field asked for: an account ruled
+    // out without one is indistinguishable, a year later, from an overlooked
+    // one, which is why the route refuses it and why it is published as missing
+    // rather than quietly omitted.
+    let mut exclusion_preset = BTreeMap::new();
+    exclusion_preset.insert("id".to_owned(), account.id.inner().to_string().into());
+    exclusion_preset.insert("disposition".to_owned(), "outside".into());
+    let exclusion = ResolutionOption {
+        operation: OperationKey::RecordAccountScope,
+        request: RequestPlan {
+            preset: exclusion_preset,
+            missing: vec![MissingInput::plain("/reason", ProvidedBy::Owner)],
+        },
+    };
+
     Action::new(
         ActionFacts {
             id: format!(
@@ -1620,12 +1744,18 @@ fn account_scope_action(
             account.id.inner(),
             account.title
         ),
-        ActionTarget::Operation {
-            operation: OperationKey::AddContourVersion,
-            request: RequestPlan { preset, missing },
-        },
+        ActionTarget::from_options(vec![
+            ResolutionOption {
+                operation: OperationKey::AddContourVersion,
+                request: RequestPlan {
+                    preset: membership_preset,
+                    missing: membership_missing,
+                },
+            },
+            exclusion,
+        ]),
     )
-    .expect("account scope action has an operation target")
+    .expect("account scope action publishes both of its resolutions")
 }
 
 /// Every account the owner has, as contour-membership candidates.
@@ -1895,13 +2025,11 @@ mod tests {
 
         let actions = frontier(owner, &store).await.expect("frontier");
         assert!(
-            actions.iter().any(|action| matches!(
-                action.target(),
-                ActionTarget::Operation {
-                    operation: OperationKey::AddContourVersion,
-                    ..
-                }
-            )),
+            actions.iter().any(|action| action
+                .target()
+                .resolutions()
+                .iter()
+                .any(|(operation, _)| *operation == OperationKey::AddContourVersion)),
             "nothing in the queue offers contour membership for the account that has none: {actions:?}"
         );
 
@@ -1921,13 +2049,14 @@ mod tests {
         assert_eq!(action.category(), ActionCategory::RequiredForGoal);
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
         assert_eq!(action.required_scope(), Some(Scope::Owner));
-        let ActionTarget::Operation { operation, request } = action.target() else {
-            panic!("the account scope action must name an operation");
-        };
         // The act is «add it to one of the contours that exist», not «create a
         // contour»: naming the creating operation here is what let an agent
         // answer this item with a second perimeter.
-        assert_eq!(*operation, OperationKey::AddContourVersion);
+        let published = action.target().resolutions();
+        let (_, request) = published
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::AddContourVersion)
+            .expect("the account scope action offers contour membership");
         // Two contours exist, so which one the account belongs in is the owner's
         // choice and the composition cannot be written out without it.
         assert!(
@@ -1992,10 +2121,11 @@ mod tests {
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
             .expect("the orphaned account is named");
-        let ActionTarget::Operation { operation, request } = action.target() else {
-            panic!("the account scope action must name an operation");
-        };
-        assert_eq!(*operation, OperationKey::AddContourVersion);
+        let published = action.target().resolutions();
+        let (_, request) = published
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::AddContourVersion)
+            .expect("the account scope action offers contour membership");
         assert_eq!(
             request.preset.get("contour"),
             Some(&serde_json::Value::from(contour.0.to_string()))
@@ -2015,6 +2145,95 @@ mod tests {
             request.missing.is_empty(),
             "the owner is asked for a judgement, not for a title he already gave: {:?}",
             request.missing
+        );
+    }
+
+    /// The reason names two ways out, so the contract must publish two.
+    ///
+    /// The invariant this pins is that the sentence and the target cannot drift:
+    /// an agent reads `target` as the contract — that is what `target` is for —
+    /// and while the item offered contour membership alone, the only way it
+    /// could act on «or record that it is outside the perimeter» was to read the
+    /// prose and go hunting through the specification for a route no queue item
+    /// mentioned. Prose cannot be asserted mechanically; two published
+    /// operations, each with the request that closes the item its own way, can.
+    #[tokio::test]
+    async fn the_scope_item_publishes_both_ways_it_can_be_closed() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let member = named("Main");
+        let orphan = named("Savings");
+        for account in [&member, &orphan] {
+            store
+                .upsert_account(owner, account.clone())
+                .await
+                .expect("account");
+        }
+        let contour = ContourId::new_random();
+        store
+            .insert_contour_version(
+                owner,
+                ContourDefinition::new(contour, ContourVersion(1), [member.id]),
+                "Household".into(),
+                vec![member.id],
+            )
+            .await
+            .expect("contour");
+
+        let actions = frontier(owner, &store).await.expect("frontier");
+        let action = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
+            .expect("the orphaned account is named");
+
+        let published = action.target().resolutions();
+        assert_eq!(
+            published.len(),
+            2,
+            "the sentence names two ways to close this item and the contract publishes {}: {:?}",
+            published.len(),
+            action.target()
+        );
+
+        // Each option carries its own plan, and the two plans are not the same
+        // plan: what a contour version wants is a composition, and what an
+        // exclusion wants is a reason.
+        let (_, membership) = published
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::AddContourVersion)
+            .expect("contour membership is one way out");
+        assert_eq!(
+            membership.preset.get("contour"),
+            Some(&serde_json::Value::from(contour.0.to_string())),
+            "the membership option keeps its own written-out request"
+        );
+        assert!(
+            membership
+                .missing
+                .iter()
+                .all(|missing| missing.pointer != "/reason"),
+            "a reason is not a field of the membership call: {:?}",
+            membership.missing
+        );
+
+        let (_, exclusion) = published
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::RecordAccountScope)
+            .expect("ruling the account outside the perimeter is the other way out");
+        assert_eq!(
+            exclusion.preset.get("disposition"),
+            Some(&serde_json::Value::from("outside")),
+            "an option that left the disposition to be guessed publishes a route, not a resolution"
+        );
+        let reason = exclusion
+            .missing
+            .iter()
+            .find(|missing| missing.pointer == "/reason")
+            .expect("the reason is a required field of the exclusion option");
+        assert_eq!(
+            reason.provided_by,
+            ProvidedBy::Owner,
+            "why an account is outside the perimeter is the owner's to say"
         );
     }
 
@@ -2162,6 +2381,55 @@ mod tests {
         assert!(account_scope_eligibility(&contours));
     }
 
+    /// One way out has one encoding, whichever side computed the set.
+    ///
+    /// A list holding a single resolution would publish a transport shape that
+    /// `operation` already publishes, and the two would drift: a consumer would
+    /// have to read both to answer the same question.
+    #[test]
+    fn a_set_of_resolutions_holding_one_is_the_single_operation_shape() {
+        let only = ResolutionOption {
+            operation: OperationKey::CreateAccount,
+            request: RequestPlan {
+                preset: BTreeMap::new(),
+                missing: vec![MissingInput::plain("/title", ProvidedBy::Owner)],
+            },
+        };
+        assert!(matches!(
+            ActionTarget::from_options(vec![only.clone()]),
+            ActionTarget::Operation {
+                operation: OperationKey::CreateAccount,
+                ..
+            }
+        ));
+        assert_eq!(ActionTarget::from_options(Vec::new()), ActionTarget::None);
+        assert_eq!(
+            ActionTarget::from_options(vec![only.clone(), only.clone()])
+                .resolutions()
+                .len(),
+            2
+        );
+
+        // Built by hand, the invariant still holds: a choice of one is not a
+        // choice, and the constructor is the only thing that normalises.
+        assert_eq!(
+            Action::new(
+                ActionFacts {
+                    id: "made_up".to_owned(),
+                    kind: ActionKind::CreateFirstAccount,
+                    category: ActionCategory::Blocking,
+                    state: ActionState::NeedsOwnerInput,
+                    required_scope: Some(Scope::Owner),
+                    subject: None,
+                },
+                "invented for this test",
+                ActionTarget::Options(vec![only]),
+            )
+            .unwrap_err(),
+            ActionInvariantError::OptionsWithoutChoice
+        );
+    }
+
     /// An item with no operation is `blocked`, whatever else is true of it.
     #[test]
     fn an_item_the_agent_cannot_call_says_so_in_its_state() {
@@ -2184,7 +2452,7 @@ mod tests {
                     "{} has nothing to call and must say so",
                     action.id()
                 ),
-                ActionTarget::Operation { .. } => assert_ne!(
+                ActionTarget::Operation { .. } | ActionTarget::Options(_) => assert_ne!(
                     action.state(),
                     ActionState::Blocked,
                     "{} names an operation and cannot be blocked",

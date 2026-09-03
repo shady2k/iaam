@@ -2941,6 +2941,17 @@ pub enum ActionSubjectDto {
 }
 
 /// The tagged target of an action.
+///
+/// `options` is the third shape and the reason it exists is drift. An action
+/// whose `reason` named two ways to close it could publish only one, so a client
+/// that reads `target` as the contract — which is what `target` is for — could
+/// act on that one and never learn the other existed without reading prose and
+/// searching the specification. Each option carries its own `request`, because
+/// two ways out of one state are two calls wanting different fields.
+///
+/// A separate variant rather than an `options` array on every target: most
+/// actions genuinely have one way out or none, and `operation` and `none` keep
+/// exactly the shape they had for them.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionTargetDto {
@@ -2953,7 +2964,30 @@ pub enum ActionTargetDto {
         request_schema: String,
         request: RequestPlanDto,
     },
+    /// Two or more admissible resolutions, in the order the item offers them.
+    ///
+    /// Ordered, not ranked: the first is the ordinary answer and none of them is
+    /// a default the caller may take without the owner.
+    Options {
+        options: Vec<ResolutionOptionDto>,
+    },
     None,
+}
+
+/// One admissible way to close an action.
+///
+/// The body of [`ActionTargetDto::Operation`] as a value, so that one resolution
+/// among several is described exactly as the sole resolution of another action
+/// is, and a client needs one reader for both.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResolutionOptionDto {
+    #[serde(rename = "operationId")]
+    pub operation_id: String,
+    pub method: String,
+    pub path: String,
+    #[serde(rename = "requestSchema")]
+    pub request_schema: String,
+    pub request: RequestPlanDto,
 }
 
 /// Request fields that the policy cannot fill.

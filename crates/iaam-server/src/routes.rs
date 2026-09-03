@@ -16,7 +16,7 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
     AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
-    ActionTarget, MissingInput, ProvidedBy, account_scope,
+    ActionTarget, MissingInput, OperationKey, ProvidedBy, RequestPlan, account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
@@ -84,7 +84,7 @@ use crate::dto::{
     MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
     QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
     ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest,
-    RecordAccountTransferPartnersRequest, RequestPlanDto, RequiredInputDto,
+    RecordAccountTransferPartnersRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
     ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
     SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
     VerdictDto,
@@ -134,18 +134,23 @@ pub async fn list_actions(
 fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
     let target = match action.target() {
         ActionTarget::Operation { operation, request } => {
-            let resolved = catalog.operation(*operation);
+            let resolved = resolution_option_dto(*operation, request, catalog);
             ActionTargetDto::Operation {
-                operation_id: resolved.operation_id.clone(),
-                method: resolved.method.clone(),
-                path: resolved.path.clone(),
-                request_schema: resolved.request_schema.clone(),
-                request: RequestPlanDto {
-                    preset: request.preset.clone(),
-                    missing: request.missing.iter().map(missing_input_dto).collect(),
-                },
+                operation_id: resolved.operation_id,
+                method: resolved.method,
+                path: resolved.path,
+                request_schema: resolved.request_schema,
+                request: resolved.request,
             }
         }
+        // Every option is resolved through the same catalogue as a sole target,
+        // so an alternative way out is addressed exactly as well as the first.
+        ActionTarget::Options(options) => ActionTargetDto::Options {
+            options: options
+                .iter()
+                .map(|option| resolution_option_dto(option.operation, &option.request, catalog))
+                .collect(),
+        },
         ActionTarget::None => ActionTargetDto::None,
     };
     ActionDto {
@@ -173,6 +178,25 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
             ActionSubject::Event(event) => ActionSubjectDto::Event { id: event.inner() },
         }),
         target,
+    }
+}
+
+/// One way to close an action, addressed against the completed contract.
+fn resolution_option_dto(
+    operation: OperationKey,
+    request: &RequestPlan,
+    catalog: &ActionCatalog,
+) -> ResolutionOptionDto {
+    let resolved = catalog.operation(operation);
+    ResolutionOptionDto {
+        operation_id: resolved.operation_id.clone(),
+        method: resolved.method.clone(),
+        path: resolved.path.clone(),
+        request_schema: resolved.request_schema.clone(),
+        request: RequestPlanDto {
+            preset: request.preset.clone(),
+            missing: request.missing.iter().map(missing_input_dto).collect(),
+        },
     }
 }
 

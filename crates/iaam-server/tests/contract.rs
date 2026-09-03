@@ -7077,6 +7077,10 @@ fn every_action_kind_resolves_to_one_matching_post_operation() {
             OperationKey::RecordOwnerBalance,
             "/v1/reconciliation/balance",
         ),
+        // An alternative resolution is resolved through the same catalogue as a
+        // sole one: an option the queue publishes and the catalogue cannot
+        // address would be a route named and not reachable.
+        (OperationKey::RecordAccountScope, "/v1/accounts/{id}/scope"),
     ] {
         let resolved = catalog.operation(key);
         assert_eq!(resolved.method, "POST");
@@ -9519,16 +9523,16 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
     assert_eq!(item["category"], "required_for_goal", "{item}");
     assert_eq!(item["state"], "needs_owner_input", "{item}");
     assert_eq!(item["required_scope"], "owner", "{item}");
+    // Two ways out, so the target is a set of options and not one of them.
+    assert_eq!(item["target"]["type"], "options", "{item}");
+    let membership = published_option(item, "add_contour_version")
+        .expect("the item must offer membership of an existing contour");
+    assert_eq!(membership["method"], "POST", "{item}");
     assert_eq!(
-        item["target"]["operationId"], "add_contour_version",
-        "the item must offer membership of an existing contour: {item}"
-    );
-    assert_eq!(item["target"]["method"], "POST", "{item}");
-    assert_eq!(
-        item["target"]["path"], "/v1/contours/{contour}/versions",
+        membership["path"], "/v1/contours/{contour}/versions",
         "the creating route answered this item with a second perimeter: {item}"
     );
-    let candidates = item["target"]["request"]["missing"]
+    let candidates = membership["request"]["missing"]
         .as_array()
         .expect("missing inputs")
         .iter()
@@ -9542,6 +9546,34 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
             .any(|candidate| candidate["id"] == orphan),
         "{item}"
     );
+
+    // The other way out, published rather than left in the sentence. Until it
+    // was, a client that reads `target` as the contract — which is what it is
+    // for — could only ever put the account inside a contour, and reaching this
+    // route meant reading prose and searching the specification for it.
+    let exclusion = published_option(item, "record_account_scope")
+        .expect("the item must offer ruling the account outside the perimeter");
+    assert_eq!(exclusion["method"], "POST", "{item}");
+    assert_eq!(exclusion["path"], "/v1/accounts/{id}/scope", "{item}");
+    assert_eq!(
+        exclusion["request"]["preset"]["disposition"], "outside",
+        "an option that leaves the disposition to be guessed publishes a route, not a resolution: {item}"
+    );
+    let reason = exclusion["request"]["missing"]
+        .as_array()
+        .expect("missing inputs")
+        .iter()
+        .find(|missing| missing["pointer"] == "/reason")
+        .expect("the reason is a required field of this option");
+    assert_eq!(reason["provided_by"], "owner", "{item}");
+}
+
+/// One published resolution of an action, by the operation it names.
+fn published_option<'a>(item: &'a Value, operation_id: &str) -> Option<&'a Value> {
+    item["target"]["options"]
+        .as_array()?
+        .iter()
+        .find(|option| option["operationId"] == operation_id)
 }
 
 /// The third state, reachable through the API.
@@ -10398,22 +10430,20 @@ async fn the_queue_points_an_undecided_account_at_an_existing_contour() {
         .iter()
         .find(|item| item["kind"] == "account_scope_undecided")
         .expect("the orphaned account is named");
+    let membership = published_option(item, "add_contour_version")
+        .expect("the item must add the account to the contour that exists");
+    assert_eq!(membership["method"], "POST", "{item}");
     assert_eq!(
-        item["target"]["operationId"], "add_contour_version",
-        "the item must add the account to the contour that exists: {item}"
-    );
-    assert_eq!(item["target"]["method"], "POST", "{item}");
-    assert_eq!(
-        item["target"]["path"], "/v1/contours/{contour}/versions",
+        membership["path"], "/v1/contours/{contour}/versions",
         "{item}"
     );
     assert_eq!(
-        item["target"]["request"]["preset"]["contour"], contour,
+        membership["request"]["preset"]["contour"], contour,
         "with one contour there is no doubt which is meant: {item}"
     );
 
     // The action is a call the agent can make as written.
-    let preset = &item["target"]["request"]["preset"];
+    let preset = &membership["request"]["preset"];
     let (status, added) = call(
         &harness.router,
         post(

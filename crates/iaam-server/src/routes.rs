@@ -105,11 +105,14 @@ use crate::dto::{
     ImportRowDto, ImportSessionContentsDto, ImportSessionDto, OpenImportSessionRequest,
     RecordedEventDto, StateImportControlFiguresRequest,
 };
+// Types added by wave K, in a block of their own for the reason the block above
+// states: this file is edited by several changes at once, and merging one name
+// into a wrapped list reflows lines nothing else touched.
+use crate::dto::OwnerBalanceOutcomeDto;
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
-use iaam_app::scenarios::import_session::AccountDirectory;
-use iaam_app::scenarios::import_session::SessionRevision;
+use iaam_app::scenarios::import_session::{AccountDirectory, AnswerableQuestion, SessionRevision};
 use iaam_core::batch::ControlSection;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
@@ -757,7 +760,7 @@ pub async fn reconciliation(
     operation_id = RECORD_OWNER_BALANCE_OPERATION_ID,
     request_body = OwnerBalanceRequest,
     responses(
-        (status = 200, description = "Updated statuses", body = Vec<ReconciliationStatusDto>),
+        (status = 200, description = "What the claim wrote, and the updated statuses", body = OwnerBalanceOutcomeDto),
         (status = 403, description = "Owner only", body = ApiError),
         (status = 422, description = "Invalid balance", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
@@ -770,7 +773,7 @@ pub async fn reconciliation_balance(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<OwnerBalanceRequest>,
-) -> Result<Json<Vec<ReconciliationStatusDto>>, ApiFailure> {
+) -> Result<Json<OwnerBalanceOutcomeDto>, ApiFailure> {
     require_admin(&principal)?;
     let period = AssertionPeriod::between(request.from, request.to).ok_or_else(|| {
         invalid_field(
@@ -817,7 +820,10 @@ pub async fn reconciliation_balance(
     let raw_hash = request.source_hash.unwrap_or_else(|| "0".repeat(64));
     let raw_hash = iaam_core::event::provenance::RawHash::parse(&raw_hash)
         .ok_or_else(|| invalid_field("source_hash", "64 hex-characters", raw_hash))?;
-    let _ = record_owner_balance(
+    // The verdicts are the answer's own half. Discarding them is how a claim
+    // that deduplicated against another one looked exactly like a claim that
+    // was written: the statuses below are computed from the journal either way.
+    let recorded = record_owner_balance(
         &state.services,
         &principal,
         OwnerBalance {
@@ -838,9 +844,10 @@ pub async fn reconciliation_balance(
         period.to,
     )
     .await?;
-    Ok(Json(
-        statuses.iter().map(reconciliation_status_dto).collect(),
-    ))
+    Ok(Json(OwnerBalanceOutcomeDto {
+        control_assertions: recorded.iter().map(RecordedEventDto::from_domain).collect(),
+        statuses: statuses.iter().map(reconciliation_status_dto).collect(),
+    }))
 }
 
 /// Active and retired classification rules.
@@ -3180,7 +3187,16 @@ pub async fn get_import_session(
         ImportSessionId(id),
     )
     .await?;
-    Ok(Json(session_contents_dto(&contents)))
+    // The candidates are read here and handed to the renderer rather than looked
+    // up inside it: the transport copies a name that came with its identifier
+    // and never joins one on (§3.4).
+    let questions = iaam_app::scenarios::import_session::answerable_questions(
+        &state.services,
+        &principal,
+        &contents.questions,
+    )
+    .await?;
+    Ok(Json(session_contents_dto(&contents, &questions)))
 }
 
 /// Feed rows into a session.
@@ -3258,6 +3274,15 @@ pub async fn add_import_rows(
 /// whose name does not mention rules. Under an agent token the row settles and
 /// `rule` comes back absent; the owner turns the answer into a rule with his own
 /// token if he wants it to stand.
+///
+/// The two answers that name one of the owner's accounts take an identifier, and
+/// the question published only that an account was needed — so answering one
+/// meant fetching the account list and joining, the last such join on the import
+/// path (`iaam-boj4`). The question now carries its own candidates, with the
+/// owner's title and institution beside each id, so the answer is a copy of
+/// something the caller was handed. It is still an id and never a title:
+/// `docs/api/conventions.md` §3.2, because a request resolved by name addresses
+/// the wrong account and succeeds.
 ///
 /// An answer carrying a field its own word does not take — an `account` beside
 /// `received`, an `origin` beside anything but `fee` — is refused rather than
@@ -3630,12 +3655,14 @@ pub async fn abandon_import_session(
     Ok(Json(ImportSessionDto::from_domain(&session)))
 }
 
-fn session_contents_dto(contents: &SessionContents) -> ImportSessionContentsDto {
+fn session_contents_dto(
+    contents: &SessionContents,
+    questions: &[AnswerableQuestion],
+) -> ImportSessionContentsDto {
     ImportSessionContentsDto {
         session: ImportSessionDto::from_domain(&contents.session),
         row_count: contents.observations.len(),
-        questions: contents
-            .questions
+        questions: questions
             .iter()
             .map(ImportQuestionDto::from_domain)
             .collect(),

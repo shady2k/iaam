@@ -155,7 +155,7 @@ things. Read it as the lookup table for §1.
 | `POST /v1/ingest/journal-events` | `[VerdictDto]` | bare array | one verdict per submitted row |
 | `POST /v1/ingest/csv` | `[VerdictDto]` | bare array | one verdict per parsed row |
 | `POST /v1/corrections` | `[VerdictDto]` | bare array | one verdict per submitted correction |
-| `POST /v1/reconciliation/balance` | `[ReconciliationStatusDto]` | bare array | the statuses the balance changed |
+| `POST /v1/reconciliation/balance` | `OwnerBalanceOutcomeDto` | object, `statuses` | `control_assertions` — whether each claim reached the journal or was already held there, which no status row can say |
 | `POST /v1/import-sessions/{session}/rows` | `[ImportRowDto]` | bare array | one outcome per fed row; nothing was recorded |
 | `POST /v1/documents` | `DocumentDto` | object, `rows` | the document hash, source, parser version and period |
 | `POST /v1/brokers/{broker}/sync` | `SyncOutcomeDto` | object, `recorded` | the duplicate and assertion counts for the run, and `actions` |
@@ -199,6 +199,16 @@ manifest exists to be read: an owner asked to rule on an account cannot act on a
 bare UUID, and a caller that had to fetch the names separately would be free to
 render the manifest without them." An action item is that sentence with the same
 reader.
+
+`ImportQuestionDto.accounts` is the same reasoning reaching the last place on
+the import path that had not had it. Two of the six answers to a classification
+question name one of the owner's own accounts, and the question published only
+`needs_account: true` — so a client answering one called `GET /v1/accounts` and
+joined, which is the join §3.1 exists to remove. The candidates are the
+question's own: the account the row is already on is not among them, because an
+account is not the other side of itself, and they are built by the function that
+builds the action queue's `/account` field so that the two cannot offer
+different lists for one question.
 
 `institution` travels with `title` for the case a title alone cannot settle. Two
 accounts the owner calls `Savings`, at two banks, are one word apart in a list
@@ -275,7 +285,7 @@ Every published type that prints an identifier of a thing the owner named.
 | `ActionSubjectDto::Account` | `id` | `title`, `institution` |
 | `AccountScopeDto` | `account` | `title`, `institution` |
 | `PopulationAccountDto` | `account` | `title` |
-| `ImportQuestionDto` | in `prompt` | the titles, in the sentence |
+| `ImportQuestionDto` | in `prompt`, and `accounts[].id` | the titles, in the sentence; `title` and `institution` on each candidate |
 | `ContourDto` | `contour` | `title` |
 | `CategoryDto`, `CategoryGroupDto` | `id` | `title` |
 | `InstrumentDto` | `id` | `symbol`, `title` |

@@ -86,17 +86,68 @@ pub async fn create_rule(
     outcome: Classification,
     replaces: Option<Uuid>,
 ) -> Result<RuleChange, AppError> {
+    let matcher = encoded(&matcher_json(matcher), "matcher")?;
+    let outcome = encoded(&outcome_json(outcome), "outcome")?;
+    refuse_unreadable_rules(services, principal.owner, &matcher, &outcome).await?;
     let rule = services
         .rules
-        .create_rule(
-            principal.owner,
-            encoded(&matcher_json(matcher), "matcher")?,
-            encoded(&outcome_json(outcome), "outcome")?,
-            replaces,
-        )
+        .create_rule(principal.owner, matcher, outcome, replaces)
         .await?;
     let plan = recompute_history(services, principal.owner).await?;
     Ok(RuleChange { rule, plan })
+}
+
+/// Read every rule the recomputation will read, before anything is written.
+///
+/// **This is the ordering, and it is the whole of iaam-y6kt.**
+/// [`recompute_history`] parses the owner's entire active rule set with
+/// [`rule_from_view`], and a rule it cannot read is an
+/// [`AppError::Invalid`] — a 422 at the transport. Run after the write, that
+/// refusal reached the caller while the store already held the rule it had just
+/// been told was refused, and the only reasonable response to a refusal —
+/// sending it again — added a second copy of it. Nothing in the response said
+/// so, and `GET /v1/classification-rules` refuses for the same reason, so the
+/// caller could not even look.
+///
+/// Two things this is deliberately not.
+///
+/// It is **not** a check of the proposal alone. The proposal is composed here
+/// out of typed values by [`matcher_json`] and [`outcome_json`], so it
+/// round-trips by construction; what actually fails is one of the rules already
+/// stored. The store keeps every matcher and outcome as opaque text — on
+/// purpose, so that it need not know the classifier's vocabulary — so it can
+/// hold JSON written before this route was typed or by something other than it,
+/// and one such rule made *every* later rule creation refuse. The proposal is
+/// read back all the same, through the same function and not a second parser of
+/// the same text, because "round-trips by construction" is an invariant worth
+/// holding rather than assuming.
+///
+/// It is **not** a recomputation moved before the write. The plan is still
+/// computed afterwards, from the rule set the store actually holds, for the
+/// reason [`recompute_history`] gives in its third point: there is exactly one
+/// write, so nothing can half-happen. Computing the plan first would mean
+/// modelling here what the write will do — which rule the amendment retires,
+/// what version the new one is given, and therefore which rule wins a tie — and
+/// a second model of the store's own behaviour is a model that drifts, silently,
+/// into a plan the owner applies to his journal.
+///
+/// What remains after the write can still fail: `recompute_plan` refuses a
+/// journal it cannot resolve. That is a fact about the journal and not about the
+/// rule, it is reported as a 5xx and not as a refusal, and the rule it leaves
+/// stored is a valid standing decision whose plan any later call recomputes.
+async fn refuse_unreadable_rules(
+    services: &AppServices,
+    owner: OwnerId,
+    matcher: &str,
+    outcome: &str,
+) -> Result<(), AppError> {
+    matcher_and_outcome(matcher, outcome)?;
+    for rule in services.rules.list_rules(owner).await? {
+        if rule.retired_at.is_none() {
+            rule_from_view(rule)?;
+        }
+    }
+    Ok(())
 }
 
 /// The condition, in the form the rule store keeps it in.
@@ -147,11 +198,29 @@ fn encoded(value: &Value, field: &'static str) -> Result<String, AppError> {
         .map_err(|error| AppError::Store(format!("{field} could not be written: {error}")))
 }
 
+/// Retire a rule and say what the remaining set corrects.
+///
+/// The readability check runs first for the reason
+/// [`refuse_unreadable_rules`] gives, and this route had the same defect:
+/// retiring wrote, and the recomputation that followed could refuse with a 422
+/// naming a different rule entirely — leaving the rule retired, and a second
+/// attempt answered `404`, because a retired rule cannot be retired again. A
+/// caller reading the two responses would conclude it had never retired
+/// anything.
+///
+/// Checking the set *before* the retirement is a superset of what the
+/// recomputation afterwards reads: retiring only removes a rule from it. So the
+/// check cannot pass here and fail there.
 pub async fn retire_rule(
     services: &AppServices,
     principal: &Principal,
     id: Uuid,
 ) -> Result<Vec<PlannedCorrection>, AppError> {
+    for rule in services.rules.list_rules(principal.owner).await? {
+        if rule.retired_at.is_none() {
+            rule_from_view(rule)?;
+        }
+    }
     services.rules.retire_rule(principal.owner, id).await?;
     recompute_history(services, principal.owner).await
 }
@@ -280,18 +349,37 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
 /// readings of one stored matcher would eventually disagree about what the owner
 /// decided.
 pub fn rule_from_view(rule: ClassificationRuleView) -> Result<ClassificationRule, AppError> {
-    let matcher = json_object(&rule.matcher, "matcher")?;
-    let outcome = json_object(&rule.outcome, "outcome")?;
+    let (matcher, outcome) = matcher_and_outcome(&rule.matcher, &rule.outcome)?;
     Ok(ClassificationRule {
         id: ClassificationRuleId(rule.id),
         version: rule.version,
-        matcher: RuleMatcher {
+        matcher,
+        outcome,
+    })
+}
+
+/// The stored condition and outcome, in the classifier's own vocabulary.
+///
+/// Split out of [`rule_from_view`] so that a rule which is not stored yet can be
+/// read by exactly the code that reads one which is: [`create_rule`] reads its
+/// own proposal back before writing it, and it has no identity or version to
+/// build a view out of. A second parser there would eventually accept text the
+/// classifier refuses, which is the failure the one-reader rule exists to
+/// prevent.
+fn matcher_and_outcome(
+    matcher: &str,
+    outcome: &str,
+) -> Result<(RuleMatcher, Classification), AppError> {
+    let matcher = json_object(matcher, "matcher")?;
+    let outcome = json_object(outcome, "outcome")?;
+    Ok((
+        RuleMatcher {
             counterparty_account: optional_string(&matcher, "counterparty_account", "matcher")?,
             description_contains: optional_string(&matcher, "description_contains", "matcher")?,
             kind: optional_string(&matcher, "kind", "matcher")?,
         },
-        outcome: parse_outcome(outcome)?,
-    })
+        parse_outcome(outcome)?,
+    ))
 }
 
 fn json_object(raw: &str, field: &str) -> Result<Map<String, Value>, AppError> {

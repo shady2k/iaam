@@ -35,7 +35,8 @@ use sha2::{Digest, Sha256};
 
 use crate::AppServices;
 use crate::actions::{
-    AccountScope, OperationKey, RequestPlan, ResolutionOption, account_scope, answer_input,
+    AccountCandidate, AccountScope, OperationKey, RequestPlan, ResolutionOption, account_scope,
+    answer_account_candidates, answer_input,
 };
 use crate::error::{AppError, FieldRejection};
 use iaam_ingest::dedup::IdentityScope;
@@ -117,6 +118,97 @@ impl SessionContents {
     pub fn has_open_questions(&self) -> bool {
         self.questions.iter().any(ImportQuestionView::is_open)
     }
+}
+
+/// A question, and the accounts an answer to it may name.
+///
+/// **Why the pair exists (iaam-boj4).** Two of the six answers —
+/// `sent_to_own_account` and `received_from_own_account` — name one of the
+/// owner's own accounts, and the question published only `needs_account: true`.
+/// A client holding the question therefore had to call `GET /v1/accounts` and
+/// join, which is the one identifier left on the import path that a client had
+/// to fetch rather than copy out of the response it was answering. Everything
+/// else was removed: a session is declared by what the source prints, and a
+/// row's account is copied out of the open response.
+///
+/// **Why it is a pair and not a field on the store's view.** The candidates are
+/// built where the answer is built, out of the account list this read of the
+/// store returned, under `docs/api/conventions.md` §3.4. Joined on by the
+/// transport they would come from a second reading, and one response could then
+/// name one account two ways. The store's `ImportQuestionView` cannot carry them
+/// either: it is what the questions table holds, and the questions table knows
+/// nothing about accounts.
+///
+/// **Why the answer still sends an identifier.** §3.2: a name is not an
+/// identity, and a request that resolved an account by title would address the
+/// wrong account and succeed. So the candidate carries `title` and
+/// `institution` to be read by, and `id` to be sent back — which makes the
+/// answer a copy of something the client was given rather than a value it
+/// composed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerableQuestion {
+    pub view: ImportQuestionView,
+    /// Empty in three cases a client tells apart from the rest of the answer:
+    /// the question is answered (`answered_at` is set, and an answered question
+    /// cannot be answered again); no alternative it offers names an account
+    /// (every `needs_account` is false); or the owner has no account other than
+    /// the one the row is already on, which is a true statement about his
+    /// directory and not a missing lookup.
+    pub accounts: Vec<AccountCandidate>,
+}
+
+/// Pair each question with the accounts an answer to it may name.
+///
+/// The account list is read once, here, and only when some open question
+/// actually offers an answer that names one — a session whose questions are all
+/// answered, or all about a fee that no account is the other side of, costs no
+/// query at all.
+///
+/// The candidates come from [`answer_account_candidates`], which is the function
+/// the action queue's `/account` field and the answering route's own refusal
+/// already use. One builder, so what the question offers, what the queue offers
+/// and what the route accepts cannot drift apart — and a caller that copies an
+/// id out of any of the three is copying the same list.
+///
+/// A question whose stored JSON cannot be read gets no candidates rather than
+/// failing the read. The same tolerance the transport already applies to a
+/// question's stored alternatives: what the session holds does not become
+/// unreadable because one row of it is.
+pub async fn answerable_questions(
+    services: &AppServices,
+    principal: &Principal,
+    questions: &[ImportQuestionView],
+) -> Result<Vec<AnswerableQuestion>, AppError> {
+    let asked: Vec<Option<Question>> = questions
+        .iter()
+        .map(|question| {
+            question
+                .is_open()
+                .then(|| serde_json::from_str::<Question>(&question.question).ok())
+                .flatten()
+                .filter(|asked| {
+                    asked
+                        .alternatives()
+                        .into_iter()
+                        .any(AnswerShape::needs_account)
+                })
+        })
+        .collect();
+    let accounts = if asked.iter().any(Option::is_some) {
+        services.store.list_accounts(principal.owner).await?
+    } else {
+        Vec::new()
+    };
+    Ok(questions
+        .iter()
+        .zip(asked)
+        .map(|(question, asked)| AnswerableQuestion {
+            view: question.clone(),
+            accounts: asked.map_or_else(Vec::new, |asked| {
+                answer_account_candidates(&asked, &accounts)
+            }),
+        })
+        .collect())
 }
 
 /// Submit rows without naming a session.
@@ -601,7 +693,7 @@ pub async fn answer_question(
     session: ImportSessionId,
     question: ImportQuestionId,
     answer: Answer,
-) -> Result<ImportQuestionView, AppError> {
+) -> Result<AnswerableQuestion, AppError> {
     require_submit(principal)?;
     let contents = read_session(services, principal, session).await?;
     let stored = contents
@@ -686,7 +778,7 @@ pub async fn answer_question(
         None => None,
     };
 
-    services
+    let answered = services
         .store
         .answer_import_question(
             principal.owner,
@@ -695,7 +787,20 @@ pub async fn answer_question(
             json(&answer, "answer")?,
             rule,
         )
-        .await
+        .await?;
+    // Through the same pairing every other reading of a question goes through,
+    // rather than an empty list written out here. The answered question offers
+    // no candidates *because it is answered*, and that is one rule; stated in
+    // two places it is a rule that can come to disagree with itself.
+    Ok(
+        answerable_questions(services, principal, std::slice::from_ref(&answered))
+            .await?
+            .pop()
+            .unwrap_or(AnswerableQuestion {
+                view: answered,
+                accounts: Vec::new(),
+            }),
+    )
 }
 
 /// Record what the source printed about itself in its own control section.

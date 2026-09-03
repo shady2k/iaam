@@ -3269,7 +3269,9 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    let statuses = response.as_array().expect("reconciliation statuses");
+    let statuses = response["statuses"]
+        .as_array()
+        .expect("reconciliation statuses");
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
     assert_eq!(statuses[0]["dimensions"][0]["dimension"], "cash");
@@ -3281,6 +3283,97 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
     );
     drop(harness);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The verdict is the half of the answer the statuses cannot give.
+///
+/// A status is about a dimension over a period. It reads identically whether
+/// this call wrote the claim, found it already written, or — as in iaam-ihyi —
+/// deduplicated it against a different claim entirely. The route used to answer
+/// with the statuses alone, so a claim that never reached the journal was
+/// reported exactly as one that did.
+#[tokio::test]
+async fn a_recorded_balance_says_whether_the_claim_reached_the_journal() {
+    let harness = harness();
+    let claim = json!({
+        "account": harness.account.inner(),
+        "from": "2026-08-01",
+        "to": "2026-08-31",
+        "at": "closing",
+        "cash": { "currency": "RUB", "amount": "100.00" },
+    });
+
+    let (status, first) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &claim),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let written = first["control_assertions"]
+        .as_array()
+        .expect("one entry per claim the request stated");
+    assert_eq!(written.len(), 1, "{first}");
+    assert_eq!(written[0]["outcome"], "inserted", "{first}");
+    let event = written[0]["event"].as_str().expect("the event written");
+    assert!(first["statuses"].is_array(), "{first}");
+
+    // Restating the same claim is one fact, not two, and the honest answer is
+    // that it was already held — not an error, and not silence.
+    let (status, again) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &claim),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    let repeated = again["control_assertions"]
+        .as_array()
+        .expect("one entry per claim the request stated");
+    assert_eq!(repeated.len(), 1, "{again}");
+    assert_eq!(repeated[0]["outcome"], "duplicate", "{again}");
+    assert_eq!(
+        repeated[0]["event"], event,
+        "a duplicate names the event it repeats: {again}"
+    );
+}
+
+/// One entry per claim, in the order the request stated them.
+///
+/// The opening and closing claims of one account and period are two facts, and
+/// iaam-ihyi is the wave in which they were one. The verdicts are what a client
+/// can read that against: two `inserted` entries naming two different events.
+#[tokio::test]
+async fn an_opening_and_a_closing_claim_are_two_written_facts() {
+    let harness = harness();
+    let mut written = Vec::new();
+    for at in ["opening", "closing"] {
+        let (status, response) = call(
+            &harness.router,
+            post(
+                "/v1/reconciliation/balance",
+                &harness.owner_token,
+                &json!({
+                    "account": harness.account.inner(),
+                    "from": "2026-08-01",
+                    "to": "2026-08-31",
+                    "at": at,
+                    "cash": { "currency": "RUB", "amount": "100.00" },
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{at}: {response}");
+        let entries = response["control_assertions"]
+            .as_array()
+            .expect("one entry per claim")
+            .clone();
+        assert_eq!(entries.len(), 1, "{at}: {response}");
+        assert_eq!(entries[0]["outcome"], "inserted", "{at}: {response}");
+        written.push(entries[0]["event"].as_str().expect("event id").to_owned());
+    }
+    assert_ne!(
+        written[0], written[1],
+        "the opening and the closing claim are two events"
+    );
 }
 
 /// A coverage gap is written by the broker sync path before any assertion is
@@ -12803,6 +12896,177 @@ async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_i
         journal_rows(&harness).await,
         before,
         "nothing may be recorded while the question waits"
+    );
+}
+
+/// The question carries the accounts an answer to it may name (iaam-boj4).
+///
+/// Two of the six answers name one of the owner's own accounts, and the question
+/// used to publish only `needs_account: true`. A client answering one had to
+/// call `GET /v1/accounts` and join — the last identifier on the import path it
+/// had to fetch rather than copy out of the response it was answering.
+///
+/// The whole test is written the way such a client would now work: the account
+/// directory is never read, and the identifier the answer sends is taken from
+/// the question itself.
+#[tokio::test]
+async fn a_question_that_needs_an_account_offers_the_accounts_it_may_name() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "candidates-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "needs_classification", "{verdicts}");
+
+    let (status, sessions) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    let session = sessions.as_array().expect("sessions")[0]["session"]
+        .as_str()
+        .expect("session identifier")
+        .to_owned();
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let question = contents["questions"].as_array().expect("questions")[0].clone();
+
+    // The alternatives still say which answers need one; the candidates say
+    // which accounts those are. The first without the second is the defect.
+    assert!(
+        question["alternatives"]
+            .as_array()
+            .expect("alternatives")
+            .iter()
+            .any(|alternative| alternative["needs_account"] == json!(true)),
+        "{question}"
+    );
+    let candidates = question["accounts"]
+        .as_array()
+        .expect("the accounts an answer may name");
+    assert_eq!(candidates.len(), 1, "{question}");
+
+    // The name travels with the identifier, and the institution with it: two
+    // accounts the owner calls `Savings` at two banks are not one question
+    // (conventions §3.1).
+    assert_eq!(candidates[0]["id"], json!(savings), "{question}");
+    assert_eq!(candidates[0]["title"], "Savings", "{question}");
+    assert_eq!(candidates[0]["institution"], "Northline", "{question}");
+
+    // An account is not the other side of itself.
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate["id"] != json!(account)),
+        "the row is already on that account: {question}"
+    );
+
+    // The answer is a copy of what the question published, not a lookup: this is
+    // the only place the identifier comes from.
+    let chosen = candidates[0]["id"].clone();
+    let question_id = question["question"].as_str().expect("question identifier");
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question_id}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": chosen }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert!(answered["answered_at"].is_string(), "{answered}");
+
+    // Nothing is offered on a question that can no longer be answered, and the
+    // client tells that case from the others by `answered_at`.
+    assert!(
+        answered
+            .get("accounts")
+            .is_none_or(|accounts| accounts.as_array().is_some_and(Vec::is_empty)),
+        "an answered question offers no candidates: {answered}"
+    );
+}
+
+/// The question and the queue offer one list, because one function builds it.
+///
+/// The queue's item for the same question publishes the candidates under
+/// `/account`, and the question publishes them itself. Two constructions of
+/// "which accounts may this answer name" would eventually differ, and a client
+/// copying an id out of either could not tell which was right.
+#[tokio::test]
+async fn the_question_and_the_action_queue_offer_the_same_accounts() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let _savings = another_account(&harness, "Savings").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "same-list-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let from_queue = items[0]["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .and_then(|answer| answer["alternatives"].as_array())
+        .expect("alternatives")
+        .iter()
+        .find(|alternative| alternative["value"] == "sent_to_own_account")
+        .and_then(|alternative| alternative["requires"].as_array())
+        .and_then(|requires| requires.first())
+        .map(|required| required["candidates"].clone())
+        .expect("the queue offers the accounts under /account");
+
+    let session = items[0]["target"]["request"]["preset"]["session"]
+        .as_str()
+        .expect("the session is preset");
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let from_question = contents["questions"].as_array().expect("questions")[0]["accounts"].clone();
+
+    assert_eq!(
+        from_question, from_queue,
+        "one question, one list of accounts it may name"
     );
 }
 

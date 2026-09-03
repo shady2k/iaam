@@ -139,6 +139,12 @@ money went and whose account was on the other side are facts about the owner's
 affairs; you may show him the question and the alternatives, and relay what he
 says.
 
+Where an answer names one of the owner's own accounts, the question carries the
+accounts it may name, each with his own title for it and the institution holding
+it. Show him those and send back the identifier of the one he picks. You never
+look an account up to answer a question, and you never compose an identifier: the
+one you send was in the question you are answering.
+
 **An answer you relay settles the row and nothing beyond it.** Answering has two
 halves. Disposing of the line in front of you is import mechanics, and it is
 yours to do. Turning that disposal into a standing classification rule decides

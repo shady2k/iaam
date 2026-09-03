@@ -22,6 +22,7 @@ use iaam_core::event::Event;
 use iaam_core::event::correction::{CorrectionError, resolve};
 use iaam_core::event::kind::{EventKind, FeeOrigin};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId};
+use serde::{Deserialize, Serialize};
 
 /// Where the money is moving. Needed so that the question asked of the owner is relevant:
 /// debits and credits have different branches.
@@ -51,7 +52,14 @@ pub struct ClassificationSubject {
     /// What the source called the operation. An open set: each
     /// broker uses its own words, so this is a string, not an enum.
     pub source_kind: Option<String>,
-    pub movement: Movement,
+    /// Which way the money went, when the source said.
+    ///
+    /// `None` is not a default and not a missing field: it means the source
+    /// stated an amount and no direction — a bank row printed as "internal to
+    /// this institution" and nothing else. The two rows this distinguishes look
+    /// identical once a direction has been supplied, and supplying one is the
+    /// guess this type exists to refuse.
+    pub movement: Option<Movement>,
 }
 
 /// Rule condition. Specified fields are joined with “and”.
@@ -174,7 +182,8 @@ pub enum Basis {
 /// An enumeration, not a string: the question is sent to the API and rendered
 /// with human-readable account names, which the pure function does not have,
 /// and a string containing a UUID is not a specific question.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "question", rename_all = "snake_case")]
 pub enum Question {
     /// Recipient account named but not recognized.
     IsTransferInternal {
@@ -185,6 +194,188 @@ pub enum Question {
     IsOutflowAFee { account: AccountId },
     /// Receipt without a named counterparty: income or refund?
     IsInflowIncome { account: AccountId },
+    /// The source gave an amount and no direction.
+    ///
+    /// **This one is not a yes/no, unlike its three siblings**, and a reader who
+    /// assumes it is will build the wrong answer form. The other three are asked
+    /// about a row whose direction is already settled — two of them branch on
+    /// [`Movement`] to be asked at all. This one is asked when nothing has
+    /// settled the direction: a bank printed a word meaning "internal to this
+    /// institution" with an amount beside it, and neither which way the money
+    /// went nor the account on the other side can be read out of that.
+    ///
+    /// Answering it therefore names a direction **and** a classification at
+    /// once, which is what [`Answer`] is shaped for. Splitting it into "which
+    /// way?" followed by "and what was it?" would put the owner in a chain of
+    /// questions where one has to be asked before the next can be phrased, and
+    /// the first answer would sit somewhere provisional while the second was
+    /// pending.
+    UnresolvedDirection {
+        account: AccountId,
+        /// The word the source used for the operation, verbatim, when it used
+        /// one — [`ClassificationSubject::source_kind`]. `INNER` is the one this
+        /// variant was written for; it is what a bank prints where another bank
+        /// prints "debit" or "credit", and it is retained rather than
+        /// interpreted. `None` means the source named the operation nothing at
+        /// all, which is a weaker statement, not the same one.
+        stated: Option<String>,
+        /// The party the source named, when it named one. A named counterparty
+        /// that the directory did not recognise still narrows the question.
+        counterparty: Option<String>,
+    },
+}
+
+impl Question {
+    /// The account the question is about.
+    #[must_use]
+    pub const fn account(&self) -> AccountId {
+        match self {
+            Self::IsTransferInternal { account, .. }
+            | Self::IsOutflowAFee { account }
+            | Self::IsInflowIncome { account }
+            | Self::UnresolvedDirection { account, .. } => *account,
+        }
+    }
+
+    /// The answers that answer **this** question.
+    ///
+    /// Published with the question rather than assumed by the caller: an answer
+    /// the question does not admit is a different mistake from an answer that is
+    /// wrong, and only the first can be refused.
+    ///
+    /// [`Answer::SentToOwnAccount`] and [`Answer::ReceivedFromOwnAccount`] name
+    /// an account the question cannot know, so they appear here in their
+    /// `AnswerShape` form: the alternative says *an account is required*, and
+    /// the answering call supplies it.
+    #[must_use]
+    pub fn alternatives(&self) -> Vec<AnswerShape> {
+        match self {
+            Self::IsTransferInternal { .. } => vec![
+                AnswerShape::SentToOwnAccount,
+                AnswerShape::ReceivedFromOwnAccount,
+                AnswerShape::Paid,
+                AnswerShape::Received,
+            ],
+            Self::IsOutflowAFee { .. } => vec![AnswerShape::Fee, AnswerShape::Paid],
+            Self::IsInflowIncome { .. } => vec![AnswerShape::Income, AnswerShape::Received],
+            Self::UnresolvedDirection { .. } => vec![
+                AnswerShape::SentToOwnAccount,
+                AnswerShape::ReceivedFromOwnAccount,
+                AnswerShape::Paid,
+                AnswerShape::Received,
+                AnswerShape::Fee,
+                AnswerShape::Income,
+            ],
+        }
+    }
+
+    /// Whether this question admits that answer.
+    #[must_use]
+    pub fn admits(&self, answer: &Answer) -> bool {
+        self.alternatives().contains(&answer.shape())
+    }
+}
+
+/// One alternative a question offers, without the value it needs.
+///
+/// The wire vocabulary of [`Answer`], minus the account two of the answers
+/// carry. It exists so a question can publish what may be said to it before
+/// anyone has said anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerShape {
+    SentToOwnAccount,
+    ReceivedFromOwnAccount,
+    Paid,
+    Received,
+    Fee,
+    Income,
+}
+
+impl AnswerShape {
+    /// Wire code. One place, so the transport cannot spell it differently.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SentToOwnAccount => "sent_to_own_account",
+            Self::ReceivedFromOwnAccount => "received_from_own_account",
+            Self::Paid => "paid",
+            Self::Received => "received",
+            Self::Fee => "fee",
+            Self::Income => "income",
+        }
+    }
+
+    /// Whether the answer must name one of the owner's accounts.
+    #[must_use]
+    pub const fn needs_account(self) -> bool {
+        matches!(self, Self::SentToOwnAccount | Self::ReceivedFromOwnAccount)
+    }
+}
+
+/// The owner's answer to one question.
+///
+/// Every variant names a direction **and** a classification, because a
+/// directionless row needs both and a single answer is the only way to give
+/// both without something provisional existing in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+pub enum Answer {
+    /// The money left this account for the owner's own account named here.
+    SentToOwnAccount { to: AccountId },
+    /// The money arrived at this account from the owner's own account named here.
+    ReceivedFromOwnAccount { from: AccountId },
+    /// The money left the perimeter, and it was not a fee.
+    Paid,
+    /// The money arrived from outside the perimeter, and it is not income.
+    Received,
+    /// The money left the perimeter as a fee.
+    Fee { origin: FeeOrigin },
+    /// The money arrived from outside the perimeter as income.
+    Income,
+}
+
+impl Answer {
+    /// Which alternative this answer is.
+    #[must_use]
+    pub const fn shape(&self) -> AnswerShape {
+        match self {
+            Self::SentToOwnAccount { .. } => AnswerShape::SentToOwnAccount,
+            Self::ReceivedFromOwnAccount { .. } => AnswerShape::ReceivedFromOwnAccount,
+            Self::Paid => AnswerShape::Paid,
+            Self::Received => AnswerShape::Received,
+            Self::Fee { .. } => AnswerShape::Fee,
+            Self::Income => AnswerShape::Income,
+        }
+    }
+
+    /// Which way the money went.
+    #[must_use]
+    pub const fn movement(&self) -> Movement {
+        match self {
+            Self::SentToOwnAccount { .. } | Self::Paid | Self::Fee { .. } => Movement::Out,
+            Self::ReceivedFromOwnAccount { .. } | Self::Received | Self::Income => Movement::In,
+        }
+    }
+
+    /// The decision the answer records, in the vocabulary a rule is written in.
+    ///
+    /// `ReceivedFromOwnAccount { from }` becomes `InternalTransfer { to: from }`
+    /// and that is not a slip: a rule matches on the **counterparty**, and the
+    /// account a rule names is the far side of the movement, whichever way it
+    /// went. Which side is which on a given row is recovered by comparing that
+    /// account with the row's own — see [`Classification`]'s use in the import
+    /// session.
+    #[must_use]
+    pub const fn classification(&self) -> Classification {
+        match self {
+            Self::SentToOwnAccount { to } => Classification::InternalTransfer { to: *to },
+            Self::ReceivedFromOwnAccount { from } => Classification::InternalTransfer { to: *from },
+            Self::Paid | Self::Received => Classification::ExternalFlow,
+            Self::Fee { origin } => Classification::Fee { origin: *origin },
+            Self::Income => Classification::Income,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,15 +423,30 @@ pub fn classify(
 
 fn question_for(subject: &ClassificationSubject) -> Question {
     match (&subject.counterparty, subject.movement) {
-        (Counterparty::Named(counterparty), _) => Question::IsTransferInternal {
+        (Counterparty::Named(counterparty), Some(_)) => Question::IsTransferInternal {
             account: subject.account,
             counterparty: counterparty.clone(),
         },
-        (Counterparty::Unknown, Movement::Out) => Question::IsOutflowAFee {
+        (Counterparty::Unknown, Some(Movement::Out)) => Question::IsOutflowAFee {
             account: subject.account,
         },
-        (Counterparty::Unknown, Movement::In) => Question::IsInflowIncome {
+        (Counterparty::Unknown, Some(Movement::In)) => Question::IsInflowIncome {
             account: subject.account,
+        },
+        // The source stated no direction. None of the three yes/no questions can
+        // be asked: two of them branch on the movement to exist at all, and the
+        // first would take "is this counterparty your own account?" as settling a
+        // row whose direction is still open — the answer would be recorded and
+        // the guess would be made anyway, one step further along.
+        (Counterparty::Named(counterparty), None) => Question::UnresolvedDirection {
+            account: subject.account,
+            stated: subject.source_kind.clone(),
+            counterparty: Some(counterparty.clone()),
+        },
+        (Counterparty::Unknown, None) => Question::UnresolvedDirection {
+            account: subject.account,
+            stated: subject.source_kind.clone(),
+            counterparty: None,
         },
         // An own account does not reach this point: it is handled in `classify`
         // as inferred from data.

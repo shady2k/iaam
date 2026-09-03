@@ -1,0 +1,408 @@
+//! A row as its source stated it, before anyone concluded what it was (§10.4).
+//!
+//! [`crate::operation::SubmittedOperation`] carries a conclusion:
+//! `Deposit` and `Withdrawal` assert a direction, `Transfer { to }` names an
+//! account. A caller holding a bank row that says only "internal to this
+//! institution" with an amount beside it has none of those, and the shape it was
+//! offered forced it to invent one. It invented `deposit`, one of the rows was a
+//! withdrawal, and a replacement correction had to undo it.
+//!
+//! **The fix is here rather than at classification.** Reaching `classify` from
+//! the existing intake path would not have worked: by the time it could be
+//! called the caller has already chosen an `OperationKind`, so the conclusion is
+//! made and the evidence it was made from — the source's own direction word, the
+//! counterparty string it printed — is no longer in the request. `classify`
+//! would be handed the answer and asked to re-derive the question.
+//!
+//! So this module accepts the observation instead, and nothing in it is a fact
+//! about money yet. An [`ObservedRow`] becomes an operation only once the
+//! classification is settled — by the directory, by one of the owner's rules, or
+//! by the owner answering.
+
+use iaam_core::event::kind::IncomeKind;
+use iaam_core::ids::AccountId;
+use iaam_core::money::CurrencyCode;
+use serde::{Deserialize, Serialize};
+
+use crate::classification::{
+    Answer, Classification, ClassificationSubject, Counterparty, Movement,
+};
+use crate::operation::{OperationDates, OperationKind, SubmittedOperation};
+use crate::verdict::Rejection;
+
+/// Which way the source said the money went.
+///
+/// A closed set of four, and the fourth is not a default. `Unknown` means the
+/// source named no direction; `Inner` means it named one that does not resolve
+/// to a direction — the word a bank prints for a movement it considers internal
+/// to itself, which says the money did not leave the institution and nothing at
+/// all about which of the owner's accounts was on which side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedDirection {
+    /// The source said the money arrived.
+    In,
+    /// The source said the money left.
+    Out,
+    /// The source said the movement was internal to the institution, without
+    /// saying which side this account was on.
+    Inner,
+    /// The source said nothing about direction.
+    Unknown,
+}
+
+impl ObservedDirection {
+    /// The direction as a [`Movement`], or `None` where the source stated none.
+    ///
+    /// `Inner` and `Unknown` both answer `None`, and they are still distinct
+    /// values: `Inner` narrows the question — the counterparty is very likely
+    /// another account at the same institution — while `Unknown` narrows
+    /// nothing. Collapsing them here would be safe; collapsing them in the type
+    /// would lose the narrowing.
+    #[must_use]
+    pub const fn movement(self) -> Option<Movement> {
+        match self {
+            Self::In => Some(Movement::In),
+            Self::Out => Some(Movement::Out),
+            Self::Inner | Self::Unknown => None,
+        }
+    }
+
+    /// Parse the word a caller sent.
+    ///
+    /// A rejection rather than a fallback to `Unknown`: a caller that meant
+    /// "out" and typed "outgoing" must be told, not silently asked a question it
+    /// had already answered.
+    pub fn parse(value: &str) -> Result<Self, Rejection> {
+        match value {
+            "in" => Ok(Self::In),
+            "out" => Ok(Self::Out),
+            "inner" => Ok(Self::Inner),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(Rejection {
+                field: "direction".to_owned(),
+                expected: "in, out, inner or unknown".to_owned(),
+                actual: other.to_owned(),
+            }),
+        }
+    }
+
+    /// Wire code. One place, so the transport cannot spell it differently.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+            Self::Inner => "inner",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Who the source said was on the other side.
+///
+/// There is deliberately no `OwnAccount` variant, unlike [`Counterparty`].
+/// Recognising a printed name as one of the owner's accounts is a **conclusion**,
+/// and this type is what the caller is allowed to state. The resolution happens
+/// on this side of the wire, against the owner's directory, and it is what turns
+/// a question into a derived internal transfer without asking anybody.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedCounterparty {
+    /// The source named a party, and this is the string it printed.
+    Named(String),
+    /// The source named nobody.
+    Unknown,
+}
+
+/// Where the row came from, precisely enough to find it again.
+///
+/// Kept beside the observation rather than folded into it: a question asked
+/// about a row outlives the response that carried it, and the answer has to name
+/// the row it answers. A row identified only by its position in a batch stops
+/// being identifiable the moment the batch is re-sent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RowIdentity {
+    /// The document the row was read out of, as the source names it.
+    pub document: Option<String>,
+    /// The row's identifier within that document, as the source names it.
+    pub row: Option<String>,
+    /// The caller's own idempotency key for the row (§10.6).
+    pub idempotency_key: Option<String>,
+}
+
+impl RowIdentity {
+    /// A stable key for the row, or `None` when the caller gave nothing stable.
+    ///
+    /// `None` is honest rather than convenient: without it the same row
+    /// re-submitted would open a second question about the same money, and the
+    /// owner would answer one of them.
+    #[must_use]
+    pub fn key(&self) -> Option<String> {
+        if let Some(key) = &self.idempotency_key {
+            return Some(format!("idempotency/{key}"));
+        }
+        match (&self.document, &self.row) {
+            (Some(document), Some(row)) => Some(format!("document/{document}/{row}")),
+            (None, Some(row)) => Some(format!("row/{row}")),
+            _ => None,
+        }
+    }
+}
+
+/// A row as the source stated it.
+///
+/// Every field is what the source said, or an explicit statement that it said
+/// nothing. Nothing here has been normalised into a conclusion — in particular
+/// `amount_minor` keeps the **source's own sign**, because the sign is evidence
+/// about direction where the source used one and would be a fabricated direction
+/// where it did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedRow {
+    /// The account whose statement this row is on.
+    pub account: AccountId,
+    pub direction: ObservedDirection,
+    /// The amount with the sign the source printed. Not made positive: making it
+    /// positive discards the source's own statement about direction, and the
+    /// whole point of this shape is to keep it.
+    pub amount_minor: i64,
+    pub currency: CurrencyCode,
+    pub counterparty: ObservedCounterparty,
+    /// What the source called the operation, verbatim.
+    pub source_kind: Option<String>,
+    /// What the source printed as the description or payment purpose, verbatim.
+    pub description: Option<String>,
+    pub dates: OperationDates,
+    pub source_time: Option<time::Time>,
+    pub identity: RowIdentity,
+}
+
+impl ObservedRow {
+    /// The row's attributes, as the classifier asks about them.
+    ///
+    /// `resolved` is what the owner's directory made of the printed counterparty:
+    /// `Some(account)` when it recognised one of the owner's own accounts. The
+    /// caller of this function does the recognising, because a pure function has
+    /// no directory — and this is the seam through which
+    /// [`Counterparty::OwnAccount`] reaches `classify` and produces a derived
+    /// internal transfer with no question asked.
+    #[must_use]
+    pub fn subject(&self, resolved: Option<AccountId>) -> ClassificationSubject {
+        ClassificationSubject {
+            account: self.account,
+            counterparty: match (resolved, &self.counterparty) {
+                (Some(account), _) => Counterparty::OwnAccount(account),
+                (None, ObservedCounterparty::Named(name)) => Counterparty::Named(name.clone()),
+                (None, ObservedCounterparty::Unknown) => Counterparty::Unknown,
+            },
+            description: self.description.clone(),
+            source_kind: self.source_kind.clone(),
+            movement: self.movement(),
+        }
+    }
+
+    /// Which way the money went, when anything says so.
+    ///
+    /// The source's own direction word first; failing that, the sign it printed
+    /// on the amount — but **only** when it also stated a direction, so that the
+    /// sign is read as the convention it accompanies rather than as one invented
+    /// here. A row with no direction word has no direction, whatever its sign
+    /// happens to be: a bank that prints every amount positive would otherwise
+    /// have every row read as an inflow.
+    #[must_use]
+    pub const fn movement(&self) -> Option<Movement> {
+        self.direction.movement()
+    }
+
+    /// The name the counterparty is matched by in a rule, when there is one.
+    #[must_use]
+    pub fn counterparty_name(&self) -> Option<&str> {
+        match &self.counterparty {
+            ObservedCounterparty::Named(name) => Some(name.as_str()),
+            ObservedCounterparty::Unknown => None,
+        }
+    }
+
+    /// The magnitude, which is what every conclusive operation kind wants.
+    ///
+    /// A rejection rather than an absolute value: `i64::MIN` has no positive
+    /// counterpart, and an amount of zero is a row that states no movement,
+    /// which is not a movement of zero.
+    fn magnitude(&self) -> Result<i64, Rejection> {
+        let magnitude = self.amount_minor.checked_abs().filter(|value| *value > 0);
+        magnitude.ok_or_else(|| Rejection {
+            field: "amount".to_owned(),
+            expected: "a non-zero amount the source stated".to_owned(),
+            actual: self.amount_minor.to_string(),
+        })
+    }
+
+    /// The operation this row is, once the classification and direction are
+    /// settled.
+    ///
+    /// This is the **only** place an observation becomes a conclusion, and it
+    /// takes both arguments because neither alone is enough:
+    /// [`Classification::ExternalFlow`] does not say which way the money went,
+    /// and a direction does not say whether the outflow was a fee.
+    ///
+    /// `InternalTransfer { to }` is read against this row's own account: the
+    /// account a rule names is the far side of the movement, so `to` equal to
+    /// this account means the money arrived from the counterparty, and `to`
+    /// different from it means the money left for `to`. An internal transfer
+    /// whose far side is this very account is refused rather than recorded as a
+    /// transfer to itself.
+    pub fn resolve(
+        &self,
+        classification: Classification,
+        movement: Movement,
+    ) -> Result<SubmittedOperation, Rejection> {
+        let amount_minor = self.magnitude()?;
+        let currency = self.currency;
+        let kind = match (classification, movement) {
+            (Classification::InternalTransfer { to }, Movement::Out) => {
+                if to == self.account {
+                    return Err(self.self_transfer());
+                }
+                OperationKind::Transfer {
+                    to,
+                    amount_minor,
+                    currency,
+                }
+            }
+            (Classification::InternalTransfer { to }, Movement::In) => {
+                if to == self.account {
+                    return Err(self.self_transfer());
+                }
+                // The money arrived, so the operation belongs to the account it
+                // left: a transfer is submitted from its sending side, and the
+                // event carries a leg on each.
+                return Ok(SubmittedOperation {
+                    account: to,
+                    kind: OperationKind::Transfer {
+                        to: self.account,
+                        amount_minor,
+                        currency,
+                    },
+                    ..self.envelope(to)
+                });
+            }
+            (Classification::ExternalFlow, Movement::Out) => OperationKind::Withdrawal {
+                amount_minor,
+                currency,
+            },
+            (Classification::ExternalFlow, Movement::In) => OperationKind::Deposit {
+                amount_minor,
+                currency,
+            },
+            (Classification::Fee { origin }, Movement::Out) => OperationKind::Fee {
+                amount_minor,
+                currency,
+                origin,
+            },
+            (Classification::Income, Movement::In) => OperationKind::Income {
+                instrument: None,
+                gross_minor: amount_minor,
+                currency,
+                // The source named no kind of income, and naming one here would
+                // record an invention (§4.9).
+                kind: None::<IncomeKind>,
+            },
+            // A fee that arrived and income that left are not rows this system
+            // can record: refusing is the only answer that does not write
+            // something nobody asserted.
+            (Classification::Fee { .. }, Movement::In)
+            | (Classification::Income, Movement::Out) => {
+                return Err(Rejection {
+                    field: "answer".to_owned(),
+                    expected: "an answer whose direction matches what it names: \
+                               a fee leaves the account and income arrives"
+                        .to_owned(),
+                    actual: format!("{} money", movement_word(movement)),
+                });
+            }
+        };
+        Ok(SubmittedOperation {
+            account: self.account,
+            kind,
+            ..self.envelope(self.account)
+        })
+    }
+
+    /// The row resolved by an answer the owner gave.
+    pub fn resolve_with(&self, answer: Answer) -> Result<SubmittedOperation, Rejection> {
+        self.resolve(answer.classification(), answer.movement())
+    }
+
+    fn self_transfer(&self) -> Rejection {
+        Rejection {
+            field: "answer".to_owned(),
+            expected: "an account different from the one the row is on".to_owned(),
+            actual: self.account.inner().to_string(),
+        }
+    }
+
+    /// Everything about the row that does not depend on what it turned out to be.
+    ///
+    /// `account` is passed rather than read from `self` because a received
+    /// internal transfer is submitted from the sending account, and the envelope
+    /// is otherwise identical.
+    fn envelope(&self, account: AccountId) -> SubmittedOperation {
+        SubmittedOperation {
+            account,
+            // Replaced by every caller; a placeholder is needed because
+            // `OperationKind` has no meaningless value and inventing one would
+            // put it in the type.
+            kind: OperationKind::Deposit {
+                amount_minor: 1,
+                currency: self.currency,
+            },
+            dates: self.dates,
+            source_time: self.source_time,
+            idempotency_key: self.identity.idempotency_key.clone(),
+            source_operation_id: self.identity.row.clone(),
+            source_category: self.source_kind.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+const fn movement_word(movement: Movement) -> &'static str {
+    match movement {
+        Movement::In => "incoming",
+        Movement::Out => "outgoing",
+    }
+}
+
+/// One submitted line.
+///
+/// The two arms are the whole of iaam-6qsa: a caller that **has** concluded is
+/// still right to say so, and a caller that has not is no longer forced to
+/// invent one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "intake", rename_all = "snake_case")]
+pub enum Intake {
+    /// The caller decided what the row is.
+    Concluded { operation: Box<SubmittedOperation> },
+    /// The caller reported what the source said and decided nothing.
+    Observed { row: Box<ObservedRow> },
+}
+
+impl Intake {
+    /// A stable key for the row, when the caller gave one.
+    #[must_use]
+    pub fn row_key(&self) -> Option<String> {
+        match self {
+            Self::Concluded { operation } => operation
+                .idempotency_key
+                .as_ref()
+                .map(|key| format!("idempotency/{key}")),
+            Self::Observed { row } => row.identity.key(),
+        }
+    }
+
+    /// Whether the caller submitted a conclusion.
+    #[must_use]
+    pub const fn is_concluded(&self) -> bool {
+        matches!(self, Self::Concluded { .. })
+    }
+}

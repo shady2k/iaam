@@ -80,6 +80,24 @@ typed_id!(
     ClassificationRuleId
 );
 typed_id!(
+    /// One import session: observations accumulated before anything is committed.
+    ///
+    /// Pre-journal state, and named separately from [`ImportId`] for that
+    /// reason. The import names rows that are already in the journal and is what
+    /// a retraction takes; the session names rows that are not in it yet and may
+    /// never be. Folding the two together would give a retraction a handle on
+    /// something that was never recorded.
+    ImportSessionId
+);
+typed_id!(
+    /// One question put to the owner about one observed row.
+    ///
+    /// A question needs an identity of its own because it outlives the response
+    /// that carried it: the answer arrives in a later request, possibly days
+    /// later, and must name the question it answers rather than restate it.
+    ImportQuestionId
+);
+typed_id!(
     /// Owner category group.
     CategoryGroupId
 );

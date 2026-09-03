@@ -5,8 +5,8 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::ids::{
-    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, OwnerId,
-    SourceId,
+    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, CustodyId, ImportId, ImportQuestionId,
+    ImportSessionId, InstrumentId, OwnerId, SourceId,
 };
 use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::Dimension;
@@ -410,6 +410,179 @@ pub trait Store: Send + Sync {
         route: String,
         outcome: String,
     ) -> Result<(), AppError>;
+
+    // --- Import sessions -------------------------------------------------
+    //
+    // Pre-journal state, and on this port rather than a port of its own. Two
+    // reasons, and the first is the architectural one: committing a session
+    // writes its events and closes the session, and two ports cannot do that
+    // against one connection — the store this port is implemented over
+    // serialises every read and write behind one mutex, and splitting the pair
+    // across two of them would put a window between them in which the facts are
+    // written and the session still looks open.
+    //
+    // The second is that a new field on `AppServices` has to be written into
+    // every struct literal that builds one, including test harnesses this change
+    // is not allowed to touch. A design that cannot be installed is the wrong
+    // design.
+
+    /// Open a session, or return the open one this import already has.
+    async fn open_import_session(
+        &self,
+        owner: OwnerId,
+        source: Option<SourceId>,
+        import: Option<ImportId>,
+    ) -> Result<ImportSessionView, AppError>;
+
+    /// One session of the owner's. `None` means it is not theirs or not there,
+    /// and the two are deliberately one answer (§14).
+    async fn load_import_session(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportSessionView>, AppError>;
+
+    /// Every session of the owner's, newest first.
+    ///
+    /// This is what makes a question outlive the response that carried it.
+    async fn list_import_sessions(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<ImportSessionView>, AppError>;
+
+    /// Add one submitted line, or return the row it already occupies.
+    async fn add_import_observation(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row_key: Option<String>,
+        concluded: bool,
+        payload: String,
+    ) -> Result<ImportObservationView, AppError>;
+
+    async fn list_import_observations(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ImportObservationView>, AppError>;
+
+    /// Record the question one row raises, or return the one it already raised.
+    async fn record_import_question(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row: u32,
+        asking: NewImportQuestion,
+    ) -> Result<ImportQuestionView, AppError>;
+
+    async fn list_import_questions(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ImportQuestionView>, AppError>;
+
+    /// Record the owner's answer on the question and on the row it is about.
+    async fn answer_import_question(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        answer: String,
+        rule: Option<String>,
+    ) -> Result<ImportQuestionView, AppError>;
+
+    /// Close a session, committed or abandoned.
+    async fn close_import_session(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        state: ImportSessionState,
+    ) -> Result<ImportSessionView, AppError>;
+}
+
+/// Where a session is in its life, in the port's vocabulary.
+///
+/// A separate enum rather than the store's, for the reason `Scope` is separate
+/// from `TokenScope`: the transport calls the port and must not know about the
+/// adapter. Conversion in both directions is an exhaustive `match`, so a fourth
+/// state breaks the build rather than silently reading as `Open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportSessionState {
+    Open,
+    Committed,
+    Abandoned,
+}
+
+impl ImportSessionState {
+    /// Wire code. One place, so two routes cannot spell it differently.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Committed => "committed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// A session in a form the transport can return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSessionView {
+    pub id: ImportSessionId,
+    pub state: ImportSessionState,
+    pub source: Option<SourceId>,
+    pub import: Option<ImportId>,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+}
+
+/// One submitted line held in a session.
+///
+/// `payload` is JSON the store keeps and this layer reads, exactly as a
+/// classification rule's matcher is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportObservationView {
+    pub row: u32,
+    pub row_key: Option<String>,
+    /// Whether the caller submitted a conclusion rather than an observation.
+    pub concluded: bool,
+    pub payload: String,
+    pub answer: Option<String>,
+}
+
+/// A question about to be written: its typed form, its alternatives, its wording.
+///
+/// The three travel together because they are one question. Passed separately
+/// they are three strings whose order a caller can get wrong, and two of them
+/// are JSON while the third is prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewImportQuestion {
+    pub question: String,
+    pub alternatives: String,
+    pub prompt: String,
+}
+
+/// One question put to the owner about one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportQuestionView {
+    pub id: ImportQuestionId,
+    pub session: ImportSessionId,
+    pub row: u32,
+    pub question: String,
+    pub alternatives: String,
+    pub prompt: String,
+    pub asked_at: String,
+    pub answered_at: Option<String>,
+    pub answer: Option<String>,
+    pub rule: Option<String>,
+}
+
+impl ImportQuestionView {
+    /// Whether the owner has answered it.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.answered_at.is_none()
+    }
 }
 /// Source response after applying the transport policy.
 ///

@@ -88,6 +88,15 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::get_contour))
         .routes(routes!(routes::add_contour_version))
         .routes(routes!(routes::ingest_operations))
+        .routes(routes!(
+            routes::open_import_session,
+            routes::list_import_sessions
+        ))
+        .routes(routes!(routes::get_import_session))
+        .routes(routes!(routes::add_import_rows))
+        .routes(routes!(routes::answer_import_question))
+        .routes(routes!(routes::commit_import_session))
+        .routes(routes!(routes::abandon_import_session))
         .routes(routes!(routes::ingest_journal_events))
         .routes(routes!(routes::ingest_csv))
         .routes(routes!(routes::list_journal_events))

@@ -684,6 +684,7 @@ mod tests {
                 .map(|row| PopulationAccount {
                     account: row.account,
                     title: format!("Account {}", row.account.inner()),
+                    institution: None,
                     standing: AccountStanding::Covered,
                 })
                 .collect(),
@@ -1073,6 +1074,7 @@ mod tests {
         report.population.accounts.push(PopulationAccount {
             account: account(11),
             title: "Elsewhere".into(),
+            institution: None,
             standing: AccountStanding::OutsideUndecided,
         });
         let snapshot = asset_snapshot(

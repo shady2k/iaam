@@ -398,6 +398,7 @@ mod tests {
                 .map(|(index, standing)| PopulationAccount {
                     account: account(index as u128 + 10),
                     title: format!("Account {index}"),
+                    institution: None,
                     standing: *standing,
                 })
                 .collect(),

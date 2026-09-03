@@ -20,22 +20,44 @@ use super::confidence::{Caveat, CaveatKind, CaveatSubject};
 /// standing is the second statement, made per account because that is the
 /// granularity at which the owner decides.
 ///
-/// The two outside variants are the distinction that makes the manifest worth
+/// The three outside variants are the distinction that makes the manifest worth
 /// having: "four accounts are outside this report and nobody has decided
 /// whether they belong" is a different sentence from "four accounts are outside
 /// this report on purpose", and a manifest that could not tell them apart would
 /// let the first be read as the second.
+///
+/// They are declared strongest ruling first, and they grade **what was said**
+/// rather than how far outside the account is. The middle one is why there are
+/// three and not two: for one wave, membership in another contour was the only
+/// evidence of a ruling this type could read, so it was published as the
+/// deliberate omission — and an owner who had ruled in as many words, with a
+/// reason, was told nobody had. Reading the disposition splits the two apart,
+/// and what is left in the middle claims exactly what it can prove: he decided
+/// where the account belongs; he did not say it does not belong here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountStanding {
     /// Inside the contour the report was folded over: this account's facts are
     /// in the answer.
     Covered,
-    /// Outside this report, and the owner has placed the account in a contour
-    /// of his own. Something has ruled on where it belongs.
+    /// Outside this report because the owner ruled the account outside every
+    /// contour of his and said why.
+    ///
+    /// The authoritative disposition, recorded per account and per owner
+    /// because it is a statement about the account that no single contour owns.
+    /// Nothing here is inferred, and there is nothing further to ask him: the
+    /// absence is answered, not open.
+    OutsideByDecision,
+    /// Outside this report, and some other contour of the owner's names the
+    /// account.
+    ///
+    /// He has ruled on where it belongs. He has **not** ruled that it does not
+    /// belong in this report, and this variant claims no more than that — which
+    /// is the whole of the difference between it and
+    /// [`Self::OutsideByDecision`].
     OutsidePlacedElsewhere,
-    /// Outside this report and in no contour at all. Nobody has ruled on
-    /// whether it belongs, so its absence is an open question and not a
-    /// decision.
+    /// Outside this report, in no contour at all, and carrying no disposition.
+    /// Nobody has ruled on whether it belongs, so its absence is an open
+    /// question and not a decision.
     OutsideUndecided,
 }
 
@@ -45,6 +67,7 @@ impl AccountStanding {
     pub const fn code(self) -> &'static str {
         match self {
             Self::Covered => "covered",
+            Self::OutsideByDecision => "outside_by_decision",
             Self::OutsidePlacedElsewhere => "outside_placed_elsewhere",
             Self::OutsideUndecided => "outside_undecided",
         }
@@ -62,11 +85,21 @@ impl AccountStanding {
 /// The title travels with the identifier because the manifest exists to be
 /// read: an owner asked to rule on an account cannot act on a bare UUID, and a
 /// caller that had to fetch the names separately would be free to render the
-/// manifest without them.
+/// manifest without them. `docs/api/conventions.md` §3 is that sentence made a
+/// rule for the whole API, and it cites this type as where the rule was first
+/// written down.
+///
+/// The institution follows for the case the title alone cannot settle: two
+/// accounts the owner calls the same word, at two banks, are one line apart in
+/// an `outside` list and are not the same question. `None` is "he has not said
+/// where it is held" and is never filled in — an invented institution would
+/// tell two accounts apart by a fiction, which is worse than not telling them
+/// apart at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PopulationAccount {
     pub account: AccountId,
     pub title: String,
+    pub institution: Option<String>,
     pub standing: AccountStanding,
 }
 
@@ -75,8 +108,9 @@ pub struct PopulationAccount {
 pub enum PopulationCompleteness {
     /// Every account the system knows of is inside the report.
     Whole,
-    /// Accounts are outside the report, and each of them is placed in a contour
-    /// the owner drew. The answer is partial by decision.
+    /// Accounts are outside the report, and the owner has ruled on every one of
+    /// them — each is either placed in a contour of his own or ruled outside
+    /// every contour with a reason. The answer is partial by decision.
     Bounded,
     /// Accounts are outside the report that no contour claims. The answer is
     /// partial, and nothing says the omission was meant — this is the state the
@@ -122,7 +156,7 @@ impl ReportPopulation {
             .filter(|entry| entry.standing == AccountStanding::Covered)
     }
 
-    /// The known accounts outside it, on a decision or otherwise.
+    /// The known accounts outside it, on a ruling or otherwise.
     pub fn outside(&self) -> impl Iterator<Item = &PopulationAccount> {
         self.accounts
             .iter()
@@ -141,6 +175,16 @@ impl ReportPopulation {
     /// `Undecided` outranks `Bounded`: one account nobody has ruled on is
     /// enough to make the report an answer about an undecided part of the
     /// owner's money, however many deliberate exclusions stand beside it.
+    ///
+    /// An account the owner ruled outside is `Bounded` and **not** `Whole`, and
+    /// the temptation to make it `Whole` is worth answering here. `Whole` is a
+    /// statement about the figures — every account the system knows of is in
+    /// them — and not a grade of the owner's housekeeping. Money he has ruled
+    /// out of every contour is still money the system knows he has, so a report
+    /// answering `whole` over it would tell a reader the figures cover
+    /// everything when they cover everything *he chose*. What his decision
+    /// changes is the sentence the reader is given — the standing, and the kind
+    /// of caveat — never whether he is given one.
     #[must_use]
     pub fn completeness(&self) -> PopulationCompleteness {
         if self.undecided().next().is_some() {
@@ -160,10 +204,18 @@ impl ReportPopulation {
     /// owner acts per account, and a caveat he cannot attach to an account is
     /// one he cannot act on.
     ///
-    /// The two outside standings keep their distinction here for the reason
-    /// [`AccountStanding`] draws it — a deliberate omission and an undecided
-    /// one are different sentences — and both are caveats, because both make
-    /// the figures an answer about part of the owner's money.
+    /// The three outside standings keep their distinction here for the reason
+    /// [`AccountStanding`] draws it — a ruling, a placement and an open
+    /// question are three different sentences — and all three are caveats,
+    /// because all three make the figures an answer about part of the owner's
+    /// money.
+    ///
+    /// Written as a `filter_map` over every account rather than a `map` over
+    /// [`Self::outside`] so that the match is exhaustive over the standings: a
+    /// fifth standing does not compile until somebody has said which line of
+    /// the register it produces, and the alternative — a catch-all arm — is
+    /// exactly how [`AccountStanding::OutsideByDecision`] would have been
+    /// silently reported as a placement elsewhere.
     ///
     /// This is exactly the complement of [`Self::completeness`]: empty if and
     /// only if the population is [`PopulationCompleteness::Whole`], which is
@@ -171,13 +223,16 @@ impl ReportPopulation {
     /// complete.
     #[must_use]
     pub fn caveats(&self) -> Vec<Caveat> {
-        self.outside()
-            .map(|entry| {
+        self.accounts
+            .iter()
+            .filter_map(|entry| {
                 let kind = match entry.standing {
+                    AccountStanding::Covered => return None,
+                    AccountStanding::OutsideByDecision => CaveatKind::AccountRuledOutside,
+                    AccountStanding::OutsidePlacedElsewhere => CaveatKind::AccountInAnotherScope,
                     AccountStanding::OutsideUndecided => CaveatKind::AccountInNoScope,
-                    _ => CaveatKind::AccountInAnotherScope,
                 };
-                Caveat::new(kind, CaveatSubject::Account(entry.account))
+                Some(Caveat::new(kind, CaveatSubject::Account(entry.account)))
             })
             .collect()
     }
@@ -198,6 +253,7 @@ mod tests {
                 .map(|(index, standing)| PopulationAccount {
                     account: AccountId(Uuid::from_u128(index as u128 + 10)),
                     title: format!("Account {index}"),
+                    institution: None,
                     standing: *standing,
                 })
                 .collect(),

@@ -380,17 +380,28 @@ counted.
 `population.completeness` is the summary:
 
 - `whole` — every account the system knows of is inside the report.
-- `bounded` — accounts are outside it, and each of them sits in a scope the
-  owner drew.
-- `undecided` — accounts are outside it that no scope claims at all.
+- `bounded` — accounts are outside it, and the owner has ruled on every one of
+  them.
+- `undecided` — accounts are outside it that he has not ruled on at all.
 
 **`undecided` is not a milder `bounded`.** "Four accounts are outside this report
 and nobody has decided whether they belong" is a different sentence from "four
 accounts are outside this report on purpose", and only the second makes the
 figures an answer about a boundary the owner chose. Each entry in
-`population.outside` carries the same distinction per account, as
-`outside_placed_elsewhere` or `outside_undecided`, with the account's title so
-the owner can be asked about it by name.
+`population.outside` carries the distinction per account, with the account's
+title and institution so the owner can be asked about it by name:
+
+- `outside_by_decision` — he ruled the account outside every scope and gave a
+  reason. Report it as a boundary he drew, and do not ask him again.
+- `outside_placed_elsewhere` — the account sits in another scope of his. He said
+  where it belongs; he did **not** say it does not belong here, so this is
+  weaker than the line above and must not be reported as the same thing.
+- `outside_undecided` — no scope claims it and he has ruled nothing. Nobody has
+  decided whether its money belongs in these figures.
+
+A deliberate exclusion never makes the population `whole`. `whole` says the
+figures cover every account the system knows of; money he ruled out is still
+money he has, and the honest report is "these figures cover the part he chose".
 
 So a report whose `population.completeness` is `undecided` is reported as what
 it is: an answer about part of the owner's money, with the undecided accounts

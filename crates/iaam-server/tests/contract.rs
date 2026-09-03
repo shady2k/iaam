@@ -10475,6 +10475,126 @@ async fn an_account_placed_in_another_scope_is_not_reported_as_undecided() {
     );
 }
 
+/// The owner rules an account outside, in as many words and with a reason, and
+/// the report stops calling it an account nobody has ruled on.
+///
+/// This is the promise `closed_by` makes for `account_in_no_scope`: the
+/// register names `record_account_scope` as one of the two calls that close it.
+/// It was published before the report read the disposition, so a caller could
+/// make the call, be answered `200`, fetch the report again and find the same
+/// caveat over its own ruling — a silent gap turned into a broken promise. The
+/// assertions below are the promise: the standing changes, the completeness
+/// changes, and the line that offered the call is gone.
+#[tokio::test]
+async fn an_account_the_owner_ruled_outside_stops_being_one_nobody_ruled_on() {
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let (status, reported) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reported}");
+    let contour_id = reported["contour"].as_str().expect("scope").to_owned();
+
+    let path = format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31");
+
+    // Before the ruling: nobody has decided, and the register says so and says
+    // which call would settle it.
+    let (status, before) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(
+        before["population"]["completeness"], "undecided",
+        "{before}"
+    );
+    assert!(
+        before["confidence"]["caveats"]
+            .as_array()
+            .expect("caveats")
+            .iter()
+            .any(|caveat| caveat["kind"] == "account_in_no_scope"),
+        "{before}"
+    );
+
+    let (status, ruled) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{savings}/scope"),
+            &harness.owner_token,
+            &json!({ "disposition": "outside", "reason": "held for somebody else" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ruled}");
+    assert_eq!(ruled["disposition"], "outside", "{ruled}");
+
+    let (status, after) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(
+        after["population"]["completeness"], "bounded",
+        "a ruling makes the omission deliberate: {after}"
+    );
+    let outside = after["population"]["outside"]
+        .as_array()
+        .expect("outside accounts");
+    assert_eq!(outside.len(), 1, "{after}");
+    assert_eq!(outside[0]["account"], savings, "{after}");
+    assert_eq!(outside[0]["standing"], "outside_by_decision", "{after}");
+    // Named and located: this is the list the owner is read back, and two
+    // accounts he calls one word are one line apart in it.
+    assert_eq!(outside[0]["title"], "Savings", "{after}");
+    assert_eq!(outside[0]["institution"], "Second Bank", "{after}");
+
+    let caveats = after["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .clone();
+    assert!(
+        !caveats
+            .iter()
+            .any(|caveat| caveat["kind"] == "account_in_no_scope"),
+        "the report still says nobody ruled on an account the owner ruled on: {after}"
+    );
+    let ruled_out = caveats
+        .iter()
+        .find(|caveat| caveat["kind"] == "account_ruled_outside")
+        .unwrap_or_else(|| panic!("no caveat about the account ruled outside: {after}"));
+    assert_eq!(
+        ruled_out["subject"],
+        json!({ "type": "account", "id": savings }),
+        "{ruled_out}"
+    );
+    assert_eq!(ruled_out["see"], "population.outside[]", "{ruled_out}");
+    // The figures are still partial — deliberately — so the caveat stands. What
+    // it must not do is offer him the call he has already made.
+    assert_eq!(
+        ruled_out["closed_by"],
+        json!([{
+            "operationId": "add_contour_version",
+            "method": "POST",
+            "path": "/v1/contours/{contour}/versions",
+            "requestSchema": "#/components/schemas/AddContourVersionRequest",
+        }]),
+        "{ruled_out}"
+    );
+}
+
 /// The returns report keeps every field it had, with the population beside
 /// them.
 ///

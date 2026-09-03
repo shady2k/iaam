@@ -154,17 +154,29 @@ impl MoneyFlowOutcome {
     }
 }
 
-/// The population, from the contour the fold was given and the accounts the
-/// system knows about.
+/// The population, from the contour the fold was given, the accounts the system
+/// knows about, and the two things that can put an account outside on purpose.
 ///
-/// `placed_elsewhere` is the set of accounts some contour of the owner claims.
-/// It is a parameter rather than a lookup here so that the decision this
-/// function makes — which of three standings an account has — can be tested
-/// without a store, and so that the store round-trips happen once per report.
+/// `placed_elsewhere` is the set of accounts some other contour of the owner
+/// claims. `ruled_outside` is the set he has ruled outside every contour of his
+/// through `record_account_scope`, with a reason. Both are parameters rather
+/// than lookups here so that the decision this function makes — which of four
+/// standings an account has — can be tested without a store, and so that the
+/// store round-trips happen once per report.
+///
+/// **Membership outranks a disposition.** Nothing clears an exclusion when an
+/// account is later added to a contour, so an account can carry both, and then
+/// the two disagree about whether the owner wants it reported. When they do,
+/// this reports the membership — which is what [`crate::actions::account_scope`]
+/// reports to the outstanding-work queue. The queue and the report reading one
+/// pair of facts in two different orders would be one question with two
+/// answers, and the reader would have no way to tell which of them the owner
+/// had actually said last.
 fn population_from(
     definition: &ContourDefinition,
     accounts: Vec<AccountView>,
     placed_elsewhere: &BTreeSet<AccountId>,
+    ruled_outside: &BTreeSet<AccountId>,
 ) -> ReportPopulation {
     let entries = accounts
         .into_iter()
@@ -173,12 +185,15 @@ fn population_from(
                 AccountStanding::Covered
             } else if placed_elsewhere.contains(&account.id) {
                 AccountStanding::OutsidePlacedElsewhere
+            } else if ruled_outside.contains(&account.id) {
+                AccountStanding::OutsideByDecision
             } else {
                 AccountStanding::OutsideUndecided
             };
             PopulationAccount {
                 account: account.id,
                 title: account.title,
+                institution: account.institution,
                 standing,
             }
         })
@@ -193,12 +208,18 @@ fn population_from(
 /// Every account claimed by a contour of this owner other than the one the
 /// report was computed over.
 ///
-/// Membership elsewhere is the strongest evidence available today that the
-/// owner has ruled on an account: he drew a contour and put it in one. It is
-/// **not** evidence that leaving it out of this report was intended — only that
-/// the account is not one the system has never been told anything about. The
-/// authoritative disposition is a separate notion (see `ReportPopulation`);
-/// when it exists, this derivation is what it replaces.
+/// Membership elsewhere is evidence that the owner has ruled on where an
+/// account belongs: he drew a contour and put it in one. It is **not** evidence
+/// that leaving it out of this report was intended — only that the account is
+/// not one the system has never been told anything about.
+///
+/// The authoritative disposition is a separate notion, and it did not replace
+/// this derivation when it arrived: the two answer different questions, so they
+/// stand beside each other as two of the four standings. This one says the
+/// account is somewhere; [`account_scope_exclusions`] says the owner wants it
+/// nowhere.
+///
+/// [`account_scope_exclusions`]: crate::ports::ReferenceStore::list_account_scope_exclusions
 ///
 /// Each contour is read at the version the store currently holds: the question
 /// is what the owner has decided by now, not what he had decided when the
@@ -240,7 +261,24 @@ async fn report_population(
     let accounts = services.store.list_accounts(principal.owner).await?;
     let placed_elsewhere =
         accounts_placed_elsewhere(services, principal, definition, &accounts).await?;
-    Ok(population_from(definition, accounts, &placed_elsewhere))
+    // The owner's own ruling, read rather than inferred. Before this read the
+    // report derived every standing from contour membership, so a disposition
+    // recorded in as many words changed nothing a reader of the report could
+    // see — while the register beside it went on naming the call that recorded
+    // it as the way to close the caveat.
+    let ruled_outside = services
+        .store
+        .list_account_scope_exclusions(principal.owner)
+        .await?
+        .into_iter()
+        .map(|exclusion| exclusion.account)
+        .collect();
+    Ok(population_from(
+        definition,
+        accounts,
+        &placed_elsewhere,
+        &ruled_outside,
+    ))
 }
 
 async fn resolve_contour(
@@ -1173,6 +1211,7 @@ async fn build_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iaam_core::operation::OperationKey;
     use iaam_core::projection::invariants::InvariantViolation;
     use time::macros::date;
 
@@ -1394,7 +1433,7 @@ mod tests {
         ];
         let placed: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
 
-        let population = population_from(&definition, accounts, &placed);
+        let population = population_from(&definition, accounts, &placed, &BTreeSet::new());
 
         assert_eq!(population.contour, definition.id());
         assert_eq!(population.version, ContourVersion(3));
@@ -1438,7 +1477,7 @@ mod tests {
             institution: None,
         }];
 
-        let population = population_from(&definition, accounts, &BTreeSet::new());
+        let population = population_from(&definition, accounts, &BTreeSet::new(), &BTreeSet::new());
 
         assert_eq!(population.outside().count(), 0);
         assert_eq!(population.completeness(), PopulationCompleteness::Whole);
@@ -1464,10 +1503,100 @@ mod tests {
         ];
         let placed: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
 
-        let population = population_from(&definition, accounts, &placed);
+        let population = population_from(&definition, accounts, &placed, &BTreeSet::new());
 
         assert_eq!(population.undecided().count(), 0);
         assert_eq!(population.completeness(), PopulationCompleteness::Bounded);
+    }
+
+    /// The bug this standing was added for. The owner ruled the account
+    /// outside, in as many words and with a reason; before the disposition was
+    /// read, the manifest still called it an account nobody had ruled on, and
+    /// the register beside it still offered him the call he had already made.
+    #[test]
+    fn an_account_the_owner_ruled_outside_is_not_reported_as_one_nobody_ruled_on() {
+        let inside = AccountId::new_random();
+        let ruled_out = AccountId::new_random();
+        let definition =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [inside]);
+        let accounts = vec![
+            AccountView {
+                id: inside,
+                title: "Main".to_owned(),
+                institution: None,
+            },
+            AccountView {
+                id: ruled_out,
+                title: "Savings".to_owned(),
+                institution: Some("Second Bank".to_owned()),
+            },
+        ];
+        let ruled_outside: BTreeSet<AccountId> = [ruled_out].into_iter().collect();
+
+        let population = population_from(&definition, accounts, &BTreeSet::new(), &ruled_outside);
+
+        assert_eq!(
+            population
+                .outside()
+                .map(|entry| (entry.account, entry.standing))
+                .collect::<Vec<_>>(),
+            vec![(ruled_out, AccountStanding::OutsideByDecision)]
+        );
+        assert_eq!(population.undecided().count(), 0);
+        assert_eq!(population.completeness(), PopulationCompleteness::Bounded);
+        // The name and the bank travel with the identifier: this is the list
+        // the owner is asked to rule on, and two accounts he calls one word are
+        // one line apart in it.
+        let entry = population.outside().next().expect("the ruled-out account");
+        assert_eq!(entry.title, "Savings");
+        assert_eq!(entry.institution.as_deref(), Some("Second Bank"));
+        // And the register no longer offers him the call he already made.
+        let kinds: Vec<_> = population
+            .caveats()
+            .iter()
+            .map(|caveat| caveat.kind())
+            .collect();
+        assert_eq!(kinds, vec![CaveatKind::AccountRuledOutside]);
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| kind.closed_by().contains(&OperationKey::RecordAccountScope)),
+            "the register still names the call the owner has already made"
+        );
+    }
+
+    /// Membership and a disposition can both be recorded for one account —
+    /// nothing clears the exclusion when the account joins a contour — and the
+    /// report must then say what the outstanding-work queue says.
+    #[test]
+    fn membership_outranks_a_disposition_the_owner_never_withdrew() {
+        let inside = AccountId::new_random();
+        let elsewhere = AccountId::new_random();
+        let definition =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [inside]);
+        let accounts = vec![
+            AccountView {
+                id: inside,
+                title: "Main".to_owned(),
+                institution: None,
+            },
+            AccountView {
+                id: elsewhere,
+                title: "Savings".to_owned(),
+                institution: None,
+            },
+        ];
+        let both: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
+
+        let population = population_from(&definition, accounts, &both, &both);
+
+        assert_eq!(
+            population
+                .outside()
+                .map(|entry| entry.standing)
+                .collect::<Vec<_>>(),
+            vec![AccountStanding::OutsidePlacedElsewhere]
+        );
     }
 
     #[test]
@@ -1476,12 +1605,14 @@ mod tests {
         // standings sharing a code is the defect with a manifest bolted on.
         let standings = [
             AccountStanding::Covered,
+            AccountStanding::OutsideByDecision,
             AccountStanding::OutsidePlacedElsewhere,
             AccountStanding::OutsideUndecided,
         ];
         let codes: BTreeSet<&str> = standings.iter().map(|standing| standing.code()).collect();
         assert_eq!(codes.len(), standings.len());
         assert!(!AccountStanding::Covered.is_outside());
+        assert!(AccountStanding::OutsideByDecision.is_outside());
         assert!(AccountStanding::OutsidePlacedElsewhere.is_outside());
         assert!(AccountStanding::OutsideUndecided.is_outside());
 

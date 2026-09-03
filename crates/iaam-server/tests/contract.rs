@@ -9104,3 +9104,191 @@ async fn every_documented_parameter_sits_where_the_route_reads_it() {
         wrong.join("\n")
     );
 }
+
+/// Two imports through one account and one channel are two imports.
+///
+/// The ordinary case: two months of the same account, exported the same way.
+/// Retracting the second must leave the first in force — a route published as
+/// «retract a whole import» that swept both would be a destructive operation
+/// keyed more coarsely than its own description.
+#[tokio::test]
+async fn two_labelled_imports_through_one_channel_retract_separately() {
+    let (harness, path) = harness_on_disk();
+    let account = harness.account.inner();
+
+    let import = |label: &str, key: &str, amount: &str, day: &str| {
+        json!({
+            "source": { "account": account, "channel": "file", "label": label },
+            "operations": [{
+                "account": account,
+                "type": "deposit",
+                "amount": amount,
+                "currency": "RUB",
+                "dates": { "cash_posted": day },
+                "idempotency_key": key
+            }]
+        })
+    };
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &import("statement-january", "import-jan-1", "100.00", "2026-01-05"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let january = first[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("the January fact");
+
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &import("statement-february", "import-feb-1", "200.00", "2026-02-05"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let february = second[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("the February fact");
+
+    let (status, corrected) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": {
+                    "account": account,
+                    "channel": "file",
+                    "label": "statement-february"
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{corrected}");
+    assert_eq!(
+        corrected["affected"], 1,
+        "only the February import was named: {corrected}"
+    );
+    assert_eq!(corrected["written"], 1, "{corrected}");
+
+    let reversed: std::collections::BTreeSet<Uuid> = journal_of(&path, harness.owner)
+        .iter()
+        .filter_map(|event| match event.relation {
+            iaam_core::event::Relation::Reversal { target } => Some(target.inner()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reversed.contains(&february),
+        "the named import was not retracted"
+    );
+    assert!(
+        !reversed.contains(&january),
+        "retracting one import retracted another one made through the same channel"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+/// A batch declares the account its rows belong to, and the rows must agree.
+///
+/// Otherwise rows for one account are recorded against it while carrying the
+/// import identity of another, and retracting that import reaches into an
+/// account the caller never named.
+#[tokio::test]
+async fn an_operation_disagreeing_with_the_declared_account_is_refused() {
+    let harness = harness();
+    let declared = harness.account.inner();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let other = created["id"]
+        .as_str()
+        .expect("account identifier")
+        .to_owned();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                    "source": { "account": declared, "channel": "file", "label": "statement" },
+                "operations": [{
+                    "account": other,
+                    "type": "deposit",
+                    "amount": "100.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-05" },
+                    "idempotency_key": "disagreeing-row"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+    assert_eq!(body["field"], "operations[0].account", "{body}");
+    assert_eq!(body["expected"], declared.to_string(), "{body}");
+    assert_eq!(body["actual"], other, "{body}");
+}
+
+/// The route says what it retracts, in the document an external agent reads.
+///
+/// The published description is the only account of the key an agent has: one
+/// that promised «a whole import» while retracting every import of an account
+/// and channel is how a destructive operation gets called on the wrong rows.
+#[tokio::test]
+async fn the_import_correction_publishes_the_key_it_actually_retracts_on() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = spec["paths"]["/v1/corrections/imports"]["post"]["description"]
+        .as_str()
+        .expect("the import correction route carries a description")
+        .to_owned();
+    for word in ["label", "without a label"] {
+        assert!(
+            described.contains(word),
+            "the description does not say what it retracts on ({word}): {described}"
+        );
+    }
+
+    let declared = &spec["components"]["schemas"]["DeclaredSourceDto"]["properties"];
+    for field in ["account", "channel", "label"] {
+        assert!(
+            declared[field].is_object(),
+            "a declared source no longer publishes {field}: {spec}"
+        );
+    }
+    // A field accepted and ignored is worse than one that is absent: the label
+    // that names an import now lives inside the declaration, and the old
+    // free-text one, which reached no production path, is gone.
+    assert!(
+        spec["components"]["schemas"]["SubmitOperationsRequest"]["properties"]["source_label"]
+            .is_null(),
+        "the ignored source_label is still published: {spec}"
+    );
+}

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::SourceId;
+use crate::ids::{ImportId, SourceId};
 
 /// Hash of the raw source record. A hexadecimal SHA-256 string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -78,6 +78,22 @@ pub struct Provenance {
     /// already recorded do not carry this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// The import this row arrived in, when the caller named one.
+    ///
+    /// Beside the source rather than inside it. The source is what
+    /// deduplication is scoped by — a source operation identifier is unique
+    /// within a source (§10.6) — so narrowing the source to one submission
+    /// would stop the same bank's identifiers being compared across two of its
+    /// own exports. Retraction needs the narrower handle, and it is this one.
+    ///
+    /// `None` means the submission named no import: rows ingested before this
+    /// field existed, and rows from channels that declare no source at all.
+    /// They are retracted as one unnamed group, which is what they are.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import: Option<ImportId>,
     row: Option<RowLocator>,
 }
 
@@ -95,6 +111,7 @@ impl Provenance {
             source_operation_id: None,
             source_category: None,
             description: None,
+            import: None,
             row: None,
         }
     }
@@ -118,6 +135,12 @@ impl Provenance {
     }
 
     #[must_use]
+    pub fn with_import(mut self, import: ImportId) -> Self {
+        self.import = Some(import);
+        self
+    }
+
+    #[must_use]
     pub fn with_row(mut self, row: RowLocator) -> Self {
         self.row = Some(row);
         self
@@ -126,6 +149,13 @@ impl Provenance {
     #[must_use]
     pub const fn source(&self) -> SourceId {
         self.source
+    }
+
+    /// The import this row arrived in, or `None` when the submission named
+    /// none. The key an import correction is decided by.
+    #[must_use]
+    pub const fn import(&self) -> Option<ImportId> {
+        self.import
     }
 
     #[must_use]

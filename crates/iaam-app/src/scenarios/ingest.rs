@@ -2,7 +2,7 @@
 
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::{Event, SCHEMA_VERSION};
-use iaam_core::ids::SourceId;
+use iaam_core::ids::{ImportId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{
@@ -26,10 +26,17 @@ use crate::ports::{Principal, Recorded};
 ///
 /// Parsing lives here, writing is below, in [`submit_candidates`]: the input
 /// for journal facts has its own parser, while the journal and its safeguards are shared.
+///
+/// `import` names the submission these rows arrived in, when the caller
+/// declared one. It is stamped after normalisation rather than carried in
+/// [`NormalizationContext`], because normalisation decides what a row *is* and
+/// the import decides nothing about that: it is the handle a later retraction
+/// is keyed on, and nothing in the shape of an event depends on it.
 pub async fn submit_operations(
     services: &AppServices,
     principal: &Principal,
     source: SourceId,
+    import: Option<ImportId>,
     operations: &[SubmittedOperation],
 ) -> Result<Vec<Verdict>, AppError> {
     let candidates = operations
@@ -42,7 +49,13 @@ pub async fn submit_operations(
                     source,
                 },
             )
-            .map(|normalized| normalized.event)
+            .map(|normalized| {
+                let mut event = normalized.event;
+                if let Some(import) = import {
+                    event.provenance = event.provenance.with_import(import);
+                }
+                event
+            })
         })
         .collect();
     submit_candidates(services, principal, "operation", candidates).await

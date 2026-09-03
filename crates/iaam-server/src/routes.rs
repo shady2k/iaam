@@ -22,7 +22,7 @@ use iaam_app::scenarios::categories::{
     list_category_rules, list_groups, preview_category_rule, retire_category,
 };
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
-use iaam_app::scenarios::correction::correct_events;
+use iaam_app::scenarios::correction::{ImportTarget, correct_events};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
 use iaam_app::scenarios::journal::{DeclaredSource, JournalReadQuery, read_journal};
@@ -40,7 +40,9 @@ use iaam_app::sync::{
 };
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::ids::{AccountId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, SourceId};
+use iaam_core::ids::{
+    AccountId, CategoryId, CategoryRuleId, CustodyId, ImportId, InstrumentId, SourceId,
+};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -488,15 +490,28 @@ pub async fn submit_corrections(
     ))
 }
 
-/// Retract a whole import, keyed on the source that was declared for it.
+/// Retract one import, keyed on the declaration that was made for it.
 ///
 /// The remedy for a month imported against the wrong account map: one request,
-/// and one reversal fact per event the import left effective. Nothing is deleted
-/// and nothing is mutated — the originals stay in the journal and stop counting,
-/// which is what §4.8 means by a correction.
+/// and one reversal fact per event that import left effective. Nothing is
+/// deleted and nothing is mutated — the originals stay in the journal and stop
+/// counting, which is what §4.8 means by a correction.
+///
+/// What it retracts, exactly: the rows of the account, channel **and label**
+/// named in the request. Other imports through the same account and channel,
+/// under other labels, are left in force. A request that names no label
+/// retracts instead every row of that account and channel which named no
+/// import — the rows recorded before an import could be named, and the only
+/// way to reach them.
 #[utoipa::path(
     post,
     path = "/v1/corrections/imports",
+    description = "Retract one import: the rows submitted under the account, \
+                   channel and label named here. Other imports through the same \
+                   account and channel, under other labels, keep counting. A \
+                   request without a label retracts every row of that account \
+                   and channel that named no import. One reversal fact per \
+                   retracted event; nothing is deleted and nothing is mutated.",
     request_body = CorrectImportRequest,
     responses(
         (status = 200, description = "What the correction retracted", body = ImportCorrectionDto),
@@ -518,11 +533,15 @@ pub async fn correct_import(
         invalid_field("body", "import correction JSON object", error.to_string())
     })?;
     let source = declared_source(principal.owner, &request.source)?;
+    let target = match declared_import(principal.owner, &request.source)? {
+        Some(import) => ImportTarget::Named { source, import },
+        None => ImportTarget::Unnamed { source },
+    };
     let outcome = iaam_app::scenarios::correction::correct_import(
         &state.services,
         &principal,
         request.acknowledge_retraction,
-        source,
+        target,
     )
     .await?;
     Ok(Json(ImportCorrectionDto::from_domain(outcome)))
@@ -1646,11 +1665,33 @@ pub async fn ingest_operations(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let source = match &request.source {
-        Some(declared) => declared_source(principal.owner, declared)?,
+    let (source, import) = match &request.source {
+        Some(declared) => (
+            declared_source(principal.owner, declared)?,
+            declared_import(principal.owner, declared)?,
+        ),
         // No declaration: today's behaviour, so existing callers keep working.
-        None => SourceId::new_random(),
+        None => (SourceId::new_random(), None),
     };
+
+    // The declaration says whose rows these are, and the rows must say the
+    // same. This is checked before anything is written and refuses the whole
+    // batch rather than the row, unlike an unreadable operation: an
+    // unreadable row is one row the caller got wrong, while a row for another
+    // account contradicts the declaration the caller made over all of them,
+    // and writing the agreeing half would leave a half-import recorded under
+    // an identity that names the wrong account.
+    if let Some(declared) = &request.source {
+        for (index, operation) in request.operations.iter().enumerate() {
+            if operation.account != declared.account {
+                return Err(invalid_field(
+                    format!("operations[{index}].account"),
+                    &declared.account.to_string(),
+                    operation.account.to_string(),
+                ));
+            }
+        }
+    }
 
     // Parsing the DTO yields a verdict for each row: one unrecognised operation
     // does not invalidate the others (§10.1).
@@ -1670,7 +1711,7 @@ pub async fn ingest_operations(
         .iter()
         .map(|(_, operation)| operation.clone())
         .collect();
-    let outcomes = submit_operations(&state.services, &principal, source, &domain).await?;
+    let outcomes = submit_operations(&state.services, &principal, source, import, &domain).await?;
     for ((row, _), verdict) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(VerdictDto::from_domain(*row, verdict));
     }
@@ -1766,12 +1807,16 @@ pub async fn ingest_csv(
         }
     }
 
+    // A CSV body declares no source, so it names no import either: its rows
+    // arrive under a source minted for this request alone, and
+    // `POST /v1/corrections/imports` cannot reach them. Declaring a source for
+    // this route is a separate change to its request shape.
     let source = SourceId::new_random();
     let domain: Vec<SubmittedOperation> = accepted
         .iter()
         .map(|(_, operation)| operation.clone())
         .collect();
-    let outcomes = submit_operations(&state.services, &principal, source, &domain).await?;
+    let outcomes = submit_operations(&state.services, &principal, source, None, &domain).await?;
     for ((row, _), verdict) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(VerdictDto::from_domain(*row, verdict));
     }
@@ -2371,16 +2416,12 @@ fn parse_as_of(value: Option<&str>) -> Result<Option<Date>, ApiFailure> {
     })
 }
 
-/// The source identity a declared source names, refused when it names none.
+/// The channel a declaration names, refused when it names none.
 ///
-/// Shared by ingestion and by the import correction on purpose: the correction
-/// is keyed on the very identity the import was written under, and two copies
-/// of this derivation would eventually disagree about which import a correction
-/// retracts.
-fn declared_source(
-    owner: iaam_core::ids::OwnerId,
-    declared: &DeclaredSourceDto,
-) -> Result<SourceId, ApiFailure> {
+/// Shared by every derivation below on purpose: the source and the import are
+/// both built from this text, and two copies of the bound would eventually
+/// admit a channel one derivation accepted and the other refused.
+fn declared_channel(declared: &DeclaredSourceDto) -> Result<&str, ApiFailure> {
     let channel = declared.channel.trim();
     if channel.is_empty() || channel.len() > 32 {
         return Err(ApiFailure::new(
@@ -2395,11 +2436,60 @@ fn declared_source(
             },
         ));
     }
+    Ok(channel)
+}
+
+/// The source identity a declared source names, refused when it names none.
+///
+/// Shared by ingestion and by the import correction on purpose: the correction
+/// reports the very source the import was written under, and two copies of this
+/// derivation would eventually disagree about it.
+///
+/// The label is deliberately **not** part of it. Deduplication is scoped by the
+/// source — a source operation identifier is unique within a source (§10.6) —
+/// so a source that narrowed to one submission would stop one bank's
+/// identifiers being compared across two of its own exports. What a retraction
+/// needs is [`declared_import`], beside this and not inside it.
+fn declared_source(
+    owner: iaam_core::ids::OwnerId,
+    declared: &DeclaredSourceDto,
+) -> Result<SourceId, ApiFailure> {
+    let channel = declared_channel(declared)?;
     Ok(SourceId::declared(
         owner,
         AccountId(declared.account),
         channel,
     ))
+}
+
+/// The import identity a declaration names, or `None` when it names no import.
+///
+/// The single place the import key is derived, used by ingestion to stamp rows
+/// and by the correction to find them again. Two copies of it would eventually
+/// disagree about which import a retraction takes, and a retraction that took
+/// the wrong rows cannot be undone by re-sending them.
+fn declared_import(
+    owner: iaam_core::ids::OwnerId,
+    declared: &DeclaredSourceDto,
+) -> Result<Option<ImportId>, ApiFailure> {
+    let channel = declared_channel(declared)?;
+    let Some(label) = declared.label.as_deref().map(str::trim) else {
+        return Ok(None);
+    };
+    if label.is_empty() || label.len() > 128 {
+        return Err(invalid_field(
+            "source.label",
+            "a label of 1 to 128 characters naming this import, such as a \
+             statement period or an export file name",
+            declared.label.clone().unwrap_or_default(),
+        ));
+    }
+    Ok(Some(ImportId::declared(
+        owner,
+        AccountId(declared.account),
+        channel,
+        label,
+    )))
 }
 
 fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {

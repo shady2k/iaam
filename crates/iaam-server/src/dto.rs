@@ -663,24 +663,39 @@ impl OperationDto {
     }
 }
 
-/// The source the caller declares for this batch.
+/// The source the caller declares for this batch, and the import within it.
 ///
 /// Without it the server mints a random source per request, and nothing
 /// deduplicates across requests: a corrected re-submission would add a second
 /// set of rows rather than replace the first (spec §6).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeclaredSourceDto {
-    /// Account the rows belong to.
+    /// Account the rows belong to. Every operation in the batch must name this
+    /// same account: the declaration says whose rows these are, and a row that
+    /// disagreed would be recorded against one account while carrying the
+    /// import identity of another.
     pub account: Uuid,
     /// How the rows arrived: `file`, `paste`, `manual`.
     pub channel: String,
+    /// What names this import within the account and channel — a statement
+    /// period, an export file name, a run identifier.
+    ///
+    /// Two submissions carrying the same label are one import: re-sending a
+    /// batch under its own label retracts and adds nothing. Two submissions
+    /// labelled differently are two imports, and
+    /// `POST /v1/corrections/imports` retracts exactly the one it names.
+    ///
+    /// Optional, and omitting it has a meaning rather than being a default:
+    /// the rows belong to no named import, and they are retracted together
+    /// with every other unnamed row of the same account and channel. Every
+    /// import worth retracting on its own should be labelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Intake request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitOperationsRequest {
-    /// Source label: manual input, a specific agent, a specific file.
-    pub source_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DeclaredSourceDto>,
     pub operations: Vec<OperationDto>,
@@ -730,23 +745,34 @@ pub struct SubmitCorrectionsRequest {
     pub corrections: Vec<CorrectionDto>,
 }
 
-/// Correct a whole import, keyed on the source the caller declared for it.
+/// Correct one import, keyed on the declaration the caller made for it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CorrectImportRequest {
     /// Acknowledge that the retracted facts stop counting in every report, and
     /// that re-submitting the same rows does not bring them back.
     #[serde(default)]
     pub acknowledge_retraction: bool,
-    /// The declared source of the import to retract — the same account and
-    /// channel that were submitted with it.
+    /// The declaration the import was submitted under — the same account,
+    /// channel and label.
+    ///
+    /// With the label, exactly that import is retracted and other imports
+    /// through the same account and channel are left in force. Without it,
+    /// what is retracted is every row of that account and channel that named
+    /// no import — which is what rows recorded before imports could be named
+    /// look like, and is the only way to reach them.
     pub source: DeclaredSourceDto,
 }
 
 /// Outcome of correcting one whole declared import.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 pub struct ImportCorrectionDto {
-    /// The source identity the correction was keyed on.
+    /// The source the retracted rows arrived through.
     pub source: Uuid,
+    /// The import identity the correction was keyed on. Absent when the
+    /// request named no label, in which case the unnamed rows of `source`
+    /// were the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<Uuid>,
     /// Effective events this import still had in the journal.
     pub affected: usize,
     /// Reversed by an earlier correction: a repeat run reports these and writes
@@ -780,6 +806,12 @@ impl ImportCorrectionDto {
     pub const fn from_domain(outcome: ImportCorrectionOutcome) -> Self {
         Self {
             source: outcome.source.inner(),
+            // `Option::map` is not a const function, and this conversion is
+            // worth keeping const beside its neighbours.
+            import: match outcome.import {
+                Some(import) => Some(import.inner()),
+                None => None,
+            },
             affected: outcome.affected,
             already_reversed: outcome.already_reversed,
             written: outcome.written,

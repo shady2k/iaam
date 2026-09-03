@@ -7534,24 +7534,32 @@ pub struct OpenImportSessionRequest {
     /// import identity when a `label` was given. What this buys is retraction as
     /// a unit: `POST /v1/corrections/imports`, given the same three fields,
     /// retracts exactly this import and leaves the account's other imports in
-    /// force. A labelled declaration also reaches the session it already
-    /// opened, rather than opening a second one holding half the answers —
-    /// **that reuse is keyed on the label**, so a declaration without one opens
-    /// a fresh session on every call.
+    /// force. A declaration also reaches the session it already opened rather
+    /// than opening a second one holding half the answers, and that recognition
+    /// is on the **whole** declaration: a declaration without a label used to be
+    /// recognised by nothing and opened a fresh session on every call, which
+    /// split one declaration's questions across as many sessions as calls
+    /// (iaam-zv54).
     ///
     /// **Absent** — a free session. Nothing scopes it to an account, and rows
     /// for several accounts sit in it together. This is the shape for an export
     /// that covers a whole institution: one session, questions answered once,
     /// one commit. Reading the account requirement on `DeclaredSourceDto` as a
     /// property of sessions is what turns such an export into four staged
-    /// imports, and it is not one.
+    /// imports, and it is not one. Two calls with no declaration open two
+    /// sessions, necessarily: there is nothing to recognise a free session by.
     ///
-    /// What a free session costs is the handle. Its rows are committed under a
-    /// source minted for the occasion, which is neither declared nor reported
-    /// back — the session's own `source` stays absent — and under no import at
-    /// all. `POST /v1/corrections/imports` keys on a declaration and so cannot
-    /// reach them: a free session's rows are corrected one event at a time
-    /// through `POST /v1/corrections`, having been found in the journal first.
+    /// A free session's rows are **also** retractable, since iaam-zv54. They
+    /// used to be committed under a source minted for the occasion, which was
+    /// neither declared nor reported back, so nothing could name them again;
+    /// they now carry a source and an import derived from what the caller
+    /// already holds — the account each row names, the channel `session`, and
+    /// the session's own identifier as the label. So
+    /// `POST /v1/corrections/imports` with
+    /// `{"account": <the account>, "channel": "session", "label": <session id>}`
+    /// retracts exactly what this session committed for that account. The
+    /// session's own `source` field still stays absent, and truthfully: the
+    /// session declared none, and the identity is a property of the rows.
     ///
     /// One thing a declaration does **not** buy: the session does not check that
     /// the rows fed to it name the declared account, and cannot. It stores the

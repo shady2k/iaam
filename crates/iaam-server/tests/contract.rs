@@ -13929,6 +13929,245 @@ async fn a_concluded_row_is_recorded_exactly_as_it_was_before_sessions_existed()
     );
 }
 
+/// A free session's rows are retractable as the import that session is.
+///
+/// iaam-zv54. `plan_session` stamped `SourceId::new_random()` on the rows of a
+/// session that declared no source, and the session's own `source` stayed
+/// absent, so nothing the caller held could name those rows again:
+/// `POST /v1/corrections/imports` is keyed on a declaration, and there was none
+/// to make. A free session's rows could be corrected only one event at a time,
+/// after finding them in the journal.
+///
+/// The identity is now derived from what the caller already holds — the account
+/// each row names, the channel `session`, and the session's own identifier as
+/// the label — so the retraction below is written the way a caller would write
+/// it, out of nothing but the account and the session identifier it was handed
+/// when it opened.
+#[tokio::test]
+async fn a_free_sessions_rows_are_retractable_as_the_import_the_session_is() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-02" },
+                    "idempotency_key": "free-session-1",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    // Read twice before committing. Committing plans the session again, so a
+    // provenance that depended on anything but the session and the row would
+    // differ between what the owner read and what was written — the defect that
+    // is invisible on the wire, because the assessment publishes no source.
+    let first = assessment_of(&harness, &session).await;
+    let second = assessment_of(&harness, &session).await;
+    assert_eq!(
+        first["facts"], second["facts"],
+        "two readings of one session must plan one import: {first}"
+    );
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let (status, retracted) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": {
+                    "account": account,
+                    "channel": "session",
+                    "label": session
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(
+        retracted["affected"], 1,
+        "the commit wrote the identity the caller can re-derive: {retracted}"
+    );
+    assert_eq!(retracted["written"], 1, "{retracted}");
+}
+
+/// Two free sessions are two imports, and one is retracted without the other.
+///
+/// The session identifier is the label because a session commits once, so one
+/// session is one import. Keying the whole thing on the account and channel
+/// alone would have made every free session of an account one undifferentiated
+/// group.
+#[tokio::test]
+async fn two_free_sessions_are_two_imports() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let mut sessions = Vec::new();
+    for (index, key) in ["free-a", "free-b"].into_iter().enumerate() {
+        let (status, opened) = call(
+            &harness.router,
+            post("/v1/import-sessions", &harness.owner_token, &json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{opened}");
+        let session = opened["session"].as_str().expect("session").to_owned();
+
+        let (status, rows) = call(
+            &harness.router,
+            post(
+                &format!("/v1/import-sessions/{session}/rows"),
+                &harness.owner_token,
+                &json!({
+                    "operations": [{
+                        "account": account,
+                        "type": "deposit",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": format!("2025-0{}-02", index + 4) },
+                        "idempotency_key": key,
+                    }],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+
+        let (status, committed) = call(
+            &harness.router,
+            post(
+                &format!("/v1/import-sessions/{session}/commit"),
+                &harness.owner_token,
+                &json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{committed}");
+        sessions.push(session);
+    }
+
+    let retract = |session: String| {
+        json!({
+            "acknowledge_retraction": true,
+            "source": { "account": account, "channel": "session", "label": session }
+        })
+    };
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &retract(sessions[0].clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["affected"], 1, "{first}");
+
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &retract(sessions[1].clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["source"], first["source"],
+        "one account and one channel are one source, whatever the session"
+    );
+    assert_eq!(
+        second["affected"], 1,
+        "retracting one free session must not have swept the other: {second}"
+    );
+}
+
+/// A declaration without a label reaches the session it already opened.
+///
+/// iaam-zv54, the second fact. Recognition was keyed on the import, which a
+/// declaration without a label does not name, so every call opened a fresh
+/// session — splitting one declaration's questions across as many sessions as
+/// the caller made calls, which is the exact failure the reuse exists to
+/// prevent.
+#[tokio::test]
+async fn a_declaration_without_a_label_reaches_the_session_it_already_opened() {
+    let harness = harness();
+    let declaration = json!({
+        "source": { "account": harness.account.inner(), "channel": "file" }
+    });
+
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+
+    let (status, again) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{again}");
+    assert_eq!(
+        again["session"], opened["session"],
+        "one declaration has one open session, label or no label: {again}"
+    );
+
+    // Declaring nothing at all is still a session of its own every time: there
+    // is nothing to recognise a free session by, and pretending otherwise would
+    // join two unrelated exports.
+    let (status, free) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{free}");
+    let (status, free_again) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{free_again}");
+    assert_ne!(
+        free["session"], free_again["session"],
+        "a free session is recognised by nothing: {free_again}"
+    );
+}
+
 /// Every schema the contract points at is a schema the contract defines.
 ///
 /// A `$ref` to a component that does not exist is a document a generator cannot

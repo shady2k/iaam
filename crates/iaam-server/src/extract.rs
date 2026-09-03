@@ -85,6 +85,47 @@ where
     }
 }
 
+/// A JSON body that may be absent, refused as `ApiError` when it is malformed.
+///
+/// For a route whose body carries nothing a caller is obliged to send. The
+/// alternative shapes were both wrong: a mandatory [`ApiJson`] refuses every
+/// caller that has nothing to say, and reading the body without checking its
+/// content type would let a revision sent as `text/plain` be dropped in silence
+/// — and dropping it skips the staleness check the field exists for.
+///
+/// So: an empty body is the default value, and a body that is present must be
+/// JSON and must parse.
+#[derive(Debug, Clone, Default)]
+pub struct ApiJsonOrDefault<T>(pub T);
+
+impl<T, S> FromRequest<S> for ApiJsonOrDefault<T>
+where
+    T: DeserializeOwned + Default,
+    S: Send + Sync,
+{
+    type Rejection = ApiFailure;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let json = is_json_content_type(request.headers());
+        let bytes = Bytes::from_request(request, state)
+            .await
+            .map_err(unreadable_body)?;
+        if bytes.is_empty() {
+            return Ok(Self(T::default()));
+        }
+        if !json {
+            return Err(unsupported_media_type());
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let value = serde_path_to_error::deserialize(&mut deserializer)
+            .map_err(|error| unreadable(Subject::BodyField, &error))?;
+        deserializer
+            .end()
+            .map_err(|_| malformed_body("the body carries content after the JSON document"))?;
+        Ok(Self(value))
+    }
+}
+
 /// A path parameter, refused as `ApiError`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApiPath<T>(pub T);

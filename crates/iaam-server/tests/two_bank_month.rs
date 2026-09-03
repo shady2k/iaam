@@ -730,14 +730,89 @@ async fn an_ambiguous_row_does_not_silently_become_a_deposit() {
 /// unrelated movements it makes the report count an external outflow and an
 /// external inflow that never happened — for a contour spanning both banks,
 /// wrong twice over.
+///
+/// The confirmation is part of the test, and it has to be: the system proposes
+/// the pair on its evidence and the owner relates it. Test 1 above imports the
+/// same month, confirms nothing, and asserts the two legs are still counted
+/// separately — so a build that related them by itself would fail that test.
+/// The two assertions are compatible only because the relating is an act.
 #[tokio::test]
-#[ignore = "iaam-3ul2: nothing relates two legs of one transfer, so both count as external"]
 async fn the_two_legs_of_the_cross_bank_transfer_can_be_related() {
     let harness = harness();
     let accounts = create_accounts(&harness).await;
     let contour = draw_contour(&harness, "Household", &accounts.all()).await;
     import_northline(&harness, accounts).await;
     import_southgate(&harness, accounts).await;
+
+    // The pair is proposed, with the evidence it rests on, and nothing else is.
+    let (status, proposals) = call(
+        &harness.router,
+        get("/v1/transfer-pairings", &harness.owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{proposals}");
+    let candidates = proposals["candidates"]
+        .as_array()
+        .expect("candidate pairs")
+        .clone();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "one pair, and it is the cross-bank transfer: {proposals}"
+    );
+    let candidate = &candidates[0];
+    assert_eq!(
+        candidate["evidence"]["amount"], CROSS_BANK_AMOUNT,
+        "{proposals}"
+    );
+    assert_eq!(candidate["evidence"]["days_apart"], 0, "{proposals}");
+    assert_eq!(candidate["evidence"]["sole_candidate"], true, "{proposals}");
+    assert_eq!(
+        candidate["outgoing"]["account"],
+        accounts.main.to_string(),
+        "{proposals}"
+    );
+    assert_eq!(
+        candidate["incoming"]["account"],
+        accounts.everyday.to_string(),
+        "{proposals}"
+    );
+    // The month's other one-sided movements are reported as unmatched rather
+    // than dropped: a leg that vanished from the answer is a leg the owner reads
+    // as external flow by default.
+    let unmatched = proposals["unmatched"].as_array().expect("unmatched legs");
+    assert_eq!(
+        unmatched.len(),
+        2,
+        "the pay and the expense pair with nothing: {proposals}"
+    );
+
+    // Nothing is related until the owner says so.
+    let untouched = flow_report(&harness, &contour).await;
+    assert_eq!(
+        rub(&untouched)["came_in"],
+        "52000.00",
+        "a proposal is not a decision: {untouched}"
+    );
+
+    let (status, confirmed) = call(
+        &harness.router,
+        post(
+            "/v1/transfer-pairings",
+            &harness.owner_token,
+            &json!({
+                "outgoing": candidate["outgoing"]["event"],
+                "incoming": candidate["incoming"]["event"],
+                "acknowledge_retraction": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    assert!(
+        confirmed["transfer"].is_string(),
+        "the confirmation records one transfer: {confirmed}"
+    );
 
     let report = flow_report(&harness, &contour).await;
     let rub = rub(&report);

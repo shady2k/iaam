@@ -11531,3 +11531,450 @@ async fn open_question_items(harness: &Harness) -> Vec<Value> {
         .cloned()
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// The assessment, and the revision commit checks (iaam-k1xa)
+// ---------------------------------------------------------------------------
+
+/// An import says what it will and will not record, before it records it.
+///
+/// The defect: an import committed before anything said what it would do. Rows
+/// came back with positive verdicts and part of them were absent from the report
+/// the owner was shown, and no step in between had ever stated the difference.
+///
+/// What is asserted is the assessment's substance, not merely that a route
+/// answers: the row that is settled appears among the facts to be written, the
+/// row that is not appears as retained and unrecorded, the account's scope
+/// disposition is named, and the readiness says whose decision is outstanding.
+#[tokio::test]
+async fn an_assessment_says_what_the_import_will_and_will_not_record() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+    let before = journal_rows(&harness).await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "assessed" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    {
+                        "account": account,
+                        "type": "withdrawal",
+                        "amount": "1500.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-20" },
+                        "description": "Shop One",
+                        "idempotency_key": "assessed-spend",
+                    },
+                    unresolved_row(account, "assessed-inner"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+
+    assert_eq!(plan["source_inventory"]["rows"], 2, "{plan}");
+    assert_eq!(
+        plan["source_inventory"]["accounts"]
+            .as_array()
+            .expect("accounts"),
+        &vec![json!(account.to_string())],
+        "{plan}"
+    );
+    assert_eq!(
+        plan["account_resolution"]["missing"],
+        json!([]),
+        "both rows are on an account the owner holds: {plan}"
+    );
+    // The account sits in no contour, and the assessment says so rather than
+    // recording rows that will appear in no report.
+    assert_eq!(
+        plan["scope_assessment"]["awaiting_disposition"]
+            .as_array()
+            .expect("awaiting disposition")
+            .len(),
+        1,
+        "{plan}"
+    );
+
+    let facts = plan["commit_delta"]["facts"].as_array().expect("facts");
+    assert_eq!(facts.len(), 1, "one row can be written: {plan}");
+    assert_eq!(facts[0]["records_as"], "cash_out", "{plan}");
+    assert_eq!(facts[0]["amount"], "-1500.00", "{plan}");
+    assert_eq!(facts[0]["idempotency_key"], "assessed-spend", "{plan}");
+
+    let retained = plan["commit_delta"]["retained_unrecorded"]
+        .as_array()
+        .expect("retained rows");
+    assert_eq!(retained.len(), 1, "one row cannot be written yet: {plan}");
+    assert_eq!(retained[0]["reason"], "unanswered", "{plan}");
+    assert_eq!(
+        plan["interpretation"]["open_questions"]
+            .as_array()
+            .expect("open questions")
+            .len(),
+        1,
+        "{plan}"
+    );
+    assert_eq!(plan["readiness"], "requires_owner_decision", "{plan}");
+
+    // Reading the assessment wrote nothing, which is the other half of the
+    // property: it is a plan, and a plan is not an import.
+    assert_eq!(journal_rows(&harness).await, before, "{plan}");
+
+    // And it is the code that commits: answer the question, commit against the
+    // revision the assessment now stamps, and both rows are recorded.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let question = contents["questions"].as_array().expect("questions")[0]["question"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    let (status, replanned) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replanned}");
+    assert_eq!(replanned["readiness"], "ready", "{replanned}");
+    assert_eq!(
+        replanned["commit_delta"]["facts"]
+            .as_array()
+            .expect("facts")
+            .len(),
+        2,
+        "{replanned}"
+    );
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({ "revision": replanned["revision"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(
+        committed["revision"], replanned["revision"],
+        "commit reports the reading it wrote under: {committed}"
+    );
+    assert_eq!(
+        journal_rows(&harness).await,
+        before + 2,
+        "the commit wrote exactly what the assessment said it would"
+    );
+}
+
+/// A commit against a reading the session no longer answers to is refused.
+///
+/// The revision is stale when what the plan describes has changed — here by a
+/// row arriving after the assessment was read. Committing anyway would write
+/// something other than what the caller approved, which is the whole defect in
+/// miniature.
+#[tokio::test]
+async fn a_commit_against_a_stale_revision_is_refused() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let before = journal_rows(&harness).await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "stale" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let spend = |key: &str, amount: &str| {
+        json!({
+            "account": account,
+            "type": "withdrawal",
+            "amount": amount,
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-03-20" },
+            "idempotency_key": key,
+        })
+    };
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [spend("stale-one", "1500.00")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    let read = plan["revision"].as_str().expect("revision").to_owned();
+
+    // A second row arrives after the reading. What would be committed is no
+    // longer what was read.
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [spend("stale-two", "700.00")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({ "revision": read }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "revision", "{refused}");
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "a refused commit writes nothing"
+    );
+
+    // Reading again and committing against that reading works, and writes both.
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_ne!(
+        plan["revision"].as_str().expect("revision"),
+        read,
+        "a session that changed carries a different revision: {plan}"
+    );
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({ "revision": plan["revision"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(journal_rows(&harness).await, before + 2, "{committed}");
+}
+
+/// Two legs of one transfer are proposed, never merged, and relate on the
+/// owner's word (iaam-3ul2).
+///
+/// The refusals are the substance. A pair the system does not propose cannot be
+/// confirmed — otherwise the route would relate any outflow to any inflow, which
+/// is the fabrication the proposal exists to prevent with the owner's name on it
+/// — and a confirmation that does not acknowledge the retraction is refused like
+/// every other correction, because two movements the owner has already seen
+/// stop counting.
+#[tokio::test]
+async fn a_transfer_pairing_is_proposed_with_its_evidence_and_never_confirmed_blindly() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let elsewhere = another_account(&harness, "Elsewhere").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "near" },
+                "operations": [{
+                    "account": account,
+                    "type": "withdrawal",
+                    "amount": "12000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-15" },
+                    "description": "Transfer out",
+                    "idempotency_key": "pairing-out",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let outgoing = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": elsewhere, "channel": "file", "label": "far" },
+                "operations": [{
+                    "account": elsewhere,
+                    "type": "deposit",
+                    "amount": "12000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-16" },
+                    "description": "Transfer in",
+                    "idempotency_key": "pairing-in",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let incoming = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    let (status, proposals) = call(
+        &harness.router,
+        get("/v1/transfer-pairings", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{proposals}");
+    let candidates = proposals["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1, "{proposals}");
+    let evidence = &candidates[0]["evidence"];
+    assert_eq!(evidence["amount"], "12000.00", "{proposals}");
+    assert_eq!(evidence["days_apart"], 1, "{proposals}");
+    assert_eq!(
+        evidence["outgoing_reference"], "Transfer out",
+        "{proposals}"
+    );
+    assert_eq!(evidence["incoming_reference"], "Transfer in", "{proposals}");
+    assert_eq!(evidence["sole_candidate"], true, "{proposals}");
+
+    // A pair nothing proposed cannot be confirmed: the two identifiers here are
+    // the same event, and no candidate relates an event to itself.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/transfer-pairings",
+            &harness.owner_token,
+            &json!({
+                "outgoing": outgoing,
+                "incoming": outgoing,
+                "acknowledge_retraction": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+
+    // Nor is it confirmed without acknowledging what stops counting.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/transfer-pairings",
+            &harness.owner_token,
+            &json!({ "outgoing": outgoing, "incoming": incoming }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "acknowledge_retraction", "{refused}");
+
+    let (status, confirmed) = call(
+        &harness.router,
+        post(
+            "/v1/transfer-pairings",
+            &harness.owner_token,
+            &json!({
+                "outgoing": outgoing,
+                "incoming": incoming,
+                "acknowledge_retraction": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    assert!(confirmed["transfer"].is_string(), "{confirmed}");
+
+    // And the pair is gone from the proposals: both legs are accounted for by
+    // the transfer, so neither is half of anything any more.
+    let (status, proposals) = call(
+        &harness.router,
+        get("/v1/transfer-pairings", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{proposals}");
+    assert!(
+        proposals["candidates"]
+            .as_array()
+            .expect("candidates")
+            .is_empty(),
+        "{proposals}"
+    );
+    assert!(
+        proposals["unmatched"]
+            .as_array()
+            .expect("unmatched")
+            .is_empty(),
+        "{proposals}"
+    );
+}

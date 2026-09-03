@@ -8,7 +8,7 @@
 //! numbers: the JSON number `0.1` in binary floating point is not equal to one
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
-use iaam_app::ingest::classification::{Answer, AnswerShape};
+use iaam_app::ingest::classification::{Answer, AnswerShape, Movement};
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::observation::{
     Intake, ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity,
@@ -23,11 +23,14 @@ use iaam_app::ports::{ImportQuestionView, ImportSessionView};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::classification::{ClassifiedAs, PlannedCorrection, RuleChange};
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
-use iaam_app::scenarios::import_session::HeldRow;
+use iaam_app::scenarios::import_session::{
+    HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow, RetentionReason,
+};
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, BalancesReport, MoneyFlowReport, PopulationAccount, ReportPopulation,
     ReturnsOutcome,
 };
+use iaam_app::scenarios::transfer_pairing::{ConfirmedPairing, LegOrigin, Proposals, TransferLeg};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -6196,6 +6199,9 @@ impl AnswerImportQuestionRequest {
 pub struct ImportCommitDto {
     #[serde(flatten)]
     pub session: ImportSessionDto,
+    /// The reading of the session this commit was planned from. A caller that
+    /// sent one has it echoed; a caller that sent none learns what it wrote.
+    pub revision: String,
     /// A verdict per held row, in the order the rows were fed.
     pub rows: Vec<VerdictDto>,
 }
@@ -6269,4 +6275,475 @@ impl ImportRowDto {
             },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The import assessment (iaam-k1xa) and transfer pairing (iaam-3ul2)
+// ---------------------------------------------------------------------------
+
+/// Commit a session, optionally against the reading the caller approved.
+///
+/// `revision` is the stamp the assessment carried. Sent, a commit whose plan no
+/// longer matches it is refused: the rows, the answers or the owner's directory
+/// changed between the reading and the writing, so what would be recorded is not
+/// what was approved. Omitted, the commit proceeds and the answer says which
+/// revision it wrote under.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CommitImportSessionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+/// What an import will and will not record.
+///
+/// Seven sections, and they are separate because their answers can disagree: a
+/// row can be interpretable and on an account no contour covers, or resolved and
+/// already in the journal under its key.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportPlanDto {
+    #[serde(flatten)]
+    pub session: ImportSessionDto,
+    /// The stamp to send back to the commit route.
+    pub revision: String,
+    pub source_inventory: SourceInventoryDto,
+    pub account_resolution: AccountResolutionDto,
+    pub scope_assessment: ScopeAssessmentDto,
+    pub interpretation: InterpretationDto,
+    pub cross_source_matching: CrossSourceMatchingDto,
+    pub commit_delta: CommitDeltaDto,
+    /// `ready`, `blocked` or `requires_owner_decision`.
+    pub readiness: String,
+    /// Why, for `blocked` and `requires_owner_decision`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_detail: Option<String>,
+}
+
+/// What the session's rows turned out to name.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SourceInventoryDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<Uuid>,
+    pub documents: Vec<String>,
+    pub rows: usize,
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub period_from: Option<Date>,
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub period_to: Option<Date>,
+    pub accounts: Vec<Uuid>,
+}
+
+/// What the rows' accounts resolved to.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountResolutionDto {
+    pub resolved: Vec<Uuid>,
+    /// Named by a row and absent from the owner's directory.
+    pub missing: Vec<Uuid>,
+    /// Counterparty strings naming more than one of the owner's accounts.
+    pub conflicting: Vec<String>,
+}
+
+/// Where the rows' accounts stand relative to the reporting perimeter.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScopeAssessmentDto {
+    pub in_contour: Vec<Uuid>,
+    pub explicitly_outside: Vec<Uuid>,
+    pub awaiting_disposition: Vec<Uuid>,
+}
+
+/// What each row was read as, and what is still unread.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InterpretationDto {
+    pub resolved: Vec<PlannedFactDto>,
+    pub open_questions: Vec<OpenQuestionDto>,
+}
+
+/// One question the session is waiting on.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OpenQuestionDto {
+    pub row: u32,
+    pub question: Uuid,
+    pub prompt: String,
+}
+
+/// One fact the commit would write.
+///
+/// No event identifier: it is minted at commit, and naming one here would name a
+/// fact that does not exist.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlannedFactDto {
+    pub row: u32,
+    pub account: Uuid,
+    /// The event kind, in the journal's own vocabulary.
+    pub records_as: String,
+    /// Signed cash this row moves on its own account, as a decimal string.
+    pub amount: String,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub date: Option<Date>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// What the journal gains, and what it does not.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CommitDeltaDto {
+    pub facts: Vec<PlannedFactDto>,
+    /// Rows whose key the journal already holds. They commit to `duplicate` and
+    /// add nothing.
+    pub duplicates: Vec<PlannedFactDto>,
+    /// Rows the session keeps and the journal will not receive.
+    pub retained_unrecorded: Vec<RetainedRowDto>,
+}
+
+/// A row that stays in the session and becomes no fact.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RetainedRowDto {
+    pub row: u32,
+    /// `unreadable` or `unanswered`.
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+}
+
+/// Transfers proposed out of two one-sided movements, and the legs nothing
+/// paired with.
+///
+/// Both halves are published. A leg that vanished from the answer because
+/// nothing matched it is a leg the owner reads as an external flow by default,
+/// which is the defect rather than the fix.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CrossSourceMatchingDto {
+    pub candidates: Vec<PairingCandidateDto>,
+    pub unmatched: Vec<TransferLegDto>,
+}
+
+/// One side of a movement that may be half of a transfer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TransferLegDto {
+    /// The journal event, when the leg is already recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<Uuid>,
+    /// The session and row, when the leg is still an observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row: Option<u32>,
+    pub account: Uuid,
+    /// `in` or `out`.
+    pub direction: String,
+    pub amount: String,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub date: Date,
+    /// What the source printed beside the row. Evidence, never matched on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<Uuid>,
+}
+
+/// Two legs proposed as one movement, and what the proposal rests on.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PairingCandidateDto {
+    pub outgoing: TransferLegDto,
+    pub incoming: TransferLegDto,
+    pub evidence: PairingEvidenceDto,
+}
+
+/// What the two legs agree on.
+///
+/// The fields, not a score: a confidence number would be an opinion the owner
+/// cannot check, and these are checkable.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PairingEvidenceDto {
+    pub amount: String,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub outgoing_date: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub incoming_date: Date,
+    pub days_apart: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outgoing_reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incoming_reference: Option<String>,
+    /// Whether each leg has exactly this one counterpart. `false` means the
+    /// candidates cannot all be true.
+    pub sole_candidate: bool,
+}
+
+/// The owner relating two recorded legs.
+///
+/// `acknowledge_retraction` is required for the same reason every correction
+/// requires it: confirming stops both one-sided movements counting, in reports
+/// the owner has already read.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConfirmTransferPairingRequest {
+    pub outgoing: Uuid,
+    pub incoming: Uuid,
+    #[serde(default)]
+    pub acknowledge_retraction: bool,
+}
+
+/// What confirming one pairing wrote.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConfirmedPairingDto {
+    pub outgoing: Uuid,
+    pub incoming: Uuid,
+    /// The transfer that supersedes the outgoing leg. Absent when the journal
+    /// already held it, which is what confirming one pairing twice looks like.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<Uuid>,
+}
+
+impl ImportPlanDto {
+    #[must_use]
+    pub fn from_domain(plan: &ImportPlan) -> Self {
+        let (readiness_detail, readiness) = match &plan.readiness {
+            Readiness::Ready => (None, plan.readiness.code()),
+            Readiness::Blocked { reason } => (Some(reason.clone()), plan.readiness.code()),
+            Readiness::RequiresOwnerDecision {
+                unanswered_questions,
+                transfer_candidates,
+            } => (
+                Some(format!(
+                    "{unanswered_questions} question(s) unanswered, \
+                     {transfer_candidates} transfer candidate(s) unconfirmed"
+                )),
+                plan.readiness.code(),
+            ),
+        };
+        Self {
+            session: ImportSessionDto::from_domain(&plan.session),
+            revision: plan.revision.0.clone(),
+            source_inventory: SourceInventoryDto {
+                source: plan.source_inventory.source.map(|id| id.inner()),
+                import: plan.source_inventory.import.map(|id| id.inner()),
+                documents: plan.source_inventory.documents.clone(),
+                rows: plan.source_inventory.rows,
+                period_from: plan.source_inventory.period.map(|(from, _)| from),
+                period_to: plan.source_inventory.period.map(|(_, to)| to),
+                accounts: plan
+                    .source_inventory
+                    .accounts
+                    .iter()
+                    .map(|id| id.inner())
+                    .collect(),
+            },
+            account_resolution: AccountResolutionDto {
+                resolved: plan
+                    .account_resolution
+                    .resolved
+                    .iter()
+                    .map(|id| id.inner())
+                    .collect(),
+                missing: plan
+                    .account_resolution
+                    .missing
+                    .iter()
+                    .map(|id| id.inner())
+                    .collect(),
+                conflicting: plan.account_resolution.conflicting.clone(),
+            },
+            scope_assessment: ScopeAssessmentDto {
+                in_contour: plan
+                    .scope_assessment
+                    .in_contour
+                    .iter()
+                    .map(|id| id.inner())
+                    .collect(),
+                explicitly_outside: plan
+                    .scope_assessment
+                    .explicitly_outside
+                    .iter()
+                    .map(|id| id.inner())
+                    .collect(),
+                awaiting_disposition: plan
+                    .scope_assessment
+                    .awaiting_disposition
+                    .iter()
+                    .map(|id| id.inner())
+                    .collect(),
+            },
+            interpretation: InterpretationDto {
+                resolved: plan
+                    .interpretation
+                    .resolved
+                    .iter()
+                    .map(PlannedFactDto::from_domain)
+                    .collect(),
+                open_questions: plan
+                    .interpretation
+                    .open_questions
+                    .iter()
+                    .map(|open| OpenQuestionDto {
+                        row: open.row,
+                        question: open.question.inner(),
+                        prompt: open.prompt.clone(),
+                    })
+                    .collect(),
+            },
+            cross_source_matching: CrossSourceMatchingDto::from_domain(&plan.cross_source_matching),
+            commit_delta: CommitDeltaDto {
+                facts: plan
+                    .commit_delta
+                    .facts
+                    .iter()
+                    .map(PlannedFactDto::from_domain)
+                    .collect(),
+                duplicates: plan
+                    .commit_delta
+                    .duplicates
+                    .iter()
+                    .map(PlannedFactDto::from_domain)
+                    .collect(),
+                retained_unrecorded: plan
+                    .commit_delta
+                    .retained_unrecorded
+                    .iter()
+                    .map(RetainedRowDto::from_domain)
+                    .collect(),
+            },
+            readiness: readiness.to_owned(),
+            readiness_detail,
+        }
+    }
+}
+
+impl PlannedFactDto {
+    #[must_use]
+    pub fn from_domain(fact: &PlannedFact) -> Self {
+        Self {
+            row: fact.row,
+            account: fact.account.inner(),
+            records_as: fact.records_as.to_owned(),
+            amount: minor_amount(fact.amount_minor, fact.currency),
+            currency: CurrencyDto::from_domain(fact.currency),
+            date: fact.date,
+            idempotency_key: fact.idempotency_key.clone(),
+        }
+    }
+}
+
+impl RetainedRowDto {
+    #[must_use]
+    pub fn from_domain(retained: &RetainedRow) -> Self {
+        match &retained.reason {
+            RetentionReason::Unreadable {
+                field,
+                expected,
+                actual,
+            } => Self {
+                row: retained.row,
+                reason: "unreadable".to_owned(),
+                question: None,
+                field: Some(field.clone()),
+                expected: Some(expected.clone()),
+                actual: Some(actual.clone()),
+            },
+            RetentionReason::Unanswered { question } => Self {
+                row: retained.row,
+                reason: "unanswered".to_owned(),
+                question: Some(question.inner()),
+                field: None,
+                expected: None,
+                actual: None,
+            },
+        }
+    }
+}
+
+impl CrossSourceMatchingDto {
+    #[must_use]
+    pub fn from_domain(proposals: &Proposals) -> Self {
+        Self {
+            candidates: proposals
+                .candidates
+                .iter()
+                .map(|candidate| PairingCandidateDto {
+                    outgoing: TransferLegDto::from_domain(&candidate.outgoing),
+                    incoming: TransferLegDto::from_domain(&candidate.incoming),
+                    evidence: PairingEvidenceDto {
+                        amount: minor_amount(
+                            candidate.evidence.amount_minor,
+                            candidate.evidence.currency,
+                        ),
+                        currency: CurrencyDto::from_domain(candidate.evidence.currency),
+                        outgoing_date: candidate.evidence.outgoing_date,
+                        incoming_date: candidate.evidence.incoming_date,
+                        days_apart: candidate.evidence.days_apart,
+                        outgoing_reference: candidate.evidence.outgoing_reference.clone(),
+                        incoming_reference: candidate.evidence.incoming_reference.clone(),
+                        sole_candidate: candidate.evidence.sole_candidate,
+                    },
+                })
+                .collect(),
+            unmatched: proposals
+                .unmatched
+                .iter()
+                .map(TransferLegDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+impl TransferLegDto {
+    #[must_use]
+    pub fn from_domain(leg: &TransferLeg) -> Self {
+        let (event, session, row) = match leg.origin {
+            LegOrigin::Recorded { event } => (Some(event.inner()), None, None),
+            LegOrigin::Observed { session, row } => (None, Some(session.inner()), Some(row)),
+        };
+        Self {
+            event,
+            session,
+            row,
+            account: leg.account.inner(),
+            direction: match leg.direction {
+                Movement::In => "in".to_owned(),
+                Movement::Out => "out".to_owned(),
+            },
+            amount: minor_amount(leg.amount_minor, leg.currency),
+            currency: CurrencyDto::from_domain(leg.currency),
+            date: leg.date,
+            reference: leg.reference.clone(),
+            import: leg.import.map(|id| id.inner()),
+        }
+    }
+}
+
+impl ConfirmedPairingDto {
+    #[must_use]
+    pub fn from_domain(confirmed: &ConfirmedPairing) -> Self {
+        Self {
+            outgoing: confirmed.outgoing.inner(),
+            incoming: confirmed.incoming.inner(),
+            transfer: confirmed.transfer.map(|id| id.inner()),
+        }
+    }
+}
+
+/// An amount in minor units as the decimal string this API publishes.
+///
+/// The same rendering every other amount uses: a JSON number would stop being
+/// the fact it states, because `0.1` is not one tenth in binary floating point.
+fn minor_amount(minor: i64, currency: CurrencyCode) -> String {
+    Money::new(PostedMinor::new(minor), currency)
+        .to_calc_dec()
+        .inner()
+        .to_string()
 }

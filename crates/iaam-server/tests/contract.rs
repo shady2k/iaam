@@ -35,6 +35,7 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::{DateCertainty, EventKind};
 use iaam_core::event::provenance::ParserVersion;
+use iaam_core::goal::ReportGoal;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
@@ -42,7 +43,7 @@ use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
-use iaam_core::report::confidence::{CaveatKind, ReportGoal};
+use iaam_core::report::confidence::CaveatKind;
 use iaam_core::returns::{
     KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
 };

@@ -156,55 +156,45 @@ impl ActionKind {
     }
 }
 
-/// One report the owner is trying to reach.
-///
-/// The four are the whole vocabulary, and they are the four report scenarios
-/// this workspace computes: [`crate::scenarios::reports::account_balances`],
+/// One report the owner is trying to reach: the four scenarios this crate
+/// computes — [`crate::scenarios::reports::account_balances`],
 /// [`crate::scenarios::reports::money_flow`],
 /// [`crate::scenarios::reports::returns`] and
-/// [`crate::scenarios::reconciliation::report`]. A fifth name would be a goal no
-/// code produces, and a queue whose goals do not match the reports is worse than
-/// a queue with no goals at all, because it would be believed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ReportGoal {
-    /// What the owner holds, per account: `reports::account_balances`.
-    AssetSnapshot,
-    /// Where money came from and where it went: `reports::money_flow`.
-    MoneyFlow,
-    /// What the holdings earned: `reports::returns`.
-    Returns,
-    /// Whether the journal agrees with the documents: `reconciliation::report`.
-    Reconciliation,
-}
+/// [`crate::scenarios::reconciliation::report`].
+///
+/// Re-exported rather than declared here, and for the reason
+/// [`OperationKey`] is. Until this wave the queue declared its own enum with the
+/// same four variants and the same four `code()` strings as the one a report's
+/// confidence register carries, and the two were joined only where the strings
+/// met on the wire. A stopgap assertion compared the two arrays of codes, which
+/// is the weakest form the promise can take: it lets both enums exist, and it
+/// reports a divergence only when someone runs the tests. The vocabulary belongs
+/// to neither side, so it lives in [`iaam_core::goal`], which is also where the
+/// argument for that placement is written down. Every path that named
+/// `iaam_app::actions::ReportGoal` still resolves.
+pub use iaam_core::goal::ReportGoal;
 
-impl ReportGoal {
-    /// Every goal, in the order the queue publishes them.
-    pub const ALL: [Self; 4] = [
-        Self::AssetSnapshot,
-        Self::MoneyFlow,
-        Self::Returns,
-        Self::Reconciliation,
-    ];
+/// The queue's goal type **is** the report's, asserted where a comment would
+/// otherwise have to be believed.
+///
+/// A coercion and not a test: it is checked by every build rather than by
+/// `cargo test`, and re-declaring a local `ReportGoal` here — the exact defect
+/// this wave removed — stops the crate from compiling instead of producing two
+/// vocabularies that agree until they do not.
+const _: fn(iaam_core::goal::ReportGoal) -> ReportGoal = std::convert::identity;
 
-    /// The stable wire name of this goal.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::AssetSnapshot => "asset_snapshot",
-            Self::MoneyFlow => "money_flow",
-            Self::Returns => "returns",
-            Self::Reconciliation => "reconciliation",
-        }
-    }
-
-    /// This goal's place in a set's bit pattern.
-    const fn bit(self) -> u8 {
-        match self {
-            Self::AssetSnapshot => 1,
-            Self::MoneyFlow => 1 << 1,
-            Self::Returns => 1 << 2,
-            Self::Reconciliation => 1 << 3,
-        }
+/// A goal's place in a [`ReportGoals`] bit pattern.
+///
+/// A free function because the goal is a foreign type now, and it stays an
+/// exhaustive `match` for the reason [`ReportGoals`] is four bits wide: a fifth
+/// goal must not acquire a bit by accident, and here it acquires a compile
+/// error instead.
+const fn bit(goal: ReportGoal) -> u8 {
+    match goal {
+        ReportGoal::AssetSnapshot => 1,
+        ReportGoal::MoneyFlow => 1 << 1,
+        ReportGoal::Returns => 1 << 2,
+        ReportGoal::Reconciliation => 1 << 3,
     }
 }
 
@@ -240,7 +230,7 @@ impl ReportGoals {
         let mut bits = 0;
         let mut index = 0;
         while index < goals.len() {
-            bits |= goals[index].bit();
+            bits |= bit(goals[index]);
             index += 1;
         }
         Self(bits)
@@ -248,7 +238,7 @@ impl ReportGoals {
 
     #[must_use]
     pub const fn contains(self, goal: ReportGoal) -> bool {
-        self.0 & goal.bit() != 0
+        self.0 & bit(goal) != 0
     }
 
     #[must_use]
@@ -2684,26 +2674,22 @@ mod tests {
         }
     }
 
-    /// The four names, spelled once, because two spellings is the whole defect.
+    /// The set carries every goal the vocabulary has, and no more.
+    ///
+    /// The four names themselves are asserted where they are declared, in
+    /// `iaam_core::goal`. Restating them here would be a second copy of the
+    /// vocabulary in the crate that has just stopped keeping one — and the
+    /// stopgap that used to stand here, comparing this crate's four codes with
+    /// the core's, is now a comparison of an array with itself.
     #[test]
-    fn the_goal_vocabulary_is_the_four_agreed_names() {
-        assert_eq!(
-            ReportGoal::ALL.map(ReportGoal::code),
-            ["asset_snapshot", "money_flow", "returns", "reconciliation"]
-        );
+    fn the_goal_set_covers_the_whole_vocabulary() {
         assert_eq!(ReportGoals::ALL.iter().count(), ReportGoal::ALL.len());
-        assert!(ReportGoals::NONE.is_empty());
-        // Two enums spell these four names: this one, which grades queue items,
-        // and the one a report's confidence register carries, which the
-        // discovery catalog also publishes. They are joined on the wire — an
-        // item saying `money_flow` and a report saying `money_flow` are meant to
-        // be the same word — and nothing but this assertion joins them in code.
         assert_eq!(
-            ReportGoal::ALL.map(ReportGoal::code),
-            iaam_core::report::confidence::ReportGoal::ALL
-                .map(iaam_core::report::confidence::ReportGoal::code),
-            "the queue and the reports no longer agree on what a goal is called"
+            ReportGoals::ALL.iter().collect::<Vec<_>>(),
+            ReportGoal::ALL.to_vec(),
+            "a goal has no bit in the set, so an item required for it publishes nothing"
         );
+        assert!(ReportGoals::NONE.is_empty());
     }
 
     /// Asking for the snapshot returns a shorter list than asking for the queue.

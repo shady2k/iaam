@@ -41,6 +41,7 @@
 //! two free functions below, all folding the values the report itself
 //! publishes.
 
+use crate::goal::ReportGoal;
 use crate::ids::{AccountId, InstrumentId};
 use crate::money::CurrencyCode;
 use crate::operation::OperationKey;
@@ -48,51 +49,6 @@ use crate::projection::money_flow::{MoneyFlow, MoneyFlowError};
 use crate::returns::ReturnsReport;
 
 use super::population::ReportPopulation;
-
-/// What a report is for.
-///
-/// The four names are shared vocabulary: the outstanding-work queue grades its
-/// items by the goal they are required for, and a report says which goal it
-/// answers. The two join on this name, so a caller holding a report with
-/// caveats can ask the queue what closes them.
-///
-/// Fixed at four. A fifth would have to mean a report nobody has written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ReportGoal {
-    /// What the owner holds, at a date: cash and positions by account.
-    AssetSnapshot,
-    /// Where money came from and went, over an interval.
-    MoneyFlow,
-    /// What the money earned.
-    Returns,
-    /// Whether the journal agrees with what the sources say.
-    Reconciliation,
-}
-
-impl ReportGoal {
-    /// Every goal, in the order this vocabulary is published.
-    ///
-    /// Listed so that a caller enumerating the four cannot publish three: the
-    /// discovery catalog names the route that answers each goal, and it walks
-    /// this array rather than a list of its own.
-    pub const ALL: [Self; 4] = [
-        Self::AssetSnapshot,
-        Self::MoneyFlow,
-        Self::Returns,
-        Self::Reconciliation,
-    ];
-
-    /// The machine-readable name carried to a caller.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::AssetSnapshot => "asset_snapshot",
-            Self::MoneyFlow => "money_flow",
-            Self::Returns => "returns",
-            Self::Reconciliation => "reconciliation",
-        }
-    }
-}
 
 /// One thing a report's figures do not account for.
 ///

@@ -198,6 +198,12 @@ impl ControlFigure {
 /// journal contains. Sharing a vocabulary between them would let a client read
 /// «no journal coverage» off an import that has not touched the journal.
 ///
+/// The two were put side by side again in `iaam-tx3c` and kept apart, on the
+/// test of which side of the comparison is missing: every `NotComparable` reason
+/// is a fact about the observed side, and this one is a fact about the claimed
+/// side — the document did not print the term. [`NotComparable`] carries the
+/// same argument from its end.
+///
 /// [`NotComparable`]: crate::reconciliation::check::NotComparable
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoCounterpart {

@@ -40,3 +40,8 @@ path — arrives as a run-time argument, and why nothing here knows any of them.
 Each tool's synthetic fixtures are invented end to end. Never point one of these
 scripts at real data to "check that it works", and never trim a real export down
 into a fixture: a file derived from real rows carries real rows.
+
+Where his channel ends and the API's begins — which route each tool writes to,
+what a converter is responsible for knowing that the server cannot know, what an
+agent is handed instead, and where that line is currently drawn wrongly — is
+`docs/import-boundary.md`.

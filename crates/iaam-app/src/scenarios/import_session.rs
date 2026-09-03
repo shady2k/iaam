@@ -917,6 +917,53 @@ impl Readiness {
 /// The whole of iaam-k1xa is that this is one function rather than two: a
 /// preview written beside the import is a second implementation of it, and it
 /// describes a different import from the one that runs.
+///
+/// # What the assessment deliberately does not say: that an amount looks wrong
+///
+/// Proposed and refused (iaam-p3az), and recorded here because this is the
+/// function somebody would add it to.
+///
+/// The occasion was real. One branch of a converter emitted minor units where
+/// every other branch emitted major, the journal then held figures orders of
+/// magnitude apart on one account, and nothing in this plan remarked on it; it
+/// was found by a person reading the numbers. The proposal was to mark a row
+/// whose magnitude is out of keeping with its neighbours — per account and
+/// currency, over the rows of one session — never refusing, never rescaling,
+/// only marking and saying why.
+///
+/// The case for it is the assessment's own case, and it is not weak: this is the
+/// one place whose entire purpose is *here is what is about to be written, look
+/// at it before it is*, and a statement about the shape of a batch is the kind
+/// of statement the sections above already make.
+///
+/// It is refused because a magnitude outlier is not a comparison. It compares a
+/// row against a distribution nobody asserted, and this system's rule is that it
+/// says what it compared and states nothing it merely assumed. Three
+/// consequences follow, and the third is what decides it:
+///
+/// - **It is wrong on ordinary data.** A month's rent beside a month's card
+///   purchases is an outlier by any measure and is not a defect; so is one
+///   transfer between the owner's own banks, which the pairing section already
+///   publishes as a candidate for its own reasons. A mark that fires on those
+///   teaches its reader to skip the section it lives in, and the sections it
+///   lives beside are the ones that are never a guess.
+/// - **No threshold makes it honest.** Anything loose enough to stay quiet on
+///   the case above is also quiet on a hundredfold scale error inside a small
+///   row — which is the error it was proposed for. The signal is tuned by what
+///   it must not fire on, and that is the wrong end.
+/// - **The same defect is caught by comparison instead.** A session that carries
+///   the statement's own control figures (iaam-jc3y) checks the planned facts
+///   against the source's arithmetic, and a converter emitting minor units fails
+///   that check by exactly the factor of its bug, with the source's own number
+///   to name in the refusal. A heuristic beside a check is a second and weaker
+///   answer to a question already answered, and the two can disagree in front of
+///   the owner.
+///
+/// What would reopen it is a source that prints no control section at all,
+/// together with an import of one that went wrong this way. Even then the move
+/// is probably not a verdict: every planned fact is already published here with
+/// its amount and its currency, so what such a source lacks is a reader, not a
+/// suspicion computed on its behalf.
 pub async fn plan_session(
     services: &AppServices,
     principal: &Principal,

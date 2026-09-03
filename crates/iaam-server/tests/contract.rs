@@ -7417,9 +7417,11 @@ async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
         keys,
         // `subject` joined the envelope with the coverage goal: a blocked
         // diagnostic still names the account it is about, in a typed field
-        // rather than only in its sentence.
+        // rather than only in its sentence. `goals` joined it with
+        // `iaam-f5e7`: `required_for_goal` named no goal, so a client could not
+        // tell an item that stops one report from an item that stops all four.
         std::collections::BTreeSet::from([
-            "id", "kind", "category", "state", "reason", "subject", "target",
+            "id", "kind", "category", "goals", "state", "reason", "subject", "target",
         ]),
         "{item}"
     );
@@ -7429,6 +7431,11 @@ async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
         "{item}"
     );
     assert_eq!(item["category"], "required_for_goal", "{item}");
+    // A coverage gap is a statement about one import attempt's confirmation —
+    // `EventKind::ImportCoverageGap` says the refused rows may already be in the
+    // journal from another channel — so it stands in the way of reconciliation
+    // and of nothing else.
+    assert_eq!(item["goals"], json!(["reconciliation"]), "{item}");
     assert_eq!(item["state"], "blocked", "{item}");
     assert_eq!(item["target"], json!({ "type": "none" }), "{item}");
     assert!(
@@ -9539,6 +9546,14 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
         "the account is named in a typed field, not only in prose: {item}"
     );
     assert_eq!(item["category"], "required_for_goal", "{item}");
+    // An account in no contour is outside the covered population, so it is
+    // absent from the three contour-scoped reports. Not reconciliation: that
+    // route takes an account and resolves no contour at all.
+    assert_eq!(
+        item["goals"],
+        json!(["asset_snapshot", "money_flow", "returns"]),
+        "{item}"
+    );
     assert_eq!(item["state"], "needs_owner_input", "{item}");
     assert_eq!(item["required_scope"], "owner", "{item}");
     // Two ways out, so the target is a set of options and not one of them.
@@ -10708,6 +10723,11 @@ async fn the_owner_states_his_transfer_relationships_and_a_new_account_reopens_t
         .find(|item| item["subject"]["id"] == json!(main))
         .expect("the item names the account it is about");
     assert_eq!(item["category"], "required_for_goal", "{item}");
+    // An unpaired leg is counted as money crossing the perimeter by the flow
+    // report and by the returns projection's flow log. It is **not** in the way
+    // of an asset snapshot: the leg lands on its own account's cash whether or
+    // not its partner is known.
+    assert_eq!(item["goals"], json!(["money_flow", "returns"]), "{item}");
     assert_eq!(item["state"], "needs_owner_input", "{item}");
     assert_eq!(item["required_scope"], "owner", "{item}");
     assert_eq!(
@@ -11486,6 +11506,14 @@ async fn an_open_classification_question_is_an_item_in_the_action_queue() {
 
     assert_eq!(item["kind"], "answer_classification_question", "{item}");
     assert_eq!(item["category"], "required_for_goal", "{item}");
+    // A row held unclassified is in no journal, so it is in no report: this one
+    // stands in the way of all four, and a client comparing it against the
+    // transfer item above can see that the two are not the same demand.
+    assert_eq!(
+        item["goals"],
+        json!(["asset_snapshot", "money_flow", "returns", "reconciliation"]),
+        "{item}"
+    );
     assert_eq!(item["state"], "needs_owner_input", "{item}");
     assert_eq!(item["required_scope"], "agent", "{item}");
     assert_eq!(item["subject"]["type"], "account", "{item}");

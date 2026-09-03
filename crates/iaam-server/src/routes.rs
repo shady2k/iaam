@@ -158,11 +158,20 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
         kind: action.kind().id().to_owned(),
         category: match action.category() {
             ActionCategory::Blocking => "blocking",
-            ActionCategory::RequiredForGoal => "required_for_goal",
+            ActionCategory::RequiredForGoal(_) => "required_for_goal",
             ActionCategory::Recommended => "recommended",
             ActionCategory::Informational => "informational",
         }
         .to_owned(),
+        // Empty for every category but the required one, which is where
+        // `ActionCategory::goals` puts the emptiness rather than this mapping
+        // repeating the case analysis one line below the one above.
+        goals: action
+            .category()
+            .goals()
+            .iter()
+            .map(|goal| goal.code().to_owned())
+            .collect(),
         state: match action.state() {
             ActionState::Ready => "ready",
             ActionState::NeedsOwnerInput => "needs_owner_input",

@@ -2916,6 +2916,34 @@ pub struct ActionDto {
     pub id: String,
     pub kind: String,
     pub category: String,
+    /// The reports this item stands between the owner and.
+    ///
+    /// Non-empty exactly when `category` is `required_for_goal`, and empty —
+    /// so, absent from the response — for every other category. A blocking item
+    /// stops the next call rather than a report, a recommendation stops nothing,
+    /// and a fact stops nothing.
+    ///
+    /// Published beside `category` rather than folded into it, because the
+    /// category is a wire string a client already switches on and the goals are
+    /// a set it filters by. A client asking "what stands between me and an asset
+    /// snapshot" keeps the items whose `goals` hold `asset_snapshot`, and gets a
+    /// shorter list than the queue — which is the whole point: the required
+    /// items were previously indistinguishable, so the queue read as a
+    /// precondition on everything, which is not what any of it does.
+    ///
+    /// The vocabulary is closed and is exactly four values, in this order:
+    /// `asset_snapshot`, `money_flow`, `returns`, `reconciliation`. They name
+    /// the four reports this API computes, and the goals a report publishes for
+    /// itself use the same four names.
+    ///
+    /// Always present, empty array included, for the reason
+    /// `a_clean_instance_carries_actions_present_and_empty` gives about the
+    /// list that holds these items: an absent key is indistinguishable from a
+    /// bug, while `[]` says this item stands in the way of no report at all —
+    /// which is a fact about a blocking item, and one a client should be able
+    /// to read rather than infer.
+    #[serde(default)]
+    pub goals: Vec<String>,
     pub state: String,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -64,19 +64,262 @@ impl ActionKind {
             Self::PossibleDuplicateUndecided => "possible_duplicate_undecided",
         }
     }
+
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 14] = [
+        Self::CreateFirstAccount,
+        Self::CreateFirstContour,
+        Self::AccountScopeUndecided,
+        Self::ResolveTransferRelationships,
+        Self::StartAccountImport,
+        Self::ProvideControlAssertion,
+        Self::AnswerClassificationQuestion,
+        Self::CoverageGapUnrepaired,
+        Self::IndependentConfirmationMissing,
+        Self::DiscrepancyUnresolved,
+        Self::UndecomposedOutflows,
+        Self::ExternalTransfersUncategorised,
+        Self::UnexplainedResidual,
+        Self::PossibleDuplicateUndecided,
+    ];
+
+    /// The reports this kind's outstanding work stands between the owner and.
+    ///
+    /// The single table, and the reason it lives on the kind rather than at each
+    /// producer: [`ActionCategory::required_for`] is the only way to build the
+    /// required category, so a kind cannot be graded required for one set of
+    /// goals in one branch and another set in the next.
+    ///
+    /// Empty for the four kinds the queue never grades required — a blocking
+    /// item, a recommendation, two statements of fact — and empty is refused by
+    /// [`Action::new`], so an attempt to promote one of them without deciding
+    /// what it blocks fails at construction rather than publishing a required
+    /// item that names nothing.
+    ///
+    /// Exhaustive on purpose. A fifteenth kind cannot compile until someone has
+    /// answered, for that kind, the question this whole type exists to answer.
+    ///
+    /// Each entry is what the code does, not what the item's prose suggests:
+    ///
+    /// - `CreateFirstContour`, `AccountScopeUndecided` — an account in no
+    ///   contour is outside `report_population`'s covered set, so it is absent
+    ///   from balances, flow and returns. **Not reconciliation**:
+    ///   `reconciliation::report` takes an account and never resolves a contour.
+    /// - `ResolveTransferRelationships` — an unpaired leg is a `CashOut` or a
+    ///   `CashIn`, which `MoneyFlow::apply` counts as money crossing the
+    ///   perimeter and `FlowLog` records as an external contribution or
+    ///   withdrawal. **Not asset snapshot**: the leg lands on its own account's
+    ///   cash whether or not its partner is known. **Not reconciliation**:
+    ///   pairing rewrites two events as one with the same two legs, so observed
+    ///   cash and turnover per account are unchanged.
+    /// - `StartAccountImport`, `AnswerClassificationQuestion` — a row that is in
+    ///   no journal is in no report, and an account with no facts has nothing
+    ///   for any of the four to say.
+    /// - `ProvideControlAssertion` — the closing assertion is the claim side of
+    ///   reconciliation, and the opening one is what makes the snapshot's cash a
+    ///   balance: `reports::account_balances` publishes `CashOpening::Asserted`
+    ///   or `Unasserted` per account and currency, from exactly these events.
+    ///   **Not returns and not flow**: a control assertion has no legs, so it
+    ///   moves no number in either; it only grades confidence there.
+    /// - `CoverageGapUnrepaired`, `IndependentConfirmationMissing`,
+    ///   `DiscrepancyUnresolved` — all three are about whether a period is
+    ///   confirmed, and nothing else. `EventKind::ImportCoverageGap` says so in
+    ///   as many words: it is «a statement about this attempt», not about the
+    ///   interval, and the refused rows may already be in the journal from
+    ///   another channel.
+    /// - `PossibleDuplicateUndecided` — `DedupDecision::records_the_row` is true
+    ///   for a possible duplicate, so the row **is** in the journal and may be
+    ///   the same money counted twice. That is wrong in every report.
+    #[must_use]
+    pub const fn goals(self) -> ReportGoals {
+        use ReportGoal::{AssetSnapshot, MoneyFlow, Reconciliation, Returns};
+        match self {
+            // Blocking, not required work: no goal.
+            Self::CreateFirstAccount => ReportGoals::NONE,
+            Self::CreateFirstContour | Self::AccountScopeUndecided => {
+                ReportGoals::of(&[AssetSnapshot, MoneyFlow, Returns])
+            }
+            Self::ResolveTransferRelationships => ReportGoals::of(&[MoneyFlow, Returns]),
+            Self::StartAccountImport
+            | Self::AnswerClassificationQuestion
+            | Self::PossibleDuplicateUndecided => ReportGoals::ALL,
+            Self::ProvideControlAssertion => ReportGoals::of(&[AssetSnapshot, Reconciliation]),
+            Self::CoverageGapUnrepaired
+            | Self::IndependentConfirmationMissing
+            | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
+            // Recommended and informational: never required, so no goal.
+            Self::UndecomposedOutflows
+            | Self::ExternalTransfersUncategorised
+            | Self::UnexplainedResidual => ReportGoals::NONE,
+        }
+    }
+}
+
+/// One report the owner is trying to reach.
+///
+/// The four are the whole vocabulary, and they are the four report scenarios
+/// this workspace computes: [`crate::scenarios::reports::account_balances`],
+/// [`crate::scenarios::reports::money_flow`],
+/// [`crate::scenarios::reports::returns`] and
+/// [`crate::scenarios::reconciliation::report`]. A fifth name would be a goal no
+/// code produces, and a queue whose goals do not match the reports is worse than
+/// a queue with no goals at all, because it would be believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReportGoal {
+    /// What the owner holds, per account: `reports::account_balances`.
+    AssetSnapshot,
+    /// Where money came from and where it went: `reports::money_flow`.
+    MoneyFlow,
+    /// What the holdings earned: `reports::returns`.
+    Returns,
+    /// Whether the journal agrees with the documents: `reconciliation::report`.
+    Reconciliation,
+}
+
+impl ReportGoal {
+    /// Every goal, in the order the queue publishes them.
+    pub const ALL: [Self; 4] = [
+        Self::AssetSnapshot,
+        Self::MoneyFlow,
+        Self::Returns,
+        Self::Reconciliation,
+    ];
+
+    /// The stable wire name of this goal.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::AssetSnapshot => "asset_snapshot",
+            Self::MoneyFlow => "money_flow",
+            Self::Returns => "returns",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+
+    /// This goal's place in a set's bit pattern.
+    const fn bit(self) -> u8 {
+        match self {
+            Self::AssetSnapshot => 1,
+            Self::MoneyFlow => 1 << 1,
+            Self::Returns => 1 << 2,
+            Self::Reconciliation => 1 << 3,
+        }
+    }
+}
+
+/// A set of goals, held as a bit pattern so that it stays [`Copy`].
+///
+/// A bitmask rather than a `BTreeSet<ReportGoal>`, and the reason is
+/// [`ActionCategory`]. That type is `Copy`, it is returned **by value** from a
+/// `const fn` accessor on [`Action`], and every consumer switches on it by
+/// value. A heap set inside it would have taken `Copy` away from the category,
+/// turned [`Action::category`] into a borrow, and rippled through the server's
+/// mapping and every test that compares one — all to carry a set that can never
+/// hold more than four elements. Four bits carry it instead, and nothing else
+/// changes.
+///
+/// The empty set is representable, and that is deliberate: a `const fn` cannot
+/// build a type whose non-emptiness is enforced by a constructor that fails, so
+/// the invariant is enforced where the item is assembled. [`Action::new`]
+/// refuses a [`ActionCategory::RequiredForGoal`] that names nothing, which is
+/// exactly the defect this type exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct ReportGoals(u8);
+
+impl ReportGoals {
+    /// No goal at all. Never admissible on [`ActionCategory::RequiredForGoal`].
+    pub const NONE: Self = Self(0);
+
+    /// Every goal there is: the item stands in the way of all four reports.
+    pub const ALL: Self = Self::of(&ReportGoal::ALL);
+
+    /// The set holding exactly the listed goals.
+    #[must_use]
+    pub const fn of(goals: &[ReportGoal]) -> Self {
+        let mut bits = 0;
+        let mut index = 0;
+        while index < goals.len() {
+            bits |= goals[index].bit();
+            index += 1;
+        }
+        Self(bits)
+    }
+
+    #[must_use]
+    pub const fn contains(self, goal: ReportGoal) -> bool {
+        self.0 & goal.bit() != 0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The goals in this set, in [`ReportGoal::ALL`] order.
+    pub fn iter(self) -> impl Iterator<Item = ReportGoal> {
+        ReportGoal::ALL
+            .into_iter()
+            .filter(move |goal| self.contains(*goal))
+    }
 }
 
 /// The policy category assigned to an action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `Copy` still, and the goal set is why that was in doubt: see [`ReportGoals`].
+/// `PartialOrd`/`Ord` are **not** derived any more. A derived order over a
+/// variant carrying a payload would have ordered two required items by their
+/// bit patterns, which is a meaningless order that [`sort_actions`] would have
+/// silently adopted for the queue. Urgency is [`Self::rank`], written out, and
+/// it is the only order this type has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionCategory {
     /// Work that prevents the system from accepting another action.
     Blocking,
-    /// Work required for a named goal.
-    RequiredForGoal,
+    /// Work required for the named goals, and for no others.
+    ///
+    /// The set is never empty. Before it existed this variant named no goal at
+    /// all, and a reader walking the queue could not tell an item that stops one
+    /// report from an item that stops every report there is — so the whole queue
+    /// read as a precondition on the entire import, which is not what any of it
+    /// does.
+    RequiredForGoal(ReportGoals),
     /// Work that improves quality but is not required.
     Recommended,
     /// A fact that requires no action.
     Informational,
+}
+
+impl ActionCategory {
+    /// The required-for-goal category of a kind, read from the one table.
+    ///
+    /// Every producer goes through this rather than writing a set beside the
+    /// kind it is building: two statements of «what this kind blocks» would
+    /// eventually disagree, and the queue is the place where a disagreement is
+    /// invisible.
+    #[must_use]
+    pub const fn required_for(kind: ActionKind) -> Self {
+        Self::RequiredForGoal(kind.goals())
+    }
+
+    /// Urgency, most urgent first. The queue's order, and nothing else.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Blocking => 0,
+            Self::RequiredForGoal(_) => 1,
+            Self::Recommended => 2,
+            Self::Informational => 3,
+        }
+    }
+
+    /// The goals this category names, which is none unless it is required work.
+    #[must_use]
+    pub const fn goals(self) -> ReportGoals {
+        match self {
+            Self::RequiredForGoal(goals) => goals,
+            Self::Blocking | Self::Recommended | Self::Informational => ReportGoals::NONE,
+        }
+    }
 }
 
 /// Whether an action can be invoked without asking the owner.
@@ -342,6 +585,14 @@ pub enum ActionInvariantError {
     /// shapes for the same fact. [`ActionTarget::from_options`] normalises, so
     /// reaching this means the variant was built by hand.
     OptionsWithoutChoice,
+    /// Work graded required for a goal, naming no goal.
+    ///
+    /// The defect this whole vocabulary exists to remove, refused at the point
+    /// an item is assembled. A required item that names nothing tells a client
+    /// only that something stands in its way, and a queue of those reads as a
+    /// precondition on everything — which is how the frontier was read, and it
+    /// was never what any of it did.
+    RequiredForNoGoal,
 }
 
 /// What an action is, apart from its prose and its target.
@@ -404,6 +655,9 @@ impl Action {
         }
         if facts.state != ActionState::Blocked && facts.required_scope.is_none() {
             return Err(ActionInvariantError::NonBlockedWithoutScope);
+        }
+        if matches!(facts.category, ActionCategory::RequiredForGoal(goals) if goals.is_empty()) {
+            return Err(ActionInvariantError::RequiredForNoGoal);
         }
         Ok(Self {
             id: facts.id,
@@ -583,15 +837,18 @@ fn diagnostics(
         let category = ledger
             .statuses()
             .find(|status| status.account() == gap.account && status.period() == gap.period)
-            .map_or(ActionCategory::RequiredForGoal, |status| {
-                if gap.dimensions.iter().all(|dimension| {
-                    status.dimension(*dimension) == DimensionStatus::AcceptedIndependent
-                }) {
-                    ActionCategory::Informational
-                } else {
-                    ActionCategory::RequiredForGoal
-                }
-            });
+            .map_or(
+                ActionCategory::required_for(ActionKind::CoverageGapUnrepaired),
+                |status| {
+                    if gap.dimensions.iter().all(|dimension| {
+                        status.dimension(*dimension) == DimensionStatus::AcceptedIndependent
+                    }) {
+                        ActionCategory::Informational
+                    } else {
+                        ActionCategory::required_for(ActionKind::CoverageGapUnrepaired)
+                    }
+                },
+            );
         let rows = if gap.rows.is_empty() {
             "the legacy record cannot name the refused rows".to_owned()
         } else {
@@ -646,7 +903,7 @@ fn diagnostics(
                         dimension.code()
                     ),
                     ActionKind::IndependentConfirmationMissing,
-                    ActionCategory::RequiredForGoal,
+                    ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
                     Some(ActionSubject::Account(status.account())),
                     format!(
                         "Account {} reached internal confirmation for {} from {} through {} but has no confirmation from a different parser and document; no acquisition operation exists in this API.",
@@ -673,7 +930,7 @@ fn diagnostics(
                     index
                 ),
                 ActionKind::DiscrepancyUnresolved,
-                ActionCategory::RequiredForGoal,
+                ActionCategory::required_for(ActionKind::DiscrepancyUnresolved),
                 Some(ActionSubject::Account(status.account())),
                 format!(
                     "Account {} has an unresolved {} discrepancy from {} through {}: claimed {}, observed {}, delta {}; the system cannot identify which side is wrong and no resolution operation exists in this API.",
@@ -884,7 +1141,7 @@ pub fn verdict_diagnostics(verdict: &Verdict) -> Option<Action> {
             level.number()
         ),
         ActionKind::PossibleDuplicateUndecided,
-        ActionCategory::RequiredForGoal,
+        ActionCategory::required_for(ActionKind::PossibleDuplicateUndecided),
         Some(ActionSubject::Event(*event)),
         format!(
             "Event {} may duplicate event {} at deduplication level {}; the owner must decide and no decision operation exists in this API.",
@@ -931,8 +1188,11 @@ fn blocked_action(
 
 fn sort_actions(actions: &mut [Action]) {
     actions.sort_by(|left, right| {
+        // By urgency, never by the category value: two required items differ
+        // only in which goals they name, and that is not an order.
         left.category()
-            .cmp(&right.category())
+            .rank()
+            .cmp(&right.category().rank())
             .then_with(|| left.id().cmp(right.id()))
     });
 }
@@ -1170,7 +1430,7 @@ fn answer_classification_question_action(
                 question.view.id.inner()
             ),
             kind: ActionKind::AnswerClassificationQuestion,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::AnswerClassificationQuestion),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Agent),
             subject: Some(ActionSubject::Account(account)),
@@ -1456,7 +1716,7 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
                 account.id.inner()
             ),
             kind: ActionKind::ResolveTransferRelationships,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::ResolveTransferRelationships),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(account.id)),
@@ -1608,7 +1868,7 @@ fn start_account_import_action(account: AccountId) -> Action {
                 account.inner()
             ),
             kind: ActionKind::StartAccountImport,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::StartAccountImport),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Agent),
             subject: Some(ActionSubject::Account(account)),
@@ -1663,7 +1923,7 @@ fn provide_control_assertion_action(
                 dimension.code()
             ),
             kind: ActionKind::ProvideControlAssertion,
-            // Required for the goal, at either point, not `Recommended`.
+            // Required for a goal, at either point, not `Recommended`.
             //
             // Without the opening assertion the cash figure is a movement over
             // the imported interval and not a balance at all, so the assertion
@@ -1676,7 +1936,12 @@ fn provide_control_assertion_action(
             // point is recommended-only, and the queue stops telling the owner
             // that the one thing which would make his numbers trustworthy is
             // his to skip.
-            category: ActionCategory::RequiredForGoal,
+            //
+            // Which goals, at either point, is `ActionKind::goals`: the snapshot
+            // and the reconciliation. Both requests are the same operation with
+            // the same fields, so a per-point set would be a second table saying
+            // the same thing.
+            category: ActionCategory::required_for(ActionKind::ProvideControlAssertion),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(account)),
@@ -1854,7 +2119,7 @@ fn account_scope_action(
                 account.id.inner()
             ),
             kind: ActionKind::AccountScopeUndecided,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::AccountScopeUndecided),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(account.id)),
@@ -1902,7 +2167,7 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
         ActionFacts {
             id: identity(ActionKind::CreateFirstContour),
             kind: ActionKind::CreateFirstContour,
-            category: ActionCategory::RequiredForGoal,
+            category: ActionCategory::required_for(ActionKind::CreateFirstContour),
             state: ActionState::NeedsOwnerInput,
             required_scope: Some(Scope::Owner),
             // Existential: no contour exists, so the item names no one account.
@@ -1958,6 +2223,186 @@ mod tests {
 
     fn store() -> SqliteAdapter {
         SqliteAdapter::new(SqliteStore::open_in_memory().expect("in-memory store"))
+    }
+
+    /// Every kind is in [`ActionKind::ALL`] exactly once.
+    ///
+    /// The walk below is only as complete as this array, so the array is checked
+    /// first and separately: `id()` is exhaustive, so two kinds sharing an
+    /// identity or a kind repeated here is caught, and the count is stated so
+    /// that a kind added to the enum and to `goals` but forgotten here does not
+    /// quietly shrink the walk.
+    #[test]
+    fn every_kind_is_listed_once_in_all() {
+        let ids: BTreeSet<&str> = ActionKind::ALL.iter().map(|kind| kind.id()).collect();
+        assert_eq!(
+            ids.len(),
+            ActionKind::ALL.len(),
+            "two kinds share an identity, or one is listed twice: {:?}",
+            ActionKind::ALL.map(ActionKind::id)
+        );
+        assert_eq!(ActionKind::ALL.len(), 14, "a kind was added without a goal");
+    }
+
+    /// Every kind graded `RequiredForGoal` names at least one goal, and every
+    /// goal it names is one of the four.
+    ///
+    /// The expected sets are restated here rather than read back from
+    /// [`ActionKind::goals`]: a test that asked the table what the table says
+    /// would pass for any table, including the one that names nothing. This is
+    /// the mapping, written a second time, from what the reports actually read.
+    ///
+    /// The `match` is exhaustive on purpose, and that is what keeps this from
+    /// going stale. A fifteenth kind does not slip through — it stops the test
+    /// from compiling, so whoever adds it answers, here, which reports their new
+    /// item stands in the way of, before the queue can publish an item that
+    /// names none.
+    ///
+    /// Each kind is also run through [`Action::new`], so the invariant is
+    /// asserted on an item and not only on a table: a required category that
+    /// names nothing is refused at construction, and a kind the queue never
+    /// grades required is refused if someone grades it.
+    #[test]
+    fn every_required_action_names_at_least_one_of_the_four_goals() {
+        use ReportGoal::{AssetSnapshot, MoneyFlow, Reconciliation, Returns};
+
+        for kind in ActionKind::ALL {
+            let expected: &[ReportGoal] = match kind {
+                // Blocking: it stops the next call, not a report.
+                ActionKind::CreateFirstAccount => &[],
+                // An account in no contour is outside `report_population`'s
+                // covered set. Not reconciliation: `reconciliation::report`
+                // takes an account and resolves no contour.
+                ActionKind::CreateFirstContour | ActionKind::AccountScopeUndecided => {
+                    &[AssetSnapshot, MoneyFlow, Returns]
+                }
+                // An unpaired leg is counted as money crossing the perimeter by
+                // `MoneyFlow::apply` and by `FlowLog`. Not the snapshot: the leg
+                // lands on its own account's cash either way. Not
+                // reconciliation: pairing keeps both legs, so observed cash and
+                // turnover per account do not move.
+                ActionKind::ResolveTransferRelationships => &[MoneyFlow, Returns],
+                // A row in no journal is in no report; an account with no facts
+                // has nothing for any of the four to say; and a possible
+                // duplicate **is** recorded, so it may be the same money twice.
+                ActionKind::StartAccountImport
+                | ActionKind::AnswerClassificationQuestion
+                | ActionKind::PossibleDuplicateUndecided => {
+                    &[AssetSnapshot, MoneyFlow, Returns, Reconciliation]
+                }
+                // The closing assertion is reconciliation's claim side; the
+                // opening one is what makes the snapshot's cash a balance, which
+                // `account_balances` publishes as `CashOpening`. It has no legs,
+                // so it moves no number in flow or returns.
+                ActionKind::ProvideControlAssertion => &[AssetSnapshot, Reconciliation],
+                // All three are about whether a period is confirmed.
+                ActionKind::CoverageGapUnrepaired
+                | ActionKind::IndependentConfirmationMissing
+                | ActionKind::DiscrepancyUnresolved => &[Reconciliation],
+                // Recommended and informational: never required work.
+                ActionKind::UndecomposedOutflows
+                | ActionKind::ExternalTransfersUncategorised
+                | ActionKind::UnexplainedResidual => &[],
+            };
+
+            let goals: Vec<ReportGoal> = kind.goals().iter().collect();
+            assert_eq!(
+                goals,
+                expected.to_vec(),
+                "the goals of {} are not what the reports read",
+                kind.id()
+            );
+            assert!(
+                goals.iter().all(|goal| ReportGoal::ALL.contains(goal)),
+                "{} names a goal outside the four",
+                kind.id()
+            );
+
+            let built = Action::new(
+                ActionFacts {
+                    id: kind.id().to_owned(),
+                    kind,
+                    category: ActionCategory::required_for(kind),
+                    state: ActionState::NeedsOwnerInput,
+                    required_scope: Some(Scope::Owner),
+                    subject: None,
+                },
+                "a reason",
+                ActionTarget::Operation {
+                    operation: OperationKey::CreateAccount,
+                    request: RequestPlan {
+                        preset: BTreeMap::new(),
+                        missing: Vec::new(),
+                    },
+                },
+            );
+
+            if expected.is_empty() {
+                assert_eq!(
+                    built.err(),
+                    Some(ActionInvariantError::RequiredForNoGoal),
+                    "{} is never required for a goal, so grading it required must be refused",
+                    kind.id()
+                );
+            } else {
+                let action =
+                    built.unwrap_or_else(|error| panic!("{} was refused: {error:?}", kind.id()));
+                assert!(
+                    !action.category().goals().is_empty(),
+                    "{} is required for a goal and names none",
+                    kind.id()
+                );
+                assert_eq!(
+                    action.category().goals().iter().collect::<Vec<_>>(),
+                    expected.to_vec(),
+                    "{} publishes goals other than the ones it carries",
+                    kind.id()
+                );
+            }
+        }
+    }
+
+    /// The four names, spelled once, because two spellings is the whole defect.
+    #[test]
+    fn the_goal_vocabulary_is_the_four_agreed_names() {
+        assert_eq!(
+            ReportGoal::ALL.map(ReportGoal::code),
+            ["asset_snapshot", "money_flow", "returns", "reconciliation"]
+        );
+        assert_eq!(ReportGoals::ALL.iter().count(), ReportGoal::ALL.len());
+        assert!(ReportGoals::NONE.is_empty());
+    }
+
+    /// Asking for the snapshot returns a shorter list than asking for the queue.
+    ///
+    /// The point of the whole change, asserted rather than described: a
+    /// reconciliation-only item is not something that stands between the owner
+    /// and a statement of what he holds, and before this it was indistinguishable
+    /// from one that is.
+    #[test]
+    fn the_snapshot_is_blocked_by_fewer_items_than_everything() {
+        let required: Vec<ActionKind> = ActionKind::ALL
+            .into_iter()
+            .filter(|kind| !kind.goals().is_empty())
+            .collect();
+        let for_snapshot: Vec<ActionKind> = required
+            .iter()
+            .copied()
+            .filter(|kind| kind.goals().contains(ReportGoal::AssetSnapshot))
+            .collect();
+
+        assert!(
+            for_snapshot.len() < required.len(),
+            "every required item still blocks the snapshot: {for_snapshot:?}"
+        );
+        assert!(
+            !for_snapshot.contains(&ActionKind::ResolveTransferRelationships),
+            "a leg folds into its own account's balance whether or not its partner is known"
+        );
+        assert!(
+            !for_snapshot.contains(&ActionKind::CoverageGapUnrepaired),
+            "a coverage gap is a statement about one import attempt's confirmation"
+        );
     }
 
     fn with_id(id: AccountId) -> AccountView {
@@ -2051,7 +2496,10 @@ mod tests {
             .iter()
             .find(|action| action.kind() == ActionKind::CreateFirstContour)
             .expect("first contour action");
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::CreateFirstContour)
+        );
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
         let ActionTarget::Operation { operation, request } = action.target() else {
             panic!("first contour needs an operation target");
@@ -2169,7 +2617,10 @@ mod tests {
         // The subject is a typed field, not a substring of the sentence: a
         // caller narrowing the queue to one account must not have to parse prose.
         assert_eq!(action.subject(), Some(ActionSubject::Account(orphan.id)));
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::AccountScopeUndecided)
+        );
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
         assert_eq!(action.required_scope(), Some(Scope::Owner));
         // The act is «add it to one of the contours that exist», not «create a
@@ -3381,7 +3832,10 @@ mod tests {
             .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
             .expect("coverage gap diagnostic");
 
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::CoverageGapUnrepaired)
+        );
         assert_eq!(action.state(), ActionState::Blocked);
         assert_eq!(action.required_scope(), None);
         assert_eq!(action.target(), &ActionTarget::None);
@@ -3393,7 +3847,8 @@ mod tests {
         let actions = ledger_diagnostics(&gap_ledger(AccountId::new_random()));
         assert!(actions.iter().any(|action| {
             action.kind() == ActionKind::CoverageGapUnrepaired
-                && action.category() == ActionCategory::RequiredForGoal
+                && action.category()
+                    == ActionCategory::required_for(ActionKind::CoverageGapUnrepaired)
         }));
     }
 
@@ -3439,7 +3894,10 @@ mod tests {
             .find(|action| action.kind() == ActionKind::IndependentConfirmationMissing)
             .expect("independence diagnostic");
 
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::IndependentConfirmationMissing)
+        );
         assert_eq!(action.state(), ActionState::Blocked);
         assert!(action.reason().contains("different parser and document"));
         assert_eq!(action.target(), &ActionTarget::None);
@@ -3478,7 +3936,10 @@ mod tests {
             .find(|action| action.kind() == ActionKind::DiscrepancyUnresolved)
             .expect("discrepancy diagnostic");
 
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::DiscrepancyUnresolved)
+        );
         assert_eq!(action.state(), ActionState::Blocked);
         assert!(
             action.reason().contains("claimed 10.00 RUB"),
@@ -3581,7 +4042,10 @@ mod tests {
         .expect("duplicate diagnostic");
 
         assert_eq!(action.kind(), ActionKind::PossibleDuplicateUndecided);
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::PossibleDuplicateUndecided)
+        );
         assert_eq!(action.state(), ActionState::Blocked);
         assert!(action.id().contains(&event.inner().to_string()));
         assert!(action.id().contains(&of.inner().to_string()));
@@ -3595,7 +4059,7 @@ mod tests {
             ActionFacts {
                 id: "blocked".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
-                category: ActionCategory::RequiredForGoal,
+                category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
                 required_scope: None,
                 subject: None,
@@ -3615,7 +4079,7 @@ mod tests {
             ActionFacts {
                 id: "blocked-operation".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
-                category: ActionCategory::RequiredForGoal,
+                category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
                 required_scope: None,
                 subject: None,
@@ -3635,7 +4099,7 @@ mod tests {
             ActionFacts {
                 id: "blocked-scope".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
-                category: ActionCategory::RequiredForGoal,
+                category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
                 required_scope: Some(Scope::Owner),
                 subject: None,
@@ -3959,7 +4423,10 @@ mod tests {
             .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
             .expect("coverage gap diagnostic");
 
-        assert_eq!(action.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            action.category(),
+            ActionCategory::required_for(ActionKind::CoverageGapUnrepaired)
+        );
     }
 
     /// One ledger, one flow report and one verdict that between them produce every
@@ -4258,7 +4725,10 @@ mod tests {
             )
         );
         assert_eq!(item.subject(), Some(ActionSubject::Account(main.id)));
-        assert_eq!(item.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(
+            item.category(),
+            ActionCategory::required_for(ActionKind::AnswerClassificationQuestion)
+        );
         assert_eq!(item.state(), ActionState::NeedsOwnerInput);
         assert_eq!(item.required_scope(), Some(Scope::Agent));
     }

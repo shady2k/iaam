@@ -1256,13 +1256,11 @@ fn actions_from_views(
             actions.push(account_scope_action(account, accounts, contours));
         }
     }
-    if transfer_relationships_eligibility(accounts) {
-        for account in accounts
-            .iter()
-            .filter(|account| transfer_relationships_gap(account.id, transfers))
-        {
-            actions.push(transfer_relationships_action(account, accounts));
-        }
+    for account in accounts.iter().filter(|account| {
+        transfer_relationships_eligibility(account.id, accounts, contours, exclusions)
+            && transfer_relationships_gap(account.id, transfers)
+    }) {
+        actions.push(transfer_relationships_action(account, accounts));
     }
     actions
 }
@@ -1355,13 +1353,38 @@ fn account_scope_completion(
     account_scope(account, contours, exclusions) != AccountScope::Undecided
 }
 
-/// The question exists once the owner has a second account to move money to.
+/// The question exists once the owner has a second account to move money to,
+/// and only for an account he has not ruled outside the perimeter.
 ///
 /// With one account there is no «other side»: an internal transfer needs two,
 /// and asking about a relationship that cannot exist is the kind of item a
 /// queue is learned to ignore for.
-fn transfer_relationships_eligibility(accounts: &[AccountView]) -> bool {
-    accounts.len() > 1
+///
+/// The scope condition is the same argument made twice over. A transfer has two
+/// ends and at least one of them is inside the perimeter — a pair of accounts
+/// both outside it appears in no contour's report, so relating them changes no
+/// reported number — and the inside end is asked which of the owner's accounts
+/// money moves between it and, with every other account offered as a candidate,
+/// the outside one included. Asking the outside account the same thing a second
+/// time therefore discovers nothing the first question could not, and it costs
+/// the owner a `RequiredForGoal` item about an account he has already ruled out
+/// of every report, with a reason. Two institutions imported at once produced
+/// one such question per account and no way to tell which were obligatory.
+///
+/// [`AccountScope::Undecided`] is *not* suppressed. The owner has not ruled on
+/// those accounts, and silencing a question because an earlier question is
+/// unanswered is a queue that goes quiet exactly when it should not.
+///
+/// Nothing is lost for good either way: the scope is read from the contours and
+/// the exclusions on every call rather than recorded beside the statement, so
+/// bringing an account back inside a contour reopens the question.
+fn transfer_relationships_eligibility(
+    account: AccountId,
+    accounts: &[AccountView],
+    contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
+) -> bool {
+    accounts.len() > 1 && account_scope(account, contours, exclusions) != AccountScope::Outside
 }
 
 fn transfer_relationships_gap(
@@ -2576,9 +2599,12 @@ mod tests {
     #[test]
     fn one_account_is_not_asked_what_it_transfers_with() {
         let only = account();
-        assert!(!transfer_relationships_eligibility(std::slice::from_ref(
-            &only
-        )));
+        assert!(!transfer_relationships_eligibility(
+            only.id,
+            std::slice::from_ref(&only),
+            &[],
+            &[]
+        ));
         assert!(
             actions_from_views(std::slice::from_ref(&only), &[], &[], &[])
                 .iter()
@@ -2650,6 +2676,96 @@ mod tests {
         assert_eq!(
             asked[0].subject(),
             Some(ActionSubject::Account(everyday.id))
+        );
+    }
+
+    /// A transfer has two ends, and at least one of them is inside the
+    /// perimeter. The inside end's question already lets the owner name the
+    /// outside one, so asking the outside account the same thing a second time
+    /// gathers nothing and costs him a `RequiredForGoal` question about an
+    /// account he has already ruled out of every report, with a reason.
+    ///
+    /// Nothing is lost for good: the scope is read from the contours and the
+    /// exclusions on every call, never recorded beside the statement, so
+    /// bringing the account back inside a contour reopens the question.
+    #[test]
+    fn an_account_ruled_outside_the_perimeter_is_not_asked_about_transfers() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let shop = named("Shop One");
+        let accounts = [main.clone(), savings.clone(), shop.clone()];
+        let contours = [ContourView {
+            id: ContourId::new_random(),
+            version: ContourVersion(1),
+            title: "Household".into(),
+            accounts: vec![main.id],
+        }];
+        let exclusions = [AccountScopeExclusionView {
+            account: shop.id,
+            reason: "A counterparty's account, not the owner's money.".into(),
+        }];
+
+        let asked: Vec<_> = actions_from_views(&accounts, &contours, &exclusions, &[])
+            .into_iter()
+            .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+            .map(|action| action.subject())
+            .collect();
+
+        assert!(
+            !asked.contains(&Some(ActionSubject::Account(shop.id))),
+            "an account ruled outside every contour is not asked: {asked:?}"
+        );
+        // Inside and undecided both still raise it. The owner has ruled on one
+        // and not on the other, and suppressing a question because an earlier
+        // one is unanswered is a queue that goes quiet exactly when it should
+        // not: the account nobody has placed is the one nobody has looked at.
+        assert!(
+            asked.contains(&Some(ActionSubject::Account(main.id))),
+            "an account inside a contour is asked: {asked:?}"
+        );
+        assert!(
+            asked.contains(&Some(ActionSubject::Account(savings.id))),
+            "an account awaiting a scope decision is asked: {asked:?}"
+        );
+    }
+
+    /// The outside account stays on the inside account's list of candidates.
+    ///
+    /// This is what makes the suppression lossless rather than a discovery
+    /// thrown away: a movement between an inside account and an outside one is
+    /// still nameable, from the end that is inside the perimeter — which is the
+    /// end whose report a pair of unrelated legs would distort.
+    #[test]
+    fn an_outside_account_is_still_offered_as_the_far_side_of_an_inside_one() {
+        let main = named("Main");
+        let shop = named("Shop One");
+        let accounts = [main.clone(), shop.clone()];
+        let contours = [ContourView {
+            id: ContourId::new_random(),
+            version: ContourVersion(1),
+            title: "Household".into(),
+            accounts: vec![main.id],
+        }];
+        let exclusions = [AccountScopeExclusionView {
+            account: shop.id,
+            reason: "Closed years ago.".into(),
+        }];
+
+        let asked = actions_from_views(&accounts, &contours, &exclusions, &[])
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+            .expect("the inside account is asked");
+        assert_eq!(asked.subject(), Some(ActionSubject::Account(main.id)));
+        let ActionTarget::Operation { request, .. } = asked.target() else {
+            panic!("the transfer item names an operation");
+        };
+        let candidates = request.missing[0]
+            .candidates
+            .as_ref()
+            .expect("the owner is offered his other accounts");
+        assert!(
+            candidates.iter().any(|candidate| candidate.id == shop.id),
+            "the outside account is still a possible far side: {candidates:#?}"
         );
     }
 

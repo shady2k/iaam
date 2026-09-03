@@ -257,6 +257,10 @@ impl From<AppError> for ApiFailure {
             // The scheduler failed while listing active documents: this is a
             // server failure, not a request error.
             | AppError::Schedule(_)
+            // A total that would not add up is our defect too: the request named
+            // a scope and a date, and neither of them can make two currencies
+            // meet inside one figure.
+            | AppError::AssetSnapshot(_)
             // Failure of the randomness source is also a `500`: no secret was issued,
             // and this is a server failure, not a request error. Retrying the request
             // makes sense, but substituting a fallback generator does not,

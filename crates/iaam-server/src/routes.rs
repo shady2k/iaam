@@ -41,7 +41,7 @@ use iaam_app::scenarios::market_reference::{
 };
 use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, report, statuses};
 use iaam_app::scenarios::reports::{
-    MoneyFlowQuery, ReturnsQuery, account_balances, money_flow, returns,
+    MoneyFlowQuery, ReturnsQuery, account_balances, asset_snapshot, money_flow, returns,
 };
 use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
@@ -72,22 +72,23 @@ use crate::action_catalog::ActionCatalog;
 use crate::dto::{
     AccountAliasDto, AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
     AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto, ActionsResponseDto,
-    AddContourVersionRequest, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest,
-    CashAssetClassDto, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest,
-    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
-    ClassificationRuleDto, ClassificationRuleRequest, ContourDto, ContourVersionDto,
-    CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
+    AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto, BrokerAccessDto,
+    BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto, CategoryGroupRequest,
+    CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest,
+    ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
+    ContourVersionDto, CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
     CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
     ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto,
     JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
     MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
-    MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
-    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
-    RecordAccountScopeRequest, RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
-    RequestPlanDto, RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    MoneyFlowReportDto, NegativeBalanceExpectationDto, OwnerBalanceRequest, QuotationBasisDto,
+    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
+    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersRequest,
+    ReplaceAccountAliasesRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -1535,6 +1536,9 @@ pub async fn create_account(
         provider,
         provider_account_id,
         cash_class: request.cash_class.map(CashAssetClassDto::to_domain),
+        negative_balance_expectation: request
+            .negative_balance_expectation
+            .map(NegativeBalanceExpectationDto::to_domain),
         aliases,
     };
     let created = state
@@ -1656,6 +1660,9 @@ fn account_dto(account: AccountDetailView) -> AccountDto {
         provider: account.provider,
         provider_account_id: account.provider_account_id,
         cash_class: account.cash_class.map(CashAssetClassDto::from_domain),
+        negative_balance_expectation: account
+            .negative_balance_expectation
+            .map(NegativeBalanceExpectationDto::from_domain),
         aliases: account
             .aliases
             .into_iter()
@@ -3213,6 +3220,54 @@ pub async fn balances_report(
     )
     .await?;
     Ok(Json(BalancesReportDto::from_domain(&report)))
+}
+
+/// What the owner holds at a date.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct AssetSnapshotParams {
+    /// Scope identifier.
+    pub contour: Uuid,
+    /// Scope composition version. By default — the latest.
+    #[serde(default)]
+    pub contour_version: Option<u32>,
+    /// Report date in YYYY-MM-DD format.
+    pub as_of: String,
+}
+
+/// What the owner holds at a date, grouped by the class of cash he declared.
+///
+/// The same fold as `/v1/reports/balances`, regrouped: the rows in `accounts`
+/// are that report's rows, and every total is folded from them in the core.
+/// A second path to a total could disagree with the rows it summarises.
+#[utoipa::path(
+    get,
+    path = "/v1/reports/assets",
+    params(AssetSnapshotParams),
+    responses(
+        (status = 200, description = "Cash by class, positions at the prices the journal holds, \
+                                      and the whole", body = AssetSnapshotDto),
+        (status = 404, description = "Scope not found", body = ApiError),
+        (status = 422, description = "Invalid report date", body = ApiError),
+        (status = 500, description = "Snapshot could not be built", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn asset_snapshot_report(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<AssetSnapshotParams>,
+) -> Result<Json<AssetSnapshotDto>, ApiFailure> {
+    let as_of = parse_query_date("as_of", &params.as_of)?;
+    let snapshot = asset_snapshot(
+        &state.services,
+        &principal,
+        ContourId(params.contour),
+        params.contour_version.map(ContourVersion),
+        as_of,
+    )
+    .await?;
+    Ok(Json(AssetSnapshotDto::from_domain(&snapshot)))
 }
 
 /// Returns report parameters.

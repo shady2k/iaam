@@ -21,9 +21,12 @@ use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+use iaam_core::report::assets;
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
-use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue};
+use iaam_core::valuation::{
+    FxSource, FxTable, PriceBoard, PriceCandidate, QuotationBasis, Venue as CoreVenue,
+};
 use iaam_market::{Executability, ObservedAt, PriceKind, PriceObservation, TradeDate, Venue};
 use iaam_store::market::SeriesKey;
 use iaam_store::market::{MarketWindow, PriceRow, PriceVenue};
@@ -36,7 +39,7 @@ use super::categories::load_index;
 use crate::AppServices;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
-use crate::ports::{AccountView, Principal};
+use crate::ports::{AccountView, NegativeBalanceExpectation, Principal};
 
 /// The report vocabulary, in the core.
 ///
@@ -46,6 +49,9 @@ use crate::ports::{AccountView, Principal};
 /// outside the core can disagree with the report it summarises. Re-exported
 /// under their old paths, because every caller of this module names the report
 /// by the same word whichever crate defines it.
+pub use iaam_core::report::assets::{
+    AssetAccount, AssetSnapshot, CashClassTotal, CashSide, HoldingValue, PositionsSide,
+};
 pub use iaam_core::report::balances::{
     AccountBalanceRow, AccountCash, BalancesReport, CashOpening, NegativeCash, PeriodReports,
 };
@@ -325,6 +331,60 @@ pub async fn account_balances(
     contour_version: Option<ContourVersion>,
     as_of: Date,
 ) -> Result<BalancesReport, AppError> {
+    let (report, _prices) =
+        balances_with_prices(services, principal, contour, contour_version, as_of).await?;
+    Ok(report)
+}
+
+/// What the owner holds at a date, grouped by the class of cash he declared.
+///
+/// One journal read, one fold, two statements. The rows are the balances
+/// answer's own rows and the totals are folded from them in the core
+/// ([`iaam_core::report::assets::asset_snapshot`]); nothing is summed here.
+///
+/// The class reaches the core as an **opaque code**. Report grouping is the one
+/// consumer decision 0004 §3 allows it, and the core cannot branch on a class
+/// it cannot name.
+pub async fn asset_snapshot(
+    services: &AppServices,
+    principal: &Principal,
+    contour: ContourId,
+    contour_version: Option<ContourVersion>,
+    as_of: Date,
+) -> Result<AssetSnapshot, AppError> {
+    let (report, prices) =
+        balances_with_prices(services, principal, contour, contour_version, as_of).await?;
+    // Only the accounts the owner declared a class for appear here. An account
+    // missing from the map has said nothing, which is a value the fold groups
+    // on its own and never fills in.
+    let classes: BTreeMap<AccountId, String> = services
+        .store
+        .list_account_details(principal.owner)
+        .await?
+        .into_iter()
+        .filter_map(|account| {
+            account
+                .cash_class
+                .map(|class| (account.id, class.code().to_owned()))
+        })
+        .collect();
+    assets::asset_snapshot(as_of, &report, &classes, &prices).map_err(AppError::AssetSnapshot)
+}
+
+/// The balances answer and the journal's price board, from one read of the
+/// journal.
+///
+/// The board is folded beside the balances rather than by a second pass,
+/// because the snapshot's two halves must describe one state of the world: a
+/// price read from a journal loaded a moment later could postdate the cash it
+/// stands beside.
+async fn balances_with_prices(
+    services: &AppServices,
+    principal: &Principal,
+    contour: ContourId,
+    contour_version: Option<ContourVersion>,
+    as_of: Date,
+) -> Result<(BalancesReport, PriceBoard), AppError> {
     let (_version, definition) =
         resolve_contour(services, principal, contour, contour_version).await?;
     let events = services
@@ -338,11 +398,16 @@ pub async fn account_balances(
     // status beside it had already stopped confirming it (§4.8).
     let effective = resolve(&events).map_err(AppError::Correction)?;
     let mut balances = Balances::new();
+    // The board is filled by `PriceBoard::observe`, the same call the projection
+    // makes: one definition of "this event carries a price", so a report cannot
+    // value a holding from a price the projection would not have recorded.
+    let mut prices = PriceBoard::new();
     for event in &effective {
         balances
             .apply(event)
             .map_err(ProjectionError::from)
             .map_err(AppError::from_projection)?;
+        prices.observe(event);
     }
     // §11 is assessed from the set already in hand rather than from the raw
     // journal: `assess` would resolve it a second time, and a request that
@@ -406,6 +471,23 @@ pub async fn account_balances(
         .filter(|span| span.resolved.is_none())
         .map(|span| ((span.account, span.currency), *span))
         .collect();
+    // What the owner said about a negative balance on each account, for the
+    // accounts where he said anything. Read here and nowhere else, and read
+    // ALONE: `cash_class` is not consulted, and no expectation is ever derived
+    // from one. «A savings account cannot be overdrawn, therefore warn» is the
+    // branch decision 0004 §3 forbids by name, and it is wrong on the first
+    // ordinary technical overdraft.
+    let expectations: BTreeMap<AccountId, NegativeBalanceExpectation> = services
+        .store
+        .list_account_details(principal.owner)
+        .await?
+        .into_iter()
+        .filter_map(|account| {
+            account
+                .negative_balance_expectation
+                .map(|expectation| (account.id, expectation))
+        })
+        .collect();
     // Restricted to the contour: the projection holds every account the owner
     // has, and a liability outside the requested boundary is not a fact about
     // this answer.
@@ -416,13 +498,20 @@ pub async fn account_balances(
             account,
             money,
             span: open_spans.get(&(account, money.currency())).copied(),
+            // The owner's statement travels with the figure, and nothing acts
+            // on it: the entry exists because the balance is negative, and it
+            // would exist unchanged if he had said nothing.
+            expectation: expectations.get(&account).copied(),
         })
         .collect();
-    Ok(BalancesReport {
-        accounts: rows,
-        negative_cash,
-        population,
-    })
+    Ok((
+        BalancesReport {
+            accounts: rows,
+            negative_cash,
+            population,
+        },
+        prices,
+    ))
 }
 
 /// What §11 says about one account's period reports.

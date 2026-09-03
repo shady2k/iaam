@@ -12403,6 +12403,67 @@ async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_i
     );
 }
 
+/// A count is named as a count, so no client reads it as the list beside it.
+///
+/// `rows` sat next to `questions`, which is a list of the same per-row shape,
+/// and an external agent wrote `len(rows)` against it twice. The count is now
+/// `row_count` in both places that publish one — the session's contents and the
+/// assessment's source inventory — and the word `rows` appears in neither,
+/// because a name a client can be wrong about is what caused the mistake.
+#[tokio::test]
+async fn a_session_publishes_its_row_count_under_a_name_no_client_can_index() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "counted-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session identifier")
+        .to_owned();
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(contents["row_count"], 1, "{contents}");
+    assert!(
+        contents.get("rows").is_none(),
+        "a count must not answer to the name of the list it sits beside: {contents}"
+    );
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["source_inventory"]["row_count"], 1, "{plan}");
+    assert!(
+        plan["source_inventory"].get("rows").is_none(),
+        "the inventory's count sits between two lists and must not read as a third: {plan}"
+    );
+}
+
 /// The answer is a durable rule, and what the rule makes durable is **what the
 /// row is** — not which way the next one runs.
 ///
@@ -13412,7 +13473,7 @@ async fn an_assessment_says_what_the_import_will_and_will_not_record() {
     .await;
     assert_eq!(status, StatusCode::OK, "{plan}");
 
-    assert_eq!(plan["source_inventory"]["rows"], 2, "{plan}");
+    assert_eq!(plan["source_inventory"]["row_count"], 2, "{plan}");
     assert_eq!(
         plan["source_inventory"]["accounts"]
             .as_array()

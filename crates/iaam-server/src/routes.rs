@@ -3460,7 +3460,7 @@ pub async fn abandon_import_session(
 fn session_contents_dto(contents: &SessionContents) -> ImportSessionContentsDto {
     ImportSessionContentsDto {
         session: ImportSessionDto::from_domain(&contents.session),
-        rows: contents.observations.len(),
+        row_count: contents.observations.len(),
         questions: contents
             .questions
             .iter()

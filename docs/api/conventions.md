@@ -91,6 +91,21 @@ that no item can carry, and the honest answer for this route was no. A
 something that moves and published everywhere `ActionDto` is published — not
 beside one of the four.
 
+### 1.4b A count is named as a count
+
+Where a response does publish a count — because the thing counted is not in the
+response and the client therefore cannot count it — the field is named so that it
+cannot be read as a list. `ImportSessionContentsDto.row_count` and
+`SourceInventoryDto.row_count` are both `row_count` and not `rows`, and the
+suffix was bought with a client's mistake: `rows` sat beside `questions`, a list
+of one-row-shaped items, and an external agent wrote `len(rows)` against it twice
+before reading the field description.
+
+The rule has a companion in §1.3: `rows` is the right name for a list of rows,
+and `POST /v1/import-sessions/{session}/commit` uses it for exactly that. One
+word cannot be both, and the count is the one that gives way — a client that
+indexes into a list it was given is doing the ordinary thing.
+
 ### 1.5 What this means when a new list route is added
 
 Decide the shape when the route is published, because it cannot be changed
@@ -132,7 +147,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/reconciliation` | `ReconciliationResponseDto` | object, `statuses` | three lists — `statuses`, `gaps`, `actions` — none of them a property of another's rows |
 | `GET /v1/transfer-pairings` | `CrossSourceMatchingDto` | object, `candidates` | `without_counterpart` — the legs nothing paired with, which no candidate can carry |
 | `GET /v1/accounts/{id}/transfer-partners` | `AccountTransferPartnersDto` | object, `partners` | `stated` — whether the owner has ruled at all, which an empty array cannot say |
-| `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, and how many questions are unanswered |
+| `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, `row_count`, and how many questions are unanswered |
 | `GET /v1/reports/balances` | `BalancesReportDto` | object, `accounts` | `negative_cash`, `population` |
 | `GET /v1/reports/returns` | `ReturnsAnswerDto` | object | not a list at the top level; `population` sits beside the report's own figures |
 | `GET /v1/reports/flow` | `MoneyFlowReportDto` | object, `currencies` | the interval, the scope version, `population`, `actions` |

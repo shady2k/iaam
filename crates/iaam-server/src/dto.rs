@@ -7305,7 +7305,21 @@ pub struct ImportSessionContentsDto {
     #[serde(flatten)]
     pub session: ImportSessionDto,
     /// How many rows are held, conclusive and observed together.
-    pub rows: usize,
+    ///
+    /// `row_count` and not `rows`, and the suffix is the whole point: a plural
+    /// noun standing beside `questions`, which is a list of one row's worth of
+    /// thing each, reads as the list of rows — an external client wrote
+    /// `len(rows)` against it twice before reading this sentence. A name a
+    /// client can be wrong about is worse than an ugly one it cannot.
+    ///
+    /// The rows themselves are deliberately not published here. They are
+    /// published, per row and with what each would become, by
+    /// `GET /v1/import-sessions/{session}/assessment`, and that route computes
+    /// them by planning the commit. A second rendering built from the stored
+    /// observations alone would call a row `held` that the assessment calls
+    /// unreadable, and two readings of one session that can disagree is the
+    /// defect the single-planner design exists to prevent.
+    pub row_count: usize,
     /// Every question, answered and unanswered.
     pub questions: Vec<ImportQuestionDto>,
     /// How many are still waiting on the owner. Commit refuses while this is
@@ -7508,7 +7522,10 @@ pub struct SourceInventoryDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import: Option<Uuid>,
     pub documents: Vec<String>,
-    pub rows: usize,
+    /// How many rows the session holds. A count, named so that it cannot be
+    /// read as the list it sits between — `documents` above it and `accounts`
+    /// below it are both lists, and `rows` between them read as a third.
+    pub row_count: usize,
     #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = Date)]
     pub period_from: Option<Date>,
@@ -7765,7 +7782,7 @@ impl ImportPlanDto {
                 source: plan.source_inventory.source.map(|id| id.inner()),
                 import: plan.source_inventory.import.map(|id| id.inner()),
                 documents: plan.source_inventory.documents.clone(),
-                rows: plan.source_inventory.rows,
+                row_count: plan.source_inventory.rows,
                 period_from: plan.source_inventory.period.map(|(from, _)| from),
                 period_to: plan.source_inventory.period.map(|(_, to)| to),
                 accounts: plan

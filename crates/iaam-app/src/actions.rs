@@ -433,68 +433,13 @@ pub struct RequestPlan {
 }
 
 /// A symbolic operation identifier resolved by a transport layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperationKey {
-    CreateAccount,
-    /// Create a contour. It creates one and only one: an existing contour is
-    /// versioned through [`Self::AddContourVersion`], and the two are separate
-    /// keys because they were one route, where omitting the identifier meant
-    /// «mint a fresh perimeter» and produced one for an owner who wanted a
-    /// second bank inside the perimeter he already had.
-    CreateContour,
-    /// Add a version to a contour that exists, naming it in the path.
-    AddContourVersion,
-    RecordOwnerBalance,
-    CreateCategoryRule,
-    /// Record the owner's statement about one account's transfer partners.
-    RecordAccountTransferPartners,
-    /// Rule an account outside the reporting perimeter, with a reason.
-    ///
-    /// The half of the scope decision that a contour cannot express: membership
-    /// is a contour's composition, and «this account is deliberately not in any
-    /// of them» is a fact about the account itself.
-    RecordAccountScope,
-    /// Open the import session a document's rows are held in before commit.
-    ///
-    /// The first of the two ways into an account that holds nothing, and the one
-    /// that takes a statement the owner fetched himself.
-    OpenImportSession,
-    /// Synchronise one broker channel over an interval.
-    ///
-    /// The second, and the only one that needs no document: the channel fetches
-    /// and records in a single call, which is why it is a remedy entire rather
-    /// than the first step of one.
-    SyncBroker,
-    /// Answer one classification question held open by an import session.
-    AnswerImportQuestion,
-    /// Retract or supersede events the owner names, one correction fact each.
-    ///
-    /// The only operation that acts on a reconciliation discrepancy, and it acts
-    /// on both of its sides: `ReconciliationLedger::build_with` resolves
-    /// corrections before it collects assertion groups, so retracting a
-    /// `ControlAssertion` removes the claim, and `observe` runs over the same
-    /// effective set, so superseding a journal event changes what was observed.
-    SubmitCorrections,
-}
-impl OperationKey {
-    /// The route operation identifier declared by the transport.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::CreateAccount => "create_account",
-            Self::CreateContour => "create_contour_version",
-            Self::AddContourVersion => "add_contour_version",
-            Self::RecordOwnerBalance => "record_owner_balance",
-            Self::CreateCategoryRule => "create_category_rule",
-            Self::RecordAccountTransferPartners => "record_account_transfer_partners",
-            Self::RecordAccountScope => "record_account_scope",
-            Self::OpenImportSession => "open_import_session",
-            Self::SyncBroker => "sync_broker",
-            Self::AnswerImportQuestion => "answer_import_question",
-            Self::SubmitCorrections => "submit_corrections",
-        }
-    }
-}
+///
+/// Re-exported rather than declared here. The vocabulary moved to the core when
+/// the caveat register in `iaam_core::report::confidence` began naming the
+/// operations that close its entries: the queue and the register must point at
+/// the same set of calls, and two lists that must agree are a list that will not.
+/// Every path that named `iaam_app::actions::OperationKey` still resolves.
+pub use iaam_core::operation::OperationKey;
 
 /// One admissible way to close an action: an operation and the call that ends it.
 ///

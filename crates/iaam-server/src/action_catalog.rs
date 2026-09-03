@@ -69,20 +69,14 @@ impl ActionCatalog {
             }
         }
 
+        // The whole vocabulary, not a list repeated here. A key left out of a
+        // hand-written list resolves to nothing, and [`Self::operation`] would
+        // find that out at the moment a caller asked for it rather than at
+        // start-up — which now matters to more than the queue: a caveat names
+        // its remedy by the same key, and a report pointing at an unresolvable
+        // call is exactly the drift this catalogue exists to refuse.
         let mut operations = BTreeMap::new();
-        for key in [
-            OperationKey::CreateAccount,
-            OperationKey::CreateContour,
-            OperationKey::AddContourVersion,
-            OperationKey::RecordOwnerBalance,
-            OperationKey::CreateCategoryRule,
-            OperationKey::RecordAccountTransferPartners,
-            OperationKey::RecordAccountScope,
-            OperationKey::OpenImportSession,
-            OperationKey::SyncBroker,
-            OperationKey::AnswerImportQuestion,
-            OperationKey::SubmitCorrections,
-        ] {
+        for key in OperationKey::ALL {
             let operation_id = key.as_str();
             let Some((path, method, operation)) = by_id.get(operation_id) else {
                 return Err(ActionCatalogError::MissingActionOperation {
@@ -108,7 +102,13 @@ impl ActionCatalog {
         Ok(Self { operations })
     }
 
-    /// Return the route address for an action operation.
+    /// Return the route address for an operation.
+    ///
+    /// Total, and it is [`Self::from_openapi`] that makes it so: every
+    /// [`OperationKey`] is registered or the build fails, so a key that reaches
+    /// here has an address. The index is deliberate — a lookup returning
+    /// `Option` would invite a caller to publish an item with the address
+    /// silently missing.
     #[must_use]
     pub fn operation(&self, key: OperationKey) -> &ActionOperation {
         &self.operations[key.as_str()]

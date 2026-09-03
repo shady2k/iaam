@@ -126,6 +126,50 @@ pub(super) fn statuses_for_account(
         .collect()
 }
 
+/// Parser version stamped on every fact the owner states about a balance.
+///
+/// Named rather than spelled inline because two things depend on the value: the
+/// provenance below, and [`SourceChannel::is_independent_of`], which is the
+/// reason it matters at all — see [`OWNER_STATED_CHANNEL`].
+///
+/// [`SourceChannel::is_independent_of`]: iaam_core::reconciliation::evidence::SourceChannel::is_independent_of
+pub const OWNER_STATED_PARSER_VERSION: &str = "owner-stated/1";
+
+/// Channel the owner's own statement about a balance arrives through.
+///
+/// The owner saying what he holds is a channel beside `file`, `paste` and
+/// `correction`, not one of them: he did not read the figure out of a document
+/// this system parsed, and sharing a source with one would make his word and
+/// the document's word one source.
+///
+/// **Why the source is derived and not minted.** Every call used to mint
+/// `SourceId::new_random()`. Since the idempotency key gained the balance
+/// point, an opening claim and a closing claim for one account and period are
+/// two separate calls and therefore two events — and under a per-call source
+/// they became two `StatementGroup`s where they are one statement about one
+/// interval.
+///
+/// Nothing visibly broke, and the reason is narrow. Evidence 3 needs two
+/// channels that [`SourceChannel::is_independent_of`], which demands a
+/// differing parser version **and** a differing document; every event written
+/// here carries [`OWNER_STATED_PARSER_VERSION`], so no two of them are ever
+/// independent and the owner cannot corroborate himself. That is a guard
+/// standing one condition away from failing: give owner-stated facts a second
+/// parser version, or relax the independence rule, and an owner restating a
+/// balance starts confirming it. Deriving the source closes it structurally
+/// instead — the owner's word about one account is one source, so one period
+/// holds one group of it and there is no pair to compare.
+///
+/// **Keyed on the account and not on the period.** A source answers «where do
+/// these rows come from», and the answer is the same in March as in April; the
+/// period is already carried by the assertion itself, and grouping separates by
+/// it. Putting the period in the key would mint a source per month, which is
+/// the shape [`ImportId`] exists to express and [`SourceId`] exists not to.
+///
+/// [`SourceChannel::is_independent_of`]: iaam_core::reconciliation::evidence::SourceChannel::is_independent_of
+/// [`ImportId`]: iaam_core::ids::ImportId
+pub const OWNER_STATED_CHANNEL: &str = "owner-stated";
+
 /// Version of the owner-stated idempotency key form.
 ///
 /// Part of the key itself, as `CANONICAL_VERSION` is part of the ingest
@@ -194,8 +238,10 @@ pub async fn record_owner_balance(
             actual: principal.scope.code().to_owned(),
         });
     }
-    let source = SourceId::new_random();
-    let parser_version = ParserVersion("owner-stated/1".to_owned());
+    // Derived, not minted: see `OWNER_STATED_CHANNEL` for what a per-call
+    // source cost and for why the account is the whole of the key.
+    let source = SourceId::declared(principal.owner, balance.account, OWNER_STATED_CHANNEL);
+    let parser_version = ParserVersion(OWNER_STATED_PARSER_VERSION.to_owned());
     let provenance = Provenance::new(source, balance.raw_hash, parser_version);
     let mut claims = Vec::new();
     if let Some((currency, amount)) = balance.cash {

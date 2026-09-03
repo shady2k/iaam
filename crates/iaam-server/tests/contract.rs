@@ -3268,7 +3268,9 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    let statuses = response.as_array().expect("reconciliation statuses");
+    let statuses = response["statuses"]
+        .as_array()
+        .expect("reconciliation statuses");
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
     assert_eq!(statuses[0]["dimensions"][0]["dimension"], "cash");
@@ -3280,6 +3282,97 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
     );
     drop(harness);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The verdict is the half of the answer the statuses cannot give.
+///
+/// A status is about a dimension over a period. It reads identically whether
+/// this call wrote the claim, found it already written, or — as in iaam-ihyi —
+/// deduplicated it against a different claim entirely. The route used to answer
+/// with the statuses alone, so a claim that never reached the journal was
+/// reported exactly as one that did.
+#[tokio::test]
+async fn a_recorded_balance_says_whether_the_claim_reached_the_journal() {
+    let harness = harness();
+    let claim = json!({
+        "account": harness.account.inner(),
+        "from": "2026-08-01",
+        "to": "2026-08-31",
+        "at": "closing",
+        "cash": { "currency": "RUB", "amount": "100.00" },
+    });
+
+    let (status, first) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &claim),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let written = first["control_assertions"]
+        .as_array()
+        .expect("one entry per claim the request stated");
+    assert_eq!(written.len(), 1, "{first}");
+    assert_eq!(written[0]["outcome"], "inserted", "{first}");
+    let event = written[0]["event"].as_str().expect("the event written");
+    assert!(first["statuses"].is_array(), "{first}");
+
+    // Restating the same claim is one fact, not two, and the honest answer is
+    // that it was already held — not an error, and not silence.
+    let (status, again) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &claim),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    let repeated = again["control_assertions"]
+        .as_array()
+        .expect("one entry per claim the request stated");
+    assert_eq!(repeated.len(), 1, "{again}");
+    assert_eq!(repeated[0]["outcome"], "duplicate", "{again}");
+    assert_eq!(
+        repeated[0]["event"], event,
+        "a duplicate names the event it repeats: {again}"
+    );
+}
+
+/// One entry per claim, in the order the request stated them.
+///
+/// The opening and closing claims of one account and period are two facts, and
+/// iaam-ihyi is the wave in which they were one. The verdicts are what a client
+/// can read that against: two `inserted` entries naming two different events.
+#[tokio::test]
+async fn an_opening_and_a_closing_claim_are_two_written_facts() {
+    let harness = harness();
+    let mut written = Vec::new();
+    for at in ["opening", "closing"] {
+        let (status, response) = call(
+            &harness.router,
+            post(
+                "/v1/reconciliation/balance",
+                &harness.owner_token,
+                &json!({
+                    "account": harness.account.inner(),
+                    "from": "2026-08-01",
+                    "to": "2026-08-31",
+                    "at": at,
+                    "cash": { "currency": "RUB", "amount": "100.00" },
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{at}: {response}");
+        let entries = response["control_assertions"]
+            .as_array()
+            .expect("one entry per claim")
+            .clone();
+        assert_eq!(entries.len(), 1, "{at}: {response}");
+        assert_eq!(entries[0]["outcome"], "inserted", "{at}: {response}");
+        written.push(entries[0]["event"].as_str().expect("event id").to_owned());
+    }
+    assert_ne!(
+        written[0], written[1],
+        "the opening and the closing claim are two events"
+    );
 }
 
 /// A coverage gap is written by the broker sync path before any assertion is

@@ -6141,6 +6141,49 @@ pub struct ReconciliationStatusDto {
     pub taints: Vec<TaintDto>,
 }
 
+/// What recording an owner-stated balance wrote, and the statuses it changed.
+///
+/// An object rather than the bare array of statuses this route used to answer
+/// with, under `docs/api/conventions.md` §1: whether the claim reached the
+/// journal or was already held there is a fact about the whole write, and no
+/// status row can carry it. A status is about a dimension over a period, and it
+/// reads the same whether this call inserted the claim, found it already
+/// written, or recorded nothing at all.
+///
+/// The blindness that fact hid is on record. A colliding idempotency key made a
+/// closing claim deduplicate against an opening one; the closing figure never
+/// reached the journal, and the response was a list of statuses with a
+/// `200 OK` — which is what it would have been had the claim been written. The
+/// key names the claim now, so that collision cannot recur; publishing the
+/// verdicts is the other half, because a caller that cannot tell `inserted`
+/// from `duplicate` cannot detect the next collision either.
+///
+/// `duplicate` is not a failure. Restating a claim already stated is one fact,
+/// not two, and answering an honest resubmission with an error would push a
+/// client towards varying its `source_hash` until something changed — the
+/// opposite of what deduplication is for. The verdict is published so the
+/// client knows which happened, not so it can treat one as a refusal.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OwnerBalanceOutcomeDto {
+    /// One entry per claim the request stated, in the order the request stated
+    /// them: `cash` first where it was given, then `positions` in the order
+    /// they were sent.
+    ///
+    /// The caller composed the batch, so the position ties each verdict back to
+    /// the claim it answers — the same reasoning that makes every other batch
+    /// response a list in the caller's own order.
+    ///
+    /// `control_assertions` and not `recorded`, and the same type
+    /// [`ImportCommitDto::control_assertions`] uses, because it is the same
+    /// thing: the control-assertion events a write produced or found already
+    /// written. `SyncOutcomeDto.recorded` is a list of [`VerdictDto`], and one
+    /// word standing for two item shapes is a word a client reads wrong once.
+    pub control_assertions: Vec<RecordedEventDto>,
+    /// The reconciliation statuses for the account and period, as they stand
+    /// after the write.
+    pub statuses: Vec<ReconciliationStatusDto>,
+}
+
 /// Reconciliation statuses and every effective coverage gap in the requested range.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ReconciliationResponseDto {

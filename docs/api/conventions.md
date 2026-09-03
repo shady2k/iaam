@@ -155,7 +155,7 @@ things. Read it as the lookup table for §1.
 | `POST /v1/ingest/journal-events` | `[VerdictDto]` | bare array | one verdict per submitted row |
 | `POST /v1/ingest/csv` | `[VerdictDto]` | bare array | one verdict per parsed row |
 | `POST /v1/corrections` | `[VerdictDto]` | bare array | one verdict per submitted correction |
-| `POST /v1/reconciliation/balance` | `[ReconciliationStatusDto]` | bare array | the statuses the balance changed |
+| `POST /v1/reconciliation/balance` | `OwnerBalanceOutcomeDto` | object, `statuses` | `control_assertions` — whether each claim reached the journal or was already held there, which no status row can say |
 | `POST /v1/import-sessions/{session}/rows` | `[ImportRowDto]` | bare array | one outcome per fed row; nothing was recorded |
 | `POST /v1/documents` | `DocumentDto` | object, `rows` | the document hash, source, parser version and period |
 | `POST /v1/brokers/{broker}/sync` | `SyncOutcomeDto` | object, `recorded` | the duplicate and assertion counts for the run, and `actions` |

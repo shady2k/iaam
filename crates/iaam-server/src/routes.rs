@@ -105,6 +105,10 @@ use crate::dto::{
     ImportRowDto, ImportSessionContentsDto, ImportSessionDto, OpenImportSessionRequest,
     RecordedEventDto, StateImportControlFiguresRequest,
 };
+// Types added by wave K, in a block of their own for the reason the block above
+// states: this file is edited by several changes at once, and merging one name
+// into a wrapped list reflows lines nothing else touched.
+use crate::dto::OwnerBalanceOutcomeDto;
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
@@ -755,7 +759,7 @@ pub async fn reconciliation(
     operation_id = RECORD_OWNER_BALANCE_OPERATION_ID,
     request_body = OwnerBalanceRequest,
     responses(
-        (status = 200, description = "Updated statuses", body = Vec<ReconciliationStatusDto>),
+        (status = 200, description = "What the claim wrote, and the updated statuses", body = OwnerBalanceOutcomeDto),
         (status = 403, description = "Owner only", body = ApiError),
         (status = 422, description = "Invalid balance", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
@@ -768,7 +772,7 @@ pub async fn reconciliation_balance(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<OwnerBalanceRequest>,
-) -> Result<Json<Vec<ReconciliationStatusDto>>, ApiFailure> {
+) -> Result<Json<OwnerBalanceOutcomeDto>, ApiFailure> {
     require_admin(&principal)?;
     let period = AssertionPeriod::between(request.from, request.to).ok_or_else(|| {
         invalid_field(
@@ -815,7 +819,10 @@ pub async fn reconciliation_balance(
     let raw_hash = request.source_hash.unwrap_or_else(|| "0".repeat(64));
     let raw_hash = iaam_core::event::provenance::RawHash::parse(&raw_hash)
         .ok_or_else(|| invalid_field("source_hash", "64 hex-characters", raw_hash))?;
-    let _ = record_owner_balance(
+    // The verdicts are the answer's own half. Discarding them is how a claim
+    // that deduplicated against another one looked exactly like a claim that
+    // was written: the statuses below are computed from the journal either way.
+    let recorded = record_owner_balance(
         &state.services,
         &principal,
         OwnerBalance {
@@ -836,9 +843,10 @@ pub async fn reconciliation_balance(
         period.to,
     )
     .await?;
-    Ok(Json(
-        statuses.iter().map(reconciliation_status_dto).collect(),
-    ))
+    Ok(Json(OwnerBalanceOutcomeDto {
+        control_assertions: recorded.iter().map(RecordedEventDto::from_domain).collect(),
+        statuses: statuses.iter().map(reconciliation_status_dto).collect(),
+    }))
 }
 
 /// Active and retired classification rules.

@@ -7310,6 +7310,23 @@ pub struct JournalEventReadDto {
     /// The description or counterparty the source printed on the row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The import session this fact was committed out of.
+    ///
+    /// The act that put the row here, not merely the place it came from.
+    /// `source` says which channel of which account produced it and covers
+    /// every import that ever arrived that way; this names the one submission,
+    /// and it is an address: `GET /v1/import-sessions/{session}` returns the
+    /// rows that were held, the questions that were answered and the control
+    /// figures the source printed, and `?import_session=` on this same route
+    /// returns exactly the facts that commit wrote.
+    ///
+    /// Absent for every fact that reached the journal without a session —
+    /// `POST /v1/ingest/operations`, a broker synchronisation, a correction —
+    /// and for every fact recorded before the field existed. The two are not
+    /// distinguishable, so absence is «no session is recorded», never «no
+    /// session exists».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_session: Option<Uuid>,
 }
 
 /// The semantic dates a journal event carries. Absent means unknown, which is
@@ -7499,6 +7516,7 @@ impl JournalEventReadDto {
             source_operation_id: view.source_operation_id.clone(),
             source_category: view.source_category.clone(),
             description: view.description.clone(),
+            import_session: view.import_session.map(|session| session.inner()),
         }
     }
 }

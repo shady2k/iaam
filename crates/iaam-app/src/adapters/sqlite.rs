@@ -405,6 +405,7 @@ impl Store for SqliteAdapter {
             idempotency_key: query.idempotency_key,
             account: query.account,
             source: query.source,
+            import_session: query.import_session,
             from: query.from,
             to: query.to,
             after: query.after.map(|cursor| StoredJournalCursor {

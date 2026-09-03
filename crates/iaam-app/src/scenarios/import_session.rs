@@ -211,7 +211,12 @@ pub async fn submit_intake(
             })
         })
         .collect();
-    let mut recorded = submit_candidates(services, principal, "operation", candidates)
+    // No session, even where one was opened above. A session was opened only to
+    // hold the rows this batch could **not** settle; these are the ones it
+    // could, and they reach the journal without ever having been in it.
+    // Stamping the session on them would say the commit wrote what the
+    // conclusive route did.
+    let mut recorded = submit_candidates(services, principal, "operation", None, candidates)
         .await?
         .into_iter();
 
@@ -875,7 +880,14 @@ pub async fn commit_session(
         return Err(refusal);
     }
 
-    let verdicts = submit_candidates(services, principal, "operation", planned.candidates).await?;
+    let verdicts = submit_candidates(
+        services,
+        principal,
+        "operation",
+        Some(session),
+        planned.candidates,
+    )
+    .await?;
     // The assertions go in **after** the rows, and the order is not arbitrary:
     // an assertion is a statement about a period, and one written over a journal
     // that does not yet hold the period's rows is a discrepancy against an empty
@@ -2017,6 +2029,13 @@ fn control_assertion_key(
 /// never sees the file — it receives rows and figures over HTTP — and a
 /// fabricated file hash would be a claim about a document nobody read.
 ///
+/// The session is stamped on the assertion as it is on the rows, and it names
+/// the session that **wrote** it. [`control_assertion_key`] deliberately keeps
+/// the session out of the key, so a second import of the same statement states
+/// the same fact and deduplicates against the first; the assertion in the
+/// journal therefore names the session that first recorded the figure, which is
+/// the act that put it there.
+///
 /// [`ControlClaim::CashBalance`]: iaam_core::reconciliation::claim::ControlClaim::CashBalance
 /// [`ControlClaim::CashTurnover`]: iaam_core::reconciliation::claim::ControlClaim::CashTurnover
 fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event::Event> {
@@ -2052,7 +2071,8 @@ fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event
             source,
             section_hash(section),
             ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
-        );
+        )
+        .with_import_session(plan.session.id);
         for claim in claims {
             events.push(iaam_core::event::Event {
                 id: EventId::new_random(),

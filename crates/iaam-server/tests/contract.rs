@@ -9212,6 +9212,115 @@ async fn the_journal_narrows_by_the_source_the_caller_declared() {
     assert_eq!(body["code"], "invalid_request");
     assert_eq!(body["field"], "source_channel");
 }
+/// A figure leads back to the act that produced it, not merely to its source.
+///
+/// The declared source answers «which channel of which account», and covers
+/// every import that ever arrived that way. This is the question the owner
+/// actually asks when a figure surprises him — *which import put this here* —
+/// and until the session was stamped on the fact nothing in the journal could
+/// answer it: the import label is derived from the declaration, one label opens
+/// a new session every time it is committed and declared again, and a row
+/// carrying a label need never have passed through a session at all.
+#[tokio::test]
+async fn a_journal_row_names_the_import_session_that_committed_it() {
+    let harness = harness();
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "1000.00",
+        "2026-03-01",
+        "straight-to-the-journal",
+        Some("file"),
+    )
+    .await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({
+                "source": {
+                    "account": harness.account.inner(),
+                    "channel": "file",
+                    "label": "march",
+                },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": "2000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-03-02" },
+                    "idempotency_key": "committed-by-a-session",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    // Both rows arrived through one declared source, so the source cannot tell
+    // them apart. The session can.
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    let by_key = |key: &str| {
+        rows.iter()
+            .find(|row| row["idempotency_key"] == key)
+            .unwrap_or_else(|| panic!("{key} is in the journal: {page}"))
+            .clone()
+    };
+    assert_eq!(
+        by_key("committed-by-a-session")["import_session"],
+        id,
+        "the fact names the act that admitted it: {page}"
+    );
+    assert!(
+        by_key("straight-to-the-journal")
+            .get("import_session")
+            .is_none(),
+        "a row that passed through no session invents none: {page}"
+    );
+
+    let narrowed = format!("/v1/journal/events?import_session={id}");
+    let (status, page) = call(&harness.router, get(&narrowed, Some(&harness.agent_token))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["idempotency_key"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("committed-by-a-session")],
+        "the filter answers what that one import put in: {page}"
+    );
+}
 #[tokio::test]
 async fn the_journal_lists_without_any_narrowing() {
     // Reading the list is not a privilege beyond reading the aggregates: every

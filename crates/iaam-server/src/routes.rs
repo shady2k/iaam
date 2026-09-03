@@ -4198,6 +4198,12 @@ pub struct JournalParams {
     /// Channel of the declared source: `file`, `paste`, `manual`.
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// The import session whose commit wrote the rows. Narrower than the
+    /// declared source, which covers every import that came through one
+    /// channel: this names one act of importing, and it is the identifier
+    /// `POST /v1/import-sessions` returned and every row here carries back.
+    #[serde(default)]
+    pub import_session: Option<Uuid>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.
     #[serde(default)]
     #[param(value_type = Option<String>, format = Date)]
@@ -4265,6 +4271,7 @@ pub async fn list_journal_events(
             idempotency_key: params.idempotency_key,
             account: params.account.map(AccountId),
             source,
+            import_session: params.import_session.map(ImportSessionId),
             from,
             to,
             after: params.after,

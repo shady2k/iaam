@@ -82,13 +82,14 @@ use crate::dto::{
     ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
     ContourVersionDto, CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
-    ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto,
-    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
-    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
-    MoneyFlowReportDto, NegativeBalanceExpectationDto, OwnerBalanceRequest, QuotationBasisDto,
-    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
-    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
+    CustodyRepairRequest, DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams,
+    FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto,
+    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
+    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
+    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
+    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
+    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
     RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
     ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
     ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
@@ -639,8 +640,11 @@ pub async fn correct_import(
     let request: CorrectImportRequest = serde_json::from_slice(&body).map_err(|error| {
         invalid_field("body", "import correction JSON object", error.to_string())
     })?;
-    let source = declared_source(principal.owner, &request.source)?;
-    let target = match declared_import(principal.owner, &request.source)? {
+    let account = declared_account(&state, &principal, &request.source)
+        .await?
+        .id;
+    let source = declared_source(principal.owner, account, &request.source)?;
+    let target = match declared_import(principal.owner, account, &request.source)? {
         Some(import) => ImportTarget::Named { source, import },
         None => ImportTarget::Unnamed { source },
     };
@@ -2886,10 +2890,17 @@ pub async fn ingest_operations(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let (source, import) = match &request.source {
-        Some(declared) => (
-            declared_source(principal.owner, declared)?,
-            declared_import(principal.owner, declared)?,
+    let declared = match &request.source {
+        Some(declared) => Some((
+            declared,
+            declared_account(&state, &principal, declared).await?.id,
+        )),
+        None => None,
+    };
+    let (source, import) = match declared {
+        Some((declared, account)) => (
+            declared_source(principal.owner, account, declared)?,
+            declared_import(principal.owner, account, declared)?,
         ),
         // No declaration: today's behaviour, so existing callers keep working.
         None => (SourceId::new_random(), None),
@@ -2902,12 +2913,17 @@ pub async fn ingest_operations(
     // account contradicts the declaration the caller made over all of them,
     // and writing the agreeing half would leave a half-import recorded under
     // an identity that names the wrong account.
-    if let Some(declared) = &request.source {
+    //
+    // The comparison is against the account the declaration **resolved** to,
+    // not against the text it was written as: a caller may declare the batch by
+    // the number its bank prints, and the rows still name the account by its
+    // iaam identifier, which is the one thing both sides can agree on.
+    if let Some((_, account)) = declared {
         for (index, operation) in request.operations.iter().enumerate() {
-            if operation.account != declared.account {
+            if operation.account != account.inner() {
                 return Err(invalid_field(
                     format!("operations[{index}].account"),
-                    &declared.account.to_string(),
+                    &account.inner().to_string(),
                     operation.account.to_string(),
                 ));
             }
@@ -2972,6 +2988,13 @@ fn intake_verdict_dto(row: usize, outcome: &IntakeOutcome) -> VerdictDto {
 // ---------------------------------------------------------------------------
 
 /// Open an import session.
+///
+/// The declared account may be named by its iaam identifier or by the identifier
+/// its source prints for it — its `provider_account_id`, or one of its aliases,
+/// a card among them. An identifier two accounts answer to is refused rather
+/// than guessed at, and the refusal names both. The response carries the account
+/// the declaration resolved to, and that identifier is the one the rows of this
+/// session must name.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions",
@@ -2994,12 +3017,16 @@ pub async fn open_import_session(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let (source, import) = match &request.source {
-        Some(declared) => (
-            Some(declared_source(principal.owner, declared)?),
-            declared_import(principal.owner, declared)?,
-        ),
-        None => (None, None),
+    let (account, source, import) = match &request.source {
+        Some(declared) => {
+            let account = declared_account(&state, &principal, declared).await?;
+            (
+                Some(account.clone()),
+                Some(declared_source(principal.owner, account.id, declared)?),
+                declared_import(principal.owner, account.id, declared)?,
+            )
+        }
+        None => (None, None, None),
     };
     let session = iaam_app::scenarios::import_session::open_session(
         &state.services,
@@ -3010,7 +3037,19 @@ pub async fn open_import_session(
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(ImportSessionDto::from_domain(&session)),
+        Json(ImportSessionDto {
+            // The account goes back with the session, and only here: this is the
+            // one response that holds it, and the rows the caller is about to
+            // send have to name it. Without it a caller that declared the batch
+            // by the number its statement prints would have to go and read the
+            // directory anyway — the very read this declaration removed.
+            account: account.map(|account| DeclaredAccountDto {
+                id: account.id.inner(),
+                title: account.title,
+                institution: account.institution,
+            }),
+            ..ImportSessionDto::from_domain(&session)
+        }),
     ))
 }
 
@@ -4176,14 +4215,38 @@ fn declared_channel(declared: &DeclaredSourceDto) -> Result<&str, ApiFailure> {
 /// needs is [`declared_import`], beside this and not inside it.
 fn declared_source(
     owner: iaam_core::ids::OwnerId,
+    account: AccountId,
     declared: &DeclaredSourceDto,
 ) -> Result<SourceId, ApiFailure> {
     let channel = declared_channel(declared)?;
-    Ok(SourceId::declared(
-        owner,
-        AccountId(declared.account),
-        channel,
-    ))
+    Ok(SourceId::declared(owner, account, channel))
+}
+
+/// The account a declaration names, however it named it.
+///
+/// A thin wrapper over the scenario, and the wrapping is the point: the tiering
+/// that turns a printed identifier into one of the owner's accounts lives beside
+/// the one that does it for a row's counterparty, so a batch cannot be declared
+/// against one account while its rows resolve against another. The route holds
+/// no rule of its own about what a source's identifier means.
+///
+/// Every derivation below takes the resolved account rather than the
+/// declaration, so that the resolution happens exactly once per request: the
+/// source and the import are both keyed on it, and deriving it twice is how two
+/// keys for one import get written.
+async fn declared_account(
+    state: &ServerState,
+    principal: &Principal,
+    declared: &DeclaredSourceDto,
+) -> Result<AccountDetailView, ApiFailure> {
+    Ok(
+        iaam_app::scenarios::import_session::resolve_declared_account(
+            &state.services,
+            principal,
+            &declared.account,
+        )
+        .await?,
+    )
 }
 
 /// The import identity a declaration names, or `None` when it names no import.
@@ -4194,6 +4257,7 @@ fn declared_source(
 /// the wrong rows cannot be undone by re-sending them.
 fn declared_import(
     owner: iaam_core::ids::OwnerId,
+    account: AccountId,
     declared: &DeclaredSourceDto,
 ) -> Result<Option<ImportId>, ApiFailure> {
     let channel = declared_channel(declared)?;
@@ -4208,12 +4272,7 @@ fn declared_import(
             declared.label.clone().unwrap_or_default(),
         ));
     }
-    Ok(Some(ImportId::declared(
-        owner,
-        AccountId(declared.account),
-        channel,
-        label,
-    )))
+    Ok(Some(ImportId::declared(owner, account, channel, label)))
 }
 
 fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {

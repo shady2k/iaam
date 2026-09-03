@@ -12116,6 +12116,218 @@ async fn an_abandoned_import_session_writes_nothing_to_the_journal() {
     );
 }
 
+/// An import is declared by what the statement prints, and walks to a commit
+/// without the caller ever reading the directory.
+///
+/// This is the friction the route was reported for: opening a session used to
+/// cost a `GET /v1/accounts` and a client-side join, once per account in the
+/// export, before a single row could be sent. The account number is on the
+/// statement; iaam already stores it; so the declaration takes it, and hands
+/// back the identifier the rows need.
+#[tokio::test]
+async fn a_session_is_declared_by_the_identifier_the_source_prints() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "institution": "Bank One",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+    let before = journal_rows(&harness).await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": "acct-1", "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    assert_eq!(session["account"]["id"], created, "{session}");
+    assert_eq!(
+        session["account"]["title"], "Main",
+        "the identifier comes back with the owner's own name beside it, so the \
+         caller can see it reached the account it meant: {session}"
+    );
+    assert_eq!(session["account"]["institution"], "Bank One", "{session}");
+
+    // Nothing else in this test is written by hand: the account the rows name is
+    // the one the response just handed back.
+    let id = session["session"].as_str().expect("session").to_owned();
+    let account = session["account"]["id"].clone();
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-02" },
+                    "idempotency_key": "declared-by-identifier",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "held", "{rows}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert!(
+        journal_rows(&harness).await > before,
+        "the whole path was walked without a directory read: {committed}"
+    );
+}
+
+/// The identifier and iaam's own name for the account reach one session.
+///
+/// Two declarations of one import must not open two sessions holding half the
+/// answers each, and the source and import keys are derived from the resolved
+/// account — so a caller that switches vocabularies mid-import finds the session
+/// it already had.
+#[tokio::test]
+async fn a_declaration_by_identifier_and_by_uuid_reach_the_same_session() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+
+    let mut opened = Vec::new();
+    for named in [json!("acct-1"), json!(created)] {
+        let (status, session) = call(
+            &harness.router,
+            post(
+                "/v1/import-sessions",
+                &harness.owner_token,
+                &json!({ "source": { "account": named, "channel": "file", "label": "march" } }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{session}");
+        assert_eq!(session["account"]["id"], created, "{session}");
+        opened.push(session["session"].clone());
+    }
+    assert_eq!(
+        opened[0], opened[1],
+        "one import has one open session, however the account was named"
+    );
+}
+
+/// A card is an identifier too, and the interval on it does not gate the file.
+#[tokio::test]
+async fn a_session_is_declared_by_an_alias() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Savings",
+            "aliases": [{ "value": "card-one", "valid_from": "2024-01-01", "valid_to": "2025-03-01" }],
+        }),
+    )
+    .await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": "card-one", "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    assert_eq!(
+        session["account"]["id"], created,
+        "a declaration is about a file, not about a day: the interval decides on \
+         the rows, each against its own date: {session}"
+    );
+}
+
+/// Two accounts answering to one identifier are refused, not picked between.
+#[tokio::test]
+async fn an_ambiguous_declared_account_is_refused_and_the_refusal_says_why() {
+    let harness = harness();
+    let first = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "shared-1",
+        }),
+    )
+    .await;
+    let second = account_with(
+        &harness,
+        &json!({
+            "title": "Savings",
+            "aliases": [{ "value": "shared-1", "valid_from": "2024-01-01" }],
+        }),
+    )
+    .await;
+
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": "shared-1", "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    assert_eq!(refusal["code"], "invalid_request", "{refusal}");
+    assert_eq!(refusal["field"], "source.account", "{refusal}");
+    let actual = refusal["actual"].as_str().expect("what was ambiguous");
+    for named in [&first, &second, "Main", "Savings"] {
+        assert!(
+            actual.contains(named),
+            "the refusal must name what was ambiguous ({named}): {actual}"
+        );
+    }
+    assert!(
+        refusal["expected"]
+            .as_str()
+            .is_some_and(|expected| expected.contains("provider_account_id")),
+        "and what would disambiguate it: {refusal}"
+    );
+
+    let (status, sessions) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    assert!(
+        sessions.as_array().expect("sessions").is_empty(),
+        "a refused declaration opens nothing: {sessions}"
+    );
+}
+
 /// Commit refuses while a question is open, and writes once when it is answered.
 #[tokio::test]
 async fn a_session_commits_only_after_every_question_has_been_answered() {

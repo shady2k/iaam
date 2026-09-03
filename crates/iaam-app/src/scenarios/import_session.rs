@@ -282,6 +282,30 @@ async fn park(
 }
 
 /// Open a session the caller will feed itself.
+/// The account a batch declares, named the way its source names it.
+///
+/// The declaration used to take iaam's own account identifier and nothing else,
+/// which cost every caller a directory read and a join before it could open a
+/// session — four of them for an export holding four accounts, before a single
+/// row was sent. What a statement actually prints is an account number or a
+/// card, and the account already stores both (decision 0004), so this is the
+/// identifier the caller already has in front of it.
+///
+/// The tiering is [`AccountDirectory::resolve_declared`], which is the tiering
+/// the rows go through. Only the accounts are loaded: the statements and rules a
+/// [`Resolver`] also carries decide nothing about which account a printed string
+/// names, and loading them here would put a second, heavier read in front of
+/// every declaration for no answer.
+pub async fn resolve_declared_account(
+    services: &AppServices,
+    principal: &Principal,
+    printed: &str,
+) -> Result<AccountDetailView, AppError> {
+    AccountDirectory::load(services, principal.owner)
+        .await?
+        .resolve_declared(printed)
+}
+
 pub async fn open_session(
     services: &AppServices,
     principal: &Principal,
@@ -1024,7 +1048,11 @@ fn account_resolution(resolver: &Resolver, rows: &[ReadRow]) -> AccountResolutio
     let mut conflicting: Vec<String> = Vec::new();
     for read in rows {
         if let Some(account) = read.account() {
-            let known = resolver.accounts.iter().any(|held| held.id == account);
+            let known = resolver
+                .directory
+                .accounts
+                .iter()
+                .any(|held| held.id == account);
             let bucket = if known { &mut resolved } else { &mut missing };
             if !bucket.contains(&account) {
                 bucket.push(account);
@@ -1238,17 +1266,30 @@ enum Assessment {
     },
 }
 
+/// The owner's accounts, and the one place a printed identifier is turned into
+/// one of them.
+///
+/// The detailed view rather than the summary because resolution reads the
+/// identity a source prints and the aliases that reach the same account
+/// (decision 0004), and neither is on the summary view. `cash_class` travels
+/// with them and **nothing here reads it**: it is a grouping label for reports,
+/// and a classifier that branched on it is the failure decision 0004 asks a
+/// reviewer to check for.
+///
+/// Split out of [`Resolver`] so that the tiering below has exactly one
+/// implementation. A row's counterparty and a batch's declared account are the
+/// same question asked at two moments — «which of the owner's accounts does
+/// this printed string name» — and two implementations of it could come to
+/// disagree, which is how a batch gets declared against one account while its
+/// rows resolve against another.
+struct AccountDirectory {
+    accounts: Vec<AccountDetailView>,
+}
+
 /// The owner's accounts, his statements about them, and his rules, loaded once
 /// per batch.
-///
-/// `accounts` is the detailed view rather than the summary because resolution
-/// reads the identity a source prints and the aliases that reach the same
-/// account (decision 0004), and neither is on the summary view. `cash_class`
-/// travels with them and **nothing here reads it**: it is a grouping label for
-/// reports, and a classifier that branched on it is the failure decision 0004
-/// asks a reviewer to check for.
 struct Resolver {
-    accounts: Vec<AccountDetailView>,
+    directory: AccountDirectory,
     /// What the owner said about which of his accounts money moves between.
     ///
     /// Three states, and the absence of a view is one of them — see
@@ -1271,9 +1312,17 @@ impl Resolver {
             rules.push(crate::scenarios::classification::rule_from_view(rule)?);
         }
         Ok(Self {
-            accounts,
+            directory: AccountDirectory { accounts },
             statements,
             rules,
+        })
+    }
+}
+
+impl AccountDirectory {
+    async fn load(services: &AppServices, owner: OwnerId) -> Result<Self, AppError> {
+        Ok(Self {
+            accounts: services.store.list_account_details(owner).await?,
         })
     }
 
@@ -1337,6 +1386,82 @@ impl Resolver {
             .collect()
     }
 
+    /// The account a declaration names, or a refusal saying why it names none.
+    ///
+    /// The same tiering a row's counterparty goes through, and deliberately the
+    /// same call: a batch declared against the identifier a source prints must
+    /// land on the account its own rows land on, and the only way to guarantee
+    /// that is for one function to answer both.
+    ///
+    /// **No date is asked for, and an alias therefore matches over its whole
+    /// life.** A declaration is about a file, not about a day: the rows inside
+    /// it may span a card replacement, so requiring the identifier to be valid
+    /// on some particular date would refuse the very statement that shows the
+    /// change. The interval is still read where it can decide something — on
+    /// the rows, each against its own date.
+    ///
+    /// Two accounts is refused rather than picked between, exactly as
+    /// [`Resolver::resolve_counterparty`] refuses. The refusal names both the
+    /// identifier and the accounts it reached: an ambiguity the owner cannot
+    /// see is one he cannot clear.
+    fn resolve_declared(&self, printed: &str) -> Result<AccountDetailView, AppError> {
+        let matched = self.candidates(printed, None);
+        let [only] = matched[..] else {
+            return Err(AppError::Invalid {
+                // The pointer the caller sent it under. Every route reading a
+                // declaration spells it this way, beside `source.channel` and
+                // `source.label`, which are refused from the same object.
+                field: "source.account".to_owned(),
+                expected: if matched.is_empty() {
+                    "an account of the owner's, named by its iaam identifier or \
+                     by the identifier its source prints for it"
+                        .to_owned()
+                } else {
+                    "an identifier naming exactly one account: name one of them \
+                     by its iaam identifier, or give exactly one of them the \
+                     identifier this source prints (provider, provider_account_id)"
+                        .to_owned()
+                },
+                actual: if matched.is_empty() {
+                    format!("«{printed}» names none of the owner's accounts")
+                } else {
+                    format!(
+                        "«{printed}» names {} of the owner's accounts: {}",
+                        matched.len(),
+                        matched
+                            .iter()
+                            .map(|id| format!("{} ({})", self.title(*id), id.inner()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+            });
+        };
+        Ok(self
+            .accounts
+            .iter()
+            .find(|account| account.id == only)
+            .cloned()
+            .expect("a candidate comes from this directory"))
+    }
+
+    fn title(&self, account: AccountId) -> String {
+        self.accounts
+            .iter()
+            .find(|known| known.id == account)
+            .map_or_else(|| account.inner().to_string(), |known| known.title.clone())
+    }
+}
+
+impl Resolver {
+    fn candidates(&self, name: &str, on: Option<time::Date>) -> Vec<AccountId> {
+        self.directory.candidates(name, on)
+    }
+
+    fn title(&self, account: AccountId) -> String {
+        self.directory.title(account)
+    }
+
     /// The owner's own account a printed counterparty names, if it names one.
     ///
     /// This is the seam the derived internal transfer comes through: a
@@ -1395,13 +1520,6 @@ impl Resolver {
             (Some(true), _) | (_, Some(true)) | (None, None) => false,
             (Some(false), _) | (_, Some(false)) => true,
         }
-    }
-
-    fn title(&self, account: AccountId) -> String {
-        self.accounts
-            .iter()
-            .find(|known| known.id == account)
-            .map_or_else(|| account.inner().to_string(), |known| known.title.clone())
     }
 
     /// Settle the row, or name what has to be asked.
@@ -1738,7 +1856,7 @@ mod tests {
 
     fn resolver(accounts: Vec<AccountDetailView>) -> Resolver {
         Resolver {
-            accounts,
+            directory: AccountDirectory { accounts },
             statements: Vec::new(),
             rules: Vec::new(),
         }
@@ -1747,7 +1865,7 @@ mod tests {
     /// A resolver holding rules the owner has already written.
     fn ruled(accounts: Vec<AccountDetailView>, rules: Vec<ClassificationRule>) -> Resolver {
         Resolver {
-            accounts,
+            directory: AccountDirectory { accounts },
             statements: Vec::new(),
             rules,
         }
@@ -1758,7 +1876,7 @@ mod tests {
         statements: Vec<(AccountId, Vec<AccountId>)>,
     ) -> Resolver {
         Resolver {
-            accounts,
+            directory: AccountDirectory { accounts },
             statements: statements
                 .into_iter()
                 .map(|(account, partners)| AccountTransferStatementView { account, partners })
@@ -1946,6 +2064,112 @@ mod tests {
         let main = account(1);
         let resolver = resolver(vec![detail(main, "Savings")]);
         assert_eq!(resolver.resolve_counterparty(" savings ", None), Some(main));
+    }
+
+    // --- what a batch's declaration resolves to ---------------------------
+
+    #[test]
+    fn a_declaration_is_read_by_the_identifier_its_source_prints() {
+        let main = account(1);
+        let directory = AccountDirectory {
+            accounts: vec![
+                with_identity(detail(main, "Main"), "ACC-1"),
+                detail(account(2), "Savings"),
+            ],
+        };
+        assert_eq!(
+            directory
+                .resolve_declared("ACC-1")
+                .expect("the identity names one account")
+                .id,
+            main,
+        );
+        assert_eq!(
+            directory
+                .resolve_declared(&main.inner().to_string())
+                .expect("iaam's own identifier still names it")
+                .id,
+            main,
+            "the shape every existing caller sends keeps working unchanged"
+        );
+    }
+
+    #[test]
+    fn a_declaration_is_read_by_an_alias_whatever_its_interval() {
+        // A statement spans a card replacement, so the declaration cannot be
+        // tied to a day: the interval decides on the rows, each against its own
+        // date, and refusing the file would refuse the very export that shows
+        // the change.
+        let main = account(1);
+        let directory = AccountDirectory {
+            accounts: vec![with_alias(
+                detail(main, "Main"),
+                "CARD-1",
+                date!(2026 - 01 - 01),
+                Some(date!(2026 - 03 - 01)),
+            )],
+        };
+        assert_eq!(
+            directory
+                .resolve_declared("CARD-1")
+                .expect("the alias names one account")
+                .id,
+            main,
+        );
+    }
+
+    #[test]
+    fn a_declaration_naming_two_accounts_is_refused_and_says_which() {
+        let directory = AccountDirectory {
+            accounts: vec![
+                with_identity(detail(account(1), "Main"), "ACC-1"),
+                with_alias(
+                    detail(account(2), "Savings"),
+                    "ACC-1",
+                    date!(2026 - 01 - 01),
+                    None,
+                ),
+            ],
+        };
+        let error = directory
+            .resolve_declared("ACC-1")
+            .expect_err("two accounts answer to it");
+        let AppError::Invalid {
+            field,
+            expected,
+            actual,
+        } = &error
+        else {
+            panic!("an ambiguous declaration is an invalid request: {error}");
+        };
+        assert_eq!(field, "source.account");
+        assert!(
+            actual.contains("Main") && actual.contains("Savings"),
+            "an ambiguity the owner cannot see is one he cannot clear: {actual}"
+        );
+        assert!(
+            actual.contains(&account(1).inner().to_string()),
+            "and the identifiers are what he answers with: {actual}"
+        );
+        assert!(
+            expected.contains("provider_account_id"),
+            "the refusal has to say what would settle it: {expected}"
+        );
+    }
+
+    #[test]
+    fn a_declaration_naming_nothing_is_refused_as_a_stranger() {
+        let directory = AccountDirectory {
+            accounts: vec![detail(account(1), "Main")],
+        };
+        let error = directory
+            .resolve_declared("ACC-9")
+            .expect_err("no account answers to it");
+        assert_eq!(error.code(), "invalid_request");
+        assert!(
+            error.to_string().contains("ACC-9"),
+            "the refusal repeats what was sent: {error}"
+        );
     }
 
     // --- what the owner's transfer statement does -------------------------

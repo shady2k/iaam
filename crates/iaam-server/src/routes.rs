@@ -112,7 +112,7 @@ use crate::dto::OwnerBalanceOutcomeDto;
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
-use iaam_app::scenarios::import_session::SessionRevision;
+use iaam_app::scenarios::import_session::{AnswerableQuestion, SessionRevision};
 use iaam_core::batch::ControlSection;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
@@ -3178,7 +3178,16 @@ pub async fn get_import_session(
         ImportSessionId(id),
     )
     .await?;
-    Ok(Json(session_contents_dto(&contents)))
+    // The candidates are read here and handed to the renderer rather than looked
+    // up inside it: the transport copies a name that came with its identifier
+    // and never joins one on (§3.4).
+    let questions = iaam_app::scenarios::import_session::answerable_questions(
+        &state.services,
+        &principal,
+        &contents.questions,
+    )
+    .await?;
+    Ok(Json(session_contents_dto(&contents, &questions)))
 }
 
 /// Feed rows into a session.
@@ -3252,6 +3261,15 @@ pub async fn add_import_rows(
 /// whose name does not mention rules. Under an agent token the row settles and
 /// `rule` comes back absent; the owner turns the answer into a rule with his own
 /// token if he wants it to stand.
+///
+/// The two answers that name one of the owner's accounts take an identifier, and
+/// the question published only that an account was needed — so answering one
+/// meant fetching the account list and joining, the last such join on the import
+/// path (`iaam-boj4`). The question now carries its own candidates, with the
+/// owner's title and institution beside each id, so the answer is a copy of
+/// something the caller was handed. It is still an id and never a title:
+/// `docs/api/conventions.md` §3.2, because a request resolved by name addresses
+/// the wrong account and succeeds.
 ///
 /// An answer carrying a field its own word does not take — an `account` beside
 /// `received`, an `origin` beside anything but `fee` — is refused rather than
@@ -3624,12 +3642,14 @@ pub async fn abandon_import_session(
     Ok(Json(ImportSessionDto::from_domain(&session)))
 }
 
-fn session_contents_dto(contents: &SessionContents) -> ImportSessionContentsDto {
+fn session_contents_dto(
+    contents: &SessionContents,
+    questions: &[AnswerableQuestion],
+) -> ImportSessionContentsDto {
     ImportSessionContentsDto {
         session: ImportSessionDto::from_domain(&contents.session),
         row_count: contents.observations.len(),
-        questions: contents
-            .questions
+        questions: questions
             .iter()
             .map(ImportQuestionDto::from_domain)
             .collect(),

@@ -1778,14 +1778,7 @@ fn answer_classification_question_action(
 /// route no longer accepts.
 #[must_use]
 pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput {
-    // The far side of an internal transfer is one of the owner's *other*
-    // accounts: the row is already on this one, and an account is not the other
-    // side of itself.
-    let others: Vec<AccountView> = accounts
-        .iter()
-        .filter(|candidate| candidate.id != asked.account())
-        .cloned()
-        .collect();
+    let others = answer_account_candidates(asked, accounts);
 
     MissingInput {
         pointer: "/answer".to_owned(),
@@ -1804,7 +1797,7 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
                     vec![RequiredInput {
                         pointer: "/account".to_owned(),
                         provided_by: ProvidedBy::Owner,
-                        candidates: Some(account_candidates(&others)),
+                        candidates: Some(others.clone()),
                     }]
                 } else {
                     Vec::new()
@@ -1812,6 +1805,31 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
             })
             .collect(),
     }
+}
+
+/// The accounts an answer to this question may name.
+///
+/// The far side of an internal transfer is one of the owner's **other**
+/// accounts: the row is already on this one, and an account is not the other
+/// side of itself.
+///
+/// Split out of [`answer_input`] so that the import question itself can publish
+/// the same list the queue publishes for the same question. Two constructions of
+/// "which accounts may this answer name" would eventually offer a caller an
+/// account the answering route refuses, or withhold one it would have taken —
+/// and the caller cannot check either, because it is being handed the list
+/// precisely so that it need not fetch one.
+#[must_use]
+pub fn answer_account_candidates(
+    asked: &Question,
+    accounts: &[AccountView],
+) -> Vec<AccountCandidate> {
+    let others: Vec<AccountView> = accounts
+        .iter()
+        .filter(|candidate| candidate.id != asked.account())
+        .cloned()
+        .collect();
+    account_candidates(&others)
 }
 
 fn actions_from_views(

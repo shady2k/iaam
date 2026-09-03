@@ -23,15 +23,15 @@ use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CashAssetClass, CategoryRuleView, CategoryView,
     ClassificationRuleView, IssuedToken, NegativeBalanceExpectation, Scope, TokenView,
 };
-use iaam_app::ports::{ImportQuestionView, ImportSessionView, Recorded};
+use iaam_app::ports::{ImportSessionView, Recorded};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
 };
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
 use iaam_app::scenarios::import_session::{
-    ControlReconciliation, HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow,
-    RetentionReason,
+    AnswerableQuestion, ControlReconciliation, HeldRow, ImportPlan, PlannedFact, Readiness,
+    RetainedRow, RetentionReason,
 };
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
@@ -7709,6 +7709,36 @@ pub struct ImportQuestionDto {
     /// The question in words, with the owner's own account titles in it.
     pub prompt: String,
     pub alternatives: Vec<AnswerAlternativeDto>,
+    /// The owner's accounts an answer that names one may name, each with the
+    /// title and institution he gave it.
+    ///
+    /// **This is iaam-boj4.** Two of the six answers name one of his own
+    /// accounts, and the question used to say only `needs_account: true`. A
+    /// client answering one therefore had to call `GET /v1/accounts` and join —
+    /// the last identifier on the import path it had to fetch instead of copying
+    /// out of the response it was answering. The list is here so that the answer
+    /// is a copy.
+    ///
+    /// `id` is what `POST …/answer` takes; `title` and `institution` are what
+    /// the owner reads. The asymmetry is `docs/api/conventions.md` §3.3 and not
+    /// an oversight: output is read by a person deciding something and must be
+    /// legible, input is composed by a machine and must be unambiguous.
+    ///
+    /// Absent when it is empty, which happens for three different reasons the
+    /// rest of the answer already tells apart: the question is answered
+    /// (`answered_at` is set); no alternative it offers names an account (every
+    /// `needs_account` is false); or the owner holds no account other than the
+    /// one the row is already on — an account is not the other side of itself,
+    /// so it is never its own candidate.
+    ///
+    /// [`AnswerAlternativeDto`] was deliberately not extended instead. Its own
+    /// doc comment draws the line: it answers "what may be said to this
+    /// question", and it is published by the ingest verdict and the held row as
+    /// well, neither of which has read the owner's accounts. Repeating one list
+    /// under each of two alternatives would also publish the same fact twice in
+    /// one response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountCandidateDto>,
     pub asked_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<String>,
@@ -7731,8 +7761,16 @@ pub struct ImportQuestionDto {
 }
 
 impl ImportQuestionDto {
+    /// Rendered from the pair the scenario built, not from the store's view
+    /// alone.
+    ///
+    /// The candidates arrive already paired with their titles, so this function
+    /// copies and never looks an account up — `docs/api/conventions.md` §3.4.
+    /// Reading the directory here would be a second reading of the store, and
+    /// the prompt beside it already names accounts out of the first.
     #[must_use]
-    pub fn from_domain(question: &ImportQuestionView) -> Self {
+    pub fn from_domain(asked: &AnswerableQuestion) -> Self {
+        let question = &asked.view;
         Self {
             question: question.id.inner(),
             session: question.session.inner(),
@@ -7742,6 +7780,15 @@ impl ImportQuestionDto {
                 .unwrap_or_default()
                 .into_iter()
                 .map(AnswerAlternativeDto::from_domain)
+                .collect(),
+            accounts: asked
+                .accounts
+                .iter()
+                .map(|candidate| AccountCandidateDto {
+                    id: candidate.id.inner(),
+                    title: candidate.title.clone(),
+                    institution: candidate.institution.clone(),
+                })
                 .collect(),
             asked_at: question.asked_at.clone(),
             answered_at: question.answered_at.clone(),

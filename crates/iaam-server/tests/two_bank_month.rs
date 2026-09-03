@@ -587,38 +587,76 @@ async fn no_operation_leaves_the_report_because_of_the_order_the_setup_was_done_
 /// contour holding only the second bank's accounts. Both exist, every operation
 /// is in the journal, and the report for the newer contour shows one bank.
 ///
-/// The assertion is written against the route as it stands, because that is the
-/// route the action queue shows an agent and the only one there is. iaam-j9oi
-/// also weighs splitting it — `POST /v1/contours` creates, `POST
-/// /v1/contours/{id}/versions` versions — and under that shape this call is a
-/// deliberate creation rather than an omission, and what has to be asserted
-/// instead is the bead's other criterion: that the response says which contour
-/// was written and whether it was new. Whoever lands the split should rewrite
-/// this test to that criterion rather than delete it.
+/// Under the split this is no longer an omission the caller can make: the create
+/// route refuses a contour identifier outright and names the versions route in
+/// its refusal, so "create a perimeter" and "write into the one I have" are two
+/// calls that cannot be confused. What is asserted instead is the bead's other
+/// criterion — the response says which contour was written and whether it was
+/// new — and that adding the second bank reaches the first contour rather than
+/// minting a second.
 #[tokio::test]
-#[ignore = "iaam-j9oi: POST /v1/contours mints a new contour when the caller omits its id"]
-async fn a_second_contour_cannot_be_created_by_omitting_its_identifier() {
+async fn a_second_bank_joins_the_contour_instead_of_minting_another() {
     let harness = harness();
     let accounts = create_accounts(&harness).await;
     let first = draw_contour(&harness, "Household", &accounts.northline()).await;
 
-    // The same call again, for the second bank, with no contour named. The
-    // caller means «add these to the contour I have»; there is no other route
-    // for that, and the action queue shows no other call.
-    let (status, second) = call(
+    // The call that used to mint a second perimeter in silence is now refused,
+    // and the refusal names the route that does what the caller meant.
+    let (status, refused) = call(
         &harness.router,
         post(
             "/v1/contours",
             &harness.owner_token,
-            &json!({ "title": "Household", "accounts": accounts.southgate() }),
+            &json!({
+                "contour": first,
+                "title": "Household",
+                "accounts": accounts.southgate()
+            }),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "{second}");
-    assert_eq!(
-        second["contour"], first,
-        "an omitted identifier must not mint a second contour: {second}"
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("/v1/contours/{contour}/versions")),
+        "the refusal must name the route that adds a version: {refused}"
     );
+
+    // The whole month's accounts, written into the contour that already exists.
+    let (status, added) = call(
+        &harness.router,
+        post(
+            &format!("/v1/contours/{first}/versions"),
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": accounts.all() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{added}");
+    assert_eq!(
+        added["contour"], first,
+        "a version belongs to the contour it was written into: {added}"
+    );
+    assert_eq!(
+        added["created"], false,
+        "writing into a contour that exists did not create one: {added}"
+    );
+
+    // And only one perimeter exists, which is the thing the owner was never
+    // able to check before: the read route did not exist.
+    let (status, listed) = call(&harness.router, get("/v1/contours", &harness.owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let contours = listed.as_array().map_or_else(
+        || {
+            listed["contours"]
+                .as_array()
+                .expect("a list of contours")
+                .clone()
+        },
+        Clone::clone,
+    );
+    assert_eq!(contours.len(), 1, "one bank joined the other: {listed}");
 }
 
 // ---------------------------------------------------------------------------
@@ -866,10 +904,11 @@ async fn an_opening_balance_is_asked_for_per_account() {
 /// accounts whose whole content arrived by transfer are the two the queue never
 /// asks about, and a contour spanning both banks is full of them.
 ///
-/// No bead covers this. It is reported as a finding of iaam-tk2j rather than
-/// asserted live, because it fails today.
+/// Found while building this scenario and filed as iaam-8axt:
+/// `list_account_activity` joins on the account an event is recorded against,
+/// and a transfer is recorded against one side only.
 #[tokio::test]
-#[ignore = "unfiled: an account that only receives transfer legs is asked for no opening balance"]
+#[ignore = "iaam-8axt: activity counts one side of a transfer, so the receiving account looks empty"]
 async fn an_opening_balance_is_asked_for_an_account_that_only_received_transfers() {
     let harness = harness();
     let accounts = create_accounts(&harness).await;

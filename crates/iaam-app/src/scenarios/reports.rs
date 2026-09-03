@@ -9,18 +9,18 @@ use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::ids::{AccountId, InstrumentId};
 use iaam_core::instrument::CurrencyRoles;
-use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, Quantity};
+use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{
     NegativeCashSpan, PerimeterAssessment, PerimeterPolicy, assess, assess_effective,
 };
-use iaam_core::projection::balances::{Balances, PositionKey};
+use iaam_core::projection::balances::Balances;
 use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
+use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
-use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
 use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable, PriceCandidate, QuotationBasis, Venue as CoreVenue};
@@ -37,6 +37,26 @@ use crate::AppServices;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::{AccountView, Principal};
+
+/// The report vocabulary, in the core.
+///
+/// These types were defined here, beside the scenario that fills them, and
+/// moved into `iaam_core::report` when the caveat register was written: the
+/// register is derived from exactly these fields, and a summary computed
+/// outside the core can disagree with the report it summarises. Re-exported
+/// under their old paths, because every caller of this module names the report
+/// by the same word whichever crate defines it.
+pub use iaam_core::report::balances::{
+    AccountBalanceRow, AccountCash, BalancesReport, CashOpening, NegativeCash, PeriodReports,
+};
+pub use iaam_core::report::confidence::{
+    Caveat, CaveatKind, CaveatSubject, ReportConfidence, ReportGoal, money_flow_confidence,
+    returns_confidence,
+};
+pub use iaam_core::report::population::{
+    AccountStanding, PopulationAccount, PopulationCompleteness, ReportPopulation,
+};
+
 /// Yield report request.
 #[derive(Debug, Clone)]
 pub struct ReturnsQuery {
@@ -61,6 +81,18 @@ pub struct ReturnsOutcome {
     pub report: ReturnsReport,
     /// The accounts the report covered, and the known accounts it did not.
     pub population: ReportPopulation,
+}
+
+impl ReturnsOutcome {
+    /// What would have to be true for these figures to be complete, and which
+    /// of those are not.
+    ///
+    /// A method that delegates, not a computation: the fold is
+    /// [`returns_confidence`] in the core, beside the numbers it reads.
+    #[must_use]
+    pub fn confidence(&self) -> ReportConfidence {
+        returns_confidence(&self.population, &self.report)
+    }
 }
 
 /// Money flow report request.
@@ -97,292 +129,19 @@ pub struct MoneyFlowOutcome {
     pub population: ReportPopulation,
 }
 
-/// Whether anything asserts the state a cash figure was accumulated from.
-///
-/// The projection sums cash legs from zero. Zero is a starting point only when
-/// something says the account held nothing before its first event; otherwise the
-/// figure is the movement over the imported interval, not a balance.
-///
-/// This is carried by **every** cash figure, not only by figures that look
-/// wrong. In the reported case one account showed an impossible negative and
-/// the rest showed plausible positives — and from an unasserted start the
-/// plausible ones were exactly as unfounded as the impossible one. They were
-/// merely the ones that passed a plausibility check the reader happened to
-/// have. A marker that appeared only on anomalies would confirm that mistake.
-///
-/// The distinction is per account-and-currency, because that is what an opening
-/// assertion is about and what a cash figure is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CashOpening {
-    /// An opening assertion covers the state before this account's first cash
-    /// movement in this currency.
-    Asserted,
-    /// Nothing does: the figure accumulated from an unasserted start.
-    Unasserted,
-}
-
-impl CashOpening {
-    /// The machine-readable name carried to a caller.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Asserted => "asserted",
-            Self::Unasserted => "unasserted",
-        }
-    }
-}
-
-/// One cash figure together with what is known about where it started.
-///
-/// The two travel as one value rather than in parallel collections: a caller
-/// that carried them separately could render the amount and drop the marker,
-/// which is the defect this type exists to prevent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AccountCash {
-    pub money: Money,
-    pub opening: CashOpening,
-}
-
-/// Whether §11 lets the period's tax and financial reports be calculated for
-/// one account.
-///
-/// The refusal is **per account**: §11 requires the remainder of the scope to
-/// go on being calculated, so this is a field on a row rather than a state of
-/// the answer. It is also not a refusal of the row: the account's observed cash
-/// and positions are stated either way, because the perimeter retains an
-/// observable cash effect and declines only to reconstruct financing economics
-/// it does not support.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeriodReports {
-    /// Nothing in the assessment stops the period's reports for this account.
-    Calculated,
-    /// §11 refuses them, for the reasons carried here. Never empty: it is
-    /// constructed only when the assessment says the account is blocked, and a
-    /// refusal without its reason is the shape the owner cannot act on.
-    Refused(Vec<NegativeCashSpan>),
-}
-
-impl PeriodReports {
-    /// The machine-readable name carried to a caller.
-    #[must_use]
-    pub const fn code(&self) -> &'static str {
-        match self {
-            Self::Calculated => "calculated",
-            Self::Refused(_) => "refused",
-        }
-    }
-
-    /// The spans that refuse the period's reports; empty when none does.
-    #[must_use]
-    pub fn refusals(&self) -> &[NegativeCashSpan] {
-        match self {
-            Self::Calculated => &[],
-            Self::Refused(spans) => spans,
-        }
-    }
-}
-
-/// Cash, reconciliation, and positions for one contour account.
-#[derive(Debug, Clone)]
-pub struct AccountBalanceRow {
-    pub account: iaam_core::ids::AccountId,
-    pub cash: Vec<AccountCash>,
-    pub reconciliation: Vec<ReconciliationStatus>,
-    pub positions: Vec<(PositionKey, Quantity)>,
-    /// What §11 says about this account's period reports (§11).
-    pub period_reports: PeriodReports,
-}
-
-/// The balances answer: one row per contour account, plus what is true of the
-/// answer rather than of a row.
-///
-/// `negative_cash` is on the answer because it is a fact about the set — which
-/// accounts carry a liability — and a reader looking for it should not have to
-/// scan every row's every currency to find out there is none. It is a warning,
-/// not a prohibition: a technical overdraft on an ordinary account is real, and
-/// a margin balance is a liability that belongs in NAV (§11). Nothing here
-/// refuses, suppresses, or calls it an error; the answer states it and the
-/// reader judges it, which is the stance `Balances::negative_cash` already
-/// takes.
-///
-/// **How this composes with the perimeter.** `perimeter::NegativeCashSpan`
-/// (`iaam-core/src/perimeter.rs`) is the richer statement of the same fact:
-/// account, currency, `from`, `resolved`, and a `NegativeCashClassification`.
-/// The key is the span's key, and at one `as_of` at most one span per account
-/// and currency is still open, so each entry here **is** that open span — the
-/// projection supplies the amount, which no span carries, and the span supplies
-/// the dates and the classification. That is why wiring `assess` in was
-/// additive: it added fields to these entries rather than introducing a second,
-/// differently-keyed notion of negative cash to reconcile with them.
-#[derive(Debug, Clone)]
-pub struct BalancesReport {
-    pub accounts: Vec<AccountBalanceRow>,
-    pub negative_cash: Vec<NegativeCash>,
-    /// The accounts this answer covered, and the known accounts it did not.
+impl MoneyFlowOutcome {
+    /// What would have to be true for these figures to be complete, and which
+    /// of those are not.
     ///
-    /// On the answer rather than on a row for the reason `negative_cash` is: it
-    /// is a fact about the set, and a row cannot state that another account was
-    /// left out — there is no row for an account outside the contour, which is
-    /// exactly the silence this field breaks.
-    pub population: ReportPopulation,
-}
-
-/// One account-and-currency whose cash balance is negative at the report date,
-/// with the perimeter span it is the tail of.
-///
-/// The amount comes from the projection and the span from the assessment, and
-/// the **projection decides which entries exist**. A figure is never withheld
-/// for want of an explanation: if the assessment produced no open span for the
-/// key, the entry is still here with the number on it and `span` is `None`.
-/// Driving the list from the spans instead would let a disagreement between the
-/// two folds silently drop a negative balance from the answer, which is the one
-/// outcome §11 forbids.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NegativeCash {
-    pub account: AccountId,
-    pub money: Money,
-    pub span: Option<NegativeCashSpan>,
-}
-
-/// Where one of the owner's accounts stands with respect to a report's
-/// population.
-///
-/// Selection happens **before** the fold, so nothing computed afterwards can
-/// see what was left out: a report's quality fields all speak about defects
-/// inside the calculation and are silent about whose money was calculated. The
-/// standing is the second statement, made per account because that is the
-/// granularity at which the owner decides.
-///
-/// The two outside variants are the distinction that makes the manifest worth
-/// having: "four accounts are outside this report and nobody has decided
-/// whether they belong" is a different sentence from "four accounts are outside
-/// this report on purpose", and a manifest that could not tell them apart would
-/// let the first be read as the second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccountStanding {
-    /// Inside the contour the report was folded over: this account's facts are
-    /// in the answer.
-    Covered,
-    /// Outside this report, and the owner has placed the account in a contour
-    /// of his own. Something has ruled on where it belongs.
-    OutsidePlacedElsewhere,
-    /// Outside this report and in no contour at all. Nobody has ruled on
-    /// whether it belongs, so its absence is an open question and not a
-    /// decision.
-    OutsideUndecided,
-}
-
-impl AccountStanding {
-    /// The machine-readable name carried to a caller.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Covered => "covered",
-            Self::OutsidePlacedElsewhere => "outside_placed_elsewhere",
-            Self::OutsideUndecided => "outside_undecided",
-        }
-    }
-
-    /// Whether this standing keeps the account out of the answer.
-    #[must_use]
-    pub const fn is_outside(self) -> bool {
-        !matches!(self, Self::Covered)
-    }
-}
-
-/// One of the owner's accounts, and where it stands relative to a report.
-///
-/// The title travels with the identifier because the manifest exists to be
-/// read: an owner asked to rule on an account cannot act on a bare UUID, and a
-/// caller that had to fetch the names separately would be free to render the
-/// manifest without them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PopulationAccount {
-    pub account: AccountId,
-    pub title: String,
-    pub standing: AccountStanding,
-}
-
-/// How much of what the system knows about one report answered about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PopulationCompleteness {
-    /// Every account the system knows of is inside the report.
-    Whole,
-    /// Accounts are outside the report, and each of them is placed in a contour
-    /// the owner drew. The answer is partial by decision.
-    Bounded,
-    /// Accounts are outside the report that no contour claims. The answer is
-    /// partial, and nothing says the omission was meant — this is the state the
-    /// reader must not mistake for `Bounded`.
-    Undecided,
-}
-
-impl PopulationCompleteness {
-    /// The machine-readable name carried to a caller.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Whole => "whole",
-            Self::Bounded => "bounded",
-            Self::Undecided => "undecided",
-        }
-    }
-}
-
-/// The population a report answered about: the accounts it covered, and the
-/// accounts the system knows of that it did not.
-///
-/// Held as **one** list rather than a covered list beside an outside list: an
-/// account has exactly one standing, and two lists could disagree about which
-/// it is or list an account twice. Callers that want one side ask for it.
-///
-/// This is built from the same `ContourDefinition` the fold was given, at the
-/// point the population is chosen. Reconstructing it afterwards from the rows
-/// of a result would produce a second, independently-derived answer to what the
-/// report covered — and the two would drift on the first change to either.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportPopulation {
-    pub contour: ContourId,
-    pub version: ContourVersion,
-    pub accounts: Vec<PopulationAccount>,
-}
-
-impl ReportPopulation {
-    /// The accounts inside the report's scope.
-    pub fn covered(&self) -> impl Iterator<Item = &PopulationAccount> {
-        self.accounts
-            .iter()
-            .filter(|entry| entry.standing == AccountStanding::Covered)
-    }
-
-    /// The known accounts outside it, on a decision or otherwise.
-    pub fn outside(&self) -> impl Iterator<Item = &PopulationAccount> {
-        self.accounts
-            .iter()
-            .filter(|entry| entry.standing.is_outside())
-    }
-
-    /// Those of them nobody has ruled on.
-    pub fn undecided(&self) -> impl Iterator<Item = &PopulationAccount> {
-        self.accounts
-            .iter()
-            .filter(|entry| entry.standing == AccountStanding::OutsideUndecided)
-    }
-
-    /// What the manifest says about the answer as a whole.
-    ///
-    /// `Undecided` outranks `Bounded`: one account nobody has ruled on is
-    /// enough to make the report an answer about an undecided part of the
-    /// owner's money, however many deliberate exclusions stand beside it.
-    #[must_use]
-    pub fn completeness(&self) -> PopulationCompleteness {
-        if self.undecided().next().is_some() {
-            return PopulationCompleteness::Undecided;
-        }
-        if self.outside().next().is_some() {
-            return PopulationCompleteness::Bounded;
-        }
-        PopulationCompleteness::Whole
+    /// Fallible for the reason every reader of a [`MoneyFlow`] aggregate is:
+    /// the register asks the fold what it did not decompose and what it could
+    /// not explain, and those are sums that can overflow. A register that
+    /// swallowed the error would report a complete answer over figures the
+    /// report itself refuses to state.
+    pub fn confidence(
+        &self,
+    ) -> Result<ReportConfidence, iaam_core::projection::money_flow::MoneyFlowError> {
+        money_flow_confidence(&self.population, &self.report.flow)
     }
 }
 

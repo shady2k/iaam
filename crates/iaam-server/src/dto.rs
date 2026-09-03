@@ -27,8 +27,8 @@ use iaam_app::scenarios::import_session::{
     HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow, RetentionReason,
 };
 use iaam_app::scenarios::reports::{
-    AccountBalanceRow, BalancesReport, MoneyFlowReport, PopulationAccount, ReportPopulation,
-    ReturnsOutcome,
+    AccountBalanceRow, BalancesReport, Caveat, CaveatSubject, MoneyFlowOutcome, PopulationAccount,
+    ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
 use iaam_core::bond::offer::OfferChoice;
@@ -2217,6 +2217,145 @@ fn issue(value: &MaterialIssue) -> String {
     }
 }
 
+/// What would have to be true for a report's figures to be complete, and which
+/// of those things are not.
+///
+/// **First in every report that carries it**, before the accounts, the
+/// currencies and the population. A caveat published after the figures has
+/// already lost to the reader who stopped at the figures — which is the
+/// difficulty this block answers: `population.completeness` was the last
+/// top-level field of the balances answer, and a run that read `covered=3,
+/// outside=15` as an ordinary complete result never got that far.
+///
+/// **There is no score here.** No number, no percentage, no grade. A confidence
+/// figure is an opinion the owner cannot check — the reason `PairingEvidenceDto`
+/// publishes the fields two legs agree on rather than a match score. What is
+/// published is a list of specific caveats, each naming one thing and the field
+/// of this same response that states it in full.
+///
+/// **It is never a second source of truth.** Every caveat's `see` points at the
+/// field that already says the same thing, and its `detail` is a constant of its
+/// kind with nothing interpolated into it: a summary that restated an amount
+/// could restate it wrongly, and then the report would contradict itself. The
+/// whole register is computed in the core, from the values the response
+/// publishes, for the same reason.
+///
+/// A caveat is not an error and does not make the figures wrong. It says what
+/// they are an answer about. `complete: true` beside an empty `caveats` is the
+/// statement that nothing known is missing.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConfidenceDto {
+    /// Which of the four goals this report answers: `asset_snapshot`,
+    /// `money_flow`, `returns` or `reconciliation`.
+    ///
+    /// The same four names the outstanding-work queue grades its items by, so a
+    /// caller holding a report with caveats can ask the queue what closes them.
+    pub goal: String,
+    /// Whether everything that would have to be true for these figures to be
+    /// complete is true.
+    ///
+    /// Exactly `caveats == []`, and derived from it rather than stated beside
+    /// it: there is no way to build this block asserting completeness over a
+    /// non-empty register.
+    pub complete: bool,
+    /// The specific things that are not. Always present; empty exactly when
+    /// `complete` is true.
+    pub caveats: Vec<CaveatDto>,
+}
+
+/// One specific, checkable thing a report's figures do not account for.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CaveatDto {
+    /// What sort of gap this is — `account_in_no_scope`,
+    /// `account_in_another_scope`, `running_cash_sum`, `period_reports_refused`,
+    /// `undecomposed_movements`, `unexplained_cash_change`, `unpriced_position`,
+    /// `terminal_value_not_computed`, `return_not_computed`.
+    ///
+    /// A closed set. Every one of them is read off a computation the report
+    /// already performs: nothing here folds the journal a second time.
+    pub kind: String,
+    /// What the caveat is about. Identifiers only — the title, the amount and
+    /// the dates live at `see`.
+    pub subject: CaveatSubjectDto,
+    /// What this kind of caveat means, in one sentence. Constant for the kind:
+    /// no figure of this report is interpolated into it.
+    pub detail: String,
+    /// The field of **this same response** that states the fact in full, as a
+    /// path through the answer: `[]` stands for every element of an array, and
+    /// `subject` says which element. Read it instead of believing this block.
+    pub see: String,
+}
+
+/// The typed subject of a caveat.
+///
+/// Shaped like `ActionSubjectDto`, and for the reason that field exists: a
+/// client that wants the caveats about one account must be able to select them
+/// without parsing prose. `account_currency` is its own variant because a cash
+/// figure and an opening assertion are both per account **and** currency, and a
+/// caveat naming only the account would send the reader to the wrong row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CaveatSubjectDto {
+    /// The answer as a whole: a figure the report declined to compute.
+    Report,
+    Account {
+        id: Uuid,
+    },
+    AccountCurrency {
+        account: Uuid,
+        currency: CurrencyDto,
+    },
+    Instrument {
+        id: Uuid,
+    },
+}
+
+impl ConfidenceDto {
+    #[must_use]
+    pub fn from_domain(confidence: &ReportConfidence) -> Self {
+        Self {
+            goal: confidence.goal().code().to_owned(),
+            // From the register, never beside it: the domain type has no
+            // `complete` field to copy, so the two cannot fall out of step.
+            complete: confidence.complete(),
+            caveats: confidence
+                .caveats()
+                .iter()
+                .map(CaveatDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+impl CaveatDto {
+    fn from_domain(caveat: &Caveat) -> Self {
+        Self {
+            kind: caveat.kind().code().to_owned(),
+            subject: CaveatSubjectDto::from_domain(caveat.subject()),
+            detail: caveat.detail().to_owned(),
+            see: caveat.see().to_owned(),
+        }
+    }
+}
+
+impl CaveatSubjectDto {
+    fn from_domain(subject: CaveatSubject) -> Self {
+        match subject {
+            CaveatSubject::Report => Self::Report,
+            CaveatSubject::Account(account) => Self::Account {
+                id: account.inner(),
+            },
+            CaveatSubject::AccountCurrency { account, currency } => Self::AccountCurrency {
+                account: account.inner(),
+                currency: CurrencyDto::from_domain(currency),
+            },
+            CaveatSubject::Instrument(instrument) => Self::Instrument {
+                id: instrument.inner(),
+            },
+        }
+    }
+}
+
 /// The population a report answered about.
 ///
 /// Every report carries one. The quality fields of a report — data quality,
@@ -2296,6 +2435,10 @@ impl PopulationAccountDto {
 /// Cash movement report over an inclusive interval.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MoneyFlowReportDto {
+    /// What would have to be true for these figures to be a complete account of
+    /// the interval's money, and which of those things are not. First, for the
+    /// reason it is first on the balances answer.
+    pub confidence: ConfidenceDto,
     pub contour: Uuid,
     pub contour_version: u32,
     #[serde(with = "iso_date")]
@@ -2385,10 +2528,15 @@ impl MoneyFlowReportDto {
     /// resolves an operation through its catalogue and the DTO cannot, and a
     /// carrier that could be built without them would eventually be.
     pub fn from_domain(
-        report: &MoneyFlowReport,
-        population: &ReportPopulation,
+        outcome: &MoneyFlowOutcome,
         actions: Vec<ActionDto>,
     ) -> Result<Self, MoneyFlowError> {
+        // The whole outcome rather than its two halves: the register is a
+        // statement about the pair, and a signature that took them separately
+        // would let a caller summarise one flow beside another's population.
+        let confidence = ConfidenceDto::from_domain(&outcome.confidence()?);
+        let report = &outcome.report;
+        let population = &outcome.population;
         let currencies = report
             .flow
             .currencies()
@@ -2501,6 +2649,7 @@ impl MoneyFlowReportDto {
             })
             .collect();
         Ok(Self {
+            confidence,
             contour: report.contour.0,
             contour_version: report.version.0,
             from: report.from,
@@ -2523,6 +2672,15 @@ impl MoneyFlowReportDto {
 /// between them.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BalancesReportDto {
+    /// What would have to be true for these figures to be a complete statement
+    /// of what the owner holds, and which of those things are not.
+    ///
+    /// **First**, before the rows. It was the reader who stopped at the numbers
+    /// that this answer failed: `amount` under an `unasserted` opening is a
+    /// running sum from an unknown start and not a balance, and `population`
+    /// stood last, after `accounts` and `negative_cash`. Both facts were
+    /// published and neither was reached.
+    pub confidence: ConfidenceDto,
     pub accounts: Vec<AccountBalanceDto>,
     /// Every account-and-currency in the scope whose cash balance is negative.
     /// Always present; empty when none is.
@@ -2652,6 +2810,10 @@ pub struct PositionQuantityDto {
 impl BalancesReportDto {
     pub fn from_domain(report: &BalancesReport) -> Self {
         Self {
+            // Asked of the report itself. The transport neither folds the rows
+            // nor decides what a caveat is: a register assembled here could
+            // disagree with the answer printed beside it.
+            confidence: ConfidenceDto::from_domain(&report.confidence()),
             accounts: report
                 .accounts
                 .iter()
@@ -2791,6 +2953,10 @@ pub struct ReturnsReportDto {
 /// without the population it computed them over cannot be built.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ReturnsAnswerDto {
+    /// What would have to be true for these figures to be a complete statement
+    /// of what the money earned, and which of those things are not. First, for
+    /// the reason it is first on the balances answer.
+    pub confidence: ConfidenceDto,
     #[serde(flatten)]
     pub report: ReturnsReportDto,
     /// The accounts this report covered, and the known accounts it did not.
@@ -2801,6 +2967,7 @@ impl ReturnsAnswerDto {
     #[must_use]
     pub fn from_domain(outcome: &ReturnsOutcome) -> Self {
         Self {
+            confidence: ConfidenceDto::from_domain(&outcome.confidence()),
             report: ReturnsReportDto::from_domain(&outcome.report),
             population: PopulationDto::from_domain(&outcome.population),
         }

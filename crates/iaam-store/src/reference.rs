@@ -20,6 +20,137 @@ pub struct AccountRecord {
     pub institution: Option<String>,
 }
 
+/// What kind of cash an account holds, as the owner declares it.
+///
+/// **Nothing branches on this value, and nothing may start.** It is a grouping
+/// label: report grouping reads it to render a heading, and no rule, no
+/// projection, no classification, no validation, no invariant and no refusal
+/// reads it at all (decision 0004 §3). A later feature that wants to branch on
+/// it is evidence that the objection recorded in `iaam-d41s` was right, and the
+/// answer then is to give that feature its own declaration rather than to grow
+/// this one.
+///
+/// One branch is named because it is the one that would be reached for first,
+/// and it is forbidden by name: **which negative balances are impossible must
+/// not be derived from this label.** "A savings account cannot be overdrawn,
+/// therefore warn" is precisely the reasoning `iaam-d41s` refuses, and it is
+/// wrong on the first ordinary technical overdraft.
+///
+/// The type lives in the storage adapter rather than in `iaam-core` on purpose:
+/// the core is where rules live, and a label no rule may read has no business
+/// being reachable from one.
+///
+/// Cash only. `Balances` separates cash from positions structurally, so
+/// `brokerage` and `security_position` are not values here: a position on an
+/// instrument is what the journal records and needs no declaration.
+///
+/// Unset is a value — "not stated" — and is expressed by `Option::None` rather
+/// than by a variant, so a caller cannot pass it where a stated class is meant.
+/// It is never inferred from a title or from a transaction pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CashAssetClass {
+    Deposit,
+    Savings,
+    CardAccount,
+    Wallet,
+}
+
+impl CashAssetClass {
+    /// All variants. This exists for table-driven tests: a list assembled by
+    /// hand in a test would silently drift from the `enum`.
+    pub const ALL: [Self; 4] = [
+        Self::Deposit,
+        Self::Savings,
+        Self::CardAccount,
+        Self::Wallet,
+    ];
+
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Deposit => "deposit",
+            Self::Savings => "savings",
+            Self::CardAccount => "card_account",
+            Self::Wallet => "wallet",
+        }
+    }
+
+    /// Parse a code. `None`, rather than a default, ensures an unknown class
+    /// reaches the caller instead of becoming a deposit.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.code() == code)
+    }
+}
+
+/// The identity a source prints for one account.
+///
+/// `provider` is the client's own label for the source; it scopes
+/// `provider_account_id`, which is **opaque to iaam** — not parsed, not
+/// shape-checked, not validated against a register, and never rendered where a
+/// title belongs. Equality and uniqueness are the entire contract, and they are
+/// enough for the upsert (decision 0004 §1).
+///
+/// A struct rather than two adjacent `String` fields on the account: the
+/// compiler cannot see two `String` values passed the wrong way round, and an
+/// identity stored backwards would look like a legitimate one belonging to
+/// nobody.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AccountIdentity {
+    pub provider: String,
+    pub provider_account_id: String,
+}
+
+/// A further identifier that reaches one account, valid over an interval.
+///
+/// Two cards over one underlying account are one account with two aliases, and
+/// its balance is counted once. A card that stopped working is an alias whose
+/// interval closed: there is no binding lifecycle, so "expired", "reissued",
+/// "blocked" and "closed" are the same fact here, deliberately (decision 0004
+/// §2).
+///
+/// [`AliasInterval`] is reused rather than respelled: instruments already carry
+/// exactly this shape for exactly this reason, and a second spelling of a
+/// half-open interval is a second set of off-by-one bugs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAliasRecord {
+    /// Opaque for the same reason `provider_account_id` is opaque.
+    pub value: String,
+    pub interval: AliasInterval,
+}
+
+/// An account with everything decision 0004 gives it.
+///
+/// Separate from [`AccountRecord`], which stays the summary the pre-existing
+/// callers read. The separation is the point: the identity, the aliases and the
+/// class travel only to the callers built to carry them, so a reader of the
+/// summary cannot begin to branch on a label that nothing may branch on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDetailRecord {
+    pub id: AccountId,
+    pub owner: OwnerId,
+    pub title: String,
+    pub institution: Option<String>,
+    /// `None` — the account carries no external identity. Accounts written
+    /// before decision 0004 are all in this state, and none of them is given one
+    /// by guesswork.
+    pub identity: Option<AccountIdentity>,
+    pub cash_class: Option<CashAssetClass>,
+    pub aliases: Vec<AccountAliasRecord>,
+}
+
+/// What [`SqliteStore::create_account`] did.
+///
+/// `Existing` is not a failure: it is the upsert by external identity working.
+/// It is distinguished from `Created` so the caller can tell the truth about
+/// what happened rather than reporting a creation that did not occur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountCreation {
+    Created(AccountDetailRecord),
+    /// The identity was already known: this is the account created last time.
+    Existing(AccountDetailRecord),
+}
+
 /// The current version of a contour owned by one portfolio owner.
 ///
 /// The title travels with the identity because it is a property of the version,
@@ -164,6 +295,212 @@ impl SqliteStore {
                 title,
                 institution,
             });
+        }
+        Ok(accounts)
+    }
+
+    /// Create an account, upserting by external identity.
+    ///
+    /// A create carrying an identity that already exists returns the account
+    /// created last time rather than minting a second one, and changes nothing
+    /// about it. The title is a display name: repeating an identity under a
+    /// different title is not a rename, and treating it as one would let a
+    /// re-import silently overwrite what the owner reads.
+    ///
+    /// An account carrying no identity is always created. Two accounts that
+    /// state no identity are not the same account, and merging them on the
+    /// strength of a shared absence is the one mistake the partial uniqueness
+    /// index exists to prevent.
+    ///
+    /// Immediate transaction: the lookup and the insert are a check-then-act,
+    /// and two concurrent imports of one statement would otherwise both find
+    /// nothing and both mint an account.
+    pub fn create_account(
+        &mut self,
+        account: &AccountDetailRecord,
+    ) -> Result<AccountCreation, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(identity) = &account.identity {
+            let existing: Option<String> = transaction
+                .query_row(
+                    "SELECT id FROM accounts
+                     WHERE owner = ?1 AND provider = ?2 AND provider_account_id = ?3",
+                    params![
+                        account.owner.inner().to_string(),
+                        identity.provider,
+                        identity.provider_account_id,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                let id = AccountId(parse_uuid(&id, "account")?);
+                let stored = read_account_detail(&transaction, account.owner, id)?;
+                transaction.commit()?;
+                return Ok(AccountCreation::Existing(stored));
+            }
+        }
+
+        transaction.execute(
+            "INSERT INTO accounts
+                 (id, owner, title, institution, created_at,
+                  provider, provider_account_id, cash_class)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                account.id.inner().to_string(),
+                account.owner.inner().to_string(),
+                account.title,
+                account.institution,
+                now(),
+                account.identity.as_ref().map(|it| it.provider.as_str()),
+                account
+                    .identity
+                    .as_ref()
+                    .map(|it| it.provider_account_id.as_str()),
+                account.cash_class.map(CashAssetClass::code),
+            ],
+        )?;
+        for alias in &account.aliases {
+            transaction.execute(
+                "INSERT INTO account_aliases (owner, account, value, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    account.owner.inner().to_string(),
+                    account.id.inner().to_string(),
+                    alias.value,
+                    date_to_text(alias.interval.valid_from),
+                    alias.interval.valid_to.map(date_to_text),
+                ],
+            )?;
+        }
+        let stored = read_account_detail(&transaction, account.owner, account.id)?;
+        transaction.commit()?;
+        Ok(AccountCreation::Created(stored))
+    }
+
+    /// Replace one account's aliases with the set the owner now states.
+    ///
+    /// Replacement rather than an add-one/close-one pair, following
+    /// `record_account_transfer_statement`: the owner states what is true now,
+    /// and a diff against what he said last time is a second thing to get wrong.
+    /// A card that stopped working is stated as an alias whose interval closed,
+    /// alongside whichever alias replaced it.
+    ///
+    /// The account must be the owner's. The delete alone would silently succeed
+    /// against a stranger's account, so ownership is established first rather
+    /// than left to the foreign key on the insert — an empty set would never
+    /// reach one.
+    pub fn replace_account_aliases(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+        aliases: &[AccountAliasRecord],
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let held: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM accounts WHERE owner = ?1 AND id = ?2",
+                params![owner.inner().to_string(), account.inner().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if held.is_none() {
+            return Err(StoreError::NotFound {
+                what: "account",
+                id: account.inner().to_string(),
+            });
+        }
+
+        transaction.execute(
+            "DELETE FROM account_aliases WHERE owner = ?1 AND account = ?2",
+            params![owner.inner().to_string(), account.inner().to_string()],
+        )?;
+        for alias in aliases {
+            transaction.execute(
+                "INSERT INTO account_aliases (owner, account, value, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    owner.inner().to_string(),
+                    account.inner().to_string(),
+                    alias.value,
+                    date_to_text(alias.interval.valid_from),
+                    alias.interval.valid_to.map(date_to_text),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every account of one owner, with the identity, aliases and class it
+    /// carries.
+    ///
+    /// An account written before decision 0004 reads back with no identity, no
+    /// class and no aliases. That is the honest answer rather than a defect: the
+    /// migration invented nothing.
+    pub fn list_account_details(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountDetailRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, title, institution, provider, provider_account_id, cash_class
+             FROM accounts WHERE owner = ?1 ORDER BY title, id",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            let (id, title, institution, provider, provider_account_id, cash_class) = row?;
+            accounts.push(AccountDetailRecord {
+                id: AccountId(parse_uuid(&id, "account")?),
+                owner,
+                title,
+                institution,
+                identity: external_identity(provider, provider_account_id),
+                cash_class: parse_cash_class(cash_class.as_deref())?,
+                aliases: Vec::new(),
+            });
+        }
+        drop(statement);
+
+        let mut statement = self.conn.prepare(
+            "SELECT account, value, valid_from, valid_to FROM account_aliases
+             WHERE owner = ?1 ORDER BY account, valid_from, value",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (account, value, valid_from, valid_to) = row?;
+            let account = AccountId(parse_uuid(&account, "account")?);
+            let alias = AccountAliasRecord {
+                value,
+                interval: AliasInterval {
+                    valid_from: text_to_date(&valid_from)?,
+                    valid_to: valid_to.as_deref().map(text_to_date).transpose()?,
+                },
+            };
+            if let Some(target) = accounts.iter_mut().find(|entry| entry.id == account) {
+                target.aliases.push(alias);
+            }
         }
         Ok(accounts)
     }
@@ -813,6 +1150,102 @@ impl SqliteStore {
         )?;
         Ok(version.map(ContourVersion))
     }
+}
+
+/// Both halves of an external identity, or neither.
+///
+/// The partial uniqueness index binds only rows that carry both columns, so a
+/// row carrying one of them is not an identity and must not be read as one.
+fn external_identity(
+    provider: Option<String>,
+    provider_account_id: Option<String>,
+) -> Option<AccountIdentity> {
+    match (provider, provider_account_id) {
+        (Some(provider), Some(provider_account_id)) => Some(AccountIdentity {
+            provider,
+            provider_account_id,
+        }),
+        _ => None,
+    }
+}
+
+/// A stored class code, refusing one this build does not know.
+///
+/// An unrecognised code is an error rather than `None`: `None` means "the owner
+/// has not said", and reading a value the owner did say as a value he did not
+/// would put a wrong heading on a report he is meant to trust.
+fn parse_cash_class(code: Option<&str>) -> Result<Option<CashAssetClass>, StoreError> {
+    code.map(|code| {
+        CashAssetClass::from_code(code).ok_or_else(|| StoreError::InvalidValue {
+            field: "accounts.cash_class",
+            value: code.to_owned(),
+        })
+    })
+    .transpose()
+}
+
+/// One account with its identity, class and aliases, read inside a transaction.
+fn read_account_detail(
+    transaction: &rusqlite::Transaction<'_>,
+    owner: OwnerId,
+    id: AccountId,
+) -> Result<AccountDetailRecord, StoreError> {
+    let (title, institution, provider, provider_account_id, cash_class) = transaction
+        .query_row(
+            "SELECT title, institution, provider, provider_account_id, cash_class
+             FROM accounts WHERE owner = ?1 AND id = ?2",
+            params![owner.inner().to_string(), id.inner().to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound {
+            what: "account",
+            id: id.inner().to_string(),
+        })?;
+
+    let mut statement = transaction.prepare(
+        "SELECT value, valid_from, valid_to FROM account_aliases
+         WHERE owner = ?1 AND account = ?2 ORDER BY valid_from, value",
+    )?;
+    let rows = statement.query_map(
+        params![owner.inner().to_string(), id.inner().to_string()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    let mut aliases = Vec::new();
+    for row in rows {
+        let (value, valid_from, valid_to) = row?;
+        aliases.push(AccountAliasRecord {
+            value,
+            interval: AliasInterval {
+                valid_from: text_to_date(&valid_from)?,
+                valid_to: valid_to.as_deref().map(text_to_date).transpose()?,
+            },
+        });
+    }
+
+    Ok(AccountDetailRecord {
+        id,
+        owner,
+        title,
+        institution,
+        identity: external_identity(provider, provider_account_id),
+        cash_class: parse_cash_class(cash_class.as_deref())?,
+        aliases,
+    })
 }
 
 fn parse_uuid(value: &str, what: &'static str) -> Result<uuid::Uuid, StoreError> {

@@ -16,8 +16,8 @@ use iaam_app::ingest::observation::{
 use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperation};
 use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
-    BrokerAccessView, BrokerEnvironment, CategoryRuleView, CategoryView, ClassificationRuleView,
-    IssuedToken, Scope, TokenView,
+    BrokerAccessView, BrokerEnvironment, CashAssetClass, CategoryRuleView, CategoryView,
+    ClassificationRuleView, IssuedToken, Scope, TokenView,
 };
 use iaam_app::ports::{ImportQuestionView, ImportSessionView};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
@@ -2895,12 +2895,96 @@ impl ReturnsReportDto {
 }
 
 /// Account.
+///
+/// The three fields decision 0004 adds are absent from an account that carries
+/// none of them, which is every account created before it. Absent is the honest
+/// wire shape for "the owner has not said", and it keeps every client written
+/// against the old response working unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccountDto {
     pub id: Uuid,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub institution: Option<String>,
+    /// The client's own label for the source this account's identity came from.
+    /// Present exactly when `provider_account_id` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// What the source prints for this account. Opaque: iaam does not parse it,
+    /// does not check its shape, and never renders it where a title belongs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cash_class: Option<CashAssetClassDto>,
+    /// Further identifiers reaching this same account. Two cards over one
+    /// underlying account are one account with two aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<AccountAliasDto>,
+}
+
+/// One alias of an account, valid over a half-open interval.
+///
+/// `valid_to` absent is an open-ended interval. A card that stopped working is
+/// an alias whose `valid_to` is set: there is no binding lifecycle, so an
+/// expired, a reissued, a blocked and a closed card are the same fact here.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountAliasDto {
+    /// Opaque for the same reason `provider_account_id` is opaque.
+    pub value: String,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub valid_from: Date,
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub valid_to: Option<Date>,
+}
+
+/// The class of cash an account holds, as the owner declares it.
+///
+/// **A grouping label, and nothing branches on it.** Report grouping reads it to
+/// render a heading; no rule, no projection, no classification, no validation
+/// and no refusal reads it (decision 0004 §3). In particular it must not be used
+/// to decide which negative balances are impossible — that is a separate need
+/// with a separate declaration, and deriving it here is the branch `iaam-d41s`
+/// refuses.
+///
+/// Cash only: `brokerage` and `security_position` are deliberately not values,
+/// because a position on an instrument is what the journal records and needs no
+/// declaration. Unset is a value — "not stated" — expressed by the field's
+/// absence, and it is never inferred from a title or a transaction pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CashAssetClassDto {
+    Deposit,
+    Savings,
+    CardAccount,
+    Wallet,
+}
+
+impl CashAssetClassDto {
+    #[must_use]
+    pub const fn to_domain(self) -> CashAssetClass {
+        match self {
+            Self::Deposit => CashAssetClass::Deposit,
+            Self::Savings => CashAssetClass::Savings,
+            Self::CardAccount => CashAssetClass::CardAccount,
+            Self::Wallet => CashAssetClass::Wallet,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_domain(class: CashAssetClass) -> Self {
+        match class {
+            CashAssetClass::Deposit => Self::Deposit,
+            CashAssetClass::Savings => Self::Savings,
+            CashAssetClass::CardAccount => Self::CardAccount,
+            CashAssetClass::Wallet => Self::Wallet,
+        }
+    }
 }
 
 /// The computed action policy returned for an owner.
@@ -3132,11 +3216,48 @@ pub struct RecordAccountTransferPartnersRequest {
 }
 
 /// Account creation.
+///
+/// Every field decision 0004 adds is optional, and a request that omits them all
+/// is exactly the request this endpoint accepted before it.
+///
+/// Sending `provider` and `provider_account_id` makes the call an upsert by
+/// external identity: a create repeating an identity already recorded returns
+/// the account created last time, with `200 OK`, rather than minting a second
+/// one. The pair travels together — one half alone is refused, because a request
+/// that stated half an identity would be stored as having stated none and the
+/// caller would discover it only on the re-import that duplicated the account.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAccountRequest {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub institution: Option<String>,
+    /// The client's own label for the source. iaam does not interpret it; it
+    /// scopes the identifier below so that two sources printing short
+    /// sequential identifiers cannot collide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Whatever the source prints for this account. iaam accepts any string and
+    /// stores it as given: it does not require a fingerprint and does not
+    /// compute one. Client tooling is advised to send a stable derived value
+    /// rather than the printed number, and to change `provider` whenever it
+    /// changes that derivation — a re-derivation must present as a new source
+    /// rather than as new accounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cash_class: Option<CashAssetClassDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<AccountAliasDto>,
+}
+
+/// The aliases an account carries, as the owner now states them.
+///
+/// The whole set, not a change to it. An empty list is a real statement —
+/// "this account is reached by no further identifier" — and it is how the last
+/// alias is withdrawn.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReplaceAccountAliasesRequest {
+    pub aliases: Vec<AccountAliasDto>,
 }
 
 /// Broker environment in the transport layer. A separate type because

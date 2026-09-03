@@ -18,6 +18,9 @@ use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_store::documents::BrokerCode;
+// The grouping label deliberately does not live in `iaam-core`: the core is
+// where rules live, and nothing may branch on it.
+pub use iaam_store::reference::CashAssetClass;
 use serde_json::Value;
 use std::sync::Arc;
 use time::Date;
@@ -82,6 +85,71 @@ pub struct AccountView {
     pub id: AccountId,
     pub title: String,
     pub institution: Option<String>,
+}
+
+/// An account together with the identity its source prints, the further
+/// identifiers that reach it, and the class of cash the owner says it holds
+/// (decision 0004).
+///
+/// A view of its own rather than three more fields on [`AccountView`], and the
+/// separation is the decision rather than a convenience. `AccountView` is the
+/// summary the action policy and the reports read, and `cash_class` is a
+/// grouping label that **nothing may branch on**: keeping it out of the summary
+/// means a rule cannot reach it by accident, which is the condition decision
+/// 0004 asks a later reviewer to check against the code rather than against
+/// anyone's memory of intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDetailView {
+    pub id: AccountId,
+    pub title: String,
+    pub institution: Option<String>,
+    /// The client's own label for the source. Present exactly when
+    /// `provider_account_id` is: one half alone is not an identity.
+    pub provider: Option<String>,
+    /// What the source prints for this account. **Opaque to iaam**: not parsed,
+    /// not shape-checked, not validated against a register, and never rendered
+    /// where a title belongs. Equality and uniqueness are the whole contract.
+    pub provider_account_id: Option<String>,
+    /// The owner's grouping label. See [`CashAssetClass`]: report grouping reads
+    /// it and nothing else may.
+    pub cash_class: Option<CashAssetClass>,
+    /// Further identifiers for this same account, each with a validity
+    /// interval. Two cards over one underlying account are one account with two
+    /// aliases, so the balance is counted once.
+    pub aliases: Vec<AccountAliasView>,
+}
+
+/// One alias of an account, valid over a half-open interval.
+///
+/// `valid_to` is `None` for an open-ended interval. A card that stopped working
+/// is an alias whose `valid_to` is set, and there is no binding lifecycle
+/// beyond that: decision 0004 records what is lost by refusing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAliasView {
+    pub value: String,
+    pub valid_from: Date,
+    pub valid_to: Option<Date>,
+}
+
+/// What [`Store::create_account`] did.
+///
+/// `Existing` is the upsert by external identity working, not a failure: a
+/// create carrying an identity already known returns the account created last
+/// time. It is a separate variant so the transport can say which happened
+/// instead of announcing a creation that did not occur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountCreated {
+    Created(AccountDetailView),
+    Existing(AccountDetailView),
+}
+
+impl AccountCreated {
+    #[must_use]
+    pub const fn account(&self) -> &AccountDetailView {
+        match self {
+            Self::Created(account) | Self::Existing(account) => account,
+        }
+    }
 }
 
 /// The current version of an owner's contour, with the accounts it covers.
@@ -353,6 +421,32 @@ pub trait Store: Send + Sync {
     ) -> Result<(), AppError>;
 
     async fn upsert_account(&self, owner: OwnerId, account: AccountView) -> Result<(), AppError>;
+
+    /// Create an account, upserting by external identity (decision 0004).
+    ///
+    /// A create carrying an identity that already exists returns the account
+    /// created last time and changes nothing about it. An account carrying no
+    /// identity is always created: two accounts that state none are not the
+    /// same account.
+    async fn create_account(
+        &self,
+        owner: OwnerId,
+        account: AccountDetailView,
+    ) -> Result<AccountCreated, AppError>;
+
+    /// Every account of the owner, with its identity, aliases and class.
+    async fn list_account_details(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountDetailView>, AppError>;
+
+    /// Replace one account's aliases with the set the owner now states.
+    async fn replace_account_aliases(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        aliases: Vec<AccountAliasView>,
+    ) -> Result<(), AppError>;
     async fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourView>, AppError>;
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;
     async fn list_account_activity(

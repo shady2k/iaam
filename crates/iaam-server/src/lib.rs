@@ -74,6 +74,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
             routes::get_account_scope,
             routes::record_account_scope
         ))
+        .routes(routes!(routes::replace_account_aliases))
         .routes(routes!(
             routes::get_account_transfer_partners,
             routes::record_account_transfer_partners,

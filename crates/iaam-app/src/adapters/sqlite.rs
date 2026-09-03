@@ -9,14 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
-    AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
-    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView,
-    CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
-    ControlAssertionView, CustodyView, DocumentToKeep, ImportObservationView, ImportQuestionView,
-    ImportSessionState, ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView,
-    IssuedToken, JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store,
-    TokenAdmin, TokenView,
+    AccountActivityView, AccountAliasView, AccountCreated, AccountDetailView,
+    AccountScopeExclusionView, AccountTransferStatementView, AccountView, AliasUpsert, AliasView,
+    BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
+    CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
+    ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
+    CustodyView, DocumentToKeep, ImportObservationView, ImportQuestionView, ImportSessionState,
+    ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken,
+    JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin,
+    TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -31,7 +32,7 @@ use iaam_core::ids::{
     AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, ImportId,
     ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, SourceId,
 };
-use iaam_core::instrument::AliasNamespace;
+use iaam_core::instrument::{AliasInterval, AliasNamespace};
 use iaam_core::projection::Snapshot;
 use iaam_core::rules::LotRuleVersion;
 use iaam_ingest::dedup::IdentityScope;
@@ -52,8 +53,9 @@ use iaam_store::import_session::{
     StoredQuestion, StoredSession,
 };
 use iaam_store::reference::{
-    AccountRecord, AccountScopeExclusionRecord, AccountTransferStatementRecord, AliasRecord,
-    ContourRecord, InstrumentRecord,
+    AccountAliasRecord, AccountCreation, AccountDetailRecord, AccountIdentity, AccountRecord,
+    AccountScopeExclusionRecord, AccountTransferStatementRecord, AliasRecord, ContourRecord,
+    InstrumentRecord,
 };
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
@@ -401,6 +403,60 @@ impl Store for SqliteAdapter {
                     title: account.title,
                     institution: account.institution,
                 })
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn create_account(
+        &self,
+        owner: OwnerId,
+        account: AccountDetailView,
+    ) -> Result<AccountCreated, AppError> {
+        self.blocking(move |store| {
+            let record = account_detail_record(owner, account);
+            match store.create_account(&record).map_err(store_error)? {
+                AccountCreation::Created(stored) => {
+                    Ok(AccountCreated::Created(account_detail_view(stored)))
+                }
+                AccountCreation::Existing(stored) => {
+                    Ok(AccountCreated::Existing(account_detail_view(stored)))
+                }
+            }
+        })
+        .await
+    }
+
+    async fn list_account_details(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountDetailView>, AppError> {
+        self.blocking(move |store| {
+            let accounts = store.list_account_details(owner).map_err(store_error)?;
+            Ok(accounts.into_iter().map(account_detail_view).collect())
+        })
+        .await
+    }
+
+    async fn replace_account_aliases(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        aliases: Vec<AccountAliasView>,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            let aliases: Vec<AccountAliasRecord> = aliases
+                .into_iter()
+                .map(|alias| AccountAliasRecord {
+                    value: alias.value,
+                    interval: AliasInterval {
+                        valid_from: alias.valid_from,
+                        valid_to: alias.valid_to,
+                    },
+                })
+                .collect();
+            store
+                .replace_account_aliases(owner, account, &aliases)
                 .map_err(store_error)
         })
         .await
@@ -1676,6 +1732,62 @@ impl TokenAdmin for SqliteAdapter {
             })
         })
         .await
+    }
+}
+
+/// The port's account, as the store's row.
+///
+/// Both halves of the identity or neither: one half alone would be stored as no
+/// identity at all, and the transport refuses that shape before it reaches here.
+fn account_detail_record(owner: OwnerId, account: AccountDetailView) -> AccountDetailRecord {
+    AccountDetailRecord {
+        id: account.id,
+        owner,
+        title: account.title,
+        institution: account.institution,
+        identity: account.provider.zip(account.provider_account_id).map(
+            |(provider, provider_account_id)| AccountIdentity {
+                provider,
+                provider_account_id,
+            },
+        ),
+        cash_class: account.cash_class,
+        aliases: account
+            .aliases
+            .into_iter()
+            .map(|alias| AccountAliasRecord {
+                value: alias.value,
+                interval: AliasInterval {
+                    valid_from: alias.valid_from,
+                    valid_to: alias.valid_to,
+                },
+            })
+            .collect(),
+    }
+}
+
+/// The store's row, as the port's account.
+fn account_detail_view(record: AccountDetailRecord) -> AccountDetailView {
+    let (provider, provider_account_id) = match record.identity {
+        Some(identity) => (Some(identity.provider), Some(identity.provider_account_id)),
+        None => (None, None),
+    };
+    AccountDetailView {
+        id: record.id,
+        title: record.title,
+        institution: record.institution,
+        provider,
+        provider_account_id,
+        cash_class: record.cash_class,
+        aliases: record
+            .aliases
+            .into_iter()
+            .map(|alias| AccountAliasView {
+                value: alias.value,
+                valid_from: alias.interval.valid_from,
+                valid_to: alias.interval.valid_to,
+            })
+            .collect(),
     }
 }
 

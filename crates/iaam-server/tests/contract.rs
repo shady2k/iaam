@@ -12345,3 +12345,354 @@ async fn a_transfer_pairing_is_proposed_with_its_evidence_and_never_confirmed_bl
         "{proposals}"
     );
 }
+
+// --- Decision 0004: the identity a source prints for an account -------------
+
+#[tokio::test]
+async fn an_account_created_without_an_identity_states_none() {
+    // Every account that existed before decision 0004 is in this state, and the
+    // wire shape must keep saying so rather than filling the gap in.
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Main" }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert!(created.get("provider").is_none(), "{created}");
+    assert!(created.get("provider_account_id").is_none(), "{created}");
+    assert!(created.get("cash_class").is_none(), "{created}");
+    assert!(created.get("aliases").is_none(), "{created}");
+}
+
+#[tokio::test]
+async fn a_create_repeating_an_external_identity_returns_the_account_created_last_time() {
+    // A re-import must find the account it created last time. The title differs
+    // on the second call on purpose: a title is a display name, so repeating an
+    // identity under a new one is not a rename and must not become one.
+    let harness = harness();
+    let identity = json!({ "provider": "bank-one", "provider_account_id": "opaque-1" });
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main",
+                "provider": identity["provider"],
+                "provider_account_id": identity["provider_account_id"],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["provider"], "bank-one");
+
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main, renamed at the source",
+                "provider": identity["provider"],
+                "provider_account_id": identity["provider_account_id"],
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a create that minted nothing must not report a creation: {second}"
+    );
+    assert_eq!(second["id"], first["id"], "{second}");
+    assert_eq!(
+        second["title"], "Main",
+        "the identity was already known, so the title the owner reads is untouched"
+    );
+
+    let (status, list) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let minted = list
+        .as_array()
+        .expect("account list")
+        .iter()
+        .filter(|account| account["provider"] == "bank-one")
+        .count();
+    assert_eq!(minted, 1, "a second account must not exist: {list}");
+}
+
+#[tokio::test]
+async fn one_provider_account_id_at_two_providers_is_two_accounts() {
+    // Uniqueness is scoped by provider: two sources that both print short
+    // sequential identifiers would otherwise collide on values neither controls.
+    let harness = harness();
+
+    for provider in ["bank-one", "bank-two"] {
+        let (status, body) = call(
+            &harness.router,
+            post(
+                "/v1/accounts",
+                &harness.owner_token,
+                &json!({
+                    "title": format!("Main at {provider}"),
+                    "provider": provider,
+                    "provider_account_id": "7",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (_, list) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    let with_seven = list
+        .as_array()
+        .expect("account list")
+        .iter()
+        .filter(|account| account["provider_account_id"] == "7")
+        .count();
+    assert_eq!(with_seven, 2, "{list}");
+}
+
+#[tokio::test]
+async fn half_an_external_identity_is_refused() {
+    // The pair is the identity. One half alone would be stored as no identity at
+    // all, and the caller would learn that only on the re-import that minted a
+    // duplicate. This is a check on the shape of the pair, never on the value:
+    // `provider_account_id` stays opaque.
+    let harness = harness();
+
+    for body in [
+        json!({ "title": "Main", "provider": "bank-one" }),
+        json!({ "title": "Main", "provider_account_id": "opaque-1" }),
+    ] {
+        let (status, refusal) = call(
+            &harness.router,
+            post("/v1/accounts", &harness.owner_token, &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+        assert_eq!(refusal["code"], "invalid_request");
+        assert!(
+            !refusal.to_string().contains("opaque-1"),
+            "the refusal must not echo the identifier back: {refusal}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_cards_over_one_account_are_one_account_with_two_aliases() {
+    // The balance is counted once because there is one account. A card that
+    // stopped working is an alias whose interval closed, and that is all the
+    // model records about it.
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main",
+                "aliases": [
+                    { "value": "card-one", "valid_from": "2024-01-01", "valid_to": "2025-03-01" },
+                    { "value": "card-two", "valid_from": "2025-03-01" },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (_, list) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    let account = list
+        .as_array()
+        .expect("account list")
+        .iter()
+        .find(|account| account["id"] == created["id"])
+        .expect("the created account")
+        .clone();
+    assert_eq!(
+        account["aliases"],
+        json!([
+            { "value": "card-one", "valid_from": "2024-01-01", "valid_to": "2025-03-01" },
+            { "value": "card-two", "valid_from": "2025-03-01" },
+        ]),
+        "{account}"
+    );
+}
+
+#[tokio::test]
+async fn an_alias_interval_that_ends_before_it_begins_is_refused() {
+    let harness = harness();
+
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main",
+                "aliases": [
+                    { "value": "card-one", "valid_from": "2025-03-01", "valid_to": "2024-01-01" },
+                ],
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    assert_eq!(refusal["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn a_cash_class_the_owner_states_survives_the_round_trip() {
+    let harness = harness();
+
+    for class in ["deposit", "savings", "card_account", "wallet"] {
+        let (status, created) = call(
+            &harness.router,
+            post(
+                "/v1/accounts",
+                &harness.owner_token,
+                &json!({ "title": format!("Account: {class}"), "cash_class": class }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["cash_class"], class, "{created}");
+    }
+}
+
+#[tokio::test]
+async fn a_cash_class_outside_the_cash_perimeter_is_refused() {
+    // `brokerage` and `security_position` are not values here: positions are
+    // what the journal records, and the projection separates them from cash
+    // structurally. An unknown class is refused rather than defaulted.
+    let harness = harness();
+
+    for class in ["brokerage", "security_position", "invented"] {
+        let (status, refusal) = call(
+            &harness.router,
+            post(
+                "/v1/accounts",
+                &harness.owner_token,
+                &json!({ "title": "Main", "cash_class": class }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    }
+}
+
+#[tokio::test]
+async fn an_alias_the_owner_adds_later_reaches_the_same_account() {
+    // The two-card case usually arrives in two steps: the account exists, then a
+    // second card appears over it. Without a route for that, an account's
+    // aliases could only ever be stated at creation, and the case decision 0004
+    // was written about would still need two accounts.
+    let harness = harness();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main",
+                "aliases": [{ "value": "card-one", "valid_from": "2024-01-01" }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("account id").to_owned();
+
+    // The first card stopped working and a second took its place: one interval
+    // closes, another opens, and there is nothing else to record.
+    let (status, updated) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{id}/aliases"),
+            &harness.owner_token,
+            &json!({
+                "aliases": [
+                    { "value": "card-one", "valid_from": "2024-01-01", "valid_to": "2025-03-01" },
+                    { "value": "card-two", "valid_from": "2025-03-01" },
+                ],
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(
+        updated["aliases"],
+        json!([
+            { "value": "card-one", "valid_from": "2024-01-01", "valid_to": "2025-03-01" },
+            { "value": "card-two", "valid_from": "2025-03-01" },
+        ]),
+        "{updated}"
+    );
+    assert_eq!(updated["id"], created["id"], "still one account: {updated}");
+}
+
+#[tokio::test]
+async fn aliases_cannot_be_written_against_an_account_the_owner_does_not_hold() {
+    let harness = harness();
+
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{}/aliases", Uuid::new_v4()),
+            &harness.owner_token,
+            &json!({ "aliases": [{ "value": "card-one", "valid_from": "2024-01-01" }] }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+    assert_eq!(refusal["code"], "not_found");
+}
+
+#[tokio::test]
+async fn an_agent_may_not_state_an_accounts_aliases() {
+    // An alias decides which printed identifier reaches which account, and
+    // therefore which account a row lands on. That is the owner's statement, by
+    // the same rule that keeps account creation out of the agent's hands.
+    let harness = harness();
+
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{}/aliases", harness.account.inner()),
+            &harness.agent_token,
+            &json!({ "aliases": [] }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+}

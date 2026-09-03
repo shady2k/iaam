@@ -22,8 +22,8 @@ use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{
-    AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Principal,
-    Scope,
+    AccountAliasView, AccountCreated, AccountDetailView, AccountScopeExclusionView,
+    AccountTransferStatementView, ContourView, Principal, Scope,
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
@@ -70,24 +70,24 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
+    AccountAliasDto, AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
     AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto, ActionsResponseDto,
-    AddContourVersionRequest, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto,
-    CategoryGroupDto, CategoryGroupRequest, CategoryRequest, CategoryRuleDto,
-    CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
-    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
-    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
-    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
-    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
-    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
-    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
-    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
-    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
-    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest,
-    RecordAccountTransferPartnersRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
-    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
-    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
-    VerdictDto,
+    AddContourVersionRequest, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest,
+    CashAssetClassDto, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest,
+    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
+    ClassificationRuleDto, ClassificationRuleRequest, ContourDto, ContourVersionDto,
+    CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
+    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
+    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
+    ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto,
+    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
+    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
+    MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
+    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    RecordAccountScopeRequest, RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
+    RequestPlanDto, RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest,
+    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -104,6 +104,7 @@ pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
 pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
+pub const REPLACE_ACCOUNT_ALIASES_OPERATION_ID: &str = "replace_account_aliases";
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
@@ -1464,17 +1465,12 @@ pub async fn list_accounts(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<AccountDto>>, ApiFailure> {
-    let accounts = state.services.store.list_accounts(principal.owner).await?;
-    Ok(Json(
-        accounts
-            .into_iter()
-            .map(|account| AccountDto {
-                id: account.id.inner(),
-                title: account.title,
-                institution: account.institution,
-            })
-            .collect(),
-    ))
+    let accounts = state
+        .services
+        .store
+        .list_account_details(principal.owner)
+        .await?;
+    Ok(Json(accounts.into_iter().map(account_dto).collect()))
 }
 
 /// Create an account.
@@ -1485,6 +1481,8 @@ pub async fn list_accounts(
     request_body = CreateAccountRequest,
     responses(
         (status = 201, description = "Account created", body = AccountDto),
+        (status = 200, description = "The external identity was already known: this is the \
+                                      account created last time, unchanged", body = AccountDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -1499,24 +1497,175 @@ pub async fn create_account(
     ApiJson(request): ApiJson<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<AccountDto>), ApiFailure> {
     require_admin(&principal)?;
-    let account = AccountView {
+    // The pair is the identity, so half of it is refused rather than silently
+    // stored as no identity at all. This is a check on the shape of the pair and
+    // never on the value: `provider_account_id` stays opaque, and the refusal
+    // does not echo it back.
+    let (provider, provider_account_id) = match (request.provider, request.provider_account_id) {
+        (Some(provider), Some(provider_account_id)) => (Some(provider), Some(provider_account_id)),
+        (None, None) => (None, None),
+        (Some(_), None) => {
+            return Err(unprocessable(
+                "provider_account_id",
+                "both halves of the external identity, or neither",
+                "provider alone",
+                "an account identified at a source is identified by the pair: a \
+                 request naming only the source would be stored as naming no \
+                 identity, and the next import would mint a second account",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(unprocessable(
+                "provider",
+                "both halves of the external identity, or neither",
+                "provider_account_id alone",
+                "an identifier without the source that printed it has no scope: \
+                 two sources printing short sequential identifiers would collide \
+                 on values neither of them controls",
+            ));
+        }
+    };
+
+    let aliases = alias_views(request.aliases)?;
+
+    let account = AccountDetailView {
         id: AccountId::new_random(),
         title: request.title,
         institution: request.institution,
+        provider,
+        provider_account_id,
+        cash_class: request.cash_class.map(CashAssetClassDto::to_domain),
+        aliases,
     };
+    let created = state
+        .services
+        .store
+        .create_account(principal.owner, account)
+        .await?;
+
+    // `200 OK` when the identity was already known: nothing was created, and
+    // reporting `201` for an account minted on an earlier call would be a lie a
+    // client cannot check.
+    let status = match created {
+        AccountCreated::Created(_) => StatusCode::CREATED,
+        AccountCreated::Existing(_) => StatusCode::OK,
+    };
+    let account = match created {
+        AccountCreated::Created(account) | AccountCreated::Existing(account) => account,
+    };
+    Ok((status, Json(account_dto(account))))
+}
+
+/// State an account's aliases.
+///
+/// The route decision 0004 asks for by name: an account's further identifiers
+/// must be addable, closable and readable after it exists, because the case the
+/// decision was written about — a second card over one underlying account —
+/// usually arrives after the account does.
+///
+/// The whole set is replaced, following the transfer statement: the owner says
+/// what is true now, and a diff against what he said last time is a second thing
+/// to get wrong. A card that stopped working is sent as an alias whose
+/// `valid_to` is set, beside whichever alias replaced it.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/{id}/aliases",
+    operation_id = REPLACE_ACCOUNT_ALIASES_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = ReplaceAccountAliasesRequest,
+    responses(
+        (status = 200, description = "Aliases recorded", body = AccountDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn replace_account_aliases(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<ReplaceAccountAliasesRequest>,
+) -> Result<Json<AccountDto>, ApiFailure> {
+    // Which printed identifier reaches which account decides which account a row
+    // lands on: the owner's judgement, by the rule that keeps account creation
+    // out of the agent's hands.
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+
+    let aliases = alias_views(request.aliases)?;
     state
         .services
         .store
-        .upsert_account(principal.owner, account.clone())
+        .replace_account_aliases(principal.owner, account, aliases)
         .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(AccountDto {
-            id: account.id.inner(),
-            title: account.title,
-            institution: account.institution,
-        }),
-    ))
+
+    let stored = state
+        .services
+        .store
+        .list_account_details(principal.owner)
+        .await?
+        .into_iter()
+        .find(|held| held.id == account)
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                ApiError::simple("not_found", format!("not found: account {id}")),
+            )
+        })?;
+    Ok(Json(account_dto(stored)))
+}
+
+/// Aliases from the wire, with the one check the dates carry.
+///
+/// The value is never inspected: it is opaque for the same reason
+/// `provider_account_id` is. Only the interval around it is checked, and only
+/// for being an interval at all.
+fn alias_views(aliases: Vec<AccountAliasDto>) -> Result<Vec<AccountAliasView>, ApiFailure> {
+    let mut views = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        // The interval is half-open, so an end on the start day covers nothing.
+        if alias.valid_to.is_some_and(|end| end <= alias.valid_from) {
+            return Err(unprocessable(
+                "aliases.valid_to",
+                "a date after valid_from, or nothing for an open interval",
+                "a date on or before valid_from",
+                "the interval is half-open, so an alias that ends on or before \
+                 the day it begins is valid on no day at all",
+            ));
+        }
+        views.push(AccountAliasView {
+            value: alias.value,
+            valid_from: alias.valid_from,
+            valid_to: alias.valid_to,
+        });
+    }
+    Ok(views)
+}
+
+/// One account on the wire.
+fn account_dto(account: AccountDetailView) -> AccountDto {
+    AccountDto {
+        id: account.id.inner(),
+        title: account.title,
+        institution: account.institution,
+        provider: account.provider,
+        provider_account_id: account.provider_account_id,
+        cash_class: account.cash_class.map(CashAssetClassDto::from_domain),
+        aliases: account
+            .aliases
+            .into_iter()
+            .map(|alias| AccountAliasDto {
+                value: alias.value,
+                valid_from: alias.valid_from,
+                valid_to: alias.valid_to,
+            })
+            .collect(),
+    }
 }
 
 /// An account's scope disposition.

@@ -28,6 +28,13 @@ pub enum CurrencyCode {
 }
 
 impl CurrencyCode {
+    /// Every currency this system accounts in, in declaration order.
+    ///
+    /// A constant rather than a list repeated at each use, because the two uses
+    /// are parsing and refusing: a currency added here and forgotten in the
+    /// refusal would be accepted by a route that tells its caller it is not.
+    pub const ALL: [Self; 5] = [Self::Rub, Self::Usd, Self::Eur, Self::Cny, Self::Xau];
+
     /// Number of decimal places in the minor unit.
     #[must_use]
     pub const fn minor_units(self) -> u32 {
@@ -51,7 +58,7 @@ impl CurrencyCode {
     /// Parse an ISO code without choosing a default currency.
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
-        [Self::Rub, Self::Usd, Self::Eur, Self::Cny, Self::Xau]
+        Self::ALL
             .into_iter()
             .find(|currency| currency.code() == code)
     }

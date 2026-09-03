@@ -8,6 +8,7 @@
 //! numbers: the JSON number `0.1` in binary floating point is not equal to one
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
+use crate::action_catalog::ActionCatalog;
 use iaam_app::ingest::classification::{Answer, AnswerShape, Movement};
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::observation::{
@@ -27,8 +28,8 @@ use iaam_app::scenarios::import_session::{
     HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow, RetentionReason,
 };
 use iaam_app::scenarios::reports::{
-    AccountBalanceRow, AssetSnapshot, BalancesReport, Caveat, CaveatSubject, MoneyFlowOutcome,
-    PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
+    AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
+    MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
 use iaam_core::bond::offer::OfferChoice;
@@ -792,11 +793,32 @@ impl OperationDto {
 /// set of rows rather than replace the first (spec §6).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeclaredSourceDto {
-    /// Account the rows belong to. Every operation in the batch must name this
-    /// same account: the declaration says whose rows these are, and a row that
-    /// disagreed would be recorded against one account while carrying the
-    /// import identity of another.
-    pub account: Uuid,
+    /// Account the rows belong to, named however the caller can name it: this
+    /// account's iaam identifier, or the identifier its source prints for it —
+    /// its `provider_account_id`, or one of its aliases, a card among them.
+    ///
+    /// **One field and not two**, and that is the decision. A second field
+    /// beside a `Uuid` one would create a request that fills both, and the
+    /// server would then have to publish a precedence rule for a case the
+    /// caller never meant. There is nothing to disambiguate here because the
+    /// tiering already answers it: an identifier that parses as an account of
+    /// the owner's *is* that account, before anything else is consulted, so a
+    /// caller sending a `Uuid` — every caller written before this — is answered
+    /// exactly as it was. Anything else is matched against the identity a source
+    /// prints, then against aliases, then against the title, stopping at the
+    /// first tier that matches anything; two accounts in that tier are refused
+    /// rather than picked between, and the refusal names both.
+    ///
+    /// Widening this field is what removes the read-then-join an import used to
+    /// begin with: a statement prints an account number, and a caller holding
+    /// one no longer has to fetch `/v1/accounts` to translate it before it can
+    /// send a single row.
+    ///
+    /// Every operation in the batch must still name the account this resolves
+    /// to, by its iaam identifier: the declaration says whose rows these are,
+    /// and a row that disagreed would be recorded against one account while
+    /// carrying the import identity of another.
+    pub account: String,
     /// How the rows arrived: `file`, `paste`, `manual`.
     pub channel: String,
     /// What names this import within the account and channel — a statement
@@ -2270,7 +2292,8 @@ pub struct CaveatDto {
     /// What sort of gap this is — `account_in_no_scope`,
     /// `account_in_another_scope`, `running_cash_sum`, `period_reports_refused`,
     /// `undecomposed_movements`, `unexplained_cash_change`, `unpriced_position`,
-    /// `terminal_value_not_computed`, `return_not_computed`.
+    /// `holding_not_valued`, `terminal_value_not_computed`,
+    /// `return_not_computed`.
     ///
     /// A closed set. Every one of them is read off a computation the report
     /// already performs: nothing here folds the journal a second time.
@@ -2285,6 +2308,44 @@ pub struct CaveatDto {
     /// path through the answer: `[]` stands for every element of an array, and
     /// `subject` says which element. Read it instead of believing this block.
     pub see: String,
+    /// What to call about it. Always present; **empty means nothing in this API
+    /// acts on this kind of gap**, which is a decision and not an omission.
+    ///
+    /// The other half of `see`: `see` is where to check the fact, this is where
+    /// to act on it. Before it, a client that read `complete: false` had to
+    /// fetch `/v1/actions` and filter it by `goal` — which answers "what stands
+    /// between me and this whole report", not "what removes this line" — and a
+    /// run through the flow shows an agent doing exactly that and still hunting
+    /// through separate sections.
+    ///
+    /// Addressed the way an action's target is, through the same catalogue and
+    /// against the same completed contract, so one reader serves both. What it
+    /// does **not** carry is a `request`: the preset fields and the missing ones
+    /// depend on the account, the interval and what the owner has already said,
+    /// and only the outstanding-work queue computes them. A caveat says which
+    /// call; `/v1/actions` says how to fill it in.
+    ///
+    /// One call does not always empty a caveat — a caveat is one line per
+    /// account, currency or instrument, and closing it may take more than one
+    /// fact. `see` remains the check.
+    pub closed_by: Vec<ClosingOperationDto>,
+}
+
+/// One operation a caveat names, addressed against the completed contract.
+///
+/// `ResolutionOptionDto` without the `request`, and spelled identically in the
+/// three fields they share so that a client reading an action's target reads
+/// this with the same code. The request plan is what the two genuinely differ
+/// on: the queue holds an account and an interval and can preset fields from
+/// them, and a caveat kind holds nothing but its own identity.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ClosingOperationDto {
+    #[serde(rename = "operationId")]
+    pub operation_id: String,
+    pub method: String,
+    pub path: String,
+    #[serde(rename = "requestSchema")]
+    pub request_schema: String,
 }
 
 /// The typed subject of a caveat.
@@ -2312,8 +2373,12 @@ pub enum CaveatSubjectDto {
 }
 
 impl ConfidenceDto {
+    /// `catalog` is a parameter for the reason `MoneyFlowReportDto::from_domain`
+    /// takes its actions as one: the transport resolves an operation through its
+    /// catalogue and the DTO cannot, and a register that could be built without
+    /// addressing its remedies would eventually be built that way.
     #[must_use]
-    pub fn from_domain(confidence: &ReportConfidence) -> Self {
+    pub fn from_domain(confidence: &ReportConfidence, catalog: &ActionCatalog) -> Self {
         Self {
             goal: confidence.goal().code().to_owned(),
             // From the register, never beside it: the domain type has no
@@ -2322,19 +2387,36 @@ impl ConfidenceDto {
             caveats: confidence
                 .caveats()
                 .iter()
-                .map(CaveatDto::from_domain)
+                .map(|caveat| CaveatDto::from_domain(caveat, catalog))
                 .collect(),
         }
     }
 }
 
 impl CaveatDto {
-    fn from_domain(caveat: &Caveat) -> Self {
+    fn from_domain(caveat: &Caveat, catalog: &ActionCatalog) -> Self {
         Self {
             kind: caveat.kind().code().to_owned(),
             subject: CaveatSubjectDto::from_domain(caveat.subject()),
             detail: caveat.detail().to_owned(),
             see: caveat.see().to_owned(),
+            // Resolved, not spelled. The core names the operation and the
+            // catalogue says where it lives, so the register cannot publish a
+            // route the contract does not declare: `ActionCatalog::from_openapi`
+            // fails the server's start-up before it could.
+            closed_by: caveat
+                .closed_by()
+                .iter()
+                .map(|key| {
+                    let resolved = catalog.operation(*key);
+                    ClosingOperationDto {
+                        operation_id: resolved.operation_id.clone(),
+                        method: resolved.method.clone(),
+                        path: resolved.path.clone(),
+                        request_schema: resolved.request_schema.clone(),
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -2531,11 +2613,12 @@ impl MoneyFlowReportDto {
     pub fn from_domain(
         outcome: &MoneyFlowOutcome,
         actions: Vec<ActionDto>,
+        catalog: &ActionCatalog,
     ) -> Result<Self, MoneyFlowError> {
         // The whole outcome rather than its two halves: the register is a
         // statement about the pair, and a signature that took them separately
         // would let a caller summarise one flow beside another's population.
-        let confidence = ConfidenceDto::from_domain(&outcome.confidence()?);
+        let confidence = ConfidenceDto::from_domain(&outcome.confidence()?, catalog);
         let report = &outcome.report;
         let population = &outcome.population;
         let currencies = report
@@ -2677,10 +2760,12 @@ pub struct BalancesReportDto {
     /// of what the owner holds, and which of those things are not.
     ///
     /// **First**, before the rows. It was the reader who stopped at the numbers
-    /// that this answer failed: `amount` under an `unasserted` opening is a
-    /// running sum from an unknown start and not a balance, and `population`
-    /// stood last, after `accounts` and `negative_cash`. Both facts were
-    /// published and neither was reached.
+    /// that this answer failed: a cash figure over an unasserted opening is
+    /// movement from an unknown start and not a balance, and `population` stood
+    /// last, after `accounts` and `negative_cash`. Both facts were published
+    /// and neither was reached. `accounts[].cash[]` no longer lets the number
+    /// be reached without the distinction; this block still says which rows are
+    /// affected, in one place, without reading every row.
     pub confidence: ConfidenceDto,
     pub accounts: Vec<AccountBalanceDto>,
     /// Every account-and-currency in the scope whose cash balance is negative.
@@ -2689,9 +2774,10 @@ pub struct BalancesReportDto {
     /// A **warning, not a prohibition**: a technical overdraft happens on an
     /// ordinary account, and a margin balance is a liability that belongs in
     /// NAV. Nothing refuses, suppresses, or drops a row over it — the answer
-    /// states it and the reader judges. A negative balance on an account that
-    /// cannot be overdrawn is a reason to read `accounts[].cash[].opening`
-    /// before reading the number as a balance at all.
+    /// states it and the reader judges. A negative figure on an account that
+    /// cannot be overdrawn is most often not a balance at all:
+    /// `accounts[].cash[].kind` says `movement_since_unknown_start` for it, and
+    /// that is the first thing to read.
     pub negative_cash: Vec<NegativeCashDto>,
     /// The accounts this report covered, and the known accounts it did not.
     ///
@@ -2755,7 +2841,7 @@ pub struct NegativeCashDto {
     /// the owner records an expectation rather than a prohibition. Nothing is
     /// refused, suppressed or recalculated when this is true: the figure above
     /// stands, the report stays complete, and the reader is told where to look
-    /// first — usually at `accounts[].cash[].opening`, since the reported case
+    /// first — usually at `accounts[].cash[].kind`, since the reported case
     /// behind this was a missing opening assertion rather than an overdraft.
     ///
     /// Derived from `expectation`, never stored beside it: silence is not a
@@ -2767,7 +2853,7 @@ pub struct NegativeCashDto {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AccountBalanceDto {
     pub account: Uuid,
-    pub cash: Vec<BalanceCashDto>,
+    pub cash: Vec<CashFigureDto>,
     pub reconciliation: Vec<ReconciliationStatusDto>,
     pub positions: Vec<PositionQuantityDto>,
     /// `calculated` — nothing in §11 stops the period's tax and financial
@@ -2809,19 +2895,85 @@ pub struct PerimeterRefusalDto {
     pub classification: NegativeCashClassificationDto,
 }
 
-/// A cash figure and where its accumulation starts.
+/// A cash figure, in a shape that cannot be read without deciding what kind of
+/// figure it is.
+///
+/// This was `{currency, amount, opening}`, and the flag said correctly that an
+/// `unasserted` amount is a running sum from an unknown start and not a
+/// balance. It was not enough: `amount` could be read without reading
+/// `opening`, and it was — an agent ran a first import, took
+/// `accounts[].cash[].amount` for holdings, and reported an impossible negative
+/// asset. A caveat beside a number loses to the number.
+///
+/// So there is no field called `amount` any more. The figure is spelled
+/// `balance` exactly where it is one, `movement` where it is not, and the
+/// variant has to be settled before either can be reached. This is the answer
+/// `HoldingPriceDto` already gives for a price, in the same shape and for the
+/// same reason: one reader serves both.
+///
+/// **The `mixed` case is only ever a total.** One account and currency is
+/// covered by an opening assertion or is not, so its figure is `balance` or
+/// `movement`. A total folded across accounts can be a mixture of the two, and
+/// then it carries both parts and no sum of them — see `CashClassTotalDto`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct BalanceCashDto {
-    pub currency: CurrencyDto,
-    pub amount: String,
-    /// `asserted` — an opening assertion covers the state before this account's
-    /// first cash movement in this currency, so `amount` is a balance.
-    /// `unasserted` — nothing does, so `amount` is a running sum from an
-    /// unknown start and is not a balance. It rides on the cash figure rather
-    /// than beside it, in `reconciliation`, because it is what a caller reading
-    /// the figure needs in order to read it correctly, and because it differs
-    /// per account and currency.
-    pub opening: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CashFigureDto {
+    /// Every figure folded in rests on an opening assertion covering the state
+    /// before the first cash movement in this currency. `balance` is a balance.
+    Balance {
+        currency: CurrencyDto,
+        /// Decimal number as a string: binary floating-point loses pennies.
+        #[schema(example = "1000.00")]
+        balance: String,
+    },
+    /// Nothing asserts the state this accumulated from, so `movement` is what
+    /// the recorded interval moved and says nothing about what was there
+    /// before it. It can be negative on an account that cannot be overdrawn
+    /// without anything being wrong: money that arrived before the journal
+    /// began and was spent after it makes exactly that figure.
+    MovementSinceUnknownStart {
+        currency: CurrencyDto,
+        #[schema(example = "-500.00")]
+        movement: String,
+    },
+    /// Part of what was folded in is a balance and part is movement. Both parts
+    /// are stated and **their sum is not**: it would be neither of them.
+    Mixed {
+        currency: CurrencyDto,
+        /// The part covered by opening assertions.
+        #[schema(example = "1000.00")]
+        balance: String,
+        /// The part accumulated from an unknown start.
+        #[schema(example = "-500.00")]
+        movement: String,
+    },
+}
+
+impl CashFigureDto {
+    fn from_domain(figure: CashFigure) -> Self {
+        let currency = CurrencyDto::from_domain(figure.currency());
+        match figure {
+            CashFigure::Balance(money) => Self::Balance {
+                currency,
+                balance: decimal_amount(money),
+            },
+            CashFigure::Movement(money) => Self::MovementSinceUnknownStart {
+                currency,
+                movement: decimal_amount(money),
+            },
+            CashFigure::Mixed { balance, movement } => Self::Mixed {
+                currency,
+                balance: decimal_amount(balance),
+                movement: decimal_amount(movement),
+            },
+        }
+    }
+}
+
+/// A posted amount as the decimal string every cash figure in this module is
+/// spelled with.
+fn decimal_amount(money: Money) -> String {
+    money.to_calc_dec().inner().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2832,12 +2984,12 @@ pub struct PositionQuantityDto {
 }
 
 impl BalancesReportDto {
-    pub fn from_domain(report: &BalancesReport) -> Self {
+    pub fn from_domain(report: &BalancesReport, catalog: &ActionCatalog) -> Self {
         Self {
             // Asked of the report itself. The transport neither folds the rows
             // nor decides what a caveat is: a register assembled here could
             // disagree with the answer printed beside it.
-            confidence: ConfidenceDto::from_domain(&report.confidence()),
+            confidence: ConfidenceDto::from_domain(&report.confidence(), catalog),
             accounts: report
                 .accounts
                 .iter()
@@ -2875,11 +3027,7 @@ impl AccountBalanceDto {
             cash: row
                 .cash
                 .iter()
-                .map(|cash| BalanceCashDto {
-                    currency: CurrencyDto::from_domain(cash.money.currency()),
-                    amount: cash.money.to_calc_dec().inner().to_string(),
-                    opening: cash.opening.code().to_owned(),
-                })
+                .map(|cash| CashFigureDto::from_domain(CashFigure::for_account(*cash)))
                 .collect(),
             reconciliation: row
                 .reconciliation
@@ -2945,6 +3093,16 @@ pub struct AssetSnapshotDto {
     /// A calculated value rather than a posted amount: the moment a quote
     /// enters a figure the figure stops being a bank balance, and the type says
     /// so.
+    ///
+    /// **A currency whose cash is not entirely balances is absent from this
+    /// list, halves and all.** It is the one figure here that cannot say what
+    /// it is — a whole is a single number by definition — and it is the figure
+    /// a reader in a hurry stops at. While part of a currency's cash is
+    /// movement from an unknown start there is no whole to state, so none is
+    /// stated, exactly as an unvalued holding is absent from the position total
+    /// rather than valued at zero. Nothing is withheld but the addition:
+    /// `cash.totals` and `positions.totals` state both halves for every
+    /// currency, and `confidence` names the accounts that would anchor them.
     pub total: Vec<CalcMoneyDto>,
     /// The rows every total above was folded from — the balances answer's own
     /// rows. They are here so a total can be checked against them inside one
@@ -2963,13 +3121,9 @@ pub struct CashSideDto {
     /// unstated class first. Always present; empty when the scope holds no
     /// account at all.
     pub classes: Vec<CashClassTotalDto>,
-    /// Every class added up, per currency.
-    pub totals: Vec<AmountDto>,
-    /// `asserted` — every figure summed here rests on an opening assertion, so
-    /// the totals are balances. `unasserted` — at least one does not, so at
-    /// least part of the sum is movement since an unknown start. The register
-    /// names which account and currency.
-    pub opening: String,
+    /// Every class added up, per currency, each entry saying what kind of
+    /// figure it is on the same terms a class total does.
+    pub totals: Vec<CashFigureDto>,
 }
 
 /// One class of cash and what the accounts declared to be it hold.
@@ -2984,10 +3138,27 @@ pub struct CashClassTotalDto {
     /// the rows beneath it.
     pub accounts: Vec<Uuid>,
     /// One figure per currency. Nothing is converted.
-    pub totals: Vec<AmountDto>,
-    /// `asserted` or `unasserted`, for this class. One running sum makes the
-    /// class total a running sum.
-    pub opening: String,
+    ///
+    /// **A class no longer carries one `opening` word for all its currencies.**
+    /// An opening assertion is per account *and* currency, so a class can be
+    /// anchored in one currency and not in another, and the single flag said
+    /// `unasserted` for both. Each figure now says it for itself.
+    ///
+    /// **When the accounts in a class disagree**, the figure is `mixed`: it
+    /// carries the balance part and the movement part and no sum of them. That
+    /// is the decision this shape records. The alternatives were worse. Calling
+    /// the whole thing movement understates a real balance and makes the
+    /// anchored accounts useless at the class level. Publishing one number
+    /// under a `mixed` label is worse still — a stock added to a flow denotes
+    /// nothing, and a labelled number is still a number a reader can lift out.
+    /// Two labelled parts are each a sum of like figures, and a reader who
+    /// wants one number must add them himself, which is the moment he decides
+    /// the addition means something.
+    ///
+    /// Which accounts lack the anchor is not repeated here: `confidence`
+    /// carries one `running_cash_sum` caveat per account and currency, and a
+    /// second copy on this row could fall out of step with it.
+    pub totals: Vec<CashFigureDto>,
 }
 
 /// Positions, at the prices the journal holds.
@@ -3108,17 +3279,17 @@ pub struct AssetAccountDto {
     pub account: Uuid,
     /// The class the owner declared, or null where he has not.
     pub cash_class: Option<String>,
-    pub cash: Vec<BalanceCashDto>,
+    pub cash: Vec<CashFigureDto>,
     pub positions: Vec<PositionQuantityDto>,
 }
 
 impl AssetSnapshotDto {
-    pub fn from_domain(snapshot: &AssetSnapshot) -> Self {
+    pub fn from_domain(snapshot: &AssetSnapshot, catalog: &ActionCatalog) -> Self {
         Self {
             // Asked of the snapshot itself. The transport neither folds the
             // rows nor decides what a caveat is: a register assembled here
             // could disagree with the answer printed beside it.
-            confidence: ConfidenceDto::from_domain(&snapshot.confidence()),
+            confidence: ConfidenceDto::from_domain(&snapshot.confidence(), catalog),
             as_of: snapshot.as_of,
             cash: CashSideDto {
                 classes: snapshot
@@ -3132,12 +3303,21 @@ impl AssetSnapshotDto {
                             .iter()
                             .map(|account| account.inner())
                             .collect(),
-                        totals: class.totals.iter().map(amount_dto).collect(),
-                        opening: class.opening.code().to_owned(),
+                        totals: class
+                            .totals
+                            .iter()
+                            .copied()
+                            .map(CashFigureDto::from_domain)
+                            .collect(),
                     })
                     .collect(),
-                totals: snapshot.cash.totals.iter().map(amount_dto).collect(),
-                opening: snapshot.cash.opening.code().to_owned(),
+                totals: snapshot
+                    .cash
+                    .totals
+                    .iter()
+                    .copied()
+                    .map(CashFigureDto::from_domain)
+                    .collect(),
             },
             positions: PositionsSideDto {
                 holdings: snapshot
@@ -3173,11 +3353,7 @@ impl AssetSnapshotDto {
                     cash: row
                         .cash
                         .iter()
-                        .map(|cash| BalanceCashDto {
-                            currency: CurrencyDto::from_domain(cash.money.currency()),
-                            amount: cash.money.to_calc_dec().inner().to_string(),
-                            opening: cash.opening.code().to_owned(),
-                        })
+                        .map(|cash| CashFigureDto::from_domain(CashFigure::for_account(*cash)))
                         .collect(),
                     positions: row
                         .positions
@@ -3192,15 +3368,6 @@ impl AssetSnapshotDto {
                 .collect(),
             population: PopulationDto::from_domain(&snapshot.population),
         }
-    }
-}
-
-/// A posted amount on the wire, spelled the way every other cash figure in this
-/// module is spelled.
-fn amount_dto(money: &Money) -> AmountDto {
-    AmountDto {
-        amount: money.to_calc_dec().inner().to_string(),
-        currency: CurrencyDto::from_domain(money.currency()),
     }
 }
 
@@ -3286,9 +3453,9 @@ pub struct ReturnsAnswerDto {
 
 impl ReturnsAnswerDto {
     #[must_use]
-    pub fn from_domain(outcome: &ReturnsOutcome) -> Self {
+    pub fn from_domain(outcome: &ReturnsOutcome, catalog: &ActionCatalog) -> Self {
         Self {
-            confidence: ConfidenceDto::from_domain(&outcome.confidence()),
+            confidence: ConfidenceDto::from_domain(&outcome.confidence(), catalog),
             report: ReturnsReportDto::from_domain(&outcome.report),
             population: PopulationDto::from_domain(&outcome.population),
         }
@@ -3595,11 +3762,38 @@ pub struct ActionDto {
 /// A field of its own rather than a name buried in `reason`: `id` is opaque by
 /// contract and `reason` is a sentence, so a client that wants the items about
 /// one account had no way to select them without parsing prose.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+///
+/// An account subject carries the owner's own name for the account beside the
+/// identifier, under the naming rule in `docs/api/conventions.md` §3. The queue
+/// is the surface that rule was written for: a client is handed a dozen items,
+/// one per account, and nothing else in the response says which account any of
+/// them is about. Before the name travelled with the item, reading the queue
+/// meant a second request to `GET /v1/accounts` and a join the client was left
+/// to perform — and an item the owner cannot name is an item he cannot act on.
+///
+/// The pair is built in `iaam_app::actions`, where the item is built, and not
+/// joined here. See `iaam_app::actions::AccountSubject` for why: `reason`
+/// already interpolates the title, and a name joined from a second read of the
+/// store could contradict the sentence printed beside it.
+///
+/// An event has no name. `Event` stays a bare identifier because nothing the
+/// owner said names one — the id is the whole of its identity, and the item's
+/// `reason` states what the event is.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionSubjectDto {
-    Account { id: Uuid },
-    Event { id: Uuid },
+    Account {
+        id: Uuid,
+        /// What the owner calls this account.
+        title: String,
+        /// The institution he said holds it, when he said. Absent means he has
+        /// not said, never that the account has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        institution: Option<String>,
+    },
+    Event {
+        id: Uuid,
+    },
 }
 
 /// The tagged target of an action.
@@ -3737,9 +3931,19 @@ pub enum AccountScopeDispositionDto {
 }
 
 /// An account's current disposition.
+///
+/// `title` and `institution` travel with `account` under the naming rule in
+/// `docs/api/conventions.md` §3. This answer exists to be read back to the
+/// owner — «is this one inside your perimeter, and if not, why» — and it names
+/// exactly one account, so nothing else in it says which.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccountScopeDto {
     pub account: Uuid,
+    /// What the owner calls this account.
+    pub title: String,
+    /// The institution he said holds it, when he said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
     pub disposition: AccountScopeDispositionDto,
     /// The owner's reason, present only for `outside`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6959,6 +7163,22 @@ pub struct OpenImportSessionRequest {
     pub source: Option<DeclaredSourceDto>,
 }
 
+/// The account a declaration resolved to, named as the owner named it.
+///
+/// The identifier with the title beside it, because a caller that declared an
+/// account by the number its bank prints has no way to check it reached the
+/// right one — and the rows it is about to send have to carry this `id`. Sending
+/// it back is what lets the whole import be walked without a directory read:
+/// what the caller sends is what its statement prints, and what it copies into
+/// the rows is what this response just handed it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeclaredAccountDto {
+    pub id: Uuid,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
+}
+
 /// Rows fed into a session.
 ///
 /// The same shape the conclusive route takes, and deliberately so: a session is
@@ -7006,6 +7226,17 @@ pub struct ImportSessionDto {
     /// readily as an open one, and what it would have recorded is exactly what a
     /// caller asks about after the fact.
     pub assessment: String,
+    /// The account the declaration named, resolved.
+    ///
+    /// Present on the response that opened the session, and absent everywhere
+    /// else — which is a fact about the session rather than an oversight. A
+    /// session stores its `source` and `import`, and both are one-way
+    /// derivations from the account: nothing read back later can recover it.
+    /// The moment the server holds the account is the moment it resolved the
+    /// declaration, so that is the response that carries it, and a caller
+    /// wanting it afterwards asks the directory as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<DeclaredAccountDto>,
 }
 
 impl ImportSessionDto {
@@ -7019,6 +7250,7 @@ impl ImportSessionDto {
             opened_at: session.opened_at.clone(),
             closed_at: session.closed_at.clone(),
             assessment: format!("/v1/import-sessions/{}/assessment", session.id.inner()),
+            account: None,
         }
     }
 }
@@ -7373,24 +7605,31 @@ pub struct RetainedRowDto {
 /// nothing matched it is a leg the owner reads as an external flow by default,
 /// which is the defect rather than the fix.
 ///
-/// **`unmatched` is not a list of failures, and this block is not a job queue.**
-/// Every cash movement carrying a posting date is offered to the matcher,
-/// because nothing printed in a row says whether it is half of a transfer: a
-/// payment in a shop and the outgoing leg of a transfer between two of the
-/// owner's banks are the same row until a counterpart turns up on another
-/// account. So a movement no counterpart was proposed for is listed here, and
-/// for everything that is not a transfer — a card payment, a salary, a cash
-/// withdrawal — that is its correct and permanent state. It will be listed on
-/// every reading of this route, for good, and there is nothing for the owner to
-/// do about it.
+/// **`without_counterpart` is a state, not a queue.** Every cash movement
+/// carrying a posting date is offered to the matcher, because nothing printed in
+/// a row says whether it is half of a transfer: a payment in a shop and the
+/// outgoing leg of a transfer between two of the owner's banks are the same row
+/// until a counterpart turns up on another account. So a movement no counterpart
+/// was proposed for is listed there, and for everything that is not a transfer —
+/// a card payment, a salary, a cash withdrawal — that is its correct and
+/// permanent state. There is nothing for the owner to do about it.
 ///
-/// The normal shape of an import containing no transfers is therefore
-/// `candidates: []` beside an `unmatched` holding every row of it: five ordinary
-/// deposits and withdrawals produce five unmatched legs and nothing to confirm.
-/// A caller that reads that as an error will report one on every import the
-/// owner makes. What deserves attention is `candidates`, which are the pairs put
-/// to the owner to judge, and, inside an import session, the readiness that
-/// counts them.
+/// The ordinary shape of an import containing no transfers is therefore
+/// `candidates: []` beside a `without_counterpart` holding every row of it: five
+/// deposits and withdrawals produce five legs with no counterpart and nothing to
+/// confirm. What deserves attention is `candidates`, which are the pairs put to
+/// the owner to judge, and, inside an import session, the readiness that counts
+/// them.
+///
+/// The field was called `unmatched`, and the paragraph above used to be twice
+/// this length because the name was working against it: under a parent called
+/// `cross_source_matching`, `unmatched` reads as *failed to match* or *still
+/// being worked on*, and an external agent read it exactly that way in spite of
+/// the documentation. [`TransferLegDto`] below records the opposite decision —
+/// an imprecise wire name kept rather than broken — and the two are consistent:
+/// a type name that overstates what a row is costs a reader a second, while a
+/// field name that reads as pending work cost a false alarm on every import the
+/// owner made, for as long as the name stood.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CrossSourceMatchingDto {
     /// Pairs proposed for the owner to confirm. Empty is the ordinary case: most
@@ -7399,24 +7638,24 @@ pub struct CrossSourceMatchingDto {
     /// Cash movements for which no counterpart was proposed — permanently, for
     /// every movement that is not half of a transfer.
     ///
-    /// Read it as "nothing was proposed against these", never as "these failed
-    /// to match" or "these are still being worked on". A full `unmatched` beside
-    /// an empty `candidates` says only that the source held no transfer, which
-    /// is what most sources hold.
-    pub unmatched: Vec<TransferLegDto>,
+    /// A long list here beside an empty `candidates` says only that the source
+    /// held no transfer, which is what most sources hold.
+    pub without_counterpart: Vec<TransferLegDto>,
 }
 
 /// One side of a cash movement, which may or may not be half of a transfer.
 ///
 /// Rendered from any recorded or planned `CashOut` or `CashIn` that carries a
-/// posting date, so appearing here — in `unmatched` above all — asserts nothing
-/// about the row beyond its having moved cash on a day.
+/// posting date, so appearing here — in `without_counterpart` above all —
+/// asserts nothing about the row beyond its having moved cash on a day.
 ///
 /// The domain type behind it is called `CashLeg` for exactly that reason: naming
 /// it after transfers claimed of every row the thing the owner alone decides.
 /// The two names differ on purpose, and this one keeps `Transfer` because it is
 /// published in the OpenAPI schema and clients hold it; renaming the wire would
-/// break them for a word.
+/// break them for a word. That the field beside it *was* renamed is not a
+/// reversal: what is bought here is a more accurate noun, and what was bought
+/// there was the end of a recurring false alarm.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TransferLegDto {
     /// The journal event, when the leg is already recorded.
@@ -7684,7 +7923,7 @@ impl CrossSourceMatchingDto {
                     },
                 })
                 .collect(),
-            unmatched: proposals
+            without_counterpart: proposals
                 .unmatched
                 .iter()
                 .map(TransferLegDto::from_domain)

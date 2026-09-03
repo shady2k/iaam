@@ -2,7 +2,7 @@
 //! of those things are not.
 //!
 //! Every fact this module publishes is already published somewhere in the
-//! report it summarises. `population.completeness`, `accounts[].cash[].opening`
+//! report it summarises. `population.completeness`, `accounts[].cash[].kind`
 //! and the rest are each correct and each in the right place; the difficulty
 //! reported from a run through the whole flow was that a reader had to
 //! reconstruct "how much of this answer do I believe" from four fields in three
@@ -22,6 +22,18 @@
 //! assembled from figures: a summary that restated an amount could restate it
 //! wrongly, and then the report would contradict itself.
 //!
+//! **A caveat names the call that would close it.** [`CaveatKind::closed_by`]
+//! is the operation, or the two operations, this API publishes that act on that
+//! kind of gap — empty where nothing does. Before it, the only join was by
+//! [`ReportGoal`]: a caller read `complete: false` and had to fetch the
+//! outstanding-work queue and filter it by goal, which answers "what stands
+//! between me and this whole report" and not "what removes this line". An
+//! external agent read the register and still went hunting through separate
+//! sections. The names it points at are [`crate::operation::OperationKey`],
+//! owned by the core and resolved by the transport against the completed
+//! contract, so the register and the queue cannot name different calls for the
+//! same remedy — see that module for why the vocabulary is not the queue's.
+//!
 //! **It is computed here, beside the numbers.** A register assembled by the
 //! transport can disagree with the report it summarises — the same failure the
 //! architecture guard caught when a cash fold was written outside the core. The
@@ -31,6 +43,7 @@
 
 use crate::ids::{AccountId, InstrumentId};
 use crate::money::CurrencyCode;
+use crate::operation::OperationKey;
 use crate::projection::money_flow::{MoneyFlow, MoneyFlowError};
 use crate::returns::ReturnsReport;
 
@@ -57,6 +70,18 @@ pub enum ReportGoal {
 }
 
 impl ReportGoal {
+    /// Every goal, in the order this vocabulary is published.
+    ///
+    /// Listed so that a caller enumerating the four cannot publish three: the
+    /// discovery catalog names the route that answers each goal, and it walks
+    /// this array rather than a list of its own.
+    pub const ALL: [Self; 4] = [
+        Self::AssetSnapshot,
+        Self::MoneyFlow,
+        Self::Returns,
+        Self::Reconciliation,
+    ];
+
     /// The machine-readable name carried to a caller.
     #[must_use]
     pub const fn code(self) -> &'static str {
@@ -110,6 +135,24 @@ pub enum CaveatKind {
 }
 
 impl CaveatKind {
+    /// Every kind, in declaration order.
+    ///
+    /// Iterated by the guard that resolves [`Self::closed_by`] against the
+    /// published contract: a table checked for the kinds someone remembered to
+    /// list is a table with a hole in it exactly where the mistake is.
+    pub const ALL: [Self; 10] = [
+        Self::AccountInNoScope,
+        Self::AccountInAnotherScope,
+        Self::RunningCashSum,
+        Self::PeriodReportsRefused,
+        Self::UndecomposedMovements,
+        Self::UnexplainedCashChange,
+        Self::UnpricedPosition,
+        Self::HoldingNotValued,
+        Self::TerminalValueNotComputed,
+        Self::ReturnNotComputed,
+    ];
+
     /// The machine-readable name carried to a caller.
     #[must_use]
     pub const fn code(self) -> &'static str {
@@ -138,7 +181,7 @@ impl CaveatKind {
     pub const fn see(self) -> &'static str {
         match self {
             Self::AccountInNoScope | Self::AccountInAnotherScope => "population.outside[]",
-            Self::RunningCashSum => "accounts[].cash[].opening",
+            Self::RunningCashSum => "accounts[].cash[].kind",
             Self::PeriodReportsRefused => "accounts[].period_reports",
             Self::UndecomposedMovements => "currencies[].not_decomposed.by_account[]",
             Self::UnexplainedCashChange => "unexplained[]",
@@ -146,6 +189,82 @@ impl CaveatKind {
             Self::HoldingNotValued => "positions.holdings[].value",
             Self::TerminalValueNotComputed => "terminal_value",
             Self::ReturnNotComputed => "xirr_pre_tax",
+        }
+    }
+
+    /// The operations this API publishes that act on this kind of gap.
+    ///
+    /// The other half of [`Self::see`]. `see` says where to check the fact;
+    /// this says what to call about it, so a caller holding a report with
+    /// caveats needs neither a second request nor a filter of its own. It is a
+    /// property of the kind for the reason `see` is: a caveat built pointing at
+    /// a remedy of the caller's choosing could point at one that does nothing.
+    ///
+    /// **Empty means nothing in this API acts on it**, and never "not yet
+    /// decided". The match is exhaustive over a closed set, so an eleventh kind
+    /// does not compile until someone has answered this question for it, and
+    /// `&[]` is that answer written down rather than the question unasked. The
+    /// same arrangement, and the same reason, as `ReportGoals::NONE` on the
+    /// queue's `ActionKind::goals` — which is where the empty entries below are
+    /// confirmed rather than guessed.
+    ///
+    /// It does not promise that one call removes the whole caveat. A caveat is
+    /// one line per account, currency or instrument, and closing it may take
+    /// more than one fact; what is promised is that the operation named is
+    /// addressed to this state and that the transport can resolve it. `see`
+    /// remains the check.
+    ///
+    /// Each entry is what the queue does about the same state, not what the
+    /// caveat's prose suggests:
+    ///
+    /// - `AccountInNoScope` — the two resolutions `account_scope_undecided`
+    ///   publishes, in its order: place the account in a contour, or rule it
+    ///   deliberately outside and say why.
+    /// - `AccountInAnotherScope` — one only. The account is already in a
+    ///   contour of the owner's, so there is nothing to rule outside; what
+    ///   closes the caveat is adding it to the contour **this** report was
+    ///   folded over, which is a new version of that contour.
+    /// - `RunningCashSum` — the opening control assertion, which is exactly
+    ///   what turns the figure from a movement into a balance. The queue's
+    ///   `provide_control_assertion` names the same operation.
+    /// - `UndecomposedMovements` — a category rule. It is the only operation
+    ///   addressed to this state and it does not reach all of it: category
+    ///   assignment is never consulted for a transfer that left the contour, so
+    ///   the transfer half of the same total has no remedy at all. The queue
+    ///   splits the aggregate into two items for that reason; the caveat is per
+    ///   account and currency and cannot, which is why the promise above is the
+    ///   narrow one.
+    /// - `PeriodReportsRefused` — nothing. §11 refuses the period on an open
+    ///   negative-cash span the journal does not explain, and no call in this
+    ///   API asserts a classification for one.
+    /// - `UnexplainedCashChange` — nothing, and the queue says so in as many
+    ///   words: the residual is an aggregate over one account and one currency
+    ///   that names no event, every correction is addressed to an event the
+    ///   caller names, so `unexplained_residual` is published `Blocked`.
+    /// - `UnpricedPosition`, `HoldingNotValued` — nothing. No quote exists at
+    ///   or before the report date, and this API records prices from sources
+    ///   rather than accepting a value for a holding; a call that let one be
+    ///   supplied to close a caveat would be the invented number the whole
+    ///   register exists to refuse.
+    /// - `TerminalValueNotComputed`, `ReturnNotComputed` — nothing, for the
+    ///   reason above: both are absent *because* something they are derived
+    ///   from is, and the caveat for that thing stands beside them.
+    #[must_use]
+    pub const fn closed_by(self) -> &'static [OperationKey] {
+        match self {
+            Self::AccountInNoScope => &[
+                OperationKey::AddContourVersion,
+                OperationKey::RecordAccountScope,
+            ],
+            Self::AccountInAnotherScope => &[OperationKey::AddContourVersion],
+            Self::RunningCashSum => &[OperationKey::RecordOwnerBalance],
+            Self::UndecomposedMovements => &[OperationKey::CreateCategoryRule],
+            Self::PeriodReportsRefused
+            | Self::UnexplainedCashChange
+            | Self::UnpricedPosition
+            | Self::HoldingNotValued
+            | Self::TerminalValueNotComputed
+            | Self::ReturnNotComputed => &[],
         }
     }
 
@@ -251,6 +370,13 @@ impl Caveat {
     #[must_use]
     pub const fn see(&self) -> &'static str {
         self.kind.see()
+    }
+
+    /// What to call about it, and empty where nothing does. See
+    /// [`CaveatKind::closed_by`].
+    #[must_use]
+    pub const fn closed_by(&self) -> &'static [OperationKey] {
+        self.kind.closed_by()
     }
 }
 
@@ -403,26 +529,72 @@ mod tests {
     /// Every kind must name a field, and no two kinds may share a name.
     #[test]
     fn every_kind_carries_a_pointer_and_a_sentence() {
-        const KINDS: [CaveatKind; 10] = [
-            CaveatKind::AccountInNoScope,
-            CaveatKind::AccountInAnotherScope,
-            CaveatKind::RunningCashSum,
-            CaveatKind::PeriodReportsRefused,
-            CaveatKind::UndecomposedMovements,
-            CaveatKind::UnexplainedCashChange,
-            CaveatKind::UnpricedPosition,
-            CaveatKind::HoldingNotValued,
-            CaveatKind::TerminalValueNotComputed,
-            CaveatKind::ReturnNotComputed,
-        ];
-        let mut codes: Vec<&str> = KINDS.iter().map(|kind| kind.code()).collect();
-        codes.sort_unstable();
+        let mut codes: Vec<&str> = CaveatKind::ALL.iter().map(|kind| kind.code()).collect();
         let unique = codes.len();
+        codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), unique, "two caveat kinds share a code");
-        for kind in KINDS {
+        for kind in CaveatKind::ALL {
             assert!(!kind.see().is_empty(), "{} names no field", kind.code());
             assert!(!kind.detail().is_empty(), "{} says nothing", kind.code());
         }
+    }
+
+    /// A remedy offered twice is a caller told to make the same call twice, and
+    /// it reads as two ways out where there is one.
+    #[test]
+    fn no_kind_names_the_same_operation_twice() {
+        for kind in CaveatKind::ALL {
+            let mut keys: Vec<&str> = kind.closed_by().iter().map(|key| key.as_str()).collect();
+            let listed = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(
+                keys.len(),
+                listed,
+                "{} names an operation twice",
+                kind.code()
+            );
+        }
+    }
+
+    /// Empty is the answer «nothing in this API closes this», and it is a
+    /// decision. Pinned so that giving one of these kinds a remedy — or taking
+    /// one away from a kind that has one — is an edit somebody made on purpose.
+    #[test]
+    fn the_kinds_nothing_closes_are_the_ones_the_queue_leaves_blocked() {
+        let unclosable: Vec<&str> = CaveatKind::ALL
+            .iter()
+            .filter(|kind| kind.closed_by().is_empty())
+            .map(|kind| kind.code())
+            .collect();
+        assert_eq!(
+            unclosable,
+            vec![
+                "period_reports_refused",
+                "unexplained_cash_change",
+                "unpriced_position",
+                "holding_not_valued",
+                "terminal_value_not_computed",
+                "return_not_computed",
+            ]
+        );
+    }
+
+    /// The register's own join: an account nobody has ruled on offers both ways
+    /// out, in the order the outstanding-work queue offers them.
+    #[test]
+    fn an_undecided_account_carries_both_of_its_remedies() {
+        let caveat = Caveat::new(
+            CaveatKind::AccountInNoScope,
+            CaveatSubject::Account(AccountId(uuid::Uuid::from_u128(1))),
+        );
+        assert_eq!(
+            caveat.closed_by(),
+            &[
+                OperationKey::AddContourVersion,
+                OperationKey::RecordAccountScope
+            ]
+        );
     }
 }

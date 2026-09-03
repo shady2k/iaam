@@ -55,7 +55,8 @@ pub use iaam_core::report::assets::{
     AssetAccount, AssetSnapshot, CashClassTotal, CashSide, HoldingValue, PositionsSide,
 };
 pub use iaam_core::report::balances::{
-    AccountBalanceRow, AccountCash, BalancesReport, CashOpening, NegativeCash, PeriodReports,
+    AccountBalanceRow, AccountCash, BalancesReport, CashFigure, CashOpening, NegativeCash,
+    PeriodReports,
 };
 pub use iaam_core::report::confidence::{
     Caveat, CaveatKind, CaveatSubject, ReportConfidence, ReportGoal, money_flow_confidence,
@@ -1362,13 +1363,6 @@ mod tests {
             cash_opening(&movements, &[], account, CurrencyCode::Rub),
             CashOpening::Unasserted
         );
-    }
-
-    #[test]
-    fn each_cash_opening_has_a_distinct_machine_readable_code() {
-        assert_eq!(CashOpening::Asserted.code(), "asserted");
-        assert_eq!(CashOpening::Unasserted.code(), "unasserted");
-        assert_ne!(CashOpening::Asserted.code(), CashOpening::Unasserted.code());
     }
 
     #[test]

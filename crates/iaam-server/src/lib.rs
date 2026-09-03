@@ -6,8 +6,10 @@
 //! from the API responses is an error.
 
 pub mod action_catalog;
+pub mod api_catalog;
 pub mod auth;
 pub use action_catalog::{ActionCatalog, ActionCatalogError, ActionOperation};
+pub use api_catalog::{ApiCatalog, ApiCatalogError};
 pub mod dto;
 pub mod error;
 pub mod extract;
@@ -60,6 +62,8 @@ impl ServerState {
 pub enum BuildError {
     #[error(transparent)]
     ActionCatalog(#[from] ActionCatalogError),
+    #[error(transparent)]
+    ApiCatalog(#[from] ApiCatalogError),
 }
 
 /// Builds the axum application together with the generated specification.
@@ -160,6 +164,10 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .merge(protected)
         .split_for_parts();
     let catalog = ActionCatalog::from_openapi(&api)?;
+    // The discovery document is resolved against the same completed document,
+    // so an entry point advertising a route that no longer exists refuses the
+    // build instead of reaching a client that has nothing else to go on.
+    let discovery = ApiCatalog::from_openapi(&api)?;
 
     // In production, build is called from within the tokio runtime. This check
     // preserves the ability to build a Router in a normal synchronous test.
@@ -170,8 +178,12 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
     let spec = api.clone();
     let router = router
         .layer(Extension(Arc::new(catalog)))
+        .layer(Extension(Arc::new(discovery)))
+        // Mounted from the constant the catalog links, because the generated
+        // document does not describe itself and so cannot be the shared source
+        // of this one address.
         .route(
-            "/v1/openapi.json",
+            api_catalog::OPENAPI_PATH,
             get(move || {
                 let spec = spec.clone();
                 async move { Json(spec) }

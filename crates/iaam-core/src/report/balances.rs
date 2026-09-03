@@ -6,7 +6,7 @@
 //! able to disagree with them.
 
 use crate::ids::AccountId;
-use crate::money::{Money, Quantity};
+use crate::money::{CurrencyCode, Money, Quantity};
 use crate::perimeter::NegativeCashSpan;
 use crate::projection::balances::PositionKey;
 use crate::reconciliation::ReconciliationStatus;
@@ -29,6 +29,10 @@ use super::population::ReportPopulation;
 ///
 /// The distinction is per account-and-currency, because that is what an opening
 /// assertion is about and what a cash figure is about.
+///
+/// This is evidence, not the published shape. What a caller reads is
+/// [`CashFigure`], which spends this distinction on the spelling of the figure
+/// instead of stating it beside one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CashOpening {
     /// An opening assertion covers the state before this account's first cash
@@ -36,17 +40,6 @@ pub enum CashOpening {
     Asserted,
     /// Nothing does: the figure accumulated from an unasserted start.
     Unasserted,
-}
-
-impl CashOpening {
-    /// The machine-readable name carried to a caller.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Asserted => "asserted",
-            Self::Unasserted => "unasserted",
-        }
-    }
 }
 
 /// One cash figure together with what is known about where it started.
@@ -58,6 +51,92 @@ impl CashOpening {
 pub struct AccountCash {
     pub money: Money,
     pub opening: CashOpening,
+}
+
+/// A cash figure together with what it is a figure *of*.
+///
+/// [`CashOpening`] states the same distinction **beside** the number, and that
+/// turned out not to be enough. A reader of `{amount, opening}` reaches the
+/// amount without reading the flag, and the reported defect is exactly that: an
+/// agent ran a first import, read the cash figures — one of them an impossible
+/// negative on a savings-class account — and reported them as holdings. Here
+/// there is no field spelled `amount` to reach for. The figure is called a
+/// balance only where it is one, so the case has to be decided before the
+/// number can be had at all.
+///
+/// The same answer [`super::assets::HoldingValue::price`] gives for a price,
+/// and deliberately the same shape, so that a client needs one reader for both.
+///
+/// **Three cases and not two.** A figure summed across accounts can be a
+/// mixture, because an opening assertion is per account and currency and the
+/// owner may have made some of them. The sum of a mixture is neither of its
+/// parts: a balance is a stock and a movement from an unasserted start is a
+/// flow, and adding a stock to a flow yields a number that denotes nothing.
+/// (That is also why the whole may mix cash with position values and may not
+/// mix these two — the first is a difference in how well a value is known, the
+/// second a difference in what the number is about.) So a mixture keeps its
+/// parts apart and publishes no combined figure; whoever decides that adding
+/// them means something performs the addition himself, and by then he has
+/// decided it.
+///
+/// A single account and currency is never [`Self::Mixed`]: one opening
+/// assertion either covers it or does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CashFigure {
+    /// Every leg summed into this figure starts from an asserted opening, so
+    /// the figure is a balance.
+    Balance(Money),
+    /// Nothing asserts the state summed from: the movement over the recorded
+    /// interval, which is not a balance and cannot be made into one by looking
+    /// plausible.
+    Movement(Money),
+    /// Part of what was summed is a balance and part is movement. Both parts
+    /// are in the same currency by construction: the fold that builds this
+    /// groups by currency first.
+    Mixed { balance: Money, movement: Money },
+}
+
+impl CashFigure {
+    /// The figure for one account and currency.
+    #[must_use]
+    pub const fn for_account(cash: AccountCash) -> Self {
+        match cash.opening {
+            CashOpening::Asserted => Self::Balance(cash.money),
+            CashOpening::Unasserted => Self::Movement(cash.money),
+        }
+    }
+
+    /// The currency every part of this figure is in.
+    #[must_use]
+    pub const fn currency(&self) -> CurrencyCode {
+        match self {
+            Self::Balance(money) | Self::Movement(money) | Self::Mixed { balance: money, .. } => {
+                money.currency()
+            }
+        }
+    }
+
+    /// The part of this figure that rests on asserted openings, where there is
+    /// one.
+    #[must_use]
+    pub const fn balance(&self) -> Option<Money> {
+        match self {
+            Self::Balance(money) | Self::Mixed { balance: money, .. } => Some(*money),
+            Self::Movement(_) => None,
+        }
+    }
+
+    /// The part accumulated from an unasserted start, where there is one.
+    #[must_use]
+    pub const fn movement(&self) -> Option<Money> {
+        match self {
+            Self::Movement(money)
+            | Self::Mixed {
+                movement: money, ..
+            } => Some(*money),
+            Self::Balance(_) => None,
+        }
+    }
 }
 
 /// Whether §11 lets the period's tax and financial reports be calculated for
@@ -397,9 +476,33 @@ mod tests {
         assert_eq!(confidence.goal(), ReportGoal::AssetSnapshot);
     }
 
-    /// Each caveat names the account and currency whose `opening` says the same
-    /// thing, and points at that field. Without the currency the reader is sent
-    /// to the wrong row of a multi-currency account.
+    /// One account and currency is a balance or it is movement, and never both:
+    /// a single opening assertion either covers it or does not. The figure it
+    /// publishes says which, and there is no third field to read it out of.
+    #[test]
+    fn an_account_figure_is_a_balance_only_where_an_assertion_anchors_it() {
+        let money = Money::new(PostedMinor::new(1_000), CurrencyCode::Rub);
+        let anchored = CashFigure::for_account(AccountCash {
+            money,
+            opening: CashOpening::Asserted,
+        });
+        let adrift = CashFigure::for_account(AccountCash {
+            money,
+            opening: CashOpening::Unasserted,
+        });
+
+        assert_eq!(anchored, CashFigure::Balance(money));
+        assert_eq!(anchored.balance(), Some(money));
+        assert_eq!(anchored.movement(), None);
+
+        assert_eq!(adrift, CashFigure::Movement(money));
+        assert_eq!(adrift.balance(), None);
+        assert_eq!(adrift.movement(), Some(money));
+    }
+
+    /// Each caveat names the account and currency whose figure says the same
+    /// thing, and points at the field that says it. Without the currency the
+    /// reader is sent to the wrong row of a multi-currency account.
     #[test]
     fn a_running_sum_caveat_names_the_account_and_currency_and_the_field() {
         let report = report(&[AccountStanding::Covered], CashOpening::Unasserted);
@@ -413,7 +516,7 @@ mod tests {
                 currency: CurrencyCode::Rub,
             }
         );
-        assert_eq!(caveat.see(), "accounts[].cash[].opening");
+        assert_eq!(caveat.see(), "accounts[].cash[].kind");
     }
 
     /// §11 refusing one account's period reports is a caveat, and points at the

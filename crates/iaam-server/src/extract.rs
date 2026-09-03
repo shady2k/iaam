@@ -192,17 +192,16 @@ impl Subject {
 }
 
 fn invalid_request(field: Option<String>, expected: Option<String>, message: String) -> ApiFailure {
-    ApiFailure::new(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        ApiError {
-            code: "invalid_request".to_owned(),
-            message,
-            field,
-            expected,
-            actual: None,
-            correlation_id: None,
-        },
-    )
+    let mut body = ApiError::simple("invalid_request", message);
+    // `about` is what derives the pointer, so a rejection that knows the field
+    // publishes both forms of it and one that does not publishes neither.
+    if let Some(field) = field {
+        body = body.about(field);
+    }
+    if let Some(expected) = expected {
+        body = body.expecting(expected);
+    }
+    ApiFailure::new(StatusCode::UNPROCESSABLE_ENTITY, body)
 }
 
 /// A `415`: there is nothing to deserialise, so `422` would be a lie about
@@ -210,14 +209,11 @@ fn invalid_request(field: Option<String>, expected: Option<String>, message: Str
 fn unsupported_media_type() -> ApiFailure {
     ApiFailure::new(
         StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        ApiError {
-            code: "unsupported_media_type".to_owned(),
-            message: "a JSON body must be sent with Content-Type: application/json".to_owned(),
-            field: None,
-            expected: Some("application/json".to_owned()),
-            actual: None,
-            correlation_id: None,
-        },
+        ApiError::simple(
+            "unsupported_media_type",
+            "a JSON body must be sent with Content-Type: application/json",
+        )
+        .expecting("application/json"),
     )
 }
 

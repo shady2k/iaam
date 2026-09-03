@@ -13,6 +13,7 @@ pub mod ids;
 pub mod instrument;
 pub mod money;
 pub mod numeric;
+pub mod operation;
 pub mod perimeter;
 pub mod projection;
 pub mod reconciliation;

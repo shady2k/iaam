@@ -130,7 +130,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/market/fx` | `MarketFxSeriesDto` | object, `rows` | `complete_through` |
 | `GET /v1/market/key-rate` | `MarketKeyRateSeriesDto` | object, `rows` | `complete_through` |
 | `GET /v1/reconciliation` | `ReconciliationResponseDto` | object, `statuses` | three lists — `statuses`, `gaps`, `actions` — none of them a property of another's rows |
-| `GET /v1/transfer-pairings` | `CrossSourceMatchingDto` | object, `candidates` | `unmatched` — the legs nothing paired with, which no candidate can carry |
+| `GET /v1/transfer-pairings` | `CrossSourceMatchingDto` | object, `candidates` | `without_counterpart` — the legs nothing paired with, which no candidate can carry |
 | `GET /v1/accounts/{id}/transfer-partners` | `AccountTransferPartnersDto` | object, `partners` | `stated` — whether the owner has ruled at all, which an empty array cannot say |
 | `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, and how many questions are unanswered |
 | `GET /v1/reports/balances` | `BalancesReportDto` | object, `accounts` | `negative_cash`, `population` |
@@ -153,3 +153,158 @@ reason a full list is: the caller supplied the batch, so it already knows what
 the array is about, and each verdict carries the row number that ties it back.
 Where a batch response is an object, it is because the run produced a fact of its
 own: a document hash, a set of counts, a revision.
+
+---
+
+## 3. Naming a thing the owner named
+
+> **Wherever the API prints the identifier of a thing the owner named, it prints
+> his own name for it beside it: `title`, and `institution` too for an account
+> he gave one for. A name is never accepted as input.**
+
+### 3.1 Why the name travels with the identifier
+
+The whole interaction this API serves is the system asking the owner something
+and the owner answering. `GET /v1/actions` is the clearest case: it returns one
+item per account, and the items of a kind differ from one another in nothing but
+a UUID. An agent that had run an import and asked what remained received a dozen
+`record_owner_balance` items and could not tell which bank any of them was about
+— not because the fact was unavailable, but because it was in a different
+response. Reading the queue meant fetching `GET /v1/accounts` and joining.
+
+A join every client must write is a join every client can get wrong, and a
+question the owner cannot read is a question he cannot answer. The account
+already holds everything needed to ask it properly — he supplied the title and
+the institution once, when he created it — so making him supply the connection
+again, every time, is asking twice.
+
+The same reasoning is already written in the core, at the first type that needed
+it. `PopulationAccount` carries a title beside the identifier because "the
+manifest exists to be read: an owner asked to rule on an account cannot act on a
+bare UUID, and a caller that had to fetch the names separately would be free to
+render the manifest without them." An action item is that sentence with the same
+reader.
+
+`institution` travels with `title` for the case a title alone cannot settle. Two
+accounts the owner calls `Savings`, at two banks, are one word apart in a list
+and are not the same question. It is absent, never null and never guessed, when
+he has not said where the account is held — an invented institution would tell
+two accounts apart by a fiction.
+
+### 3.2 Why a name is never accepted as input
+
+A name is not an identity. The owner renames an account when the bank renames a
+product; two of his accounts may carry one title; a title is a string a client
+can autocomplete, mistype, translate or invent. A request that resolved an
+account by name would have no way to fail on a plausible wrong answer — it would
+address the wrong account and succeed, which is worse than a refusal.
+
+The identifier has the properties the name does not: opaque, unique, stable
+across every rename. And a client that took it from a response cannot have made
+it up, which is the property that matters most when the client is a language
+model. Every identifier a request carries was copied out of an earlier response.
+
+There is a second cost. If a title were addressable, renaming an account would
+break every stored request that named it, and the owner would be choosing
+between a name that reads well and a name nothing depends on.
+
+### 3.3 Why the asymmetry is the protection
+
+Reading and writing are not the same act, and the rule points the same way in
+both.
+
+Output is read by a person deciding something. It must be legible, so it carries
+the name.
+
+Input is composed by a machine acting on his behalf. It must be unambiguous, so
+it carries the identifier and nothing else.
+
+Made symmetric in either direction the pair loses one of those. Accept names as
+input and the ambiguity of names — renames, duplicates, near-misses — reaches
+the one place in the system that must have none. Withhold names from output and
+the owner is asked to rule on something he cannot read. So the asymmetry is not
+an inconsistency to be tidied away: it is what lets a client obey a single rule
+with no exceptions — **it never composes an identifier and never resolves a
+name.**
+
+### 3.4 The name is paired with the identifier where the answer is made
+
+The pair is built in the component that computed the answer, not joined onto it
+by the transport. This is §1.4a's sibling: a second, independently-derived copy
+of a fact is a fact that can disagree with itself.
+
+`ActionSubjectDto::Account` is filled from `iaam_app::actions::AccountSubject`,
+which the action policy builds at the moment it builds the item, out of the same
+account list it wrote the item's `reason` sentence from — and that sentence names
+the account too. Joined at the transport, the name beside the identifier would
+come from a second reading of the store, and one response could name one account
+two ways. The transport copies; it does not look up. `ConfidenceDto::from_domain`
+carries the same note for the same reason: "a register assembled here could
+disagree with the answer printed beside it."
+
+That decision has a visible consequence. The diagnostic functions over a
+reconciliation ledger and a money flow report are given the owner's accounts as
+an argument, because a ledger holds identifiers and no names; and if they name
+an account the list does not hold, they refuse the whole answer rather than
+publish an item the owner cannot act on. Nothing deletes an account, so the
+refusal reports the store contradicting itself and nothing else.
+
+### 3.5 What carries the name, and what does not
+
+Every published type that prints an identifier of a thing the owner named.
+
+| Published type | Identifier | Name beside it |
+|---|---|---|
+| `AccountDto` | `id` | `title`, `institution` |
+| `AccountCandidateDto` | `id` | `title`, `institution` |
+| `ActionSubjectDto::Account` | `id` | `title`, `institution` |
+| `AccountScopeDto` | `account` | `title`, `institution` |
+| `PopulationAccountDto` | `account` | `title` |
+| `ImportQuestionDto` | in `prompt` | the titles, in the sentence |
+| `ContourDto` | `contour` | `title` |
+| `CategoryDto`, `CategoryGroupDto` | `id` | `title` |
+| `InstrumentDto` | `id` | `symbol`, `title` |
+| `TokenDto` | `id` | `label` |
+| `BrokerAccessDto` | `id` | `broker` |
+
+And the types that print a bare identifier on purpose.
+
+| Published type | Identifier | Why no name |
+|---|---|---|
+| `ActionSubjectDto::Event` | `id` | nothing the owner said names an event; the identifier is the whole of its identity and the item's `reason` states what it was |
+| `AccountBalanceDto`, `NegativeCashDto`, `AssetAccountDto`, `CashClassTotalDto`, `NotDecomposedAccountDto`, `AccountResidualDto`, `EarningSourceAmountDto`, `CaveatSubjectDto` | `account` | the answer these sit in carries `population`, whose `covered` and `outside` name every account it mentions and every account it left out. The join table is in the same response, computed by the same fold, and one report row cannot disagree with it |
+| `ReconciliationStatusDto`, `TaintDto` | `account` | the caller named the account in the request; the response answers about that one and no other |
+| `JournalEventReadDto`, `JournalLegDto`, `OperationDto`, `VerdictDto` | `account` | a row-level echo of what the caller submitted or asked for |
+| every request body | — | §3.2 |
+
+Two things follow for a client. Where a response carries a `population` block, it
+is the name table for every account named anywhere in that response — look the
+account up there rather than calling `GET /v1/accounts`. Where a response carries
+neither the name nor a population, the account is the one the request named.
+
+### 3.6 Where the rule is not yet kept
+
+Named here rather than left to be discovered, in the spirit of §1.4a. Each is a
+surface that asks the owner to act on an account, a contour or a category and
+prints only its identifier, with no name table beside it in the same response:
+
+- `AccountTransferPartnersDto` and `AccountTransferPartnersStatementDto` —
+  `account` and `partners` are bare, and `partners` is precisely a list of the
+  owner's own accounts he is being asked to confirm.
+- The import session assessment — `SourceInventoryDto.accounts`,
+  `AccountResolutionDto.resolved` and `.missing`, `ScopeAssessmentDto`'s three
+  lists, `PlannedFactDto.account`, `TransferLegDto.account`. The session's
+  questions do keep the rule; the assessment printed beside them does not.
+- Contour references: `AccountScopeDto.contours`, `ContourDto.accounts`,
+  `ContourVersionDto.accounts`, `PopulationDto.contour`,
+  `MoneyFlowReportDto.contour`, `AppliedRulesDto.contour`.
+- Category references: `CategoryDto.group`, `CategoryRuleDto.category`,
+  `CategoryAmountDto.category`, `ClassifiedAsDto.to`, `CategoryMoveDto`.
+- Instrument references outside the catalogue: `HoldingValueDto`,
+  `PositionQuantityDto`, `CaveatSubjectDto::Instrument` and the position types.
+  An instrument is named by a catalogue rather than by the owner, so this is the
+  weakest of the five; it is listed because the reader's difficulty is the same.
+
+Each of these is a shape change to a published type, so each is its own decision
+about breaking a client, and none of them is a reason to publish a new type that
+prints an identifier alone. A type added after this section carries the name.

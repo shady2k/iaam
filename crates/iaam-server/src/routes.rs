@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
@@ -16,15 +16,16 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
     AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
-    ActionTarget, MissingInput, OperationKey, ProvidedBy, RequestPlan, account_scope,
+    ActionTarget, InputAlternative, MissingInput, OperationKey, ProvidedBy, RequestPlan,
+    account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     AccountAliasView, AccountCreated, AccountDeclarations, AccountDetailView, AccountIdentityView,
-    AccountScopeExclusionView, AccountTransferStatementView, ContourView, Declared, Principal,
-    Scope,
+    AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Declared,
+    Principal, Scope,
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
@@ -70,6 +71,7 @@ use uuid::Uuid;
 
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
+use crate::api_catalog::ApiCatalog;
 use crate::dto::{
     AccountAliasDto, AccountCandidateDto, AccountCashClassStatementDto, AccountDeclarationsDto,
     AccountDto, AccountIdentityNotDoneDto, AccountIdentityRepointedDto, AccountIdentityStatedDto,
@@ -82,13 +84,14 @@ use crate::dto::{
     ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
     ContourVersionDto, CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
-    ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto,
-    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
-    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
-    MoneyFlowReportDto, NegativeBalanceExpectationDto, OwnerBalanceRequest, QuotationBasisDto,
-    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
-    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
+    CustodyRepairRequest, DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams,
+    FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto,
+    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
+    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
+    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
+    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
+    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
     RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
     ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
     ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
@@ -192,9 +195,14 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
         .to_owned(),
         reason: action.reason().to_owned(),
         required_scope: action.required_scope().map(|scope| scope.code().to_owned()),
+        // Copied, not looked up: the pairing of an account with what the owner
+        // calls it is made where the item is made, so the name here and the name
+        // inside `reason` are one reading of the store rather than two.
         subject: action.subject().map(|subject| match subject {
             ActionSubject::Account(account) => ActionSubjectDto::Account {
-                id: account.inner(),
+                id: account.id.inner(),
+                title: account.title.clone(),
+                institution: account.institution.clone(),
             },
             ActionSubject::Event(event) => ActionSubjectDto::Event { id: event.inner() },
         }),
@@ -203,7 +211,11 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
 }
 
 /// One way to close an action, addressed against the completed contract.
-fn resolution_option_dto(
+///
+/// Visible to the crate because a rejection publishes the same shape: a refusal
+/// whose remedy is another call names it exactly as an action does, and a second
+/// construction of the address would eventually offer a route the queue does not.
+pub(crate) fn resolution_option_dto(
     operation: OperationKey,
     request: &RequestPlan,
     catalog: &ActionCatalog,
@@ -230,17 +242,27 @@ fn missing_input_dto(missing: &MissingInput) -> MissingInputDto {
         alternatives: missing
             .alternatives
             .iter()
-            .map(|alternative| InputAlternativeDto {
-                value: alternative.value.clone(),
-                requires: alternative
-                    .requires
-                    .iter()
-                    .map(|required| RequiredInputDto {
-                        pointer: required.pointer.clone(),
-                        provided_by: provided_by_code(required.provided_by),
-                        candidates: required.candidates.as_deref().map(account_candidate_dtos),
-                    })
-                    .collect(),
+            .map(input_alternative_dto)
+            .collect(),
+    }
+}
+
+/// One admissible value, and the fields choosing it then needs.
+///
+/// Lifted out of [`missing_input_dto`] because a rejection publishes the same
+/// list without a missing input around it: the values a field admits are the
+/// values it admits whether the caller has yet to supply one or supplied a wrong
+/// one.
+pub(crate) fn input_alternative_dto(alternative: &InputAlternative) -> InputAlternativeDto {
+    InputAlternativeDto {
+        value: alternative.value.clone(),
+        requires: alternative
+            .requires
+            .iter()
+            .map(|required| RequiredInputDto {
+                pointer: required.pointer.clone(),
+                provided_by: provided_by_code(required.provided_by),
+                candidates: required.candidates.as_deref().map(account_candidate_dtos),
             })
             .collect(),
     }
@@ -639,8 +661,11 @@ pub async fn correct_import(
     let request: CorrectImportRequest = serde_json::from_slice(&body).map_err(|error| {
         invalid_field("body", "import correction JSON object", error.to_string())
     })?;
-    let source = declared_source(principal.owner, &request.source)?;
-    let target = match declared_import(principal.owner, &request.source)? {
+    let account = declared_account(&state, &principal, &request.source)
+        .await?
+        .id;
+    let source = declared_source(principal.owner, account, &request.source)?;
+    let target = match declared_import(principal.owner, account, &request.source)? {
         Some(import) => ImportTarget::Named { source, import },
         None => ImportTarget::Unnamed { source },
     };
@@ -1432,23 +1457,29 @@ fn market_source(source: MarketSourceDto) -> MarketSource {
     }
 }
 /// The standards discovery document for this API.
-pub const API_CATALOG_BODY: &[u8] = br#"{"linkset":[{"anchor":"/v1","service-desc":[{"href":"/v1/openapi.json","type":"application/json"}],"status":[{"href":"/v1/health","type":"application/json"}]}]}"#;
-
+///
+/// Not a directory of the sixty-six routes — the contract behind `service-desc`
+/// is that, and it is generated. This document is the ordering the contract has
+/// no way to express: the four goals this API answers and the route that answers
+/// each, the queue that says which of them this instance cannot answer yet, and
+/// the scopes every goal route takes an id from. See [`crate::api_catalog`] for
+/// why it is resolved from the router rather than written out.
 #[utoipa::path(
     get,
     path = "/.well-known/api-catalog",
     responses((
         status = 200,
-        description = "API discovery links",
+        description = "The contract, the health resource, the outstanding-work queue, the scopes, \
+                       and the route answering each of the four report goals",
         content_type = "application/linkset+json"
     ))
 )]
-pub async fn api_catalog() -> Response {
+pub async fn api_catalog(Extension(catalog): Extension<Arc<ApiCatalog>>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/linkset+json")
-        .body(Body::from(Bytes::from_static(API_CATALOG_BODY)))
-        .expect("static catalog response is valid")
+        .body(Body::from(catalog.body()))
+        .expect("catalog response is valid")
 }
 
 /// Service status.
@@ -1954,9 +1985,8 @@ pub async fn get_account_scope(
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<AccountScopeDto>, ApiFailure> {
-    let account = AccountId(id);
-    owned_account(&state, &principal, account).await?;
-    Ok(Json(account_scope_dto(&state, &principal, account).await?))
+    let account = owned_account(&state, &principal, AccountId(id)).await?;
+    Ok(Json(account_scope_dto(&state, &principal, &account).await?))
 }
 
 /// Record the owner's decision about an account's place in the perimeter.
@@ -1992,7 +2022,7 @@ pub async fn record_account_scope(
     // same rule that keeps contour composition out of the agent's hands.
     require_admin(&principal)?;
     let account = AccountId(id);
-    owned_account(&state, &principal, account).await?;
+    let named = owned_account(&state, &principal, account).await?;
 
     match request.disposition {
         AccountScopeDispositionDto::Inside => {
@@ -2046,7 +2076,7 @@ pub async fn record_account_scope(
         }
     }
 
-    Ok(Json(account_scope_dto(&state, &principal, account).await?))
+    Ok(Json(account_scope_dto(&state, &principal, &named).await?))
 }
 
 /// An account's stated transfer partners.
@@ -2325,27 +2355,29 @@ async fn owned_account(
     state: &ServerState,
     principal: &Principal,
     account: AccountId,
-) -> Result<(), ApiFailure> {
+) -> Result<AccountView, ApiFailure> {
     let accounts = state.services.store.list_accounts(principal.owner).await?;
-    if accounts.iter().any(|held| held.id == account) {
-        Ok(())
-    } else {
-        Err(ApiFailure::new(
-            StatusCode::NOT_FOUND,
-            ApiError::simple(
-                "not_found",
-                format!("not found: account {}", account.inner()),
-            ),
-        ))
-    }
+    accounts
+        .into_iter()
+        .find(|held| held.id == account)
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                ApiError::simple(
+                    "not_found",
+                    format!("not found: account {}", account.inner()),
+                ),
+            )
+        })
 }
 
 /// Read the disposition back from the two places that hold one.
 async fn account_scope_dto(
     state: &ServerState,
     principal: &Principal,
-    account: AccountId,
+    account: &AccountView,
 ) -> Result<AccountScopeDto, ApiFailure> {
+    let id = account.id;
     let contours = state.services.store.list_contours(principal.owner).await?;
     let exclusions = state
         .services
@@ -2354,22 +2386,24 @@ async fn account_scope_dto(
         .await?;
     let naming: Vec<Uuid> = contours
         .iter()
-        .filter(|contour| contour.accounts.contains(&account))
+        .filter(|contour| contour.accounts.contains(&id))
         .map(|contour| contour.id.0)
         .collect();
-    let (disposition, reason) = match account_scope(account, &contours, &exclusions) {
+    let (disposition, reason) = match account_scope(id, &contours, &exclusions) {
         AccountScope::Inside => (AccountScopeDispositionDto::Inside, None),
         AccountScope::Outside => (
             AccountScopeDispositionDto::Outside,
             exclusions
                 .iter()
-                .find(|exclusion| exclusion.account == account)
+                .find(|exclusion| exclusion.account == id)
                 .map(|exclusion| exclusion.reason.clone()),
         ),
         AccountScope::Undecided => (AccountScopeDispositionDto::Undecided, None),
     };
     Ok(AccountScopeDto {
-        account: account.inner(),
+        account: id.inner(),
+        title: account.title.clone(),
+        institution: account.institution.clone(),
         disposition,
         reason,
         contours: naming,
@@ -2379,14 +2413,10 @@ async fn account_scope_dto(
 fn unprocessable(field: &str, expected: &str, actual: &str, message: &str) -> ApiFailure {
     ApiFailure::new(
         StatusCode::UNPROCESSABLE_ENTITY,
-        ApiError {
-            code: "invalid_request".into(),
-            message: message.to_owned(),
-            field: Some(field.to_owned()),
-            expected: Some(expected.to_owned()),
-            actual: Some(actual.to_owned()),
-            correlation_id: None,
-        },
+        ApiError::simple("invalid_request", message)
+            .about(field)
+            .expecting(expected)
+            .receiving(actual),
     )
 }
 
@@ -2478,16 +2508,27 @@ pub async fn create_token(
         TokenScopeDto::Owner => {
             return Err(ApiFailure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                ApiError {
-                    code: "invalid_request".into(),
-                    message: "an owner token cannot be issued via the API: the owner is created \
-                              with `iaam claim --label <label>`"
-                        .into(),
-                    field: Some("scope".into()),
-                    expected: Some("agent or read_only".into()),
-                    actual: Some("owner".into()),
-                    correlation_id: None,
-                },
+                ApiError::simple(
+                    "invalid_request",
+                    "an owner token cannot be issued via the API: the owner is created with \
+                     `iaam claim --label <label>`",
+                )
+                .about("scope")
+                .expecting("agent or read_only")
+                .receiving("owner")
+                // The two scopes a token may be issued with, as values: the
+                // sentence beside them says the same thing, and a caller
+                // retrying should not have to split it on the word "or".
+                .admitting(vec![
+                    InputAlternativeDto {
+                        value: "agent".to_owned(),
+                        requires: Vec::new(),
+                    },
+                    InputAlternativeDto {
+                        value: "read_only".to_owned(),
+                        requires: Vec::new(),
+                    },
+                ]),
             ));
         }
         TokenScopeDto::Agent => Scope::Agent,
@@ -2694,16 +2735,14 @@ pub async fn add_contour_version(
     {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
-            ApiError {
-                code: "version_conflict".into(),
-                message: "the contour has moved on since the version this request names; \
-                          read it back and decide the composition again"
-                    .into(),
-                field: Some("expected_version".into()),
-                expected: Some(current.version.0.to_string()),
-                actual: Some(expected.to_string()),
-                correlation_id: None,
-            },
+            ApiError::simple(
+                "version_conflict",
+                "the contour has moved on since the version this request names; read it back \
+                 and decide the composition again",
+            )
+            .about("expected_version")
+            .expecting(current.version.0.to_string())
+            .receiving(expected.to_string()),
         ));
     }
 
@@ -2820,14 +2859,13 @@ fn bounded_composition(accounts: &[Uuid]) -> Result<Vec<AccountId>, ApiFailure> 
     if accounts.is_empty() {
         return Err(ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError {
-                code: "invalid_request".into(),
-                message: "a contour with no accounts has no boundary".into(),
-                field: Some("accounts".into()),
-                expected: Some("at least one account".into()),
-                actual: Some("empty list".into()),
-                correlation_id: None,
-            },
+            ApiError::simple(
+                "invalid_request",
+                "a contour with no accounts has no boundary",
+            )
+            .about("accounts")
+            .expecting("at least one account")
+            .receiving("empty list"),
         ));
     }
     Ok(accounts.iter().copied().map(AccountId).collect())
@@ -2886,10 +2924,17 @@ pub async fn ingest_operations(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let (source, import) = match &request.source {
-        Some(declared) => (
-            declared_source(principal.owner, declared)?,
-            declared_import(principal.owner, declared)?,
+    let declared = match &request.source {
+        Some(declared) => Some((
+            declared,
+            declared_account(&state, &principal, declared).await?.id,
+        )),
+        None => None,
+    };
+    let (source, import) = match declared {
+        Some((declared, account)) => (
+            declared_source(principal.owner, account, declared)?,
+            declared_import(principal.owner, account, declared)?,
         ),
         // No declaration: today's behaviour, so existing callers keep working.
         None => (SourceId::new_random(), None),
@@ -2902,12 +2947,17 @@ pub async fn ingest_operations(
     // account contradicts the declaration the caller made over all of them,
     // and writing the agreeing half would leave a half-import recorded under
     // an identity that names the wrong account.
-    if let Some(declared) = &request.source {
+    //
+    // The comparison is against the account the declaration **resolved** to,
+    // not against the text it was written as: a caller may declare the batch by
+    // the number its bank prints, and the rows still name the account by its
+    // iaam identifier, which is the one thing both sides can agree on.
+    if let Some((_, account)) = declared {
         for (index, operation) in request.operations.iter().enumerate() {
-            if operation.account != declared.account {
+            if operation.account != account.inner() {
                 return Err(invalid_field(
                     format!("operations[{index}].account"),
-                    &declared.account.to_string(),
+                    &account.inner().to_string(),
                     operation.account.to_string(),
                 ));
             }
@@ -2972,6 +3022,13 @@ fn intake_verdict_dto(row: usize, outcome: &IntakeOutcome) -> VerdictDto {
 // ---------------------------------------------------------------------------
 
 /// Open an import session.
+///
+/// The declared account may be named by its iaam identifier or by the identifier
+/// its source prints for it — its `provider_account_id`, or one of its aliases,
+/// a card among them. An identifier two accounts answer to is refused rather
+/// than guessed at, and the refusal names both. The response carries the account
+/// the declaration resolved to, and that identifier is the one the rows of this
+/// session must name.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions",
@@ -2994,12 +3051,16 @@ pub async fn open_import_session(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let (source, import) = match &request.source {
-        Some(declared) => (
-            Some(declared_source(principal.owner, declared)?),
-            declared_import(principal.owner, declared)?,
-        ),
-        None => (None, None),
+    let (account, source, import) = match &request.source {
+        Some(declared) => {
+            let account = declared_account(&state, &principal, declared).await?;
+            (
+                Some(account.clone()),
+                Some(declared_source(principal.owner, account.id, declared)?),
+                declared_import(principal.owner, account.id, declared)?,
+            )
+        }
+        None => (None, None, None),
     };
     let session = iaam_app::scenarios::import_session::open_session(
         &state.services,
@@ -3010,7 +3071,19 @@ pub async fn open_import_session(
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(ImportSessionDto::from_domain(&session)),
+        Json(ImportSessionDto {
+            // The account goes back with the session, and only here: this is the
+            // one response that holds it, and the rows the caller is about to
+            // send have to name it. Without it a caller that declared the batch
+            // by the number its statement prints would have to go and read the
+            // directory anyway — the very read this declaration removed.
+            account: account.map(|account| DeclaredAccountDto {
+                id: account.id.inner(),
+                title: account.title,
+                institution: account.institution,
+            }),
+            ..ImportSessionDto::from_domain(&session)
+        }),
     ))
 }
 
@@ -3227,6 +3300,7 @@ pub async fn assess_import_session(
 pub async fn commit_import_session(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiPath(id): ApiPath<Uuid>,
     ApiJsonOrDefault(request): ApiJsonOrDefault<CommitImportSessionRequest>,
 ) -> Result<Json<ImportCommitDto>, ApiFailure> {
@@ -3238,13 +3312,18 @@ pub async fn commit_import_session(
     // revision it committed under. Making the body mandatory would break every
     // caller that already commits with nothing to say.
     let revision = request.revision.map(SessionRevision);
+    // Converted through the catalog rather than with `?`: this is the one
+    // refusal in the API whose remedy is a call — an unanswered question is not
+    // settled by writing anything into the request — and the address of that
+    // call is only resolvable against the completed document.
     let outcome = iaam_app::scenarios::import_session::commit_session(
         &state.services,
         &principal,
         ImportSessionId(id),
         revision.as_ref(),
     )
-    .await?;
+    .await
+    .map_err(|error| ApiFailure::from_app(error, &catalog))?;
     let contents = iaam_app::scenarios::import_session::read_session(
         &state.services,
         &principal,
@@ -3279,11 +3358,11 @@ pub async fn commit_import_session(
 /// owner confirms. Legs nothing paired with are published too: a leg dropped
 /// from the answer is a leg read as external flow by default.
 ///
-/// `unmatched` is therefore most of the journal, permanently, and is not work
-/// waiting to be done: every cash movement with a posting date is offered to the
-/// matcher, and a payment in a shop has no counterpart to propose and never
-/// will. An empty `candidates` beside a long `unmatched` is this route's
-/// ordinary answer, not an error.
+/// `without_counterpart` is therefore most of the journal, permanently, and is
+/// not work waiting to be done: every cash movement with a posting date is
+/// offered to the matcher, and a payment in a shop has no counterpart to propose
+/// and never will. An empty `candidates` beside a long `without_counterpart` is
+/// this route's ordinary answer, not an error.
 #[utoipa::path(
     get,
     path = "/v1/transfer-pairings",
@@ -3542,12 +3621,14 @@ pub async fn flow_report(
     };
     let outcome = money_flow(&state.services, &principal, &query).await?;
     // No scoping: the projection admits no leg from outside the contour, so the
-    // report cannot name an account it does not cover.
-    let actions = iaam_app::actions::flow_diagnostics(&outcome.report)
+    // report cannot name an account it does not cover. The accounts are read for
+    // the names the items carry, not to narrow them.
+    let accounts = state.services.store.list_accounts(principal.owner).await?;
+    let actions = iaam_app::actions::flow_diagnostics(&outcome.report, &accounts)?
         .iter()
         .map(|action| action_dto(action, &catalog))
         .collect();
-    let dto = MoneyFlowReportDto::from_domain(&outcome, actions)
+    let dto = MoneyFlowReportDto::from_domain(&outcome, actions, &catalog)
         .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
 }
@@ -3581,6 +3662,7 @@ pub struct BalancesParams {
 pub async fn balances_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiQuery(params): ApiQuery<BalancesParams>,
 ) -> Result<Json<BalancesReportDto>, ApiFailure> {
     let as_of = parse_query_date("as_of", &params.as_of)?;
@@ -3592,7 +3674,7 @@ pub async fn balances_report(
         as_of,
     )
     .await?;
-    Ok(Json(BalancesReportDto::from_domain(&report)))
+    Ok(Json(BalancesReportDto::from_domain(&report, &catalog)))
 }
 
 /// What the owner holds at a date.
@@ -3629,6 +3711,7 @@ pub struct AssetSnapshotParams {
 pub async fn asset_snapshot_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiQuery(params): ApiQuery<AssetSnapshotParams>,
 ) -> Result<Json<AssetSnapshotDto>, ApiFailure> {
     let as_of = parse_query_date("as_of", &params.as_of)?;
@@ -3640,7 +3723,7 @@ pub async fn asset_snapshot_report(
         as_of,
     )
     .await?;
-    Ok(Json(AssetSnapshotDto::from_domain(&snapshot)))
+    Ok(Json(AssetSnapshotDto::from_domain(&snapshot, &catalog)))
 }
 
 /// Returns report parameters.
@@ -3676,6 +3759,7 @@ pub struct ReturnsParams {
 pub async fn returns_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiQuery(params): ApiQuery<ReturnsParams>,
 ) -> Result<Json<ReturnsAnswerDto>, ApiFailure> {
     let query = ReturnsQuery {
@@ -3689,7 +3773,7 @@ pub async fn returns_report(
         lot_rule: LotRuleVersion(1),
     };
     let outcome = returns(&state.services, &principal, &query).await?;
-    Ok(Json(ReturnsAnswerDto::from_domain(&outcome)))
+    Ok(Json(ReturnsAnswerDto::from_domain(&outcome, &catalog)))
 }
 
 /// Exchange rates supplied with the report request.
@@ -3713,6 +3797,7 @@ pub async fn returns_report(
 pub async fn returns_report_with_rates(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiQuery(params): ApiQuery<ReturnsParams>,
     ApiJson(rates): ApiJson<Vec<FxRateDto>>,
 ) -> Result<Json<ReturnsAnswerDto>, ApiFailure> {
@@ -3721,14 +3806,10 @@ pub async fn returns_report_with_rates(
         let parsed = rate.rate.parse::<Decimal>().map_err(|_| {
             ApiFailure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                ApiError {
-                    code: "invalid_request".into(),
-                    message: "exchange rate must be a decimal number".into(),
-                    field: Some("rate".into()),
-                    expected: Some("decimal number represented as a string".into()),
-                    actual: Some(rate.rate.clone()),
-                    correlation_id: None,
-                },
+                ApiError::simple("invalid_request", "exchange rate must be a decimal number")
+                    .about("rate")
+                    .expecting("decimal number represented as a string")
+                    .receiving(rate.rate.clone()),
             )
         })?;
         fx = fx.with_rate(
@@ -3748,7 +3829,7 @@ pub async fn returns_report_with_rates(
         lot_rule: LotRuleVersion(1),
     };
     let outcome = returns(&state.services, &principal, &query).await?;
-    Ok(Json(ReturnsAnswerDto::from_domain(&outcome)))
+    Ok(Json(ReturnsAnswerDto::from_domain(&outcome, &catalog)))
 }
 
 fn instrument_dto(instrument: iaam_app::ports::InstrumentView) -> InstrumentDto {
@@ -4070,14 +4151,14 @@ fn declared_source_filter(
 fn missing_companion(field: &'static str, expected: &'static str) -> ApiFailure {
     ApiFailure::new(
         StatusCode::UNPROCESSABLE_ENTITY,
-        ApiError {
-            code: "invalid_request".into(),
-            message: format!("required query parameter {field} is missing"),
-            field: Some(field.to_owned()),
-            expected: Some(expected.to_owned()),
-            actual: None,
-            correlation_id: None,
-        },
+        // No `receiving`: the field is absent, and quoting the companion's
+        // value instead would name one field and echo another.
+        ApiError::simple(
+            "invalid_request",
+            format!("required query parameter {field} is missing"),
+        )
+        .about(field)
+        .expecting(expected),
     )
 }
 
@@ -4089,23 +4170,40 @@ fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure
     .map_err(|_| invalid_field(field, "YYYY-MM-DD", value.to_owned()))
 }
 
+/// The currency vocabulary is closed and short, so the refusal publishes it.
+///
+/// The codes come from [`CurrencyCode::ALL`] rather than from the sentence
+/// beside them: a sixth currency would otherwise be accepted by `from_code` and
+/// withheld from the caller told which five it may send.
 fn parse_currency(field: &'static str, value: &str) -> Result<CurrencyCode, ApiFailure> {
-    CurrencyCode::from_code(value)
-        .ok_or_else(|| invalid_field(field, "RUB, USD, EUR, CNY or XAU", value.to_owned()))
+    CurrencyCode::from_code(value).ok_or_else(|| {
+        ApiFailure::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::simple("invalid_request", format!("invalid field {field}"))
+                .about(field)
+                .expecting("RUB, USD, EUR, CNY or XAU")
+                .receiving(value)
+                .admitting(
+                    CurrencyCode::ALL
+                        .iter()
+                        .map(|currency| InputAlternativeDto {
+                            value: currency.code().to_owned(),
+                            requires: Vec::new(),
+                        })
+                        .collect(),
+                ),
+        )
+    })
 }
 
 fn invalid_field(field: impl Into<String>, expected: &str, actual: String) -> ApiFailure {
     let field = field.into();
     ApiFailure::new(
         StatusCode::UNPROCESSABLE_ENTITY,
-        ApiError {
-            code: "invalid_request".into(),
-            message: format!("invalid field {field}"),
-            field: Some(field),
-            expected: Some(expected.into()),
-            actual: Some(actual),
-            correlation_id: None,
-        },
+        ApiError::simple("invalid_request", format!("invalid field {field}"))
+            .about(field)
+            .expecting(expected)
+            .receiving(actual),
     )
 }
 fn invalid_rejection(rejection: Rejection) -> ApiFailure {
@@ -4128,14 +4226,13 @@ fn parse_as_of(value: Option<&str>) -> Result<Option<Date>, ApiFailure> {
     .map_err(|_| {
         ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError {
-                code: "invalid_request".into(),
-                message: "report date must be in YYYY-MM-DD format".into(),
-                field: Some("as_of".into()),
-                expected: Some("YYYY-MM-DD".into()),
-                actual: Some(raw.to_owned()),
-                correlation_id: None,
-            },
+            ApiError::simple(
+                "invalid_request",
+                "report date must be in YYYY-MM-DD format",
+            )
+            .about("as_of")
+            .expecting("YYYY-MM-DD")
+            .receiving(raw),
         )
     })
 }
@@ -4150,14 +4247,10 @@ fn declared_channel(declared: &DeclaredSourceDto) -> Result<&str, ApiFailure> {
     if channel.is_empty() || channel.len() > 32 {
         return Err(ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError {
-                code: "invalid_request".into(),
-                message: "channel must be 1..=32 characters".into(),
-                field: Some("source.channel".into()),
-                expected: Some("a short channel name such as file, paste or manual".into()),
-                actual: Some(declared.channel.clone()),
-                correlation_id: None,
-            },
+            ApiError::simple("invalid_request", "channel must be 1..=32 characters")
+                .about("source.channel")
+                .expecting("a short channel name such as file, paste or manual")
+                .receiving(declared.channel.clone()),
         ));
     }
     Ok(channel)
@@ -4176,14 +4269,38 @@ fn declared_channel(declared: &DeclaredSourceDto) -> Result<&str, ApiFailure> {
 /// needs is [`declared_import`], beside this and not inside it.
 fn declared_source(
     owner: iaam_core::ids::OwnerId,
+    account: AccountId,
     declared: &DeclaredSourceDto,
 ) -> Result<SourceId, ApiFailure> {
     let channel = declared_channel(declared)?;
-    Ok(SourceId::declared(
-        owner,
-        AccountId(declared.account),
-        channel,
-    ))
+    Ok(SourceId::declared(owner, account, channel))
+}
+
+/// The account a declaration names, however it named it.
+///
+/// A thin wrapper over the scenario, and the wrapping is the point: the tiering
+/// that turns a printed identifier into one of the owner's accounts lives beside
+/// the one that does it for a row's counterparty, so a batch cannot be declared
+/// against one account while its rows resolve against another. The route holds
+/// no rule of its own about what a source's identifier means.
+///
+/// Every derivation below takes the resolved account rather than the
+/// declaration, so that the resolution happens exactly once per request: the
+/// source and the import are both keyed on it, and deriving it twice is how two
+/// keys for one import get written.
+async fn declared_account(
+    state: &ServerState,
+    principal: &Principal,
+    declared: &DeclaredSourceDto,
+) -> Result<AccountDetailView, ApiFailure> {
+    Ok(
+        iaam_app::scenarios::import_session::resolve_declared_account(
+            &state.services,
+            principal,
+            &declared.account,
+        )
+        .await?,
+    )
 }
 
 /// The import identity a declaration names, or `None` when it names no import.
@@ -4194,6 +4311,7 @@ fn declared_source(
 /// the wrong rows cannot be undone by re-sending them.
 fn declared_import(
     owner: iaam_core::ids::OwnerId,
+    account: AccountId,
     declared: &DeclaredSourceDto,
 ) -> Result<Option<ImportId>, ApiFailure> {
     let channel = declared_channel(declared)?;
@@ -4208,12 +4326,7 @@ fn declared_import(
             declared.label.clone().unwrap_or_default(),
         ));
     }
-    Ok(Some(ImportId::declared(
-        owner,
-        AccountId(declared.account),
-        channel,
-        label,
-    )))
+    Ok(Some(ImportId::declared(owner, account, channel, label)))
 }
 
 fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {

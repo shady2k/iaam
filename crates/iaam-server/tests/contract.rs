@@ -41,6 +41,7 @@ use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
+use iaam_core::report::confidence::{CaveatKind, ReportGoal};
 use iaam_core::returns::{
     KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
 };
@@ -249,8 +250,11 @@ fn add_reconciliation_assertion_for_period(
         ),
         relation: iaam_core::event::Relation::None,
         confidence: iaam_core::event::Confidence::Known,
+        // A fixture key, not an imitation of one the production path writes:
+        // this seed is stamped `contract-test`, and nothing here depends on it
+        // colliding with a claim the owner-stated route would record.
         idempotency_key: Some(format!(
-            "owner-balance:{}:{}:{}",
+            "contract-test-assertion:{}:{}:{}",
             account.inner(),
             period.from,
             period.to
@@ -881,20 +885,82 @@ async fn api_catalog_is_public_state_independent_and_route_complete() {
             .and_then(|value| value.to_str().ok()),
         Some("application/linkset+json")
     );
-    assert_eq!(
-        provisioned_body,
-        iaam_server::routes::API_CATALOG_BODY.to_vec()
-    );
+    // The bytes are the same on both instances, which is the disclosure property:
+    // the document is resolved from the generated contract and reads no state, so
+    // it cannot say whether an owner exists here.
 
     let catalog: Value = serde_json::from_slice(&provisioned_body).expect("catalog JSON");
-    let linkset = catalog["linkset"].as_array().expect("linkset array");
-    for relation in ["service-desc", "status"] {
-        for link in linkset[0][relation].as_array().expect("link relation") {
+    let context = catalog["linkset"][0].as_object().expect("link context");
+    // Every relation the document carries, not a list of the ones it carried when
+    // this test was written: a test enumerating relations by hand drifts from the
+    // catalog exactly as the catalog used to drift from the router.
+    for (relation, links) in context.iter().filter(|(key, _)| key.as_str() != "anchor") {
+        for link in links.as_array().expect("link relation") {
             let href = link["href"].as_str().expect("catalog href");
-            let (status, _, _) = call_raw(&provisioned.router, get(href, None)).await;
-            assert_eq!(status, StatusCode::OK, "{relation} href {href}");
+            assert!(
+                link["title"]
+                    .as_str()
+                    .is_some_and(|title| !title.is_empty()),
+                "{relation} href {href} is published without saying what it is"
+            );
+            let request = Request::builder()
+                .uri(href)
+                .method("GET")
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", provisioned.owner_token),
+                )
+                .body(Body::empty())
+                .expect("request");
+            let (status, body) = call(&provisioned.router, request).await;
+            // A linked route may refuse the call — most of them require a scope
+            // this request does not carry. What it may not do is not exist: an
+            // empty `404` is axum reporting no route at all, which is the dead
+            // link the entry point must never publish.
+            assert!(
+                status != StatusCode::NOT_FOUND || body.get("code").is_some(),
+                "{relation} href {href} addresses no route"
+            );
         }
     }
+}
+
+#[tokio::test]
+async fn the_catalog_names_the_four_goals_in_the_vocabulary_the_reports_use() {
+    // The catalog is built from `ReportGoal::code`, so the two cannot disagree at
+    // runtime. This is the guard against the change that would make them able to:
+    // a `goal` spelled into the catalog by hand, which reads identically today and
+    // drifts the first time the vocabulary moves.
+    let harness = harness();
+    let (_, _, body) = call_raw(&harness.router, get("/.well-known/api-catalog", None)).await;
+    let catalog: Value = serde_json::from_slice(&body).expect("catalog JSON");
+
+    let goals: Vec<&str> = catalog["linkset"][0]["related"]
+        .as_array()
+        .expect("related links")
+        .iter()
+        .filter_map(|link| link["goal"].as_str())
+        .collect();
+    assert_eq!(
+        goals,
+        ReportGoal::ALL.map(ReportGoal::code).to_vec(),
+        "the catalog's goals are not the four the reports publish: {catalog}"
+    );
+
+    // And each of them addresses a different route: two goals sharing an href
+    // would tell a client the API answers three questions, not four.
+    let hrefs: std::collections::BTreeSet<&str> = catalog["linkset"][0]["related"]
+        .as_array()
+        .expect("related links")
+        .iter()
+        .filter(|link| link["goal"].is_string())
+        .filter_map(|link| link["href"].as_str())
+        .collect();
+    assert_eq!(
+        hrefs.len(),
+        goals.len(),
+        "two goals share a route: {catalog}"
+    );
 }
 
 #[tokio::test]
@@ -5484,8 +5550,10 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
     let row = &rows[0];
     assert_eq!(row["account"], harness.account.inner().to_string());
     assert_eq!(row["cash"][0]["currency"], "RUB");
-    assert_eq!(row["cash"][0]["amount"], "3000.00");
-    assert_eq!(row["cash"][0]["opening"], "unasserted");
+    assert_eq!(row["cash"][0]["kind"], "movement_since_unknown_start");
+    assert_eq!(row["cash"][0]["movement"], "3000.00");
+    // Nothing anchors this figure, so nothing in it is spelled `balance`.
+    assert!(row["cash"][0].get("balance").is_none());
     assert_eq!(body["negative_cash"], json!([]));
     assert_eq!(
         row["positions"][0]["instrument"],
@@ -5593,6 +5661,11 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
 /// assertion showed a negative cash balance on an account that cannot be
 /// overdrawn. The number was a running sum from an unknown start presented as a
 /// balance, and nothing on the answer said so.
+///
+/// It said so afterwards, in an `opening` field beside the amount, and that was
+/// still not enough — the amount could be read without the field, and was. So
+/// the figure now names itself: there is no `amount` to read, `movement` is
+/// spelled `movement`, and only an anchored figure is spelled `balance`.
 #[tokio::test]
 async fn a_cash_figure_says_whether_its_start_was_asserted() {
     let harness = harness();
@@ -5630,8 +5703,12 @@ async fn a_cash_figure_says_whether_its_start_was_asserted() {
     let (status, body) = call(&harness.router, get(&balances, Some(&harness.owner_token))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let cash = &body["accounts"][0]["cash"][0];
-    assert_eq!(cash["amount"], "3000.00", "{body}");
-    assert_eq!(cash["opening"], "unasserted", "{body}");
+    assert_eq!(cash["kind"], "movement_since_unknown_start", "{body}");
+    assert_eq!(cash["movement"], "3000.00", "{body}");
+    // The figure a reader would have lifted out and called a balance is not
+    // there under any name it could be mistaken for.
+    assert!(cash.get("amount").is_none(), "{body}");
+    assert!(cash.get("balance").is_none(), "{body}");
 
     // The remedy the queue asks for: an assertion about the state before the
     // interval's first event, recorded through the ordinary operation.
@@ -5652,8 +5729,9 @@ async fn a_cash_figure_says_whether_its_start_was_asserted() {
     let (status, body) = call(&harness.router, get(&balances, Some(&harness.owner_token))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let cash = &body["accounts"][0]["cash"][0];
-    assert_eq!(cash["amount"], "3000.00", "{body}");
-    assert_eq!(cash["opening"], "asserted", "{body}");
+    assert_eq!(cash["kind"], "balance", "{body}");
+    assert_eq!(cash["balance"], "3000.00", "{body}");
+    assert!(cash.get("movement").is_none(), "{body}");
 }
 
 /// An assertion that opens after the first movement leaves everything before it
@@ -5716,7 +5794,7 @@ async fn an_opening_assertion_that_starts_too_late_asserts_nothing() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        body["accounts"][0]["cash"][0]["opening"], "unasserted",
+        body["accounts"][0]["cash"][0]["kind"], "movement_since_unknown_start",
         "{body}"
     );
 }
@@ -5812,12 +5890,18 @@ async fn a_negative_cash_balance_is_stated_by_the_answer_and_not_refused() {
         .expect("plausible row");
 
     // The row is there, carrying the negative number rather than hiding it.
-    assert_eq!(overdrawn["cash"][0]["amount"], "-1500.00", "{body}");
-    assert_eq!(positive["cash"][0]["amount"], "4200.00", "{body}");
-    // Both were accumulated from an unasserted start. The plausible one is not
-    // exempt from the marker for looking plausible.
-    assert_eq!(overdrawn["cash"][0]["opening"], "unasserted", "{body}");
-    assert_eq!(positive["cash"][0]["opening"], "unasserted", "{body}");
+    assert_eq!(overdrawn["cash"][0]["movement"], "-1500.00", "{body}");
+    assert_eq!(positive["cash"][0]["movement"], "4200.00", "{body}");
+    // Both were accumulated from an unasserted start, so neither is spelled as
+    // a balance. The plausible one is not exempt for looking plausible.
+    assert_eq!(
+        overdrawn["cash"][0]["kind"], "movement_since_unknown_start",
+        "{body}"
+    );
+    assert_eq!(
+        positive["cash"][0]["kind"], "movement_since_unknown_start",
+        "{body}"
+    );
 
     // The entry is the open §11 span seen with its amount: same key, plus the
     // date it opened and what the perimeter makes of it. `resolved` is null
@@ -5978,11 +6062,11 @@ async fn margin_financing_refuses_one_accounts_period_reports_and_no_others() {
     );
     // The observable cash effect is retained: the perimeter declines to
     // reconstruct the economics, not to state the figure.
-    assert_eq!(blocked["cash"][0]["amount"], "-1540.00", "{body}");
+    assert_eq!(blocked["cash"][0]["movement"], "-1540.00", "{body}");
 
     assert_eq!(calculated["period_reports"], "calculated", "{body}");
     assert_eq!(calculated["period_reports_refused"], json!([]), "{body}");
-    assert_eq!(calculated["cash"][0]["amount"], "4200.00", "{body}");
+    assert_eq!(calculated["cash"][0]["movement"], "4200.00", "{body}");
 
     assert_eq!(
         body["negative_cash"],
@@ -6064,7 +6148,7 @@ async fn a_temporary_settlement_deficit_does_not_refuse_the_period_reports() {
     let row = &body["accounts"][0];
     assert_eq!(row["period_reports"], "calculated", "{body}");
     assert_eq!(row["period_reports_refused"], json!([]), "{body}");
-    assert_eq!(row["cash"][0]["amount"], "500.00", "{body}");
+    assert_eq!(row["cash"][0]["movement"], "500.00", "{body}");
     // The span closed before the report date, so nothing is negative now.
     assert_eq!(body["negative_cash"], json!([]), "{body}");
 }
@@ -7599,7 +7683,11 @@ async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
     );
     assert_eq!(
         item["subject"],
-        json!({ "type": "account", "id": harness.account.inner() }),
+        json!({
+            "type": "account",
+            "id": harness.account.inner(),
+            "title": "Brokerage",
+        }),
         "{item}"
     );
     assert_eq!(item["category"], "required_for_goal", "{item}");
@@ -9716,7 +9804,11 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
     let item = named[0];
     assert_eq!(
         item["subject"],
-        json!({ "type": "account", "id": orphan }),
+        json!({
+            "type": "account",
+            "id": orphan,
+            "title": "Second Bank Current",
+        }),
         "the account is named in a typed field, not only in prose: {item}"
     );
     assert_eq!(item["category"], "required_for_goal", "{item}");
@@ -9781,6 +9873,175 @@ fn published_option<'a>(item: &'a Value, operation_id: &str) -> Option<&'a Value
         .as_array()?
         .iter()
         .find(|option| option["operationId"] == operation_id)
+}
+
+/// Every queue item about an account says what the owner calls it.
+///
+/// The queue is the surface the naming rule (`docs/api/conventions.md` §3) was
+/// written for. A client that opened an instance after an import got one
+/// `record_owner_balance` item per account, each naming a UUID and nothing
+/// else, and could not tell which bank any of them was about without a second
+/// request to `GET /v1/accounts` and a join it was left to perform. Asked which
+/// account, the owner cannot answer from a bare identifier, and neither can the
+/// agent asking on his behalf.
+///
+/// `institution` travels with the title for the case the title alone cannot
+/// settle: two accounts he calls `Savings` at two banks are one word apart in a
+/// list and are not the same question.
+#[tokio::test]
+async fn every_queue_item_about_an_account_names_the_account() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("account id").to_owned();
+
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    let items = actions.as_array().expect("action items");
+    assert!(!items.is_empty(), "{actions}");
+
+    let about_accounts: Vec<&Value> = items
+        .iter()
+        .filter(|item| item["subject"]["type"] == "account")
+        .collect();
+    assert!(
+        !about_accounts.is_empty(),
+        "a fresh instance with two accounts raises items about them: {actions}"
+    );
+    for item in &about_accounts {
+        let title = item["subject"]["title"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an account subject carries the owner's title: {item}"));
+        assert!(!title.is_empty(), "{item}");
+        // One reading of the store, not two: the sentence and the field are
+        // filled from the same account at the moment the item is built, so a
+        // client that renders either sees the same name.
+        assert!(
+            item["reason"].as_str().expect("reason").contains(title),
+            "the name beside the identifier and the name in the sentence differ: {item}"
+        );
+    }
+
+    let about_savings: Vec<&&Value> = about_accounts
+        .iter()
+        .filter(|item| item["subject"]["id"] == savings)
+        .collect();
+    assert!(!about_savings.is_empty(), "{actions}");
+    for item in about_savings {
+        assert_eq!(item["subject"]["title"], "Savings", "{item}");
+        assert_eq!(item["subject"]["institution"], "Northline", "{item}");
+    }
+
+    // The account the harness created carries no institution, and the key is
+    // absent rather than null: he has not said, which is not «it has none».
+    for item in &about_accounts {
+        if item["subject"]["id"] == json!(harness.account.inner()) {
+            assert_eq!(item["subject"]["title"], "Brokerage", "{item}");
+            assert!(
+                item["subject"].get("institution").is_none(),
+                "an institution the owner never gave is absent, not null: {item}"
+            );
+        }
+    }
+}
+
+/// An event subject stays a bare identifier, and that is the rule, not a gap.
+///
+/// The naming rule is about things the owner named. Nothing he said names an
+/// event: its identity is the identifier, and what it was is in the item's
+/// sentence. Printing a title for one would mean inventing a name for a fact.
+#[tokio::test]
+async fn an_event_subject_carries_no_name() {
+    let harness = harness();
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    for item in actions.as_array().expect("action items") {
+        if item["subject"]["type"] == "event" {
+            let keys: std::collections::BTreeSet<&str> = item["subject"]
+                .as_object()
+                .expect("subject object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                std::collections::BTreeSet::from(["type", "id"]),
+                "{item}"
+            );
+        }
+    }
+}
+
+/// The disposition answer names the account it is about.
+///
+/// `GET /v1/accounts/{id}/scope` exists to be read back to the owner — «is this
+/// one inside your perimeter, and if not, why» — and it answers about exactly
+/// one account, so nothing else in the response says which. A client that has
+/// just been handed the identifier by the queue can render the answer without a
+/// second call, and one that resolved the account from a report cannot render
+/// the wrong one.
+#[tokio::test]
+async fn an_account_scope_answer_names_the_account() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("account id").to_owned();
+    let scope_path = format!("/v1/accounts/{savings}/scope");
+
+    let (status, before) = call(
+        &harness.router,
+        get(&scope_path, Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["account"], savings, "{before}");
+    assert_eq!(before["title"], "Savings", "{before}");
+    assert_eq!(before["institution"], "Northline", "{before}");
+    assert_eq!(before["disposition"], "undecided", "{before}");
+
+    // The write answers in the same shape as the read: an owner who has just
+    // ruled an account outside is told which account he ruled on.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({
+                "disposition": "outside",
+                "reason": "A counterparty's account, not the owner's money.",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["account"], savings, "{recorded}");
+    assert_eq!(recorded["title"], "Savings", "{recorded}");
+    assert_eq!(recorded["institution"], "Northline", "{recorded}");
+    assert_eq!(recorded["disposition"], "outside", "{recorded}");
 }
 
 /// The third state, reachable through the API.
@@ -9887,7 +10148,8 @@ async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
             .expect("action items")
             .iter()
             .any(|item| item["kind"] == "account_scope_undecided"
-                && item["subject"] == json!({ "type": "account", "id": outside })),
+                && item["subject"]
+                    == json!({ "type": "account", "id": outside, "title": "Shop One" })),
         "{reopened}"
     );
 }
@@ -10474,7 +10736,10 @@ async fn a_running_cash_sum_is_named_by_account_and_currency() {
     // The population is whole here, so the register can only be speaking about
     // the figure itself.
     assert_eq!(report["population"]["completeness"], "whole", "{report}");
-    assert_eq!(report["accounts"][0]["cash"][0]["opening"], "unasserted");
+    assert_eq!(
+        report["accounts"][0]["cash"][0]["kind"],
+        "movement_since_unknown_start"
+    );
     let confidence = &report["confidence"];
     assert_eq!(
         confidence["complete"], false,
@@ -10495,7 +10760,7 @@ async fn a_running_cash_sum_is_named_by_account_and_currency() {
         }),
         "{caveat}"
     );
-    assert_eq!(caveat["see"], "accounts[].cash[].opening", "{caveat}");
+    assert_eq!(caveat["see"], "accounts[].cash[].kind", "{caveat}");
     // The register summarises; it does not restate the amount, because a second
     // copy of a figure is a second chance to state it wrongly.
     assert!(
@@ -10515,7 +10780,12 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
-    for schema in ["ConfidenceDto", "CaveatDto", "CaveatSubjectDto"] {
+    for schema in [
+        "ConfidenceDto",
+        "CaveatDto",
+        "CaveatSubjectDto",
+        "ClosingOperationDto",
+    ] {
         assert!(
             spec["components"]["schemas"][schema].is_object(),
             "schema {schema} must be in OpenAPI"
@@ -10527,8 +10797,15 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
     assert!(confidence["caveats"].is_object(), "{confidence}");
 
     let caveat = &spec["components"]["schemas"]["CaveatDto"]["properties"];
-    for field in ["kind", "subject", "detail", "see"] {
+    for field in ["kind", "subject", "detail", "see", "closed_by"] {
         assert!(caveat[field].is_object(), "{field}: {caveat}");
+    }
+
+    // Spelled as an action's target spells it, so one client reader serves
+    // both.
+    let closing = &spec["components"]["schemas"]["ClosingOperationDto"]["properties"];
+    for field in ["operationId", "method", "path", "requestSchema"] {
+        assert!(closing[field].is_object(), "{field}: {closing}");
     }
 
     // `ReturnsAnswerDto` flattens the report into itself, which utoipa renders
@@ -10552,6 +10829,252 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
             "{report} must declare the register: {schema}"
         );
     }
+}
+
+/// Every remedy the caveat register names is a call this API actually declares.
+///
+/// This is the guard on the join the register now publishes. `CaveatKind` lives
+/// in the core and the action queue lives in the application, so the operation
+/// a caveat names could once have been written twice — a table in the transport
+/// beside the queue that actually offers those calls — and the two would drift
+/// on the first rename, leaving a report pointing at a call nothing answers.
+/// They are not written twice: `OperationKey` is one enum owned by the core, so
+/// a name that does not exist does not compile, and `ActionCatalog::from_openapi`
+/// resolves the whole vocabulary — not a list repeated by hand — against the
+/// completed contract, so a key nothing routes fails the server's start-up.
+///
+/// What is left for a test is that those two facts stay true: every key the
+/// register can name resolves through the same catalogue the queue uses, and
+/// resolves to the operation the document declares under that identifier.
+#[test]
+fn every_remedy_the_register_names_is_a_call_the_contract_publishes() {
+    let harness = harness();
+    let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
+
+    // The catalogue addresses the whole vocabulary. If it ever went back to a
+    // hand-written subset, a caveat naming a key outside it would resolve to
+    // nothing at the moment a client asked for the report.
+    for key in OperationKey::ALL {
+        assert_eq!(
+            catalog.operation(key).operation_id,
+            key.as_str(),
+            "{} is not addressed by the catalogue",
+            key.as_str()
+        );
+    }
+
+    for kind in CaveatKind::ALL {
+        for key in kind.closed_by() {
+            let resolved = catalog.operation(*key);
+            let item = harness
+                .api
+                .paths
+                .paths
+                .get(&resolved.path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} names {}, and the contract declares no {}",
+                        kind.code(),
+                        key.as_str(),
+                        resolved.path
+                    )
+                });
+            let operation = match resolved.method.as_str() {
+                "POST" => item.post.as_ref(),
+                "PUT" => item.put.as_ref(),
+                "PATCH" => item.patch.as_ref(),
+                method => panic!("{} names {key:?} under an unexpected {method}", kind.code()),
+            }
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} names {}, and {} {} is not declared",
+                    kind.code(),
+                    key.as_str(),
+                    resolved.method,
+                    resolved.path
+                )
+            });
+            assert_eq!(
+                operation.operation_id.as_deref(),
+                Some(key.as_str()),
+                "{} names {}, and {} {} answers to another identifier",
+                kind.code(),
+                key.as_str(),
+                resolved.method,
+                resolved.path
+            );
+            assert!(
+                !resolved.request_schema.is_empty(),
+                "{} names {}, whose request shape is not published",
+                kind.code(),
+                key.as_str()
+            );
+        }
+    }
+}
+
+/// A caveat carries the call that closes it, and says so when nothing does.
+///
+/// The gap this closes (iaam-f234): the register said what a report was silent
+/// about and not what to do about it. The only join was by `goal` — fetch
+/// `/v1/actions`, filter by the report's goal — which answers what stands
+/// between the caller and the *whole* report rather than what removes the line
+/// in hand, and an external agent read `complete: false` and went hunting
+/// through separate sections anyway.
+///
+/// Addressed, not merely named: the caveat carries the method and the path, in
+/// the spelling an action's target uses, so the call can be copied rather than
+/// composed. What it does not carry is a request plan — that is the queue's,
+/// because only the queue knows the account and the interval.
+#[tokio::test]
+async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does() {
+    let harness = harness();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    // A second account nobody has ruled on, and a movement on the first so that
+    // its cash figure is a running sum from an unknown start.
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": "1200.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-05" },
+                    "idempotency_key": "closed-by-deposit"
+                }, {
+                    "account": harness.account.inner(),
+                    "type": "opening_position",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "10",
+                    "cost_basis": "100.00",
+                    "currency": "RUB",
+                    "dates": { "trade": "2026-01-01" },
+                    "idempotency_key": "closed-by-position"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let caveats = report["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .clone();
+
+    let find = |kind: &str| {
+        caveats
+            .iter()
+            .find(|caveat| caveat["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} caveat: {report}"))
+            .clone()
+    };
+
+    // Both ways out, in the order the outstanding-work queue offers them: place
+    // the account in a contour, or rule it deliberately outside.
+    let outside = find("account_in_no_scope");
+    assert_eq!(
+        outside["closed_by"],
+        json!([
+            {
+                "operationId": "add_contour_version",
+                "method": "POST",
+                "path": "/v1/contours/{contour}/versions",
+                "requestSchema": "#/components/schemas/AddContourVersionRequest",
+            },
+            {
+                "operationId": "record_account_scope",
+                "method": "POST",
+                "path": "/v1/accounts/{id}/scope",
+                "requestSchema": "#/components/schemas/RecordAccountScopeRequest",
+            },
+        ]),
+        "{outside}"
+    );
+
+    // The opening assertion is what turns the figure into a balance, and it is
+    // the operation the queue names for the same state.
+    let running = find("running_cash_sum");
+    assert_eq!(
+        running["closed_by"][0]["operationId"],
+        "record_owner_balance"
+    );
+    assert_eq!(running["closed_by"][0]["method"], "POST");
+    assert_eq!(
+        running["closed_by"][0]["path"], "/v1/reconciliation/balance",
+        "{running}"
+    );
+    // The register points at the call; the queue fills it in. A caveat that
+    // carried a request plan would be computing one from what a caveat holds,
+    // which is its own identity and nothing else.
+    assert!(
+        running["closed_by"][0].get("request").is_none(),
+        "{running}"
+    );
+
+    // Absent, and it means nothing closes this — not that nobody decided. The
+    // holding is in the journal and no quote covers it; this API records prices
+    // from sources and accepts no value for a holding, so there is no call to
+    // name. The field is always present, so a client never has to tell «nothing
+    // closes this» from «nobody decided».
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+    let unclosable = snapshot["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .iter()
+        .find(|caveat| caveat["kind"] == "holding_not_valued")
+        .unwrap_or_else(|| panic!("no holding_not_valued caveat: {snapshot}"))
+        .clone();
+    assert_eq!(unclosable["closed_by"], json!([]), "{unclosable}");
 }
 
 /// Creating a contour and versioning one are two acts, and the create route
@@ -12116,6 +12639,218 @@ async fn an_abandoned_import_session_writes_nothing_to_the_journal() {
     );
 }
 
+/// An import is declared by what the statement prints, and walks to a commit
+/// without the caller ever reading the directory.
+///
+/// This is the friction the route was reported for: opening a session used to
+/// cost a `GET /v1/accounts` and a client-side join, once per account in the
+/// export, before a single row could be sent. The account number is on the
+/// statement; iaam already stores it; so the declaration takes it, and hands
+/// back the identifier the rows need.
+#[tokio::test]
+async fn a_session_is_declared_by_the_identifier_the_source_prints() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "institution": "Bank One",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+    let before = journal_rows(&harness).await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": "acct-1", "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    assert_eq!(session["account"]["id"], created, "{session}");
+    assert_eq!(
+        session["account"]["title"], "Main",
+        "the identifier comes back with the owner's own name beside it, so the \
+         caller can see it reached the account it meant: {session}"
+    );
+    assert_eq!(session["account"]["institution"], "Bank One", "{session}");
+
+    // Nothing else in this test is written by hand: the account the rows name is
+    // the one the response just handed back.
+    let id = session["session"].as_str().expect("session").to_owned();
+    let account = session["account"]["id"].clone();
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-02" },
+                    "idempotency_key": "declared-by-identifier",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "held", "{rows}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert!(
+        journal_rows(&harness).await > before,
+        "the whole path was walked without a directory read: {committed}"
+    );
+}
+
+/// The identifier and iaam's own name for the account reach one session.
+///
+/// Two declarations of one import must not open two sessions holding half the
+/// answers each, and the source and import keys are derived from the resolved
+/// account — so a caller that switches vocabularies mid-import finds the session
+/// it already had.
+#[tokio::test]
+async fn a_declaration_by_identifier_and_by_uuid_reach_the_same_session() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+
+    let mut opened = Vec::new();
+    for named in [json!("acct-1"), json!(created)] {
+        let (status, session) = call(
+            &harness.router,
+            post(
+                "/v1/import-sessions",
+                &harness.owner_token,
+                &json!({ "source": { "account": named, "channel": "file", "label": "march" } }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{session}");
+        assert_eq!(session["account"]["id"], created, "{session}");
+        opened.push(session["session"].clone());
+    }
+    assert_eq!(
+        opened[0], opened[1],
+        "one import has one open session, however the account was named"
+    );
+}
+
+/// A card is an identifier too, and the interval on it does not gate the file.
+#[tokio::test]
+async fn a_session_is_declared_by_an_alias() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Savings",
+            "aliases": [{ "value": "card-one", "valid_from": "2024-01-01", "valid_to": "2025-03-01" }],
+        }),
+    )
+    .await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": "card-one", "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    assert_eq!(
+        session["account"]["id"], created,
+        "a declaration is about a file, not about a day: the interval decides on \
+         the rows, each against its own date: {session}"
+    );
+}
+
+/// Two accounts answering to one identifier are refused, not picked between.
+#[tokio::test]
+async fn an_ambiguous_declared_account_is_refused_and_the_refusal_says_why() {
+    let harness = harness();
+    let first = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "shared-1",
+        }),
+    )
+    .await;
+    let second = account_with(
+        &harness,
+        &json!({
+            "title": "Savings",
+            "aliases": [{ "value": "shared-1", "valid_from": "2024-01-01" }],
+        }),
+    )
+    .await;
+
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": "shared-1", "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    assert_eq!(refusal["code"], "invalid_request", "{refusal}");
+    assert_eq!(refusal["field"], "source.account", "{refusal}");
+    let actual = refusal["actual"].as_str().expect("what was ambiguous");
+    for named in [&first, &second, "Main", "Savings"] {
+        assert!(
+            actual.contains(named),
+            "the refusal must name what was ambiguous ({named}): {actual}"
+        );
+    }
+    assert!(
+        refusal["expected"]
+            .as_str()
+            .is_some_and(|expected| expected.contains("provider_account_id")),
+        "and what would disambiguate it: {refusal}"
+    );
+
+    let (status, sessions) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    assert!(
+        sessions.as_array().expect("sessions").is_empty(),
+        "a refused declaration opens nothing: {sessions}"
+    );
+}
+
 /// Commit refuses while a question is open, and writes once when it is answered.
 #[tokio::test]
 async fn a_session_commits_only_after_every_question_has_been_answered() {
@@ -13049,9 +13784,9 @@ async fn a_transfer_pairing_is_proposed_with_its_evidence_and_never_confirmed_bl
         "{proposals}"
     );
     assert!(
-        proposals["unmatched"]
+        proposals["without_counterpart"]
             .as_array()
-            .expect("unmatched")
+            .expect("legs with no counterpart")
             .is_empty(),
         "{proposals}"
     );
@@ -13952,27 +14687,171 @@ async fn the_asset_snapshot_groups_cash_by_the_class_the_owner_declared() {
             .find(|class| class["cash_class"] == json!(code))
             .unwrap_or_else(|| panic!("no group for {code:?}: {snapshot}"))
     };
-    assert_eq!(group(Some("deposit"))["totals"][0]["amount"], "1000.00");
-    assert_eq!(group(Some("savings"))["totals"][0]["amount"], "250.00");
+    // Nothing anchors any of these accounts, so every class total is movement
+    // from an unknown start and says so in the only field that carries a
+    // number.
+    let deposit = &group(Some("deposit"))["totals"][0];
+    assert_eq!(
+        deposit["kind"], "movement_since_unknown_start",
+        "{snapshot}"
+    );
+    assert_eq!(deposit["movement"], "1000.00", "{snapshot}");
+    assert_eq!(
+        group(Some("savings"))["totals"][0]["movement"],
+        "250.00",
+        "{snapshot}"
+    );
     // The account whose class the owner never stated is its own group. It is
     // never folded into a default one, which would put his money under a
     // heading he did not choose.
     let unstated = group(None);
-    assert_eq!(unstated["totals"][0]["amount"], "40.00", "{snapshot}");
+    assert_eq!(unstated["totals"][0]["movement"], "40.00", "{snapshot}");
     assert_eq!(
         unstated["accounts"].as_array().expect("accounts").len(),
         2,
         "the harness account has no class either: {snapshot}"
     );
 
-    // The whole, and it is the sum of the parts rather than a second reading.
-    assert_eq!(snapshot["cash"]["totals"][0]["amount"], "1290.00");
+    // The classes added up, and it is the sum of the parts rather than a second
+    // reading.
+    assert_eq!(snapshot["cash"]["totals"][0]["movement"], "1290.00");
     assert_eq!(snapshot["cash"]["totals"][0]["currency"], "RUB");
-    assert_eq!(snapshot["total"][0]["value"], "1290.00", "{snapshot}");
+    // No whole, because there is none to state: every figure inside it is
+    // movement from an unknown start, and adding those to position values would
+    // produce a number that is not what the owner holds.
+    assert_eq!(snapshot["total"], json!([]), "{snapshot}");
 
     // The register the answer opens with, naming the goal the outstanding-work
     // queue grades by.
     assert_eq!(snapshot["confidence"]["goal"], "asset_snapshot");
+}
+
+/// Two accounts in one class and one currency, one anchored by an opening
+/// assertion and one not. Their sum is neither a balance nor a movement — a
+/// stock added to a flow — so the class publishes both parts and no sum.
+///
+/// The shape this replaced said `unasserted` for the whole class and printed
+/// one number, which understated the anchored account and made the class total
+/// unusable at the same time. Nothing in this answer states the combined
+/// figure: a reader who wants it adds two labelled parts and knows what he
+/// added.
+#[tokio::test]
+async fn a_class_total_whose_accounts_disagree_states_both_parts_and_no_sum() {
+    let harness = harness();
+
+    let mut created = Vec::new();
+    for title in ["Savings One", "Savings Two"] {
+        let (status, account) = call(
+            &harness.router,
+            post(
+                "/v1/accounts",
+                &harness.owner_token,
+                &json!({ "title": title, "cash_class": "savings" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+        created.push(account["id"].as_str().expect("identifier").to_owned());
+    }
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Savings only",
+                "accounts": [created[0].clone(), created[1].clone()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let deposit = |account: &str, amount: &str, key: &str| {
+        json!({
+            "account": account,
+            "type": "deposit",
+            "amount": amount,
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-01-05" },
+            "idempotency_key": key
+        })
+    };
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [
+                    deposit(&created[0], "600.00", "mixed-anchored"),
+                    deposit(&created[1], "400.00", "mixed-adrift"),
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    // Only the first account is anchored. The second is left as it arrived,
+    // which is how every account looks after a first import.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.owner_token,
+            &json!({
+                "account": created[0],
+                "from": "2026-01-01",
+                "to": "2026-01-31",
+                "at": "opening",
+                "cash": { "currency": "RUB", "amount": "0.00" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+
+    let savings = &snapshot["cash"]["classes"][0];
+    assert_eq!(savings["cash_class"], "savings", "{snapshot}");
+    let total = &savings["totals"][0];
+    assert_eq!(total["kind"], "mixed", "{snapshot}");
+    assert_eq!(total["balance"], "600.00", "{snapshot}");
+    assert_eq!(total["movement"], "400.00", "{snapshot}");
+    // The figure the old shape published, and the one this refuses to.
+    assert!(total.get("amount").is_none(), "{snapshot}");
+    assert!(
+        !snapshot.to_string().contains("1000.00"),
+        "nothing states the sum of a stock and a flow: {snapshot}"
+    );
+
+    // The same treatment one level up, and no whole for the currency.
+    assert_eq!(snapshot["cash"]["totals"][0]["kind"], "mixed", "{snapshot}");
+    assert_eq!(snapshot["total"], json!([]), "{snapshot}");
+
+    // Which account is unanchored is said once, in the register, and is not
+    // copied onto the class row where it could fall out of step.
+    let caveat = snapshot["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .iter()
+        .find(|caveat| caveat["kind"] == "running_cash_sum")
+        .unwrap_or_else(|| panic!("no caveat about the running sum: {snapshot}"));
+    assert_eq!(caveat["subject"]["account"], created[1], "{snapshot}");
+    assert_eq!(caveat["see"], "accounts[].cash[].kind", "{snapshot}");
 }
 
 /// Cash is exact; a position is worth what a quote said on a date. Both halves
@@ -14038,6 +14917,27 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
     .await;
     assert_eq!(status, StatusCode::OK, "{verdicts}");
 
+    // The opening the whole depends on. Without it the cash half is movement
+    // from an unknown start, and then no whole exists to state at all — which
+    // is the subject of another test; this one is about the order the three
+    // figures are read in when there *is* a whole.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.owner_token,
+            &json!({
+                "account": harness.account.inner(),
+                "from": "2026-01-01",
+                "to": "2026-01-31",
+                "at": "opening",
+                "cash": { "currency": "RUB", "amount": "0.00" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
     let (status, _headers, bytes) = call_raw(
         &harness.router,
         get(
@@ -14050,8 +14950,10 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
     let body = String::from_utf8(bytes).expect("a JSON body");
     let snapshot: Value = serde_json::from_str(&body).expect("a JSON body");
 
-    // The exact half does not move when a quote does.
-    assert_eq!(snapshot["cash"]["totals"][0]["amount"], "500.00", "{body}");
+    // The exact half does not move when a quote does, and it is anchored, so
+    // it is spelled as the balance it is.
+    assert_eq!(snapshot["cash"]["totals"][0]["kind"], "balance", "{body}");
+    assert_eq!(snapshot["cash"]["totals"][0]["balance"], "500.00", "{body}");
     // The market-dependent half, and the date the price it used was for.
     assert_eq!(snapshot["positions"]["totals"][0]["value"], "300", "{body}");
     assert_eq!(
@@ -14253,7 +15155,7 @@ async fn a_negative_balance_the_owner_called_unexpected_is_reported_as_contradic
     // Nothing is suppressed: the row states the figure exactly as it would have
     // without the expectation.
     assert_eq!(
-        report["accounts"][0]["cash"][0]["amount"], "-80.00",
+        report["accounts"][0]["cash"][0]["movement"], "-80.00",
         "{report}"
     );
     // And the expectation contributes no caveat. The register is about what the
@@ -14385,4 +15287,287 @@ async fn a_savings_account_the_owner_said_nothing_about_is_not_warned_on() {
     let ordinary = entry(&ids[1]);
     assert_eq!(ordinary["expectation"], "ordinary", "{report}");
     assert_eq!(ordinary["contradicts_expectation"], false, "{report}");
+}
+
+// ---------------------------------------------------------------------------
+// A rejection a client can act on without reading documentation (iaam-yszw)
+// ---------------------------------------------------------------------------
+
+/// RFC 6901 §3: a pointer is a sequence of `/`-prefixed reference tokens, and
+/// inside a token a tilde may only be followed by `0` or `1`.
+fn is_rfc6901_pointer(pointer: &str) -> bool {
+    if pointer.is_empty() {
+        return true;
+    }
+    if !pointer.starts_with('/') {
+        return false;
+    }
+    pointer[1..].split('/').all(|token| {
+        let mut characters = token.chars();
+        while let Some(character) = characters.next() {
+            if character == '~' && !matches!(characters.next(), Some('0' | '1')) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+/// A rejection addresses the offending field mechanically, not in prose.
+///
+/// The nested indexed case is the one that matters: `corrections[0].target`
+/// reads well and is not a form anything can look up. A client holding the body
+/// it just sent can apply `/corrections/0/target` to it and reach the value that
+/// was refused, with no parsing of its own.
+#[tokio::test]
+async fn a_rejected_field_is_addressed_by_a_json_pointer() {
+    let harness = harness();
+    let missing = Uuid::new_v4();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": missing }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // The readable form stays: it is what `message` quotes.
+    assert_eq!(body["field"], "corrections[0].target", "{body}");
+    assert_eq!(body["pointer"], "/corrections/0/target", "{body}");
+    let pointer = body["pointer"].as_str().expect("a pointer");
+    assert!(
+        is_rfc6901_pointer(pointer),
+        "the pointer must be one a client can apply to its own body: {body}"
+    );
+
+    // And a field with no structure to it still points at itself.
+    let (status, flat) = call(
+        &harness.router,
+        get(
+            "/v1/reports/balances?contour=00000000-0000-0000-0000-000000000000&as_of=yesterday",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{flat}");
+    assert_eq!(flat["field"], "as_of", "{flat}");
+    assert_eq!(flat["pointer"], "/as_of", "{flat}");
+}
+
+/// A field with a closed vocabulary says which values it takes.
+///
+/// `expected` spells the same five out in a sentence, and a client that wanted
+/// to retry from it would have to split prose on commas and the word "or".
+#[tokio::test]
+async fn a_rejected_field_with_a_closed_vocabulary_publishes_its_values() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/instruments",
+            &harness.owner_token,
+            &json!({
+                "kind": "share",
+                "symbol": "SHR",
+                "title": "Test share",
+                "denomination_currency": "ZZZ",
+                "settlement_currency": "RUB",
+                "quote_currency": "RUB"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "denomination_currency", "{body}");
+    assert_eq!(body["pointer"], "/denomination_currency", "{body}");
+    let admitted: Vec<&str> = body["alternatives"]
+        .as_array()
+        .expect("the values the field admits")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert_eq!(admitted, ["RUB", "USD", "EUR", "CNY", "XAU"], "{body}");
+}
+
+/// The classification outcome vocabulary travels as values, not as a sentence.
+///
+/// The rule's outcome is a JSON string the caller composes, so the four
+/// classifications it may name are the caller's business and not the store's.
+#[tokio::test]
+async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": r#"{"kind":"income"}"#,
+                "outcome": r#"{"kind":"gift"}"#,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "outcome", "{body}");
+    assert_eq!(body["pointer"], "/outcome", "{body}");
+    let admitted: Vec<&str> = body["alternatives"]
+        .as_array()
+        .expect("the classifications the field admits")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert_eq!(
+        admitted,
+        ["internal_transfer", "external_flow", "income", "fee"],
+        "{body}"
+    );
+}
+
+/// Where the remedy is a call rather than a value, the refusal names the call.
+///
+/// Nothing may be written into the commit request that makes an unanswered
+/// question answered, so a rejection that only named the field would leave the
+/// caller to find the answering route in the specification. It is published in
+/// the shape the action queue publishes a resolution with: the operation, its
+/// address, the two path segments already known, and the one field still wanted.
+#[tokio::test]
+async fn a_commit_refused_for_an_open_question_names_the_call_that_answers_it() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(account, "remedy-one")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let question = rows[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "session", "{refused}");
+    assert_eq!(refused["pointer"], "/session", "{refused}");
+
+    let resolutions = refused["resolutions"]
+        .as_array()
+        .expect("the call that lifts the refusal");
+    assert_eq!(
+        resolutions.len(),
+        1,
+        "one call, not the whole backlog: {refused}"
+    );
+    let resolution = &resolutions[0];
+    assert_eq!(
+        resolution["operationId"], "answer_import_question",
+        "{refused}"
+    );
+    assert_eq!(resolution["method"], "POST", "{refused}");
+    assert_eq!(
+        resolution["path"], "/v1/import-sessions/{session}/questions/{question}/answer",
+        "{refused}"
+    );
+
+    // Both path segments are already filled in: the caller copies them rather
+    // than composing them out of identifiers it would have to carry.
+    assert_eq!(
+        resolution["request"]["preset"]["session"],
+        json!(id),
+        "{refused}"
+    );
+    assert_eq!(
+        resolution["request"]["preset"]["question"],
+        json!(question),
+        "{refused}"
+    );
+
+    // And the one field still wanted carries the shapes this question admits,
+    // built by the same function the queue publishes `/answer` with.
+    let answer = resolution["request"]["missing"]
+        .as_array()
+        .expect("the fields still wanted")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .unwrap_or_else(|| panic!("no /answer field: {refused}"));
+    assert_eq!(answer["provided_by"], "owner", "{refused}");
+    let shapes: Vec<&str> = answer["alternatives"]
+        .as_array()
+        .expect("the shapes the question admits")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert!(
+        shapes.contains(&"received_from_own_account") && shapes.contains(&"paid"),
+        "the shapes must be this question's own: {refused}"
+    );
+    let naming_an_account = answer["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .find(|alternative| alternative["value"] == "received_from_own_account")
+        .expect("the shape that names an account");
+    let candidates = naming_an_account["requires"][0]["candidates"]
+        .as_array()
+        .expect("the accounts that shape may name");
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate["id"] == json!(savings)),
+        "an account a shape may name is offered by identifier and title: {refused}"
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate["id"] != json!(account)),
+        "the account the row is already on is not the far side of itself: {refused}"
+    );
+
+    // A refusal that offers no call says so by omission rather than by an empty
+    // list: most rejections have no next call, and one is not manufactured.
+    let (status, other) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({ "revision": "not-the-revision" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{other}");
+    assert_eq!(other["field"], "revision", "{other}");
+    assert!(other.get("resolutions").is_none(), "{other}");
+    assert!(other.get("alternatives").is_none(), "{other}");
 }

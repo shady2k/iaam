@@ -1066,15 +1066,11 @@ fn scope_assessment(
 
 fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact {
     let account = read.account().unwrap_or(event.account);
-    let effect = event
-        .legs
-        .iter()
-        .filter(|leg| leg.account == account)
-        .filter_map(|leg| leg.cash_effect())
-        .fold(None::<iaam_core::money::Money>, |sum, money| match sum {
-            None => Some(money),
-            Some(sum) => sum.try_add(money).ok(),
-        });
+    // `cash_effect_on` rather than a fold here: summing money is arithmetic and
+    // belongs to the core, which the architecture guard enforces (§3.1, §13).
+    // A mixture of currencies on one account is an error there, where the old
+    // fold turned it into `None` and then into a zero labelled RUB.
+    let effect = event.cash_effect_on(account).ok().flatten();
     PlannedFact {
         row: read.row,
         account,

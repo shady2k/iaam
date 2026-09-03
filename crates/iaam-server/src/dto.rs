@@ -7373,24 +7373,31 @@ pub struct RetainedRowDto {
 /// nothing matched it is a leg the owner reads as an external flow by default,
 /// which is the defect rather than the fix.
 ///
-/// **`unmatched` is not a list of failures, and this block is not a job queue.**
-/// Every cash movement carrying a posting date is offered to the matcher,
-/// because nothing printed in a row says whether it is half of a transfer: a
-/// payment in a shop and the outgoing leg of a transfer between two of the
-/// owner's banks are the same row until a counterpart turns up on another
-/// account. So a movement no counterpart was proposed for is listed here, and
-/// for everything that is not a transfer — a card payment, a salary, a cash
-/// withdrawal — that is its correct and permanent state. It will be listed on
-/// every reading of this route, for good, and there is nothing for the owner to
-/// do about it.
+/// **`without_counterpart` is a state, not a queue.** Every cash movement
+/// carrying a posting date is offered to the matcher, because nothing printed in
+/// a row says whether it is half of a transfer: a payment in a shop and the
+/// outgoing leg of a transfer between two of the owner's banks are the same row
+/// until a counterpart turns up on another account. So a movement no counterpart
+/// was proposed for is listed there, and for everything that is not a transfer —
+/// a card payment, a salary, a cash withdrawal — that is its correct and
+/// permanent state. There is nothing for the owner to do about it.
 ///
-/// The normal shape of an import containing no transfers is therefore
-/// `candidates: []` beside an `unmatched` holding every row of it: five ordinary
-/// deposits and withdrawals produce five unmatched legs and nothing to confirm.
-/// A caller that reads that as an error will report one on every import the
-/// owner makes. What deserves attention is `candidates`, which are the pairs put
-/// to the owner to judge, and, inside an import session, the readiness that
-/// counts them.
+/// The ordinary shape of an import containing no transfers is therefore
+/// `candidates: []` beside a `without_counterpart` holding every row of it: five
+/// deposits and withdrawals produce five legs with no counterpart and nothing to
+/// confirm. What deserves attention is `candidates`, which are the pairs put to
+/// the owner to judge, and, inside an import session, the readiness that counts
+/// them.
+///
+/// The field was called `unmatched`, and the paragraph above used to be twice
+/// this length because the name was working against it: under a parent called
+/// `cross_source_matching`, `unmatched` reads as *failed to match* or *still
+/// being worked on*, and an external agent read it exactly that way in spite of
+/// the documentation. [`TransferLegDto`] below records the opposite decision —
+/// an imprecise wire name kept rather than broken — and the two are consistent:
+/// a type name that overstates what a row is costs a reader a second, while a
+/// field name that reads as pending work cost a false alarm on every import the
+/// owner made, for as long as the name stood.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CrossSourceMatchingDto {
     /// Pairs proposed for the owner to confirm. Empty is the ordinary case: most
@@ -7399,24 +7406,24 @@ pub struct CrossSourceMatchingDto {
     /// Cash movements for which no counterpart was proposed — permanently, for
     /// every movement that is not half of a transfer.
     ///
-    /// Read it as "nothing was proposed against these", never as "these failed
-    /// to match" or "these are still being worked on". A full `unmatched` beside
-    /// an empty `candidates` says only that the source held no transfer, which
-    /// is what most sources hold.
-    pub unmatched: Vec<TransferLegDto>,
+    /// A long list here beside an empty `candidates` says only that the source
+    /// held no transfer, which is what most sources hold.
+    pub without_counterpart: Vec<TransferLegDto>,
 }
 
 /// One side of a cash movement, which may or may not be half of a transfer.
 ///
 /// Rendered from any recorded or planned `CashOut` or `CashIn` that carries a
-/// posting date, so appearing here — in `unmatched` above all — asserts nothing
-/// about the row beyond its having moved cash on a day.
+/// posting date, so appearing here — in `without_counterpart` above all —
+/// asserts nothing about the row beyond its having moved cash on a day.
 ///
 /// The domain type behind it is called `CashLeg` for exactly that reason: naming
 /// it after transfers claimed of every row the thing the owner alone decides.
 /// The two names differ on purpose, and this one keeps `Transfer` because it is
 /// published in the OpenAPI schema and clients hold it; renaming the wire would
-/// break them for a word.
+/// break them for a word. That the field beside it *was* renamed is not a
+/// reversal: what is bought here is a more accurate noun, and what was bought
+/// there was the end of a recurring false alarm.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TransferLegDto {
     /// The journal event, when the leg is already recorded.
@@ -7684,7 +7691,7 @@ impl CrossSourceMatchingDto {
                     },
                 })
                 .collect(),
-            unmatched: proposals
+            without_counterpart: proposals
                 .unmatched
                 .iter()
                 .map(TransferLegDto::from_domain)

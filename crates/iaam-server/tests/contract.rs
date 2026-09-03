@@ -13112,9 +13112,9 @@ async fn a_transfer_pairing_is_proposed_with_its_evidence_and_never_confirmed_bl
         "{proposals}"
     );
     assert!(
-        proposals["unmatched"]
+        proposals["without_counterpart"]
             .as_array()
-            .expect("unmatched")
+            .expect("legs with no counterpart")
             .is_empty(),
         "{proposals}"
     );

@@ -135,6 +135,12 @@ pub enum IncomeKind {
 /// from silently drifting when a journal kind is renamed.
 pub const CONTROL_ASSERTION_KIND: &str = "control_assertion";
 pub const IMPORT_COVERAGE_GAP_KIND: &str = "import_coverage_gap";
+/// The one kind whose fact names a second account.
+///
+/// Named here for the same reason as the two above: a projection that has to
+/// find transfers writes this string, and a rename that did not break the
+/// build would leave the projection quietly matching nothing.
+pub const CASH_TRANSFER_KIND: &str = "cash_transfer";
 
 /// The event type is exhaustive — `#[non_exhaustive]` is intentionally **not**
 /// used: the core has no external consumers, and exhaustiveness enables
@@ -312,7 +318,7 @@ impl EventKind {
             Self::CashIn { .. } => "cash_in",
             Self::CashOut { .. } => "cash_out",
             Self::Refund { .. } => "refund",
-            Self::CashTransfer { .. } => "cash_transfer",
+            Self::CashTransfer { .. } => CASH_TRANSFER_KIND,
             Self::Income { .. } => "income",
             Self::Fee { .. } => "fee",
             Self::Tax { .. } => "tax",

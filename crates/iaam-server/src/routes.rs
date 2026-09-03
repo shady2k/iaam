@@ -20,7 +20,10 @@ use iaam_app::actions::{
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
-use iaam_app::ports::{AccountScopeExclusionView, AccountView, ContourView, Principal, Scope};
+use iaam_app::ports::{
+    AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Principal,
+    Scope,
+};
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
     list_category_rules, list_groups, preview_category_rule, retire_category,
@@ -64,11 +67,11 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto, ActionDto,
-    ActionSubjectDto, ActionTargetDto, ActionsResponseDto, AddContourVersionRequest,
-    BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
+    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto, ActionsResponseDto,
+    AddContourVersionRequest, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto,
+    CategoryGroupDto, CategoryGroupRequest, CategoryRequest, CategoryRuleDto,
+    CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
     CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
@@ -77,9 +80,10 @@ use crate::dto::{
     MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
     MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
     QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
-    ReconciliationStatusDto, RecordAccountScopeRequest, RequestPlanDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersRequest,
+    RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto,
+    SubmitCorrectionsRequest, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
+    TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
@@ -89,6 +93,7 @@ pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
 pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
+pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 
@@ -1561,6 +1566,162 @@ pub async fn record_account_scope(
     }
 
     Ok(Json(account_scope_dto(&state, &principal, account).await?))
+}
+
+/// An account's stated transfer partners.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{id}/transfer-partners",
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    responses(
+        (status = 200, description = "The accounts money moves between this one and", body = AccountTransferPartnersDto),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_account_transfer_partners(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<AccountTransferPartnersDto>, ApiFailure> {
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+    Ok(Json(
+        account_transfer_partners_dto(&state, &principal, account).await?,
+    ))
+}
+
+/// Record which of the owner's accounts money moves between this one and.
+///
+/// The route that makes the discovery item answerable. One transfer between two
+/// institutions is printed twice, once by each side, and nothing in the rows
+/// relates the two legs; the system may not decide the relationship for him,
+/// because a relationship inferred from two amounts that happen to match is a
+/// fabricated fact about his money. So he states it, and he states it before
+/// the import rather than after, which is the order the queue now asks in.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/{id}/transfer-partners",
+    operation_id = RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = RecordAccountTransferPartnersRequest,
+    responses(
+        (status = 200, description = "Statement recorded", body = AccountTransferPartnersDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_transfer_partners(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<RecordAccountTransferPartnersRequest>,
+) -> Result<Json<AccountTransferPartnersDto>, ApiFailure> {
+    // Saying which two accounts are the two sides of one movement is the
+    // owner's judgement, by the same rule that keeps the contour composition
+    // out of the agent's hands.
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+
+    let mut partners = Vec::with_capacity(request.partners.len());
+    for partner in request.partners {
+        let partner = AccountId(partner);
+        if partner == account {
+            return Err(unprocessable(
+                "partners",
+                "the owner's other accounts",
+                "the account itself",
+                "a transfer has two sides, and an account is not the other side of itself",
+            ));
+        }
+        // Refused rather than ignored: a named account that does not exist is a
+        // mistake in the statement, and silently dropping it would record a
+        // statement the owner did not make.
+        owned_account(&state, &principal, partner).await?;
+        if !partners.contains(&partner) {
+            partners.push(partner);
+        }
+    }
+
+    state
+        .services
+        .store
+        .record_account_transfer_statement(
+            principal.owner,
+            AccountTransferStatementView { account, partners },
+        )
+        .await?;
+
+    Ok(Json(
+        account_transfer_partners_dto(&state, &principal, account).await?,
+    ))
+}
+
+/// Withdraw the statement, returning the account to awaiting a decision.
+#[utoipa::path(
+    delete,
+    path = "/v1/accounts/{id}/transfer-partners",
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    responses(
+        (status = 200, description = "Statement withdrawn", body = AccountTransferPartnersDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn clear_account_transfer_partners(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<AccountTransferPartnersDto>, ApiFailure> {
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+    state
+        .services
+        .store
+        .clear_account_transfer_statement(principal.owner, account)
+        .await?;
+    Ok(Json(
+        account_transfer_partners_dto(&state, &principal, account).await?,
+    ))
+}
+
+/// Read the statement back, distinguishing «none» from «not said».
+async fn account_transfer_partners_dto(
+    state: &ServerState,
+    principal: &Principal,
+    account: AccountId,
+) -> Result<AccountTransferPartnersDto, ApiFailure> {
+    let statements = state
+        .services
+        .store
+        .list_account_transfer_statements(principal.owner)
+        .await?;
+    let stated = statements
+        .iter()
+        .find(|statement| statement.account == account);
+    Ok(AccountTransferPartnersDto {
+        account: account.inner(),
+        stated: stated.is_some(),
+        partners: stated
+            .map(|statement| {
+                statement
+                    .partners
+                    .iter()
+                    .map(|partner| partner.inner())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
 }
 
 /// Refuse an account identifier the owner does not hold.

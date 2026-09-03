@@ -5,7 +5,7 @@ use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId, TransferId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -523,4 +523,119 @@ fn account_activity_reports_bounds_for_business_facts() {
         Some(date!(2026 - 02 - 01))
     );
     assert_eq!(activity[0].last_effective_date, Some(date!(2026 - 03 - 15)));
+}
+
+/// A transfer counts for the account it arrives at, not only for the one it is
+/// recorded against (iaam-8axt).
+///
+/// `events.account` names one of the two accounts a transfer moves money
+/// between. An account whose whole content arrived that way — savings fed from
+/// a current account, a deposit opened by moving money across — looked empty:
+/// the queue never asked it for a balance and offered it an import instead,
+/// while it held money at the end of the month.
+#[test]
+fn account_activity_counts_both_accounts_a_transfer_touched() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    insert_account(&store, &ctx);
+    let savings = AccountId::new_random();
+    store
+        .upsert_account(&AccountRecord {
+            id: savings,
+            owner: ctx.owner,
+            title: "Savings".into(),
+            institution: Some("Northline".into()),
+        })
+        .unwrap();
+
+    // One event, recorded against `Main`, moving money to `Savings`. Nothing at
+    // all is recorded against `Savings`.
+    let amount = Money::new(PostedMinor::new(500_000), CurrencyCode::Rub);
+    let day = date!(2026 - 02 - 10);
+    let mut transfer = ctx.deposit(1, 500_000);
+    transfer.kind = EventKind::CashTransfer {
+        transfer_id: TransferId::new_random(),
+        from: ctx.account,
+        to: savings,
+        amount,
+    };
+    transfer.order = EffectiveOrder::new(day, 1);
+    transfer.dates = EventDates::for_cash(CashPostedDate(day));
+    store
+        .append_event(&transfer, IdentityScope::Source)
+        .unwrap();
+
+    let activity = store.list_account_activity(ctx.owner).unwrap();
+    let arrived = activity
+        .iter()
+        .find(|record| record.account == savings)
+        .expect("the receiving account is still listed");
+    assert!(
+        arrived.has_business_fact,
+        "money reached this account and nothing said so: {arrived:?}"
+    );
+    // The bounds are data-coverage bounds, and the day money arrived is a day
+    // this account is covered on.
+    assert_eq!(arrived.first_effective_date, Some(day));
+    assert_eq!(arrived.last_effective_date, Some(day));
+
+    // The sending side is unchanged: it was already counted by the account the
+    // event is recorded against, and counting it twice must not widen anything.
+    let sent = activity
+        .iter()
+        .find(|record| record.account == ctx.account)
+        .expect("the sending account");
+    assert!(sent.has_business_fact);
+    assert_eq!(sent.first_effective_date, Some(day));
+    assert_eq!(sent.last_effective_date, Some(day));
+}
+
+/// A transfer widens the receiving account's bounds without narrowing them.
+#[test]
+fn a_transfer_widens_the_coverage_it_reaches_beyond() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    insert_account(&store, &ctx);
+    let savings = AccountId::new_random();
+    store
+        .upsert_account(&AccountRecord {
+            id: savings,
+            owner: ctx.owner,
+            title: "Savings".into(),
+            institution: Some("Northline".into()),
+        })
+        .unwrap();
+
+    // `Savings` has one fact of its own on the first of the month...
+    let mut own = ctx.deposit(1, 100_000);
+    own.account = savings;
+    own.legs = vec![Leg::cash(
+        savings,
+        Money::new(PostedMinor::new(100_000), CurrencyCode::Rub),
+    )];
+    store.append_event(&own, IdentityScope::Source).unwrap();
+
+    // ...and money reaches it from `Main` a fortnight later.
+    let amount = Money::new(PostedMinor::new(500_000), CurrencyCode::Rub);
+    let day = date!(2026 - 02 - 15);
+    let mut transfer = ctx.deposit(2, 500_000);
+    transfer.kind = EventKind::CashTransfer {
+        transfer_id: TransferId::new_random(),
+        from: ctx.account,
+        to: savings,
+        amount,
+    };
+    transfer.order = EffectiveOrder::new(day, 1);
+    transfer.dates = EventDates::for_cash(CashPostedDate(day));
+    store
+        .append_event(&transfer, IdentityScope::Source)
+        .unwrap();
+
+    let activity = store.list_account_activity(ctx.owner).unwrap();
+    let arrived = activity
+        .iter()
+        .find(|record| record.account == savings)
+        .expect("the receiving account");
+    assert_eq!(arrived.first_effective_date, Some(date!(2026 - 02 - 01)));
+    assert_eq!(arrived.last_effective_date, Some(day));
 }

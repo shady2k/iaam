@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountActivityView, AccountScopeExclusionView, AccountView, AliasUpsert, AliasView,
-    BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
-    CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
-    ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
-    CustodyView, DocumentToKeep, InstrumentDirectory, InstrumentUpsert, InstrumentView,
-    IssuedToken, JournalQuery, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
+    AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
+    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView,
+    CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
+    ControlAssertionView, CustodyView, DocumentToKeep, InstrumentDirectory, InstrumentUpsert,
+    InstrumentView, IssuedToken, JournalQuery, Principal, Recorded, Scope, SoleOwner, Store,
+    TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -46,7 +47,8 @@ use iaam_store::events::{
     JournalQuery as StoredJournalQuery,
 };
 use iaam_store::reference::{
-    AccountRecord, AccountScopeExclusionRecord, AliasRecord, ContourRecord, InstrumentRecord,
+    AccountRecord, AccountScopeExclusionRecord, AccountTransferStatementRecord, AliasRecord,
+    ContourRecord, InstrumentRecord,
 };
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
@@ -456,6 +458,53 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .clear_account_scope_exclusion(owner, account)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_account_transfer_statements(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountTransferStatementView>, AppError> {
+        self.blocking(move |store| {
+            let statements = store
+                .list_account_transfer_statements(owner)
+                .map_err(store_error)?;
+            Ok(statements
+                .into_iter()
+                .map(
+                    |record: AccountTransferStatementRecord| AccountTransferStatementView {
+                        account: record.account,
+                        partners: record.partners,
+                    },
+                )
+                .collect())
+        })
+        .await
+    }
+
+    async fn record_account_transfer_statement(
+        &self,
+        owner: OwnerId,
+        statement: AccountTransferStatementView,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .record_account_transfer_statement(owner, statement.account, &statement.partners)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn clear_account_transfer_statement(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .clear_account_transfer_statement(owner, account)
                 .map_err(store_error)
         })
         .await

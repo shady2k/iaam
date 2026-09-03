@@ -10581,3 +10581,235 @@ async fn the_openapi_document_says_when_a_reparse_still_needs_the_bytes() {
         "the contract must say when the bytes are still needed: {description}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The discovery stage: which of the owner's accounts are the two sides of one
+// internal movement (iaam-7xh3)
+// ---------------------------------------------------------------------------
+
+/// `PUT`, which no other test in this file needs.
+fn put(path: &str, token: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .method("PUT")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+async fn transfer_partners_queue(harness: &Harness) -> Vec<Value> {
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .filter(|item| item["kind"] == "resolve_transfer_relationships")
+        .cloned()
+        .collect()
+}
+
+/// The owner states which of his accounts money moves between, and the queue
+/// stops asking — for the accounts he has answered, and only those.
+///
+/// The goal is quantified over his accounts, so a statement is not «some
+/// relationship exists»: an account added afterwards — the second bank, which is
+/// the case this exists for — reopens it, and nothing about the answers already
+/// given closes the new question.
+#[tokio::test]
+async fn the_owner_states_his_transfer_relationships_and_a_new_account_reopens_the_question() {
+    let harness = harness();
+    let main = harness.account.inner().to_string();
+
+    // One account: there is no other side, so nothing is asked.
+    assert!(
+        transfer_partners_queue(&harness).await.is_empty(),
+        "with one account a transfer has no other side"
+    );
+
+    let (status, savings) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{savings}");
+    let savings = savings["id"].as_str().expect("account id").to_owned();
+
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 2, "both accounts are asked: {asked:#?}");
+    let item = asked
+        .iter()
+        .find(|item| item["subject"]["id"] == json!(main))
+        .expect("the item names the account it is about");
+    assert_eq!(item["category"], "required_for_goal", "{item}");
+    assert_eq!(item["state"], "needs_owner_input", "{item}");
+    assert_eq!(item["required_scope"], "owner", "{item}");
+    assert_eq!(
+        item["target"]["operationId"], "record_account_transfer_partners",
+        "{item}"
+    );
+    assert_eq!(item["target"]["method"], "PUT", "{item}");
+    assert_eq!(
+        item["target"]["path"], "/v1/accounts/{id}/transfer-partners",
+        "{item}"
+    );
+    // Candidates are proposed; the choice is not made. The account itself is not
+    // among them, because a transfer has two sides.
+    let candidates = item["target"]["request"]["missing"][0]["candidates"]
+        .as_array()
+        .expect("the owner is offered his other accounts");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|entry| &entry["id"])
+            .collect::<Vec<_>>(),
+        vec![&json!(savings)],
+        "{item}"
+    );
+
+    // Drawing this relationship is the owner's judgement, not the agent's.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.agent_token,
+            &json!({ "partners": [savings] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+
+    // An account is not the other side of itself.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [main] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+
+    let (status, recorded) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [savings] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["stated"], true, "{recorded}");
+    assert_eq!(recorded["partners"], json!([savings]), "{recorded}");
+
+    // Being named by his statement about `Main` is not a statement about
+    // `Savings`: the far side of one relationship says nothing about the ones
+    // this account is the near side of.
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert_eq!(asked[0]["subject"]["id"], json!(savings), "{asked:#?}");
+
+    // «None of my others» is an answer, and it closes the item.
+    let (status, none) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{savings}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{none}");
+    assert_eq!(none["stated"], true, "an empty list is a statement: {none}");
+    assert!(
+        transfer_partners_queue(&harness).await.is_empty(),
+        "every account has been ruled on"
+    );
+
+    // A third account reopens the goal, and reopens it only for itself.
+    let (status, everyday) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Everyday", "institution": "Southgate" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{everyday}");
+    let everyday = everyday["id"].as_str().expect("account id").to_owned();
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert_eq!(asked[0]["subject"]["id"], json!(everyday), "{asked:#?}");
+
+    // Withdrawing returns the account to awaiting a decision, and the read-back
+    // says «not stated» rather than «none», which are different answers.
+    let (status, withdrawn) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/accounts/{savings}/transfer-partners"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{withdrawn}");
+    assert_eq!(withdrawn["stated"], false, "{withdrawn}");
+    let (status, read_back) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts/{savings}/transfer-partners"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read_back}");
+    assert_eq!(read_back["stated"], false, "{read_back}");
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 2, "{asked:#?}");
+}
+
+/// An account identifier is not an access right, in either position.
+#[tokio::test]
+async fn a_transfer_statement_cannot_name_an_account_the_owner_does_not_hold() {
+    let harness = harness();
+    let main = harness.account.inner().to_string();
+    let stranger = Uuid::new_v4();
+
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{stranger}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [main] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [stranger] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a named account that is not the owner's is a mistake in the statement, \
+         not something to drop quietly: {refusal}"
+    );
+}

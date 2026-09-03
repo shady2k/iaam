@@ -113,6 +113,19 @@ pub struct AccountScopeExclusionView {
     pub reason: String,
 }
 
+/// The owner's statement about which of his accounts money moves between.
+///
+/// Three states, and only two of them are records. `partners` naming accounts
+/// is «money moves between this one and those»; `partners` empty is «and none
+/// of my others», which is an answer and not a silence; the absence of a view
+/// for an account altogether is the third state — he has not said — and it is
+/// the state a newly created account starts in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountTransferStatementView {
+    pub account: AccountId,
+    pub partners: Vec<AccountId>,
+}
+
 /// Per-account business activity projected by the journal store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountActivityView {
@@ -367,6 +380,26 @@ pub trait Store: Send + Sync {
 
     /// Withdraw it, returning the account to awaiting the owner's decision.
     async fn clear_account_scope_exclusion(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError>;
+
+    /// Every account the owner has stated the transfer partners of.
+    async fn list_account_transfer_statements(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountTransferStatementView>, AppError>;
+
+    /// Record, or replace, that statement for one account.
+    async fn record_account_transfer_statement(
+        &self,
+        owner: OwnerId,
+        statement: AccountTransferStatementView,
+    ) -> Result<(), AppError>;
+
+    /// Withdraw it, returning the account to awaiting the owner's decision.
+    async fn clear_account_transfer_statement(
         &self,
         owner: OwnerId,
         account: AccountId,

@@ -2869,6 +2869,33 @@ pub struct RecordAccountScopeRequest {
     pub reason: Option<String>,
 }
 
+/// The owner's statement about which of his accounts money moves between.
+///
+/// `stated` is the field that carries the third state. An empty `partners` list
+/// means two different things — «none of my others» and «he has not said» — and
+/// a response that spelled both as `[]` would let a caller read a silence as an
+/// answer.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountTransferPartnersDto {
+    pub account: Uuid,
+    /// Whether the owner has ruled at all.
+    pub stated: bool,
+    /// The accounts he named. Empty while `stated` is false, and legitimately
+    /// empty when he has stated that none of his others is on the other side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partners: Vec<Uuid>,
+}
+
+/// Recording that statement for one account.
+///
+/// An empty list is accepted and is not the same as not calling the route: it
+/// is «money moves between this account and none of my others», and it is what
+/// closes the queue item for an account that genuinely stands alone.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecordAccountTransferPartnersRequest {
+    pub partners: Vec<Uuid>,
+}
+
 /// Account creation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAccountRequest {

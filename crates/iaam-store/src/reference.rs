@@ -6,7 +6,7 @@ use iaam_core::instrument::{
     AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind, Lineage, LineageReason,
 };
 use iaam_core::money::CurrencyCode;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use time::Date;
 use time::format_description::well_known::Iso8601;
 
@@ -33,6 +33,17 @@ pub struct ContourRecord {
     pub version: ContourVersion,
     /// The title recorded with that version.
     pub title: String,
+}
+
+/// The owner's recorded statement about one account's transfer partners.
+///
+/// `partners` may be empty, and that is not the same as having no record: an
+/// empty list is «money moves between this account and none of my others»,
+/// while the absence of a record altogether is «he has not said».
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountTransferStatementRecord {
+    pub account: AccountId,
+    pub partners: Vec<AccountId>,
 }
 
 /// The owner's recorded statement that an account sits outside every contour.
@@ -648,6 +659,122 @@ impl SqliteStore {
             params![owner.inner().to_string(), account.inner().to_string()],
         )?;
         Ok(())
+    }
+
+    /// Record, or replace, the owner's statement about one account's transfer
+    /// partners.
+    ///
+    /// Replacing rather than merging: the statement is «these, and no others»,
+    /// and a call that only added would leave the owner unable to withdraw a
+    /// partner he named by mistake. An empty list is a statement too — «money
+    /// moves between this account and none of my others» — and it is why the
+    /// statement row exists apart from the partner rows.
+    pub fn record_account_transfer_statement(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+        partners: &[AccountId],
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO account_transfer_statements (owner, account, recorded_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (owner, account) DO UPDATE SET recorded_at = excluded.recorded_at
+             WHERE account_transfer_statements.owner = excluded.owner",
+            params![
+                owner.inner().to_string(),
+                account.inner().to_string(),
+                now(),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM account_transfer_partners WHERE owner = ?1 AND account = ?2",
+            params![owner.inner().to_string(), account.inner().to_string()],
+        )?;
+        for partner in partners {
+            transaction.execute(
+                "INSERT OR IGNORE INTO account_transfer_partners (owner, account, partner)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    owner.inner().to_string(),
+                    account.inner().to_string(),
+                    partner.inner().to_string(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Withdraw the statement, returning the account to «awaiting a decision».
+    ///
+    /// The partner rows go with it: the absence of a statement row is what
+    /// «undecided» means, and partners left behind would be an answer nobody
+    /// currently stands behind.
+    pub fn clear_account_transfer_statement(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM account_transfer_partners WHERE owner = ?1 AND account = ?2",
+            params![owner.inner().to_string(), account.inner().to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM account_transfer_statements WHERE owner = ?1 AND account = ?2",
+            params![owner.inner().to_string(), account.inner().to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every statement the owner has made, with the partners each names.
+    ///
+    /// A statement with no partners is returned with an empty list rather than
+    /// omitted: it is the answer «none of my others», and dropping it here
+    /// would put the account back into the queue the owner has already answered.
+    pub fn list_account_transfer_statements(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountTransferStatementRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT account FROM account_transfer_statements
+             WHERE owner = ?1 ORDER BY account",
+        )?;
+        let rows =
+            statement.query_map([owner.inner().to_string()], |row| row.get::<_, String>(0))?;
+        let mut statements = Vec::new();
+        for row in rows {
+            statements.push(AccountTransferStatementRecord {
+                account: AccountId(parse_uuid(&row?, "account")?),
+                partners: Vec::new(),
+            });
+        }
+
+        let mut partners = self.conn.prepare(
+            "SELECT account, partner FROM account_transfer_partners
+             WHERE owner = ?1 ORDER BY account, partner",
+        )?;
+        let rows = partners.query_map([owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (account, partner) = row?;
+            let account = AccountId(parse_uuid(&account, "account")?);
+            let partner = AccountId(parse_uuid(&partner, "account")?);
+            if let Some(found) = statements
+                .iter_mut()
+                .find(|statement| statement.account == account)
+            {
+                found.partners.push(partner);
+            }
+        }
+        Ok(statements)
     }
 
     pub fn list_account_scope_exclusions(

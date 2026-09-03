@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use iaam_core::event::Event;
-use iaam_core::event::kind::{EventKind, FeeOrigin};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, OwnerId};
 use iaam_ingest::classification::{
     Classification, ClassificationRule, ClassificationSubject, Correction, Counterparty, Movement,
@@ -40,6 +40,14 @@ pub struct ClassifiedAs {
     pub to: Option<AccountId>,
     /// The fee's origin, for `fee` only.
     pub origin: Option<&'static str>,
+    /// The earning the owner named, for `income` only.
+    ///
+    /// Optional twice over, and the two absences are not the same one. The field
+    /// is absent from every outcome but `income`, where it means the outcome
+    /// takes no such word; and it is absent on `income` itself where the owner
+    /// named no kind, which is a decision he made about the rows the rule
+    /// matches (§4.9). Only the second can be sent back.
+    pub income_kind: Option<&'static str>,
 }
 
 /// One event a rule change requires correcting, and what it would become.
@@ -112,13 +120,26 @@ pub fn matcher_json(matcher: &RuleMatcher) -> Value {
 #[must_use]
 pub fn outcome_json(classification: Classification) -> Value {
     let named = classified_as(classification);
-    match named.to {
-        Some(to) => serde_json::json!({ "kind": named.kind, "to": to.inner().to_string() }),
-        None => match named.origin {
-            Some(origin) => serde_json::json!({ "kind": named.kind, "origin": origin }),
-            None => serde_json::json!({ "kind": named.kind }),
-        },
+    // Built by walking the named fields rather than by a ladder over the
+    // outcomes. The ladder had one arm per shape of outcome and needed a new one
+    // for every field an outcome learned to carry, which is how `income` could
+    // gain a kind that this function would have written nowhere — a rule stored
+    // without the word the owner chose, and unreadable as the decision he made.
+    let mut object = serde_json::Map::new();
+    object.insert("kind".to_owned(), Value::String(named.kind.to_owned()));
+    if let Some(to) = named.to {
+        object.insert("to".to_owned(), Value::String(to.inner().to_string()));
     }
+    if let Some(origin) = named.origin {
+        object.insert("origin".to_owned(), Value::String(origin.to_owned()));
+    }
+    if let Some(income_kind) = named.income_kind {
+        object.insert(
+            "income_kind".to_owned(),
+            Value::String(income_kind.to_owned()),
+        );
+    }
+    Value::Object(object)
 }
 
 fn encoded(value: &Value, field: &'static str) -> Result<String, AppError> {
@@ -212,16 +233,30 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
             kind: "internal_transfer",
             to: Some(to),
             origin: None,
+            income_kind: None,
         },
         Classification::ExternalFlow => ClassifiedAs {
             kind: "external_flow",
             to: None,
             origin: None,
+            income_kind: None,
         },
-        Classification::Income => ClassifiedAs {
+        Classification::Refund => ClassifiedAs {
+            kind: "refund",
+            to: None,
+            origin: None,
+            income_kind: None,
+        },
+        Classification::Income { kind } => ClassifiedAs {
             kind: "income",
             to: None,
             origin: None,
+            income_kind: match kind {
+                None => None,
+                Some(IncomeKind::Coupon) => Some("coupon"),
+                Some(IncomeKind::Dividend) => Some("dividend"),
+                Some(IncomeKind::DepositInterest) => Some("deposit_interest"),
+            },
         },
         Classification::Fee { origin } => ClassifiedAs {
             kind: "fee",
@@ -233,6 +268,7 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
                 FeeOrigin::MarginInterest => "margin_interest",
                 FeeOrigin::Other => "other",
             }),
+            income_kind: None,
         },
     }
 }
@@ -299,6 +335,7 @@ fn parse_outcome(outcome: Map<String, Value>) -> Result<Classification, AppError
         kind,
         outcome.get("to").and_then(Value::as_str),
         outcome.get("origin").and_then(Value::as_str),
+        outcome.get("income_kind").and_then(Value::as_str),
     )
 }
 
@@ -314,6 +351,7 @@ pub fn outcome_from(
     kind: &str,
     to: Option<&str>,
     origin: Option<&str>,
+    income_kind: Option<&str>,
 ) -> Result<Classification, AppError> {
     match kind {
         "internal_transfer" => {
@@ -322,7 +360,21 @@ pub fn outcome_from(
             Ok(Classification::InternalTransfer { to: AccountId(to) })
         }
         "external_flow" => Ok(Classification::ExternalFlow),
-        "income" => Ok(Classification::Income),
+        "refund" => Ok(Classification::Refund),
+        // Absent means the owner named no kind, and that is a rule he is
+        // entitled to write: it says the rows this matches are income of a kind
+        // nobody stated. A word this reader does not know is refused rather than
+        // dropped to `None` — dropping it would store a weaker decision than the
+        // one he sent and tell him nothing (§4.9).
+        "income" => Ok(Classification::Income {
+            kind: match income_kind {
+                None => None,
+                Some("coupon") => Some(IncomeKind::Coupon),
+                Some("dividend") => Some(IncomeKind::Dividend),
+                Some("deposit_interest") => Some(IncomeKind::DepositInterest),
+                Some(actual) => Err(invalid_income_kind(actual))?,
+            },
+        }),
         "fee" => Ok(Classification::Fee {
             origin: match origin {
                 Some("brokerage") => FeeOrigin::Brokerage,
@@ -346,10 +398,32 @@ pub fn outcome_from(
 fn invalid_outcome(actual: &str) -> AppError {
     FieldRejection::new(
         "outcome",
-        "internal_transfer, external_flow, income or fee",
+        "internal_transfer, external_flow, refund, income or fee",
         actual,
     )
-    .admitting_codes(&["internal_transfer", "external_flow", "income", "fee"])
+    .admitting_codes(&[
+        "internal_transfer",
+        "external_flow",
+        "refund",
+        "income",
+        "fee",
+    ])
+    .into()
+}
+
+/// The income vocabulary is closed too, and names its own field.
+///
+/// Separate from [`invalid_outcome`] so the refusal points at the word that was
+/// wrong. A caller told that `income` is not one of the outcomes, when `income`
+/// is exactly what it sent and `interest` was the unknown word beside it, is
+/// being sent to fix a field it got right.
+fn invalid_income_kind(actual: &str) -> AppError {
+    FieldRejection::new(
+        "outcome.income_kind",
+        "coupon, dividend or deposit_interest, or nothing where the owner named no kind",
+        actual,
+    )
+    .admitting_codes(&["coupon", "dividend", "deposit_interest"])
     .into()
 }
 

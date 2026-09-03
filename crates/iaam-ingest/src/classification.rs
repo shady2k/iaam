@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use iaam_core::event::Event;
 use iaam_core::event::correction::{CorrectionError, resolve};
-use iaam_core::event::kind::{EventKind, FeeOrigin};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId};
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +115,21 @@ impl RuleMatcher {
 /// carried over from the row he wrote it on would be asserted about all of them.
 /// So `InternalTransfer` names the account on the far side and says nothing
 /// about which way the money ran — see [`Self::implied_movement`].
+///
+/// **A rule does carry what the row *is*, including how finely it is named.**
+/// That is the line the direction rule does not cross and the reason
+/// [`Self::Income`] holds an [`IncomeKind`]: "this is interest on a balance" is
+/// a claim about every row the matcher matches, exactly as "this is a fee" is,
+/// while "the money went out" is a fact about one row. A kind kept off this type
+/// and put only on [`Answer`] would settle the row the owner looked at and be
+/// dropped the moment his answer became a rule, which is how the observation
+/// channel came to record every arrival as income of no stated kind while a
+/// converter reading the same statement named one (`iaam-7l7v`).
+///
+/// The set is closed and the five members are the outcomes a **cash statement
+/// row** can have. There is deliberately no `Tax`: [`classification_of`] answers
+/// `None` for a recorded tax, so tax sits outside recalculation altogether, and
+/// admitting it here would overturn that in passing rather than by decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Classification {
     /// A transfer between the owner's own accounts. `to` is the **far side** of
@@ -127,16 +142,52 @@ pub enum Classification {
     Fee {
         origin: FeeOrigin,
     },
-    Income,
+    /// Money a counterparty returned, reversing an earlier outflow.
+    ///
+    /// Not [`Self::ExternalFlow`] with money arriving, which is what an
+    /// observation resolved as a return used to become. The journal draws the
+    /// distinction — `EventKind::Refund` is subtracted from what went out, in
+    /// the category the money was spent in, while `CashIn` is money entering the
+    /// perimeter — so a returned purchase recorded as a deposit overstates both
+    /// what arrived and what was spent, by the same sum, in the same month.
+    Refund,
+    /// Money the account earned, and the kind of earning where one is named.
+    ///
+    /// `kind: None` means **no kind was stated**, in the sense §4.9 fixes for
+    /// the same field on `EventKind::Income` and `OperationKind::Income`. It is
+    /// not a wildcard: a rule written with `None` asserts that the rows it
+    /// matches name no kind, and [`recompute_plan`] will accordingly propose
+    /// correcting a coupon it matches down to income of no stated kind. That is
+    /// the rule saying what it says, and the plan is proposed rather than
+    /// applied, so the owner sees it before anything is written. Spelling
+    /// "leave the kind alone" would need a second meaning for one value, and one
+    /// spelling with two meanings is the defect §4.9 exists to prevent.
+    Income {
+        kind: Option<IncomeKind>,
+    },
 }
 
 impl Classification {
     /// The direction this classification states on its own, when it states one.
     ///
-    /// Two of the four do, and they do because the classification **is** the
-    /// direction: a fee leaves the account and income arrives at it. Nothing has
-    /// to be read off the row to know that, and answering `None` for them would
-    /// send a settled row back to the owner as a question.
+    /// Three of the five do, and they do because the classification **is** the
+    /// direction: a fee leaves the account, income arrives at it, and a refund
+    /// is money coming back. Nothing has to be read off the row to know that,
+    /// and answering `None` for them would send a settled row back to the owner
+    /// as a question.
+    ///
+    /// `Refund` was the one that had to be argued rather than read off. Its
+    /// direction looks like a property of the row — the sign the source printed,
+    /// the direction word beside it — and the row does state one, which is why
+    /// `movement_of` consults the row **before** this function. But that is true
+    /// of income too, and the question here is a different one: what does the
+    /// classification claim when the row states nothing? A refund that left the
+    /// account is not an under-specified refund, it is not a fact this journal
+    /// holds at all — `EventKind::Refund` carries a single positive cash leg —
+    /// so `None` here would open a question with no admissible answer. The
+    /// contract therefore stands unchanged, and the arm that refuses `Refund`
+    /// leaving the account lives in `ObservedRow::resolve` beside the one that
+    /// already refuses income leaving it.
     ///
     /// The other two answer `None`, and that is the whole point of the function
     /// existing. `ExternalFlow` never claimed one. `InternalTransfer` looks as
@@ -156,7 +207,7 @@ impl Classification {
     pub const fn implied_movement(self) -> Option<Movement> {
         match self {
             Self::Fee { .. } => Some(Movement::Out),
-            Self::Income => Some(Movement::In),
+            Self::Income { .. } | Self::Refund => Some(Movement::In),
             Self::InternalTransfer { .. } | Self::ExternalFlow => None,
         }
     }
@@ -201,12 +252,28 @@ impl ClassificationRule {
     }
 }
 
+/// The outcome in words, one static sentence per outcome.
+///
+/// The income kind is spelled out rather than appended, so the wording stays
+/// static: a rule the owner reads back must say which earning it claims, because
+/// "this is income" and "this is interest on a balance" are different decisions
+/// and only one of them can be wrong about a coupon.
 fn describe_outcome(outcome: Classification) -> &'static str {
     match outcome {
         Classification::InternalTransfer { .. } => "this is a transfer between own accounts",
         Classification::ExternalFlow => "this is movement outside the portfolio",
         Classification::Fee { .. } => "this is a fee",
-        Classification::Income => "this is income",
+        Classification::Refund => "this is money a counterparty returned",
+        Classification::Income { kind: None } => "this is income",
+        Classification::Income {
+            kind: Some(IncomeKind::Coupon),
+        } => "this is income: a coupon",
+        Classification::Income {
+            kind: Some(IncomeKind::Dividend),
+        } => "this is income: a dividend",
+        Classification::Income {
+            kind: Some(IncomeKind::DepositInterest),
+        } => "this is income: interest on a balance",
     }
 }
 
@@ -237,7 +304,12 @@ pub enum Question {
     },
     /// Debit without a named counterparty: fee or withdrawal?
     IsOutflowAFee { account: AccountId },
-    /// Receipt without a named counterparty: income or refund?
+    /// Receipt without a named counterparty: income, a refund, or money in?
+    ///
+    /// The three are not shades of one another. Income is money the capital
+    /// earned, a refund is an earlier outflow coming back, and `Received` is
+    /// money arriving from outside that is neither. The reports separate all
+    /// three, so answering one for another is not a wording choice.
     IsInflowIncome { account: AccountId },
     /// The source gave an amount and no direction.
     ///
@@ -292,6 +364,20 @@ impl Question {
     /// an account the question cannot know, so they appear here in their
     /// `AnswerShape` form: the alternative says *an account is required*, and
     /// the answering call supplies it.
+    ///
+    /// **[`AnswerShape::Refund`] is offered by three of the four and refused by
+    /// [`Self::IsOutflowAFee`]**, and the split is by what each question leaves
+    /// open rather than by which of them mentions returns. `IsOutflowAFee` is
+    /// the one question both of whose alternatives run the same way — a fee and
+    /// a payment out both leave the account — so it is asked only where the
+    /// direction is settled outward, and every answer it admits agrees with
+    /// that. The other three already publish alternatives pointing both ways:
+    /// `IsTransferInternal` offers `paid` beside `received` although the row
+    /// stated a direction, because an answer states its own and the owner is
+    /// entitled to contradict the source. A refund arriving is admissible
+    /// wherever `received` is, and the case it exists for — a merchant the
+    /// directory does not recognise, printed by name beside a positive amount —
+    /// is `IsTransferInternal`'s, not `IsInflowIncome`'s.
     #[must_use]
     pub fn alternatives(&self) -> Vec<AnswerShape> {
         match self {
@@ -300,9 +386,14 @@ impl Question {
                 AnswerShape::ReceivedFromOwnAccount,
                 AnswerShape::Paid,
                 AnswerShape::Received,
+                AnswerShape::Refund,
             ],
             Self::IsOutflowAFee { .. } => vec![AnswerShape::Fee, AnswerShape::Paid],
-            Self::IsInflowIncome { .. } => vec![AnswerShape::Income, AnswerShape::Received],
+            Self::IsInflowIncome { .. } => vec![
+                AnswerShape::Income,
+                AnswerShape::Received,
+                AnswerShape::Refund,
+            ],
             Self::UnresolvedDirection { .. } => vec![
                 AnswerShape::SentToOwnAccount,
                 AnswerShape::ReceivedFromOwnAccount,
@@ -310,6 +401,7 @@ impl Question {
                 AnswerShape::Received,
                 AnswerShape::Fee,
                 AnswerShape::Income,
+                AnswerShape::Refund,
             ],
         }
     }
@@ -335,6 +427,7 @@ pub enum AnswerShape {
     Received,
     Fee,
     Income,
+    Refund,
 }
 
 impl AnswerShape {
@@ -348,6 +441,7 @@ impl AnswerShape {
             Self::Received => "received",
             Self::Fee => "fee",
             Self::Income => "income",
+            Self::Refund => "refund",
         }
     }
 
@@ -377,7 +471,22 @@ pub enum Answer {
     /// The money left the perimeter as a fee.
     Fee { origin: FeeOrigin },
     /// The money arrived from outside the perimeter as income.
-    Income,
+    ///
+    /// `kind` is what the owner calls the earning, and `None` means he named
+    /// none — not that the system will work one out. It is carried on the answer
+    /// and not only on the request because [`Self::classification`] must be able
+    /// to hand it on: an answer whose kind stopped at the row would leave every
+    /// later row matching the same rule as income of no stated kind, which is
+    /// the half of `iaam-7l7v` that is not about refunds.
+    Income { kind: Option<IncomeKind> },
+    /// The money arrived as a counterparty returning an earlier outflow.
+    ///
+    /// Distinct from [`Self::Received`], which is money arriving from outside
+    /// that nobody is giving back. The journal reports the two in opposite
+    /// columns — a refund is subtracted from what went out — so this is the one
+    /// answer whose absence made the honest path record a worse fact than the
+    /// converter that concluded for itself.
+    Refund,
 }
 
 impl Answer {
@@ -390,7 +499,8 @@ impl Answer {
             Self::Paid => AnswerShape::Paid,
             Self::Received => AnswerShape::Received,
             Self::Fee { .. } => AnswerShape::Fee,
-            Self::Income => AnswerShape::Income,
+            Self::Income { .. } => AnswerShape::Income,
+            Self::Refund => AnswerShape::Refund,
         }
     }
 
@@ -399,7 +509,10 @@ impl Answer {
     pub const fn movement(&self) -> Movement {
         match self {
             Self::SentToOwnAccount { .. } | Self::Paid | Self::Fee { .. } => Movement::Out,
-            Self::ReceivedFromOwnAccount { .. } | Self::Received | Self::Income => Movement::In,
+            Self::ReceivedFromOwnAccount { .. }
+            | Self::Received
+            | Self::Income { .. }
+            | Self::Refund => Movement::In,
         }
     }
 
@@ -424,7 +537,8 @@ impl Answer {
             Self::ReceivedFromOwnAccount { from } => Classification::InternalTransfer { to: *from },
             Self::Paid | Self::Received => Classification::ExternalFlow,
             Self::Fee { origin } => Classification::Fee { origin: *origin },
-            Self::Income => Classification::Income,
+            Self::Income { kind } => Classification::Income { kind: *kind },
+            Self::Refund => Classification::Refund,
         }
     }
 }
@@ -520,12 +634,16 @@ fn question_for(subject: &ClassificationSubject) -> Question {
 pub const fn classification_of(event: &Event) -> Option<Classification> {
     match event.kind {
         EventKind::CashTransfer { to, .. } => Some(Classification::InternalTransfer { to }),
-        EventKind::CashIn { .. } | EventKind::CashOut { .. } | EventKind::Refund { .. } => {
-            Some(Classification::ExternalFlow)
-        }
+        EventKind::CashIn { .. } | EventKind::CashOut { .. } => Some(Classification::ExternalFlow),
+        // A recorded refund reads back as a refund, not as the external flow it
+        // used to read back as. The two were the same answer while the
+        // vocabulary had one word for both; now that it has two, saying
+        // `ExternalFlow` here would make every refund in the journal look to
+        // `recompute_plan` like a row a refund rule still has to correct.
+        EventKind::Refund { .. } => Some(Classification::Refund),
         EventKind::Fee { origin, .. } => Some(Classification::Fee { origin }),
         EventKind::Tax { .. } => None,
-        EventKind::Income { .. } => Some(Classification::Income),
+        EventKind::Income { kind, .. } => Some(Classification::Income { kind }),
         EventKind::Trade { .. }
         | EventKind::OpeningPosition { .. }
         | EventKind::OpeningCash { .. }

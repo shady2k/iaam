@@ -245,6 +245,15 @@ impl ObservedRow {
     /// [`Classification::ExternalFlow`] does not say which way the money went,
     /// and a direction does not say whether the outflow was a fee.
     ///
+    /// Between them the two arguments now reach every conclusion a cash
+    /// statement row can be — deposit, withdrawal, transfer either way, fee,
+    /// income with the kind the owner named, and refund. That list is the
+    /// parity `iaam-7l7v` was about: while `Refund` was missing from the
+    /// classification vocabulary, a caller that submitted an observation and let
+    /// the server conclude got a strictly poorer journal than one that concluded
+    /// for itself, and no question could repair it because none was ever asked
+    /// about a return.
+    ///
     /// `InternalTransfer { to }` names the **far side** of the movement and not
     /// a destination, so it is read against `movement` rather than against this
     /// row's own account: outgoing, the money left for `to`; incoming, it
@@ -302,23 +311,48 @@ impl ObservedRow {
                 currency,
                 origin,
             },
-            (Classification::Income, Movement::In) => OperationKind::Income {
+            (Classification::Income { kind }, Movement::In) => OperationKind::Income {
+                // The row is a cash statement line and names no security. An
+                // instrument is not the same absence as the kind beside it: the
+                // kind is a word the owner can say about every row a rule
+                // matches, while the instrument is a different security on every
+                // row, so there is nothing for a rule or an answer to carry.
                 instrument: None,
                 gross_minor: amount_minor,
                 currency,
-                // The source named no kind of income, and naming one here would
-                // record an invention (§4.9).
-                kind: None::<IncomeKind>,
+                // Whatever named the classification named this too, or named
+                // nothing. `None` is still "not stated" (§4.9) — it is now the
+                // owner's silence rather than the resolver's, which is the
+                // difference between a fact he can supply and one nothing could.
+                kind: kind as Option<IncomeKind>,
             },
-            // A fee that arrived and income that left are not rows this system
-            // can record: refusing is the only answer that does not write
-            // something nobody asserted.
+            // A refund is money coming back on a purchase, so the operation is
+            // the returning half and never the purchase. Nothing here reaches
+            // for the outflow it reverses: the journal pairs them by category in
+            // the money-flow report, and a link invented at intake would be a
+            // claim about which purchase came back.
+            (Classification::Refund, Movement::In) => OperationKind::Refund {
+                amount_minor,
+                currency,
+            },
+            // A fee that arrived, income that left, and a refund that left are
+            // not rows this system can record: refusing is the only answer that
+            // does not write something nobody asserted.
+            //
+            // The refund arm is reached by a route the other two are not. Both
+            // answers that name a refund state that money arrived, so an owner
+            // cannot produce this pair; a **rule** can, because a rule carries no
+            // direction and fires on rows the owner has never seen — a matcher
+            // written on a merchant's name matches that merchant's purchases as
+            // well as its returns. The rejection is per row and the import
+            // continues (§10.1), so the owner sees exactly which rows his rule
+            // was too wide for instead of finding purchases filed as returns.
             (Classification::Fee { .. }, Movement::In)
-            | (Classification::Income, Movement::Out) => {
+            | (Classification::Income { .. } | Classification::Refund, Movement::Out) => {
                 return Err(Rejection {
                     field: "answer".to_owned(),
-                    expected: "an answer whose direction matches what it names: \
-                               a fee leaves the account and income arrives"
+                    expected: "an answer whose direction matches what it names: a fee leaves \
+                               the account, and income and a refund arrive at it"
                         .to_owned(),
                     actual: format!("{} money", movement_word(movement)),
                 });

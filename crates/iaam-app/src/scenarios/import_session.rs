@@ -2552,9 +2552,16 @@ impl Resolver {
                 "Money left {account} and the source named no counterparty. \
                  Was it a fee, or a payment out?"
             ),
+            // Three alternatives and therefore three clauses. The middle one is
+            // new wording as well as a new answer: the question used to read
+            // «income, or money coming back?», where «money coming back» was the
+            // sentence for `received` — money arriving from outside — and read
+            // to a human, and to an agent relaying it, as the refund the
+            // vocabulary could not express (`iaam-7l7v`).
             Question::IsInflowIncome { .. } => format!(
                 "Money arrived at {account} and the source named no counterparty. \
-                 Was it income, or money coming back?"
+                 Was it income the capital earned, money a counterparty returned \
+                 on something you paid for, or money coming in from outside?"
             ),
             Question::UnresolvedDirection {
                 stated,
@@ -2635,7 +2642,11 @@ const fn named_account(answer: Answer) -> Option<AccountId> {
     match answer {
         Answer::SentToOwnAccount { to } => Some(to),
         Answer::ReceivedFromOwnAccount { from } => Some(from),
-        Answer::Paid | Answer::Received | Answer::Fee { .. } | Answer::Income => None,
+        Answer::Paid
+        | Answer::Received
+        | Answer::Fee { .. }
+        | Answer::Income { .. }
+        | Answer::Refund => None,
     }
 }
 

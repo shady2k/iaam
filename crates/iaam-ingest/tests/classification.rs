@@ -569,7 +569,7 @@ fn amortisation_is_not_classified_as_income() {
     let journal = Journal::start();
     assert_ne!(
         classification_of(&amortisation_event(&journal)),
-        Some(Classification::Income)
+        Some(Classification::Income { kind: None })
     );
 }
 

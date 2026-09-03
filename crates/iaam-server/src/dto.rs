@@ -1139,7 +1139,7 @@ pub struct VerdictDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AnswerAlternativeDto {
     /// The word to send back: `sent_to_own_account`, `received_from_own_account`,
-    /// `paid`, `received`, `fee`, `income`.
+    /// `paid`, `received`, `fee`, `income`, `refund`.
     pub answer: String,
     /// Whether the answer must also name one of the owner's accounts.
     pub needs_account: bool,
@@ -5678,6 +5678,7 @@ mod tests {
             answer: word.to_owned(),
             account: None,
             origin: None,
+            income_kind: None,
         }
     }
 
@@ -5688,7 +5689,7 @@ mod tests {
         // `received_from_own_account`, and the two say different things about
         // where the money came from. Applying the answer it typed rather than
         // the one it meant settles the row wrongly and says nothing.
-        for word in ["paid", "received", "fee", "income"] {
+        for word in ["paid", "received", "fee", "income", "refund"] {
             let request = AnswerImportQuestionRequest {
                 account: Some(Uuid::new_v4()),
                 ..answer(word)
@@ -5731,6 +5732,7 @@ mod tests {
             "paid",
             "received",
             "income",
+            "refund",
         ] {
             let request = AnswerImportQuestionRequest {
                 account: matches!(word, "sent_to_own_account" | "received_from_own_account")
@@ -5756,6 +5758,62 @@ mod tests {
             Answer::Fee {
                 origin: FeeOrigin::Depositary
             }
+        );
+    }
+
+    /// Only the income answer carries an earning's kind (`iaam-7l7v`).
+    ///
+    /// The same refusal as `origin`, and worth the second test for the pair it
+    /// separates: a caller that sends a kind beside `refund` has confused money
+    /// a counterparty returned with money the capital earned, and the reports
+    /// keep the two in opposite columns — a refund is subtracted from what went
+    /// out. Dropping the field would settle the row as the answer the caller
+    /// typed while it believed it had said something else.
+    #[test]
+    fn only_the_income_answer_carries_an_earnings_kind() {
+        for word in [
+            "sent_to_own_account",
+            "received_from_own_account",
+            "paid",
+            "received",
+            "fee",
+            "refund",
+        ] {
+            let request = AnswerImportQuestionRequest {
+                account: matches!(word, "sent_to_own_account" | "received_from_own_account")
+                    .then(Uuid::new_v4),
+                income_kind: Some(IncomeKindDto::DepositInterest),
+                ..answer(word)
+            };
+            let rejection = request
+                .to_domain()
+                .expect_err("a kind the answer does not take is refused");
+            assert_eq!(rejection.field, "income_kind");
+            assert_eq!(rejection.actual, "deposit_interest");
+        }
+
+        // Absence on `income` is the owner naming no kind, not a malformed
+        // answer: §4.9 records silence as silence.
+        assert_eq!(
+            answer("income").to_domain().expect("income needs no kind"),
+            Answer::Income { kind: None }
+        );
+        assert_eq!(
+            AnswerImportQuestionRequest {
+                income_kind: Some(IncomeKindDto::Coupon),
+                ..answer("income")
+            }
+            .to_domain()
+            .expect("income carries the kind the owner named"),
+            Answer::Income {
+                kind: Some(IncomeKind::Coupon)
+            }
+        );
+        assert_eq!(
+            answer("refund")
+                .to_domain()
+                .expect("a refund names nothing"),
+            Answer::Refund
         );
     }
 }
@@ -6572,7 +6630,7 @@ impl ClassificationRuleDto {
 /// rules in or it names a decision he cannot restate as a rule.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClassifiedAsDto {
-    /// `internal_transfer`, `external_flow`, `income` or `fee`.
+    /// `internal_transfer`, `external_flow`, `refund`, `income` or `fee`.
     pub kind: String,
     /// Receiving account, for `internal_transfer` only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6580,6 +6638,17 @@ pub struct ClassifiedAsDto {
     /// Fee origin, for `fee` only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// The earning named, for `income` only: `coupon`, `dividend` or
+    /// `deposit_interest`.
+    ///
+    /// Optional on `income` itself, and its absence there is a decision rather
+    /// than a gap: the rule says the rows it matches are income of a kind nobody
+    /// stated (§4.9). A rule that omits it therefore *proposes correcting* an
+    /// already-recorded coupon it matches down to income of no stated kind —
+    /// read the plan the rule route returns before applying it. Refused on every
+    /// other outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub income_kind: Option<String>,
 }
 
 impl ClassifiedAsDto {
@@ -6588,6 +6657,7 @@ impl ClassifiedAsDto {
             kind: classification.kind.to_owned(),
             to: classification.to.map(|account| account.inner()),
             origin: classification.origin.map(str::to_owned),
+            income_kind: classification.income_kind.map(str::to_owned),
         }
     }
 
@@ -6602,6 +6672,7 @@ impl ClassifiedAsDto {
             &self.kind,
             self.to.map(|account| account.to_string()).as_deref(),
             self.origin.as_deref(),
+            self.income_kind.as_deref(),
         )
     }
 }
@@ -7795,8 +7866,8 @@ pub struct ImportSessionContentsDto {
 /// `answer` is one of the words the question published in its alternatives.
 /// `account` is required by exactly the two that name one, and refused by the
 /// rest: an answer carrying an account the question does not take is a caller
-/// mistake worth naming rather than ignoring. `origin` follows the same rule
-/// for the one answer that takes it.
+/// mistake worth naming rather than ignoring. `origin` and `income_kind` follow
+/// the same rule for the one answer each of them takes.
 ///
 /// The refusal is the point rather than tidiness. An LLM client resends fields
 /// it no longer needs, and a superfluous `account` beside `received` is the
@@ -7814,10 +7885,28 @@ pub struct AnswerImportQuestionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<Uuid>,
     /// Where a fee came from, for the `fee` answer only. Refused on the other
-    /// five; optional on `fee` itself, where absence means the origin was not
+    /// six; optional on `fee` itself, where absence means the origin was not
     /// stated and the fee is recorded as `other` rather than as a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<FeeOriginDto>,
+    /// Which earning this was, for the `income` answer only. Refused on the
+    /// other six.
+    ///
+    /// Optional on `income` itself, where absence means the owner named no kind
+    /// and the journal records none (§4.9). **Naming one is the only way an
+    /// observation ever carries an earning's kind**: the row is what the source
+    /// stated, and a bank's own category word is the source's, not a claim that
+    /// the arrival was a coupon. Before this field existed, every observation
+    /// resolved as income reached the journal with no kind at all, while a
+    /// converter reading the same statement supplied one — which is the half of
+    /// `iaam-7l7v` that is not about refunds, and the reason an agent that
+    /// deferred to the server produced the poorer journal.
+    ///
+    /// An answer given under the owner's own token also becomes a classification
+    /// rule, and the kind travels with it, so the next statement's rows are
+    /// settled with the same word rather than asked about again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub income_kind: Option<IncomeKindDto>,
 }
 
 impl AnswerImportQuestionRequest {
@@ -7847,12 +7936,15 @@ impl AnswerImportQuestionRequest {
                     .origin
                     .map_or(FeeOrigin::Other, FeeOriginDto::to_domain),
             },
-            "income" => Answer::Income,
+            "income" => Answer::Income {
+                kind: self.income_kind.map(IncomeKindDto::to_domain),
+            },
+            "refund" => Answer::Refund,
             other => {
                 return Err(Rejection {
                     field: "answer".into(),
                     expected: "sent_to_own_account, received_from_own_account, paid, \
-                               received, fee or income"
+                               received, fee, income or refund"
                         .into(),
                     actual: other.to_owned(),
                 });
@@ -7875,6 +7967,20 @@ impl AnswerImportQuestionRequest {
                 expected: format!(
                     "no origin: only the `{}` answer carries one",
                     AnswerShape::Fee.code()
+                ),
+                actual: wire_word(superfluous),
+            });
+        }
+        // Refused on `refund` as firmly as on `paid`, and that pair is the one
+        // worth naming: a client that meant "the money came back" and sent an
+        // earning's kind beside it has confused a return with an earning, which
+        // the reports keep in opposite columns.
+        if let Some(superfluous) = self.income_kind.filter(|_| shape != AnswerShape::Income) {
+            return Err(Rejection {
+                field: "income_kind".into(),
+                expected: format!(
+                    "no income kind: only the `{}` answer carries one",
+                    AnswerShape::Income.code()
                 ),
                 actual: wire_word(superfluous),
             });

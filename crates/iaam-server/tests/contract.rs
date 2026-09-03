@@ -13029,6 +13029,220 @@ async fn answering_the_question_writes_a_rule_that_settles_what_the_next_row_is(
     );
 }
 
+/// A row the source printed with a merchant's name beside a positive amount.
+///
+/// Invented end to end: `Shop One` is nobody, and the amount and labels were made
+/// up for this test. The direction is stated because a bank prints one for a
+/// card return; what it does not print, and cannot, is that the money is coming
+/// back rather than arriving.
+fn merchant_inflow_row(account: Uuid, key: &str) -> Value {
+    json!({
+        "account": account,
+        "type": "unresolved_direction",
+        "amount": "1250.00",
+        "currency": "RUB",
+        "direction": "in",
+        "counterparty": "Shop One",
+        "dates": { "cash_posted": "2025-03-20" },
+        "source_category": "RETURN",
+        "idempotency_key": key,
+    })
+}
+
+/// A refund submitted as an observation reaches the journal as a refund
+/// (`iaam-7l7v`).
+///
+/// The whole path, because the defect was that the path did not exist. The
+/// caller states what the source printed and concludes nothing; the question
+/// offers `refund` among its alternatives; the owner says so; the committed fact
+/// is `refund` and not `cash_in`.
+///
+/// Before this, the conclusive channel had `refund` and the observation channel
+/// had four outcomes without it, so the same row submitted honestly could only
+/// come out as a deposit — and no question could repair it afterwards, because
+/// none was ever asked about a return. The money-flow projection subtracts a
+/// refund from what went out in the category it was spent in, so the deposit was
+/// not a wording difference: it overstated what arrived and what was spent, by
+/// the same sum, in the same month.
+#[tokio::test]
+async fn an_observed_refund_reaches_the_journal_as_a_refund() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "paste", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [merchant_inflow_row(account, "refund-one")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "needs_classification", "{rows}");
+    let question = rows[0]["question_id"]
+        .as_str()
+        .expect("question identifier")
+        .to_owned();
+
+    let alternatives: Vec<&str> = rows[0]["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|entry| entry["answer"].as_str().expect("answer code"))
+        .collect();
+    assert!(
+        alternatives.contains(&"refund"),
+        "a named counterparty and money arriving is exactly the shape of a \
+         return, so the question must admit one: {rows}"
+    );
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "refund" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    // The decision survives as a rule the owner can read back, in the same
+    // vocabulary he may write one in. A word the listing cannot print is a
+    // decision he can never send again.
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert_eq!(rules[0]["outcome"]["kind"], "refund", "{rules}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=refund-one",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page["rows"][0]["kind"], "refund",
+        "the owner said the money came back, so the fact is a refund and not \
+         money arriving: {page}"
+    );
+}
+
+/// An answer that names an earning names which earning (`iaam-7l7v`, second
+/// half).
+///
+/// The kind is refused on every answer but `income`, and carried into the rule
+/// by the one that takes it — so the next statement's interest is settled with
+/// the word the owner chose rather than asked about again, and never reaches the
+/// journal as an earning of no stated kind while a converter reading the same
+/// row supplies one.
+#[tokio::test]
+async fn an_answer_that_names_income_may_name_which_earning_it_was() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "paste", "label": "march" },
+                "operations": [{
+                    "account": account,
+                    "type": "unresolved_direction",
+                    "amount": "42.15",
+                    "currency": "RUB",
+                    "direction": "in",
+                    "dates": { "cash_posted": "2025-03-31" },
+                    "source_category": "BALANCE INTEREST",
+                    "idempotency_key": "interest-one",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "needs_classification", "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    // A kind on an answer that names no earning is refused rather than dropped:
+    // a caller sending one beside `refund` has confused a return with an
+    // earning, and the reports keep the two in opposite columns.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "refund", "income_kind": "deposit_interest" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "income_kind", "{refused}");
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "income", "income_kind": "deposit_interest" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert_eq!(rules[0]["outcome"]["kind"], "income", "{rules}");
+    assert_eq!(
+        rules[0]["outcome"]["income_kind"], "deposit_interest",
+        "the word the owner chose must survive into the rule, or every later \
+         row matching it is income of no stated kind again: {rules}"
+    );
+}
+
 /// A session defers everything, and abandoning it leaves the journal untouched.
 #[tokio::test]
 async fn an_abandoned_import_session_writes_nothing_to_the_journal() {

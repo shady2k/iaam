@@ -7190,40 +7190,58 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
 
         for item in body["items"].as_array().expect("action items") {
             let target = &item["target"];
-            if target["type"] == "none" {
-                continue;
-            }
-            let schema_name = target["requestSchema"]
-                .as_str()
-                .expect("request schema reference")
-                .strip_prefix("#/components/schemas/")
-                .expect("component schema reference")
-                .to_owned();
-            let advertised: Vec<String> = target["request"]["missing"]
-                .as_array()
-                .expect("missing inputs")
-                .iter()
-                .map(|entry| {
-                    entry["pointer"]
-                        .as_str()
-                        .expect("missing pointer")
-                        .to_owned()
-                })
-                .collect();
-            let preset = target["request"]["preset"].as_object();
+            // A target carrying several ways out is swept option by option, the
+            // same way `ActionTarget::resolutions` reads it. Checking only the
+            // sole-operation shape would leave every alternative resolution
+            // unchecked, which is precisely the reachable-but-undescribed state
+            // the `options` variant was added to end.
+            let resolutions: Vec<&serde_json::Value> = match target["type"].as_str() {
+                Some("none") => Vec::new(),
+                Some("options") => target["options"]
+                    .as_array()
+                    .expect("resolution options")
+                    .iter()
+                    .collect(),
+                _ => vec![target],
+            };
+            for resolution in resolutions {
+                let schema_name = resolution["requestSchema"]
+                    .as_str()
+                    .expect("request schema reference")
+                    .strip_prefix("#/components/schemas/")
+                    .expect("component schema reference")
+                    .to_owned();
+                let advertised: Vec<String> = resolution["request"]["missing"]
+                    .as_array()
+                    .expect("missing inputs")
+                    .iter()
+                    .map(|entry| {
+                        entry["pointer"]
+                            .as_str()
+                            .expect("missing pointer")
+                            .to_owned()
+                    })
+                    .collect();
+                let preset = resolution["request"]["preset"].as_object();
 
-            for field in body_of_spec["components"]["schemas"][&schema_name]["required"]
-                .as_array()
-                .expect("required request fields")
-            {
-                let name = field.as_str().expect("field name");
-                let pointer = format!("/{name}");
-                assert!(
-                    advertised.iter().any(|value| value == &pointer)
-                        || preset.is_some_and(|values| values.contains_key(name)),
-                    "{schema_name} requires {pointer}, and the action neither presets \
-                     it nor lists it as missing: {target}"
-                );
+                // A schema whose every field is optional emits no `required`
+                // list at all, and requires nothing; the sweep is then vacuous
+                // rather than absent. `OpenImportSessionRequest` is the first
+                // such schema an action addresses.
+                let required = body_of_spec["components"]["schemas"][&schema_name]["required"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for field in &required {
+                    let name = field.as_str().expect("field name");
+                    let pointer = format!("/{name}");
+                    assert!(
+                        advertised.iter().any(|value| value == &pointer)
+                            || preset.is_some_and(|values| values.contains_key(name)),
+                        "{schema_name} requires {pointer}, and the action neither presets \
+                         it nor lists it as missing: {resolution}"
+                    );
+                }
             }
         }
     }
@@ -9756,6 +9774,13 @@ async fn a_scope_decision_needs_a_reason_and_cannot_claim_membership() {
 /// elsewhere accompanies a real operation with a list of fields to collect;
 /// carrying it on an item with no operation at all made «collect these and call
 /// this» indistinguishable from «there is nothing here for you to call».
+///
+/// The rule is swept in both directions, but only one of them has a witness
+/// here, and that is a fact about the queue rather than a hole in the test:
+/// since `start_account_import` was promoted, `frontier` emits no `blocked` item
+/// at all. The blocked diagnostics are all carried by reports and by broker
+/// synchronisation, not by `/v1/actions`. The witness kept is therefore the item
+/// that once got this wrong, asserted the other way round.
 #[tokio::test]
 async fn no_queue_item_promises_a_call_it_does_not_have() {
     let harness = harness();
@@ -9780,9 +9805,11 @@ async fn no_queue_item_promises_a_call_it_does_not_have() {
         }
     }
     assert!(
-        items
-            .iter()
-            .any(|item| item["kind"] == "start_account_import" && item["state"] == "blocked"),
+        items.iter().any(|item| {
+            item["kind"] == "start_account_import"
+                && item["state"] == "needs_owner_input"
+                && item["target"]["type"] == "options"
+        }),
         "{actions}"
     );
 }

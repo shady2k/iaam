@@ -211,6 +211,17 @@ pub enum OperationKey {
     /// is a contour's composition, and «this account is deliberately not in any
     /// of them» is a fact about the account itself.
     RecordAccountScope,
+    /// Open the import session a document's rows are held in before commit.
+    ///
+    /// The first of the two ways into an account that holds nothing, and the one
+    /// that takes a statement the owner fetched himself.
+    OpenImportSession,
+    /// Synchronise one broker channel over an interval.
+    ///
+    /// The second, and the only one that needs no document: the channel fetches
+    /// and records in a single call, which is why it is a remedy entire rather
+    /// than the first step of one.
+    SyncBroker,
     /// Answer one classification question held open by an import session.
     AnswerImportQuestion,
 }
@@ -226,6 +237,8 @@ impl OperationKey {
             Self::CreateCategoryRule => "create_category_rule",
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
             Self::RecordAccountScope => "record_account_scope",
+            Self::OpenImportSession => "open_import_session",
+            Self::SyncBroker => "sync_broker",
             Self::AnswerImportQuestion => "answer_import_question",
         }
     }
@@ -1468,40 +1481,127 @@ fn activity_period(activity: &AccountActivityView) -> Option<AssertionPeriod> {
     )
 }
 
-/// The owner has to fetch a statement, and no operation in this API does it.
+/// Both ways into an account that holds nothing, and the one step that is not
+/// a route.
 ///
-/// `Blocked`, not `NeedsOwnerInput`. Both readings were true of this item — the
-/// owner must act, and there is nothing to call — but the two states do not mean
-/// the same thing to the agent reading the queue. `NeedsOwnerInput` everywhere
-/// else accompanies a real operation with a list of fields the policy cannot
-/// fill: collect these, then call this. Here there is no `this`. `Blocked`'s own
-/// documentation is exactly the second reading — "no operation in this API is
-/// available for this item" — and the queue's states are the only map an agent
-/// has of what it may call.
+/// `NeedsOwnerInput`, not `Blocked`, and `undecomposed_outflows_action` is the
+/// precedent — the same substitution, made for the same reason. There, `Blocked`
+/// had been earned by the sentence «no *report* operation can provide a rule»,
+/// which was true and irrelevant: the state means «no operation in this API is
+/// available for this item», the rule route was in this same API, and the
+/// action catalogue resolves a target against the whole completed contract and
+/// not a caller-local namespace. Here the narrower true sentence was «no
+/// operation in this API fetches the document», and it bought the same wrong
+/// state. Two operations begin an import: `POST /v1/import-sessions` opens the
+/// session a statement's rows are fed into, and `POST /v1/brokers/{broker}/sync`
+/// is the second remedy entire.
 ///
-/// The invariant then removes `required_scope` as well, and that is right rather
-/// than a loss: a scope answers "who may call it", a question that does not
-/// arise when nothing can be called.
+/// The cost was not theoretical. An agent walking the queue reads `state` as its
+/// map of what it may call; told that nothing here helps with the single most
+/// important next step, it stopped. A reviewer who reached the session routes by
+/// reading the OpenAPI document instead ran a whole import that the queue had
+/// disowned.
+///
+/// The sentence about the document stays in the reason, because it is the honest
+/// half and it is the half the state was never making: getting the statement out
+/// of the bank is a step outside this API, and a step outside this API is not a
+/// missing route. So the reason now says both — what the owner must do himself,
+/// and what to call once he has done it.
+///
+/// Two options rather than one, ordered and not ranked, which is what
+/// `account_scope_action` established `Options` for: a statement is the ordinary
+/// answer and a broker channel is the answer for the accounts that have one, and
+/// publishing either alone would leave the other reachable only by reading the
+/// specification.
+///
+/// `Scope::Agent`, for the reason `answer_classification_question_action` gives:
+/// both routes check `may_submit`, which an agent token satisfies, and an item
+/// marked `owner` would tell an agent it may not send a request the server would
+/// accept.
 fn start_account_import_action(account: AccountId) -> Action {
-    blocked_action(
-        // Scoped to the account: this action is emitted once per account with no
-        // facts, and an unscoped id would give every one of them the same
-        // identity — which is what an agent deduplicates by.
-        format!(
-            "{}:{}",
-            ActionKind::StartAccountImport.id(),
-            account.inner()
-        ),
-        ActionKind::StartAccountImport,
-        ActionCategory::RequiredForGoal,
-        Some(ActionSubject::Account(account)),
+    // The session's `source` is what names the account these rows belong to, and
+    // it is the whole of what the policy knows here: the account is the subject
+    // of this item. Preset as the object the pointers below write into, so a
+    // caller merges rather than reassembles.
+    let mut session_preset = BTreeMap::new();
+    session_preset.insert(
+        "source".to_owned(),
+        serde_json::json!({ "account": account.inner().to_string() }),
+    );
+
+    let session = ResolutionOption {
+        operation: OperationKey::OpenImportSession,
+        request: RequestPlan {
+            preset: session_preset,
+            missing: vec![
+                // How the rows arrived — `file`, `paste`, `manual` — is a fact
+                // about the transmission and not about the owner's money, so it
+                // is the caller's to state. No alternatives: the route takes any
+                // short name, and publishing three would claim a closed set the
+                // server does not enforce.
+                MissingInput::plain("/source/channel", ProvidedBy::Caller),
+                // The label is what makes this import retractable on its own,
+                // and it is a statement period or an export file name — it is
+                // read off the document the owner fetched, which is why this is
+                // the first field marked `ExternalDocument`. Optional in the
+                // schema and published as missing anyway, on the same ground as
+                // `/cash` in the control assertion: `missing` states what the
+                // plan needs supplied, and a plan that quietly omitted it would
+                // produce unlabelled rows retractable only together with every
+                // other unlabelled row of the same account and channel.
+                MissingInput::plain("/source/label", ProvidedBy::ExternalDocument),
+            ],
+        },
+    };
+
+    // The broker sync knows the account and nothing else. `broker` is a path
+    // segment and is not preset: which channel this account is held at is the
+    // owner's to name, and the queue cannot read it off an account that has no
+    // facts. The interval is his too — with no business fact there is no first
+    // or last effective date to propose one from, and a window invented here
+    // would decide how much of his history gets imported.
+    let mut sync_preset = BTreeMap::new();
+    sync_preset.insert("account".to_owned(), account.inner().to_string().into());
+    let sync = ResolutionOption {
+        operation: OperationKey::SyncBroker,
+        request: RequestPlan {
+            preset: sync_preset,
+            missing: vec![
+                MissingInput::plain("/broker", ProvidedBy::Owner),
+                MissingInput::plain("/from", ProvidedBy::Owner),
+                MissingInput::plain("/to", ProvidedBy::Owner),
+            ],
+        },
+    };
+
+    Action::new(
+        ActionFacts {
+            // Scoped to the account: this action is emitted once per account with
+            // no facts, and an unscoped id would give every one of them the same
+            // identity — which is what an agent deduplicates by.
+            id: format!(
+                "{}:{}",
+                ActionKind::StartAccountImport.id(),
+                account.inner()
+            ),
+            kind: ActionKind::StartAccountImport,
+            category: ActionCategory::RequiredForGoal,
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Agent),
+            subject: Some(ActionSubject::Account(account)),
+        },
         format!(
             "Account {} has no business facts; import a statement or connect a broker. \
-             Import is continuous and never complete. No operation in this API fetches \
-             the document.",
+             Fetching the statement out of the bank is a step outside this API — no \
+             operation here downloads the document, and the owner obtains it himself. \
+             Recording it is not: open an import session for this account, feed it the \
+             rows and commit, or synchronise a broker channel over an interval. Import \
+             is continuous and never complete.",
             account.inner()
         ),
+        ActionTarget::from_options(vec![session, sync]),
     )
+    .expect("account import action publishes both of its resolutions")
 }
 
 /// The request for one control assertion, at the point it is wanted for.
@@ -2460,11 +2560,16 @@ mod tests {
                 ),
             }
         }
+        // The witness this sweep keeps is the item that once got the state
+        // wrong. It is no longer blocked — two operations begin an import — so
+        // what it witnesses now is the other half of the same rule: an item that
+        // names operations must not say `blocked`.
         let import = actions
             .iter()
             .find(|action| action.kind() == ActionKind::StartAccountImport)
             .expect("account import action");
-        assert_eq!(import.state(), ActionState::Blocked);
+        assert_ne!(import.state(), ActionState::Blocked);
+        assert_eq!(import.target().resolutions().len(), 2);
         assert_eq!(import.subject(), Some(ActionSubject::Account(account.id)));
     }
 
@@ -2717,6 +2822,98 @@ mod tests {
                 .all(|actions| actions[0].kind() <= actions[1].kind())
         );
     }
+
+    /// An account with nothing in it is offered both routes that begin an import.
+    ///
+    /// The item used to be `Blocked`, on a sentence that was true of fetching the
+    /// document and of nothing else. An agent reads `state` as its map of what it
+    /// may call, so the queue disowned the two routes that do exist.
+    #[test]
+    fn an_account_awaiting_its_first_import_names_both_routes_that_begin_one() {
+        let account = account();
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[no_facts(account.id)],
+            assertions: &[],
+            questions: &[],
+        });
+        let import = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::StartAccountImport)
+            .expect("account import action");
+
+        assert_eq!(import.state(), ActionState::NeedsOwnerInput);
+        // Both routes check `may_submit`, so an agent may send either.
+        assert_eq!(import.required_scope(), Some(Scope::Agent));
+
+        let resolutions = import.target().resolutions();
+        assert_eq!(
+            resolutions
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            vec![OperationKey::OpenImportSession, OperationKey::SyncBroker],
+            "the statement is the ordinary answer and the broker channel the other"
+        );
+
+        // The session is opened for this account and nothing else is known: the
+        // channel is the caller's, the label is read off the fetched document.
+        let session = resolutions[0].1;
+        assert_eq!(
+            session.preset.get("source"),
+            Some(&serde_json::json!({ "account": account.id.inner().to_string() }))
+        );
+        assert_eq!(
+            session
+                .missing
+                .iter()
+                .map(|input| (input.pointer.as_str(), input.provided_by))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/source/channel", ProvidedBy::Caller),
+                ("/source/label", ProvidedBy::ExternalDocument),
+            ]
+        );
+
+        // The sync knows the account; which broker, and over what interval, are
+        // the owner's to name.
+        let sync = resolutions[1].1;
+        assert_eq!(
+            sync.preset.get("account"),
+            Some(&serde_json::Value::from(account.id.inner().to_string()))
+        );
+        assert_eq!(
+            sync.missing
+                .iter()
+                .map(|input| (input.pointer.as_str(), input.provided_by))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/broker", ProvidedBy::Owner),
+                ("/from", ProvidedBy::Owner),
+                ("/to", ProvidedBy::Owner),
+            ]
+        );
+
+        // The honest half of the old sentence survives: the document is still
+        // the owner's to fetch, and the reason says so without claiming the API
+        // is inert.
+        assert!(
+            import
+                .reason()
+                .contains("no operation here downloads the document"),
+            "{}",
+            import.reason()
+        );
+        assert!(
+            import.reason().contains("open an import session"),
+            "{}",
+            import.reason()
+        );
+    }
+
     #[test]
     fn an_account_without_business_facts_gets_a_continuous_import_action() {
         let account = account();
@@ -2736,11 +2933,14 @@ mod tests {
             assertions: &[],
             questions: &[],
         });
-        let import = actions
-            .iter()
-            .find(|action| action.kind() == ActionKind::StartAccountImport)
-            .expect("account import action");
-        assert_eq!(import.target(), &ActionTarget::None);
+        // What this test is about is the gap and its closing. The target is
+        // asserted in full by the test above, which is where the old
+        // `ActionTarget::None` assertion sat and where it was wrong.
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.kind() == ActionKind::StartAccountImport)
+        );
         assert!(!account_import_completion(&activity));
 
         let completed = AccountActivityView {

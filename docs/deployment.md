@@ -68,9 +68,11 @@ Three rules follow, and they hold for every step below.
 `IAAM_BROKER_KEY_FILE` is optional for `serve` only in the sense that a service
 that never talks to a broker can run without it. If it is set and the file is
 absent, `serve` refuses to start rather than starting silently without
-encryption. Broker routes on a server started without it answer
-`{"code":"not_configured", …}`; the fix is a restart with the key, not a
-different call.
+encryption. Broker routes that **use** a credential — a sync, anything that
+decrypts — answer `{"code":"not_configured", …}` on a server started without it,
+and the fix is a restart with the key, not a different call.
+`GET /v1/broker-access` is not one of them: it lists metadata, decrypts nothing,
+and answers `200` with or without the key (§6.2).
 
 ### 2.2 Secrets
 
@@ -409,7 +411,7 @@ $ curl -sS http://127.0.0.1:8080/v1/health
 {"status":"ok","schema_version":12,"projection_version":8}
 
 $ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/actions
-{"policy_version":1,"items":[{"id":"create_first_account","kind":"create_first_account","category":"blocking","state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered.","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}]}
+[{"id":"create_first_account","kind":"create_first_account","category":"blocking","goals":[],"state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered.","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}]
 ```
 
 The first call is the discovery document (RFC 9727) and the entry point for an
@@ -427,6 +429,16 @@ issued, read the store, and resolved the action's address from the routes the
 server actually registered — transport, storage and the trust root in one
 answer. On a freshly claimed instance the queue holds exactly the item above,
 and an agent's work starts there rather than in any document a human maintains.
+
+The queue is a **bare array**, not an object with an `items` field. It carried
+one until the `policy_version` beside it turned out to be a literal that nothing
+ever moved; `docs/api/conventions.md` §1.4a records the removal and the rule it
+follows from. A client that unwraps this response finds nothing to unwrap.
+`goals` is empty here because the item is `blocking` — it stops the next call
+rather than standing between the owner and a report. On an item graded
+`required_for_goal` it names which of the four reports the item blocks, in the
+same words the reports themselves use, so "what is in the way of the asset
+snapshot" is a filter on this array rather than a reading of the whole queue.
 
 **On failure** — `{"code":"unauthorized", …}` means the header is missing,
 misspelled or carries a revoked token; §7 issues a new one, and only a console
@@ -491,22 +503,32 @@ because `serve` only reads it.
     --env IAAM_BROKER_KEY_FILE=/etc/iaam/broker-key \
 ```
 
-Check:
+Check that the route answers:
 
 ```console
 $ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/broker-access
 []
 ```
 
-`[]` is success on an instance with no credentials yet. The failure to look for
-is this one:
+`[]` is an instance with no credentials yet, and that is the whole of what this
+call proves. It lists metadata and decrypts nothing, so it answers `200` with or
+without the key, and once §6.3 has provisioned an access it prints the row on a
+server that cannot read it. **It is not the check that the mount above took
+effect.** The call that needs the key is one that uses a credential, so the
+proof comes after §6.3:
 
 ```console
+$ curl -sS -X POST http://127.0.0.1:8080/v1/brokers/tinkoff/sync \
+    -H "authorization: Bearer $OWNER" -H 'content-type: application/json' \
+    -d '{"account":"<account id>","from":"2025-01-01","to":"2025-01-31"}'
 {"code":"not_configured","message":"broker access encryption is not configured: set IAAM_BROKER_KEY_FILE and restart the server"}
 ```
 
-It means the running process was started without the key. The fix is the
-restart, not a different call.
+`503` with that message means the running process was started without the key.
+The fix is the restart, not a different call. Its near neighbour
+`{"code":"not_configured","message":"broker access is not configured"}` shares
+the code and says something else entirely — no active access exists for that
+broker and environment — and §6.3 answers it, not a restart.
 
 ### 6.3 Provision a credential
 
@@ -646,7 +668,7 @@ The `owner` scope cannot be issued over the API:
 ```console
 $ curl -sS -X POST http://127.0.0.1:8080/v1/tokens -H "authorization: Bearer $OWNER" \
     -H 'content-type: application/json' -d '{"label": "second", "scope": "owner"}'
-{"code":"invalid_request","message":"an owner token cannot be issued via the API: the owner is created with `iaam claim --label <label>`","field":"scope","expected":"agent or read_only","actual":"owner"}
+{"code":"invalid_request","message":"an owner token cannot be issued via the API: the owner is created with `iaam claim --label <label>`","field":"scope","pointer":"/scope","expected":"agent or read_only","actual":"owner","alternatives":[{"value":"agent"},{"value":"read_only"}]}
 ```
 
 Otherwise a stolen owner token could immediately copy itself into
@@ -785,7 +807,8 @@ supplies what is missing and with which command.
 | `error: key file … exists but is unreadable or has an invalid format` | wrong file, or a damaged key | restore the key from backup. Do **not** create a new one over it |
 | `error: SQLite error: unable to open database file: /var/lib/iaam/iaam.db` | the data directory is not writable by the process's uid | the machine's administrator: `sudo chown 10001:10001 /var/lib/iaam` (container) or `sudo chown iaam:iaam /var/lib/iaam` (host) |
 | `{"code":"unauthorized", …}` (401) | header missing, or the token is unknown or revoked | §7.1 for an agent token; §7.3 for an owner token |
-| `{"code":"not_configured","message":"broker access encryption is not configured: …"}` | the server was started without `IAAM_BROKER_KEY_FILE` | restart it with the key mounted: §6.2 |
+| `{"code":"not_configured","message":"broker access encryption is not configured: …"}` (503) | the server was started without `IAAM_BROKER_KEY_FILE` | restart it with the key mounted: §6.2 |
+| `{"code":"not_configured","message":"broker access is not configured"}` (503) | same code, different fact: no active access for that broker and environment | the owner, at a console: `iaam broker access add` (§6.3). A restart changes nothing |
 | `{"code":"invalid_request","message":"an owner token cannot be issued via the API: …"}` (422) | `scope: owner` requested over HTTP | by design; issue it at the console (§7.3) |
 | `Connection refused` from curl | nothing is listening at that address | container: `IAAM_LISTEN` left at the loopback default while publishing a port (§3.6). Host: `systemctl is-active iaam` |
 

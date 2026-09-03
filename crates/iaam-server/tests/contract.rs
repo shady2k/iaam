@@ -850,7 +850,7 @@ async fn health_is_public_and_reports_versions() {
     // silent bump would tell that agent nothing had changed, and a silent
     // omission would tell it nothing had changed when a new event kind
     // appeared.
-    assert_eq!(body["schema_version"], 11);
+    assert_eq!(body["schema_version"], 12);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version
@@ -8426,9 +8426,11 @@ async fn an_unparsable_path_parameter_is_refused_in_the_documented_shape() {
 ///
 /// The permission is the point of the route existing separately from ingestion:
 /// `Scope::may_submit` admits an agent, so an agent that could carry a relation
-/// on an ingest row could retract the owner's history.
+/// on an ingest row could retract the owner's history. That reasoning is
+/// unchanged by `iaam-rond`, which moved the gate on one of the two routes and
+/// not the shape of either.
 #[tokio::test]
-async fn corrections_are_described_and_an_agent_token_is_refused() {
+async fn corrections_are_described_and_a_foreign_token_is_refused() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
@@ -8486,17 +8488,39 @@ async fn corrections_are_described_and_an_agent_token_is_refused() {
         "unexpected relation tags: {relations:?}"
     );
 
-    for path in ["/v1/corrections", "/v1/corrections/imports"] {
-        for token in [&harness.agent_token, &harness.readonly_token] {
-            let (status, body) = call(
-                &harness.router,
-                post(path, token, &json!({"acknowledge_retraction": true})),
-            )
-            .await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
-            assert_eq!(body["code"], "forbidden", "{path}: {body}");
-        }
+    // Reversing a named event of the owner's is a judgement about his history,
+    // and nothing about the caller's own conduct bounds it: both non-owner
+    // scopes are refused at the door.
+    for token in [&harness.agent_token, &harness.readonly_token] {
+        let (status, body) = call(
+            &harness.router,
+            post(
+                "/v1/corrections",
+                token,
+                &json!({"acknowledge_retraction": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], "forbidden", "{body}");
     }
+
+    // Retracting a whole import is not the same act (iaam-rond): an agent may
+    // take back its own declaration, so the route keeps only the floor and the
+    // scenario decides the rest against the journal. Read-only is still refused
+    // here; what an agent may and may not reach is asserted where the journal
+    // exists to decide it.
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.readonly_token,
+            &json!({"acknowledge_retraction": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden", "{body}");
 }
 
 /// Seed one deposit and return the event identifier the server minted for it.
@@ -15787,4 +15811,365 @@ async fn a_commit_refused_for_an_open_question_names_the_call_that_answers_it() 
     assert_eq!(other["field"], "revision", "{other}");
     assert!(other.get("resolutions").is_none(), "{other}");
     assert!(other.get("alternatives").is_none(), "{other}");
+}
+
+// ---------------------------------------------------------------------------
+// Scope is drawn by consequence (iaam-hnod, iaam-rond)
+// ---------------------------------------------------------------------------
+
+/// Feed one row nothing settles and hand back the session and its question.
+///
+/// Parametrised by token because the whole point of the two tests below is that
+/// one act reaches two outcomes depending on who performed it, and a helper that
+/// fixed the owner's token could not express the other half.
+async fn ask_one_question(harness: &Harness, token: &str, key: &str) -> (String, String) {
+    let account = harness.account.inner();
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, key)],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    (
+        verdicts[0]["session_id"]
+            .as_str()
+            .expect("session")
+            .to_owned(),
+        verdicts[0]["question_id"]
+            .as_str()
+            .expect("question")
+            .to_owned(),
+    )
+}
+
+async fn classification_rule_count(harness: &Harness) -> usize {
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    rules.as_array().expect("rules").len()
+}
+
+/// An agent's answer settles the row and generalises nothing (iaam-hnod).
+///
+/// The defect: writing a classification rule is owner-only at the route that
+/// says so, and answering a question wrote one too. The decision the agent could
+/// not make directly it made through a route whose name does not mention rules,
+/// and the only thing forbidding it was a sentence in the agent's document.
+///
+/// Both halves are asserted in one test on purpose. "An agent writes no rule" is
+/// satisfiable by breaking the feature outright, and the owner's half is what
+/// says the rule still exists for the caller entitled to it.
+#[tokio::test]
+async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
+    let harness = harness();
+    let savings = another_account(&harness, "Savings").await;
+    let before = journal_rows(&harness).await;
+
+    let (session, question) = ask_one_question(&harness, &harness.agent_token, "agent-inner").await;
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.agent_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the row still settles under an agent token: {answered}"
+    );
+    assert!(
+        answered["rule"].is_null(),
+        "an agent's answer must not become a standing rule: {answered}"
+    );
+    assert!(
+        answered["answered_at"].is_string(),
+        "the question is answered even though nothing was generalised: {answered}"
+    );
+    assert_eq!(
+        classification_rule_count(&harness).await,
+        0,
+        "the agent wrote a rule through the route that does not say it writes one"
+    );
+
+    // The settled row commits like any other: the refusal is of the
+    // generalisation, not of the import.
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.agent_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(journal_rows(&harness).await, before + 1, "{committed}");
+
+    // And the same act under the owner's token does generalise.
+    let (session, question) = ask_one_question(&harness, &harness.owner_token, "owner-inner").await;
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert!(
+        answered["rule"].is_string(),
+        "the owner's answer is still recorded as a rule: {answered}"
+    );
+    assert_eq!(classification_rule_count(&harness).await, 1);
+}
+
+/// Ingest one deposit under a declared import and report what the journal holds.
+async fn declare_import(harness: &Harness, token: &str, label: &str, key: &str) -> Value {
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            token,
+            &json!({
+                "source": {
+                    "account": harness.account.inner(),
+                    "channel": "file",
+                    "label": label,
+                },
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": "100.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-08-05" },
+                    "idempotency_key": key
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    json!({
+        "account": harness.account.inner(),
+        "channel": "file",
+        "label": label,
+    })
+}
+
+/// An agent takes back the import it declared, and nothing else (iaam-rond).
+///
+/// Committing an import is open to the agent and rewrites every downstream
+/// report; the retraction was not, so an agent that found by control total that
+/// it had written nonsense could only wake the owner to undo the agent's own
+/// mistake. Retracting one's own declaration reverses no decision of the
+/// owner's — he made none about rows the agent put there.
+#[tokio::test]
+async fn an_agent_retracts_the_import_it_declared() {
+    let harness = harness();
+    let before = journal_rows(&harness).await;
+    let source = declare_import(&harness, &harness.agent_token, "agent-august", "agent-own").await;
+    assert_eq!(journal_rows(&harness).await, before + 1);
+
+    let (status, retracted) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.agent_token,
+            &json!({ "acknowledge_retraction": true, "source": source }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["affected"], 1, "{retracted}");
+    assert_eq!(retracted["written"], 1, "{retracted}");
+
+    // The acknowledgement is not waived for the agent: a retracted fact stops
+    // counting in every report either way.
+    let source_two = declare_import(
+        &harness,
+        &harness.agent_token,
+        "agent-september",
+        "agent-two",
+    )
+    .await;
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.agent_token,
+            &json!({ "source": source_two }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "acknowledge_retraction", "{refused}");
+}
+
+/// Everything wider than its own untouched declaration is still the owner's.
+///
+/// Four refusals, one per condition of the bound, because a gate that passes the
+/// happy case and lets one of these through is the defect it was meant to close.
+#[tokio::test]
+async fn an_agent_may_not_retract_anything_it_did_not_declare() {
+    let harness = harness();
+    let owners = declare_import(&harness, &harness.owner_token, "owner-august", "owner-own").await;
+
+    // 1. Not the caller's declaration.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.agent_token,
+            &json!({ "acknowledge_retraction": true, "source": owners }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "source", "{refused}");
+    assert!(
+        refused["expected"]
+            .as_str()
+            .is_some_and(|text| text.contains("declared")),
+        "the refusal must say which condition failed: {refused}"
+    );
+
+    // 2. No label: the rows that named no import are nobody's to take back.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.agent_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": { "account": harness.account.inner(), "channel": "file" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "source.label", "{refused}");
+
+    // 3. Already reversed: the second retraction is refused, and the refusal is
+    // also the answer to "did my first call land".
+    let mine = declare_import(&harness, &harness.agent_token, "agent-august", "agent-own").await;
+    let (status, done) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.agent_token,
+            &json!({ "acknowledge_retraction": true, "source": mine.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.agent_token,
+            &json!({ "acknowledge_retraction": true, "source": mine }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert!(
+        refused["actual"]
+            .as_str()
+            .is_some_and(|text| text.contains("effective")),
+        "{refused}"
+    );
+
+    // 4. Something is built on it: the owner has reconciled a balance against
+    // the interval these rows fall in.
+    let reconciled = declare_import(
+        &harness,
+        &harness.agent_token,
+        "agent-october",
+        "agent-three",
+    )
+    .await;
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.owner_token,
+            &json!({
+                "account": harness.account.inner(),
+                "from": "2026-08-01",
+                "to": "2026-08-31",
+                "at": "closing",
+                "cash": { "currency": "RUB", "amount": "100.00" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.agent_token,
+            &json!({ "acknowledge_retraction": true, "source": reconciled.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert!(
+        refused["actual"]
+            .as_str()
+            .is_some_and(|text| text.contains("control assertion")),
+        "{refused}"
+    );
+
+    // The owner is refused none of it.
+    let (status, retracted) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({ "acknowledge_retraction": true, "source": reconciled }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["written"], 1, "{retracted}");
+}
+
+/// A read-only token is refused at the transport, before any journal is read.
+///
+/// The floor the route still keeps: no state of the journal makes a read-only
+/// token entitled to write a reversal, so that one refusal does not need the
+/// evidence the agent's does.
+#[tokio::test]
+async fn a_read_only_token_may_not_retract_an_import() {
+    let harness = harness();
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.readonly_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": { "account": harness.account.inner(), "channel": "file", "label": "x" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["code"], "forbidden", "{refused}");
 }

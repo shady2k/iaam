@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ImportId, SourceId};
+use crate::ids::{ImportId, PrincipalId, SourceId};
 
 /// Hash of the raw source record. A hexadecimal SHA-256 string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -94,6 +94,26 @@ pub struct Provenance {
     /// already recorded do not carry this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     import: Option<ImportId>,
+    /// The credential the fact was submitted under.
+    ///
+    /// Provenance already answers «which software wrote this» through
+    /// [`ParserVersion`]; this answers «which credential presented it», which is
+    /// the same axis and the one thing about a submission that cannot be
+    /// recovered afterwards. A token's scope is checked at the door and then
+    /// forgotten, so without this field the journal can say what an act was and
+    /// never who performed it.
+    ///
+    /// It is here rather than in a table beside the journal for the reason
+    /// every other origin field is: a second place recording where a fact came
+    /// from is a second place that can disagree with the fact.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field. `None` therefore means «not
+    /// recorded», never «submitted by nobody», and every rule that reads it
+    /// must refuse on `None` rather than assume — the whole point of the field
+    /// is that a missing declaration is not evidence of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declared_by: Option<PrincipalId>,
     row: Option<RowLocator>,
 }
 
@@ -112,6 +132,7 @@ impl Provenance {
             source_category: None,
             description: None,
             import: None,
+            declared_by: None,
             row: None,
         }
     }
@@ -140,6 +161,17 @@ impl Provenance {
         self
     }
 
+    /// Stamp the credential this fact was submitted under.
+    ///
+    /// Applied after normalisation rather than carried in the normalisation
+    /// context, for the reason the import is: normalisation decides what a row
+    /// *is*, and who presented it decides nothing about that.
+    #[must_use]
+    pub const fn with_declared_by(mut self, principal: PrincipalId) -> Self {
+        self.declared_by = Some(principal);
+        self
+    }
+
     #[must_use]
     pub fn with_row(mut self, row: RowLocator) -> Self {
         self.row = Some(row);
@@ -156,6 +188,17 @@ impl Provenance {
     #[must_use]
     pub const fn import(&self) -> Option<ImportId> {
         self.import
+    }
+
+    /// The credential this fact was submitted under, when one was recorded.
+    ///
+    /// `None` for everything written before the field existed and for every
+    /// path that appends without a caller behind it — a broker synchronisation,
+    /// a correction minted by this code. A caller that reads `None` as «mine»
+    /// would hand every unattributed fact to whoever asked first.
+    #[must_use]
+    pub const fn declared_by(&self) -> Option<PrincipalId> {
+        self.declared_by
     }
 
     #[must_use]
@@ -290,6 +333,32 @@ mod tests {
         .with_description("Corner Shop");
 
         assert_eq!(provenance.description(), Some("Corner Shop"));
+    }
+
+    #[test]
+    fn the_declaring_principal_is_kept_and_read_back() {
+        let principal = PrincipalId::new_random();
+        let provenance = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_declared_by(principal);
+
+        assert_eq!(provenance.declared_by(), Some(principal));
+    }
+
+    #[test]
+    fn provenance_written_before_a_declarer_was_recorded_names_none() {
+        // The load-bearing half of the field: a fact that names no declarer must
+        // read as «not recorded», so a rule of the form «you may undo what you
+        // declared» refuses it instead of handing it to whoever asks first.
+        let stored = r#"{"source":"00000000-0000-0000-0000-000000000000",
+        "raw_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "parser_version":"test"}"#;
+        let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
+
+        assert_eq!(provenance.declared_by(), None);
     }
 
     #[test]

@@ -109,6 +109,23 @@ typed_id!(
     /// Owner category assignment rule.
     CategoryRuleId
 );
+typed_id!(
+    /// The credential a fact was submitted under.
+    ///
+    /// Deliberately **not** an identity of a person or a program. It names the
+    /// token the request presented, and nothing finer is knowable: two clients
+    /// handed one token are one principal here, and the same client after the
+    /// owner rotates its token is a different one. Both follow from how the
+    /// owner keeps his keys rather than from what this identifier means, and
+    /// the second is why every rule written on it must fail closed.
+    ///
+    /// It exists because a scope answers what a caller *may* do and never what
+    /// it *did*. A rule of the form «you may undo what you yourself declared»
+    /// cannot be decided from a scope, so the declaration has to be recorded
+    /// when it is made — which is what
+    /// [`crate::event::provenance::Provenance::declared_by`] holds.
+    PrincipalId
+);
 
 /// Namespace for declared sources. A fixed UUID, so the derivation is stable
 /// across builds and machines.

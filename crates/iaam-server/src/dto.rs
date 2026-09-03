@@ -7463,9 +7463,19 @@ pub struct ImportQuestionDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<String>,
     /// The classification rule the answer created, so the same counterparty is
-    /// not asked about twice. Absent when the row offered nothing a rule can
-    /// match on: a rule that asks nothing matches nothing, and writing one would
-    /// record a decision that never applies.
+    /// not asked about twice.
+    ///
+    /// Absent for either of two reasons, and a client cannot tell them apart
+    /// from this field alone — it knows which applies because it knows what
+    /// token it holds:
+    ///
+    /// - the row offered nothing a rule can match on, so no rule was written
+    ///   under any scope: a rule that asks nothing matches nothing, and writing
+    ///   one would record a decision that never applies;
+    /// - the answer came in under an agent token, which settles the row and
+    ///   generalises nothing (`iaam-hnod`). A standing rule decides rows nobody
+    ///   has looked at, and that is the owner's judgement, made with his own
+    ///   token through `POST /v1/classification-rules`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<Uuid>,
 }

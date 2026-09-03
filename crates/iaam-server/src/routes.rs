@@ -15,8 +15,8 @@ use axum::response::Response;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
-    AccountScope, Action, ActionCategory, ActionState, ActionSubject, ActionTarget, ProvidedBy,
-    account_scope,
+    AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
+    ActionTarget, MissingInput, ProvidedBy, account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
@@ -78,15 +78,16 @@ use crate::dto::{
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
     CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
-    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InstrumentDto, IssuedTokenDto,
-    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
-    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
-    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
-    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
-    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersRequest,
-    RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto,
-    SubmitCorrectionsRequest, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
-    TokenDto, TokenScopeDto, VerdictDto,
+    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
+    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
+    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
+    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
+    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
+    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest,
+    RecordAccountTransferPartnersRequest, RequestPlanDto, RequiredInputDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest, ImportCommitDto,
@@ -139,24 +140,7 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
                 request_schema: resolved.request_schema.clone(),
                 request: RequestPlanDto {
                     preset: request.preset.clone(),
-                    missing: request
-                        .missing
-                        .iter()
-                        .map(|missing| MissingInputDto {
-                            pointer: missing.pointer.clone(),
-                            provided_by: provided_by_code(missing.provided_by),
-                            candidates: missing.candidates.as_ref().map(|candidates| {
-                                candidates
-                                    .iter()
-                                    .map(|candidate| AccountCandidateDto {
-                                        id: candidate.id.inner(),
-                                        title: candidate.title.clone(),
-                                        institution: candidate.institution.clone(),
-                                    })
-                                    .collect()
-                            }),
-                        })
-                        .collect(),
+                    missing: request.missing.iter().map(missing_input_dto).collect(),
                 },
             }
         }
@@ -188,6 +172,42 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
         }),
         target,
     }
+}
+
+/// One missing field, the alternatives it admits, and what each of them needs.
+fn missing_input_dto(missing: &MissingInput) -> MissingInputDto {
+    MissingInputDto {
+        pointer: missing.pointer.clone(),
+        provided_by: provided_by_code(missing.provided_by),
+        candidates: missing.candidates.as_deref().map(account_candidate_dtos),
+        alternatives: missing
+            .alternatives
+            .iter()
+            .map(|alternative| InputAlternativeDto {
+                value: alternative.value.clone(),
+                requires: alternative
+                    .requires
+                    .iter()
+                    .map(|required| RequiredInputDto {
+                        pointer: required.pointer.clone(),
+                        provided_by: provided_by_code(required.provided_by),
+                        candidates: required.candidates.as_deref().map(account_candidate_dtos),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn account_candidate_dtos(candidates: &[AccountCandidate]) -> Vec<AccountCandidateDto> {
+    candidates
+        .iter()
+        .map(|candidate| AccountCandidateDto {
+            id: candidate.id.inner(),
+            title: candidate.title.clone(),
+            institution: candidate.institution.clone(),
+        })
+        .collect()
 }
 
 fn provided_by_code(source: ProvidedBy) -> String {

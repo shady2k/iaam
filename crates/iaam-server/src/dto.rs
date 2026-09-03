@@ -2968,6 +2968,49 @@ pub struct MissingInputDto {
     pub provided_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<AccountCandidateDto>>,
+    /// The literal values this field admits, when it admits a closed set.
+    ///
+    /// Absent where the field is not a choice. Distinct from `candidates`,
+    /// which offers accounts for a field whose type is an account; an
+    /// alternative is a value of this field itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<InputAlternativeDto>,
+}
+
+/// One admissible value of a missing input, and what choosing it then needs.
+///
+/// `requires` is why an alternative is an object and not a bare string: some
+/// values need a further field that the others do not, and a flat list of words
+/// would either look complete when it is not, or make every such field required
+/// for every value.
+///
+/// Deliberately not [`AnswerAlternativeDto`], which the ingest and session
+/// responses publish. That one answers "what may be said to this question" and
+/// says `needs_account: true`; this one answers "what goes in which request
+/// field, and what else that value then needs", and names the accounts. A queue
+/// item that only said an account was needed would leave the caller to find out
+/// which are eligible somewhere else.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InputAlternativeDto {
+    /// The value written at the parent's pointer.
+    pub value: String,
+    /// Fields that become required only if this alternative is chosen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<RequiredInputDto>,
+}
+
+/// A field one alternative requires. It carries no alternatives of its own.
+///
+/// `MissingInputDto` without the `alternatives`, so the two do not nest. A
+/// required field that were itself a closed choice would be a second question
+/// asked before the first is answered, and the mutually recursive schemas would
+/// not terminate.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequiredInputDto {
+    pub pointer: String,
+    pub provided_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<AccountCandidateDto>>,
 }
 
 /// An account that can be selected for a contour.

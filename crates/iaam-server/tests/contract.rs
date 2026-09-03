@@ -11377,3 +11377,157 @@ fn collect_refs(value: &Value, found: &mut impl FnMut(&str)) {
         _ => {}
     }
 }
+
+/// Every open classification question is an item in `/v1/actions`.
+///
+/// The ingest response is discarded on purpose, because that is the defect: a
+/// question that lives only in a response body is invisible once the body is
+/// gone. Everything below — the session, the question, the shapes it admits and
+/// the route that answers it — is taken from the queue alone.
+#[tokio::test]
+async fn an_open_classification_question_is_an_item_in_the_action_queue() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, raised) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                // Two rows, so a second, unrelated question is a second item.
+                // Both name the declared source account: a batch may not carry
+                // rows for an account its source did not declare.
+                "operations": [
+                    unresolved_row(account, "queue-one"),
+                    unresolved_row(account, "queue-two"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raised}");
+    drop(raised);
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 2, "one item per open question: {items:?}");
+    let identities: std::collections::BTreeSet<&str> = items
+        .iter()
+        .map(|item| item["id"].as_str().expect("an identity"))
+        .collect();
+    assert_eq!(identities.len(), 2, "one identity each: {items:?}");
+    for item in &items {
+        assert_eq!(
+            item["subject"]["id"],
+            json!(account),
+            "the item names the account the row is on: {item}"
+        );
+    }
+    let item = items[0].clone();
+
+    assert_eq!(item["kind"], "answer_classification_question", "{item}");
+    assert_eq!(item["category"], "required_for_goal", "{item}");
+    assert_eq!(item["state"], "needs_owner_input", "{item}");
+    assert_eq!(item["required_scope"], "agent", "{item}");
+    assert_eq!(item["subject"]["type"], "account", "{item}");
+
+    // The operation that answers it, so the item is actionable and not a notice.
+    let target = &item["target"];
+    assert_eq!(target["type"], "operation", "{item}");
+    assert_eq!(target["operationId"], "answer_import_question", "{item}");
+    assert_eq!(target["method"], "POST", "{item}");
+    assert_eq!(
+        target["path"], "/v1/import-sessions/{session}/questions/{question}/answer",
+        "{item}"
+    );
+
+    // The typed answer shapes, and the account the two of them that need one need.
+    let answer = target["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .expect("the answer field");
+    let shapes: Vec<&str> = answer["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![
+            "sent_to_own_account",
+            "received_from_own_account",
+            "paid",
+            "received",
+            "fee",
+            "income",
+        ],
+        "{item}"
+    );
+    for alternative in answer["alternatives"].as_array().expect("alternatives") {
+        let requires = alternative["requires"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        match alternative["value"].as_str().expect("a value") {
+            "sent_to_own_account" | "received_from_own_account" => {
+                assert_eq!(requires[0]["pointer"], "/account", "{alternative}");
+                let offered: Vec<&str> = requires[0]["candidates"]
+                    .as_array()
+                    .expect("the owner's other accounts")
+                    .iter()
+                    .map(|candidate| candidate["id"].as_str().expect("an identifier"))
+                    .collect();
+                assert_eq!(
+                    offered,
+                    vec![savings.to_string().as_str()],
+                    "an account is not the other side of itself: {alternative}"
+                );
+            }
+            _ => assert!(requires.is_empty(), "{alternative}"),
+        }
+    }
+
+    // Answering removes its own item, and only its own.
+    let session = target["request"]["preset"]["session"]
+        .as_str()
+        .expect("the session is preset");
+    let question = target["request"]["preset"]["question"]
+        .as_str()
+        .expect("the question is preset");
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "paid" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    let left = open_question_items(&harness).await;
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_ne!(left[0]["id"], item["id"], "{left:?}");
+}
+
+/// The queue's items for open classification questions, and nothing else.
+async fn open_question_items(harness: &Harness) -> Vec<Value> {
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .filter(|item| item["kind"] == "answer_classification_question")
+        .cloned()
+        .collect()
+}

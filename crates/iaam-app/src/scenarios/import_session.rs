@@ -14,9 +14,10 @@
 
 use std::collections::BTreeSet;
 
+use iaam_core::batch::{self, BatchTotal};
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
-use iaam_core::money::CurrencyCode;
+use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule, Movement,
     Question, RuleMatcher, classify,
@@ -847,6 +848,18 @@ pub struct PlannedFact {
 }
 
 /// What the journal gains, and what it does not.
+///
+/// Every list here is a list of rows, and beside two of them is what those rows
+/// come to. The totals answer the question the lists cannot: an operator
+/// checking a two-hundred-row import against the figure printed on his statement
+/// has one number on the statement and two hundred decimal strings here, and
+/// adding them up is arithmetic — which belongs in the core (§3.1, §13) and not
+/// in a client that is a language model.
+///
+/// They decide nothing and refuse nothing: they let a reader compare one number
+/// with one number, and what he does about a difference is his business. A
+/// source that printed no control section at all still leaves him a figure to
+/// check by hand against the statement in front of him.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitDelta {
     /// Facts that would be appended.
@@ -858,6 +871,16 @@ pub struct CommitDelta {
     pub duplicates: Vec<PlannedFact>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRow>,
+    /// What `facts` come to, per account and currency.
+    pub fact_totals: Vec<BatchTotal>,
+    /// What `duplicates` come to, per account and currency.
+    ///
+    /// Totalled separately rather than folded in with the facts, because the two
+    /// answer different questions. The facts' total is what the journal gains;
+    /// this one is what the source stated and the journal already holds, and it
+    /// is the figure that explains a statement whose turnover exceeds what the
+    /// import adds. Summed together they would be neither.
+    pub duplicate_totals: Vec<BatchTotal>,
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -1058,6 +1081,8 @@ pub async fn plan_session(
     };
 
     let commit_delta = CommitDelta {
+        fact_totals: batch_totals(&facts)?,
+        duplicate_totals: batch_totals(&duplicates)?,
         facts,
         duplicates,
         retained_unrecorded: retained,
@@ -1221,6 +1246,32 @@ fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact 
     }
 }
 
+/// What a list of planned facts comes to, per account and currency.
+///
+/// The fold itself is [`iaam_core::batch::total`]: summing money is arithmetic,
+/// and the architecture guard refuses it here (§3.1, §13). What this function
+/// decides is what counts as a movement, which the core deliberately leaves to
+/// its caller.
+///
+/// A fact whose cash effect on its own account is zero is left out. Its
+/// `currency` is a placeholder — [`planned_fact`] labels a zero `RUB` where the
+/// event moves no cash on that account, because the published shape has no room
+/// for «no cash» — and folding it would open a rouble total on an account that
+/// has never held roubles, and count a row against a currency it never named.
+fn batch_totals(facts: &[PlannedFact]) -> Result<Vec<BatchTotal>, AppError> {
+    let movements: Vec<(AccountId, Money)> = facts
+        .iter()
+        .filter(|fact| fact.amount_minor != 0)
+        .map(|fact| {
+            (
+                fact.account,
+                Money::new(PostedMinor::new(fact.amount_minor), fact.currency),
+            )
+        })
+        .collect();
+    batch::total(&movements).map_err(AppError::BatchTotal)
+}
+
 /// The stamp a plan carries, and commit refuses when it no longer matches.
 ///
 /// A digest of everything the plan says, and of nothing else. That is what makes
@@ -1332,6 +1383,16 @@ fn fingerprint(
     }
     for retained in &delta.retained_unrecorded {
         let _ = writeln!(rendered, "retained {retained:?}");
+    }
+    // Derived from the lists above, and stamped anyway: the digest's contract is
+    // that it covers everything the plan says, and a section left out because it
+    // «cannot disagree» is the section that will, the day someone changes how it
+    // is folded.
+    for total in &delta.fact_totals {
+        let _ = writeln!(rendered, "fact total {total:?}");
+    }
+    for total in &delta.duplicate_totals {
+        let _ = writeln!(rendered, "duplicate total {total:?}");
     }
     let _ = writeln!(rendered, "readiness {readiness:?}");
 

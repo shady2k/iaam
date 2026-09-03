@@ -46,6 +46,12 @@ use crate::dto::{
     SubmitOperationsRequest, SyncOutcomeDto, TaintDto, TokenDto, TristateDto, UncoveredPositionDto,
     VerdictDto, ZeroReinvestmentMetricsDto,
 };
+// The import assessment's own types, in a block of their own rather than merged
+// into the list above. Merging one name into a wrapped list of two hundred
+// reflows a third of them, and this file is edited by several changes at once;
+// a second `use` of the same module is the shape `routes.rs` already uses for
+// the same reason.
+use crate::dto::BatchTotalDto;
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -246,6 +252,7 @@ impl Modify for BearerSecurity {
         TokenDto,
         UncoveredPositionDto,
         VerdictDto,
+        BatchTotalDto,
         // The published vocabularies: every code the API can return, each with
         // the sentence that explains it (§13).
         VerdictCodeDto,

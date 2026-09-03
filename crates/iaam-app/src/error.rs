@@ -6,6 +6,7 @@
 
 use crate::actions::{InputAlternative, ResolutionOption};
 use iaam_core::event::correction::CorrectionError;
+use iaam_core::money::MoneyError;
 use iaam_core::perimeter::PerimeterError;
 use iaam_core::projection::ProjectionError;
 use iaam_core::projection::active_instruments::ActiveInstrumentsError;
@@ -113,6 +114,15 @@ pub enum AppError {
     /// to the journal rather than to the totals.
     #[error("asset snapshot not built: {0}")]
     AssetSnapshot(#[source] AssetSnapshotError),
+    /// An import batch did not total: adding one account's rows overflowed.
+    /// Separate from `AssetSnapshot`, which names the same kind of failure over
+    /// a different fold — reporting a batch that would not add up as a snapshot
+    /// failure would send an investigator to the valuation report rather than to
+    /// the rows a session is holding. Separate from `Invalid`, because nothing
+    /// the caller sent is wrong: each row states an amount the currency admits,
+    /// and it is their sum that does not fit.
+    #[error("import batch not totalled: {0}")]
+    BatchTotal(#[source] MoneyError),
 }
 
 /// A rejected request field, and everything the server can say about it.
@@ -298,6 +308,7 @@ impl AppError {
             Self::Reconciliation(_) => "reconciliation_failed",
             Self::Schedule(_) => "schedule_not_built",
             Self::AssetSnapshot(_) => "asset_snapshot_not_built",
+            Self::BatchTotal(_) => "batch_not_totalled",
             Self::Perimeter(_) => "perimeter_assessment_failed",
             Self::Correction(_) => "corrections_do_not_resolve",
             Self::NotConfigured { .. } => "not_configured",

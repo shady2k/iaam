@@ -4,6 +4,7 @@
 //! No I/O, `async`, `Mutex`, or dependencies on other workspace crates.
 //! See §3.1 of the specification.
 
+pub mod batch;
 pub mod bond;
 pub mod category;
 pub mod contour;

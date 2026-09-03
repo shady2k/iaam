@@ -13349,6 +13349,152 @@ async fn a_session_publishes_the_path_to_its_own_assessment() {
     assert_eq!(contents["assessment"], json!(link), "{contents}");
 }
 
+/// The commit delta totals its rows, per account and currency (iaam-o1ni).
+///
+/// The defect: `commit_delta` published three lists, each row carrying a signed
+/// amount and a currency, and no sum anywhere. An operator checking a
+/// two-hundred-row import against the one figure printed on his statement had to
+/// add two hundred decimal strings on the client — and the client of this API is
+/// a language model, in a system that deliberately keeps money arithmetic inside
+/// the core.
+///
+/// Every amount and account here is invented (CLAUDE.md).
+#[tokio::test]
+async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
+    let harness = harness();
+    let main = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    // One row committed on its own first, so the session below holds a row the
+    // journal already has: a duplicate totals separately from a fact, and the
+    // two must not be summed together.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": main,
+                    "type": "deposit",
+                    "amount": "400.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-02" },
+                    "idempotency_key": "totalled-already-held",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": main, "channel": "file", "label": "totalled" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    {
+                        "account": main,
+                        "type": "deposit",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-03" },
+                        "idempotency_key": "totalled-in",
+                    },
+                    {
+                        "account": main,
+                        "type": "withdrawal",
+                        "amount": "250.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-04" },
+                        "idempotency_key": "totalled-out",
+                    },
+                    {
+                        "account": savings,
+                        "type": "deposit",
+                        "amount": "60.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-05" },
+                        "idempotency_key": "totalled-savings",
+                    },
+                    {
+                        "account": main,
+                        "type": "deposit",
+                        "amount": "400.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-02" },
+                        "idempotency_key": "totalled-already-held",
+                    },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+
+    let totals = plan["commit_delta"]["fact_totals"]
+        .as_array()
+        .expect("fact totals");
+    assert_eq!(
+        totals.len(),
+        2,
+        "one total per account and currency: {plan}"
+    );
+    let on_main = totals
+        .iter()
+        .find(|total| total["account"] == json!(main.to_string()))
+        .expect("a total for the declared account");
+    assert_eq!(on_main["rows"], 2, "{plan}");
+    assert_eq!(on_main["debit"], "1000.00", "{plan}");
+    assert_eq!(on_main["credit"], "250.00", "both sides positive: {plan}");
+    assert_eq!(on_main["net"], "750.00", "{plan}");
+    assert_eq!(on_main["currency"], "RUB", "{plan}");
+
+    let on_savings = totals
+        .iter()
+        .find(|total| total["account"] == json!(savings.to_string()))
+        .expect("a total for the second account");
+    assert_eq!(on_savings["debit"], "60.00", "{plan}");
+    assert_eq!(
+        on_savings["net"], "60.00",
+        "two accounts are never folded into one figure: {plan}"
+    );
+
+    // The row the journal already holds is totalled apart. Folded in with the
+    // facts it would say the import adds money it adds nothing of.
+    let duplicates = plan["commit_delta"]["duplicate_totals"]
+        .as_array()
+        .expect("duplicate totals");
+    assert_eq!(duplicates.len(), 1, "{plan}");
+    assert_eq!(duplicates[0]["account"], json!(main.to_string()), "{plan}");
+    assert_eq!(duplicates[0]["debit"], "400.00", "{plan}");
+    assert_eq!(duplicates[0]["rows"], 1, "{plan}");
+}
+
 /// An import says what it will and will not record, before it records it.
 ///
 /// The defect: an import committed before anything said what it would do. Rows

@@ -32,6 +32,7 @@ use iaam_app::scenarios::reports::{
     MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
+use iaam_core::batch::BatchTotal;
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -7580,6 +7581,67 @@ pub struct CommitDeltaDto {
     pub duplicates: Vec<PlannedFactDto>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRowDto>,
+    /// What `facts` come to, per account and currency.
+    ///
+    /// One number to compare with one number. Without it a client checking a
+    /// two-hundred-row import against the figure on the statement has to add up
+    /// two hundred decimal strings, and this API's client is a language model in
+    /// a system that deliberately keeps money arithmetic in the core.
+    pub fact_totals: Vec<BatchTotalDto>,
+    /// What `duplicates` come to, per account and currency.
+    ///
+    /// Separate from `fact_totals` because they answer different questions: one
+    /// is what the journal gains, the other is what the source restated and the
+    /// journal already holds. Their sum is neither, which is why it is not
+    /// published.
+    pub duplicate_totals: Vec<BatchTotalDto>,
+}
+
+/// What one account's rows in one currency come to.
+///
+/// `debit` and `credit` are **absolute values**, the way a statement's turnover
+/// section prints them: the side carries the sign. `net` is signed, because a
+/// month that spent more than it received is the ordinary case and a total
+/// without a sign could not say so.
+///
+/// The account is a bare identifier, and this is the one place in the API where
+/// that needs saying rather than assuming. The rule (conventions §3) is that a
+/// published identifier of a thing the owner named carries his name for it; the
+/// exemption it grants is for a response that carries its own join table,
+/// computed by the same fold. This response does: `account_resolution` names
+/// every account these rows are on, splitting them into the ones the owner's
+/// directory holds and the ones it does not. The second list is why a name
+/// cannot simply be printed here — a total over rows on an account the directory
+/// has never heard of is exactly what this section must be able to publish, and
+/// an invented or omitted title on those rows would be worse than the identifier
+/// that is right beside them in `facts`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BatchTotalDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    /// How many of the rows above this total folded. Rows that moved no cash on
+    /// the account are not among them.
+    pub rows: usize,
+    /// What arrived, as a positive decimal string.
+    pub debit: String,
+    /// What left, as a positive decimal string.
+    pub credit: String,
+    /// `debit` minus `credit`, signed.
+    pub net: String,
+}
+
+impl BatchTotalDto {
+    #[must_use]
+    pub fn from_domain(total: &BatchTotal) -> Self {
+        Self {
+            account: total.account.inner(),
+            currency: CurrencyDto::from_domain(total.currency),
+            rows: total.rows,
+            debit: minor_amount(total.debit.raw(), total.currency),
+            credit: minor_amount(total.credit.raw(), total.currency),
+            net: minor_amount(total.net.raw(), total.currency),
+        }
+    }
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -7847,6 +7909,18 @@ impl ImportPlanDto {
                     .retained_unrecorded
                     .iter()
                     .map(RetainedRowDto::from_domain)
+                    .collect(),
+                fact_totals: plan
+                    .commit_delta
+                    .fact_totals
+                    .iter()
+                    .map(BatchTotalDto::from_domain)
+                    .collect(),
+                duplicate_totals: plan
+                    .commit_delta
+                    .duplicate_totals
+                    .iter()
+                    .map(BatchTotalDto::from_domain)
                     .collect(),
             },
             readiness: readiness.to_owned(),

@@ -33,16 +33,6 @@ reports whether the answer has something to say about itself.
 
 ### 1.2 Why a wrapper, when there is one
 
-Two routes wrap today, and each wraps for a fact that has nowhere else to live.
-
-**`GET /v1/actions` → `{"policy_version": …, "items": […]}`.** The items are
-computed, not stored: the service derives the outstanding actions from the state
-of the journal under a policy, and the policy has a version. That version
-belongs to the whole computation. Copying it onto every item would invite a
-client to believe two items could disagree about it, and they cannot; omitting it
-would leave a client comparing two responses with no way to tell a change in the
-owner's data from a change in the rules.
-
 **`GET /v1/journal/events` → `{"rows": […], "next": …}`.** The journal is read a
 page at a time, and the position to resume from is a property of the page, not
 of any row in it. It is also the one field that cannot be reconstructed from the
@@ -77,8 +67,29 @@ the ones that have no row — the report left them out, and that silence is what
 the block breaks. A report over part of the owner's money that did not say so
 would read as an answer about all of it.
 
-So `population` is exactly the kind of fact the wrapper exists for, and both
-reports are objects for the same reason `GET /v1/actions` is.
+So `population` is exactly the kind of fact the wrapper exists for.
+
+### 1.4a A wrapper that turned out to hold nothing: `GET /v1/actions`
+
+`GET /v1/actions` wrapped, and it was cited here as the clearest case: the items
+are computed under a policy, and a policy has a version, so `policy_version` sat
+beside `items` as a fact about the whole computation.
+
+It never was one. The field was the literal `1`, written at the single place the
+response was built; nothing derived it and nothing bumped it, and it never
+changed across any release. A client told to compare it between two responses
+would have found them equal forever, which is worse than having nothing to
+compare: it reads as evidence that the rules did not change, and it was never
+evidence of anything. The three other responses that carry the same items — the
+reconciliation answer, the broker sync outcome, the money-flow report — carried
+no version at all, so the promise was not even made consistently.
+
+The route is a bare array now. This is §1 working rather than an exception to
+it: the question in §1.5 is whether there is a fact about the answer as a whole
+that no item can carry, and the honest answer for this route was no. A
+`policy_version` may come back, and if it does it comes back derived from
+something that moves and published everywhere `ActionDto` is published — not
+beside one of the four.
 
 ### 1.5 What this means when a new list route is added
 
@@ -113,7 +124,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/broker-access` | `[BrokerAccessDto]` | bare array | whole list, revoked included |
 | `GET /v1/contours` | `[ContourDto]` | bare array | whole list; each contour carries its own version |
 | `GET /v1/import-sessions` | `[ImportSessionDto]` | bare array | whole list, newest first |
-| `GET /v1/actions` | `ActionsResponseDto` | object, `items` | `policy_version` — the policy the items were computed under |
+| `GET /v1/actions` | `[ActionDto]` | bare array | the whole queue; nothing true of the set that is not true of each item (§1.4a) |
 | `GET /v1/journal/events` | `JournalPageDto` | object, `rows` | `next` — the position to resume the page from |
 | `GET /v1/market/prices` | `MarketPriceSeriesDto` | object, `rows` | `complete_through` — how far the series is known |
 | `GET /v1/market/fx` | `MarketFxSeriesDto` | object, `rows` | `complete_through` |

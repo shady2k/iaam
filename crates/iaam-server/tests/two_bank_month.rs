@@ -455,7 +455,7 @@ async fn flow_report(harness: &Harness, contour: &str) -> Value {
 async fn actions(harness: &Harness) -> Vec<Value> {
     let (status, body) = call(&harness.router, get("/v1/actions", &harness.owner_token)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    body["items"].as_array().expect("action items").clone()
+    body.as_array().expect("action items").clone()
 }
 
 /// The one currency the month is denominated in.

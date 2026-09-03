@@ -251,12 +251,28 @@ most, a provider label — the identifiers come from the export itself.
 - One more optional value the owner is asked for, and therefore one more item the
   action queue must either raise or deliberately not raise.
 
-**What this does not fix.** Classification still resolves counterparties by
-title. External identity gives `resolve_counterparty` something better to match
-on, and the transfer statements the owner already gives would bound which pairs
-are plausible — but pointing the classifier at either is a separate change that
-this decision only makes possible. Until it happens, the owner keeps answering a
-question nothing reads.
+**What this does not fix.** Written when it did not: classification then resolved
+counterparties by title alone, and the owner kept answering a question nothing
+read. Both were closed immediately afterwards, in `iaam-f8d3`, and the shape they
+took is worth recording here because this decision made only one of the two
+possible and the other turned out to need an argument of its own.
+
+Resolution now tries three tiers and stops at the first that matches anything:
+iaam's own identifier, then `provider_account_id` and the aliases, then the
+title. Title matching stays, because every account created before this decision
+states no identity and dropping the tier would silently stop recognising their
+transfers; what identity buys is *precedence*, so a rename can no longer
+re-point a resolution.
+
+The transfer statement bounds resolutions rather than making them. It may
+withdraw one — an account the owner's enumeration omits is one he excluded — and
+it may not make one, break a tie, or supply a direction. The distinction is the
+whole of it: applying the statement to the candidate set instead of to the
+resolution would let two accounts of one title be told apart by a general claim
+about which pairs move money, and that conclusion is assembled from two facts
+neither of which is about the row in hand. Withdrawal is monotone toward more
+questions and never toward a new fact, which is why it is safe and why the other
+direction is not.
 
 **How we will know this was wrong.** Two signs, and both are checkable rather
 than felt. Something other than a report groups or branches on the cash label —

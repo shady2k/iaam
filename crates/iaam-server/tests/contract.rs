@@ -6020,7 +6020,7 @@ async fn a_balance_point_taken_from_an_action_is_accepted_verbatim() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let action = body["items"]
+        let action = body
             .as_array()
             .expect("action items")
             .iter()
@@ -6077,8 +6077,7 @@ async fn the_action_queue_asks_for_the_opening_balance_before_the_closing_one() 
     assert_eq!(status, StatusCode::OK, "{verdicts}");
 
     let assertion_requests = |body: &Value| -> Vec<Value> {
-        body["items"]
-            .as_array()
+        body.as_array()
             .expect("action items")
             .iter()
             .filter(|item| item["kind"] == "provide_control_assertion")
@@ -6974,8 +6973,12 @@ async fn actions_endpoint_is_authenticated_and_reports_the_empty_owner_frontier(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["policy_version"], 1);
-    let items = body["items"].as_array().expect("action items");
+    // A bare array, under §1 of `docs/api/conventions.md`. The wrapper existed
+    // for `policy_version`, and `policy_version` was a literal nothing derived
+    // and nothing bumped — so there was no fact about the answer as a whole for
+    // the object to carry, which is exactly what the rule asks.
+    let items = body.as_array().expect("action items");
+    assert!(body.get("policy_version").is_none(), "{body}");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], "create_first_account");
     assert_eq!(items[0]["kind"], "create_first_account");
@@ -7009,7 +7012,7 @@ async fn actions_endpoint_reports_the_first_contour_and_its_candidates() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let items = body["items"].as_array().expect("action items");
+    let items = body.as_array().expect("action items");
     assert_eq!(items.len(), 2);
     let item = items
         .iter()
@@ -7188,7 +7191,7 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        for item in body["items"].as_array().expect("action items") {
+        for item in body.as_array().expect("action items") {
             let target = &item["target"];
             // A target carrying several ways out is swept option by option, the
             // same way `ActionTarget::resolutions` reads it. Checking only the
@@ -9534,7 +9537,7 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
 
-    let named: Vec<&Value> = actions["items"]
+    let named: Vec<&Value> = actions
         .as_array()
         .expect("action items")
         .iter()
@@ -9681,7 +9684,7 @@ async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
     assert!(
-        actions["items"]
+        actions
             .as_array()
             .expect("action items")
             .iter()
@@ -9710,7 +9713,7 @@ async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
     .await;
     assert_eq!(status, StatusCode::OK, "{reopened}");
     assert!(
-        reopened["items"]
+        reopened
             .as_array()
             .expect("action items")
             .iter()
@@ -9808,7 +9811,7 @@ async fn no_queue_item_promises_a_call_it_does_not_have() {
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
 
-    let items = actions["items"].as_array().expect("action items");
+    let items = actions.as_array().expect("action items");
     assert!(
         !items.is_empty(),
         "the fixture must produce a queue to sweep"
@@ -10748,7 +10751,7 @@ async fn the_queue_points_an_undecided_account_at_an_existing_contour() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    let item = actions["items"]
+    let item = actions
         .as_array()
         .expect("action items")
         .iter()
@@ -10959,7 +10962,7 @@ async fn transfer_partners_queue(harness: &Harness) -> Vec<Value> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    actions["items"]
+    actions
         .as_array()
         .expect("action items")
         .iter()
@@ -12287,7 +12290,7 @@ async fn open_question_items(harness: &Harness) -> Vec<Value> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    actions["items"]
+    actions
         .as_array()
         .expect("action items")
         .iter()
@@ -12299,6 +12302,75 @@ async fn open_question_items(harness: &Harness) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 // The assessment, and the revision commit checks (iaam-k1xa)
 // ---------------------------------------------------------------------------
+
+/// The session says where its own assessment is, and the path it gives answers.
+///
+/// The gap this closes (iaam-51c0): the assessment answered, section by section,
+/// what a reviewer asked for as a wishlist — he ran a whole import without
+/// finding it. The queue could not lead him there, and still cannot: an action's
+/// target is an `OperationKey`, `ActionCatalog::from_openapi` demands a JSON
+/// request schema of every key it registers, and `assess_import_session` is a
+/// GET with no request body. So the link lives on the session, where a client
+/// that has one already looks — on every response built from
+/// `ImportSessionDto`, which is the open response, the list, the contents and
+/// the commit outcome alike.
+///
+/// The path is followed rather than merely matched: a published link that does
+/// not answer is worse than none, and asserting its spelling alone would not
+/// have noticed.
+#[tokio::test]
+async fn a_session_publishes_the_path_to_its_own_assessment() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, opened) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "linked" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let id = opened["session"].as_str().expect("session").to_owned();
+    let link = opened["assessment"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the open response names no assessment: {opened}"))
+        .to_owned();
+    assert_eq!(link, format!("/v1/import-sessions/{id}/assessment"));
+
+    let (status, plan) = call(&harness.router, get(&link, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert!(plan["revision"].is_string(), "{plan}");
+    // The one field the commit route takes whose only source is this answer.
+    assert_eq!(plan["session"], json!(id), "{plan}");
+
+    // The same link on the responses a client reaches later, so a caller that
+    // lost the open response is not sent back to the specification.
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        listed.as_array().expect("sessions")[0]["assessment"],
+        json!(link),
+        "{listed}"
+    );
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(contents["assessment"], json!(link), "{contents}");
+}
 
 /// An import says what it will and will not record, before it records it.
 ///

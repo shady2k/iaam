@@ -22,7 +22,9 @@ use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, adva
 use iaam_core::reconciliation::ReconciliationLedger;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::report::assets;
-use iaam_core::returns::{ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs};
+use iaam_core::returns::{
+    KnowledgeCoordinate, ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs,
+};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_core::valuation::{
     FxSource, FxTable, PriceBoard, PriceCandidate, QuotationBasis, Venue as CoreVenue,
@@ -345,6 +347,13 @@ pub async fn account_balances(
 /// The class reaches the core as an **opaque code**. Report grouping is the one
 /// consumer decision 0004 §3 allows it, and the core cannot branch on a class
 /// it cannot name.
+///
+/// The market store is read through the same call the returns report makes, and
+/// the observations are handed to the core, which chooses among them with the
+/// same policy. This scenario picks no price: it could not, and `make arch`
+/// says so, but the reason is older than the guard — a selection made here
+/// would be a second one, and the snapshot's holding could then disagree with
+/// `terminal_value` over the same instrument on the same day.
 pub async fn asset_snapshot(
     services: &AppServices,
     principal: &Principal,
@@ -368,7 +377,35 @@ pub async fn asset_snapshot(
                 .map(|class| (account.id, class.code().to_owned()))
         })
         .collect();
-    assets::asset_snapshot(as_of, &report, &classes, &prices).map_err(AppError::AssetSnapshot)
+    let knowledge_as_of = OffsetDateTime::now_utc();
+    let instruments: BTreeSet<InstrumentId> = report
+        .accounts
+        .iter()
+        .flat_map(|row| row.positions.iter())
+        .filter(|(_, quantity)| !quantity.0.is_zero())
+        .map(|(key, _)| key.instrument)
+        .collect();
+    let market_inputs =
+        market_price_candidates(services, instruments, as_of, knowledge_as_of).await?;
+    assets::asset_snapshot(
+        as_of,
+        &report,
+        &classes,
+        assets::SnapshotPrices {
+            board: &prices,
+            market: &market_inputs.candidates,
+            schedules: &market_inputs.schedules,
+            // The same coordinate the returns report states, so the two answers
+            // are answers to the same question. `1` is the version both paths
+            // carry today; when it becomes a stored decision, both read it.
+            coordinate: KnowledgeCoordinate {
+                knowledge_as_of,
+                source_priority_version: 1,
+                valuation_policy_version: 1,
+            },
+        },
+    )
+    .map_err(AppError::AssetSnapshot)
 }
 
 /// The balances answer and the journal's price board, from one read of the
@@ -689,8 +726,15 @@ pub async fn returns(
         &context,
     )
     .await?;
+    let instruments: BTreeSet<InstrumentId> = projection
+        .state()
+        .balances()
+        .iter_positions()
+        .filter(|(key, quantity)| definition.contains(key.account) && !quantity.0.is_zero())
+        .map(|(key, _)| key.instrument)
+        .collect();
     let market_inputs =
-        market_price_candidates(services, &projection, &definition, as_of, knowledge_as_of).await?;
+        market_price_candidates(services, instruments, as_of, knowledge_as_of).await?;
 
     if snapshot_may_be_saved(as_of, today) {
         services
@@ -729,20 +773,21 @@ struct ReportMarketInputs {
     accrued_observations: BTreeMap<(InstrumentId, CoreVenue, Date), PerUnitAmount>,
 }
 
+/// Everything the market store holds about a set of instruments at a
+/// coordinate: the price observations, the payment schedules, and the accrued
+/// coupon interest.
+///
+/// The instruments are a parameter rather than derived from a projection so
+/// that the asset snapshot, which folds balances and never builds one, reads
+/// the market through **this** function too. Two readers, one store round, one
+/// set of rows — and therefore one set of candidates for the core to choose
+/// among.
 async fn market_price_candidates(
     services: &AppServices,
-    projection: &Projection,
-    definition: &ContourDefinition,
+    instruments: BTreeSet<InstrumentId>,
     as_of: Date,
     knowledge_as_of: OffsetDateTime,
 ) -> Result<ReportMarketInputs, AppError> {
-    let instruments: BTreeSet<_> = projection
-        .state()
-        .balances()
-        .iter_positions()
-        .filter(|(key, quantity)| definition.contains(key.account) && !quantity.0.is_zero())
-        .map(|(key, _)| key.instrument)
-        .collect();
     let from_date = Date::MIN.to_string();
     let to_date = as_of.to_string();
     let knowledge_as_of = knowledge_as_of
@@ -1050,7 +1095,7 @@ fn report_from_projection(
         projection.state(),
         &ReturnsRequest {
             contour: definition,
-            coordinate: iaam_core::returns::KnowledgeCoordinate {
+            coordinate: KnowledgeCoordinate {
                 knowledge_as_of: inputs.knowledge_as_of,
                 source_priority_version: 1,
                 valuation_policy_version: 1,

@@ -54,8 +54,9 @@ use iaam_core::returns::{
 };
 use iaam_core::rules::{ExpectedPosting, PostingKind};
 use iaam_core::valuation::{
-    PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection, QuotationBasis,
-    SelectedPrice, SourceExecutability,
+    PriceDecision, PriceFreshness, PriceOrigin, PriceProvenance, PriceQuality, PriceSelection,
+    QuotationBasis, SelectedPrice, SourceExecutability,
+    UncoveredReason as CandidateUncoveredReason,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -3019,29 +3020,85 @@ pub struct HoldingValueDto {
     /// The quantity across every account and custody location in the scope. The
     /// per-account keys stay on `accounts[].positions`.
     pub quantity: String,
-    /// The quote used. Null when the journal holds none at or before the report
-    /// date.
+    /// What the valuation policy decided for this instrument, whichever way it
+    /// decided. Null only where an older rule's determination lost the
+    /// observation it was made from.
     pub price: Option<HoldingPriceDto>,
-    /// Null exactly when `price` is: an unvalued holding is **absent from the
-    /// total, not valued at zero**. Zero is a number the owner would add up;
-    /// null is a question, and `confidence` names it.
+    /// Null whenever the decision yields no figure this report can turn into
+    /// money: an unvalued holding is **absent from the total, not valued at
+    /// zero**. Zero is a number the owner would add up; null is a question, and
+    /// `confidence` names it.
     pub value: Option<CalcMoneyDto>,
 }
 
-/// The quote one holding was valued at.
+/// What the valuation policy decided for one holding.
+///
+/// The same decision, made by the same call, that the returns report publishes
+/// for the same instrument on the same date: `selected` here and a
+/// `selected_price` there are one observation, not two agreeing figures.
+///
+/// Three variants because there are three answers, and the last two are not
+/// «null». A holding this report could not value says why it could not.
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct HoldingPriceDto {
-    /// Price per unit, as a decimal string.
-    pub amount: String,
-    pub currency: CurrencyDto,
-    /// The date the price was observed for. It is part of the figure, not
-    /// metadata beside it.
-    #[serde(with = "iso_date")]
-    #[schema(value_type = String, format = Date)]
-    pub as_of: Date,
-    /// `executable`, `previous_close`, `carried_forward`, `stale` or
-    /// `owner_estimate`.
-    pub quality: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HoldingPriceDto {
+    /// The policy chose an observation, with its full rationale.
+    Selected {
+        #[serde(flatten)]
+        price: Box<SelectedPriceDto>,
+    },
+    /// The journal held only a determination an older rule had already made.
+    /// It is reported, never re-derived: the event records the date the price
+    /// was assigned to, not the date it was observed.
+    LegacyDerived {
+        /// Price per unit, as a decimal string.
+        amount: String,
+        currency: CurrencyDto,
+        /// The date the price was assigned to.
+        #[serde(with = "iso_date")]
+        #[schema(value_type = String, format = Date)]
+        as_of: Date,
+        /// The determination the older rule recorded.
+        quality: String,
+    },
+    /// Nothing was selected, and why: `no_observation`, `too_old`,
+    /// `ambiguous_venue` or `ambiguous_candidate`.
+    Uncovered { reason: String },
+}
+
+impl HoldingPriceDto {
+    fn from_domain(decision: &PriceDecision) -> Option<Self> {
+        match decision {
+            PriceDecision::Selected(price) => Some(Self::Selected {
+                price: Box::new(SelectedPriceDto::from_domain(price)),
+            }),
+            PriceDecision::LegacyDerived { quality, price } => {
+                price.as_ref().map(|price| Self::LegacyDerived {
+                    amount: price.price.inner().to_string(),
+                    currency: CurrencyDto::from_domain(price.currency),
+                    as_of: price.as_of,
+                    quality: quality.code().to_owned(),
+                })
+            }
+            PriceDecision::Uncovered(reason) => Some(Self::Uncovered {
+                reason: holding_uncovered_reason(*reason).to_owned(),
+            }),
+        }
+    }
+}
+
+/// Why the policy selected nothing.
+///
+/// The same words the returns report uses for the same four outcomes: a reader
+/// comparing the reports must not have to translate between two vocabularies
+/// for one refusal.
+const fn holding_uncovered_reason(reason: CandidateUncoveredReason) -> &'static str {
+    match reason {
+        CandidateUncoveredReason::NoObservation => "no_observation",
+        CandidateUncoveredReason::TooOld => "too_old",
+        CandidateUncoveredReason::AmbiguousVenue => "ambiguous_venue",
+        CandidateUncoveredReason::AmbiguousCandidate => "ambiguous_candidate",
+    }
 }
 
 /// One account inside the snapshot: the class it was grouped under, and what it
@@ -3090,12 +3147,7 @@ impl AssetSnapshotDto {
                     .map(|holding| HoldingValueDto {
                         instrument: holding.instrument.inner(),
                         quantity: holding.quantity.0.inner().to_string(),
-                        price: holding.price.map(|price| HoldingPriceDto {
-                            amount: price.price.inner().to_string(),
-                            currency: CurrencyDto::from_domain(price.currency),
-                            as_of: price.as_of,
-                            quality: price.quality.code().to_owned(),
-                        }),
+                        price: HoldingPriceDto::from_domain(&holding.price),
                         value: holding.value.as_ref().map(CalcMoneyDto::from_domain),
                     })
                     .collect(),

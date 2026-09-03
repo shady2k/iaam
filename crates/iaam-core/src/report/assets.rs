@@ -23,18 +23,35 @@
 //! precisely the confusion the split exists to prevent. A caller who wants one
 //! number in one currency is asking for a valuation, which is what the returns
 //! report computes.
+//!
+//! **One price, two reports.** The quote behind a holding is chosen by
+//! [`crate::valuation::decide_price`] — the same call, over the same candidate
+//! set, that the returns report makes for the same instrument on the same date.
+//! This report once read the journal's board directly, which was honest but
+//! narrow: an owner who had synced market data still saw his securities half
+//! made of caveats. Reaching for the market store through a second selection of
+//! its own would have been worse — two figures for one holding and nothing to
+//! say which was wrong. The selection needs no report currency and no rate, so
+//! taking it costs this report none of its exactness.
 
 use std::collections::BTreeMap;
 
 use thiserror::Error;
 use time::Date;
 
+use crate::bond::{BondSchedule, remaining_principal};
 use crate::ids::{AccountId, InstrumentId};
-use crate::money::{CalcMoney, CurrencyCode, Money, MoneyError, Quantity};
+use crate::money::{CalcMoney, CurrencyCode, Money, MoneyError, PerUnitAmount, Quantity};
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 use crate::projection::balances::PositionKey;
-use crate::valuation::{InstrumentPrice, PriceBoard};
+use crate::returns::KnowledgeCoordinate;
+use crate::rules::quotation::{QuotationRule, QuotationV1};
+use crate::rules::valuation::SourcePriorityVersion;
+use crate::valuation::{
+    PriceBoard, PriceCandidate, PriceDecision, PriceInputs, PriceQuery, QuotationBasis,
+    decide_price,
+};
 
 use super::balances::{AccountCash, BalancesReport, CashOpening};
 use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence, ReportGoal};
@@ -109,16 +126,23 @@ pub struct HoldingValue {
     /// position is keyed by all three, but «how much is invested» is a question
     /// about the instrument, and the per-account keys stay on the rows.
     pub quantity: Quantity,
-    /// The quote used, with the date it was for. `None` — no quote in the
-    /// journal covers this instrument at or before the report date.
-    pub price: Option<InstrumentPrice>,
-    /// `None` exactly when `price` is: an unpriced holding is **absent from the
-    /// total, not valued at zero**. Zero is a figure the owner would add up;
-    /// absence is a question, and the register names it.
+    /// What the valuation policy decided for this instrument on this date, in
+    /// full: the observation it chose and why, or the reason it chose none.
+    ///
+    /// The whole decision rather than a bare figure, and the same value the
+    /// returns report publishes for the same instrument: a reader comparing the
+    /// two reports is entitled to see that they rest on one observation, and a
+    /// reader of one report is entitled to know that «not valued» meant «too
+    /// old» rather than «never observed».
+    pub price: PriceDecision,
+    /// `None` whenever the decision yields no figure this report can turn into
+    /// money: an unvalued holding is **absent from the total, not valued at
+    /// zero**. Zero is a figure the owner would add up; absence is a question,
+    /// and the register names it.
     pub value: Option<CalcMoney>,
 }
 
-/// The market-dependent half: positions, at the prices the journal holds.
+/// The market-dependent half: positions, at the prices the policy selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionsSide {
     /// One entry per instrument held, ascending by instrument.
@@ -192,21 +216,47 @@ impl AssetSnapshot {
     }
 }
 
+/// Everything a holding needs a price from.
+///
+/// A struct rather than four arguments because the four travel together and
+/// must describe **one** state of the world: a board folded from one journal, a
+/// market slice read at one coordinate, and the coordinate itself. Passed
+/// separately, a caller could hand this report a coordinate the returns report
+/// did not use, and the two would disagree by construction.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotPrices<'a> {
+    /// The journal's own board — the same board [`crate::projection::advance`]
+    /// fills from `Valuation` events, folded by `PriceBoard::observe`.
+    pub board: &'a PriceBoard,
+    /// Observations the shell read from the market store, for the instruments
+    /// this report covers. Empty means the owner has synced nothing, which is a
+    /// state this report describes rather than an error.
+    pub market: &'a [PriceCandidate],
+    /// Payment schedules at the knowledge coordinate, by instrument. Needed
+    /// only by a quote made as a percentage of face value: without the
+    /// schedule, such a quote is a number this report cannot turn into money,
+    /// and the holding stays unvalued rather than being multiplied as if the
+    /// percentage were roubles.
+    pub schedules: &'a BTreeMap<InstrumentId, BondSchedule>,
+    /// The coordinate the selection was made at. Shared with the returns
+    /// report, which is what makes the two answers comparable.
+    pub coordinate: KnowledgeCoordinate,
+}
+
 /// Fold the balances answer into what the owner holds by class.
 ///
 /// `classes` maps an account to the code the owner declared for it. An account
 /// missing from the map has no declared class, which is a value: it lands in
 /// the unstated group rather than in a default one.
 ///
-/// `prices` is the journal's own price board — the same board
-/// [`crate::projection::advance`] fills from `Valuation` events. It is not a
-/// second market lookup: an instrument the journal never priced is reported as
-/// unvalued rather than valued from a source this report picked on its own.
+/// `prices` carries the two price channels and the coordinate they were read
+/// at. The choice between them is not made here: it is
+/// [`crate::valuation::decide_price`], the one the returns report makes.
 pub fn asset_snapshot(
     as_of: Date,
     report: &BalancesReport,
     classes: &BTreeMap<AccountId, String>,
-    prices: &PriceBoard,
+    prices: SnapshotPrices<'_>,
 ) -> Result<AssetSnapshot, AssetSnapshotError> {
     // One pass over the report's own rows produces the rows this answer
     // publishes; every total below is folded from that same vector, so no
@@ -223,7 +273,7 @@ pub fn asset_snapshot(
         .collect();
 
     let cash = fold_cash(&accounts)?;
-    let positions = fold_positions(&accounts, prices, as_of)?;
+    let positions = fold_positions(&accounts, &prices, as_of)?;
     let total = fold_total(&cash, &positions)?;
 
     Ok(AssetSnapshot {
@@ -290,10 +340,71 @@ fn fold_cash(accounts: &[AssetAccount]) -> Result<CashSide, AssetSnapshotError> 
     })
 }
 
-/// The market-dependent half, at the prices the journal holds.
+/// The figure a decision offers, in the unit and currency the source quoted it
+/// in, with the date it was for.
+///
+/// `None` is «this decision yields no figure», and it covers three cases that
+/// are one case here: nothing was selected, the old rule's determination lost
+/// the observation it was made from, and the selected candidate's own evidence
+/// contradicts the basis recorded for it. The returns report refuses the third
+/// for the same reason: a price whose unit is disputed is not a price.
+fn quoted(decision: &PriceDecision) -> Option<(Dec, CurrencyCode, QuotationBasis, Date)> {
+    match decision {
+        PriceDecision::Selected(selected) => {
+            if selected.candidate.basis_evidence_contradicts {
+                return None;
+            }
+            Some((
+                selected.candidate.price,
+                selected.candidate.currency,
+                selected.candidate.basis,
+                selected.candidate.trade_date,
+            ))
+        }
+        // §10.3 again: a price stated in the journal is money per unit by
+        // definition, which is why this arm may name the basis and the arm
+        // above may not.
+        PriceDecision::LegacyDerived { price, .. } => price.as_ref().map(|price| {
+            (
+                price.price,
+                price.currency,
+                QuotationBasis::MoneyPerUnit,
+                price.as_of,
+            )
+        }),
+        PriceDecision::Uncovered(_) => None,
+    }
+}
+
+/// Money per security, from a quote whose unit may not be money.
+///
+/// The conversion is [`QuotationV1`], the rule the returns report uses, so a
+/// bond quoted at a percentage of its remaining face value is worth the same in
+/// both reports. A failure is `None` and not an error: the holding is left out
+/// of the total with its caveat, which is this report's answer to «I do not
+/// know» everywhere else.
+fn money_per_unit(
+    quote: (Dec, CurrencyCode, QuotationBasis, Date),
+    schedules: &BTreeMap<InstrumentId, BondSchedule>,
+    instrument: InstrumentId,
+    as_of: Date,
+) -> Option<(Dec, CurrencyCode)> {
+    let (price, currency, basis, _) = quote;
+    let remaining_face: Option<PerUnitAmount> = match basis {
+        QuotationBasis::PercentOfRemainingFace => {
+            Some(remaining_principal(schedules.get(&instrument)?, as_of).ok()?)
+        }
+        QuotationBasis::MoneyPerUnit | QuotationBasis::Unknown => None,
+    };
+    QuotationV1
+        .money_per_unit(basis, price, currency, remaining_face)
+        .ok()
+}
+
+/// The market-dependent half, at the prices the policy selected.
 fn fold_positions(
     accounts: &[AssetAccount],
-    prices: &PriceBoard,
+    prices: &SnapshotPrices<'_>,
     as_of: Date,
 ) -> Result<PositionsSide, AssetSnapshotError> {
     let mut quantities: BTreeMap<InstrumentId, Quantity> = BTreeMap::new();
@@ -306,18 +417,38 @@ fn fold_positions(
         }
     }
 
+    let inputs = PriceInputs {
+        board: prices.board,
+        market: prices.market,
+        source_priority: SourcePriorityVersion(prices.coordinate.source_priority_version),
+    };
     let mut holdings = Vec::with_capacity(quantities.len());
     let mut totals: BTreeMap<CurrencyCode, CalcMoney> = BTreeMap::new();
     let mut oldest_price_date: Option<Date> = None;
     for (instrument, quantity) in quantities {
-        let price = prices.price_at_or_before(instrument, as_of).copied();
-        let value = match price {
-            Some(price) => {
-                let value = CalcMoney::new(price.price, price.currency).checked_mul(quantity.0)?;
+        let price = decide_price(
+            inputs,
+            &PriceQuery {
+                instrument,
+                as_of,
+                knowledge_as_of: prices.coordinate.knowledge_as_of,
+            },
+        );
+        let quote = quoted(&price);
+        let value = match quote
+            .and_then(|quote| money_per_unit(quote, prices.schedules, instrument, as_of))
+        {
+            Some((per_unit, currency)) => {
+                let value = CalcMoney::new(per_unit, currency).checked_mul(quantity.0)?;
                 add_calc(&mut totals, value)?;
+                // Only a holding that reached the total moves this date: an
+                // observation the report could not turn into money is behind no
+                // figure, and dating the total by it would age the total for
+                // nothing.
+                let trade_date = quote.expect("a value came from a quote").3;
                 oldest_price_date = Some(match oldest_price_date {
-                    Some(known) if known <= price.as_of => known,
-                    _ => price.as_of,
+                    Some(known) if known <= trade_date => known,
+                    _ => trade_date,
                 });
                 Some(value)
             }
@@ -389,11 +520,30 @@ mod tests {
     use crate::money::PostedMinor;
     use crate::report::balances::{AccountBalanceRow, PeriodReports};
     use crate::report::population::{AccountStanding, PopulationAccount};
-    use crate::valuation::PriceQuality;
-    use time::macros::date;
+    use crate::valuation::{
+        InstrumentPrice, PriceKind, PriceOrigin, PriceQuality, SourceExecutability,
+        UncoveredReason, Venue,
+    };
+    use time::macros::{date, datetime};
     use uuid::Uuid;
 
     const AS_OF: Date = date!(2026 - 01 - 31);
+
+    /// No bond schedules. A `static` because [`SnapshotPrices`] borrows the map
+    /// and a helper cannot lend out a local.
+    static NO_SCHEDULES: BTreeMap<InstrumentId, BondSchedule> = BTreeMap::new();
+
+    /// The inputs as they stand for an owner who has synced no market data:
+    /// the journal's board and nothing else. What this report saw before the
+    /// market channel reached it, and still sees when that channel is empty.
+    fn journal_only(board: &PriceBoard) -> SnapshotPrices<'_> {
+        SnapshotPrices {
+            board,
+            market: &[],
+            schedules: &NO_SCHEDULES,
+            coordinate: KnowledgeCoordinate::default(),
+        }
+    }
 
     fn account(index: u128) -> AccountId {
         AccountId(Uuid::from_u128(index))
@@ -503,7 +653,7 @@ mod tests {
             AS_OF,
             &report,
             &classes(&[(deposit, "deposit"), (savings, "savings")]),
-            &PriceBoard::new(),
+            journal_only(&PriceBoard::new()),
         )
         .expect("snapshot");
 
@@ -552,7 +702,7 @@ mod tests {
             AS_OF,
             &report,
             &classes(&[(stated, "deposit")]),
-            &PriceBoard::new(),
+            journal_only(&PriceBoard::new()),
         )
         .expect("snapshot");
 
@@ -581,7 +731,8 @@ mod tests {
 
         let mut board = PriceBoard::new();
         priced(&mut board, held, 200, date!(2026 - 01 - 29));
-        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), &board).expect("snapshot");
+        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
+            .expect("snapshot");
 
         assert_eq!(snapshot.cash.totals, vec![rub(5_000)]);
         assert_eq!(
@@ -617,7 +768,8 @@ mod tests {
 
         let mut board = PriceBoard::new();
         priced(&mut board, priced_one, 100, date!(2026 - 01 - 30));
-        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), &board).expect("snapshot");
+        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
+            .expect("snapshot");
 
         let missing = snapshot
             .positions
@@ -626,7 +778,11 @@ mod tests {
             .find(|holding| holding.instrument == unpriced)
             .expect("the unpriced holding is still listed");
         assert_eq!(missing.quantity, quantity(7));
-        assert!(missing.price.is_none());
+        assert_eq!(
+            missing.price,
+            PriceDecision::Uncovered(UncoveredReason::NoObservation),
+            "the report says why, not merely that it could not"
+        );
         assert!(missing.value.is_none(), "absent, never zero");
         assert_eq!(
             total_in(&snapshot.positions.totals, CurrencyCode::Rub),
@@ -661,7 +817,8 @@ mod tests {
 
         let mut board = PriceBoard::new();
         priced(&mut board, held, 10, date!(2026 - 01 - 20));
-        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), &board).expect("snapshot");
+        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
+            .expect("snapshot");
 
         assert_eq!(snapshot.positions.holdings.len(), 1);
         assert_eq!(snapshot.positions.holdings[0].quantity, quantity(10));
@@ -684,12 +841,13 @@ mod tests {
 
         let mut board = PriceBoard::new();
         priced(&mut board, fresh, 100, date!(2026 - 01 - 30));
-        priced(&mut board, stale, 100, date!(2025 - 06 - 02));
-        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), &board).expect("snapshot");
+        priced(&mut board, stale, 100, date!(2026 - 01 - 05));
+        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
+            .expect("snapshot");
 
         assert_eq!(
             snapshot.positions.oldest_price_date,
-            Some(date!(2025 - 06 - 02))
+            Some(date!(2026 - 01 - 05))
         );
     }
 
@@ -714,7 +872,7 @@ mod tests {
             AS_OF,
             &report,
             &classes(&[(savings, "savings")]),
-            &PriceBoard::new(),
+            journal_only(&PriceBoard::new()),
         )
         .expect("snapshot");
 
@@ -750,8 +908,13 @@ mod tests {
             title: "Elsewhere".into(),
             standing: AccountStanding::OutsideUndecided,
         });
-        let snapshot =
-            asset_snapshot(AS_OF, &report, &BTreeMap::new(), &PriceBoard::new()).expect("snapshot");
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
 
         let confidence = snapshot.confidence();
         assert_eq!(confidence.goal(), ReportGoal::AssetSnapshot);
@@ -776,9 +939,157 @@ mod tests {
 
         let mut board = PriceBoard::new();
         priced(&mut board, held, 50, date!(2026 - 01 - 31));
-        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), &board).expect("snapshot");
+        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
+            .expect("snapshot");
 
         let confidence = snapshot.confidence();
         assert!(confidence.complete(), "{:?}", confidence.caveats());
+    }
+
+    fn market_quote(instrument: InstrumentId, minor: i64, trade_date: Date) -> PriceCandidate {
+        PriceCandidate {
+            instrument,
+            price: Dec::new(minor.into()),
+            currency: CurrencyCode::Rub,
+            basis: QuotationBasis::MoneyPerUnit,
+            basis_evidence: "market:board".to_owned(),
+            basis_evidence_contradicts: false,
+            trade_date,
+            observed_at: Some(datetime!(2026 - 01 - 31 18:00 UTC)),
+            origin: PriceOrigin::Market {
+                venue: Venue {
+                    board: "MAIN".to_owned(),
+                    session: 1,
+                },
+                kind: PriceKind::LegalClose,
+            },
+            executability: SourceExecutability::Executable,
+        }
+    }
+
+    /// The reason this report was given a market channel: an owner who never
+    /// entered a valuation event still owns something, and a synced quote says
+    /// what it was worth. Before this, his securities half was caveats.
+    #[test]
+    fn a_market_quote_values_a_holding_the_journal_never_priced() {
+        let broker = account(10);
+        let held = instrument(1);
+        let mut rows = row(broker, Vec::new());
+        rows.positions = vec![(position(broker, held), quantity(4))];
+        let report = report(vec![rows]);
+
+        let board = PriceBoard::new();
+        let market = [market_quote(held, 250, date!(2026 - 01 - 30))];
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            SnapshotPrices {
+                board: &board,
+                market: &market,
+                schedules: &NO_SCHEDULES,
+                coordinate: KnowledgeCoordinate {
+                    knowledge_as_of: datetime!(2026 - 02 - 01 12:00 UTC),
+                    source_priority_version: 1,
+                    valuation_policy_version: 1,
+                },
+            },
+        )
+        .expect("snapshot");
+
+        let holding = &snapshot.positions.holdings[0];
+        let selected = holding.price.selected().expect("a market quote was chosen");
+        assert!(matches!(
+            selected.candidate.origin,
+            PriceOrigin::Market { .. }
+        ));
+        assert_eq!(
+            total_in(&snapshot.positions.totals, CurrencyCode::Rub),
+            Dec::new(1_000.into())
+        );
+        assert!(snapshot.confidence().complete());
+    }
+
+    /// Broadening the price source must not turn «I do not know» into a number.
+    /// A quote the valuation policy refuses as too old leaves the holding out
+    /// of the total — where the returns report has always left it — and the
+    /// refusal keeps its reason.
+    #[test]
+    fn a_quote_past_the_maximum_age_values_nothing_and_says_why() {
+        let broker = account(10);
+        let held = instrument(1);
+        let mut rows = row(broker, Vec::new());
+        rows.positions = vec![(position(broker, held), quantity(4))];
+        let report = report(vec![rows]);
+
+        let mut board = PriceBoard::new();
+        priced(&mut board, held, 250, date!(2025 - 06 - 02));
+        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
+            .expect("snapshot");
+
+        let holding = &snapshot.positions.holdings[0];
+        assert_eq!(
+            holding.price,
+            PriceDecision::Uncovered(UncoveredReason::TooOld)
+        );
+        assert!(holding.value.is_none(), "absent, never zero");
+        assert!(snapshot.positions.totals.is_empty());
+        assert_eq!(snapshot.positions.oldest_price_date, None);
+        assert!(
+            snapshot
+                .confidence()
+                .caveats()
+                .iter()
+                .any(|caveat| caveat.kind() == CaveatKind::HoldingNotValued)
+        );
+    }
+
+    /// A percentage of face value is not roubles. Without the schedule that
+    /// says what the face value now is, the number cannot become money, and
+    /// multiplying it by the quantity would publish a figure off by orders of
+    /// magnitude with nothing marking it.
+    #[test]
+    fn a_percent_of_face_quote_without_a_schedule_values_nothing() {
+        let broker = account(10);
+        let held = instrument(1);
+        let mut rows = row(broker, Vec::new());
+        rows.positions = vec![(position(broker, held), quantity(4))];
+        let report = report(vec![rows]);
+
+        let board = PriceBoard::new();
+        let mut quote = market_quote(held, 98, date!(2026 - 01 - 30));
+        quote.basis = QuotationBasis::PercentOfRemainingFace;
+        let market = [quote];
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            SnapshotPrices {
+                board: &board,
+                market: &market,
+                schedules: &NO_SCHEDULES,
+                coordinate: KnowledgeCoordinate {
+                    knowledge_as_of: datetime!(2026 - 02 - 01 12:00 UTC),
+                    source_priority_version: 1,
+                    valuation_policy_version: 1,
+                },
+            },
+        )
+        .expect("snapshot");
+
+        let holding = &snapshot.positions.holdings[0];
+        assert!(
+            holding.price.selected().is_some(),
+            "the quote was selected; it is the unit that is missing"
+        );
+        assert!(holding.value.is_none(), "absent, never 98 times four");
+        assert!(snapshot.positions.totals.is_empty());
+        assert!(
+            snapshot
+                .confidence()
+                .caveats()
+                .iter()
+                .any(|caveat| caveat.kind() == CaveatKind::HoldingNotValued)
+        );
     }
 }

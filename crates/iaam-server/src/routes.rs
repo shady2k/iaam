@@ -61,17 +61,18 @@ use crate::dto::{
     AccountCandidateDto, AccountDto, ActionDto, ActionTargetDto, ActionsResponseDto,
     BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
     CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto,
-    CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
-    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
-    ImportCorrectionDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto, JournalPageDto,
-    MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
-    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
-    ReconciliationResponseDto, ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsReportDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    ClassificationRuleRequest, ContourVersionDto, CorrectImportRequest, CreateAccountRequest,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams,
+    FxRateDto, HealthDto, ImportCorrectionDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto,
+    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
+    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
+    MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
+    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
+    SubmitCorrectionsRequest, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
+    TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
@@ -693,12 +694,20 @@ pub async fn list_classification_rules(
     ))
 }
 
+/// Store a rule and answer with what it would correct.
+///
+/// The plan is returned rather than applied. Correcting the journal writes
+/// reversal and replacement facts that stop counting in every report the owner
+/// has already read, and this codebase demands an explicit acknowledgement for
+/// exactly that — see `POST /v1/corrections`, which is the operation that
+/// applies the plan. A rule creation carries no such acknowledgement, so it
+/// says what it would do and does not pretend to have done it.
 #[utoipa::path(
     post,
     path = "/v1/classification-rules",
     request_body = ClassificationRuleRequest,
     responses(
-        (status = 201, description = "Rule added", body = ClassificationRuleDto),
+        (status = 201, description = "Rule added, with the history it would correct", body = ClassificationRuleChangeDto),
         (status = 403, description = "Owner only", body = ApiError),
         (status = 422, description = "Invalid rule", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
@@ -711,9 +720,9 @@ pub async fn create_classification_rule(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<ClassificationRuleRequest>,
-) -> Result<(StatusCode, Json<ClassificationRuleDto>), ApiFailure> {
+) -> Result<(StatusCode, Json<ClassificationRuleChangeDto>), ApiFailure> {
     require_admin(&principal)?;
-    let rule = create_rule(
+    let change = create_rule(
         &state.services,
         &principal,
         request.matcher,
@@ -723,16 +732,21 @@ pub async fn create_classification_rule(
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(ClassificationRuleDto::from_port(rule)),
+        Json(ClassificationRuleChangeDto::from_domain(change)),
     ))
 }
 
+/// Retire a rule and answer with what its absence would correct.
+///
+/// `200` with the plan, not `204`: retirement recomputes exactly what creation
+/// does, and a body-less response would discard it — which is the defect this
+/// route had. Symmetry with [`create_classification_rule`] is the point.
 #[utoipa::path(
     delete,
     path = "/v1/classification-rules/{id}",
     params(("id" = Uuid, Path, description = "Rule identifier")),
     responses(
-        (status = 204, description = "Rule retired"),
+        (status = 200, description = "Rule retired, with the history its absence would correct", body = RecomputePlanDto),
         (status = 403, description = "Owner only", body = ApiError),
         (status = 404, description = "Rule not found", body = ApiError),
         (status = 422, description = "Request could not be read", body = ApiError)
@@ -743,10 +757,10 @@ pub async fn delete_classification_rule(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
-) -> Result<StatusCode, ApiFailure> {
+) -> Result<Json<RecomputePlanDto>, ApiFailure> {
     require_admin(&principal)?;
-    retire_rule(&state.services, &principal, id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let plan = retire_rule(&state.services, &principal, id).await?;
+    Ok(Json(RecomputePlanDto::from_domain(plan)))
 }
 /// Active and retired owner category groups.
 #[utoipa::path(

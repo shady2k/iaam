@@ -2944,7 +2944,10 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    // 200 with the plan, not 204: retiring a rule recomputes what history it
+    // leaves needing correction, and a body-less answer would discard it.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["applied"], false, "{body}");
 
     let (status, history) = call(
         &harness.router,
@@ -9102,5 +9105,136 @@ async fn every_documented_parameter_sits_where_the_route_reads_it() {
         wrong.is_empty(),
         "a parameter is documented somewhere the route does not read it:\n{}",
         wrong.join("\n")
+    );
+}
+
+/// A rule written on what the source printed reaches history, and says so.
+///
+/// Three things at once, because they are one behaviour: the rebuilt
+/// classification subject carries the description and the source's own word
+/// (without them two thirds of the matcher are dead on the recompute path), and
+/// the plan the rule change computes is returned instead of being discarded.
+#[tokio::test]
+async fn a_classification_rule_reports_the_history_it_would_correct() {
+    let harness = harness();
+    let operations = json!({
+        "source_label": "test",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "withdrawal",
+            "amount": "1200.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-12" },
+            "source_category": "Card operation",
+            "description": "Shop One",
+            "idempotency_key": "reclass-withdrawal"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    let event = verdicts[0]["event_id"]
+        .as_str()
+        .expect("the recorded event")
+        .to_owned();
+
+    // A rule on the description the source printed. Matching it requires the
+    // subject rebuilt from the event to carry that description.
+    let by_description = json!({
+        "matcher": r#"{"description_contains":"shop one"}"#,
+        "outcome": r#"{"kind":"fee","origin":"account_maintenance"}"#,
+    });
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &by_description,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["plan"]["applied"], false, "{first}");
+    let corrections = first["plan"]["corrections"]
+        .as_array()
+        .expect("a plan, not silence");
+    assert_eq!(corrections.len(), 1, "{first}");
+    assert_eq!(corrections[0]["event"], event, "{first}");
+    assert_eq!(corrections[0]["was"]["kind"], "external_flow", "{first}");
+    assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{first}");
+    assert_eq!(
+        corrections[0]["becomes"]["origin"], "account_maintenance",
+        "{first}"
+    );
+
+    // A rule on the word the source used for the row — not on `cash_out`,
+    // which is the classification this rule exists to revise.
+    let by_source_kind = json!({
+        "matcher": r#"{"kind":"Card operation"}"#,
+        "outcome": r#"{"kind":"income"}"#,
+    });
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &by_source_kind,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let corrections = second["plan"]["corrections"]
+        .as_array()
+        .expect("a plan, not silence");
+    assert_eq!(corrections.len(), 1, "{second}");
+    assert_eq!(corrections[0]["event"], event, "{second}");
+    // The later decision wins: the rule naming the source's own word is the
+    // owner's most recent answer about this row.
+    assert_eq!(corrections[0]["becomes"]["kind"], "income", "{second}");
+    let newest = second["id"].as_str().expect("identifier").to_owned();
+
+    // Retiring is symmetric: it recomputes and answers with the plan too,
+    // here the one the surviving earlier rule produces.
+    let (status, plan) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/classification-rules/{newest}"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["applied"], false, "{plan}");
+    let corrections = plan["corrections"].as_array().expect("a plan, not silence");
+    assert_eq!(corrections.len(), 1, "{plan}");
+    assert_eq!(corrections[0]["event"], event, "{plan}");
+    assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{plan}");
+}
+
+/// A rule matching nothing says so, rather than saying nothing.
+#[tokio::test]
+async fn a_classification_rule_that_matches_nothing_returns_an_empty_plan() {
+    let harness = harness();
+    let rule = json!({
+        "matcher": r#"{"description_contains":"nothing here"}"#,
+        "outcome": r#"{"kind":"income"}"#,
+    });
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/classification-rules", &harness.owner_token, &rule),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["plan"]["applied"], false, "{created}");
+    assert!(
+        created["plan"]["corrections"]
+            .as_array()
+            .expect("an empty plan is still a plan")
+            .is_empty(),
+        "{created}"
     );
 }

@@ -10,8 +10,8 @@ use iaam_core::event::Event;
 use iaam_core::event::kind::{EventKind, FeeOrigin};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, OwnerId};
 use iaam_ingest::classification::{
-    Classification, ClassificationRule, ClassificationSubject, Counterparty, Movement, RuleMatcher,
-    recompute_plan,
+    Classification, ClassificationRule, ClassificationSubject, Correction, Counterparty, Movement,
+    RuleMatcher, recompute_plan,
 };
 use serde_json::{Map, Value};
 use time::Date;
@@ -28,36 +28,103 @@ pub async fn list_rules(
     services.rules.list_rules(principal.owner).await
 }
 
+/// A classification named the way the rule that decides it names one.
+///
+/// The vocabulary is the rule outcome's own — `internal_transfer`,
+/// `external_flow`, `income`, `fee` — so the plan answers in the words the
+/// owner wrote the rule in, rather than in the journal's event discriminants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedAs {
+    pub kind: &'static str,
+    /// The receiving account, for `internal_transfer` only.
+    pub to: Option<AccountId>,
+    /// The fee's origin, for `fee` only.
+    pub origin: Option<&'static str>,
+}
+
+/// One event a rule change requires correcting, and what it would become.
+///
+/// This is [`Correction`] in the transport's vocabulary. It is deliberately not
+/// a correction *request*: nothing here has been written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedCorrection {
+    pub event: EventId,
+    pub was: ClassifiedAs,
+    pub becomes: ClassifiedAs,
+}
+
+/// A rule that was stored, together with what storing it would correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleChange {
+    pub rule: ClassificationRuleView,
+    /// Empty means the rule changes nothing already in the journal — not that
+    /// the plan was not computed.
+    pub plan: Vec<PlannedCorrection>,
+}
+
 pub async fn create_rule(
     services: &AppServices,
     principal: &Principal,
     matcher: String,
     outcome: String,
     replaces: Option<Uuid>,
-) -> Result<ClassificationRuleView, AppError> {
+) -> Result<RuleChange, AppError> {
     let rule = services
         .rules
         .create_rule(principal.owner, matcher, outcome, replaces)
         .await?;
-    recompute_history(services, principal.owner).await?;
-    Ok(rule)
+    let plan = recompute_history(services, principal.owner).await?;
+    Ok(RuleChange { rule, plan })
 }
 
 pub async fn retire_rule(
     services: &AppServices,
     principal: &Principal,
     id: Uuid,
-) -> Result<(), AppError> {
+) -> Result<Vec<PlannedCorrection>, AppError> {
     services.rules.retire_rule(principal.owner, id).await?;
     recompute_history(services, principal.owner).await
 }
 
-/// Recomputes the current history after rule changes.
+/// What the current rule set says the recorded history should be corrected to.
 ///
-/// `recompute_plan` remains the sole place that determines which
-/// events require correction. This scenario does not modify events
-/// itself or perform monetary arithmetic in the wrapper.
-async fn recompute_history(services: &AppServices, owner: OwnerId) -> Result<(), AppError> {
+/// **The plan is returned, not applied**, and the caller is the owner's
+/// transport, which shows it to them. Three reasons, in the order they bind:
+///
+/// 1. Applying means writing reversal and replacement facts into an
+///    append-only journal (§4.8), and [`crate::scenarios::correction`] already
+///    refuses to do that without `acknowledge_retraction`, because a retracted
+///    fact stops counting in every report the owner has already read and
+///    re-submitting the same rows does not bring it back. A rule submitted
+///    through `POST /v1/classification-rules` carries no such acknowledgement,
+///    and inventing one here would route around a control the owner was
+///    deliberately given.
+/// 2. The replacement fact is not in the plan. A [`Correction`] names the
+///    classification an event *becomes*; the event that expresses it needs a
+///    `TransferId`, a sign convention, and — for an internal transfer — a cash
+///    leg on a second account the outcome names. That is a new fact about
+///    another account, invented by this wrapper, and a wrong sign in it cannot
+///    be taken back.
+/// 3. Storing the rule and correcting the journal are two writes, and this
+///    order is the only safe one. With the plan returned there is exactly one
+///    write, so nothing can half-happen. Were the corrections applied first and
+///    the rule stored second, a failure of the second write would leave the
+///    journal corrected by a rule that does not exist and that no later run
+///    could reconstruct; applied second, a failure leaves the rule stored and
+///    the plan uncorrected — which is precisely the state this function
+///    reports, and a repeat run recomputes the same plan, because the plan is
+///    built from the effective set and is idempotent by construction.
+///
+/// The operation that applies it already exists: `POST /v1/corrections`, which
+/// takes the acknowledgement and writes the reversal and replacement facts.
+///
+/// `recompute_plan` remains the sole place that determines which events require
+/// correction. This scenario does not modify events itself or perform monetary
+/// arithmetic in the wrapper.
+async fn recompute_history(
+    services: &AppServices,
+    owner: OwnerId,
+) -> Result<Vec<PlannedCorrection>, AppError> {
     let events = services.store.load_events_through(owner, Date::MAX).await?;
     let stored = services.rules.list_rules(owner).await?;
     let rules = stored
@@ -70,8 +137,50 @@ async fn recompute_history(services: &AppServices, owner: OwnerId) -> Result<(),
         .filter_map(|event| subject(event).map(|subject| (event.id, subject)))
         .collect::<BTreeMap<EventId, ClassificationSubject>>();
     recompute_plan(&events, &subjects, &rules)
-        .map(|_| ())
+        .map(|plan| plan.iter().map(planned).collect())
         .map_err(|error| AppError::Store(format!("classification recomputation: {error}")))
+}
+
+fn planned(correction: &Correction) -> PlannedCorrection {
+    PlannedCorrection {
+        event: correction.target,
+        was: classified_as(correction.was),
+        becomes: classified_as(correction.becomes),
+    }
+}
+
+/// The inverse of [`parse_outcome`], and it must stay so: the plan speaks the
+/// vocabulary the owner writes rules in, or it names a decision they cannot
+/// restate as a rule.
+const fn classified_as(classification: Classification) -> ClassifiedAs {
+    match classification {
+        Classification::InternalTransfer { to } => ClassifiedAs {
+            kind: "internal_transfer",
+            to: Some(to),
+            origin: None,
+        },
+        Classification::ExternalFlow => ClassifiedAs {
+            kind: "external_flow",
+            to: None,
+            origin: None,
+        },
+        Classification::Income => ClassifiedAs {
+            kind: "income",
+            to: None,
+            origin: None,
+        },
+        Classification::Fee { origin } => ClassifiedAs {
+            kind: "fee",
+            to: None,
+            origin: Some(match origin {
+                FeeOrigin::Brokerage => "brokerage",
+                FeeOrigin::Depositary => "depositary",
+                FeeOrigin::AccountMaintenance => "account_maintenance",
+                FeeOrigin::MarginInterest => "margin_interest",
+                FeeOrigin::Other => "other",
+            }),
+        },
+    }
 }
 
 fn domain_rule(rule: ClassificationRuleView) -> Result<ClassificationRule, AppError> {
@@ -193,8 +302,14 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
     Some(ClassificationSubject {
         account: event.account,
         counterparty,
-        description: None,
-        source_kind: Some(event.kind.discriminant().to_owned()),
+        // Both come from provenance, which retained what the source said about
+        // the row and never rewrites it. Anything else would ask the
+        // recomputation to reconsider a classification using the previous
+        // classification as its input: the event discriminant — `cash_out`,
+        // `income` — is the answer a rule is meant to revise, not the question
+        // the rule was written about.
+        description: event.provenance.description().map(str::to_owned),
+        source_kind: event.provenance.source_category().map(str::to_owned),
         movement,
     })
 }
@@ -238,6 +353,102 @@ mod tests {
             confidence: Confidence::Known,
             idempotency_key: None,
         }
+    }
+
+    fn cash_out_of(account: AccountId, provenance: Provenance) -> Event {
+        let amount = rub(-500_000);
+        Event {
+            provenance,
+            ..event_of(
+                account,
+                EventKind::CashOut { amount },
+                vec![Leg::cash(account, amount)],
+            )
+        }
+    }
+
+    fn provenance_of() -> Provenance {
+        Provenance::new(
+            SourceId::new_random(),
+            RawHash::parse(&"a".repeat(64)).unwrap(),
+            ParserVersion("test/1".into()),
+        )
+    }
+
+    fn rule_matching(matcher: RuleMatcher) -> ClassificationRule {
+        ClassificationRule {
+            id: ClassificationRuleId(Uuid::new_v4()),
+            version: 1,
+            matcher,
+            outcome: Classification::Fee {
+                origin: FeeOrigin::AccountMaintenance,
+            },
+        }
+    }
+
+    #[test]
+    fn the_rebuilt_subject_carries_the_description_the_source_printed() {
+        // Without this the `description_contains` third of `RuleMatcher` is dead
+        // on the recompute path: a rule the owner wrote about what the bank
+        // printed on the row matches at intake and matches nothing afterwards.
+        let account = AccountId::new_random();
+        let event = cash_out_of(account, provenance_of().with_description("Shop One"));
+
+        let subject = subject(&event).expect("a cash outflow is a classification subject");
+
+        assert_eq!(subject.description.as_deref(), Some("Shop One"));
+        assert!(
+            rule_matching(RuleMatcher {
+                counterparty_account: None,
+                description_contains: Some("shop one".to_owned()),
+                kind: None,
+            })
+            .matcher
+            .matches(&subject),
+            "a rule naming the description must match on recompute"
+        );
+    }
+
+    #[test]
+    fn the_rebuilt_subject_carries_the_word_the_source_used_not_the_event_kind() {
+        // `source_kind` is «what the source called the operation». Filling it
+        // with the event's own discriminant asks the recomputation to reconsider
+        // a classification using the previous classification as its input.
+        let account = AccountId::new_random();
+        let event = cash_out_of(account, provenance_of().with_source_category("Transfers"));
+
+        let subject = subject(&event).expect("a cash outflow is a classification subject");
+
+        assert_eq!(subject.source_kind.as_deref(), Some("Transfers"));
+        assert_ne!(
+            subject.source_kind.as_deref(),
+            Some(event.kind.discriminant()),
+            "the event discriminant is the answer, not the question"
+        );
+        assert!(
+            rule_matching(RuleMatcher {
+                counterparty_account: None,
+                description_contains: None,
+                kind: Some("Transfers".to_owned()),
+            })
+            .matcher
+            .matches(&subject),
+            "a rule naming the source's own word must match on recompute"
+        );
+    }
+
+    #[test]
+    fn a_source_that_named_neither_leaves_both_fields_unknown() {
+        // Unknown is `None`, not a substitute (§4.9). Falling back to the
+        // event discriminant here would restore the circularity for exactly
+        // the rows whose source said nothing.
+        let account = AccountId::new_random();
+        let event = cash_out_of(account, provenance_of());
+
+        let subject = subject(&event).expect("a cash outflow is a classification subject");
+
+        assert_eq!(subject.description, None);
+        assert_eq!(subject.source_kind, None);
     }
 
     #[test]

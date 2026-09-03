@@ -16,6 +16,7 @@ use iaam_app::ports::{
     IssuedToken, Scope, TokenView,
 };
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
+use iaam_app::scenarios::classification::{ClassifiedAs, PlannedCorrection, RuleChange};
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
 use iaam_app::scenarios::reports::{AccountBalanceRow, BalancesReport, MoneyFlowReport};
 use iaam_core::bond::offer::OfferChoice;
@@ -4545,6 +4546,88 @@ impl ClassificationRuleDto {
             created_at: rule.created_at,
             retired_at: rule.retired_at,
             replaces: rule.replaces,
+        }
+    }
+}
+
+/// A classification named in the vocabulary a rule outcome uses.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClassifiedAsDto {
+    pub kind: String,
+    /// Receiving account, for `internal_transfer` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<Uuid>,
+    /// Fee origin, for `fee` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+impl ClassifiedAsDto {
+    fn from_domain(classification: ClassifiedAs) -> Self {
+        Self {
+            kind: classification.kind.to_owned(),
+            to: classification.to.map(|account| account.inner()),
+            origin: classification.origin.map(str::to_owned),
+        }
+    }
+}
+
+/// One event a rule change requires correcting.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlannedCorrectionDto {
+    pub event: Uuid,
+    pub was: ClassifiedAsDto,
+    pub becomes: ClassifiedAsDto,
+}
+
+impl PlannedCorrectionDto {
+    fn from_domain(correction: PlannedCorrection) -> Self {
+        Self {
+            event: correction.event.inner(),
+            was: ClassifiedAsDto::from_domain(correction.was),
+            becomes: ClassifiedAsDto::from_domain(correction.becomes),
+        }
+    }
+}
+
+/// What a rule change would correct, and the fact that it has not been applied.
+///
+/// `applied: false` is stated rather than implied: an empty `corrections` list
+/// and a list nobody acted on look the same to a client that has to guess.
+/// Applying is a separate, acknowledged act — `POST /v1/corrections`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RecomputePlanDto {
+    pub applied: bool,
+    pub corrections: Vec<PlannedCorrectionDto>,
+}
+
+impl RecomputePlanDto {
+    #[must_use]
+    pub fn from_domain(plan: Vec<PlannedCorrection>) -> Self {
+        Self {
+            applied: false,
+            corrections: plan
+                .into_iter()
+                .map(PlannedCorrectionDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+/// A stored rule together with the history its arrival or retirement corrects.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ClassificationRuleChangeDto {
+    #[serde(flatten)]
+    pub rule: ClassificationRuleDto,
+    pub plan: RecomputePlanDto,
+}
+
+impl ClassificationRuleChangeDto {
+    #[must_use]
+    pub fn from_domain(change: RuleChange) -> Self {
+        Self {
+            rule: ClassificationRuleDto::from_port(change.rule),
+            plan: RecomputePlanDto::from_domain(change.plan),
         }
     }
 }

@@ -17,7 +17,6 @@ use std::collections::BTreeSet;
 use iaam_core::batch::{self, BatchTotal, ControlCheck, ControlComparison, ControlSection};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
-use iaam_core::event::kind::FeeOrigin;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{

@@ -27,8 +27,10 @@ use iaam_ingest::{Rejection, SubmittedOperation, Verdict, normalize};
 use sha2::{Digest, Sha256};
 
 use crate::AppServices;
-use crate::actions::{AccountScope, account_scope};
-use crate::error::AppError;
+use crate::actions::{
+    AccountScope, OperationKey, RequestPlan, ResolutionOption, account_scope, answer_input,
+};
+use crate::error::{AppError, FieldRejection};
 use crate::ports::{
     AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, ContourView,
     ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionView,
@@ -436,16 +438,33 @@ pub async fn answer_question(
         AppError::Store(format!("stored import question could not be read: {error}"))
     })?;
     if !asked.admits(&answer) {
-        return Err(AppError::Invalid {
-            field: "answer".to_owned(),
-            expected: asked
+        // The shapes this question admits, as values rather than as a sentence
+        // the caller would have to split on commas. They are built by the same
+        // function the action queue publishes `/answer` with, so what a refusal
+        // offers and what the queue offers cannot drift apart.
+        //
+        // Reading the owner's accounts here costs one query on a path that is
+        // already refusing, and it buys the two shapes that name an account the
+        // list of accounts they may name. A read that fails leaves the refusal
+        // as prose rather than turning a rejected answer into a store failure:
+        // what was wrong with the request does not change because the extra
+        // detail could not be fetched.
+        let alternatives = match services.store.list_accounts(principal.owner).await {
+            Ok(accounts) => answer_input(&asked, &accounts).alternatives,
+            Err(_) => Vec::new(),
+        };
+        return Err(FieldRejection::new(
+            "answer",
+            asked
                 .alternatives()
                 .iter()
                 .map(|shape| shape.code())
                 .collect::<Vec<_>>()
                 .join(", "),
-            actual: answer.shape().code().to_owned(),
-        });
+            answer.shape().code(),
+        )
+        .admitting(alternatives)
+        .into());
     }
     // An answer naming an account must name one of the owner's, and it must not
     // name the account the row is already on: a transfer to itself is not a
@@ -547,11 +566,13 @@ pub async fn commit_session(
     }
     let open = planned.plan.interpretation.open_questions.len();
     if open > 0 {
-        return Err(AppError::Invalid {
-            field: "session".to_owned(),
-            expected: "every question answered before the import is committed".to_owned(),
-            actual: format!("{open} unanswered"),
-        });
+        return Err(unanswered_refusal(
+            services,
+            principal,
+            session,
+            &planned.plan.interpretation.open_questions,
+        )
+        .await);
     }
 
     let verdicts = submit_candidates(services, principal, "operation", planned.candidates).await?;
@@ -563,6 +584,95 @@ pub async fn commit_session(
         revision: planned.plan.revision,
         verdicts,
     })
+}
+
+/// The commit refusal, carrying the call that lifts it.
+///
+/// The one rejection in this crate whose remedy genuinely is another request
+/// rather than another value: nothing may be written in the `session` field
+/// that makes an unanswered question answered. So the refusal publishes the
+/// answering call itself — the operation, the two path segments already known,
+/// and the `/answer` field with the shapes that one question admits — in the
+/// shape the action queue publishes a resolution with.
+///
+/// **One call, not one per open question.** The caller must answer all of them
+/// before committing, and it discovers the next by committing again or by
+/// reading the queue, which is the place that lists outstanding work. A refusal
+/// that reprinted the whole backlog would be a report, and a session holding a
+/// hundred questions would answer a rejected commit with a hundred requests.
+/// The first by row order is the one offered, so two identical refusals name the
+/// same question.
+///
+/// Every read here is on a path that has already decided to refuse. A failing
+/// read costs the caller the resolution, not the refusal: the commit was
+/// invalid before the read was attempted, and reporting a store failure instead
+/// would send the caller to retry a request that cannot succeed.
+async fn unanswered_refusal(
+    services: &AppServices,
+    principal: &Principal,
+    session: ImportSessionId,
+    open_questions: &[OpenQuestion],
+) -> AppError {
+    let rejection = FieldRejection::new(
+        "session",
+        "every question answered before the import is committed",
+        format!("{} unanswered", open_questions.len()),
+    );
+    let Some(first) = open_questions
+        .iter()
+        .min_by_key(|question| (question.row, question.question.inner()))
+    else {
+        return rejection.into();
+    };
+    let Some(asked) = read_asked_question(services, principal, session, first.question).await
+    else {
+        return rejection.into();
+    };
+    let accounts = services
+        .store
+        .list_accounts(principal.owner)
+        .await
+        .unwrap_or_default();
+
+    let mut preset = std::collections::BTreeMap::new();
+    // Both are path segments of the answering route, and both are known here:
+    // the session is the one being committed and the question is the one this
+    // refusal named.
+    preset.insert("session".to_owned(), session.inner().to_string().into());
+    preset.insert(
+        "question".to_owned(),
+        first.question.inner().to_string().into(),
+    );
+
+    rejection
+        .resolved_by(vec![ResolutionOption {
+            operation: OperationKey::AnswerImportQuestion,
+            request: RequestPlan {
+                preset,
+                missing: vec![answer_input(&asked, &accounts)],
+            },
+        }])
+        .into()
+}
+
+/// The typed question behind one identifier, or nothing.
+///
+/// `Option` rather than `Result` on purpose: the only caller is a refusal that
+/// is already decided, and every way this can fail — the session unreadable, the
+/// question gone, its stored JSON unparseable — costs that refusal its extra
+/// detail and nothing else.
+async fn read_asked_question(
+    services: &AppServices,
+    principal: &Principal,
+    session: ImportSessionId,
+    question: ImportQuestionId,
+) -> Option<Question> {
+    let contents = read_session(services, principal, session).await.ok()?;
+    let stored = contents
+        .questions
+        .iter()
+        .find(|candidate| candidate.id == question)?;
+    serde_json::from_str(&stored.question).ok()
 }
 
 /// What committing wrote, and under which reading of the session.

@@ -14386,3 +14386,286 @@ async fn a_savings_account_the_owner_said_nothing_about_is_not_warned_on() {
     assert_eq!(ordinary["expectation"], "ordinary", "{report}");
     assert_eq!(ordinary["contradicts_expectation"], false, "{report}");
 }
+
+// ---------------------------------------------------------------------------
+// A rejection a client can act on without reading documentation (iaam-yszw)
+// ---------------------------------------------------------------------------
+
+/// RFC 6901 §3: a pointer is a sequence of `/`-prefixed reference tokens, and
+/// inside a token a tilde may only be followed by `0` or `1`.
+fn is_rfc6901_pointer(pointer: &str) -> bool {
+    if pointer.is_empty() {
+        return true;
+    }
+    if !pointer.starts_with('/') {
+        return false;
+    }
+    pointer[1..].split('/').all(|token| {
+        let mut characters = token.chars();
+        while let Some(character) = characters.next() {
+            if character == '~' && !matches!(characters.next(), Some('0' | '1')) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+/// A rejection addresses the offending field mechanically, not in prose.
+///
+/// The nested indexed case is the one that matters: `corrections[0].target`
+/// reads well and is not a form anything can look up. A client holding the body
+/// it just sent can apply `/corrections/0/target` to it and reach the value that
+/// was refused, with no parsing of its own.
+#[tokio::test]
+async fn a_rejected_field_is_addressed_by_a_json_pointer() {
+    let harness = harness();
+    let missing = Uuid::new_v4();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": missing }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // The readable form stays: it is what `message` quotes.
+    assert_eq!(body["field"], "corrections[0].target", "{body}");
+    assert_eq!(body["pointer"], "/corrections/0/target", "{body}");
+    let pointer = body["pointer"].as_str().expect("a pointer");
+    assert!(
+        is_rfc6901_pointer(pointer),
+        "the pointer must be one a client can apply to its own body: {body}"
+    );
+
+    // And a field with no structure to it still points at itself.
+    let (status, flat) = call(
+        &harness.router,
+        get(
+            "/v1/reports/balances?contour=00000000-0000-0000-0000-000000000000&as_of=yesterday",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{flat}");
+    assert_eq!(flat["field"], "as_of", "{flat}");
+    assert_eq!(flat["pointer"], "/as_of", "{flat}");
+}
+
+/// A field with a closed vocabulary says which values it takes.
+///
+/// `expected` spells the same five out in a sentence, and a client that wanted
+/// to retry from it would have to split prose on commas and the word "or".
+#[tokio::test]
+async fn a_rejected_field_with_a_closed_vocabulary_publishes_its_values() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/instruments",
+            &harness.owner_token,
+            &json!({
+                "kind": "share",
+                "symbol": "SHR",
+                "title": "Test share",
+                "denomination_currency": "ZZZ",
+                "settlement_currency": "RUB",
+                "quote_currency": "RUB"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "denomination_currency", "{body}");
+    assert_eq!(body["pointer"], "/denomination_currency", "{body}");
+    let admitted: Vec<&str> = body["alternatives"]
+        .as_array()
+        .expect("the values the field admits")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert_eq!(admitted, ["RUB", "USD", "EUR", "CNY", "XAU"], "{body}");
+}
+
+/// The classification outcome vocabulary travels as values, not as a sentence.
+///
+/// The rule's outcome is a JSON string the caller composes, so the four
+/// classifications it may name are the caller's business and not the store's.
+#[tokio::test]
+async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": r#"{"kind":"income"}"#,
+                "outcome": r#"{"kind":"gift"}"#,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "outcome", "{body}");
+    assert_eq!(body["pointer"], "/outcome", "{body}");
+    let admitted: Vec<&str> = body["alternatives"]
+        .as_array()
+        .expect("the classifications the field admits")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert_eq!(
+        admitted,
+        ["internal_transfer", "external_flow", "income", "fee"],
+        "{body}"
+    );
+}
+
+/// Where the remedy is a call rather than a value, the refusal names the call.
+///
+/// Nothing may be written into the commit request that makes an unanswered
+/// question answered, so a rejection that only named the field would leave the
+/// caller to find the answering route in the specification. It is published in
+/// the shape the action queue publishes a resolution with: the operation, its
+/// address, the two path segments already known, and the one field still wanted.
+#[tokio::test]
+async fn a_commit_refused_for_an_open_question_names_the_call_that_answers_it() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(account, "remedy-one")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let question = rows[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "session", "{refused}");
+    assert_eq!(refused["pointer"], "/session", "{refused}");
+
+    let resolutions = refused["resolutions"]
+        .as_array()
+        .expect("the call that lifts the refusal");
+    assert_eq!(
+        resolutions.len(),
+        1,
+        "one call, not the whole backlog: {refused}"
+    );
+    let resolution = &resolutions[0];
+    assert_eq!(
+        resolution["operationId"], "answer_import_question",
+        "{refused}"
+    );
+    assert_eq!(resolution["method"], "POST", "{refused}");
+    assert_eq!(
+        resolution["path"], "/v1/import-sessions/{session}/questions/{question}/answer",
+        "{refused}"
+    );
+
+    // Both path segments are already filled in: the caller copies them rather
+    // than composing them out of identifiers it would have to carry.
+    assert_eq!(
+        resolution["request"]["preset"]["session"],
+        json!(id),
+        "{refused}"
+    );
+    assert_eq!(
+        resolution["request"]["preset"]["question"],
+        json!(question),
+        "{refused}"
+    );
+
+    // And the one field still wanted carries the shapes this question admits,
+    // built by the same function the queue publishes `/answer` with.
+    let answer = resolution["request"]["missing"]
+        .as_array()
+        .expect("the fields still wanted")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .unwrap_or_else(|| panic!("no /answer field: {refused}"));
+    assert_eq!(answer["provided_by"], "owner", "{refused}");
+    let shapes: Vec<&str> = answer["alternatives"]
+        .as_array()
+        .expect("the shapes the question admits")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert!(
+        shapes.contains(&"received_from_own_account") && shapes.contains(&"paid"),
+        "the shapes must be this question's own: {refused}"
+    );
+    let naming_an_account = answer["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .find(|alternative| alternative["value"] == "received_from_own_account")
+        .expect("the shape that names an account");
+    let candidates = naming_an_account["requires"][0]["candidates"]
+        .as_array()
+        .expect("the accounts that shape may name");
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate["id"] == json!(savings)),
+        "an account a shape may name is offered by identifier and title: {refused}"
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate["id"] != json!(account)),
+        "the account the row is already on is not the far side of itself: {refused}"
+    );
+
+    // A refusal that offers no call says so by omission rather than by an empty
+    // list: most rejections have no next call, and one is not manufactured.
+    let (status, other) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({ "revision": "not-the-revision" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{other}");
+    assert_eq!(other["field"], "revision", "{other}");
+    assert!(other.get("resolutions").is_none(), "{other}");
+    assert!(other.get("alternatives").is_none(), "{other}");
+}

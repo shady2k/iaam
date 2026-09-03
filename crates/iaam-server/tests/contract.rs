@@ -14638,6 +14638,16 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
             .all(|assertion| assertion["outcome"] == json!("inserted")),
         "{committed}"
     );
+    // Nothing was declined, so nothing is recorded as declined: a gap is a
+    // statement about rows an attempt did not take, and this one took them all
+    // (iaam-bufs).
+    assert!(
+        committed["coverage_gaps"]
+            .as_array()
+            .expect("coverage gaps")
+            .is_empty(),
+        "{committed}"
+    );
 
     let (status, reconciliation) = call(
         &harness.router,
@@ -14661,6 +14671,188 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
             .iter()
             .all(|outcome| outcome["outcome"]["code"] == json!("matched")),
         "{reconciliation}"
+    );
+}
+
+/// A commit that declines a row records what it declined (iaam-bufs).
+///
+/// The assessment has always computed, from facts the system derived itself,
+/// what an import was offered and did not take. `commit_session` then threw the
+/// plan away: the rows the caller had sent and the server had refused left no
+/// trace in the journal at all, so reconciliation could afterwards **confirm**
+/// the very dimensions those rows would have moved.
+///
+/// The line this holds, and it is the point of the bead: the gap is not a
+/// statement about the document. This server never sees the document — it
+/// receives the rows a client chose to send — so a field saying what the
+/// statement contained would republish the client's word as the server's
+/// knowledge. What the gap records is what the server **was handed and
+/// declined**, which is a fact it owns entirely.
+///
+/// Note what the flag does and does not do: `accept_control_mismatch` lets the
+/// batch be committed, and the gap is what keeps that permission from becoming
+/// a confirmation later.
+///
+/// Every account, amount and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_commit_that_declines_a_row_writes_the_coverage_gap_that_says_so() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "declining",
+        json!([
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-06-10" },
+                "idempotency_key": "declining-good",
+            },
+            // A row the server cannot read into a fact: it states no date at
+            // all, so nothing places it in a period. It is held by the session
+            // and declined by the commit.
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "200.00",
+                "currency": "RUB",
+                "idempotency_key": "declining-dateless",
+            },
+        ]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "300.00",
+                "debit_turnover": "300.00",
+            }],
+        }),
+    )
+    .await;
+
+    // The plan already says the row will not be recorded. What was missing is
+    // that the journal never learned it.
+    let plan = assessment_of(&harness, &session).await;
+    let retained = plan["commit_delta"]["retained_unrecorded"]
+        .as_array()
+        .expect("retained rows");
+    assert_eq!(retained.len(), 1, "{plan}");
+    assert_eq!(plan["readiness"], "does_not_reconcile", "{plan}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({ "accept_control_mismatch": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    let gaps = committed["coverage_gaps"]
+        .as_array()
+        .expect("coverage gaps");
+    assert_eq!(
+        gaps.len(),
+        1,
+        "one account, one stated interval: {committed}"
+    );
+    assert_eq!(gaps[0]["outcome"], "inserted", "{committed}");
+
+    // And it is readable where it matters: beside the statuses the assertions
+    // this same commit wrote would otherwise confirm.
+    let (status, reconciliation) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reconciliation?account={account}&from=2025-06-01&to=2025-06-30"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reconciliation}");
+    let reported = reconciliation["gaps"].as_array().expect("gaps");
+    assert_eq!(reported.len(), 1, "{reconciliation}");
+    assert_eq!(reported[0]["refused"], 1, "{reconciliation}");
+    assert_eq!(
+        reported[0]["dimensions"],
+        json!(["cash"]),
+        "a deposit the server could not read is a cash line, and nothing more \
+         is claimed about it: {reconciliation}"
+    );
+    assert_eq!(
+        reported[0]["rows"][0]["row"],
+        json!({ "given": "idempotency/declining-dateless" }),
+        "the gap names the row it refused, not merely how many: {reconciliation}"
+    );
+
+    // Committing the same session again is refused — it is closed — so the key
+    // is exercised where it can be: the gap names its rows, so two different
+    // refusals cannot collide on one identity the way iaam-lg4q describes.
+    assert_eq!(
+        reported[0]["parser_version"], "import-control/1",
+        "the gap stands under the parser version its assertions do, or it \
+         taints nothing it is about: {reconciliation}"
+    );
+}
+
+/// A source that printed no control section leaves no gap, deliberately
+/// (iaam-bufs).
+///
+/// A gap is dated and scoped by an interval, and the only interval this server
+/// has been told about is the one the source printed beside the rows. Deriving
+/// one from the rows it managed to read would place a claim on an interval
+/// nobody asserted, computed from the rows that are not the problem.
+///
+/// This is a real limitation and it is iaam-hj1o's to close; it is asserted
+/// here so that closing it is a deliberate act rather than an accident.
+///
+/// Every account, amount and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_commit_with_no_stated_control_section_writes_no_coverage_gap() {
+    let harness = harness();
+    let account = another_account(&harness, "Savings").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "silent",
+        json!([{
+            "account": account,
+            "type": "deposit",
+            "amount": "200.00",
+            "currency": "RUB",
+            "idempotency_key": "silent-dateless",
+        }]),
+    )
+    .await;
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert!(
+        committed["coverage_gaps"]
+            .as_array()
+            .expect("coverage gaps")
+            .is_empty(),
+        "{committed}"
     );
 }
 

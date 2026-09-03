@@ -3405,6 +3405,11 @@ pub async fn commit_import_session(
             .iter()
             .map(RecordedEventDto::from_domain)
             .collect(),
+        coverage_gaps: outcome
+            .coverage_gaps
+            .iter()
+            .map(RecordedEventDto::from_domain)
+            .collect(),
     }))
 }
 

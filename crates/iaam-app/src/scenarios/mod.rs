@@ -4,6 +4,7 @@
 //! appearing in the API response comes from `iaam-core` (§3.1, §13).
 
 pub mod categories;
+pub mod coverage_gap;
 pub mod import_session;
 pub mod ingest;
 pub mod journal;

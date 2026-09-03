@@ -7887,6 +7887,29 @@ pub struct ImportCommitDto {
     /// end of the period they speak about, and every later reconciliation report
     /// compares them with what the rows actually came to.
     pub control_assertions: Vec<RecordedEventDto>,
+    /// What this commit was handed and did not take, written into the journal.
+    ///
+    /// One `import_coverage_gap` event per account and stated interval, naming
+    /// the rows the commit declined and what each of them would have moved.
+    /// Empty on the ordinary import, which declines nothing.
+    ///
+    /// **Not a statement about the document.** This system never sees the
+    /// document; it receives the rows a client chose to send, and a field
+    /// saying what the statement contained would republish the client's word as
+    /// the server's knowledge. What a gap records is the other half: the rows
+    /// this server was given and refused, which is a fact it owns.
+    ///
+    /// What it buys is that reconciliation cannot afterwards *confirm* the
+    /// dimensions those rows would have moved on the strength of this import.
+    /// The commit was still allowed — a batch that does not add up commits with
+    /// `accept_control_mismatch` — and this is what keeps that permission from
+    /// turning into a confirmation.
+    ///
+    /// Empty also where the source printed no control section: a gap is dated
+    /// and scoped by an interval, and the only interval this server has been
+    /// told about is the one printed beside the rows. Deriving one from the
+    /// rows it could read would claim an interval nobody stated.
+    pub coverage_gaps: Vec<RecordedEventDto>,
 }
 
 /// One journal event a commit wrote, or found already written.

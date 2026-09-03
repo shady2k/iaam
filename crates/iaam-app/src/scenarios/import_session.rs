@@ -20,11 +20,13 @@ use iaam_core::batch::{
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{
     AccountId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId,
 };
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
+use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule, Movement,
@@ -48,6 +50,7 @@ use crate::ports::{
     NewImportQuestion, Principal, Recorded,
 };
 use crate::scenarios::classification::{matcher_json, outcome_json};
+use crate::scenarios::coverage_gap;
 use crate::scenarios::ingest::submit_candidates;
 use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
 
@@ -968,13 +971,29 @@ pub async fn commit_session(
     // interval. A failure between the two leaves the session open, so committing
     // again re-submits the rows — which their idempotency keys answer with
     // `duplicate` — and retries the assertions, whose own keys do the same.
+    //
+    // The coverage gaps go in **with** the assertions and not after them, in one
+    // call. A gap says what this commit was handed and declined, and an
+    // assertion recorded without the gap that qualifies it is the one
+    // intermediate state that misleads: for as long as it stands alone, the
+    // figures look confirmable against a journal that is short the very rows
+    // this attempt dropped.
     let assertions = control_assertions(principal.owner, &planned.plan);
-    let control_assertions = if assertions.is_empty() {
+    let stated = assertions.len();
+    let mut writing = assertions;
+    writing.extend(coverage_gaps(
+        principal.owner,
+        &planned.plan,
+        &planned.declined,
+    ));
+    let mut recorded = if writing.is_empty() {
         Vec::new()
     } else {
-        crate::scenarios::ingest::append_checked(services, assertions, IdentityScope::Source)
-            .await?
-    };
+        crate::scenarios::ingest::append_checked(services, writing, IdentityScope::Source).await?
+    }
+    .into_iter();
+    let control_assertions: Vec<Recorded> = recorded.by_ref().take(stated).collect();
+    let coverage_gaps: Vec<Recorded> = recorded.collect();
     services
         .store
         .close_import_session(principal.owner, session, ImportSessionState::Committed)
@@ -983,6 +1002,7 @@ pub async fn commit_session(
         revision: planned.plan.revision,
         verdicts,
         control_assertions,
+        coverage_gaps,
     })
 }
 
@@ -1204,6 +1224,19 @@ pub struct CommitOutcome {
     /// list would give the last row of every import a neighbour that is not a
     /// row.
     pub control_assertions: Vec<Recorded>,
+    /// The gaps recording what this commit was handed and did not take
+    /// (iaam-bufs).
+    ///
+    /// Empty on the ordinary commit, which declines nothing, and empty on a
+    /// commit whose source printed no control section — see [`coverage_gaps`]
+    /// for why a gap needs a stated interval to be dated by.
+    ///
+    /// Reported apart from `control_assertions` because they are opposite
+    /// statements written together: an assertion is what the source claims, a
+    /// gap is what this attempt could not stand behind, and the whole point of
+    /// writing both is that a reader of the journal later sees the second
+    /// beside the first.
+    pub coverage_gaps: Vec<Recorded>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,6 +1343,27 @@ impl ControlReconciliation {
 pub struct PlannedSession {
     pub plan: ImportPlan,
     candidates: Vec<Result<iaam_core::event::Event, Rejection>>,
+    /// The rows the commit will decline, named as a coverage gap names them.
+    ///
+    /// Private for `candidates`' reason and one more of its own. The names
+    /// carry the session's source, which a caller holding them would read as
+    /// an identity it can address; and what these rows *are* is already
+    /// published, per row and with the reason each was declined, as
+    /// `commit_delta.retained_unrecorded`. This is that same fact in the shape
+    /// the journal records it, not a second finding.
+    declined: Vec<DeclinedRow>,
+}
+
+/// One row a commit was handed and will not take.
+///
+/// The account is beside the row rather than inside it because a gap is an
+/// event, and an event names an account: the rows are grouped by it. `None`
+/// where the stored payload does not parse, which is the one case in which a
+/// row names nothing this build can read.
+#[derive(Debug, Clone)]
+struct DeclinedRow {
+    account: Option<AccountId>,
+    row: RefusedRow,
 }
 
 /// What the session's own source named.
@@ -1604,7 +1658,9 @@ pub async fn plan_session(
     let mut read_rows = Vec::with_capacity(contents.observations.len());
     for observation in &contents.observations {
         let intake = parse_intake(&observation.payload).ok();
-        let candidate = operation_of(observation, &resolver)
+        let operation = operation_of(observation, &resolver);
+        let candidate = operation
+            .clone()
             .and_then(|operation| {
                 normalize(
                     &operation,
@@ -1624,6 +1680,9 @@ pub async fn plan_session(
         read_rows.push(ReadRow {
             row: observation.row,
             intake,
+            operation: operation.ok(),
+            row_key: observation.row_key.clone(),
+            payload: observation.payload.clone(),
             candidate: candidate.clone(),
         });
         candidates.push(candidate);
@@ -1646,6 +1705,11 @@ pub async fn plan_session(
     let mut facts = Vec::new();
     let mut duplicates = Vec::new();
     let mut retained = Vec::new();
+    // Rows this commit was handed and will not take, in the shape a coverage
+    // gap names them (iaam-bufs). Collected in the same pass as everything
+    // else, for the reason the whole planner is one function: a second walk
+    // over the rows would describe a different import from the one that runs.
+    let mut declined: Vec<DeclinedRow> = Vec::new();
     for read in &read_rows {
         match &read.candidate {
             Ok(event) => {
@@ -1660,22 +1724,30 @@ pub async fn plan_session(
                     facts.push(fact);
                 }
             }
-            Err(rejection) => retained.push(RetainedRow {
-                row: read.row,
-                reason: open_questions
-                    .iter()
-                    .find(|open| open.row == read.row)
-                    .map_or_else(
-                        || RetentionReason::Unreadable {
+            Err(rejection) => {
+                let open = open_questions.iter().find(|open| open.row == read.row);
+                let reason = match open {
+                    Some(open) => RetentionReason::Unanswered {
+                        question: open.question,
+                    },
+                    None => {
+                        // Only an unreadable row is declined. An unanswered one
+                        // refuses the commit outright, so no commit ever
+                        // declines it — recording a gap for it would be a
+                        // statement about an attempt that did not happen.
+                        declined.push(declined_row(read, source));
+                        RetentionReason::Unreadable {
                             field: rejection.field.clone(),
                             expected: rejection.expected.clone(),
                             actual: rejection.actual.clone(),
-                        },
-                        |open| RetentionReason::Unanswered {
-                            question: open.question,
-                        },
-                    ),
-            }),
+                        }
+                    }
+                };
+                retained.push(RetainedRow {
+                    row: read.row,
+                    reason,
+                });
+            }
         }
     }
 
@@ -1786,6 +1858,7 @@ pub async fn plan_session(
     );
 
     Ok(PlannedSession {
+        declined,
         plan: ImportPlan {
             session: contents.session,
             revision,
@@ -1807,6 +1880,20 @@ struct ReadRow {
     row: u32,
     /// `None` when the stored payload cannot be parsed by this build.
     intake: Option<Intake>,
+    /// The operation the row read as, where it read as one at all.
+    ///
+    /// Kept beside `candidate` rather than recovered from it, because the two
+    /// fail at different steps and the difference is what a coverage gap can
+    /// say: a row that reached an operation and then failed normalisation
+    /// states what it would have moved, and a row that never reached one does
+    /// not (iaam-bufs).
+    operation: Option<SubmittedOperation>,
+    /// The stable key the caller's row identity yielded, when it yielded one.
+    row_key: Option<String>,
+    /// The stored payload, so a row the caller named nothing by can still be
+    /// named by a fingerprint of what it sent — as the sync path fingerprints
+    /// a row its source did not identify.
+    payload: String,
     candidate: Result<iaam_core::event::Event, Rejection>,
 }
 
@@ -2130,6 +2217,13 @@ fn fingerprint(
 /// but are not, and [`SourceChannel::is_independent_of`] would be answering
 /// about a distinction that had been erased.
 ///
+/// It stamps the coverage gaps a commit writes as well as its assertions
+/// (iaam-bufs), and that is not a widening of what it means but the whole of
+/// what makes a gap work. Reconciliation correlates a gap with an assertion
+/// group by account, period, source **and parser version**; a gap written under
+/// any other version would taint nothing it was about, and the assertions this
+/// same commit wrote would go on to confirm a batch that had dropped rows.
+///
 /// [`Ground::OwnerStatedBalance`]: iaam_core::reconciliation::evidence::Ground::OwnerStatedBalance
 /// [`SourceChannel::is_independent_of`]: iaam_core::reconciliation::evidence::SourceChannel::is_independent_of
 const CONTROL_PARSER_VERSION: &str = "import-control/1";
@@ -2268,6 +2362,216 @@ fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event
         }
     }
     events
+}
+
+/// One declined row, named the way a coverage gap names rows.
+///
+/// The naming is the sync path's, deliberately: the identifier the caller gave
+/// the row where it gave one, and a fingerprint of what it actually sent where
+/// it did not. A later import of the same unchanged row reproduces the same
+/// name, which is what lets a gap be lifted by the row that repaired it —
+/// nothing lifts gaps today (iaam-dvki), and a name that could not survive to
+/// that point would have to be migrated when something does.
+///
+/// **The dimensions are what the system knows, and stop exactly there.** A row
+/// that reached an operation before being refused says what that operation
+/// would have moved. A row that never reached one is an observation, and the
+/// only thing an observation certainly is, is a cash line — it carries an
+/// account, an amount, a currency and a direction, and every classification of
+/// such a row moves cash. It is **not** widened to «cash and possibly income»:
+/// a row nobody could classify has not been shown to be income, and tainting
+/// `Income` on the strength of what a row might have been would make the taint
+/// mean less on every row that genuinely is one. The cost is the honest one —
+/// an unclassifiable coupon taints `Cash` and not `Income` — and it is the cost
+/// of not asserting what was never read.
+///
+/// A row whose stored payload this build cannot parse taints nothing: it is
+/// still named, so that a gap holding others reports it as refused, but nothing
+/// can be said about what it would have moved. Where such rows are the only
+/// ones, [`coverage_gap::gap_event`] writes nothing at all.
+fn declined_row(read: &ReadRow, source: SourceId) -> DeclinedRow {
+    let row = match read.row_key.as_deref() {
+        // An empty identifier is not an identifier, as the sync path also says.
+        Some(key) if !key.is_empty() => RowName::Given(key.to_owned()),
+        _ => RowName::Fingerprint(digest_hex(&read.payload)),
+    };
+    let dimensions: BTreeSet<Dimension> = match (&read.operation, &read.intake) {
+        (Some(operation), _) => coverage_gap::operation_dimensions(&operation.kind),
+        (None, Some(Intake::Observed { .. })) => [Dimension::Cash].into_iter().collect(),
+        (None, _) => BTreeSet::new(),
+    };
+    DeclinedRow {
+        account: read.account(),
+        row: RefusedRow {
+            key: SourceRowKey { source, row },
+            dimensions,
+        },
+    }
+}
+
+/// Version of the key one import coverage gap is written under.
+///
+/// Part of the key for [`CONTROL_KEY_VERSION`]'s reason: keys have already been
+/// deduplicated against, so a change of form must be visible in the value
+/// rather than inferred from its shape.
+const IMPORT_GAP_KEY_VERSION: u8 = 1;
+
+/// The key under which one import's coverage gap is the same fact twice.
+///
+/// **Keyed on the rows it refused, not on how many there were.** That is the
+/// defect iaam-lg4q names on the sync path, which builds its identity from the
+/// dimension union and a count: refuse row A, repair it, later refuse a
+/// different row B in the same dimension, and the second gap collides with the
+/// first one's key and is dropped as a duplicate — leaving the journal holding
+/// a gap for a row that is now present and none for the row that is missing.
+/// A path written after that was found has no excuse for reproducing it, so
+/// this key digests the rows themselves.
+///
+/// Rendered field by field and sorted, never through `Debug`: a digest over a
+/// derived rendering is a digest that can change with the compiler, and this
+/// string is compared against keys already in the journal.
+///
+/// The session is **not** in the key, exactly as it is not in
+/// [`control_assertion_key`]: two commits of the same statement refusing the
+/// same rows state one fact and must write it once. What that costs is the
+/// counterpart of iaam-dvki — a later clean import through the same channel
+/// writes no gap, and so records nothing that could lift the old one — and it
+/// is the epic's to fix, not this key's.
+fn coverage_gap_key(account: AccountId, period: AssertionPeriod, rows: &[RefusedRow]) -> String {
+    let mut named: Vec<String> = rows
+        .iter()
+        .map(|refused| {
+            let (kind, value) = match &refused.key.row {
+                RowName::Given(id) => ("given", id.as_str()),
+                RowName::Fingerprint(hex) => ("fingerprint", hex.as_str()),
+            };
+            format!(
+                "{}:{kind}:{value}:{}",
+                refused.key.source.inner(),
+                refused
+                    .dimensions
+                    .iter()
+                    .map(|dimension| dimension.code())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect();
+    // Sorted, so that the same refusals fed in another order are one identity:
+    // the rows a commit declines are a set, and their order is the order the
+    // caller happened to send them in.
+    named.sort();
+    format!(
+        "import-coverage-gap:v{IMPORT_GAP_KEY_VERSION}:{}:{}:{}:{}",
+        account.inner(),
+        period.from,
+        period.to,
+        digest_hex(&named.join("\n"))
+    )
+}
+
+/// The coverage gaps this commit writes, one per account and stated interval.
+///
+/// **What this records, and the line it does not cross.** A commit must not
+/// record what the *document* contained: this system never sees the document,
+/// it receives the rows a client chose to send, and a field saying «the
+/// statement held forty rows» would republish the client's word as the
+/// system's knowledge. What it may record is what it **was handed and
+/// declined**, which is a fact it owns entirely — the rows are in its own
+/// session table and the refusal is its own. That is the whole of iaam-bufs,
+/// and the line runs exactly between those two sentences.
+///
+/// So the rows are `commit_delta.retained_unrecorded`, and only the unreadable
+/// ones. Three neighbouring lists were considered and each is excluded for the
+/// same reason — **the rows are recorded**:
+///
+/// - `duplicates` commit to a `duplicate` verdict because the journal already
+///   holds them under their key. A gap naming them would taint an interval
+///   whose rows are present, which is the false taint iaam-lg4q was filed
+///   about arriving by another door.
+/// - `account_resolution.missing` names accounts the owner has never
+///   described. Its rows are written all the same, against an account nobody
+///   has described — a directory problem, published as one, and not a coverage
+///   problem.
+/// - `scope_assessment.awaiting_disposition` names accounts in no contour.
+///   Those rows are in the journal and appear in no report, which is a
+///   perimeter question the queue already raises. A gap says «this attempt
+///   could not confirm», and this attempt recorded them.
+///
+/// **One gap per account and stated interval, and no section means no gap.**
+/// A gap is dated and scoped by an [`AssertionPeriod`], and the only interval
+/// this system has been *told* about is the one the source printed in its
+/// control section. Deriving one from the rows it managed to read would place a
+/// claim on an interval nobody asserted, computed from the rows that are not
+/// the problem. It also happens to be where the gap does its work: correlation
+/// is by account, period, source and parser version, so a gap carrying
+/// [`CONTROL_PARSER_VERSION`] taints exactly the control assertions this same
+/// commit is writing — which is what stops a batch that dropped rows from
+/// later *confirming* the figures it was allowed to commit against.
+///
+/// That leaves a session whose source printed no control section writing no
+/// gap. It is a real gap in the coverage, it is iaam-hj1o's, and it needs an
+/// interval this system can honestly state rather than a change here.
+///
+/// Where an account has two stated intervals, both are tainted by the same
+/// declined rows. Which of the two a declined row belonged to is precisely what
+/// could not be read, and «this attempt cannot confirm either» is the true
+/// statement.
+fn coverage_gaps(
+    owner: OwnerId,
+    plan: &ImportPlan,
+    declined: &[DeclinedRow],
+) -> Vec<iaam_core::event::Event> {
+    let source = plan.session.source.unwrap_or_else(SourceId::new_random);
+    let mut written: BTreeSet<(AccountId, time::Date, time::Date)> = BTreeSet::new();
+    let mut events = Vec::new();
+    for section in plan
+        .control_reconciliation
+        .comparisons
+        .iter()
+        .filter_map(|comparison| comparison.stated.as_ref())
+    {
+        if !written.insert((section.account, section.period.from, section.period.to)) {
+            continue;
+        }
+        let rows: Vec<RefusedRow> = declined
+            .iter()
+            .filter(|declined| declined.account == Some(section.account))
+            .map(|declined| declined.row.clone())
+            .collect();
+        let key = coverage_gap_key(section.account, section.period, &rows);
+        let provenance = Provenance::new(
+            source,
+            RawHash::parse(&digest_hex(&key))
+                .expect("a SHA-256 digest is 64 hexadecimal characters"),
+            ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
+        );
+        if let Some(event) = coverage_gap::gap_event(
+            coverage_gap::GapTarget {
+                owner,
+                account: section.account,
+                period: section.period,
+            },
+            rows,
+            provenance,
+            key,
+        ) {
+            events.push(event);
+        }
+    }
+    events
+}
+
+/// A SHA-256 of some text, in lower-case hexadecimal.
+fn digest_hex(input: &str) -> String {
+    use std::fmt::Write as _;
+
+    Sha256::digest(input.as_bytes())
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
 }
 
 /// The digest one control section stands under.

@@ -36,7 +36,7 @@ use super::categories::load_index;
 use crate::AppServices;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
-use crate::ports::Principal;
+use crate::ports::{AccountView, Principal};
 /// Yield report request.
 #[derive(Debug, Clone)]
 pub struct ReturnsQuery {
@@ -46,6 +46,21 @@ pub struct ReturnsQuery {
     pub report_currency: CurrencyCode,
     pub fx: FxTable,
     pub lot_rule: LotRuleVersion,
+}
+
+/// The returns answer: the report, and the population it answered about.
+///
+/// A wrapper rather than a field on `iaam_core::returns::ReturnsReport`: the
+/// core computes a fold over the contour it is handed and has no way to know
+/// what else the owner has, so the second statement cannot be made there. It
+/// travels **with** the report rather than beside it in the caller, because a
+/// caller free to drop it would eventually publish the figures alone — which is
+/// the state this type exists to end.
+#[derive(Debug, Clone)]
+pub struct ReturnsOutcome {
+    pub report: ReturnsReport,
+    /// The accounts the report covered, and the known accounts it did not.
+    pub population: ReportPopulation,
 }
 
 /// Money flow report request.
@@ -67,6 +82,19 @@ pub struct MoneyFlowReport {
     /// The active owner rule versions used to derive the decomposition.
     pub category_rule_versions: Vec<u32>,
     pub flow: MoneyFlow,
+}
+
+/// The flow answer: the report, and the population it answered about.
+///
+/// A wrapper for the reason `ReturnsOutcome` is one — the population is a
+/// statement about which of the owner's accounts were selected, made before the
+/// fold, and a `MoneyFlowReport` is what the fold produced. The scenario returns
+/// the pair so that no caller can obtain one without the other.
+#[derive(Debug, Clone)]
+pub struct MoneyFlowOutcome {
+    pub report: MoneyFlowReport,
+    /// The accounts this answer covered, and the known accounts it did not.
+    pub population: ReportPopulation,
 }
 
 /// Whether anything asserts the state a cash figure was accumulated from.
@@ -190,6 +218,13 @@ pub struct AccountBalanceRow {
 pub struct BalancesReport {
     pub accounts: Vec<AccountBalanceRow>,
     pub negative_cash: Vec<NegativeCash>,
+    /// The accounts this answer covered, and the known accounts it did not.
+    ///
+    /// On the answer rather than on a row for the reason `negative_cash` is: it
+    /// is a fact about the set, and a row cannot state that another account was
+    /// left out — there is no row for an account outside the contour, which is
+    /// exactly the silence this field breaks.
+    pub population: ReportPopulation,
 }
 
 /// One account-and-currency whose cash balance is negative at the report date,
@@ -207,6 +242,237 @@ pub struct NegativeCash {
     pub account: AccountId,
     pub money: Money,
     pub span: Option<NegativeCashSpan>,
+}
+
+/// Where one of the owner's accounts stands with respect to a report's
+/// population.
+///
+/// Selection happens **before** the fold, so nothing computed afterwards can
+/// see what was left out: a report's quality fields all speak about defects
+/// inside the calculation and are silent about whose money was calculated. The
+/// standing is the second statement, made per account because that is the
+/// granularity at which the owner decides.
+///
+/// The two outside variants are the distinction that makes the manifest worth
+/// having: "four accounts are outside this report and nobody has decided
+/// whether they belong" is a different sentence from "four accounts are outside
+/// this report on purpose", and a manifest that could not tell them apart would
+/// let the first be read as the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountStanding {
+    /// Inside the contour the report was folded over: this account's facts are
+    /// in the answer.
+    Covered,
+    /// Outside this report, and the owner has placed the account in a contour
+    /// of his own. Something has ruled on where it belongs.
+    OutsidePlacedElsewhere,
+    /// Outside this report and in no contour at all. Nobody has ruled on
+    /// whether it belongs, so its absence is an open question and not a
+    /// decision.
+    OutsideUndecided,
+}
+
+impl AccountStanding {
+    /// The machine-readable name carried to a caller.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Covered => "covered",
+            Self::OutsidePlacedElsewhere => "outside_placed_elsewhere",
+            Self::OutsideUndecided => "outside_undecided",
+        }
+    }
+
+    /// Whether this standing keeps the account out of the answer.
+    #[must_use]
+    pub const fn is_outside(self) -> bool {
+        !matches!(self, Self::Covered)
+    }
+}
+
+/// One of the owner's accounts, and where it stands relative to a report.
+///
+/// The title travels with the identifier because the manifest exists to be
+/// read: an owner asked to rule on an account cannot act on a bare UUID, and a
+/// caller that had to fetch the names separately would be free to render the
+/// manifest without them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopulationAccount {
+    pub account: AccountId,
+    pub title: String,
+    pub standing: AccountStanding,
+}
+
+/// How much of what the system knows about one report answered about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopulationCompleteness {
+    /// Every account the system knows of is inside the report.
+    Whole,
+    /// Accounts are outside the report, and each of them is placed in a contour
+    /// the owner drew. The answer is partial by decision.
+    Bounded,
+    /// Accounts are outside the report that no contour claims. The answer is
+    /// partial, and nothing says the omission was meant — this is the state the
+    /// reader must not mistake for `Bounded`.
+    Undecided,
+}
+
+impl PopulationCompleteness {
+    /// The machine-readable name carried to a caller.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::Bounded => "bounded",
+            Self::Undecided => "undecided",
+        }
+    }
+}
+
+/// The population a report answered about: the accounts it covered, and the
+/// accounts the system knows of that it did not.
+///
+/// Held as **one** list rather than a covered list beside an outside list: an
+/// account has exactly one standing, and two lists could disagree about which
+/// it is or list an account twice. Callers that want one side ask for it.
+///
+/// This is built from the same `ContourDefinition` the fold was given, at the
+/// point the population is chosen. Reconstructing it afterwards from the rows
+/// of a result would produce a second, independently-derived answer to what the
+/// report covered — and the two would drift on the first change to either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportPopulation {
+    pub contour: ContourId,
+    pub version: ContourVersion,
+    pub accounts: Vec<PopulationAccount>,
+}
+
+impl ReportPopulation {
+    /// The accounts inside the report's scope.
+    pub fn covered(&self) -> impl Iterator<Item = &PopulationAccount> {
+        self.accounts
+            .iter()
+            .filter(|entry| entry.standing == AccountStanding::Covered)
+    }
+
+    /// The known accounts outside it, on a decision or otherwise.
+    pub fn outside(&self) -> impl Iterator<Item = &PopulationAccount> {
+        self.accounts
+            .iter()
+            .filter(|entry| entry.standing.is_outside())
+    }
+
+    /// Those of them nobody has ruled on.
+    pub fn undecided(&self) -> impl Iterator<Item = &PopulationAccount> {
+        self.accounts
+            .iter()
+            .filter(|entry| entry.standing == AccountStanding::OutsideUndecided)
+    }
+
+    /// What the manifest says about the answer as a whole.
+    ///
+    /// `Undecided` outranks `Bounded`: one account nobody has ruled on is
+    /// enough to make the report an answer about an undecided part of the
+    /// owner's money, however many deliberate exclusions stand beside it.
+    #[must_use]
+    pub fn completeness(&self) -> PopulationCompleteness {
+        if self.undecided().next().is_some() {
+            return PopulationCompleteness::Undecided;
+        }
+        if self.outside().next().is_some() {
+            return PopulationCompleteness::Bounded;
+        }
+        PopulationCompleteness::Whole
+    }
+}
+
+/// The population, from the contour the fold was given and the accounts the
+/// system knows about.
+///
+/// `placed_elsewhere` is the set of accounts some contour of the owner claims.
+/// It is a parameter rather than a lookup here so that the decision this
+/// function makes — which of three standings an account has — can be tested
+/// without a store, and so that the store round-trips happen once per report.
+fn population_from(
+    definition: &ContourDefinition,
+    accounts: Vec<AccountView>,
+    placed_elsewhere: &BTreeSet<AccountId>,
+) -> ReportPopulation {
+    let entries = accounts
+        .into_iter()
+        .map(|account| {
+            let standing = if definition.contains(account.id) {
+                AccountStanding::Covered
+            } else if placed_elsewhere.contains(&account.id) {
+                AccountStanding::OutsidePlacedElsewhere
+            } else {
+                AccountStanding::OutsideUndecided
+            };
+            PopulationAccount {
+                account: account.id,
+                title: account.title,
+                standing,
+            }
+        })
+        .collect();
+    ReportPopulation {
+        contour: definition.id(),
+        version: definition.version(),
+        accounts: entries,
+    }
+}
+
+/// Every account claimed by a contour of this owner other than the one the
+/// report was computed over.
+///
+/// Membership elsewhere is the strongest evidence available today that the
+/// owner has ruled on an account: he drew a contour and put it in one. It is
+/// **not** evidence that leaving it out of this report was intended — only that
+/// the account is not one the system has never been told anything about. The
+/// authoritative disposition is a separate notion (see `ReportPopulation`);
+/// when it exists, this derivation is what it replaces.
+///
+/// Each contour is read at the version the store currently holds: the question
+/// is what the owner has decided by now, not what he had decided when the
+/// report's own contour version was drawn.
+async fn accounts_placed_elsewhere(
+    services: &AppServices,
+    principal: &Principal,
+    definition: &ContourDefinition,
+    accounts: &[AccountView],
+) -> Result<BTreeSet<AccountId>, AppError> {
+    let mut placed = BTreeSet::new();
+    for contour in services.store.list_contours(principal.owner).await? {
+        if contour.id == definition.id() && contour.version == definition.version() {
+            continue;
+        }
+        let Some(other) = services
+            .store
+            .load_contour(principal.owner, contour.id, contour.version)
+            .await?
+        else {
+            continue;
+        };
+        for account in accounts {
+            if other.contains(account.id) {
+                placed.insert(account.id);
+            }
+        }
+    }
+    Ok(placed)
+}
+
+/// The population a report answers about, computed where the population is
+/// chosen: from the contour definition the fold itself is given.
+async fn report_population(
+    services: &AppServices,
+    principal: &Principal,
+    definition: &ContourDefinition,
+) -> Result<ReportPopulation, AppError> {
+    let accounts = services.store.list_accounts(principal.owner).await?;
+    let placed_elsewhere =
+        accounts_placed_elsewhere(services, principal, definition, &accounts).await?;
+    Ok(population_from(definition, accounts, &placed_elsewhere))
 }
 
 async fn resolve_contour(
@@ -245,7 +511,7 @@ pub async fn money_flow(
     services: &AppServices,
     principal: &Principal,
     query: &MoneyFlowQuery,
-) -> Result<MoneyFlowReport, AppError> {
+) -> Result<MoneyFlowOutcome, AppError> {
     if query.to < query.from {
         return Err(AppError::Invalid {
             field: "period".into(),
@@ -255,6 +521,10 @@ pub async fn money_flow(
     }
     let (version, definition) =
         resolve_contour(services, principal, query.contour, query.contour_version).await?;
+    // Built from the definition the fold below is given, at the point the
+    // population is chosen. A manifest assembled afterwards from the flow's own
+    // account keys would name only the accounts that happened to move money.
+    let population = report_population(services, principal, &definition).await?;
     let categories = load_index(services, principal).await?;
     let category_rule_versions = categories.versions().to_vec();
     let events = services
@@ -275,13 +545,16 @@ pub async fn money_flow(
     for event in effective {
         flow.apply(event, &definition, window, &categories)?;
     }
-    Ok(MoneyFlowReport {
-        contour: query.contour,
-        version,
-        from: query.from,
-        to: query.to,
-        category_rule_versions,
-        flow,
+    Ok(MoneyFlowOutcome {
+        report: MoneyFlowReport {
+            contour: query.contour,
+            version,
+            from: query.from,
+            to: query.to,
+            category_rule_versions,
+            flow,
+        },
+        population,
     })
 }
 
@@ -328,15 +601,13 @@ pub async fn account_balances(
         actual: format!("{as_of}..{as_of}"),
     })?;
 
-    // Accounts are never deleted, so this owner list equals contour membership.
-    let contour_accounts: Vec<AccountId> = services
-        .store
-        .list_accounts(principal.owner)
-        .await?
-        .into_iter()
-        .map(|account| account.id)
-        .filter(|account| definition.contains(*account))
-        .collect();
+    // The manifest is built first and the rows are built **from** it: one
+    // selection of accounts serves both, so a report cannot cover one set and
+    // name another. Accounts are never deleted, so the covered side of the
+    // manifest is exactly contour membership.
+    let population = report_population(services, principal, &definition).await?;
+    let contour_accounts: Vec<AccountId> =
+        population.covered().map(|entry| entry.account).collect();
     // Both read the effective set for the same reason `Balances` does above: a
     // retracted movement is not this account's first one, and a retracted
     // assertion anchors nothing. Reading the raw journal here would put the two
@@ -391,6 +662,7 @@ pub async fn account_balances(
     Ok(BalancesReport {
         accounts: rows,
         negative_cash,
+        population,
     })
 }
 
@@ -510,7 +782,7 @@ pub async fn returns(
     services: &AppServices,
     principal: &Principal,
     query: &ReturnsQuery,
-) -> Result<ReturnsReport, AppError> {
+) -> Result<ReturnsOutcome, AppError> {
     let version = match query.contour_version {
         Some(version) => version,
         None => services
@@ -532,6 +804,12 @@ pub async fn returns(
             what: "contour_version",
             id: format!("{}/{}", query.contour.0, version.0),
         })?;
+
+    // Here, where the contour that selects the projection's accounts has just
+    // been resolved and before anything is folded over it. The report's own
+    // quality fields are computed downstream and can all be clean while this
+    // says half the owner's money was never in the calculation.
+    let population = report_population(services, principal, &definition).await?;
 
     let today = services.clock.today();
     let as_of = query.as_of.unwrap_or(today);
@@ -580,7 +858,7 @@ pub async fn returns(
         .load_events_through(principal.owner, Date::MAX)
         .await?;
 
-    report_from_projection(
+    let report = report_from_projection(
         &projection,
         query,
         ReportInputs {
@@ -593,7 +871,8 @@ pub async fn returns(
         &definition,
         as_of,
         &reconciliation_events,
-    )
+    )?;
+    Ok(ReturnsOutcome { report, population })
 }
 
 struct ReportMarketInputs {
@@ -1197,6 +1476,135 @@ mod tests {
         assert_eq!(CashOpening::Asserted.code(), "asserted");
         assert_eq!(CashOpening::Unasserted.code(), "unasserted");
         assert_ne!(CashOpening::Asserted.code(), CashOpening::Unasserted.code());
+    }
+
+    #[test]
+    fn the_manifest_separates_a_deliberate_exclusion_from_an_open_question() {
+        // The distinction the manifest exists for. Without it the two outside
+        // accounts read alike, and a report over a contour nobody has finished
+        // drawing reads as an answer about everything the owner has.
+        let inside = AccountId::new_random();
+        let elsewhere = AccountId::new_random();
+        let undecided = AccountId::new_random();
+        let definition =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(3), [inside]);
+        let accounts = vec![
+            AccountView {
+                id: inside,
+                title: "Main".to_owned(),
+                institution: None,
+            },
+            AccountView {
+                id: elsewhere,
+                title: "Savings".to_owned(),
+                institution: None,
+            },
+            AccountView {
+                id: undecided,
+                title: "Shop One".to_owned(),
+                institution: None,
+            },
+        ];
+        let placed: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
+
+        let population = population_from(&definition, accounts, &placed);
+
+        assert_eq!(population.contour, definition.id());
+        assert_eq!(population.version, ContourVersion(3));
+        assert_eq!(
+            population
+                .covered()
+                .map(|entry| entry.account)
+                .collect::<Vec<_>>(),
+            vec![inside]
+        );
+        assert_eq!(
+            population
+                .outside()
+                .map(|entry| (entry.account, entry.standing))
+                .collect::<Vec<_>>(),
+            vec![
+                (elsewhere, AccountStanding::OutsidePlacedElsewhere),
+                (undecided, AccountStanding::OutsideUndecided),
+            ]
+        );
+        assert_eq!(
+            population
+                .undecided()
+                .map(|entry| entry.account)
+                .collect::<Vec<_>>(),
+            vec![undecided]
+        );
+        // One account nobody has ruled on outranks any number of deliberate
+        // exclusions beside it: the answer is about an undecided part.
+        assert_eq!(population.completeness(), PopulationCompleteness::Undecided);
+    }
+
+    #[test]
+    fn a_population_with_every_known_account_inside_is_whole() {
+        let inside = AccountId::new_random();
+        let definition =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [inside]);
+        let accounts = vec![AccountView {
+            id: inside,
+            title: "Main".to_owned(),
+            institution: None,
+        }];
+
+        let population = population_from(&definition, accounts, &BTreeSet::new());
+
+        assert_eq!(population.outside().count(), 0);
+        assert_eq!(population.completeness(), PopulationCompleteness::Whole);
+    }
+
+    #[test]
+    fn a_population_whose_omissions_are_all_placed_is_bounded_not_undecided() {
+        let inside = AccountId::new_random();
+        let elsewhere = AccountId::new_random();
+        let definition =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [inside]);
+        let accounts = vec![
+            AccountView {
+                id: inside,
+                title: "Main".to_owned(),
+                institution: None,
+            },
+            AccountView {
+                id: elsewhere,
+                title: "Savings".to_owned(),
+                institution: None,
+            },
+        ];
+        let placed: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
+
+        let population = population_from(&definition, accounts, &placed);
+
+        assert_eq!(population.undecided().count(), 0);
+        assert_eq!(population.completeness(), PopulationCompleteness::Bounded);
+    }
+
+    #[test]
+    fn every_standing_and_completeness_has_a_distinct_machine_readable_code() {
+        // The wire distinguishes them or the reader cannot: two outside
+        // standings sharing a code is the defect with a manifest bolted on.
+        let standings = [
+            AccountStanding::Covered,
+            AccountStanding::OutsidePlacedElsewhere,
+            AccountStanding::OutsideUndecided,
+        ];
+        let codes: BTreeSet<&str> = standings.iter().map(|standing| standing.code()).collect();
+        assert_eq!(codes.len(), standings.len());
+        assert!(!AccountStanding::Covered.is_outside());
+        assert!(AccountStanding::OutsidePlacedElsewhere.is_outside());
+        assert!(AccountStanding::OutsideUndecided.is_outside());
+
+        let completeness = [
+            PopulationCompleteness::Whole,
+            PopulationCompleteness::Bounded,
+            PopulationCompleteness::Undecided,
+        ];
+        let codes: BTreeSet<&str> = completeness.iter().map(|value| value.code()).collect();
+        assert_eq!(codes.len(), completeness.len());
     }
 
     #[test]

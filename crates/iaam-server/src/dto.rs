@@ -17,7 +17,10 @@ use iaam_app::ports::{
 };
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
-use iaam_app::scenarios::reports::{AccountBalanceRow, BalancesReport, MoneyFlowReport};
+use iaam_app::scenarios::reports::{
+    AccountBalanceRow, BalancesReport, MoneyFlowReport, PopulationAccount, ReportPopulation,
+    ReturnsOutcome,
+};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -2023,6 +2026,82 @@ fn issue(value: &MaterialIssue) -> String {
     }
 }
 
+/// The population a report answered about.
+///
+/// Every report carries one. The quality fields of a report — data quality,
+/// uncovered positions, unproven bases — all concern defects **inside** the
+/// calculation, and each of them can be clean while the accounts selected for
+/// it were the wrong ones: selection happens before the fold, so nothing
+/// computed afterwards can see what was left out. This block is the second
+/// statement, and without it a report over part of the owner's money reads as
+/// an answer about all of it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PopulationDto {
+    /// The scope the report was computed over.
+    pub contour: Uuid,
+    pub contour_version: u32,
+    /// `whole` — every account the system knows of is covered. `bounded` —
+    /// accounts are outside, and each of them is in a scope the owner drew.
+    /// `undecided` — accounts are outside that no scope claims, so the report
+    /// answers about a part of the owner's money that nobody has delimited.
+    ///
+    /// `undecided` outranks `bounded`: one account nobody has ruled on is
+    /// enough, however many deliberate omissions stand beside it.
+    pub completeness: String,
+    /// The accounts inside the report's scope — the population the figures were
+    /// folded over. Always present; the same set the report's own rows are
+    /// built from.
+    pub covered: Vec<PopulationAccountDto>,
+    /// The accounts the system knows about that this report did not cover.
+    /// Always present: an empty array says the report covered everything known,
+    /// while an absent key is indistinguishable from a report that never asked.
+    pub outside: Vec<PopulationAccountDto>,
+}
+
+/// One account in a report's population.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PopulationAccountDto {
+    pub account: Uuid,
+    /// The account's title, so that an owner asked to rule on an omission is
+    /// not asked about a bare identifier.
+    pub title: String,
+    /// `covered` — inside the report's scope. `outside_placed_elsewhere` —
+    /// outside it, and the owner has placed the account in a scope of his own.
+    /// `outside_undecided` — outside it and in no scope at all: **nobody has
+    /// ruled on whether it belongs**, which is a different statement from a
+    /// deliberate omission and must not be read as one.
+    pub standing: String,
+}
+
+impl PopulationDto {
+    #[must_use]
+    pub fn from_domain(population: &ReportPopulation) -> Self {
+        Self {
+            contour: population.contour.0,
+            contour_version: population.version.0,
+            completeness: population.completeness().code().to_owned(),
+            covered: population
+                .covered()
+                .map(PopulationAccountDto::from_domain)
+                .collect(),
+            outside: population
+                .outside()
+                .map(PopulationAccountDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+impl PopulationAccountDto {
+    fn from_domain(entry: &PopulationAccount) -> Self {
+        Self {
+            account: entry.account.inner(),
+            title: entry.title.clone(),
+            standing: entry.standing.code().to_owned(),
+        }
+    }
+}
+
 /// Cash movement report over an inclusive interval.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MoneyFlowReportDto {
@@ -2042,6 +2121,8 @@ pub struct MoneyFlowReportDto {
     /// the report was examined and found nothing, while an absent key would be
     /// indistinguishable from a bug to the agent reading it.
     pub actions: Vec<ActionDto>,
+    /// The accounts this report covered, and the known accounts it did not.
+    pub population: PopulationDto,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2114,6 +2195,7 @@ impl MoneyFlowReportDto {
     /// carrier that could be built without them would eventually be.
     pub fn from_domain(
         report: &MoneyFlowReport,
+        population: &ReportPopulation,
         actions: Vec<ActionDto>,
     ) -> Result<Self, MoneyFlowError> {
         let currencies = report
@@ -2236,6 +2318,7 @@ impl MoneyFlowReportDto {
             currencies,
             unexplained,
             actions,
+            population: PopulationDto::from_domain(population),
         })
     }
 }
@@ -2260,6 +2343,12 @@ pub struct BalancesReportDto {
     /// cannot be overdrawn is a reason to read `accounts[].cash[].opening`
     /// before reading the number as a balance at all.
     pub negative_cash: Vec<NegativeCashDto>,
+    /// The accounts this report covered, and the known accounts it did not.
+    ///
+    /// On the answer, beside `negative_cash`, for the same reason: it is a fact
+    /// about the set. No row can carry it — there is no row for an account the
+    /// report left out, and that silence is what this block breaks.
+    pub population: PopulationDto,
 }
 
 /// One account-and-currency carrying a negative cash balance at the report
@@ -2391,6 +2480,7 @@ impl BalancesReportDto {
                     }),
                 })
                 .collect(),
+            population: PopulationDto::from_domain(&report.population),
         }
     }
 }
@@ -2497,6 +2587,33 @@ pub struct ReturnsReportDto {
     pub xirr_pre_tax: RateDto,
     pub applied_rules: AppliedRulesDto,
     pub data_quality: DataQualityDto,
+}
+
+/// The returns answer: the report, and the population it answered about.
+///
+/// The report's fields sit at the top level, exactly where they have always
+/// sat, and `population` joins them. It is a separate type rather than a field
+/// on `ReturnsReportDto` because the report is a conversion of
+/// `iaam_core::returns::ReturnsReport`, which knows only the scope it was
+/// folded over and cannot know what the owner has outside it. Constructing the
+/// answer therefore **requires** the manifest: a response carrying the figures
+/// without the population it computed them over cannot be built.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReturnsAnswerDto {
+    #[serde(flatten)]
+    pub report: ReturnsReportDto,
+    /// The accounts this report covered, and the known accounts it did not.
+    pub population: PopulationDto,
+}
+
+impl ReturnsAnswerDto {
+    #[must_use]
+    pub fn from_domain(outcome: &ReturnsOutcome) -> Self {
+        Self {
+            report: ReturnsReportDto::from_domain(&outcome.report),
+            population: PopulationDto::from_domain(&outcome.population),
+        }
+    }
 }
 
 /// Applied rules (§3.2, §6.1).

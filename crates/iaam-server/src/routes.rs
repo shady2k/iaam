@@ -70,7 +70,7 @@ use crate::dto::{
     MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
     OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, ReconciliationParams,
     ReconciliationResponseDto, ReconciliationStatusDto, RequestPlanDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsReportDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
+    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
     SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
@@ -1819,14 +1819,14 @@ pub async fn flow_report(
         from: parse_query_date("from", &params.from)?,
         to: parse_query_date("to", &params.to)?,
     };
-    let report = money_flow(&state.services, &principal, &query).await?;
+    let outcome = money_flow(&state.services, &principal, &query).await?;
     // No scoping: the projection admits no leg from outside the contour, so the
     // report cannot name an account it does not cover.
-    let actions = iaam_app::actions::flow_diagnostics(&report)
+    let actions = iaam_app::actions::flow_diagnostics(&outcome.report)
         .iter()
         .map(|action| action_dto(action, &catalog))
         .collect();
-    let dto = MoneyFlowReportDto::from_domain(&report, actions)
+    let dto = MoneyFlowReportDto::from_domain(&outcome.report, &outcome.population, actions)
         .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
 }
@@ -1897,7 +1897,7 @@ pub struct ReturnsParams {
     path = "/v1/reports/returns",
     params(ReturnsParams),
     responses(
-        (status = 200, description = "Report", body = ReturnsReportDto),
+        (status = 200, description = "Report", body = ReturnsAnswerDto),
         (status = 404, description = "Scope not found", body = ApiError),
         (status = 500, description = "Invariant violated", body = ApiError),
         (status = 422, description = "Request could not be read", body = ApiError)
@@ -1908,7 +1908,7 @@ pub async fn returns_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiQuery(params): ApiQuery<ReturnsParams>,
-) -> Result<Json<ReturnsReportDto>, ApiFailure> {
+) -> Result<Json<ReturnsAnswerDto>, ApiFailure> {
     let query = ReturnsQuery {
         contour: ContourId(params.contour),
         contour_version: params.contour_version.map(ContourVersion),
@@ -1919,8 +1919,8 @@ pub async fn returns_report(
         fx: FxTable::new(FxSource::CbrOfficial),
         lot_rule: LotRuleVersion(1),
     };
-    let report = returns(&state.services, &principal, &query).await?;
-    Ok(Json(ReturnsReportDto::from_domain(&report)))
+    let outcome = returns(&state.services, &principal, &query).await?;
+    Ok(Json(ReturnsAnswerDto::from_domain(&outcome)))
 }
 
 /// Exchange rates supplied with the report request.
@@ -1933,7 +1933,7 @@ pub async fn returns_report(
     params(ReturnsParams),
     request_body = Vec<FxRateDto>,
     responses(
-        (status = 200, description = "Report using the specified exchange rates", body = ReturnsReportDto),
+        (status = 200, description = "Report using the specified exchange rates", body = ReturnsAnswerDto),
         (status = 422, description = "Invalid exchange rate", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -1946,7 +1946,7 @@ pub async fn returns_report_with_rates(
     Extension(principal): Extension<Principal>,
     ApiQuery(params): ApiQuery<ReturnsParams>,
     ApiJson(rates): ApiJson<Vec<FxRateDto>>,
-) -> Result<Json<ReturnsReportDto>, ApiFailure> {
+) -> Result<Json<ReturnsAnswerDto>, ApiFailure> {
     let mut fx = FxTable::new(FxSource::OwnerSupplied);
     for rate in &rates {
         let parsed = rate.rate.parse::<Decimal>().map_err(|_| {
@@ -1978,8 +1978,8 @@ pub async fn returns_report_with_rates(
         fx,
         lot_rule: LotRuleVersion(1),
     };
-    let report = returns(&state.services, &principal, &query).await?;
-    Ok(Json(ReturnsReportDto::from_domain(&report)))
+    let outcome = returns(&state.services, &principal, &query).await?;
+    Ok(Json(ReturnsAnswerDto::from_domain(&outcome)))
 }
 
 fn instrument_dto(instrument: iaam_app::ports::InstrumentView) -> InstrumentDto {

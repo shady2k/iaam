@@ -6,6 +6,7 @@
 //! extraneous. Therefore, the unit of status is an interval×dimension pair,
 //! not an event, and an event has no “confidence level” field.
 
+pub mod anchor;
 pub mod check;
 pub mod claim;
 pub mod evidence;
@@ -19,6 +20,7 @@ use time::Date;
 use crate::event::correction::resolve;
 use crate::event::{Event, kind::EventKind};
 use crate::ids::AccountId;
+pub use anchor::{OpeningAnchor, OpeningAnchors};
 use check::{ClaimOutcome, check_claim};
 use claim::{AssertionPeriod, BalancePoint, ControlClaim};
 pub use evidence::{Evidence, Ground, IdentityScope, SourceChannel};

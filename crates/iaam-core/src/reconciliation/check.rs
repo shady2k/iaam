@@ -6,6 +6,7 @@
 //! posted value (deposit interest accruals, §8.3) — that is E3, and the threshold there
 //! comes from the contract's rounding algorithm rather than being set here.
 
+use super::anchor::OpeningAnchor;
 use super::claim::ControlClaim;
 use super::observed::{ObservedTotals, Turnover};
 use crate::money::{CurrencyCode, PostedMinor, Quantity};
@@ -46,6 +47,24 @@ pub enum NotComparable {
     NoJournalCoverage,
     /// The system does not yet record tax facts (E5).
     TaxFactsNotRecorded,
+    /// The observed figure is a sum from a start nothing asserts, so it is
+    /// movement over the recorded interval and not a balance.
+    ///
+    /// **This is the reason the owner's own anchor used to be called wrong.**
+    /// An account whose journal begins in January was treated as having held
+    /// exactly zero on the first of January, and a balance he could prove for
+    /// the first of August was then compared against `0 + everything since` and
+    /// reported `discrepant`. The claim was right and the baseline was invented,
+    /// and the system had no vocabulary for saying so — while the balances
+    /// answer, over the same silence, already refused to call the same fold a
+    /// balance and published it as `movement_since_unknown_start` (`iaam-d7hn`).
+    ///
+    /// It is not a discrepancy for the reason `TaxFactsNotRecorded` is not one:
+    /// «the numbers do not match» sends the owner to find an error, and there is
+    /// none to find. It is also not a defect he is asked to repair by restating
+    /// the balance — the repair is an opening assertion reaching back to the
+    /// start of the recorded history, or the import of the history before it.
+    OpeningNotAsserted,
 }
 
 impl NotComparable {
@@ -54,6 +73,7 @@ impl NotComparable {
         match self {
             Self::NoJournalCoverage => "no_journal_coverage",
             Self::TaxFactsNotRecorded => "tax_facts_not_recorded",
+            Self::OpeningNotAsserted => "opening_not_asserted",
         }
     }
 }
@@ -128,29 +148,52 @@ pub fn check_claim(claim: &ControlClaim, observed: &ObservedTotals) -> ClaimOutc
         };
     }
     match *claim {
+        // A figure the fold produced can only be compared where the fold's
+        // start is asserted. Where no fold produced a figure at all — the
+        // account has never moved this currency — zero is not a placeholder for
+        // an unknown amount but the whole of what the journal records, and the
+        // comparison stands: see
+        // `a_currency_without_movement_is_compared_as_zero_when_history_exists`.
         ControlClaim::CashBalance {
             currency,
             amount,
             at,
-        } => compare_money(
-            "amount",
-            currency,
-            amount,
-            observed
-                .cash_at(at, currency)
-                .unwrap_or(PostedMinor::new(0)),
-        ),
+        } => match observed.cash_at(at, currency) {
+            Some(_) if observed.cash_anchor(currency) == Some(OpeningAnchor::Unasserted) => {
+                ClaimOutcome::NotComparable {
+                    reason: NotComparable::OpeningNotAsserted,
+                }
+            }
+            seen => compare_money(
+                "amount",
+                currency,
+                amount,
+                seen.unwrap_or(PostedMinor::new(0)),
+            ),
+        },
+        // The same, for the same reason. A quantity summed from an unasserted
+        // start is the net of the trades that were imported, and a source
+        // stating the holding is not contradicting it — there is nothing for it
+        // to contradict. The two arms are written out rather than shared: the
+        // anchor is keyed by currency for cash and by instrument-and-depository
+        // for a holding, and a helper over both would have to invent a key that
+        // is neither.
         ControlClaim::PositionQuantity {
             instrument,
             custody,
             quantity,
             at,
-        } => compare_quantity(
-            quantity,
-            observed
-                .position_at(at, instrument, custody)
-                .unwrap_or_else(Quantity::zero),
-        ),
+        } => match observed.position_at(at, instrument, custody) {
+            Some(_)
+                if observed.position_anchor(instrument, custody)
+                    == Some(OpeningAnchor::Unasserted) =>
+            {
+                ClaimOutcome::NotComparable {
+                    reason: NotComparable::OpeningNotAsserted,
+                }
+            }
+            seen => compare_quantity(quantity, seen.unwrap_or_else(Quantity::zero)),
+        },
         ControlClaim::CashTurnover {
             currency,
             debit,
@@ -276,14 +319,44 @@ mod tests {
         observe_effective(&effective, account, period)
     }
 
+    /// One March deposit on an account whose opening is anchored.
+    ///
+    /// The anchor is part of the fixture and not an extra in the tests that
+    /// happen to need it. Without one, every figure below is a sum from a start
+    /// nothing states, no balance can be compared at all, and the tests would be
+    /// exercising `OpeningNotAsserted` while claiming to exercise the
+    /// comparison. Its amount is zero because the account has no history before
+    /// March; its *presence*, not its value, is what anchors (`iaam-d7hn`).
     fn journal_with_one_deposit(account: AccountId, minor: i64) -> Vec<crate::event::Event> {
-        vec![event_with(
+        vec![
+            opening_anchor(account),
+            event_with(
+                account,
+                date!(2026 - 03 - 10),
+                1,
+                EventKind::CashIn { amount: rub(minor) },
+                vec![Leg::cash(account, rub(minor))],
+            ),
+        ]
+    }
+
+    /// A source's opening assertion for March, reaching the start of the
+    /// interval. No legs: an assertion moves no money (§10.3).
+    fn opening_anchor(account: AccountId) -> crate::event::Event {
+        event_with(
             account,
-            date!(2026 - 03 - 10),
-            1,
-            EventKind::CashIn { amount: rub(minor) },
-            vec![Leg::cash(account, rub(minor))],
-        )]
+            date!(2026 - 03 - 01),
+            0,
+            EventKind::ControlAssertion {
+                period: march(),
+                claim: ControlClaim::CashBalance {
+                    currency: CurrencyCode::Rub,
+                    amount: PostedMinor::new(0),
+                    at: BalancePoint::Opening,
+                },
+            },
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -324,6 +397,194 @@ mod tests {
                 currency: CurrencyCode::Rub
             },
             "the difference is calculated as asserted minus observed"
+        );
+    }
+
+    #[test]
+    fn an_anchor_over_an_unanchored_history_is_not_a_discrepancy() {
+        // The defect this outcome exists for (`iaam-d7hn`). The account's
+        // journal begins in February with an ordinary inflow — nothing states
+        // what was there before it — and the owner then states the balance he
+        // can prove for the first of April. The fold before April starts from an
+        // invented zero, so «zero plus everything since» is not a balance and
+        // cannot contradict him. Calling it `discrepant` sent him to look for an
+        // error the system had made itself, and told him the figure he had
+        // confirmed against two sources was wrong.
+        let account = AccountId::new_random();
+        let events = vec![
+            event_with(
+                account,
+                date!(2026 - 02 - 10),
+                1,
+                EventKind::CashIn {
+                    amount: rub(100_000),
+                },
+                vec![Leg::cash(account, rub(100_000))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 20),
+                1,
+                EventKind::CashOut {
+                    amount: rub(-30_000),
+                },
+                vec![Leg::cash(account, rub(-30_000))],
+            ),
+        ];
+        let april = AssertionPeriod::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30)).unwrap();
+        let observed = observe(&events, account, april).unwrap();
+
+        let anchor = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(500_000),
+            at: BalancePoint::Opening,
+        };
+        assert_eq!(
+            check_claim(&anchor, &observed),
+            ClaimOutcome::NotComparable {
+                reason: NotComparable::OpeningNotAsserted
+            },
+            "the claim is right and the baseline is invented"
+        );
+
+        // Nor does the observed figure become right by agreeing with it: an
+        // outcome of `matched` here would be a match against a number the
+        // system has no grounds for, which is the same defect wearing the
+        // opposite verdict.
+        let agreeing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(70_000),
+            at: BalancePoint::Opening,
+        };
+        assert_eq!(
+            check_claim(&agreeing, &observed),
+            ClaimOutcome::NotComparable {
+                reason: NotComparable::OpeningNotAsserted
+            }
+        );
+    }
+
+    #[test]
+    fn a_reconstructed_opening_anchors_the_fold_it_begins() {
+        // §10.7's reconstructed opening states what the account held before the
+        // journal began. It is a recorded fact with legs and provenance, not
+        // silence, so the sum that follows it is a balance and a source's
+        // closing figure is compared against it. Refusing to compare here would
+        // leave an owner who reconstructed his opening unable to have it checked
+        // by the very statement that could catch a wrong reconstruction.
+        let account = AccountId::new_random();
+        let events = vec![
+            event_with(
+                account,
+                date!(2026 - 03 - 01),
+                1,
+                EventKind::OpeningCash {
+                    amount: rub(200_000),
+                },
+                vec![Leg::cash(account, rub(200_000))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 10),
+                1,
+                EventKind::CashIn {
+                    amount: rub(100_000),
+                },
+                vec![Leg::cash(account, rub(100_000))],
+            ),
+        ];
+        let observed = observe(&events, account, march()).unwrap();
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(300_000),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(check_claim(&closing, &observed), ClaimOutcome::Matched);
+    }
+
+    #[test]
+    fn a_reconstructed_opening_recorded_late_anchors_nothing() {
+        // The boundary of the rule above. A reconstruction entered after
+        // transactions are already in the journal states the state before
+        // *itself*; the transactions folded in ahead of it still came from
+        // nowhere, and the sum is still a running one.
+        let account = AccountId::new_random();
+        let events = vec![
+            event_with(
+                account,
+                date!(2026 - 03 - 05),
+                1,
+                EventKind::CashIn {
+                    amount: rub(100_000),
+                },
+                vec![Leg::cash(account, rub(100_000))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 20),
+                1,
+                EventKind::OpeningCash {
+                    amount: rub(200_000),
+                },
+                vec![Leg::cash(account, rub(200_000))],
+            ),
+        ];
+        let observed = observe(&events, account, march()).unwrap();
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(300_000),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(
+            check_claim(&closing, &observed),
+            ClaimOutcome::NotComparable {
+                reason: NotComparable::OpeningNotAsserted
+            }
+        );
+    }
+
+    #[test]
+    fn a_position_summed_from_an_unasserted_start_is_not_compared() {
+        // The same rule for a holding, keyed by instrument and depository. A
+        // quantity summed from the trades that happen to have been imported is
+        // not the position, and a source stating the holding is not
+        // contradicting it.
+        let account = AccountId::new_random();
+        let custody = CustodyId::new_random();
+        let instrument = InstrumentId::new_random();
+        let events = vec![event_with(
+            account,
+            date!(2026 - 03 - 11),
+            1,
+            EventKind::Trade {
+                side: crate::event::kind::TradeSide::Buy,
+                instrument,
+                quantity: Quantity(Dec::new(Decimal::from(4))),
+                gross: rub(-40_000),
+                fee: None,
+                basis_fee: None,
+                basis_fee_exact: None,
+                accrued_interest: None,
+            },
+            vec![Leg::security(
+                account,
+                custody,
+                instrument,
+                Quantity(Dec::new(Decimal::from(4))),
+            )],
+        )];
+        let observed = observe(&events, account, march()).unwrap();
+        let claim = ControlClaim::PositionQuantity {
+            instrument,
+            custody,
+            quantity: Quantity(Dec::new(Decimal::from(4))),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(
+            check_claim(&claim, &observed),
+            ClaimOutcome::NotComparable {
+                reason: NotComparable::OpeningNotAsserted
+            }
         );
     }
 

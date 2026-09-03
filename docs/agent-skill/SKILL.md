@@ -342,6 +342,16 @@ result a balance. For the same reason a currency whose cash is not entirely
 anchored has **no entry** in the snapshot's `total` at all — no whole exists to
 state, and both halves above it still say everything they know.
 
+**Reconciliation says the same thing in its own words.** A source's balance
+assertion over a fold nothing anchors is `not_comparable` with the reason
+`opening_not_asserted` — not `discrepant`. The distinction matters because the
+two are opposite instructions: `discrepant` means the figures disagree and one
+of them is wrong; `opening_not_asserted` means there is no baseline to hold the
+figure against, and nothing the owner stated is being contradicted. Never
+report the second as an error he made. What lifts it is an opening assertion
+reaching back to the start of the recorded history, or the import of the
+history before it.
+
 A negative cash figure is reported as a fact and is never refused or hidden. It
 is not by itself an error: a margin account is legitimately negative, and a card
 can carry a technical overdraft. On an account where the owner would not expect

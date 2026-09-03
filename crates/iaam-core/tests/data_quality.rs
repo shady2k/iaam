@@ -47,6 +47,12 @@ fn deposit(channel: &TestChannel, owner: OwnerId, account: AccountId, minor: i64
 }
 
 /// Control sections confirming the balance and turnover.
+///
+/// The opening balance is stated as well as the closing one, as a real control
+/// section states both. Without it the closing figure is a sum from a start
+/// nothing asserts and cannot be compared at all (`iaam-d7hn`), and the fixture
+/// would be measuring incomparability while claiming to measure confirmation.
+/// Zero, because each account here is opened by its March deposit.
 fn sections(
     channel: &TestChannel,
     owner: OwnerId,
@@ -55,6 +61,11 @@ fn sections(
     debit: i64,
 ) -> Vec<Event> {
     [
+        ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(0),
+            at: BalancePoint::Opening,
+        },
         ControlClaim::CashBalance {
             currency: CurrencyCode::Rub,
             amount: PostedMinor::new(closing),

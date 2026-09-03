@@ -1032,3 +1032,76 @@ fn ledger_gaps_hold_a_gap_that_correlated_with_no_group() {
     assert_eq!(ledger.gaps()[0].refused, 1);
     assert_eq!(ledger.gaps()[0].rows.len(), 1);
 }
+
+#[test]
+fn an_anchor_over_an_unanchored_history_leaves_the_dimension_provisional() {
+    // The owner's case in `iaam-d7hn`, end to end. The journal begins in
+    // January with an ordinary inflow, so nothing states what the account held
+    // before it. In April he records a statement whose control section states
+    // an opening balance he has confirmed against two independent sources.
+    //
+    // The observed opening is «zero plus everything since January», which is
+    // movement and not a balance. `Discrepant` would say the figure he proved
+    // is wrong; the truth is that the system has no baseline to hold it against,
+    // and `Provisional` — «not checked yet» — is what that means. The registry
+    // keeps discrepancies as an absorbing state precisely so that a real one is
+    // never softened, and this test guards the other side of that line.
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let channel = TestChannel::new("statement/1", "april");
+    let april = AssertionPeriod::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30)).unwrap();
+
+    let mut events = vec![event_on(
+        &channel,
+        Posting {
+            owner,
+            account,
+            day: date!(2026 - 01 - 15),
+            sequence: 1,
+        },
+        EventKind::CashIn {
+            amount: rub(100_000),
+        },
+        vec![Leg::cash(account, rub(100_000))],
+    )];
+    events.extend(full_sections(
+        &channel,
+        owner,
+        account,
+        april,
+        Sections {
+            opening: 500_000,
+            closing: 500_000,
+            debit: 0,
+            credit: 0,
+        },
+    ));
+
+    let ledger = ReconciliationLedger::build(&events).unwrap();
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 04 - 15), Dimension::Cash),
+        DimensionStatus::Provisional,
+        "an invented baseline must not be published as the owner's error"
+    );
+
+    let outcomes: Vec<&ClaimOutcome> = ledger
+        .statuses()
+        .flat_map(|status| status.outcomes())
+        .map(|check| &check.outcome)
+        .collect();
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| !matches!(outcome, ClaimOutcome::Discrepant(_))),
+        "no claim here disagrees with anything: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|outcome| matches!(
+            outcome,
+            ClaimOutcome::NotComparable {
+                reason: iaam_core::reconciliation::check::NotComparable::OpeningNotAsserted
+            }
+        )),
+        "and the reason is named rather than left to be guessed: {outcomes:?}"
+    );
+}

@@ -286,6 +286,37 @@ loses precision and an amount in the journal is a fact.
 digit after the separator is refused, not rounded: rounding at the input
 substitutes a convenient number for a fact.
 
+## A transfer between the owner's own accounts is one row, not two
+
+A transfer operation names the account the money left and the account it
+arrived at, and it is **submitted once, from the sending side**. The system
+writes both movements from that single row: the sending account is debited and
+the receiving account is credited, in one fact that holds both accounts.
+
+There is deliberately no way to state the receiving half on its own, and the
+consequence is the mistake that costs an import. When two banks each print the
+movement — an outgoing row in one statement, an incoming row in the other — a
+row per printed side records **two transfers**, not the two halves of one. Both
+accounts then move by twice the sum, and it multiplies again with every export
+that overlaps. Import the sending side and drop the receiving row.
+
+Three properties follow, and each of them has been got wrong by a model that
+still produced plausible output:
+
+- **The amount is positive, like every other amount.** A negative amount is
+  refused, not read as "the outgoing leg". Direction is carried by the two
+  accounts, so the sign has nothing left to say.
+- **The two accounts must differ.** A transfer to itself moves nothing and is
+  refused on the destination field.
+- **A transfer is not a deposit plus a withdrawal.** Those two say the money
+  crossed the boundary of the owner's accounts, and a report counts them as
+  money entering and leaving. A transfer says it stayed inside and merely
+  moved. Recording a transfer as a pair overstates both what came in and what
+  went out, in the same month.
+
+If you cannot tell whether the other side is one of the owner's own accounts,
+that is exactly the row you submit as an observation and let the owner answer.
+
 ## Idempotency keys
 
 Always send an idempotency key if you can construct one. Repeating a request

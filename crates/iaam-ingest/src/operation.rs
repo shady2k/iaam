@@ -56,12 +56,35 @@ impl OperationDates {
 
 /// What happened. Amounts are **positive**: the sign determines the operation type,
 /// not the client.
+///
+/// [`Self::OpeningCash`] is the one exception, and it is an exception to the
+/// reason rather than to the rule: it restores a balance rather than reporting a
+/// movement, and a reconstructed balance may genuinely be below zero (§15.9).
+/// Every other kind here refuses a negative amount through `positive`, naming
+/// the field the client actually sent.
+///
+/// One row of a source becomes one operation. Nothing here is submitted twice:
+/// where a movement has two sides — [`Self::Transfer`] — the second side is
+/// written by `build`, not by the caller.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OperationKind {
+    /// Money the account received from **outside** the owner's own accounts.
+    ///
+    /// Becomes `CashIn`, whose flow endpoints say the other side is a
+    /// counterparty the system does not observe. That is the whole difference
+    /// from [`Self::Transfer`], and it is not a matter of wording: a report
+    /// counts a deposit as money entering the perimeter and a transfer as money
+    /// already inside it moving. Sending a deposit for the receiving side of a
+    /// transfer between two of the owner's accounts overstates what came in.
     Deposit {
         amount_minor: i64,
         currency: CurrencyCode,
     },
+    /// Money the account paid out to **outside** the owner's own accounts.
+    ///
+    /// The mirror of [`Self::Deposit`], and the same caution: the sending side
+    /// of a transfer between two of the owner's accounts is a
+    /// [`Self::Transfer`], not a withdrawal.
     Withdrawal {
         amount_minor: i64,
         currency: CurrencyCode,
@@ -71,11 +94,54 @@ pub enum OperationKind {
         amount_minor: i64,
         currency: CurrencyCode,
     },
+    /// Money moved between two of the owner's own accounts, submitted **once**.
+    ///
+    /// The operation's own `account` is the side the money left and `to` is the
+    /// side it arrived at. One submission states the whole movement:
+    /// `build` writes both legs itself, `Leg::cash(account, -amount)` beside
+    /// `Leg::cash(to, amount)`, and the caller writes neither.
+    ///
+    /// **A source that prints the movement twice is still one operation.** Two
+    /// banks each print their own half, and submitting both records two
+    /// transfers rather than the two halves of one: each account then moves by
+    /// twice the sum, and it keeps multiplying with every export that overlaps.
+    /// There is nothing to submit for the receiving side, because this variant
+    /// has already said what happened there.
+    ///
+    /// `amount_minor` is positive like every other kind here. A negative amount
+    /// is **refused**, not read as "the outgoing leg": direction is carried by
+    /// `account` → `to`, so a sign has nothing left to say and a caller using
+    /// one has a model of this variant that the code does not share.
+    ///
+    /// `to` must name an account other than `account`. A transfer to itself is
+    /// refused on the `to` field before the amount is looked at — it moves
+    /// nothing, and recording it would put two cancelling legs on one account
+    /// for a movement that never happened.
+    ///
+    /// The event is a `CashTransfer` carrying both accounts and a freshly
+    /// minted `TransferId`. Both accounts live on the event rather than being
+    /// inferred from the legs (`iaam-core/src/event/kind.rs`): whether the
+    /// movement crossed the contour boundary cannot be decided from one side,
+    /// and the journal is append-only, so a one-sided record could not be
+    /// repaired afterwards. That event is also what transfer pairing and the
+    /// flow reports read — they see one movement between two accounts, never a
+    /// pair of independent rows.
     Transfer {
         to: AccountId,
         amount_minor: i64,
         currency: CurrencyCode,
     },
+    /// A purchase: cash leaves the account and the security arrives.
+    ///
+    /// `quantity` and `gross_minor` are both positive, as is the optional
+    /// `fee_minor`; the negation belongs to `build`. What the account pays is
+    /// `gross + accrued_interest + fee`, and that sum — not `gross_minor` — is
+    /// the cash leg. A caller that reports the settled amount as `gross_minor`
+    /// and repeats the fee in `fee_minor` charges the fee twice.
+    ///
+    /// `basis_fee` is deliberately **not** in that sum: it is a commission that
+    /// belongs to the tax basis and moves no cash. The exact value is kept
+    /// beside the rounded one on the event, so the rounding stays auditable.
     Buy {
         instrument: InstrumentId,
         custody: CustodyId,
@@ -87,6 +153,18 @@ pub enum OperationKind {
         accrued_interest_minor: Option<i64>,
         currency: CurrencyCode,
     },
+    /// A sale: the security leaves the account and cash arrives.
+    ///
+    /// `quantity` is positive here too, exactly as for [`Self::Buy`]: the side
+    /// is the variant, not the sign, and `build` negates the security leg. The
+    /// event keeps the positive quantity while the leg carries the negative one,
+    /// so a reader of the event is not looking at a short position.
+    ///
+    /// What the account receives is `gross + accrued_interest - fee`: the
+    /// accrued coupon is money the buyer pays over, and the commission is
+    /// deducted from the proceeds. This is the one place where the fee's sign
+    /// differs in effect between the two sides, and it is why `fee_minor` is
+    /// submitted positive on both.
     Sell {
         instrument: InstrumentId,
         custody: CustodyId,
@@ -98,6 +176,11 @@ pub enum OperationKind {
         accrued_interest_minor: Option<i64>,
         currency: CurrencyCode,
     },
+    /// A coupon, dividend or interest payment actually received.
+    ///
+    /// `instrument` is optional because interest on a cash balance belongs to no
+    /// security. Absence means the payment names none, never "the system will
+    /// work out which".
     Income {
         instrument: Option<InstrumentId>,
         gross_minor: i64,
@@ -107,20 +190,46 @@ pub enum OperationKind {
         /// means recording an invention in the journal (§4.9).
         kind: Option<IncomeKind>,
     },
+    /// A charge not attached to a trade: custody, servicing, a transfer fee.
+    ///
+    /// Submitted positive and recorded negative, on a fee leg rather than a cash
+    /// leg. A trade's own commission belongs in [`Self::Buy`] or [`Self::Sell`]
+    /// as `fee_minor`, where it is part of the settled amount; sending it here
+    /// as well charges the account twice for one commission.
     Fee {
         amount_minor: i64,
         currency: CurrencyCode,
         origin: FeeOrigin,
     },
+    /// Tax, whether a broker withheld it or the owner paid it himself.
+    ///
+    /// Submitted positive and recorded negative, on a tax leg. `origin` is the
+    /// distinction that matters afterwards, and it is stated rather than
+    /// inferred: withheld tax has already left the account, and self-paid tax is
+    /// a payment the owner made.
     Tax {
         amount_minor: i64,
         currency: CurrencyCode,
         origin: TaxOrigin,
     },
+    /// The cash a reconstructed account already held before the journal begins.
+    ///
+    /// **The one kind whose amount may be negative**, and the sign is used as
+    /// submitted. A restored balance can be below zero — an overdraft, a margin
+    /// account — and refusing it here would force the owner to state a balance
+    /// he does not have (§15.9). It is a starting position, not a movement:
+    /// nothing entered or left the contour, so no report counts it as a flow.
     OpeningCash {
         amount_minor: i64,
         currency: CurrencyCode,
     },
+    /// A position a reconstructed account already held before the journal
+    /// begins.
+    ///
+    /// `cost_basis_minor` is optional and, when given, positive: a basis of
+    /// nothing is not a basis of zero, and the two must not be spelled the same
+    /// way. Absence means the owner did not state one, and the tax reports say
+    /// so rather than substituting the market value.
     OpeningPosition {
         instrument: InstrumentId,
         custody: CustodyId,
@@ -137,6 +246,12 @@ pub enum OperationKind {
         #[serde(default)]
         assertions: Option<OpeningAssertions>,
     },
+    /// A price for an instrument on a day, and **no movement at all**.
+    ///
+    /// The only kind that produces no legs: nothing was bought, sold or paid, so
+    /// no account balance changes. `quality` says where the price came from, and
+    /// it is carried rather than assumed — a valuation the owner estimated must
+    /// not be read later as one an exchange published.
     Valuation {
         instrument: InstrumentId,
         price: Dec,

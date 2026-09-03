@@ -793,11 +793,32 @@ impl OperationDto {
 /// set of rows rather than replace the first (spec §6).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeclaredSourceDto {
-    /// Account the rows belong to. Every operation in the batch must name this
-    /// same account: the declaration says whose rows these are, and a row that
-    /// disagreed would be recorded against one account while carrying the
-    /// import identity of another.
-    pub account: Uuid,
+    /// Account the rows belong to, named however the caller can name it: this
+    /// account's iaam identifier, or the identifier its source prints for it —
+    /// its `provider_account_id`, or one of its aliases, a card among them.
+    ///
+    /// **One field and not two**, and that is the decision. A second field
+    /// beside a `Uuid` one would create a request that fills both, and the
+    /// server would then have to publish a precedence rule for a case the
+    /// caller never meant. There is nothing to disambiguate here because the
+    /// tiering already answers it: an identifier that parses as an account of
+    /// the owner's *is* that account, before anything else is consulted, so a
+    /// caller sending a `Uuid` — every caller written before this — is answered
+    /// exactly as it was. Anything else is matched against the identity a source
+    /// prints, then against aliases, then against the title, stopping at the
+    /// first tier that matches anything; two accounts in that tier are refused
+    /// rather than picked between, and the refusal names both.
+    ///
+    /// Widening this field is what removes the read-then-join an import used to
+    /// begin with: a statement prints an account number, and a caller holding
+    /// one no longer has to fetch `/v1/accounts` to translate it before it can
+    /// send a single row.
+    ///
+    /// Every operation in the batch must still name the account this resolves
+    /// to, by its iaam identifier: the declaration says whose rows these are,
+    /// and a row that disagreed would be recorded against one account while
+    /// carrying the import identity of another.
+    pub account: String,
     /// How the rows arrived: `file`, `paste`, `manual`.
     pub channel: String,
     /// What names this import within the account and channel — a statement
@@ -7021,6 +7042,22 @@ pub struct OpenImportSessionRequest {
     pub source: Option<DeclaredSourceDto>,
 }
 
+/// The account a declaration resolved to, named as the owner named it.
+///
+/// The identifier with the title beside it, because a caller that declared an
+/// account by the number its bank prints has no way to check it reached the
+/// right one — and the rows it is about to send have to carry this `id`. Sending
+/// it back is what lets the whole import be walked without a directory read:
+/// what the caller sends is what its statement prints, and what it copies into
+/// the rows is what this response just handed it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeclaredAccountDto {
+    pub id: Uuid,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
+}
+
 /// Rows fed into a session.
 ///
 /// The same shape the conclusive route takes, and deliberately so: a session is
@@ -7068,6 +7105,17 @@ pub struct ImportSessionDto {
     /// readily as an open one, and what it would have recorded is exactly what a
     /// caller asks about after the fact.
     pub assessment: String,
+    /// The account the declaration named, resolved.
+    ///
+    /// Present on the response that opened the session, and absent everywhere
+    /// else — which is a fact about the session rather than an oversight. A
+    /// session stores its `source` and `import`, and both are one-way
+    /// derivations from the account: nothing read back later can recover it.
+    /// The moment the server holds the account is the moment it resolved the
+    /// declaration, so that is the response that carries it, and a caller
+    /// wanting it afterwards asks the directory as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<DeclaredAccountDto>,
 }
 
 impl ImportSessionDto {
@@ -7081,6 +7129,7 @@ impl ImportSessionDto {
             opened_at: session.opened_at.clone(),
             closed_at: session.closed_at.clone(),
             assessment: format!("/v1/import-sessions/{}/assessment", session.id.inner()),
+            account: None,
         }
     }
 }

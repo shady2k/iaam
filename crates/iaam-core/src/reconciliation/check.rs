@@ -42,6 +42,22 @@ pub struct Discrepancy {
 /// Inability to compare is **not** a discrepancy. A discrepancy means
 /// «the numbers do not match; investigate»; inability means «there is
 /// nothing to compare against», and these are different answers to the owner (§10.4).
+///
+/// **Deliberately not [`crate::batch::NoCounterpart`]**, which answers the same
+/// shape of question about the other fold and was re-examined for merging in
+/// `iaam-tx3c`. The two were kept apart, and the sharpest way to see why is to
+/// ask which side of the comparison is missing. Every reason here is a fact
+/// about the **observed** side, produced from a ledger over events that were
+/// recorded: the journal holds no events, no tax facts, or no asserted start.
+/// `NoCounterpart` is a fact about the **claimed** side of a batch that may
+/// never reach the journal at all: the source printed no opening balance, so the
+/// document does not supply the term its own closing figure would be checked
+/// against. One vocabulary would have to mean both, and then a client could read
+/// «no journal coverage» off an import that has not touched the journal, or be
+/// pointed at a missing document line while reconciling months of recorded
+/// history. The remedies differ for the same reason — import the history or
+/// assert an opening, against fetch a statement that prints its control section
+/// in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotComparable {
     /// The account has no events at all: there is nothing to confirm.

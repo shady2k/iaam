@@ -2191,7 +2191,11 @@ fn start_account_import_action(account: &AccountView) -> Action {
              Recording it is not: open an import session for this account, feed it the \
              rows, read the assessment the session publishes to see what committing would \
              record and what it would not, and commit under the revision that assessment \
-             carries; or synchronise a broker channel over an interval. Import is \
+             carries; or synchronise a broker channel over an interval. An import already \
+             under way for this account is not something this item can see — a session \
+             records the source and the import it was opened for, and neither can be read \
+             back as an account — so opening one again is what finds it: the call refuses, \
+             names the session, and publishes the calls that end it. Import is \
              continuous and never complete.",
             account.id.inner(),
             account.title

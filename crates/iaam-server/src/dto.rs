@@ -2349,8 +2349,10 @@ pub struct ClosingOperationDto {
     pub operation_id: String,
     pub method: String,
     pub path: String,
-    #[serde(rename = "requestSchema")]
-    pub request_schema: String,
+    /// The component schema the call's body answers to. Absent for a call that
+    /// takes no body — see [`crate::action_catalog::ActionOperation`].
+    #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
+    pub request_schema: Option<String>,
 }
 
 /// The typed subject of a caveat.
@@ -3821,8 +3823,10 @@ pub enum ActionTargetDto {
         operation_id: String,
         method: String,
         path: String,
-        #[serde(rename = "requestSchema")]
-        request_schema: String,
+        /// The component schema the call's body answers to. Absent for a call
+        /// that takes no body — see [`crate::action_catalog::ActionOperation`].
+        #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
+        request_schema: Option<String>,
         request: RequestPlanDto,
     },
     /// Two or more admissible resolutions, in the order the item offers them.
@@ -3846,8 +3850,10 @@ pub struct ResolutionOptionDto {
     pub operation_id: String,
     pub method: String,
     pub path: String,
-    #[serde(rename = "requestSchema")]
-    pub request_schema: String,
+    /// The component schema the call's body answers to. Absent for a call that
+    /// takes no body — see [`crate::action_catalog::ActionOperation`].
+    #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
+    pub request_schema: Option<String>,
     pub request: RequestPlanDto,
 }
 

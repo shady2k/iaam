@@ -3029,23 +3029,32 @@ fn intake_verdict_dto(row: usize, outcome: &IntakeOutcome) -> VerdictDto {
 /// than guessed at, and the refusal names both. The response carries the account
 /// the declaration resolved to, and that identifier is the one the rows of this
 /// session must name.
+///
+/// Refused when the declared import already has a session open **and that
+/// session holds rows**: it is a statement half imported, and only the caller
+/// knows whether the file in its hand is that statement or another one. The
+/// refusal names the session, says how long it has been open and what it holds,
+/// and publishes the two calls that end it. A session found holding nothing is
+/// handed back as before — that is a caller retrying the open call, and there is
+/// nothing in an empty session to mix a second statement into.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions",
     request_body = OpenImportSessionRequest,
     responses(
-        (status = 201, description = "Session opened, or the one this import already had", body = ImportSessionDto),
+        (status = 201, description = "Session opened, or the empty one this import already had", body = ImportSessionDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
-        (status = 422, description = "Request could not be read", body = ApiError)
+        (status = 422, description = "Request could not be read, or this import already has a session holding rows", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn open_import_session(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiJson(request): ApiJson<OpenImportSessionRequest>,
 ) -> Result<(StatusCode, Json<ImportSessionDto>), ApiFailure> {
     if !principal.scope.may_submit() {
@@ -3062,13 +3071,19 @@ pub async fn open_import_session(
         }
         None => (None, None, None),
     };
+    // Converted through the catalogue rather than with `?`: the refusal below
+    // offers calls rather than values — no label written into this request ends
+    // a session that is already open — and their addresses resolve only against
+    // the completed document. `ApiFailure::from(AppError)` has no catalogue to
+    // reach and would drop them.
     let session = iaam_app::scenarios::import_session::open_session(
         &state.services,
         &principal,
         source,
         import,
     )
-    .await?;
+    .await
+    .map_err(|error| ApiFailure::from_app(error, &catalog))?;
     Ok((
         StatusCode::CREATED,
         Json(ImportSessionDto {

@@ -11,7 +11,17 @@ pub struct ActionOperation {
     pub operation_id: String,
     pub method: String,
     pub path: String,
-    pub request_schema: String,
+    /// The component schema the route's JSON body answers to, where it takes
+    /// one.
+    ///
+    /// `Option`, and the emptiness is the honest answer rather than a
+    /// concession: `POST /v1/import-sessions/{session}/abandon` takes no body
+    /// at all — the session is in the path and there is nothing to say about
+    /// abandoning it — so it has no request schema, and demanding one would
+    /// have meant either refusing to publish a call that exists or inventing a
+    /// body for it so that a catalogue would accept it. The route was the first
+    /// to need addressing when a refusal began offering it as a way out.
+    pub request_schema: Option<String>,
 }
 
 /// The operation addresses advertised by computed actions.
@@ -29,8 +39,6 @@ pub enum ActionCatalogError {
     MissingActionOperation { operation_id: String },
     #[error("operation_id {operation_id} is declared more than once")]
     DuplicateOperationId { operation_id: String },
-    #[error("operation {operation_id} has no JSON request schema")]
-    MissingRequestSchema { operation_id: String },
 }
 
 impl ActionCatalog {
@@ -83,18 +91,13 @@ impl ActionCatalog {
                     operation_id: operation_id.to_owned(),
                 });
             };
-            let request_schema = request_schema(operation).ok_or_else(|| {
-                ActionCatalogError::MissingRequestSchema {
-                    operation_id: operation_id.to_owned(),
-                }
-            })?;
             operations.insert(
                 operation_id,
                 ActionOperation {
                     operation_id: operation_id.to_owned(),
                     method: method.clone(),
                     path: path.clone(),
-                    request_schema,
+                    request_schema: request_schema(operation),
                 },
             );
         }

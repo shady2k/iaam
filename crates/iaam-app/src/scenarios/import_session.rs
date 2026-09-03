@@ -308,6 +308,48 @@ pub async fn resolve_declared_account(
         .resolve_declared(printed)
 }
 
+/// Open a session for a declared import, or refuse because one is under way.
+///
+/// The store reuses rather than opening a second session for one import, and
+/// that is right: two sessions over one statement would split its questions
+/// across two places and the owner would answer one of them. What was wrong was
+/// answering **`201 Created` with a session that already existed** — a caller
+/// that reused a label for a different file was silently handed the earlier
+/// session, its rows joined the ones already there, and the commit was then
+/// refused over questions belonging to rows it had never sent. The refusal was
+/// truthful and useless: nothing in it said which import the questions came
+/// from, and nothing said that the session could be thrown away. The owner found
+/// `abandon` by experiment.
+///
+/// So a found session is handed back only while it holds nothing. That case is a
+/// caller retrying the open call — it lost the response, or it opens before
+/// every batch — and nothing can be mixed into a session with no rows in it.
+/// A found session that holds rows is a statement half imported, and only the
+/// caller can say whether this is the same statement or another one. It is
+/// refused, and the refusal carries the session, what it holds, and the two
+/// calls that end it.
+///
+/// **Why the refusal and not a queue item.** A stale session is invisible to
+/// every report: nothing it holds is in the journal, so no figure is computed
+/// differently because it exists, and the queue's items are the things standing
+/// between the owner and a report. The part of a stale session that *does*
+/// change what a figure means — a row nobody has classified — is already an item
+/// per open question, graded for exactly that reason, and a second item saying
+/// «and a session holds them» would name one piece of work twice. A session held
+/// open deliberately, waiting for the second bank's file so both legs of a
+/// transfer can be committed together, is the documented use of the mechanism,
+/// and an item telling the owner to finish it would be wrong every time he was
+/// doing the thing sessions exist for. There is also nothing to attach such an
+/// item to: the queue's items name an account, and a session records a source
+/// and an import, both of them one-way derivations of the account, so
+/// attributing one would mean reading every open session's rows on every call
+/// to `/v1/actions`. The moment the owner needs to know is the moment he tries
+/// to import against that import again, and that is this refusal.
+///
+/// The check is not serialised against the open that follows it, and does not
+/// need to be: the store's unique index still admits one open session per
+/// import, so the worst a race produces is the old answer — a session handed
+/// back that acquired its first row in between.
 pub async fn open_session(
     services: &AppServices,
     principal: &Principal,
@@ -315,10 +357,101 @@ pub async fn open_session(
     import: Option<ImportId>,
 ) -> Result<ImportSessionView, AppError> {
     require_submit(principal)?;
+    if let Some(import) = import
+        && let Some(standing) = open_session_for_import(services, principal, import).await?
+    {
+        let contents = read_session(services, principal, standing.id).await?;
+        if !contents.observations.is_empty() {
+            return Err(half_imported_refusal(services, principal, &contents).await);
+        }
+    }
     services
         .store
         .open_import_session(principal.owner, source, import)
         .await
+}
+
+/// The open session this import already has, if it has one.
+async fn open_session_for_import(
+    services: &AppServices,
+    principal: &Principal,
+    import: ImportId,
+) -> Result<Option<ImportSessionView>, AppError> {
+    Ok(services
+        .store
+        .list_import_sessions(principal.owner)
+        .await?
+        .into_iter()
+        .find(|session| {
+            session.state == ImportSessionState::Open && session.import == Some(import)
+        }))
+}
+
+/// The refusal that names the import already under way, and how to end it.
+///
+/// The field is `source.label`, and it is the honest one: the import is keyed on
+/// the account, the channel and the label together, the first two are what the
+/// caller means to import into, and the label is the part it varies per
+/// statement. A caller importing a different file changes the label and the
+/// refusal goes away; a caller importing the same file was never going to be
+/// helped by a different value in any field, which is why the two calls that
+/// end the session are published beside it.
+///
+/// Two resolutions, ordered, and the first depends on what the session is
+/// waiting on. With every question answered the session can be committed, so
+/// committing is offered first. With a question open it cannot — the commit
+/// route refuses — so answering is offered first and the answering call is built
+/// exactly as [`unanswered_refusal`] builds it. Abandoning is second in both
+/// cases and never first: it is the way out, not the way on, and a refusal that
+/// led with «throw this away» would invite a caller to discard rows the owner
+/// spent an evening answering questions about.
+async fn half_imported_refusal(
+    services: &AppServices,
+    principal: &Principal,
+    contents: &SessionContents,
+) -> AppError {
+    let session = contents.session.id;
+    let unanswered = contents
+        .questions
+        .iter()
+        .filter(|question| question.is_open())
+        .count();
+    let rejection = FieldRejection::new(
+        "source.label",
+        "a label naming an import with no session open, or one of the calls that          ends the session this label already has",
+        format!(
+            "session {session} has been open since {opened}, holding {rows} rows and              {unanswered} unanswered questions",
+            session = session.inner(),
+            opened = contents.session.opened_at,
+            rows = contents.observations.len(),
+        ),
+    );
+
+    let mut preset = std::collections::BTreeMap::new();
+    preset.insert("session".to_owned(), session.inner().to_string().into());
+    let end_it = |operation| ResolutionOption {
+        operation,
+        request: RequestPlan {
+            preset: preset.clone(),
+            missing: Vec::new(),
+        },
+    };
+
+    let first = match contents
+        .questions
+        .iter()
+        .filter(|question| question.is_open())
+        .min_by_key(|question| (question.row, question.id.inner()))
+    {
+        Some(open) => answer_resolution(services, principal, session, open.id).await,
+        None => None,
+    };
+    rejection
+        .resolved_by(vec![
+            first.unwrap_or_else(|| end_it(OperationKey::CommitImportSession)),
+            end_it(OperationKey::AbandonImportSession),
+        ])
+        .into()
 }
 
 /// Everything the session holds.
@@ -648,10 +781,32 @@ async fn unanswered_refusal(
     else {
         return rejection.into();
     };
-    let Some(asked) = read_asked_question(services, principal, session, first.question).await
+    let Some(resolution) = answer_resolution(services, principal, session, first.question).await
     else {
         return rejection.into();
     };
+    rejection.resolved_by(vec![resolution]).into()
+}
+
+/// The call that answers one question, addressed and pre-filled.
+///
+/// Shared by the two refusals that offer it — a commit refused for an unanswered
+/// question, and an import refused because the session standing in its way is
+/// waiting on one. Written once because the two must publish the same call: a
+/// caller that met both would otherwise be told to answer the same question in
+/// two shapes, and one of them would be the stale one.
+///
+/// `None` rather than an error on every failure below. The only callers are
+/// refusals that are already decided, and a session that cannot be read or a
+/// question whose stored JSON will not parse costs the refusal its next call and
+/// nothing else.
+async fn answer_resolution(
+    services: &AppServices,
+    principal: &Principal,
+    session: ImportSessionId,
+    question: ImportQuestionId,
+) -> Option<ResolutionOption> {
+    let asked = read_asked_question(services, principal, session, question).await?;
     let accounts = services
         .store
         .list_accounts(principal.owner)
@@ -660,23 +815,17 @@ async fn unanswered_refusal(
 
     let mut preset = std::collections::BTreeMap::new();
     // Both are path segments of the answering route, and both are known here:
-    // the session is the one being committed and the question is the one this
-    // refusal named.
+    // the session is the one in hand and the question is the one being named.
     preset.insert("session".to_owned(), session.inner().to_string().into());
-    preset.insert(
-        "question".to_owned(),
-        first.question.inner().to_string().into(),
-    );
+    preset.insert("question".to_owned(), question.inner().to_string().into());
 
-    rejection
-        .resolved_by(vec![ResolutionOption {
-            operation: OperationKey::AnswerImportQuestion,
-            request: RequestPlan {
-                preset,
-                missing: vec![answer_input(&asked, &accounts)],
-            },
-        }])
-        .into()
+    Some(ResolutionOption {
+        operation: OperationKey::AnswerImportQuestion,
+        request: RequestPlan {
+            preset,
+            missing: vec![answer_input(&asked, &accounts)],
+        },
+    })
 }
 
 /// The typed question behind one identifier, or nothing.

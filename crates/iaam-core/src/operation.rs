@@ -51,6 +51,20 @@ pub enum OperationKey {
     SyncBroker,
     /// Answer one classification question held open by an import session.
     AnswerImportQuestion,
+    /// Write everything one import session holds into the journal, once.
+    ///
+    /// Named beside [`Self::AbandonImportSession`] because the two are the only
+    /// ways an open session ends, and a refusal that offers one without the
+    /// other tells the owner he must finish an import he may have decided
+    /// against.
+    CommitImportSession,
+    /// End an import session without writing anything.
+    ///
+    /// The journal is neither read nor written: what the session held was never
+    /// a fact. This is the only key whose route takes no request body, which is
+    /// why an operation's request schema is optional — see
+    /// `iaam_server::action_catalog`.
+    AbandonImportSession,
     /// Retract or supersede events the owner names, one correction fact each.
     ///
     /// The only operation that acts on a reconciliation discrepancy, and it acts
@@ -69,10 +83,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding a twelfth variant to this
-    /// list: adding one without extending `ALL` leaves it unresolved against the
-    /// contract, so extend both in the same edit.
-    pub const ALL: [Self; 11] = [
+    /// The declared length is the only thing holding a fourteenth variant to
+    /// this list: adding one without extending `ALL` leaves it unresolved
+    /// against the contract, so extend both in the same edit.
+    pub const ALL: [Self; 13] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -83,6 +97,8 @@ impl OperationKey {
         Self::OpenImportSession,
         Self::SyncBroker,
         Self::AnswerImportQuestion,
+        Self::CommitImportSession,
+        Self::AbandonImportSession,
         Self::SubmitCorrections,
     ];
 
@@ -100,6 +116,8 @@ impl OperationKey {
             Self::OpenImportSession => "open_import_session",
             Self::SyncBroker => "sync_broker",
             Self::AnswerImportQuestion => "answer_import_question",
+            Self::CommitImportSession => "commit_import_session",
+            Self::AbandonImportSession => "abandon_import_session",
             Self::SubmitCorrections => "submit_corrections",
         }
     }

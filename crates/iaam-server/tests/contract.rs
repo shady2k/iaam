@@ -7424,9 +7424,24 @@ fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
     let required = operation["required"]
         .as_array()
         .expect("operation required");
-    for field in ["operationId", "method", "path", "requestSchema", "request"] {
+    for field in ["operationId", "method", "path", "request"] {
         assert!(required.iter().any(|value| value == field), "{field}");
     }
+    // `requestSchema` is declared and is not required: a call that takes no
+    // request body has no request schema, and the one such call an action or a
+    // refusal offers is abandoning an import session. Present in the properties
+    // so a client knows to look for it; absent from `required` so its absence is
+    // a shape the contract admits rather than a violation of it.
+    assert!(
+        operation["properties"]
+            .get("requestSchema")
+            .is_some_and(|schema| !schema.is_null()),
+        "the schema reference must still be described: {operation}"
+    );
+    assert!(
+        !required.iter().any(|value| value == "requestSchema"),
+        "a body-less call has no request schema: {operation}"
+    );
 }
 
 #[tokio::test]
@@ -11031,8 +11046,15 @@ fn every_remedy_the_register_names_is_a_call_the_contract_publishes() {
                 resolved.method,
                 resolved.path
             );
+            // A caveat's remedy is always a call that takes a body: it is a
+            // fact the owner supplies, and there is nowhere but the body to put
+            // it. The `Option` exists for the calls a *refusal* offers, which
+            // include one that takes nothing — abandoning an import session.
             assert!(
-                !resolved.request_schema.is_empty(),
+                resolved
+                    .request_schema
+                    .as_ref()
+                    .is_some_and(|schema| !schema.is_empty()),
                 "{} names {}, whose request shape is not published",
                 kind.code(),
                 key.as_str()
@@ -12947,6 +12969,191 @@ async fn a_declaration_by_identifier_and_by_uuid_reach_the_same_session() {
     assert_eq!(
         opened[0], opened[1],
         "one import has one open session, however the account was named"
+    );
+}
+
+/// An import already under way is named, not silently continued.
+///
+/// One import has one open session, and re-declaring it used to answer
+/// `201 Created` with the session that already existed — indistinguishable from
+/// one just made. A caller that reused a label for a different file had its rows
+/// join the earlier ones, and the commit was then refused over questions raised
+/// by rows it had never sent. Nothing said which session was in the way and
+/// nothing said it could be thrown away; the owner found `abandon` by
+/// experiment.
+///
+/// The empty case still hands the session back: that is a caller retrying the
+/// open call, and there is nothing in an empty session to mix a statement into.
+#[tokio::test]
+async fn a_declared_import_that_already_holds_rows_is_refused_and_the_refusal_names_the_session() {
+    let harness = harness();
+    let account = account_with(
+        &harness,
+        &json!({ "title": "Main", "provider": "bank-one", "provider_account_id": "acct-1" }),
+    )
+    .await;
+    let declaration =
+        json!({ "source": { "account": "acct-1", "channel": "file", "label": "march" } });
+
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    // Nothing fed yet, so the same declaration is the same open call.
+    let (status, again) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{again}");
+    assert_eq!(
+        again["session"], opened["session"],
+        "one import has one open session: {again}"
+    );
+
+    let account = Uuid::parse_str(&account).expect("account uuid");
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(account, "march-1")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "needs_classification", "{rows}");
+
+    let (status, refused) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a statement half imported is not silently continued: {refused}"
+    );
+    assert_eq!(refused["code"], "invalid_request", "{refused}");
+    assert_eq!(refused["field"], "source.label", "{refused}");
+    assert_eq!(refused["pointer"], "/source/label", "{refused}");
+    let actual = refused["actual"].as_str().expect("what stands in the way");
+    assert!(
+        actual.contains(&session),
+        "the refusal must name the session standing in the way: {refused}"
+    );
+    assert!(
+        actual.contains("1 rows") && actual.contains("1 unanswered"),
+        "and say what it holds: {refused}"
+    );
+
+    // Both calls that end the session, and answering leads because a session
+    // waiting on a question cannot be committed.
+    let offered: Vec<&str> = refused["resolutions"]
+        .as_array()
+        .expect("the calls that end it")
+        .iter()
+        .map(|option| option["operationId"].as_str().expect("operation"))
+        .collect();
+    assert_eq!(
+        offered,
+        ["answer_import_question", "abandon_import_session"],
+        "{refused}"
+    );
+    let abandon = &refused["resolutions"][1];
+    assert_eq!(abandon["method"], "POST", "{refused}");
+    assert_eq!(
+        abandon["path"], "/v1/import-sessions/{session}/abandon",
+        "{refused}"
+    );
+    assert_eq!(
+        abandon["request"]["preset"]["session"],
+        json!(session),
+        "{refused}"
+    );
+    assert!(
+        abandon.get("requestSchema").is_none(),
+        "abandoning takes no body, and the refusal must not invent one: {refused}"
+    );
+
+    // Abandoning is the way out, and the declaration works again afterwards.
+    let (status, abandoned) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/abandon"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{abandoned}");
+    let (status, fresh) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{fresh}");
+    assert_ne!(
+        fresh["session"], opened["session"],
+        "the abandoned session is not reopened: {fresh}"
+    );
+}
+
+/// With every question answered, committing is what the refusal leads with.
+#[tokio::test]
+async fn a_settled_import_under_way_is_refused_with_the_commit_that_ends_it() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let declaration =
+        json!({ "source": { "account": account, "channel": "file", "label": "march" } });
+
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [{
+                "account": account,
+                "type": "deposit",
+                "amount": "1000.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-03-02" },
+                "idempotency_key": "settled-one",
+            }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "held", "{rows}");
+
+    let (status, refused) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let offered: Vec<&str> = refused["resolutions"]
+        .as_array()
+        .expect("the calls that end it")
+        .iter()
+        .map(|option| option["operationId"].as_str().expect("operation"))
+        .collect();
+    assert_eq!(
+        offered,
+        ["commit_import_session", "abandon_import_session"],
+        "a session waiting on nobody is committed, not answered: {refused}"
     );
 }
 

@@ -2,12 +2,12 @@
 //! of those things are not.
 //!
 //! Every fact this module publishes is already published somewhere in the
-//! report it summarises. `population.completeness`, `accounts[].cash[].kind`
-//! and the rest are each correct and each in the right place; the difficulty
-//! reported from a run through the whole flow was that a reader had to
-//! reconstruct "how much of this answer do I believe" from four fields in three
-//! shapes, and a reader who stopped at the numbers got a confident wrong
-//! impression. So this is a **register**, published first, of the specific
+//! report it summarises. `population.known_account_coverage`,
+//! `accounts[].cash[].kind` and the rest are each correct and each in the right
+//! place; the difficulty reported from a run through the whole flow was that a
+//! reader had to reconstruct "how much of this answer do I believe" from four
+//! fields in three shapes, and a reader who stopped at the numbers got a
+//! confident wrong impression. So this is a **register**, published first, of the specific
 //! things the report is silent or partial about.
 //!
 //! **There is no score.** No number, no percentage, no grade. A confidence

@@ -104,9 +104,37 @@ pub struct PopulationAccount {
 }
 
 /// How much of what the system knows about one report answered about.
+///
+/// **Named for its denominator, because the denominator is the whole
+/// difficulty.** This is coverage of the accounts the system has been told
+/// about, and it can be nothing else: the report folds a journal, the journal
+/// holds facts about accounts somebody created here, and an account of the
+/// owner's that was never created is not *omitted* from these figures — it is
+/// absent from the system, and no fold can see it.
+///
+/// It was called `PopulationCompleteness` and published as
+/// `population.completeness`, which claims more than it can deliver. A source
+/// holding seven accounts of which four were ever mapped into this system
+/// yields a report with four covered accounts, an empty
+/// [`ReportPopulation::outside`] list, and — under the old name —
+/// `completeness: whole`, read by an agent as "these figures are all of it".
+/// The word was doing the overstating, so the word is gone: `whole` now
+/// completes a sentence that names what it is whole *of*.
+///
+/// **The other half of the coverage question is not answered here, and must not
+/// be.** What a source document held, this system never saw: the import path
+/// receives the rows a client chose to send it, and a client that silently drops
+/// three accounts is exactly the client that would also supply the total. A
+/// field claiming what the document contained would publish the client's word
+/// as the system's knowledge. Where the system does perform that comparison
+/// itself it already records it as a fact — see
+/// [`crate::event::kind::EventKind::ImportCoverageGap`], written by the broker
+/// sync, the one path where the system made the fetch and so holds both sides
+/// of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PopulationCompleteness {
-    /// Every account the system knows of is inside the report.
+pub enum KnownAccountCoverage {
+    /// Every account the system knows of is inside the report. Not every
+    /// account the owner has: see the type's second paragraph.
     Whole,
     /// Accounts are outside the report, and the owner has ruled on every one of
     /// them — each is either placed in a contour of his own or ruled outside
@@ -118,7 +146,7 @@ pub enum PopulationCompleteness {
     Undecided,
 }
 
-impl PopulationCompleteness {
+impl KnownAccountCoverage {
     /// The machine-readable name carried to a caller.
     #[must_use]
     pub const fn code(self) -> &'static str {
@@ -170,7 +198,8 @@ impl ReportPopulation {
             .filter(|entry| entry.standing == AccountStanding::OutsideUndecided)
     }
 
-    /// What the manifest says about the answer as a whole.
+    /// What the manifest says about the answer as a whole, over the accounts
+    /// the system has been told about.
     ///
     /// `Undecided` outranks `Bounded`: one account nobody has ruled on is
     /// enough to make the report an answer about an undecided part of the
@@ -186,14 +215,14 @@ impl ReportPopulation {
     /// changes is the sentence the reader is given — the standing, and the kind
     /// of caveat — never whether he is given one.
     #[must_use]
-    pub fn completeness(&self) -> PopulationCompleteness {
+    pub fn known_account_coverage(&self) -> KnownAccountCoverage {
         if self.undecided().next().is_some() {
-            return PopulationCompleteness::Undecided;
+            return KnownAccountCoverage::Undecided;
         }
         if self.outside().next().is_some() {
-            return PopulationCompleteness::Bounded;
+            return KnownAccountCoverage::Bounded;
         }
-        PopulationCompleteness::Whole
+        KnownAccountCoverage::Whole
     }
 
     /// The manifest's contribution to a report's caveat register: one caveat
@@ -217,8 +246,8 @@ impl ReportPopulation {
     /// exactly how [`AccountStanding::OutsideByDecision`] would have been
     /// silently reported as a placement elsewhere.
     ///
-    /// This is exactly the complement of [`Self::completeness`]: empty if and
-    /// only if the population is [`PopulationCompleteness::Whole`], which is
+    /// This is exactly the complement of [`Self::known_account_coverage`]:
+    /// empty if and only if that is [`KnownAccountCoverage::Whole`], which is
     /// what keeps a report over a partial population from ever reading as
     /// complete.
     #[must_use]
@@ -260,9 +289,9 @@ mod tests {
         }
     }
 
-    /// The register and the completeness verdict are one statement in two
-    /// shapes. If they could disagree, a report could publish `undecided`
-    /// beside an empty register and read as complete.
+    /// The register and the coverage verdict are one statement in two shapes.
+    /// If they could disagree, a report could publish `undecided` beside an
+    /// empty register and read as complete.
     #[test]
     fn the_register_is_empty_exactly_when_the_population_is_whole() {
         let cases = [
@@ -282,14 +311,26 @@ mod tests {
         ];
         for (standings, expected_whole) in cases {
             let population = population(&standings);
-            let whole = population.completeness() == PopulationCompleteness::Whole;
+            let whole = population.known_account_coverage() == KnownAccountCoverage::Whole;
             assert_eq!(whole, expected_whole, "{standings:?}");
             assert_eq!(
                 population.caveats().is_empty(),
                 whole,
-                "register disagrees with completeness for {standings:?}"
+                "register disagrees with the coverage verdict for {standings:?}"
             );
         }
+    }
+
+    /// The verdict was renamed and the values were not. The name said more
+    /// than the fold can know — coverage is of the accounts the system was
+    /// told about, never of what a source held — and the three verdicts
+    /// themselves were always exactly that. A client switching on the value
+    /// keeps its three cases; what changed is the question they answer.
+    #[test]
+    fn renaming_the_verdict_did_not_renumber_it() {
+        assert_eq!(KnownAccountCoverage::Whole.code(), "whole");
+        assert_eq!(KnownAccountCoverage::Bounded.code(), "bounded");
+        assert_eq!(KnownAccountCoverage::Undecided.code(), "undecided");
     }
 
     #[test]

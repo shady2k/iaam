@@ -2246,7 +2246,7 @@ fn issue(value: &MaterialIssue) -> String {
 /// **First in every report that carries it**, before the accounts, the
 /// currencies and the population. A caveat published after the figures has
 /// already lost to the reader who stopped at the figures — which is the
-/// difficulty this block answers: `population.completeness` was the last
+/// difficulty this block answers: `population` was the last
 /// top-level field of the balances answer, and a run that read `covered=3,
 /// outside=15` as an ordinary complete result never got that far.
 ///
@@ -2280,6 +2280,12 @@ pub struct ConfidenceDto {
     /// Exactly `caveats == []`, and derived from it rather than stated beside
     /// it: there is no way to build this block asserting completeness over a
     /// non-empty register.
+    ///
+    /// Bounded by what the report can see. Every caveat is read off a
+    /// computation the report itself performed, so `true` says "nothing the
+    /// fold could check is missing" — and for the population half of the
+    /// register, what the fold can check is the accounts this instance has been
+    /// told about. See `population.known_account_coverage`.
     pub complete: bool,
     /// The specific things that are not. Always present; empty exactly when
     /// `complete` is true.
@@ -2448,11 +2454,21 @@ impl CaveatSubjectDto {
 /// computed afterwards can see what was left out. This block is the second
 /// statement, and without it a report over part of the owner's money reads as
 /// an answer about all of it.
+///
+/// **`covered` and `outside` together are the whole denominator, and it is the
+/// accounts this instance has been told about.** An account of the owner's that
+/// was never created here appears in neither list, and it is not reported as
+/// missing: it is invisible to the fold rather than omitted by it. That bound
+/// is why the verdict below is called `known_account_coverage` and not
+/// `completeness` — the old name invited a client to read `whole` as "these
+/// figures are all of his money", which this API cannot know and does not say.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PopulationDto {
     /// The scope the report was computed over.
     pub contour: Uuid,
     pub contour_version: u32,
+    /// How much of what the system knows about this report answered about.
+    ///
     /// `whole` — every account the system knows of is covered. `bounded` —
     /// accounts are outside, and the owner has ruled on each of them, whether
     /// by placing it in a scope of his own or by ruling it outside every scope.
@@ -2464,7 +2480,17 @@ pub struct PopulationDto {
     /// enough, however many deliberate omissions stand beside it. And an
     /// account he ruled outside deliberately is `bounded`, never `whole`: this
     /// field says what the figures cover, not how tidy his decisions are.
-    pub completeness: String,
+    ///
+    /// **Read the name before reporting the value.** `whole` says "every
+    /// account we know of", never "everything he has". Nothing in this API sees
+    /// a source document — the import path receives the rows a client chose to
+    /// send it — so an export holding seven accounts of which four were ever
+    /// created here produces `whole` over the four, and a client that reports
+    /// that as complete coverage is making a claim this API did not make. The
+    /// check is not in this field: it is comparing `covered` and `outside`
+    /// against the accounts the source actually holds, which only the holder of
+    /// the source can do.
+    pub known_account_coverage: String,
     /// The accounts inside the report's scope — the population the figures were
     /// folded over. Always present; the same set the report's own rows are
     /// built from.
@@ -2503,7 +2529,7 @@ impl PopulationDto {
         Self {
             contour: population.contour.0,
             contour_version: population.version.0,
-            completeness: population.completeness().code().to_owned(),
+            known_account_coverage: population.known_account_coverage().code().to_owned(),
             covered: population
                 .covered()
                 .map(PopulationAccountDto::from_domain)

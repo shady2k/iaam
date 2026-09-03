@@ -63,7 +63,7 @@ pub use iaam_core::report::confidence::{
     returns_confidence,
 };
 pub use iaam_core::report::population::{
-    AccountStanding, PopulationAccount, PopulationCompleteness, ReportPopulation,
+    AccountStanding, KnownAccountCoverage, PopulationAccount, ReportPopulation,
 };
 
 /// Yield report request.
@@ -1463,7 +1463,10 @@ mod tests {
         );
         // One account nobody has ruled on outranks any number of deliberate
         // exclusions beside it: the answer is about an undecided part.
-        assert_eq!(population.completeness(), PopulationCompleteness::Undecided);
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Undecided
+        );
     }
 
     #[test]
@@ -1480,7 +1483,10 @@ mod tests {
         let population = population_from(&definition, accounts, &BTreeSet::new(), &BTreeSet::new());
 
         assert_eq!(population.outside().count(), 0);
-        assert_eq!(population.completeness(), PopulationCompleteness::Whole);
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Whole
+        );
     }
 
     #[test]
@@ -1506,7 +1512,10 @@ mod tests {
         let population = population_from(&definition, accounts, &placed, &BTreeSet::new());
 
         assert_eq!(population.undecided().count(), 0);
-        assert_eq!(population.completeness(), PopulationCompleteness::Bounded);
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Bounded
+        );
     }
 
     /// The bug this standing was added for. The owner ruled the account
@@ -1543,7 +1552,10 @@ mod tests {
             vec![(ruled_out, AccountStanding::OutsideByDecision)]
         );
         assert_eq!(population.undecided().count(), 0);
-        assert_eq!(population.completeness(), PopulationCompleteness::Bounded);
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Bounded
+        );
         // The name and the bank travel with the identifier: this is the list
         // the owner is asked to rule on, and two accounts he calls one word are
         // one line apart in it.
@@ -1617,9 +1629,9 @@ mod tests {
         assert!(AccountStanding::OutsideUndecided.is_outside());
 
         let completeness = [
-            PopulationCompleteness::Whole,
-            PopulationCompleteness::Bounded,
-            PopulationCompleteness::Undecided,
+            KnownAccountCoverage::Whole,
+            KnownAccountCoverage::Bounded,
+            KnownAccountCoverage::Undecided,
         ];
         let codes: BTreeSet<&str> = completeness.iter().map(|value| value.code()).collect();
         assert_eq!(codes.len(), completeness.len());

@@ -9520,11 +9520,14 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
     assert_eq!(item["state"], "needs_owner_input", "{item}");
     assert_eq!(item["required_scope"], "owner", "{item}");
     assert_eq!(
-        item["target"]["operationId"], "create_contour_version",
+        item["target"]["operationId"], "add_contour_version",
         "the item must offer membership of an existing contour: {item}"
     );
     assert_eq!(item["target"]["method"], "POST", "{item}");
-    assert_eq!(item["target"]["path"], "/v1/contours", "{item}");
+    assert_eq!(
+        item["target"]["path"], "/v1/contours/{contour}/versions",
+        "the creating route answered this item with a second perimeter: {item}"
+    );
     let candidates = item["target"]["request"]["missing"]
         .as_array()
         .expect("missing inputs")
@@ -10021,4 +10024,419 @@ async fn the_openapi_document_declares_the_population_a_report_covered() {
     assert!(balances["population"].is_object(), "{balances}");
     let flow = &spec["components"]["schemas"]["MoneyFlowReportDto"]["properties"];
     assert!(flow["population"].is_object(), "{flow}");
+}
+
+/// Creating a contour and versioning one are two acts, and the create route
+/// performs only the first.
+///
+/// The defect this pins: `POST /v1/contours` carried both, and the destructive
+/// reading — «mint a fresh contour» — was what an omitted identifier gave you.
+/// An agent that had already created a contour for one bank called the same
+/// route again for the second and silently acquired a second contour, whose
+/// report showed one bank. Repeating the create call is now a replay of the
+/// same intent, not a second perimeter.
+#[tokio::test]
+async fn creating_a_contour_twice_with_the_same_intent_writes_one_contour() {
+    let harness = harness();
+    let intent = json!({
+        "title": "Household",
+        "accounts": [harness.account.inner()],
+    });
+
+    let (status, first) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &intent),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["created"], true, "the first call created it: {first}");
+    let contour = first["contour"].as_str().expect("contour id").to_owned();
+
+    let (status, second) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &intent),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the same intent is a replay, not a second perimeter: {second}"
+    );
+    assert_eq!(second["created"], false, "{second}");
+    assert_eq!(second["contour"], contour, "{second}");
+    assert_eq!(second["version"], 1, "a replay writes no version: {second}");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed = listed.as_array().expect("contour list");
+    assert_eq!(listed.len(), 1, "two calls, one contour: {listed:?}");
+}
+
+/// The create route refuses an identifier rather than honouring it.
+///
+/// Silently ignoring the field would leave the original defect intact for every
+/// client already sending it: the request would still mint a second contour and
+/// still say nothing. The refusal names the route that does what the caller
+/// meant.
+#[tokio::test]
+async fn the_create_route_refuses_a_contour_identifier_and_names_the_versions_route() {
+    let harness = harness();
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "contour": Uuid::new_v4(),
+                "title": "Household",
+                "accounts": [harness.account.inner()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "contour", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .expect("message")
+            .contains("/v1/contours/{contour}/versions"),
+        "the refusal must name the act the caller meant: {refused}"
+    );
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(
+        listed.as_array().expect("contour list").is_empty(),
+        "a refused request writes nothing: {listed}"
+    );
+}
+
+/// The composition is readable, so an import skill can check the perimeter it
+/// was handed against what the system believes.
+#[tokio::test]
+async fn a_contour_can_be_listed_and_read_back_with_its_accounts() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Household",
+                "accounts": [harness.account.inner()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed = listed.as_array().expect("contour list");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["contour"], contour, "{listed:?}");
+    assert_eq!(listed[0]["title"], "Household", "{listed:?}");
+    assert_eq!(listed[0]["version"], 1, "{listed:?}");
+    assert_eq!(
+        listed[0]["accounts"],
+        json!([harness.account.inner()]),
+        "{listed:?}"
+    );
+
+    let (status, one) = call(
+        &harness.router,
+        get(
+            &format!("/v1/contours/{contour}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["contour"], contour, "{one}");
+    assert_eq!(one["accounts"], json!([harness.account.inner()]), "{one}");
+
+    // A contour identifier is a UUID, and a UUID is not an access right (§14).
+    let (status, absent) = call(
+        &harness.router,
+        get(
+            &format!("/v1/contours/{}", Uuid::new_v4()),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{absent}");
+}
+
+/// Adding an account to the contour the owner already has is expressible.
+///
+/// The act the reporter needed and could not perform: every route the queue
+/// offered him minted a contour, so a second bank's account could only arrive
+/// inside a second perimeter.
+#[tokio::test]
+async fn an_account_is_added_to_an_existing_contour_without_a_second_contour() {
+    let harness = harness();
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let second = second["id"].as_str().expect("account id").to_owned();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Household",
+                "accounts": [harness.account.inner()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+
+    let both = json!({ "accounts": [harness.account.inner().to_string(), second] });
+    let versions = format!("/v1/contours/{contour}/versions");
+    let (status, added) = call(
+        &harness.router,
+        post(&versions, &harness.owner_token, &both),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{added}");
+    assert_eq!(added["contour"], contour, "{added}");
+    assert_eq!(added["version"], 2, "{added}");
+    assert_eq!(
+        added["created"], false,
+        "versioning creates no contour: {added}"
+    );
+    // The title the contour already carries is not retyped to keep it.
+    assert_eq!(added["title"], "Household", "{added}");
+
+    // The same call again is a replay: the composition already holds, so no
+    // version is written and the caller is told the current one.
+    let (status, replayed) = call(
+        &harness.router,
+        post(&versions, &harness.owner_token, &both),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["version"], 2, "{replayed}");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed = listed.as_array().expect("contour list");
+    assert_eq!(listed.len(), 1, "no second perimeter: {listed:?}");
+    assert_eq!(listed[0]["version"], 2, "{listed:?}");
+    assert_eq!(
+        listed[0]["accounts"].as_array().expect("accounts").len(),
+        2,
+        "{listed:?}"
+    );
+
+    // A contour the caller does not hold is not versionable by knowing a UUID.
+    let (status, absent) = call(
+        &harness.router,
+        post(
+            &format!("/v1/contours/{}/versions", Uuid::new_v4()),
+            &harness.owner_token,
+            &both,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{absent}");
+}
+
+/// A caller may state the version it believes is current, and is refused if the
+/// contour moved under it.
+#[tokio::test]
+async fn versioning_a_contour_that_moved_under_the_caller_is_refused() {
+    let harness = harness();
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let second = second["id"].as_str().expect("account id").to_owned();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Household",
+                "accounts": [harness.account.inner()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+    let versions = format!("/v1/contours/{contour}/versions");
+
+    let (status, moved) = call(
+        &harness.router,
+        post(
+            &versions,
+            &harness.owner_token,
+            &json!({ "accounts": [second] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{moved}");
+    assert_eq!(moved["version"], 2, "{moved}");
+
+    // The stale caller still believes version 1 is current and would drop the
+    // account the other writer added.
+    let (status, stale) = call(
+        &harness.router,
+        post(
+            &versions,
+            &harness.owner_token,
+            &json!({
+                "accounts": [harness.account.inner()],
+                "expected_version": 1,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["field"], "expected_version", "{stale}");
+    // `expected` is what the route required, `actual` what arrived — the same
+    // reading every other refusal in this API has.
+    assert_eq!(stale["expected"], "2", "{stale}");
+    assert_eq!(stale["actual"], "1", "{stale}");
+
+    let (status, unchanged) = call(
+        &harness.router,
+        get(
+            &format!("/v1/contours/{contour}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unchanged}");
+    assert_eq!(unchanged["version"], 2, "a refusal writes nothing");
+    assert_eq!(unchanged["accounts"], json!([second]), "{unchanged}");
+}
+
+/// The queue's item for an undecided account offers the act that adds it to a
+/// contour the owner already has.
+///
+/// It used to offer the only shape the API had — the route that mints a
+/// contour — so following the queue literally is what produced the second
+/// perimeter in the report.
+#[tokio::test]
+async fn the_queue_points_an_undecided_account_at_an_existing_contour() {
+    let harness = harness();
+    let (status, orphan) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Second Bank Current" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{orphan}");
+    let orphan = orphan["id"].as_str().expect("account id").to_owned();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Household",
+                "accounts": [harness.account.inner()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    let item = actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .find(|item| item["kind"] == "account_scope_undecided")
+        .expect("the orphaned account is named");
+    assert_eq!(
+        item["target"]["operationId"], "add_contour_version",
+        "the item must add the account to the contour that exists: {item}"
+    );
+    assert_eq!(item["target"]["method"], "POST", "{item}");
+    assert_eq!(
+        item["target"]["path"], "/v1/contours/{contour}/versions",
+        "{item}"
+    );
+    assert_eq!(
+        item["target"]["request"]["preset"]["contour"], contour,
+        "with one contour there is no doubt which is meant: {item}"
+    );
+
+    // The action is a call the agent can make as written.
+    let preset = &item["target"]["request"]["preset"];
+    let (status, added) = call(
+        &harness.router,
+        post(
+            &format!("/v1/contours/{contour}/versions"),
+            &harness.owner_token,
+            &json!({ "accounts": preset["accounts"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{added}");
+    assert_eq!(added["contour"], contour, "{added}");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed = listed.as_array().expect("contour list");
+    assert_eq!(listed.len(), 1, "following the queue mints nothing");
+    let accounts = listed[0]["accounts"].as_array().expect("accounts");
+    assert!(
+        accounts.iter().any(|account| *account == json!(orphan)),
+        "{listed:?}"
+    );
 }

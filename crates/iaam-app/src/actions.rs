@@ -126,7 +126,14 @@ pub struct RequestPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKey {
     CreateAccount,
+    /// Create a contour. It creates one and only one: an existing contour is
+    /// versioned through [`Self::AddContourVersion`], and the two are separate
+    /// keys because they were one route, where omitting the identifier meant
+    /// «mint a fresh perimeter» and produced one for an owner who wanted a
+    /// second bank inside the perimeter he already had.
     CreateContour,
+    /// Add a version to a contour that exists, naming it in the path.
+    AddContourVersion,
     RecordOwnerBalance,
     CreateCategoryRule,
 }
@@ -137,6 +144,7 @@ impl OperationKey {
         match self {
             Self::CreateAccount => "create_account",
             Self::CreateContour => "create_contour_version",
+            Self::AddContourVersion => "add_contour_version",
             Self::RecordOwnerBalance => "record_owner_balance",
             Self::CreateCategoryRule => "create_category_rule",
         }
@@ -1110,6 +1118,13 @@ fn first_account_action() -> Action {
 /// account is outside the perimeter, deliberately» — is a different operation
 /// and an action carries one target; the sentence names it so the agent is not
 /// left believing membership is the only way out of this state.
+///
+/// The operation is [`OperationKey::AddContourVersion`], not
+/// [`OperationKey::CreateContour`]. This item exists because an account is in no
+/// contour while contours exist, so the act it wants is «put it in one of
+/// those» — and while the only operation the queue could name was the one that
+/// mints a contour, an agent following the queue literally answered the item by
+/// creating a second perimeter holding that account alone.
 fn account_scope_action(
     account: &AccountView,
     accounts: &[AccountView],
@@ -1129,6 +1144,8 @@ fn account_scope_action(
             }
             members.sort_by_key(AccountId::inner);
             let mut preset = BTreeMap::new();
+            // The contour the route names in its path. It is preset rather than
+            // missing because there is exactly one it could be.
             preset.insert("contour".to_owned(), only.id.0.to_string().into());
             preset.insert(
                 "accounts".to_owned(),
@@ -1139,29 +1156,17 @@ fn account_scope_action(
                         .collect(),
                 ),
             );
-            (
-                preset,
-                // The title is asked for because this API has one route for
-                // creating a contour and for versioning one, and it requires a
-                // title either way; the existing contour already has one and the
-                // owner should not have to retype it.
-                vec![MissingInput {
-                    pointer: "/title".into(),
-                    provided_by: ProvidedBy::Owner,
-                    candidates: None,
-                }],
-            )
+            // Nothing is missing. The title used to be asked for because the one
+            // route this item could name demanded one for a contour that already
+            // had one; versioning a contour carries its title forward, so the
+            // owner is asked for the judgement and not for retyping.
+            (preset, Vec::new())
         }
         _ => (
             BTreeMap::new(),
             vec![
                 MissingInput {
                     pointer: "/contour".into(),
-                    provided_by: ProvidedBy::Owner,
-                    candidates: None,
-                },
-                MissingInput {
-                    pointer: "/title".into(),
                     provided_by: ProvidedBy::Owner,
                     candidates: None,
                 },
@@ -1196,7 +1201,7 @@ fn account_scope_action(
             account.title
         ),
         ActionTarget::Operation {
-            operation: OperationKey::CreateContour,
+            operation: OperationKey::AddContourVersion,
             request: RequestPlan { preset, missing },
         },
     )
@@ -1469,7 +1474,7 @@ mod tests {
             actions.iter().any(|action| matches!(
                 action.target(),
                 ActionTarget::Operation {
-                    operation: OperationKey::CreateContour,
+                    operation: OperationKey::AddContourVersion,
                     ..
                 }
             )),
@@ -1495,7 +1500,10 @@ mod tests {
         let ActionTarget::Operation { operation, request } = action.target() else {
             panic!("the account scope action must name an operation");
         };
-        assert_eq!(*operation, OperationKey::CreateContour);
+        // The act is «add it to one of the contours that exist», not «create a
+        // contour»: naming the creating operation here is what let an agent
+        // answer this item with a second perimeter.
+        assert_eq!(*operation, OperationKey::AddContourVersion);
         // Two contours exist, so which one the account belongs in is the owner's
         // choice and the composition cannot be written out without it.
         assert!(
@@ -1527,9 +1535,11 @@ mod tests {
     /// The one-contour case, which is the one the reporter actually hit.
     ///
     /// With a single contour there is no doubt which one «add this account»
-    /// means, so the call is written out in full and only the title — which this
-    /// API demands of a new version and the owner should not have to retype —
-    /// is left to him.
+    /// means, so the call is written out in full: the contour the route names in
+    /// its path, and the whole composition it is to have. Nothing is left for
+    /// the owner to type — the title the contour already carries is carried
+    /// forward — and the item stays `NeedsOwnerInput` because drawing the
+    /// perimeter is his judgement, not because a field is blank.
     #[tokio::test]
     async fn with_one_contour_the_membership_call_is_written_out() {
         let owner = OwnerId::new_random();
@@ -1558,9 +1568,10 @@ mod tests {
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
             .expect("the orphaned account is named");
-        let ActionTarget::Operation { request, .. } = action.target() else {
+        let ActionTarget::Operation { operation, request } = action.target() else {
             panic!("the account scope action must name an operation");
         };
+        assert_eq!(*operation, OperationKey::AddContourVersion);
         assert_eq!(
             request.preset.get("contour"),
             Some(&serde_json::Value::from(contour.0.to_string()))
@@ -1576,8 +1587,11 @@ mod tests {
                 expected.into_iter().map(serde_json::Value::from).collect()
             ))
         );
-        assert_eq!(request.missing.len(), 1);
-        assert_eq!(request.missing[0].pointer, "/title");
+        assert!(
+            request.missing.is_empty(),
+            "the owner is asked for a judgement, not for a title he already gave: {:?}",
+            request.missing
+        );
     }
 
     /// A new account reopens the goal, which `!contours.is_empty()` cannot.
@@ -1695,6 +1709,7 @@ mod tests {
         let contours = [ContourView {
             id: ContourId::new_random(),
             version: ContourVersion(1),
+            title: "Household".into(),
             accounts: vec![inside],
         }];
         let exclusions = [AccountScopeExclusionView {

@@ -339,6 +339,7 @@ impl Store for SqliteAdapter {
                 views.push(ContourView {
                     id: record.id,
                     version: record.version,
+                    title: record.title,
                     accounts,
                 });
             }

@@ -4,6 +4,7 @@
 //! the result. There are no arithmetic operations on money here —
 //! this is enforced by the architecture guard (§3.1, §13).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -19,7 +20,7 @@ use iaam_app::actions::{
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
-use iaam_app::ports::{AccountScopeExclusionView, AccountView, Principal, Scope};
+use iaam_app::ports::{AccountScopeExclusionView, AccountView, ContourView, Principal, Scope};
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
     list_category_rules, list_groups, preview_category_rule, retire_category,
@@ -64,10 +65,11 @@ use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
     AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto, ActionDto,
-    ActionSubjectDto, ActionTargetDto, ActionsResponseDto, BalancesReportDto, BrokerAccessDto,
-    BrokerSyncRequest, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest,
-    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
-    ClassificationRuleDto, ClassificationRuleRequest, ContourVersionDto, CorrectImportRequest,
+    ActionSubjectDto, ActionTargetDto, ActionsResponseDto, AddContourVersionRequest,
+    BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
+    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
+    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
     CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
     DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InstrumentDto, IssuedTokenDto,
@@ -85,6 +87,7 @@ use iaam_app::scenarios::documents::UploadedDocument;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
+pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
@@ -1791,19 +1794,35 @@ pub async fn revoke_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// New contour composition version.
+/// Create a contour.
+///
+/// This route creates a contour and nothing else. It used to do two jobs — create
+/// one, and add a version to one — chosen by whether the body carried a `contour`
+/// field, so the destructive reading was the one an omission gave you. An agent
+/// that had drawn a perimeter for one bank called it again for the second and was
+/// given a second perimeter holding that bank alone: every operation recorded,
+/// every verdict positive, and the report over the newer contour showing one
+/// bank. Adding a version is now `POST /v1/contours/{contour}/versions`, which
+/// cannot create anything because it has nothing to create from.
+///
+/// Repeating the call with the same intent — the same title and the same
+/// composition — is a replay of that intent and not a second perimeter: it
+/// answers `200` with `created: false` and the contour that already says it. An
+/// agent retrying a call it is not sure landed is the ordinary case, and a
+/// perimeter is not a thing to acquire twice by accident.
 #[utoipa::path(
     post,
     path = "/v1/contours",
     operation_id = CREATE_CONTOUR_VERSION_OPERATION_ID,
     request_body = CreateContourVersionRequest,
     responses(
-        (status = 201, description = "Version created", body = ContourVersionDto),
+        (status = 201, description = "Contour created", body = ContourVersionDto),
+        (status = 200, description = "The same intent was already recorded; nothing was written", body = ContourVersionDto),
         (status = 403, description = "Insufficient privileges", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
-        (status = 422, description = "Request could not be read", body = ApiError)
+        (status = 422, description = "Request could not be read, or it named a contour", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1813,7 +1832,226 @@ pub async fn create_contour_version(
     ApiJson(request): ApiJson<CreateContourVersionRequest>,
 ) -> Result<(StatusCode, Json<ContourVersionDto>), ApiFailure> {
     require_admin(&principal)?;
-    if request.accounts.is_empty() {
+    // Refused rather than ignored. Ignoring it would leave every client still
+    // sending the field creating perimeters it did not ask for, and saying
+    // nothing — which is the defect, only quieter.
+    if request.contour.is_some() {
+        return Err(unprocessable(
+            "contour",
+            "no contour identifier",
+            "a contour identifier",
+            "this route creates a contour; to add a version to one that exists, \
+             call POST /v1/contours/{contour}/versions",
+        ));
+    }
+    let accounts = bounded_composition(&request.accounts)?;
+
+    // A replay of the same intent, not a second perimeter.
+    let existing = state.services.store.list_contours(principal.owner).await?;
+    if let Some(already) = existing
+        .iter()
+        .find(|contour| contour.title == request.title && same_composition(contour, &accounts))
+    {
+        return Ok((StatusCode::OK, Json(contour_version_dto(already, false))));
+    }
+
+    let contour = ContourId(Uuid::new_v4());
+    let version = ContourVersion(1);
+    state
+        .services
+        .store
+        .insert_contour_version(
+            principal.owner,
+            ContourDefinition::new(contour, version, accounts.clone()),
+            request.title.clone(),
+            accounts.clone(),
+        )
+        .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ContourVersionDto {
+            contour: contour.0,
+            version: version.0,
+            title: request.title,
+            accounts: accounts.iter().map(|id| id.inner()).collect(),
+            created: true,
+        }),
+    ))
+}
+
+/// Add a version to a contour that exists.
+///
+/// The contour is named by the path, so there is no field whose absence could be
+/// read as «make me a new one» — which is the whole point of the split. This is
+/// the act an owner wants when a second bank's account has to come inside the
+/// perimeter he already has, and until it existed the only route the API offered
+/// him created a second one.
+///
+/// The composition is written whole. Sending only the account being added would
+/// drop every existing member, so the request carries the membership the contour
+/// is to have from this version onwards.
+#[utoipa::path(
+    post,
+    path = "/v1/contours/{contour}/versions",
+    operation_id = ADD_CONTOUR_VERSION_OPERATION_ID,
+    params(("contour" = Uuid, Path, description = "Contour identifier")),
+    request_body = AddContourVersionRequest,
+    responses(
+        (status = 201, description = "Version created", body = ContourVersionDto),
+        (status = 200, description = "The contour already holds this composition; nothing was written", body = ContourVersionDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Contour does not exist or belongs to someone else", body = ApiError),
+        (status = 409, description = "The contour moved past the version the caller named", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn add_contour_version(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<AddContourVersionRequest>,
+) -> Result<(StatusCode, Json<ContourVersionDto>), ApiFailure> {
+    require_admin(&principal)?;
+    let current = owned_contour(&state, &principal, ContourId(id)).await?;
+
+    // The precondition, checked before anything is read out of the body: a
+    // caller that reasoned from a version someone has since replaced would not
+    // merge with that writer, it would discard them, and it cannot tell from the
+    // result which happened.
+    if let Some(expected) = request.expected_version
+        && expected != current.version.0
+    {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            ApiError {
+                code: "version_conflict".into(),
+                message: "the contour has moved on since the version this request names; \
+                          read it back and decide the composition again"
+                    .into(),
+                field: Some("expected_version".into()),
+                expected: Some(current.version.0.to_string()),
+                actual: Some(expected.to_string()),
+                correlation_id: None,
+            },
+        ));
+    }
+
+    let accounts = bounded_composition(&request.accounts)?;
+    // The title the contour already carries, unless the caller renames it. The
+    // owner is asked for the judgement, never for a name he has already given.
+    let title = request.title.unwrap_or_else(|| current.title.clone());
+
+    // Nothing to record. An identical version is not history, it is noise, and a
+    // retried call must not push the version the owner's reports cite forward.
+    if title == current.title && same_composition(&current, &accounts) {
+        return Ok((StatusCode::OK, Json(contour_version_dto(&current, false))));
+    }
+
+    let version = ContourVersion(current.version.0.saturating_add(1));
+    state
+        .services
+        .store
+        .insert_contour_version(
+            principal.owner,
+            ContourDefinition::new(current.id, version, accounts.clone()),
+            title.clone(),
+            accounts.clone(),
+        )
+        .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ContourVersionDto {
+            contour: current.id.0,
+            version: version.0,
+            title,
+            accounts: accounts.iter().map(|id| id.inner()).collect(),
+            // Versioning creates no contour. The field is not decoration here:
+            // it is what tells a caller which of the two acts it performed.
+            created: false,
+        }),
+    ))
+}
+
+/// The owner's contours, each at its current version.
+///
+/// The composition was write-only over HTTP, so an import skill had to be handed
+/// the perimeter as run-time input and had no way to check it against what the
+/// system believes. This is a view of the same composition the write routes
+/// build — derived from it, never a second copy.
+#[utoipa::path(
+    get,
+    path = "/v1/contours",
+    operation_id = "list_contours",
+    responses(
+        (status = 200, description = "Owner's contours", body = Vec<ContourDto>),
+        (status = 401, description = "Authentication required", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_contours(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<ContourDto>>, ApiFailure> {
+    let contours = state.services.store.list_contours(principal.owner).await?;
+    Ok(Json(contours.iter().map(contour_dto).collect()))
+}
+
+/// One contour, with the composition its current version names.
+#[utoipa::path(
+    get,
+    path = "/v1/contours/{contour}",
+    operation_id = "get_contour",
+    params(("contour" = Uuid, Path, description = "Contour identifier")),
+    responses(
+        (status = 200, description = "The contour and its composition", body = ContourDto),
+        (status = 404, description = "Contour does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_contour(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<ContourDto>, ApiFailure> {
+    let contour = owned_contour(&state, &principal, ContourId(id)).await?;
+    Ok(Json(contour_dto(&contour)))
+}
+
+/// Refuse a contour identifier the owner does not hold.
+///
+/// A missing contour and someone else's return the same `404`, for the reason
+/// `owned_account` does: a different answer would tell an outsider that such a
+/// record exists (§14).
+async fn owned_contour(
+    state: &ServerState,
+    principal: &Principal,
+    contour: ContourId,
+) -> Result<ContourView, ApiFailure> {
+    let contours = state.services.store.list_contours(principal.owner).await?;
+    contours
+        .into_iter()
+        .find(|held| held.id == contour)
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                ApiError::simple("not_found", format!("not found: contour {}", contour.0)),
+            )
+        })
+}
+
+/// The membership a contour version may be given.
+///
+/// A contour with no accounts has no boundary, and a report over one would be a
+/// confident answer about nothing.
+fn bounded_composition(accounts: &[Uuid]) -> Result<Vec<AccountId>, ApiFailure> {
+    if accounts.is_empty() {
         return Err(ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             ApiError {
@@ -1826,30 +2064,37 @@ pub async fn create_contour_version(
             },
         ));
     }
-    let contour = ContourId(request.contour.unwrap_or_else(Uuid::new_v4));
-    let previous = state
-        .services
-        .store
-        .latest_contour_version(principal.owner, contour)
-        .await?;
-    let version = ContourVersion(previous.map_or(1, |value| value.0.saturating_add(1)));
-    let accounts: Vec<AccountId> = request.accounts.iter().copied().map(AccountId).collect();
-    let definition = ContourDefinition::new(contour, version, accounts.clone());
+    Ok(accounts.iter().copied().map(AccountId).collect())
+}
 
-    state
-        .services
-        .store
-        .insert_contour_version(principal.owner, definition, request.title, accounts.clone())
-        .await?;
+/// Whether a contour already covers exactly this set of accounts.
+///
+/// Compared as a set: a composition is which accounts are inside, and neither
+/// the order they were listed in nor a repetition changes that.
+fn same_composition(contour: &ContourView, accounts: &[AccountId]) -> bool {
+    let held: BTreeSet<AccountId> = contour.accounts.iter().copied().collect();
+    let asked: BTreeSet<AccountId> = accounts.iter().copied().collect();
+    held == asked
+}
 
-    Ok((
-        StatusCode::CREATED,
-        Json(ContourVersionDto {
-            contour: contour.0,
-            version: version.0,
-            accounts: accounts.iter().map(|id| id.inner()).collect(),
-        }),
-    ))
+fn contour_dto(contour: &ContourView) -> ContourDto {
+    ContourDto {
+        contour: contour.id.0,
+        title: contour.title.clone(),
+        version: contour.version.0,
+        accounts: contour.accounts.iter().map(|id| id.inner()).collect(),
+    }
+}
+
+/// The answer for a call that wrote nothing: the contour as it already stands.
+fn contour_version_dto(contour: &ContourView, created: bool) -> ContourVersionDto {
+    ContourVersionDto {
+        contour: contour.id.0,
+        version: contour.version.0,
+        title: contour.title.clone(),
+        accounts: contour.accounts.iter().map(|id| id.inner()).collect(),
+        created,
+    }
 }
 
 /// Operation ingestion.

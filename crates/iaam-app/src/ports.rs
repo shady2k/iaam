@@ -92,6 +92,10 @@ pub struct AccountView {
 pub struct ContourView {
     pub id: ContourId,
     pub version: ContourVersion,
+    /// The title recorded with this version. It travels with the composition
+    /// because a caller adding an account to a contour must not have to retype
+    /// the name the contour already carries.
+    pub title: String,
     /// The accounts in this version. Empty is a real composition: a contour
     /// version can be stored with no members, and it covers nothing.
     pub accounts: Vec<AccountId>,

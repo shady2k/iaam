@@ -82,11 +82,29 @@ pub struct AccountView {
     pub institution: Option<String>,
 }
 
-/// The current version of an owner's contour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The current version of an owner's contour, with the accounts it covers.
+///
+/// The composition travels with the identity rather than behind a second call:
+/// every question the policy asks about a contour is a question about which
+/// accounts it covers, and a view that answers only «it exists» is the shape
+/// that let an account belong to no contour unnoticed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContourView {
     pub id: ContourId,
     pub version: ContourVersion,
+    /// The accounts in this version. Empty is a real composition: a contour
+    /// version can be stored with no members, and it covers nothing.
+    pub accounts: Vec<AccountId>,
+}
+
+/// The owner's statement that an account sits outside every contour on purpose.
+///
+/// Membership is not mirrored here — it is read from [`ContourView::accounts`].
+/// An account named by neither is awaiting the owner's decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountScopeExclusionView {
+    pub account: AccountId,
+    pub reason: String,
 }
 
 /// Per-account business activity projected by the journal store.
@@ -306,6 +324,26 @@ pub trait Store: Send + Sync {
         owner: OwnerId,
         account: AccountId,
     ) -> Result<Vec<ControlAssertionView>, AppError>;
+
+    /// Every account the owner has ruled outside every contour, with his reason.
+    async fn list_account_scope_exclusions(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountScopeExclusionView>, AppError>;
+
+    /// Record, or replace, that statement for one account.
+    async fn record_account_scope_exclusion(
+        &self,
+        owner: OwnerId,
+        exclusion: AccountScopeExclusionView,
+    ) -> Result<(), AppError>;
+
+    /// Withdraw it, returning the account to awaiting the owner's decision.
+    async fn clear_account_scope_exclusion(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError>;
 
     async fn save_snapshot(&self, owner: OwnerId, snapshot: Snapshot) -> Result<(), AppError>;
     async fn load_snapshot(

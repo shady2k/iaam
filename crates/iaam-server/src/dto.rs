@@ -2612,7 +2612,24 @@ pub struct ActionDto {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_scope: Option<String>,
+    /// What the item is about, when it is about one thing. Absent on the
+    /// existential items — «no account exists», «no contour exists» — which name
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<ActionSubjectDto>,
     pub target: ActionTargetDto,
+}
+
+/// The typed subject of an action.
+///
+/// A field of its own rather than a name buried in `reason`: `id` is opaque by
+/// contract and `reason` is a sentence, so a client that wants the items about
+/// one account had no way to select them without parsing prose.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActionSubjectDto {
+    Account { id: Uuid },
+    Event { id: Uuid },
 }
 
 /// The tagged target of an action.
@@ -2655,6 +2672,51 @@ pub struct AccountCandidateDto {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub institution: Option<String>,
+}
+
+/// Where an account stands relative to the owner's reporting perimeter.
+///
+/// Three values, because two are not enough. An account may be inside a
+/// contour, outside every contour on purpose — a counterparty's, a closed one,
+/// one the owner does not want reported — or waiting for him to say which. The
+/// third is the state a newly created account is in, and the one the action
+/// queue asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountScopeDispositionDto {
+    Inside,
+    Outside,
+    Undecided,
+}
+
+/// An account's current disposition.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountScopeDto {
+    pub account: Uuid,
+    pub disposition: AccountScopeDispositionDto,
+    /// The owner's reason, present only for `outside`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The contours naming this account. Empty unless the disposition is
+    /// `inside`, and the reason it is returned: «inside» is not a stored flag
+    /// but a fact of the contour composition, and the answer says whose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contours: Vec<Uuid>,
+}
+
+/// Recording the owner's decision about one account.
+///
+/// `inside` is not accepted here. Membership is the contour's composition, and
+/// writing it twice — once as a version and once as a flag on the account —
+/// would create two answers to one question. The route says so rather than
+/// silently accepting a value it cannot honour.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecordAccountScopeRequest {
+    pub disposition: AccountScopeDispositionDto,
+    /// Required for `outside` and refused for `undecided`. A perimeter decision
+    /// without a reason is indistinguishable, a year later, from an oversight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Account creation.

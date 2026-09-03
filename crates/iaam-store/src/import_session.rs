@@ -141,12 +141,29 @@ pub struct StoredControlFigures {
 }
 
 impl SqliteStore {
-    /// Open a session, or return the open one this import already has.
+    /// Open a session, or return the open one this declaration already has.
     ///
     /// Reuse rather than a second session, because two sessions over one
     /// declared import would split that statement's questions across two places
-    /// and the owner would answer one of them. A batch that declared no import
-    /// gets a session of its own every time: there is nothing to recognise it by.
+    /// and the owner would answer one of them.
+    ///
+    /// Recognition is keyed on the **whole** declaration and not on the import
+    /// alone (iaam-zv54). A batch that declared a source and no label names no
+    /// import, so keying on the import recognised nothing and opened a fresh
+    /// session on every call — splitting one declaration's questions across as
+    /// many sessions as the caller made calls, which is the very failure the
+    /// reuse exists to prevent. A batch that declared nothing at all still gets
+    /// a session of its own every time, and must: there is nothing to recognise
+    /// it by.
+    ///
+    /// **No unique index guards the source-only case**, unlike
+    /// `import_sessions_by_import`. It cannot be added: this behaviour has
+    /// already produced databases holding several open sessions for one source,
+    /// and a migration creating the index over them would refuse to apply and
+    /// leave the store unopenable. The race it would close is closed anyway —
+    /// the lookup and the insert share one `Immediate` transaction, so two
+    /// concurrent opens serialise — and across processes the worst outcome is
+    /// the state every such database is already in.
     pub fn open_import_session(
         &mut self,
         owner: OwnerId,
@@ -156,9 +173,7 @@ impl SqliteStore {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(import) = import
-            && let Some(existing) = open_session_for_import(&transaction, owner, import)?
-        {
+        if let Some(existing) = standing_session(&transaction, owner, source, import)? {
             transaction.commit()?;
             return Ok(existing);
         }
@@ -648,6 +663,61 @@ fn open_session_for_import(
     .optional()?
     .map(|row| session_from(owner, row))
     .transpose()
+}
+
+/// The open session one declared source has while naming no import.
+///
+/// Ordered oldest first and taken one at a time, unlike the lookup above: the
+/// import case is unique by index, while this one is not and this behaviour has
+/// left databases holding several. The oldest is the one that has been open
+/// longest and therefore the one holding whatever has already been answered, so
+/// picking it is what the refusal above it means to describe.
+fn open_session_for_source(
+    conn: &Connection,
+    owner: OwnerId,
+    source: SourceId,
+) -> Result<Option<StoredSession>, StoreError> {
+    conn.query_row(
+        "SELECT id, state, source, import, opened_at, closed_at
+         FROM import_sessions
+         WHERE owner = ?1 AND source = ?2 AND import IS NULL AND state = 'open'
+         ORDER BY opened_at, id
+         LIMIT 1",
+        params![owner.inner().to_string(), source.inner().to_string()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        },
+    )
+    .optional()?
+    .map(|row| session_from(owner, row))
+    .transpose()
+}
+
+/// The open session a declaration already has, whatever it declared.
+///
+/// One place, so the store and the scenario that refuses a half-imported
+/// session cannot disagree about which session a declaration reaches. A
+/// declaration naming an import is recognised by it; one naming only a source
+/// is recognised by that; one naming neither is recognised by nothing, which is
+/// the honest answer and not an oversight.
+pub(crate) fn standing_session(
+    conn: &Connection,
+    owner: OwnerId,
+    source: Option<SourceId>,
+    import: Option<ImportId>,
+) -> Result<Option<StoredSession>, StoreError> {
+    match (source, import) {
+        (_, Some(import)) => open_session_for_import(conn, owner, import),
+        (Some(source), None) => open_session_for_source(conn, owner, source),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Refuse to touch a session that is no longer open.

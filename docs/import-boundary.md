@@ -35,10 +35,18 @@ Two of those rows are read wrongly often enough to be worth naming.
 **`POST /v1/ingest/csv` does not accept a bank's export.** Its columns are
 iaam's — `date`, `type`, `account`, `currency` and the optional rest — and its
 accounts are resolved by *name* through the directory. It is a hand-writable
-format, not a bridge from anybody's institution. It also declares no source, so
-its rows arrive under an identity minted for that one request and
-`POST /v1/corrections/imports` cannot reach them afterwards. Sending a bank
-export to it does not half-work; it rejects every row.
+format, not a bridge from anybody's institution. Sending a bank export to it
+does not half-work; it rejects every row. The path is what invites the mistake:
+`csv` is the file extension of every statement any institution emits, and the
+name says nothing about whose columns are expected.
+
+Its rows **are** retractable, since iaam-0f8f. They used to arrive under a
+source minted for one request, which `POST /v1/corrections/imports` could never
+reach; they now arrive under the `csv` channel of the account each row names,
+so the retraction is the ordinary one — that account, channel `csv`, and the
+`label` query parameter the submission gave, if it gave one. A row that named
+no `idempotency_key` is identified by the document's digest and its own line
+number, so re-sending one document writes nothing the second time.
 
 **A session is not a second vocabulary.** `AddImportRowsRequest` carries the
 same `OperationDto` the conclusive route takes. The difference between the two
@@ -251,8 +259,13 @@ second half is decision 0005, and it is done.
   concludes every row, so no question would be raised and the session would buy
   it only the assessment before commit — which is not nothing, and is the whole
   reason the assessment exists.
-- Whether `POST /v1/ingest/csv` should accept a declared source, so its rows
-  become retractable as an import like every other channel's.
+- Whether `POST /v1/ingest/csv` should be renamed, or deleted. It now declares
+  its own source, so the retraction question is closed; what is left is the
+  name, which reads as «send your CSV here» and is the reason a bank export
+  keeps arriving at it. Renaming breaks every caller to fix a word, so the
+  documentation above was tried first. If exports still arrive, the answer is
+  deleting the route rather than renaming it: a hand-writable format nobody
+  hand-writes is a route with no user.
 
 ## 8. What was rejected
 

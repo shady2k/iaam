@@ -47,7 +47,7 @@ use crate::ports::{
     NewImportQuestion, Principal, Recorded,
 };
 use crate::scenarios::classification::{matcher_json, outcome_json};
-use crate::scenarios::ingest::submit_candidates;
+use crate::scenarios::ingest::{RowOrigin, submit_candidates};
 use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
 
 /// The durable question one row raised.
@@ -477,9 +477,7 @@ pub async fn open_session(
     import: Option<ImportId>,
 ) -> Result<ImportSessionView, AppError> {
     require_submit(principal)?;
-    if let Some(import) = import
-        && let Some(standing) = open_session_for_import(services, principal, import).await?
-    {
+    if let Some(standing) = standing_session(services, principal, source, import).await? {
         let contents = read_session(services, principal, standing.id).await?;
         if !contents.observations.is_empty() {
             return Err(half_imported_refusal(services, principal, &contents).await);
@@ -491,20 +489,104 @@ pub async fn open_session(
         .await
 }
 
-/// The open session this import already has, if it has one.
-async fn open_session_for_import(
+/// Channel a session that declared no source records its rows under.
+///
+/// A session the caller opened without saying where the rows came from is still
+/// a way rows reached the journal, and this names it. It is distinct from
+/// `file`, `paste`, `manual` and `correction` on purpose: those are things the
+/// caller declares about a source outside the system, and this one is a fact
+/// about how the rows got in.
+pub const SESSION_CHANNEL: &str = "session";
+
+/// The identity one session's rows arrive under, for the account a row names.
+///
+/// A declared session is stamped with what it declared, unchanged. An
+/// **undeclared** one used to be stamped with `SourceId::new_random()`
+/// (iaam-zv54), and three things followed from that:
+///
+/// - `POST /v1/corrections/imports` is keyed on a declaration a caller can
+///   re-derive, so an undeclared session's rows were reachable only one event
+///   at a time, while every other channel's are retractable as a group;
+/// - deduplication is scoped by the source, so it had nothing stable to scope
+///   against;
+/// - and worst, because it is the one that would be hardest to debug:
+///   [`plan_session`] runs a second time inside [`commit_session`], so the
+///   assessment the owner read and the commit planned from it minted
+///   **different** source identities. Invisible today only because
+///   `PlannedFactDto` carries no source — but «what the assessment said» and
+///   «what the commit wrote» differed in provenance, and the assessment is what
+///   the commit is supposed to be planned from.
+///
+/// The derivation answers all three because it is a function of what the caller
+/// already holds. The source is keyed on the account, as every source is; the
+/// **import is keyed on the session identifier**, which is the label in the
+/// [`ImportId::declared`] sense — the thing that names one import within an
+/// account and channel. A session commits once, so one session is one import,
+/// and the caller holds its identifier from the moment it opened it. Retracting
+/// it is therefore the ordinary call: that account, channel `session`, label
+/// the session identifier.
+///
+/// Per row rather than once for the session, for the reason [`RowOrigin`]
+/// gives: a session may hold rows for two accounts, and a source is keyed on
+/// one.
+///
+/// [`ImportId::declared`]: iaam_core::ids::ImportId::declared
+fn session_origin(owner: OwnerId, session: &ImportSessionView, account: AccountId) -> RowOrigin {
+    match session.source {
+        Some(source) => RowOrigin {
+            source,
+            import: session.import,
+        },
+        None => RowOrigin {
+            source: SourceId::declared(owner, account, SESSION_CHANNEL),
+            import: Some(ImportId::declared(
+                owner,
+                account,
+                SESSION_CHANNEL,
+                &session.id.inner().to_string(),
+            )),
+        },
+    }
+}
+
+/// The open session this declaration already has, if it has one.
+///
+/// Keyed on the whole declaration, exactly as the store's own recognition is: a
+/// declaration naming an import is found by it, one naming only a source is
+/// found by that, and one naming neither is found by nothing. Two layers
+/// disagreeing about which session a declaration reaches would refuse one
+/// import while feeding another.
+///
+/// Sorted oldest first rather than read in the store's listing order, which is
+/// newest first: a source may have several open sessions, because the defect
+/// this fixes produced them, and the store recognises the oldest.
+async fn standing_session(
     services: &AppServices,
     principal: &Principal,
-    import: ImportId,
+    source: Option<SourceId>,
+    import: Option<ImportId>,
 ) -> Result<Option<ImportSessionView>, AppError> {
-    Ok(services
+    let mut open: Vec<ImportSessionView> = services
         .store
         .list_import_sessions(principal.owner)
         .await?
         .into_iter()
-        .find(|session| {
-            session.state == ImportSessionState::Open && session.import == Some(import)
-        }))
+        .filter(|session| session.state == ImportSessionState::Open)
+        .collect();
+    open.sort_by(|left, right| {
+        left.opened_at
+            .cmp(&right.opened_at)
+            .then_with(|| left.id.inner().cmp(&right.id.inner()))
+    });
+    Ok(match (source, import) {
+        (_, Some(import)) => open
+            .into_iter()
+            .find(|session| session.import == Some(import)),
+        (Some(source), None) => open
+            .into_iter()
+            .find(|session| session.source == Some(source) && session.import.is_none()),
+        (None, None) => None,
+    })
 }
 
 /// The refusal that names the import already under way, and how to end it.
@@ -1709,28 +1791,31 @@ pub async fn plan_session(
         .filter_map(|event| event.idempotency_key)
         .collect();
 
-    let source = contents.session.source.unwrap_or_else(SourceId::new_random);
     let mut candidates = Vec::with_capacity(contents.observations.len());
     let mut read_rows = Vec::with_capacity(contents.observations.len());
     for observation in &contents.observations {
         let intake = parse_intake(&observation.payload).ok();
-        let candidate = operation_of(observation, &resolver)
-            .and_then(|operation| {
-                normalize(
-                    &operation,
-                    NormalizationContext {
-                        owner: principal.owner,
-                        source,
-                    },
-                )
-            })
+        let candidate = operation_of(observation, &resolver).and_then(|operation| {
+            // Derived from the session and the account this row names, so that
+            // this function called twice — which is exactly what committing
+            // does — plans the same provenance both times. See
+            // [`session_origin`].
+            let origin = session_origin(principal.owner, &contents.session, operation.account);
+            normalize(
+                &operation,
+                NormalizationContext {
+                    owner: principal.owner,
+                    source: origin.source,
+                },
+            )
             .map(|normalized| {
                 let mut event = normalized.event;
-                if let Some(import) = contents.session.import {
+                if let Some(import) = origin.import {
                     event.provenance = event.provenance.with_import(import);
                 }
                 event
-            });
+            })
+        });
         read_rows.push(ReadRow {
             row: observation.row,
             intake,
@@ -2290,7 +2375,6 @@ fn control_assertion_key(
 /// [`ControlClaim::CashBalance`]: iaam_core::reconciliation::claim::ControlClaim::CashBalance
 /// [`ControlClaim::CashTurnover`]: iaam_core::reconciliation::claim::ControlClaim::CashTurnover
 fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event::Event> {
-    let source = plan.session.source.unwrap_or_else(SourceId::new_random);
     let mut events = Vec::new();
     for section in plan
         .control_reconciliation
@@ -2318,8 +2402,13 @@ fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event
                 credit: section.credit_turnover.unwrap_or(PostedMinor::new(0)),
             });
         }
+        // The same derivation the rows of this session get, for the account
+        // this section is about: an assertion written under an identity nobody
+        // can name is as unreachable as a row written under one, and a second
+        // random source here would put the section and its own rows in two
+        // `StatementGroup`s.
         let provenance = Provenance::new(
-            source,
+            session_origin(owner, &plan.session, section.account).source,
             section_hash(section),
             ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
         )

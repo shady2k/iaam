@@ -68,6 +68,29 @@ has reached the journal is indistinguishable from a fact — every report will
 read it as one, and only the owner, who knows what actually happened, can
 retract it.
 
+## Where an import begins, and what you are not holding
+
+An import has a step before its first call: somebody turns a bank's export into
+rows this system can read. That step is not in this API, it is not yours, and it
+is the step the outstanding-work queue asks for without naming.
+
+The owner runs a converter of his own against his own file. It knows the
+export's columns, and it knows the two things an export never states: which
+printed name is an account of his at another institution, and which positive row
+is a merchant giving money back rather than money arriving. You are handed
+neither the file nor those answers, so you cannot reproduce that step and must
+not try to — reading his export to work them out is the thing the design forbids
+outright, not a shortcut with a cost.
+
+What you are handed is what he pastes and what the API answers. On rows he
+pastes, submit what the source stated rather than a conclusion you reached for
+it — the shape for that is the next section. Where he has a converter, give him
+the command and work from the summary he brings back.
+
+`docs/import-boundary.md` is the map: which channel writes what, who runs each,
+what his converter is responsible for knowing, and where that line is drawn
+wrongly today. Read it before extending an import, not before running one.
+
 ## A row you cannot classify is submitted as such
 
 The rule above — a missing value is asked of the owner, not filled in — used to

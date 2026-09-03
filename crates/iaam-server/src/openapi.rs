@@ -55,6 +55,8 @@ use crate::dto::{
     BatchTotalDto, ControlCheckDto, ControlComparisonDto, ControlReconciliationDto,
     ControlSectionDto, RecordedEventDto, StateImportControlFiguresRequest, StatedControlFiguresDto,
 };
+// A question's generalisation, in a block of its own for the reason above.
+use crate::dto::QuestionGeneralisationDto;
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -265,6 +267,7 @@ impl Modify for BearerSecurity {
         ControlComparisonDto,
         ControlCheckDto,
         RecordedEventDto,
+        QuestionGeneralisationDto,
         // The published vocabularies: every code the API can return, each with
         // the sentence that explains it (§13).
         VerdictCodeDto,

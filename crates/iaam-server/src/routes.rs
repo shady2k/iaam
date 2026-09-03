@@ -108,7 +108,7 @@ use crate::dto::{
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
-use iaam_app::scenarios::import_session::SessionRevision;
+use iaam_app::scenarios::import_session::{SessionRevision, describe_questions};
 use iaam_core::batch::ControlSection;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
@@ -3242,8 +3242,11 @@ pub async fn add_import_rows(
 /// `POST /v1/classification-rules` performs under an owner-only gate — so an
 /// agent that could do it here would be making the decision through a route
 /// whose name does not mention rules. Under an agent token the row settles and
-/// `rule` comes back absent; the owner turns the answer into a rule with his own
-/// token if he wants it to stand.
+/// no rule is written — but the response says so in a word and hands back the
+/// rule that would have been written, so the owner makes the settlement stand by
+/// posting `generalisation.proposal` under his own token, unedited (`iaam-ngwn`).
+/// Without that, the one party who knew a generalisation was possible is the one
+/// that could not perform it.
 ///
 /// An answer carrying a field its own word does not take — an `account` beside
 /// `received`, an `origin` beside anything but `fee` — is refused rather than
@@ -3620,8 +3623,11 @@ fn session_contents_dto(contents: &SessionContents) -> ImportSessionContentsDto 
     ImportSessionContentsDto {
         session: ImportSessionDto::from_domain(&contents.session),
         row_count: contents.observations.len(),
-        questions: contents
-            .questions
+        // Described rather than listed: each question comes back with what its
+        // answer generalised into, or with the rule it would have generalised
+        // into and did not. The owner reading a session back is the reader this
+        // is for, and «answered, no rule» told him nothing about which.
+        questions: describe_questions(contents)
             .iter()
             .map(ImportQuestionDto::from_domain)
             .collect(),

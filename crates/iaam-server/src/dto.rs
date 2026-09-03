@@ -23,7 +23,7 @@ use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CashAssetClass, CategoryRuleView, CategoryView,
     ClassificationRuleView, IssuedToken, NegativeBalanceExpectation, Scope, TokenView,
 };
-use iaam_app::ports::{ImportQuestionView, ImportSessionView, Recorded};
+use iaam_app::ports::{ImportSessionView, Recorded};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
@@ -33,6 +33,10 @@ use iaam_app::scenarios::import_session::{
     ControlReconciliation, HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow,
     RetentionReason,
 };
+// The question's own generalisation, in a block of its own rather than merged
+// into the list above: this file is edited by several changes at once, and one
+// name added to a wrapped list reflows every line of it.
+use iaam_app::scenarios::import_session::{Generalisation, QuestionOutcome};
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
     MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
@@ -6625,11 +6629,20 @@ impl ClassificationRuleChangeDto {
 /// containing them. That is the whole of iaam-gpo3: a field whose read form
 /// does not round-trip as its write form is the one thing an LLM client cannot
 /// infer, because inference is copying the shape it just saw.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+///
+/// Serialised as well as deserialised, because it is also what a session
+/// publishes as the rule an answer *would* have generalised into — see
+/// [`QuestionGeneralisationDto`]. Publishing the request type itself, rather
+/// than a look-alike beside it, is the same decision `matcher` and `outcome`
+/// being objects was: what the owner reads is what he may send back, and a
+/// second type would be the one that drifts.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClassificationRuleRequest {
     pub matcher: RuleMatcherDto,
     pub outcome: ClassifiedAsDto,
-    #[serde(default)]
+    /// The rule this one supersedes. Never set on a proposal: a rule that would
+    /// have been written for one answer replaces nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces: Option<Uuid>,
 }
 
@@ -7687,27 +7700,86 @@ pub struct ImportQuestionDto {
     pub asked_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<String>,
-    /// The classification rule the answer created, so the same counterparty is
-    /// not asked about twice.
+    /// What became of the chance to turn this answer into a standing rule.
     ///
-    /// Absent for either of two reasons, and a client cannot tell them apart
-    /// from this field alone — it knows which applies because it knows what
-    /// token it holds:
-    ///
-    /// - the row offered nothing a rule can match on, so no rule was written
-    ///   under any scope: a rule that asks nothing matches nothing, and writing
-    ///   one would record a decision that never applies;
-    /// - the answer came in under an agent token, which settles the row and
-    ///   generalises nothing (`iaam-hnod`). A standing rule decides rows nobody
-    ///   has looked at, and that is the owner's judgement, made with his own
-    ///   token through `POST /v1/classification-rules`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present, `unanswered` included, because an absent field is what
+    /// this replaced and what it could not say.
+    pub generalisation: QuestionGeneralisationDto,
+}
+
+/// Whether a standing rule stands for this answer, and if not, what would make
+/// one.
+///
+/// **This replaces the bare `rule` identifier**, which could be absent for two
+/// unrelated reasons and said which only by not being there: the row offered
+/// nothing a matcher could match on, or the answer arrived under an agent
+/// token, which settles the row and generalises nothing (`iaam-hnod`). A client
+/// could tell them apart, because it knows what token it holds. The owner
+/// reading the session back could not, and he is the one who can act on the
+/// difference.
+///
+/// So the identifier moved inside an object that names its own state. Four
+/// words, and the reader never has to reason about an absence:
+///
+/// - `recorded` — the answer created a rule, and `rule` names it;
+/// - `available` — a rule was possible and none was written, because the
+///   answerer may not generalise. `proposal` is that rule, in the exact body
+///   `POST /v1/classification-rules` takes: the owner makes the settlement stand
+///   by posting it under his own token, unedited;
+/// - `impossible` — no rule can be built from this row under any token. A
+///   matcher that asks nothing matches nothing, and an "everything" rule would
+///   silently reclassify the portfolio. There is no call that changes this;
+/// - `unanswered` — the question is still open, so nothing generalises yet.
+///
+/// `available` carrying the rule rather than only the word is the point. An
+/// agent that settles a hundred rows correctly and leaves the owner to
+/// reconstruct a hundred matchers from the rows has made the honest path the
+/// expensive one; here he copies one object per question and sends it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QuestionGeneralisationDto {
+    /// `recorded`, `available`, `impossible` or `unanswered`.
+    pub state: String,
+    /// The rule the answer created. Present exactly when `state` is `recorded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<Uuid>,
+    /// The rule this answer would generalise into, ready to be posted to
+    /// `POST /v1/classification-rules` as it stands. Present exactly when
+    /// `state` is `available`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ClassificationRuleRequest>,
+}
+
+impl QuestionGeneralisationDto {
+    #[must_use]
+    pub fn from_domain(generalisation: &Generalisation) -> Self {
+        let (rule, proposal) = match generalisation {
+            // The identifier is read leniently, exactly as it was before it
+            // moved inside this object: a stored value that will not parse
+            // costs the reader the identifier, and the state word still says
+            // truthfully that a rule was written.
+            Generalisation::Recorded { rule } => (Uuid::parse_str(rule).ok(), None),
+            Generalisation::Available { matcher, outcome } => (
+                None,
+                Some(ClassificationRuleRequest {
+                    matcher: RuleMatcherDto::from_domain(matcher),
+                    outcome: ClassifiedAsDto::from_domain(classified_as(*outcome)),
+                    replaces: None,
+                }),
+            ),
+            Generalisation::Impossible | Generalisation::Unanswered => (None, None),
+        };
+        Self {
+            state: generalisation.code().to_owned(),
+            rule,
+            proposal,
+        }
+    }
 }
 
 impl ImportQuestionDto {
     #[must_use]
-    pub fn from_domain(question: &ImportQuestionView) -> Self {
+    pub fn from_domain(outcome: &QuestionOutcome) -> Self {
+        let question = &outcome.question;
         Self {
             question: question.id.inner(),
             session: question.session.inner(),
@@ -7720,10 +7792,7 @@ impl ImportQuestionDto {
                 .collect(),
             asked_at: question.asked_at.clone(),
             answered_at: question.answered_at.clone(),
-            rule: question
-                .rule
-                .as_deref()
-                .and_then(|id| Uuid::parse_str(id).ok()),
+            generalisation: QuestionGeneralisationDto::from_domain(&outcome.generalisation),
         }
     }
 }

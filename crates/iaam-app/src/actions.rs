@@ -1629,7 +1629,7 @@ fn answer_classification_question_action(
             operation: OperationKey::AnswerImportQuestion,
             request: RequestPlan {
                 preset,
-                missing: vec![answer_input(question, accounts)],
+                missing: vec![answer_input(&question.asked, accounts)],
             },
         },
     )
@@ -1644,13 +1644,21 @@ fn answer_classification_question_action(
 /// asked; the answering route checks the answer against `Question::alternatives`
 /// as this build computes it, and the queue must offer what the route will
 /// accept and not what an older build once printed.
-fn answer_input(question: &ClassificationQuestion, accounts: &[AccountView]) -> MissingInput {
+///
+/// Public, and taking the typed question rather than the queue's own
+/// [`ClassificationQuestion`], because a refusal wants the same field. The
+/// answering route rejects an answer this question does not admit, and the
+/// commit route refuses a session that still holds one; both then publish this
+/// field, and a second construction of it would eventually offer a shape the
+/// route no longer accepts.
+#[must_use]
+pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput {
     // The far side of an internal transfer is one of the owner's *other*
     // accounts: the row is already on this one, and an account is not the other
     // side of itself.
     let others: Vec<AccountView> = accounts
         .iter()
-        .filter(|candidate| candidate.id != question.asked.account())
+        .filter(|candidate| candidate.id != asked.account())
         .cloned()
         .collect();
 
@@ -1658,8 +1666,7 @@ fn answer_input(question: &ClassificationQuestion, accounts: &[AccountView]) -> 
         pointer: "/answer".to_owned(),
         provided_by: ProvidedBy::Owner,
         candidates: None,
-        alternatives: question
-            .asked
+        alternatives: asked
             .alternatives()
             .into_iter()
             .map(|shape| InputAlternative {

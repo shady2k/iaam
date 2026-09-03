@@ -18,7 +18,7 @@ use time::Date;
 use uuid::Uuid;
 
 use crate::AppServices;
-use crate::error::AppError;
+use crate::error::{AppError, FieldRejection};
 use crate::ports::{ClassificationRuleView, Principal};
 
 pub async fn list_rules(
@@ -267,12 +267,19 @@ fn parse_outcome(outcome: Map<String, Value>) -> Result<Classification, AppError
     }
 }
 
+/// The outcome vocabulary is closed, so the refusal publishes it as values.
+///
+/// `expected` still spells the same four out in prose, because that sentence is
+/// what the error message reads as. The list beside it is the half a client can
+/// retry from without parsing anything.
 fn invalid_outcome(actual: &str) -> AppError {
-    AppError::Invalid {
-        field: "outcome".to_owned(),
-        expected: "internal_transfer, external_flow, income or fee".to_owned(),
-        actual: actual.to_owned(),
-    }
+    FieldRejection::new(
+        "outcome",
+        "internal_transfer, external_flow, income or fee",
+        actual,
+    )
+    .admitting_codes(&["internal_transfer", "external_flow", "income", "fee"])
+    .into()
 }
 
 fn subject(event: &Event) -> Option<ClassificationSubject> {

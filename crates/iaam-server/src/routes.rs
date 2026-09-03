@@ -16,7 +16,8 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
     AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
-    ActionTarget, MissingInput, OperationKey, ProvidedBy, RequestPlan, account_scope,
+    ActionTarget, InputAlternative, MissingInput, OperationKey, ProvidedBy, RequestPlan,
+    account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
@@ -205,7 +206,11 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
 }
 
 /// One way to close an action, addressed against the completed contract.
-fn resolution_option_dto(
+///
+/// Visible to the crate because a rejection publishes the same shape: a refusal
+/// whose remedy is another call names it exactly as an action does, and a second
+/// construction of the address would eventually offer a route the queue does not.
+pub(crate) fn resolution_option_dto(
     operation: OperationKey,
     request: &RequestPlan,
     catalog: &ActionCatalog,
@@ -232,17 +237,27 @@ fn missing_input_dto(missing: &MissingInput) -> MissingInputDto {
         alternatives: missing
             .alternatives
             .iter()
-            .map(|alternative| InputAlternativeDto {
-                value: alternative.value.clone(),
-                requires: alternative
-                    .requires
-                    .iter()
-                    .map(|required| RequiredInputDto {
-                        pointer: required.pointer.clone(),
-                        provided_by: provided_by_code(required.provided_by),
-                        candidates: required.candidates.as_deref().map(account_candidate_dtos),
-                    })
-                    .collect(),
+            .map(input_alternative_dto)
+            .collect(),
+    }
+}
+
+/// One admissible value, and the fields choosing it then needs.
+///
+/// Lifted out of [`missing_input_dto`] because a rejection publishes the same
+/// list without a missing input around it: the values a field admits are the
+/// values it admits whether the caller has yet to supply one or supplied a wrong
+/// one.
+pub(crate) fn input_alternative_dto(alternative: &InputAlternative) -> InputAlternativeDto {
+    InputAlternativeDto {
+        value: alternative.value.clone(),
+        requires: alternative
+            .requires
+            .iter()
+            .map(|required| RequiredInputDto {
+                pointer: required.pointer.clone(),
+                provided_by: provided_by_code(required.provided_by),
+                candidates: required.candidates.as_deref().map(account_candidate_dtos),
             })
             .collect(),
     }
@@ -2390,14 +2405,10 @@ async fn account_scope_dto(
 fn unprocessable(field: &str, expected: &str, actual: &str, message: &str) -> ApiFailure {
     ApiFailure::new(
         StatusCode::UNPROCESSABLE_ENTITY,
-        ApiError {
-            code: "invalid_request".into(),
-            message: message.to_owned(),
-            field: Some(field.to_owned()),
-            expected: Some(expected.to_owned()),
-            actual: Some(actual.to_owned()),
-            correlation_id: None,
-        },
+        ApiError::simple("invalid_request", message)
+            .about(field)
+            .expecting(expected)
+            .receiving(actual),
     )
 }
 
@@ -2489,16 +2500,27 @@ pub async fn create_token(
         TokenScopeDto::Owner => {
             return Err(ApiFailure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                ApiError {
-                    code: "invalid_request".into(),
-                    message: "an owner token cannot be issued via the API: the owner is created \
-                              with `iaam claim --label <label>`"
-                        .into(),
-                    field: Some("scope".into()),
-                    expected: Some("agent or read_only".into()),
-                    actual: Some("owner".into()),
-                    correlation_id: None,
-                },
+                ApiError::simple(
+                    "invalid_request",
+                    "an owner token cannot be issued via the API: the owner is created with \
+                     `iaam claim --label <label>`",
+                )
+                .about("scope")
+                .expecting("agent or read_only")
+                .receiving("owner")
+                // The two scopes a token may be issued with, as values: the
+                // sentence beside them says the same thing, and a caller
+                // retrying should not have to split it on the word "or".
+                .admitting(vec![
+                    InputAlternativeDto {
+                        value: "agent".to_owned(),
+                        requires: Vec::new(),
+                    },
+                    InputAlternativeDto {
+                        value: "read_only".to_owned(),
+                        requires: Vec::new(),
+                    },
+                ]),
             ));
         }
         TokenScopeDto::Agent => Scope::Agent,
@@ -2705,16 +2727,14 @@ pub async fn add_contour_version(
     {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
-            ApiError {
-                code: "version_conflict".into(),
-                message: "the contour has moved on since the version this request names; \
-                          read it back and decide the composition again"
-                    .into(),
-                field: Some("expected_version".into()),
-                expected: Some(current.version.0.to_string()),
-                actual: Some(expected.to_string()),
-                correlation_id: None,
-            },
+            ApiError::simple(
+                "version_conflict",
+                "the contour has moved on since the version this request names; read it back \
+                 and decide the composition again",
+            )
+            .about("expected_version")
+            .expecting(current.version.0.to_string())
+            .receiving(expected.to_string()),
         ));
     }
 
@@ -2831,14 +2851,13 @@ fn bounded_composition(accounts: &[Uuid]) -> Result<Vec<AccountId>, ApiFailure> 
     if accounts.is_empty() {
         return Err(ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError {
-                code: "invalid_request".into(),
-                message: "a contour with no accounts has no boundary".into(),
-                field: Some("accounts".into()),
-                expected: Some("at least one account".into()),
-                actual: Some("empty list".into()),
-                correlation_id: None,
-            },
+            ApiError::simple(
+                "invalid_request",
+                "a contour with no accounts has no boundary",
+            )
+            .about("accounts")
+            .expecting("at least one account")
+            .receiving("empty list"),
         ));
     }
     Ok(accounts.iter().copied().map(AccountId).collect())
@@ -3273,6 +3292,7 @@ pub async fn assess_import_session(
 pub async fn commit_import_session(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiPath(id): ApiPath<Uuid>,
     ApiJsonOrDefault(request): ApiJsonOrDefault<CommitImportSessionRequest>,
 ) -> Result<Json<ImportCommitDto>, ApiFailure> {
@@ -3284,13 +3304,18 @@ pub async fn commit_import_session(
     // revision it committed under. Making the body mandatory would break every
     // caller that already commits with nothing to say.
     let revision = request.revision.map(SessionRevision);
+    // Converted through the catalog rather than with `?`: this is the one
+    // refusal in the API whose remedy is a call — an unanswered question is not
+    // settled by writing anything into the request — and the address of that
+    // call is only resolvable against the completed document.
     let outcome = iaam_app::scenarios::import_session::commit_session(
         &state.services,
         &principal,
         ImportSessionId(id),
         revision.as_ref(),
     )
-    .await?;
+    .await
+    .map_err(|error| ApiFailure::from_app(error, &catalog))?;
     let contents = iaam_app::scenarios::import_session::read_session(
         &state.services,
         &principal,
@@ -3771,14 +3796,10 @@ pub async fn returns_report_with_rates(
         let parsed = rate.rate.parse::<Decimal>().map_err(|_| {
             ApiFailure::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                ApiError {
-                    code: "invalid_request".into(),
-                    message: "exchange rate must be a decimal number".into(),
-                    field: Some("rate".into()),
-                    expected: Some("decimal number represented as a string".into()),
-                    actual: Some(rate.rate.clone()),
-                    correlation_id: None,
-                },
+                ApiError::simple("invalid_request", "exchange rate must be a decimal number")
+                    .about("rate")
+                    .expecting("decimal number represented as a string")
+                    .receiving(rate.rate.clone()),
             )
         })?;
         fx = fx.with_rate(
@@ -4120,14 +4141,14 @@ fn declared_source_filter(
 fn missing_companion(field: &'static str, expected: &'static str) -> ApiFailure {
     ApiFailure::new(
         StatusCode::UNPROCESSABLE_ENTITY,
-        ApiError {
-            code: "invalid_request".into(),
-            message: format!("required query parameter {field} is missing"),
-            field: Some(field.to_owned()),
-            expected: Some(expected.to_owned()),
-            actual: None,
-            correlation_id: None,
-        },
+        // No `receiving`: the field is absent, and quoting the companion's
+        // value instead would name one field and echo another.
+        ApiError::simple(
+            "invalid_request",
+            format!("required query parameter {field} is missing"),
+        )
+        .about(field)
+        .expecting(expected),
     )
 }
 
@@ -4139,23 +4160,40 @@ fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure
     .map_err(|_| invalid_field(field, "YYYY-MM-DD", value.to_owned()))
 }
 
+/// The currency vocabulary is closed and short, so the refusal publishes it.
+///
+/// The codes come from [`CurrencyCode::ALL`] rather than from the sentence
+/// beside them: a sixth currency would otherwise be accepted by `from_code` and
+/// withheld from the caller told which five it may send.
 fn parse_currency(field: &'static str, value: &str) -> Result<CurrencyCode, ApiFailure> {
-    CurrencyCode::from_code(value)
-        .ok_or_else(|| invalid_field(field, "RUB, USD, EUR, CNY or XAU", value.to_owned()))
+    CurrencyCode::from_code(value).ok_or_else(|| {
+        ApiFailure::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::simple("invalid_request", format!("invalid field {field}"))
+                .about(field)
+                .expecting("RUB, USD, EUR, CNY or XAU")
+                .receiving(value)
+                .admitting(
+                    CurrencyCode::ALL
+                        .iter()
+                        .map(|currency| InputAlternativeDto {
+                            value: currency.code().to_owned(),
+                            requires: Vec::new(),
+                        })
+                        .collect(),
+                ),
+        )
+    })
 }
 
 fn invalid_field(field: impl Into<String>, expected: &str, actual: String) -> ApiFailure {
     let field = field.into();
     ApiFailure::new(
         StatusCode::UNPROCESSABLE_ENTITY,
-        ApiError {
-            code: "invalid_request".into(),
-            message: format!("invalid field {field}"),
-            field: Some(field),
-            expected: Some(expected.into()),
-            actual: Some(actual),
-            correlation_id: None,
-        },
+        ApiError::simple("invalid_request", format!("invalid field {field}"))
+            .about(field)
+            .expecting(expected)
+            .receiving(actual),
     )
 }
 fn invalid_rejection(rejection: Rejection) -> ApiFailure {
@@ -4178,14 +4216,13 @@ fn parse_as_of(value: Option<&str>) -> Result<Option<Date>, ApiFailure> {
     .map_err(|_| {
         ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError {
-                code: "invalid_request".into(),
-                message: "report date must be in YYYY-MM-DD format".into(),
-                field: Some("as_of".into()),
-                expected: Some("YYYY-MM-DD".into()),
-                actual: Some(raw.to_owned()),
-                correlation_id: None,
-            },
+            ApiError::simple(
+                "invalid_request",
+                "report date must be in YYYY-MM-DD format",
+            )
+            .about("as_of")
+            .expecting("YYYY-MM-DD")
+            .receiving(raw),
         )
     })
 }
@@ -4200,14 +4237,10 @@ fn declared_channel(declared: &DeclaredSourceDto) -> Result<&str, ApiFailure> {
     if channel.is_empty() || channel.len() > 32 {
         return Err(ApiFailure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError {
-                code: "invalid_request".into(),
-                message: "channel must be 1..=32 characters".into(),
-                field: Some("source.channel".into()),
-                expected: Some("a short channel name such as file, paste or manual".into()),
-                actual: Some(declared.channel.clone()),
-                correlation_id: None,
-            },
+            ApiError::simple("invalid_request", "channel must be 1..=32 characters")
+                .about("source.channel")
+                .expecting("a short channel name such as file, paste or manual")
+                .receiving(declared.channel.clone()),
         ));
     }
     Ok(channel)

@@ -78,6 +78,8 @@ impl ActionCatalog {
             OperationKey::CreateCategoryRule,
             OperationKey::RecordAccountTransferPartners,
             OperationKey::RecordAccountScope,
+            OperationKey::OpenImportSession,
+            OperationKey::SyncBroker,
             OperationKey::AnswerImportQuestion,
         ] {
             let operation_id = key.as_str();

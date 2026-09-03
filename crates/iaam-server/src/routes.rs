@@ -366,7 +366,7 @@ pub async fn upload_document(
     Ok(Json(document_dto(result)))
 }
 
-/// Re-parse the source while verifying that it is identical.
+/// Re-parse a source the system already keeps.
 #[utoipa::path(
     post,
     path = "/v1/documents/{id}/reparse",
@@ -374,11 +374,19 @@ pub async fn upload_document(
         ("id" = String, Path, description = "SHA-256 of the source document"),
         DocumentParams
     ),
-    request_body(content = String, description = "Binary XLSX/XLS workbook"),
+    request_body(
+        content = String,
+        description = "Empty: the document stored under this hash is parsed again, so a \
+                       caller holding only the hash needs nothing else. A binary XLSX/XLS \
+                       workbook is still accepted, and its hash still checked, for a \
+                       document uploaded before the system began storing sources — one \
+                       recorded facts but kept no body. Sending it stores it, and the next \
+                       reparse of that document needs no body."
+    ),
     responses(
         (status = 200, description = "Outcome for each row", body = DocumentDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 422, description = "Hash or document invalid", body = ApiError),
+        (status = 422, description = "Hash invalid, document invalid, or no stored document and no body", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError)
     ),
@@ -392,11 +400,16 @@ pub async fn reparse_document(
     ApiBytes(body): ApiBytes,
 ) -> Result<Json<DocumentDto>, ApiFailure> {
     let directory = build_directory(&state.services, &principal).await?;
+    // An empty body means «parse what you kept», not «parse an empty workbook»:
+    // the second is never a valid report, so nothing legitimate is lost by
+    // reading the absence this way, and the founding constraint is served — the
+    // caller names the document and holds none of it.
+    let supplied = (!body.is_empty()).then(|| body.as_ref());
     let result = reparse_report(
         &state.services,
         &principal,
         &document_hash,
-        &body,
+        supplied,
         &directory,
         params.account.map(AccountId),
     )

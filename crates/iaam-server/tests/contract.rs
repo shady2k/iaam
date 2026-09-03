@@ -10440,3 +10440,144 @@ async fn the_queue_points_an_undecided_account_at_an_existing_contour() {
         "{listed:?}"
     );
 }
+
+/// The workbook every document test in this block uploads.
+///
+/// Synthetic throughout: a real statement would put the owner's money into the
+/// repository, and no assertion here needs a real one.
+const SYNTHETIC_REPORT: &[u8] =
+    include_bytes!("../../../tests/fixtures/reports/tinkoff-synthetic.xlsx").as_slice();
+
+fn document_upload(harness: &Harness, workbook: &[u8]) -> Request<Body> {
+    Request::builder()
+        .uri(format!("/v1/documents?account={}", harness.account.inner()))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .body(Body::from(workbook.to_vec()))
+        .expect("request")
+}
+
+fn document_reparse(harness: &Harness, document_hash: &str, workbook: &[u8]) -> Request<Body> {
+    Request::builder()
+        .uri(format!(
+            "/v1/documents/{document_hash}/reparse?account={}",
+            harness.account.inner()
+        ))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .body(Body::from(workbook.to_vec()))
+        .expect("request")
+}
+
+/// The system keeps the document, so the agent driving a reparse need not.
+///
+/// The founding constraint is that the agent holds none of the owner's data.
+/// A reparse route that demands the workbook back contradicts it: the caller
+/// could only satisfy it by having kept the owner's statement. Reparsing with
+/// the bytes and reparsing without them must reach the same answer, or the
+/// empty-bodied call is a different operation wearing the same name.
+#[tokio::test]
+async fn a_stored_document_is_reparsed_without_being_sent_again() {
+    let harness = harness();
+
+    let (status, uploaded) =
+        call(&harness.router, document_upload(&harness, SYNTHETIC_REPORT)).await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
+    let document_hash = uploaded["document_hash"]
+        .as_str()
+        .expect("the upload names the document by its hash")
+        .to_owned();
+
+    let (status, with_bytes) = call(
+        &harness.router,
+        document_reparse(&harness, &document_hash, SYNTHETIC_REPORT),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{with_bytes}");
+
+    let (status, without_bytes) = call(
+        &harness.router,
+        document_reparse(&harness, &document_hash, b""),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{without_bytes}");
+    assert_eq!(
+        without_bytes, with_bytes,
+        "a reparse from the stored document must produce what the resent bytes produced"
+    );
+}
+
+/// The same file twice is one document, so the source identifier is stable.
+///
+/// The uploaded document is deduplicated by owner and hash in the store. If the
+/// response invented a fresh source identifier on the second upload, it would
+/// name a document that is not on record.
+#[tokio::test]
+async fn the_same_document_uploaded_twice_keeps_one_source_identifier() {
+    let harness = harness();
+
+    let (status, first) = call(&harness.router, document_upload(&harness, SYNTHETIC_REPORT)).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = call(&harness.router, document_upload(&harness, SYNTHETIC_REPORT)).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+
+    assert_eq!(first["document_hash"], second["document_hash"]);
+    assert_eq!(
+        first["source"], second["source"],
+        "the same file is one document, not two"
+    );
+}
+
+/// The fallback, and the refusal when it cannot help.
+///
+/// A document uploaded before the system began storing sources left facts and
+/// no bytes; a reparse of one has nothing to read. The route still accepts the
+/// workbook for that case, and says so when it is given neither.
+#[tokio::test]
+async fn a_reparse_of_a_document_that_was_never_stored_says_why_it_cannot() {
+    let harness = harness();
+    let never_uploaded = "b".repeat(64);
+
+    let (status, refusal) = call(
+        &harness.router,
+        document_reparse(&harness, &never_uploaded, b""),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    let message = refusal["message"]
+        .as_str()
+        .expect("a refusal has a message");
+    assert!(
+        message.contains("before the system began storing"),
+        "the refusal must name why the stored document is missing: {message}"
+    );
+}
+
+/// The published contract tells a client when the body is still needed.
+#[tokio::test]
+async fn the_openapi_document_says_when_a_reparse_still_needs_the_bytes() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let reparse = &spec["paths"]["/v1/documents/{id}/reparse"]["post"]["requestBody"];
+    let description = reparse["description"]
+        .as_str()
+        .expect("the reparse body is described");
+    assert!(
+        description.contains("Empty"),
+        "the contract must say that an empty body reparses the stored document: {description}"
+    );
+    assert!(
+        description.contains("before the system began storing"),
+        "the contract must say when the bytes are still needed: {description}"
+    );
+}

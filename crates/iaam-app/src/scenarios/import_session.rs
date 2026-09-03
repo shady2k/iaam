@@ -432,11 +432,14 @@ pub async fn add_rows(
 /// 1. The answer is checked against what the question actually offered. An
 ///    answer the question does not admit is a different mistake from a wrong
 ///    answer, and only the first can be refused.
-/// 2. The decision is written as a durable [`ClassificationRule`], so the next
-///    import of a matching row resolves without asking. A row that offers
+/// 2. If the answerer may generalise, the decision is also written as a durable
+///    [`ClassificationRule`], so the next import of a matching row resolves
+///    without asking. See [`may_generalise`]: settling this row is import
+///    mechanics, and standing rules are the owner's judgement. A row that offers
 ///    nothing to match on — no counterparty, no description, no word from the
-///    source — gets **no** rule, because a matcher that asks nothing matches
-///    nothing and an "everything" rule would silently reclassify the portfolio.
+///    source — gets **no** rule either way, because a matcher that asks nothing
+///    matches nothing and an "everything" rule would silently reclassify the
+///    portfolio.
 /// 3. The answer is recorded on the question and on the row.
 ///
 /// The journal is not touched. The answer settles what the row is; commit is
@@ -515,7 +518,7 @@ pub async fn answer_question(
             actual: rejection.actual,
         })?;
 
-    let rule = match matcher_for(&observed) {
+    let rule = match matcher_for(&observed).filter(|_| may_generalise(principal)) {
         Some(matcher) => Some(
             services
                 .rules
@@ -1914,6 +1917,37 @@ fn require_submit(principal: &Principal) -> Result<(), AppError> {
             actual: principal.scope.code().to_owned(),
         })
     }
+}
+
+/// May this answerer's decision be turned into a standing rule (`iaam-hnod`)?
+///
+/// Two acts hide inside one call to `/answer`, and they are gated differently
+/// because they do different things to the owner's decisions. Settling this row
+/// is import mechanics: it disposes of one line the caller already submitted,
+/// and nothing else in the portfolio changes. Writing a
+/// [`ClassificationRule`] out of it generalises the settlement into a standing
+/// decision that will classify rows nobody has looked at yet — including rows
+/// from months the caller has not imported, and including rows it will never
+/// see, because a matched row is never asked about.
+///
+/// The second act is the same one `POST /v1/classification-rules` performs, and
+/// that route is owner-only. Admitting the agent here and refusing it there
+/// would leave the harder gate protecting nothing: the agent would simply make
+/// the decision through the route whose name does not mention rules. So the
+/// answer is refused a rule rather than the whole call — the row still settles,
+/// and the import still finishes without waking the owner twice.
+///
+/// The cost is real and is the point: an agent relaying the owner's answers is
+/// asked about the same counterparty again next month, because nobody recorded
+/// that the answer generalises. Turning it into a rule is one call the owner
+/// makes with his own token, and it is a decision he can then read back, edit
+/// and retire.
+///
+/// It reads [`crate::ports::Scope::may_administer`] and not a gate of its own:
+/// this **is** the administer decision, arriving by another door, and a second
+/// predicate beside it would be a second place for the two to drift apart.
+fn may_generalise(principal: &Principal) -> bool {
+    principal.scope.may_administer()
 }
 
 #[cfg(test)]

@@ -15571,3 +15571,127 @@ async fn a_commit_refused_for_an_open_question_names_the_call_that_answers_it() 
     assert!(other.get("resolutions").is_none(), "{other}");
     assert!(other.get("alternatives").is_none(), "{other}");
 }
+
+// ---------------------------------------------------------------------------
+// Scope is drawn by consequence (iaam-hnod)
+// ---------------------------------------------------------------------------
+
+/// Feed one row nothing settles and hand back the session and its question.
+///
+/// Parametrised by token because the whole point of the two tests below is that
+/// one act reaches two outcomes depending on who performed it, and a helper that
+/// fixed the owner's token could not express the other half.
+async fn ask_one_question(harness: &Harness, token: &str, key: &str) -> (String, String) {
+    let account = harness.account.inner();
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, key)],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    (
+        verdicts[0]["session_id"]
+            .as_str()
+            .expect("session")
+            .to_owned(),
+        verdicts[0]["question_id"]
+            .as_str()
+            .expect("question")
+            .to_owned(),
+    )
+}
+
+async fn classification_rule_count(harness: &Harness) -> usize {
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    rules.as_array().expect("rules").len()
+}
+
+/// An agent's answer settles the row and generalises nothing (iaam-hnod).
+///
+/// The defect: writing a classification rule is owner-only at the route that
+/// says so, and answering a question wrote one too. The decision the agent could
+/// not make directly it made through a route whose name does not mention rules,
+/// and the only thing forbidding it was a sentence in the agent's document.
+///
+/// Both halves are asserted in one test on purpose. "An agent writes no rule" is
+/// satisfiable by breaking the feature outright, and the owner's half is what
+/// says the rule still exists for the caller entitled to it.
+#[tokio::test]
+async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
+    let harness = harness();
+    let savings = another_account(&harness, "Savings").await;
+    let before = journal_rows(&harness).await;
+
+    let (session, question) = ask_one_question(&harness, &harness.agent_token, "agent-inner").await;
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.agent_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the row still settles under an agent token: {answered}"
+    );
+    assert!(
+        answered["rule"].is_null(),
+        "an agent's answer must not become a standing rule: {answered}"
+    );
+    assert!(
+        answered["answered_at"].is_string(),
+        "the question is answered even though nothing was generalised: {answered}"
+    );
+    assert_eq!(
+        classification_rule_count(&harness).await,
+        0,
+        "the agent wrote a rule through the route that does not say it writes one"
+    );
+
+    // The settled row commits like any other: the refusal is of the
+    // generalisation, not of the import.
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.agent_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(journal_rows(&harness).await, before + 1, "{committed}");
+
+    // And the same act under the owner's token does generalise.
+    let (session, question) = ask_one_question(&harness, &harness.owner_token, "owner-inner").await;
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert!(
+        answered["rule"].is_string(),
+        "the owner's answer is still recorded as a rule: {answered}"
+    );
+    assert_eq!(classification_rule_count(&harness).await, 1);
+}

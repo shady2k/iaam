@@ -3195,10 +3195,19 @@ pub async fn add_import_rows(
 
 /// Answer one of the session's questions.
 ///
-/// The answer is written as a durable classification rule as well as onto the
-/// row, so the next import of a matching row settles without asking. Nothing is
-/// recorded in the journal: the answer settles what the row is, and commit is
-/// what records it.
+/// The answer is written onto the row, and — for an owner token only — as a
+/// durable classification rule beside it, so the next import of a matching row
+/// settles without asking. Nothing is recorded in the journal: the answer
+/// settles what the row is, and commit is what records it.
+///
+/// **The split is `iaam-hnod`.** Settling one row is import mechanics and
+/// belongs to whoever is running the import. Generalising that settlement into a
+/// standing rule decides rows nobody has looked at yet, which is the same act
+/// `POST /v1/classification-rules` performs under an owner-only gate — so an
+/// agent that could do it here would be making the decision through a route
+/// whose name does not mention rules. Under an agent token the row settles and
+/// `rule` comes back absent; the owner turns the answer into a rule with his own
+/// token if he wants it to stand.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions/{session}/questions/{question}/answer",

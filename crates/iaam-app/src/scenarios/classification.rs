@@ -130,7 +130,7 @@ async fn recompute_history(
     let rules = stored
         .into_iter()
         .filter(|rule| rule.retired_at.is_none())
-        .map(domain_rule)
+        .map(rule_from_view)
         .collect::<Result<Vec<_>, _>>()?;
     let subjects = events
         .iter()
@@ -183,7 +183,13 @@ const fn classified_as(classification: Classification) -> ClassifiedAs {
     }
 }
 
-fn domain_rule(rule: ClassificationRuleView) -> Result<ClassificationRule, AppError> {
+/// A stored rule in the classifier's own vocabulary.
+///
+/// Shared with the import session on purpose: the session classifies an incoming
+/// row against the same rules the recomputation replays history with, and two
+/// readings of one stored matcher would eventually disagree about what the owner
+/// decided.
+pub fn rule_from_view(rule: ClassificationRuleView) -> Result<ClassificationRule, AppError> {
     let matcher = json_object(&rule.matcher, "matcher")?;
     let outcome = json_object(&rule.outcome, "outcome")?;
     Ok(ClassificationRule {
@@ -310,7 +316,7 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         // the rule was written about.
         description: event.provenance.description().map(str::to_owned),
         source_kind: event.provenance.source_category().map(str::to_owned),
-        movement,
+        movement: Some(movement),
     })
 }
 

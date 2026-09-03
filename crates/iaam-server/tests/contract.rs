@@ -10581,3 +10581,799 @@ async fn the_openapi_document_says_when_a_reparse_still_needs_the_bytes() {
         "the contract must say when the bytes are still needed: {description}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The discovery stage: which of the owner's accounts are the two sides of one
+// internal movement (iaam-7xh3)
+// ---------------------------------------------------------------------------
+
+/// `PUT`, which no other test in this file needs.
+fn put(path: &str, token: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .method("PUT")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+async fn transfer_partners_queue(harness: &Harness) -> Vec<Value> {
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .filter(|item| item["kind"] == "resolve_transfer_relationships")
+        .cloned()
+        .collect()
+}
+
+/// The owner states which of his accounts money moves between, and the queue
+/// stops asking — for the accounts he has answered, and only those.
+///
+/// The goal is quantified over his accounts, so a statement is not «some
+/// relationship exists»: an account added afterwards — the second bank, which is
+/// the case this exists for — reopens it, and nothing about the answers already
+/// given closes the new question.
+#[tokio::test]
+async fn the_owner_states_his_transfer_relationships_and_a_new_account_reopens_the_question() {
+    let harness = harness();
+    let main = harness.account.inner().to_string();
+
+    // One account: there is no other side, so nothing is asked.
+    assert!(
+        transfer_partners_queue(&harness).await.is_empty(),
+        "with one account a transfer has no other side"
+    );
+
+    let (status, savings) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{savings}");
+    let savings = savings["id"].as_str().expect("account id").to_owned();
+
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 2, "both accounts are asked: {asked:#?}");
+    let item = asked
+        .iter()
+        .find(|item| item["subject"]["id"] == json!(main))
+        .expect("the item names the account it is about");
+    assert_eq!(item["category"], "required_for_goal", "{item}");
+    assert_eq!(item["state"], "needs_owner_input", "{item}");
+    assert_eq!(item["required_scope"], "owner", "{item}");
+    assert_eq!(
+        item["target"]["operationId"], "record_account_transfer_partners",
+        "{item}"
+    );
+    assert_eq!(item["target"]["method"], "PUT", "{item}");
+    assert_eq!(
+        item["target"]["path"], "/v1/accounts/{id}/transfer-partners",
+        "{item}"
+    );
+    // Candidates are proposed; the choice is not made. The account itself is not
+    // among them, because a transfer has two sides.
+    let candidates = item["target"]["request"]["missing"][0]["candidates"]
+        .as_array()
+        .expect("the owner is offered his other accounts");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|entry| &entry["id"])
+            .collect::<Vec<_>>(),
+        vec![&json!(savings)],
+        "{item}"
+    );
+
+    // Drawing this relationship is the owner's judgement, not the agent's.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.agent_token,
+            &json!({ "partners": [savings] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+
+    // An account is not the other side of itself.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [main] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+
+    let (status, recorded) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [savings] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["stated"], true, "{recorded}");
+    assert_eq!(recorded["partners"], json!([savings]), "{recorded}");
+
+    // Being named by his statement about `Main` is not a statement about
+    // `Savings`: the far side of one relationship says nothing about the ones
+    // this account is the near side of.
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert_eq!(asked[0]["subject"]["id"], json!(savings), "{asked:#?}");
+
+    // «None of my others» is an answer, and it closes the item.
+    let (status, none) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{savings}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{none}");
+    assert_eq!(none["stated"], true, "an empty list is a statement: {none}");
+    assert!(
+        transfer_partners_queue(&harness).await.is_empty(),
+        "every account has been ruled on"
+    );
+
+    // A third account reopens the goal, and reopens it only for itself.
+    let (status, everyday) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Everyday", "institution": "Southgate" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{everyday}");
+    let everyday = everyday["id"].as_str().expect("account id").to_owned();
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert_eq!(asked[0]["subject"]["id"], json!(everyday), "{asked:#?}");
+
+    // Withdrawing returns the account to awaiting a decision, and the read-back
+    // says «not stated» rather than «none», which are different answers.
+    let (status, withdrawn) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/accounts/{savings}/transfer-partners"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{withdrawn}");
+    assert_eq!(withdrawn["stated"], false, "{withdrawn}");
+    let (status, read_back) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts/{savings}/transfer-partners"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read_back}");
+    assert_eq!(read_back["stated"], false, "{read_back}");
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 2, "{asked:#?}");
+}
+
+/// An account identifier is not an access right, in either position.
+#[tokio::test]
+async fn a_transfer_statement_cannot_name_an_account_the_owner_does_not_hold() {
+    let harness = harness();
+    let main = harness.account.inner().to_string();
+    let stranger = Uuid::new_v4();
+
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{stranger}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [main] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [stranger] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a named account that is not the owner's is a mistake in the statement, \
+         not something to drop quietly: {refusal}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Import sessions: a row that can say "I don't know" (iaam-3kru, iaam-6qsa)
+// ---------------------------------------------------------------------------
+
+/// A second account of the owner's, for answers that name one.
+async fn another_account(harness: &Harness, title: &str) -> Uuid {
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": title, "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("account identifier")
+}
+
+/// A row whose direction the source did not give.
+///
+/// Invented from nothing: `INNER` is the shape of word a bank prints for a
+/// movement it considers internal to itself, and every amount and label here was
+/// made up for this test.
+fn unresolved_row(account: Uuid, key: &str) -> Value {
+    json!({
+        "account": account,
+        "type": "unresolved_direction",
+        "amount": "2500.00",
+        "currency": "RUB",
+        "dates": { "cash_posted": "2025-03-18" },
+        "source_category": "INNER",
+        "idempotency_key": key,
+    })
+}
+
+async fn journal_rows(harness: &Harness) -> usize {
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    page["rows"].as_array().expect("journal rows").len()
+}
+
+/// The question is a stored resource, not a sentence in a response body.
+///
+/// The response carrying it is deliberately thrown away: what is asserted is
+/// that the question is still there afterwards, reachable from the session list
+/// with its wording and the answers it admits — and that nothing was recorded
+/// while it waits.
+#[tokio::test]
+async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_it() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let before = journal_rows(&harness).await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "inner-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "needs_classification", "{verdicts}");
+
+    // Everything the response said is now dropped, exactly as a caller that lost
+    // it would have to manage.
+    let (status, sessions) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    let session = sessions.as_array().expect("sessions")[0]["session"]
+        .as_str()
+        .expect("session identifier")
+        .to_owned();
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(contents["state"], "open", "{contents}");
+    assert_eq!(contents["unanswered"], 1, "{contents}");
+
+    let question = &contents["questions"].as_array().expect("questions")[0];
+    assert!(
+        question["prompt"]
+            .as_str()
+            .is_some_and(|text| text.contains("which way")),
+        "the stored question must say what is being asked: {question}"
+    );
+    let alternatives: Vec<&str> = question["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|entry| entry["answer"].as_str().expect("answer code"))
+        .collect();
+    assert!(
+        alternatives.contains(&"sent_to_own_account")
+            && alternatives.contains(&"received_from_own_account"),
+        "a directionless row must offer both directions: {question}"
+    );
+
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "nothing may be recorded while the question waits"
+    );
+}
+
+/// The answer is a durable rule, so the same row is not asked about twice.
+///
+/// Two submissions of the same shape under different keys: the first raises a
+/// question, the answer writes a rule, and the second settles against that rule
+/// and is recorded without asking anyone.
+#[tokio::test]
+async fn answering_the_question_writes_a_rule_and_the_next_row_is_not_asked_about() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "inner-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert!(
+        answered["rule"].is_string(),
+        "the answer must be recorded as a rule: {answered}"
+    );
+
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert_eq!(
+        rules.as_array().expect("rules").len(),
+        1,
+        "one answer, one rule: {rules}"
+    );
+
+    // The same shape again. The rule settles it, so it is recorded rather than
+    // questioned — and it is recorded as the transfer the owner named, not as a
+    // deposit.
+    let (status, again) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "april" },
+                "operations": [unresolved_row(account, "inner-two")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_ne!(
+        again[0]["verdict"], "needs_classification",
+        "the rule must answer the second row without asking: {again}"
+    );
+    assert!(
+        again[0]["event_id"].is_string(),
+        "the settled row must reach the journal: {again}"
+    );
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=inner-two",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page["rows"][0]["kind"], "cash_transfer",
+        "the owner answered «sent to my own account», so that is the fact: {page}"
+    );
+}
+
+/// A session defers everything, and abandoning it leaves the journal untouched.
+#[tokio::test]
+async fn an_abandoned_import_session_writes_nothing_to_the_journal() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let before = journal_rows(&harness).await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    // A conclusive row and an unresolved one, in the same session. Neither is
+    // recorded: a session holds both until it commits, which is what lets two
+    // legs of one transfer be seen together.
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    {
+                        "account": account,
+                        "type": "deposit",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-02" },
+                        "idempotency_key": "held-deposit",
+                    },
+                    unresolved_row(account, "held-inner"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    // A held row is not given a verdict: a verdict answers "what was recorded",
+    // and the answer here is "nothing, yet" — which is not `quarantined`, whose
+    // published meaning is that no fact could be written from the row.
+    assert_eq!(rows[0]["state"], "held", "{rows}");
+    assert_eq!(rows[1]["state"], "needs_classification", "{rows}");
+    assert!(rows[0]["verdict"].is_null(), "{rows}");
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "a session records nothing before it commits: {rows}"
+    );
+
+    let (status, abandoned) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/abandon"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{abandoned}");
+    assert_eq!(abandoned["state"], "abandoned", "{abandoned}");
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "abandoning must leave the journal exactly as it was"
+    );
+}
+
+/// Commit refuses while a question is open, and writes once when it is answered.
+#[tokio::test]
+async fn a_session_commits_only_after_every_question_has_been_answered() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+    let before = journal_rows(&harness).await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(account, "session-inner")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let question = rows[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("answered")),
+        "the refusal must say what is missing: {refused}"
+    );
+    assert_eq!(journal_rows(&harness).await, before);
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "received_from_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "an answer settles the row; commit is what records it"
+    );
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(committed["state"], "committed", "{committed}");
+    assert_eq!(
+        committed["rows"][0]["verdict"], "provisional",
+        "{committed}"
+    );
+    assert_eq!(
+        journal_rows(&harness).await,
+        before + 1,
+        "commit writes what the session held, once"
+    );
+
+    // And a committed session takes nothing more.
+    let (status, closed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(account, "session-late")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{closed}");
+}
+
+/// An answer the question never offered is refused before anything is written.
+#[tokio::test]
+async fn an_answer_the_question_does_not_admit_is_refused() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "inner-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an answer naming no account cannot name an account: {refused}"
+    );
+
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "yes" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+
+    // The question is still open: a refused answer settles nothing.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(contents["unanswered"], 1, "{contents}");
+}
+
+/// A caller that has concluded is still right to say so.
+///
+/// The conclusive route keeps every shape it had: this is the regression the
+/// observation shape must not cause.
+#[tokio::test]
+async fn a_concluded_row_is_recorded_exactly_as_it_was_before_sessions_existed() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-02" },
+                    "idempotency_key": "plain-deposit",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    assert!(verdicts[0]["session_id"].is_null(), "{verdicts}");
+
+    let (status, sessions) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    assert!(
+        sessions.as_array().expect("sessions").is_empty(),
+        "a batch that raised no question must open no session: {sessions}"
+    );
+}
+
+/// Every schema the contract points at is a schema the contract defines.
+///
+/// A `$ref` to a component that does not exist is a document a generator cannot
+/// read, and nothing else here would notice: the routes still answer.
+#[tokio::test]
+async fn every_schema_reference_in_the_contract_resolves() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let defined = spec["components"]["schemas"]
+        .as_object()
+        .expect("the contract defines schemas");
+    let mut dangling = Vec::new();
+    collect_refs(&spec, &mut |reference| {
+        if let Some(name) = reference.strip_prefix("#/components/schemas/")
+            && !defined.contains_key(name)
+        {
+            dangling.push(name.to_owned());
+        }
+    });
+    dangling.sort_unstable();
+    dangling.dedup();
+    assert!(
+        dangling.is_empty(),
+        "unresolved schema references: {dangling:?}"
+    );
+}
+
+fn collect_refs(value: &Value, found: &mut impl FnMut(&str)) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map {
+                if key == "$ref"
+                    && let Some(reference) = entry.as_str()
+                {
+                    found(reference);
+                }
+                collect_refs(entry, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_refs(item, found);
+            }
+        }
+        _ => {}
+    }
+}

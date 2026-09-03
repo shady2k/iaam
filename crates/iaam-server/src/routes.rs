@@ -19,8 +19,12 @@ use iaam_app::actions::{
     account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
+use iaam_app::ingest::observation::Intake;
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
-use iaam_app::ports::{AccountScopeExclusionView, AccountView, ContourView, Principal, Scope};
+use iaam_app::ports::{
+    AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Principal,
+    Scope,
+};
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
     list_category_rules, list_groups, preview_category_rule, retire_category,
@@ -28,6 +32,7 @@ use iaam_app::scenarios::categories::{
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::correction::{ImportTarget, correct_events};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
+use iaam_app::scenarios::import_session::{HeldRow, IntakeOutcome, SessionContents, submit_intake};
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
 use iaam_app::scenarios::journal::{DeclaredSource, JournalReadQuery, read_journal};
 use iaam_app::scenarios::market_reference::{
@@ -45,7 +50,8 @@ use iaam_app::sync::{
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{
-    AccountId, CategoryId, CategoryRuleId, CustodyId, ImportId, InstrumentId, SourceId,
+    AccountId, CategoryId, CategoryRuleId, CustodyId, ImportId, ImportQuestionId, ImportSessionId,
+    InstrumentId, SourceId,
 };
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
@@ -64,11 +70,11 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto, ActionDto,
-    ActionSubjectDto, ActionTargetDto, ActionsResponseDto, AddContourVersionRequest,
-    BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
+    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto, ActionsResponseDto,
+    AddContourVersionRequest, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto,
+    CategoryGroupDto, CategoryGroupRequest, CategoryRequest, CategoryRuleDto,
+    CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
     CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
@@ -77,9 +83,15 @@ use crate::dto::{
     MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
     MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
     QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
-    ReconciliationStatusDto, RecordAccountScopeRequest, RequestPlanDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersRequest,
+    RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto,
+    SubmitCorrectionsRequest, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
+    TokenDto, TokenScopeDto, VerdictDto,
+};
+use crate::dto::{
+    AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest, ImportCommitDto,
+    ImportQuestionDto, ImportRowDto, ImportSessionContentsDto, ImportSessionDto,
+    OpenImportSessionRequest,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
@@ -89,6 +101,7 @@ pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
 pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
+pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 
@@ -1563,6 +1576,162 @@ pub async fn record_account_scope(
     Ok(Json(account_scope_dto(&state, &principal, account).await?))
 }
 
+/// An account's stated transfer partners.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{id}/transfer-partners",
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    responses(
+        (status = 200, description = "The accounts money moves between this one and", body = AccountTransferPartnersDto),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_account_transfer_partners(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<AccountTransferPartnersDto>, ApiFailure> {
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+    Ok(Json(
+        account_transfer_partners_dto(&state, &principal, account).await?,
+    ))
+}
+
+/// Record which of the owner's accounts money moves between this one and.
+///
+/// The route that makes the discovery item answerable. One transfer between two
+/// institutions is printed twice, once by each side, and nothing in the rows
+/// relates the two legs; the system may not decide the relationship for him,
+/// because a relationship inferred from two amounts that happen to match is a
+/// fabricated fact about his money. So he states it, and he states it before
+/// the import rather than after, which is the order the queue now asks in.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/{id}/transfer-partners",
+    operation_id = RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = RecordAccountTransferPartnersRequest,
+    responses(
+        (status = 200, description = "Statement recorded", body = AccountTransferPartnersDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_transfer_partners(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<RecordAccountTransferPartnersRequest>,
+) -> Result<Json<AccountTransferPartnersDto>, ApiFailure> {
+    // Saying which two accounts are the two sides of one movement is the
+    // owner's judgement, by the same rule that keeps the contour composition
+    // out of the agent's hands.
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+
+    let mut partners = Vec::with_capacity(request.partners.len());
+    for partner in request.partners {
+        let partner = AccountId(partner);
+        if partner == account {
+            return Err(unprocessable(
+                "partners",
+                "the owner's other accounts",
+                "the account itself",
+                "a transfer has two sides, and an account is not the other side of itself",
+            ));
+        }
+        // Refused rather than ignored: a named account that does not exist is a
+        // mistake in the statement, and silently dropping it would record a
+        // statement the owner did not make.
+        owned_account(&state, &principal, partner).await?;
+        if !partners.contains(&partner) {
+            partners.push(partner);
+        }
+    }
+
+    state
+        .services
+        .store
+        .record_account_transfer_statement(
+            principal.owner,
+            AccountTransferStatementView { account, partners },
+        )
+        .await?;
+
+    Ok(Json(
+        account_transfer_partners_dto(&state, &principal, account).await?,
+    ))
+}
+
+/// Withdraw the statement, returning the account to awaiting a decision.
+#[utoipa::path(
+    delete,
+    path = "/v1/accounts/{id}/transfer-partners",
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    responses(
+        (status = 200, description = "Statement withdrawn", body = AccountTransferPartnersDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn clear_account_transfer_partners(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<AccountTransferPartnersDto>, ApiFailure> {
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+    state
+        .services
+        .store
+        .clear_account_transfer_statement(principal.owner, account)
+        .await?;
+    Ok(Json(
+        account_transfer_partners_dto(&state, &principal, account).await?,
+    ))
+}
+
+/// Read the statement back, distinguishing «none» from «not said».
+async fn account_transfer_partners_dto(
+    state: &ServerState,
+    principal: &Principal,
+    account: AccountId,
+) -> Result<AccountTransferPartnersDto, ApiFailure> {
+    let statements = state
+        .services
+        .store
+        .list_account_transfer_statements(principal.owner)
+        .await?;
+    let stated = statements
+        .iter()
+        .find(|statement| statement.account == account);
+    Ok(AccountTransferPartnersDto {
+        account: account.inner(),
+        stated: stated.is_some(),
+        partners: stated
+            .map(|statement| {
+                statement
+                    .partners
+                    .iter()
+                    .map(|partner| partner.inner())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
 /// Refuse an account identifier the owner does not hold.
 ///
 /// A missing account and someone else's return the same `404` for the reason
@@ -2163,11 +2332,16 @@ pub async fn ingest_operations(
 
     // Parsing the DTO yields a verdict for each row: one unrecognised operation
     // does not invalidate the others (§10.1).
+    //
+    // `to_intake` rather than `to_domain`, and that is the whole change on this
+    // route: a caller that concluded still sends a conclusion and still gets the
+    // verdict it always got, while a caller that did not is no longer forced to
+    // invent one.
     let mut verdicts: Vec<VerdictDto> = Vec::with_capacity(request.operations.len());
-    let mut accepted: Vec<(usize, SubmittedOperation)> = Vec::new();
+    let mut accepted: Vec<(usize, Intake)> = Vec::new();
     for (index, operation) in request.operations.iter().enumerate() {
-        match operation.to_domain() {
-            Ok(domain) => accepted.push((index + 1, domain)),
+        match operation.to_intake() {
+            Ok(intake) => accepted.push((index + 1, intake)),
             Err(rejection) => verdicts.push(VerdictDto::from_domain(
                 index + 1,
                 &Verdict::Rejected { rejection },
@@ -2175,16 +2349,335 @@ pub async fn ingest_operations(
         }
     }
 
-    let domain: Vec<SubmittedOperation> = accepted
-        .iter()
-        .map(|(_, operation)| operation.clone())
-        .collect();
-    let outcomes = submit_operations(&state.services, &principal, source, import, &domain).await?;
-    for ((row, _), verdict) in accepted.iter().zip(outcomes.iter()) {
-        verdicts.push(VerdictDto::from_domain(*row, verdict));
+    let domain: Vec<Intake> = accepted.iter().map(|(_, intake)| intake.clone()).collect();
+    let outcomes = submit_intake(&state.services, &principal, source, import, &domain).await?;
+    for ((row, _), outcome) in accepted.iter().zip(outcomes.iter()) {
+        verdicts.push(intake_verdict_dto(*row, outcome));
     }
     verdicts.sort_by_key(|verdict| verdict.row);
     Ok(Json(verdicts))
+}
+
+/// A verdict, plus the identifiers of the question when the row raised one.
+///
+/// The sentence lives in the published verdict; the identifiers do not, and
+/// without them the caller has a question it cannot answer. This is where the
+/// two are put back together.
+fn intake_verdict_dto(row: usize, outcome: &IntakeOutcome) -> VerdictDto {
+    let base = VerdictDto::from_domain(row, &outcome.verdict);
+    let Some(asked) = &outcome.asked else {
+        return base;
+    };
+    VerdictDto {
+        session_id: Some(asked.session.inner()),
+        question_id: Some(asked.question.inner()),
+        alternatives: Some(
+            asked
+                .alternatives
+                .iter()
+                .copied()
+                .map(AnswerAlternativeDto::from_domain)
+                .collect(),
+        ),
+        ..base
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Import sessions (iaam-3kru)
+// ---------------------------------------------------------------------------
+
+/// Open an import session.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions",
+    request_body = OpenImportSessionRequest,
+    responses(
+        (status = 201, description = "Session opened, or the one this import already had", body = ImportSessionDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn open_import_session(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiJson(request): ApiJson<OpenImportSessionRequest>,
+) -> Result<(StatusCode, Json<ImportSessionDto>), ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let (source, import) = match &request.source {
+        Some(declared) => (
+            Some(declared_source(principal.owner, declared)?),
+            declared_import(principal.owner, declared)?,
+        ),
+        None => (None, None),
+    };
+    let session = iaam_app::scenarios::import_session::open_session(
+        &state.services,
+        &principal,
+        source,
+        import,
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ImportSessionDto::from_domain(&session)),
+    ))
+}
+
+/// Every import session of the owner's, newest first.
+///
+/// This is what makes a question survive the response that carried it: a caller
+/// that lost the response finds the session here and the question in it.
+#[utoipa::path(
+    get,
+    path = "/v1/import-sessions",
+    responses(
+        (status = 200, description = "The owner's import sessions", body = Vec<ImportSessionDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_import_sessions(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Vec<ImportSessionDto>>, ApiFailure> {
+    let sessions =
+        iaam_app::scenarios::import_session::list_sessions(&state.services, &principal).await?;
+    Ok(Json(
+        sessions.iter().map(ImportSessionDto::from_domain).collect(),
+    ))
+}
+
+/// What one session holds, and what it is waiting on.
+#[utoipa::path(
+    get,
+    path = "/v1/import-sessions/{session}",
+    params(("session" = Uuid, Path, description = "Import session identifier")),
+    responses(
+        (status = 200, description = "The session, its rows and its questions", body = ImportSessionContentsDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such session, or it belongs to someone else", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_import_session(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<ImportSessionContentsDto>, ApiFailure> {
+    let contents = iaam_app::scenarios::import_session::read_session(
+        &state.services,
+        &principal,
+        ImportSessionId(id),
+    )
+    .await?;
+    Ok(Json(session_contents_dto(&contents)))
+}
+
+/// Feed rows into a session.
+///
+/// Nothing reaches the journal here, whatever the rows say — including a row the
+/// caller concluded. That is what a session is for: both legs of one transfer
+/// can sit in it before either is recorded.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/rows",
+    params(("session" = Uuid, Path, description = "Import session identifier")),
+    request_body = AddImportRowsRequest,
+    responses(
+        (status = 200, description = "Outcome for each row; nothing was recorded", body = Vec<ImportRowDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such open session", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn add_import_rows(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<AddImportRowsRequest>,
+) -> Result<Json<Vec<ImportRowDto>>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    // An unreadable row does not invalidate the others (§10.1), and it is
+    // reported against its position in the request: it never reached the
+    // session, so it has no position in that.
+    let mut rejected: Vec<ImportRowDto> = Vec::new();
+    let mut accepted: Vec<Intake> = Vec::new();
+    for (index, operation) in request.operations.iter().enumerate() {
+        match operation.to_intake() {
+            Ok(intake) => accepted.push(intake),
+            Err(rejection) => rejected.push(ImportRowDto::from_domain(&HeldRow::Rejected {
+                row: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                rejection,
+            })),
+        }
+    }
+    let held = iaam_app::scenarios::import_session::add_rows(
+        &state.services,
+        &principal,
+        ImportSessionId(id),
+        &accepted,
+    )
+    .await?;
+    let mut rows: Vec<ImportRowDto> = held.iter().map(ImportRowDto::from_domain).collect();
+    rows.extend(rejected);
+    Ok(Json(rows))
+}
+
+/// Answer one of the session's questions.
+///
+/// The answer is written as a durable classification rule as well as onto the
+/// row, so the next import of a matching row settles without asking. Nothing is
+/// recorded in the journal: the answer settles what the row is, and commit is
+/// what records it.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/questions/{question}/answer",
+    params(
+        ("session" = Uuid, Path, description = "Import session identifier"),
+        ("question" = Uuid, Path, description = "Question identifier")
+    ),
+    request_body = AnswerImportQuestionRequest,
+    responses(
+        (status = 200, description = "The answered question", body = ImportQuestionDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such open session or unanswered question", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "The answer is not one this question admits", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn answer_import_question(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath((session, question)): ApiPath<(Uuid, Uuid)>,
+    ApiJson(request): ApiJson<AnswerImportQuestionRequest>,
+) -> Result<Json<ImportQuestionDto>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let answer = request.to_domain().map_err(|rejection| {
+        invalid_field(rejection.field, &rejection.expected, rejection.actual)
+    })?;
+    let answered = iaam_app::scenarios::import_session::answer_question(
+        &state.services,
+        &principal,
+        ImportSessionId(session),
+        ImportQuestionId(question),
+        answer,
+    )
+    .await?;
+    Ok(Json(ImportQuestionDto::from_domain(&answered)))
+}
+
+/// Commit the session: write everything it holds, once.
+///
+/// Refused while any question is unanswered. That refusal is the point of the
+/// session — committing with a question open records the guess the question
+/// exists to prevent.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/commit",
+    params(("session" = Uuid, Path, description = "Import session identifier")),
+    responses(
+        (status = 200, description = "The session, closed, and a verdict per row", body = ImportCommitDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such open session", body = ApiError),
+        (status = 422, description = "The session still has questions the owner has not answered", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn commit_import_session(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<ImportCommitDto>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let verdicts = iaam_app::scenarios::import_session::commit_session(
+        &state.services,
+        &principal,
+        ImportSessionId(id),
+    )
+    .await?;
+    let contents = iaam_app::scenarios::import_session::read_session(
+        &state.services,
+        &principal,
+        ImportSessionId(id),
+    )
+    .await?;
+    Ok(Json(ImportCommitDto {
+        session: ImportSessionDto::from_domain(&contents.session),
+        rows: verdicts
+            .iter()
+            .enumerate()
+            .map(|(index, verdict)| VerdictDto::from_domain(index + 1, verdict))
+            .collect(),
+    }))
+}
+
+/// Abandon the session.
+///
+/// The journal is neither read nor written: what the session held was never a
+/// fact, so there is nothing to retract.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/abandon",
+    params(("session" = Uuid, Path, description = "Import session identifier")),
+    responses(
+        (status = 200, description = "The abandoned session; the journal is untouched", body = ImportSessionDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such open session", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn abandon_import_session(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<ImportSessionDto>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let session = iaam_app::scenarios::import_session::abandon_session(
+        &state.services,
+        &principal,
+        ImportSessionId(id),
+    )
+    .await?;
+    Ok(Json(ImportSessionDto::from_domain(&session)))
+}
+
+fn session_contents_dto(contents: &SessionContents) -> ImportSessionContentsDto {
+    ImportSessionContentsDto {
+        session: ImportSessionDto::from_domain(&contents.session),
+        rows: contents.observations.len(),
+        questions: contents
+            .questions
+            .iter()
+            .map(ImportQuestionDto::from_domain)
+            .collect(),
+        unanswered: contents
+            .questions
+            .iter()
+            .filter(|question| question.is_open())
+            .count(),
+    }
 }
 
 /// Journal fact ingestion: corporate actions and offers.

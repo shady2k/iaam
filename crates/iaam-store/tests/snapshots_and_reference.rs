@@ -15,7 +15,9 @@ use iaam_core::projection::lots::LotKey;
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_store::SqliteStore;
-use iaam_store::reference::{AccountRecord, AccountScopeExclusionRecord, InstrumentRecord};
+use iaam_store::reference::{
+    AccountRecord, AccountScopeExclusionRecord, AccountTransferStatementRecord, InstrumentRecord,
+};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::macros::date;
 use uuid::Uuid;
@@ -673,4 +675,111 @@ fn a_scope_exclusion_is_one_current_statement_per_owner_and_account() {
     // Clearing what is not there is not an error: the absence of a row is the
     // state being asked for.
     store.clear_account_scope_exclusion(owner, account).unwrap();
+}
+
+/// The owner's statement about transfer partners is one current answer, and
+/// «none of my others» is one of the answers it can hold.
+#[test]
+fn a_transfer_statement_distinguishes_naming_none_from_saying_nothing() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let other_owner = OwnerId::new_random();
+    let main = AccountId::new_random();
+    let savings = AccountId::new_random();
+    let term = AccountId::new_random();
+    let foreign = AccountId::new_random();
+
+    for (id, holder, title) in [
+        (main, owner, "Main"),
+        (savings, owner, "Savings"),
+        (term, owner, "Term Deposit"),
+        (foreign, other_owner, "Main"),
+    ] {
+        store
+            .upsert_account(&AccountRecord {
+                id,
+                owner: holder,
+                title: title.into(),
+                institution: None,
+            })
+            .unwrap();
+    }
+
+    // Nothing said: no record at all, which is the third state.
+    assert!(
+        store
+            .list_account_transfer_statements(owner)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .record_account_transfer_statement(owner, main, &[savings, term])
+        .unwrap();
+    // «None of my others» is an answer, and it is stored as a statement with no
+    // partners rather than as no statement.
+    store
+        .record_account_transfer_statement(owner, savings, &[])
+        .unwrap();
+
+    let listed = store.list_account_transfer_statements(owner).unwrap();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    let named = listed
+        .iter()
+        .find(|statement| statement.account == main)
+        .unwrap();
+    let mut expected = vec![savings, term];
+    expected.sort_by_key(AccountId::inner);
+    assert_eq!(named.partners, expected);
+    assert_eq!(
+        listed
+            .iter()
+            .find(|statement| statement.account == savings)
+            .unwrap(),
+        &AccountTransferStatementRecord {
+            account: savings,
+            partners: Vec::new(),
+        }
+    );
+
+    // Restating replaces rather than merges: a partner named by mistake must be
+    // removable, and a statement that only ever grew could not be corrected.
+    store
+        .record_account_transfer_statement(owner, main, &[term])
+        .unwrap();
+    let listed = store.list_account_transfer_statements(owner).unwrap();
+    let main_statement = listed
+        .iter()
+        .find(|statement| statement.account == main)
+        .unwrap();
+    assert_eq!(main_statement.partners, vec![term]);
+
+    // Another owner's statement is not visible, and the foreign key refuses a
+    // statement about an account this owner does not hold — in either position.
+    assert!(
+        store
+            .list_account_transfer_statements(other_owner)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .record_account_transfer_statement(owner, foreign, &[main])
+            .is_err()
+    );
+    assert!(
+        store
+            .record_account_transfer_statement(owner, main, &[foreign])
+            .is_err()
+    );
+
+    // Withdrawing takes the partners with it: partners left behind would be an
+    // answer nobody currently stands behind.
+    store.clear_account_transfer_statement(owner, main).unwrap();
+    let listed = store.list_account_transfer_statements(owner).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].account, savings);
+    // Withdrawing what is not there is not an error: the absence of a row is
+    // the state being asked for.
+    store.clear_account_transfer_statement(owner, main).unwrap();
 }

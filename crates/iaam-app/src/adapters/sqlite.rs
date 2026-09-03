@@ -9,12 +9,14 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountActivityView, AccountScopeExclusionView, AccountView, AliasUpsert, AliasView,
-    BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
-    CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
-    ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
-    CustodyView, DocumentToKeep, InstrumentDirectory, InstrumentUpsert, InstrumentView,
-    IssuedToken, JournalQuery, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
+    AliasUpsert, AliasView, BrokerAccessView, BrokerChannel, BrokerChannelFactory,
+    BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView,
+    CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
+    ControlAssertionView, CustodyView, DocumentToKeep, ImportObservationView, ImportQuestionView,
+    ImportSessionState, ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView,
+    IssuedToken, JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store,
+    TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -26,8 +28,8 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{
-    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, InstrumentId,
-    OwnerId, SourceId,
+    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, ImportId,
+    ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, SourceId,
 };
 use iaam_core::instrument::AliasNamespace;
 use iaam_core::projection::Snapshot;
@@ -45,8 +47,13 @@ use iaam_store::events::{
     AccountActivityRecord, Appended, ControlAssertionRecord, JournalCursor as StoredJournalCursor,
     JournalQuery as StoredJournalQuery,
 };
+use iaam_store::import_session::{
+    NewQuestion as StoredNewQuestion, SessionState as StoredSessionState, StoredObservation,
+    StoredQuestion, StoredSession,
+};
 use iaam_store::reference::{
-    AccountRecord, AccountScopeExclusionRecord, AliasRecord, ContourRecord, InstrumentRecord,
+    AccountRecord, AccountScopeExclusionRecord, AccountTransferStatementRecord, AliasRecord,
+    ContourRecord, InstrumentRecord,
 };
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
@@ -113,6 +120,80 @@ impl SqliteAdapter {
         })
         .await
         .map_err(|error| AppError::Store(format!("blocking task failed: {error}")))?
+    }
+}
+
+/// Session state: from the port to the store, and back.
+///
+/// Exhaustive in both directions, for the reason `scope_from_store` is: a fourth
+/// state must break the build rather than silently read as `Open`, which would
+/// let a committed session accept more observations.
+const fn session_state_to_store(state: ImportSessionState) -> StoredSessionState {
+    match state {
+        ImportSessionState::Open => StoredSessionState::Open,
+        ImportSessionState::Committed => StoredSessionState::Committed,
+        ImportSessionState::Abandoned => StoredSessionState::Abandoned,
+    }
+}
+
+const fn session_state_from_store(state: StoredSessionState) -> ImportSessionState {
+    match state {
+        StoredSessionState::Open => ImportSessionState::Open,
+        StoredSessionState::Committed => ImportSessionState::Committed,
+        StoredSessionState::Abandoned => ImportSessionState::Abandoned,
+    }
+}
+
+fn import_session_view(session: StoredSession) -> ImportSessionView {
+    ImportSessionView {
+        id: session.id,
+        state: session_state_from_store(session.state),
+        source: session.source,
+        import: session.import,
+        opened_at: session.opened_at,
+        closed_at: session.closed_at,
+    }
+}
+
+fn import_observation_view(observation: StoredObservation) -> ImportObservationView {
+    ImportObservationView {
+        row: observation.row,
+        row_key: observation.row_key,
+        concluded: observation.concluded,
+        payload: observation.payload,
+        answer: observation.answer,
+    }
+}
+
+fn import_question_view(question: StoredQuestion) -> ImportQuestionView {
+    ImportQuestionView {
+        id: question.id,
+        session: question.session,
+        row: question.row,
+        question: question.question,
+        alternatives: question.alternatives,
+        prompt: question.prompt,
+        asked_at: question.asked_at,
+        answered_at: question.answered_at,
+        answer: question.answer,
+        rule: question.rule,
+    }
+}
+
+/// A session failure the caller can act on, kept apart from a store failure.
+///
+/// A closed session and a missing one are one `NotFound` here as they are in the
+/// store: distinguishing them would tell a caller holding a stranger's
+/// identifier that the session exists.
+fn import_session_error(error: iaam_store::StoreError) -> AppError {
+    match error {
+        iaam_store::StoreError::NotFound { what, id } => AppError::NotFound { what, id },
+        iaam_store::StoreError::InvalidValue { field, value } => AppError::Invalid {
+            field: field.to_owned(),
+            expected: "a value the import session accepts".to_owned(),
+            actual: value,
+        },
+        other => store_error(other),
     }
 }
 
@@ -461,6 +542,53 @@ impl Store for SqliteAdapter {
         .await
     }
 
+    async fn list_account_transfer_statements(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountTransferStatementView>, AppError> {
+        self.blocking(move |store| {
+            let statements = store
+                .list_account_transfer_statements(owner)
+                .map_err(store_error)?;
+            Ok(statements
+                .into_iter()
+                .map(
+                    |record: AccountTransferStatementRecord| AccountTransferStatementView {
+                        account: record.account,
+                        partners: record.partners,
+                    },
+                )
+                .collect())
+        })
+        .await
+    }
+
+    async fn record_account_transfer_statement(
+        &self,
+        owner: OwnerId,
+        statement: AccountTransferStatementView,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .record_account_transfer_statement(owner, statement.account, &statement.partners)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn clear_account_transfer_statement(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .clear_account_transfer_statement(owner, account)
+                .map_err(store_error)
+        })
+        .await
+    }
+
     async fn save_snapshot(&self, owner: OwnerId, snapshot: Snapshot) -> Result<(), AppError> {
         self.blocking(move |store| store.save_snapshot(owner, &snapshot).map_err(store_error))
             .await
@@ -550,6 +678,163 @@ impl Store for SqliteAdapter {
             store
                 .record_token_use(&token_hash, &route, &outcome)
                 .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn open_import_session(
+        &self,
+        owner: OwnerId,
+        source: Option<SourceId>,
+        import: Option<ImportId>,
+    ) -> Result<ImportSessionView, AppError> {
+        self.blocking(move |store| {
+            store
+                .open_import_session(owner, source, import)
+                .map(import_session_view)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn load_import_session(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Option<ImportSessionView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .load_import_session(owner, session)
+                .map(|found| found.map(import_session_view))
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_import_sessions(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<ImportSessionView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .list_import_sessions(owner)
+                .map(|sessions| sessions.into_iter().map(import_session_view).collect())
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn add_import_observation(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row_key: Option<String>,
+        concluded: bool,
+        payload: String,
+    ) -> Result<ImportObservationView, AppError> {
+        self.blocking(move |store| {
+            store
+                .add_import_observation(owner, session, row_key.as_deref(), concluded, &payload)
+                .map(import_observation_view)
+                .map_err(import_session_error)
+        })
+        .await
+    }
+
+    async fn list_import_observations(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ImportObservationView>, AppError> {
+        self.blocking(move |store| {
+            // The owner is checked before the rows are read: a session
+            // identifier is not an access right (§14), and the rows themselves
+            // carry no owner to filter on.
+            store
+                .load_import_session(owner, session)
+                .map_err(store_error)?
+                .ok_or(AppError::NotFound {
+                    what: "an import session",
+                    id: session.inner().to_string(),
+                })?;
+            store
+                .list_import_observations(session)
+                .map(|rows| rows.into_iter().map(import_observation_view).collect())
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn record_import_question(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        row: u32,
+        asking: NewImportQuestion,
+    ) -> Result<ImportQuestionView, AppError> {
+        self.blocking(move |store| {
+            let asking = StoredNewQuestion {
+                question: asking.question,
+                alternatives: asking.alternatives,
+                prompt: asking.prompt,
+            };
+            store
+                .record_import_question(owner, session, row, &asking)
+                .map(import_question_view)
+                .map_err(import_session_error)
+        })
+        .await
+    }
+
+    async fn list_import_questions(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+    ) -> Result<Vec<ImportQuestionView>, AppError> {
+        self.blocking(move |store| {
+            store
+                .load_import_session(owner, session)
+                .map_err(store_error)?
+                .ok_or(AppError::NotFound {
+                    what: "an import session",
+                    id: session.inner().to_string(),
+                })?;
+            store
+                .list_import_questions(session)
+                .map(|rows| rows.into_iter().map(import_question_view).collect())
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn answer_import_question(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        answer: String,
+        rule: Option<String>,
+    ) -> Result<ImportQuestionView, AppError> {
+        self.blocking(move |store| {
+            store
+                .answer_import_question(owner, session, question, &answer, rule.as_deref())
+                .map(import_question_view)
+                .map_err(import_session_error)
+        })
+        .await
+    }
+
+    async fn close_import_session(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        state: ImportSessionState,
+    ) -> Result<ImportSessionView, AppError> {
+        self.blocking(move |store| {
+            store
+                .close_import_session(owner, session, session_state_to_store(state))
+                .map(import_session_view)
+                .map_err(import_session_error)
         })
         .await
     }

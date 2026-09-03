@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountActivityView, AccountScopeExclusionView, AccountView, ContourView, ControlAssertionView,
-    Scope, Store,
+    AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
+    ContourView, ControlAssertionView, Scope, Store,
 };
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::source_row::RowName;
@@ -21,6 +21,9 @@ pub enum ActionKind {
     CreateFirstAccount,
     CreateFirstContour,
     AccountScopeUndecided,
+    /// The owner has not said which of his accounts money moves between this
+    /// one and. A discovery goal: it is asked before anything is imported.
+    ResolveTransferRelationships,
     StartAccountImport,
     ProvideControlAssertion,
     CoverageGapUnrepaired,
@@ -40,6 +43,7 @@ impl ActionKind {
             Self::CreateFirstAccount => "create_first_account",
             Self::CreateFirstContour => "create_first_contour",
             Self::AccountScopeUndecided => "account_scope_undecided",
+            Self::ResolveTransferRelationships => "resolve_transfer_relationships",
             Self::StartAccountImport => "start_account_import",
             Self::ProvideControlAssertion => "provide_control_assertion",
             Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
@@ -136,6 +140,8 @@ pub enum OperationKey {
     AddContourVersion,
     RecordOwnerBalance,
     CreateCategoryRule,
+    /// Record the owner's statement about one account's transfer partners.
+    RecordAccountTransferPartners,
 }
 impl OperationKey {
     /// The route operation identifier declared by the transport.
@@ -147,6 +153,7 @@ impl OperationKey {
             Self::AddContourVersion => "add_contour_version",
             Self::RecordOwnerBalance => "record_owner_balance",
             Self::CreateCategoryRule => "create_category_rule",
+            Self::RecordAccountTransferPartners => "record_account_transfer_partners",
         }
     }
 }
@@ -293,6 +300,7 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
     let accounts = store.list_accounts(owner).await?;
     let contours = store.list_contours(owner).await?;
     let exclusions = store.list_account_scope_exclusions(owner).await?;
+    let transfers = store.list_account_transfer_statements(owner).await?;
     let activity = store.list_account_activity(owner).await?;
     let mut assertions = Vec::new();
     for account in activity
@@ -309,6 +317,7 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
         &accounts,
         &contours,
         &exclusions,
+        &transfers,
         &activity,
         &assertions,
     ))
@@ -734,10 +743,11 @@ fn actions_from_state(
     accounts: &[AccountView],
     contours: &[ContourView],
     exclusions: &[AccountScopeExclusionView],
+    transfers: &[AccountTransferStatementView],
     activity: &[AccountActivityView],
     assertions: &[ControlAssertionView],
 ) -> Vec<Action> {
-    let mut actions = actions_from_views(accounts, contours, exclusions);
+    let mut actions = actions_from_views(accounts, contours, exclusions, transfers);
     actions.reserve(activity.len() + assertions.len());
     for account in activity
         .iter()
@@ -827,6 +837,7 @@ fn actions_from_views(
     accounts: &[AccountView],
     contours: &[ContourView],
     exclusions: &[AccountScopeExclusionView],
+    transfers: &[AccountTransferStatementView],
 ) -> Vec<Action> {
     let account_completion = account_completion(accounts);
     let contour_eligibility = !accounts.is_empty();
@@ -846,6 +857,14 @@ fn actions_from_views(
             .filter(|account| account_scope_gap(account.id, contours, exclusions))
         {
             actions.push(account_scope_action(account, accounts, contours));
+        }
+    }
+    if transfer_relationships_eligibility(accounts) {
+        for account in accounts
+            .iter()
+            .filter(|account| transfer_relationships_gap(account.id, transfers))
+        {
+            actions.push(transfer_relationships_action(account, accounts));
         }
     }
     actions
@@ -937,6 +956,109 @@ fn account_scope_completion(
     exclusions: &[AccountScopeExclusionView],
 ) -> bool {
     account_scope(account, contours, exclusions) != AccountScope::Undecided
+}
+
+/// The question exists once the owner has a second account to move money to.
+///
+/// With one account there is no «other side»: an internal transfer needs two,
+/// and asking about a relationship that cannot exist is the kind of item a
+/// queue is learned to ignore for.
+fn transfer_relationships_eligibility(accounts: &[AccountView]) -> bool {
+    accounts.len() > 1
+}
+
+fn transfer_relationships_gap(
+    account: AccountId,
+    statements: &[AccountTransferStatementView],
+) -> bool {
+    !transfer_relationships_completion(account, statements)
+}
+
+/// The goal is satisfied by a statement, not by a partner.
+///
+/// The same property [`account_scope_completion`] has, and for the same reason:
+/// it is asked of each account, so a newly created account reopens it however
+/// many statements already exist. An account named as somebody else's partner
+/// does **not** satisfy it — being on the far side of one relationship says
+/// nothing about the ones this account is the near side of — and a statement
+/// naming no partners does, because «none of my others» is an answer.
+fn transfer_relationships_completion(
+    account: AccountId,
+    statements: &[AccountTransferStatementView],
+) -> bool {
+    statements
+        .iter()
+        .any(|statement| statement.account == account)
+}
+
+/// Which of the owner's accounts are the two sides of one internal movement.
+///
+/// The discovery item. It is asked **before** anything is imported, because the
+/// order the reporter had to invent is the failure this exists to remove: one
+/// economic transfer between two banks is printed twice, once by each side, and
+/// nothing in either row says the two are one movement. Discovering that after
+/// the import means reclassifying rows already recorded; discovering it before
+/// means the import knows what it is looking at.
+///
+/// `RequiredForGoal`, not `Recommended`. An unrelated pair of legs makes the
+/// report count an outflow and an inflow that never crossed the perimeter — for
+/// a contour spanning both institutions, wrong twice over — so the absence
+/// changes what the reported numbers mean, which is the line the control
+/// assertions were promoted on.
+///
+/// `NeedsOwnerInput`, and the candidates are proposed rather than chosen. The
+/// system may not decide this: a relationship it inferred from two amounts that
+/// happen to match would be a fabricated fact about the owner's money, in
+/// exactly the way an inferred contour would be. So every other account is
+/// offered, with the institution that holds it, and the statement is his.
+fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]) -> Action {
+    let mut preset = BTreeMap::new();
+    preset.insert("account".to_owned(), account.id.inner().to_string().into());
+
+    Action::new(
+        ActionFacts {
+            id: format!(
+                "{}:{}",
+                ActionKind::ResolveTransferRelationships.id(),
+                account.id.inner()
+            ),
+            kind: ActionKind::ResolveTransferRelationships,
+            category: ActionCategory::RequiredForGoal,
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Owner),
+            subject: Some(ActionSubject::Account(account.id)),
+        },
+        format!(
+            "Account {} ({}) has no statement of which of your accounts money moves between it \
+             and. One transfer between two institutions is printed twice, once by each side, and \
+             nothing in the rows relates them; until you say which accounts are the two sides, \
+             each leg is counted as money crossing the perimeter. Name the accounts, or record \
+             that none of your others is on the other side.",
+            account.id.inner(),
+            account.title
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::RecordAccountTransferPartners,
+            request: RequestPlan {
+                preset,
+                // The owner's other accounts, and only those: this statement is
+                // about two accounts of his own, and a counterparty who is not
+                // him is the classification rules' question.
+                missing: vec![MissingInput {
+                    pointer: "/partners".into(),
+                    provided_by: ProvidedBy::Owner,
+                    candidates: Some(account_candidates(
+                        &accounts
+                            .iter()
+                            .filter(|candidate| candidate.id != account.id)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )),
+                }],
+            },
+        },
+    )
+    .expect("transfer relationships action has an operation target")
 }
 
 /// Use the inclusive first and last business effective dates: they are the
@@ -1746,6 +1868,7 @@ mod tests {
             std::slice::from_ref(&account),
             &[],
             &[],
+            &[],
             &[no_facts(account.id)],
             &[],
         );
@@ -1777,8 +1900,8 @@ mod tests {
     #[test]
     fn losing_contour_eligibility_is_not_contour_completion() {
         let account = account();
-        let eligible = actions_from_views(&[account], &[], &[]);
-        let ineligible = actions_from_views(&[], &[], &[]);
+        let eligible = actions_from_views(&[account], &[], &[], &[]);
+        let ineligible = actions_from_views(&[], &[], &[], &[]);
 
         assert!(
             eligible
@@ -1803,6 +1926,7 @@ mod tests {
             &[with_id(first), with_id(second)],
             &[],
             &[],
+            &[],
             &[no_facts(first), no_facts(second)],
             &[],
         );
@@ -1814,6 +1938,174 @@ mod tests {
             .collect();
         assert_eq!(identities.len(), 2);
         assert_ne!(identities[0], identities[1]);
+    }
+
+    /// The transfer statements the owner has made, spelled the way the store
+    /// returns them.
+    fn stated(account: AccountId, partners: &[AccountId]) -> AccountTransferStatementView {
+        AccountTransferStatementView {
+            account,
+            partners: partners.to_vec(),
+        }
+    }
+
+    /// Which of the owner's accounts money moves between is asked of every
+    /// account, and it is asked before anything is imported.
+    #[test]
+    fn every_account_is_asked_which_of_the_others_money_moves_between_it_and() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let accounts = [main.clone(), savings.clone()];
+
+        let actions = actions_from_views(&accounts, &[], &[], &[]);
+        let asked: Vec<_> = actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+            .collect();
+        assert_eq!(asked.len(), 2, "{actions:#?}");
+        // One item per account, identified by it: an agent deduplicates by the
+        // identity, and one shared identity would hide the second question.
+        assert_ne!(asked[0].id(), asked[1].id());
+        let subjects: Vec<_> = asked.iter().filter_map(|action| action.subject()).collect();
+        assert!(
+            subjects.contains(&ActionSubject::Account(main.id)),
+            "{subjects:?}"
+        );
+        assert!(
+            subjects.contains(&ActionSubject::Account(savings.id)),
+            "{subjects:?}"
+        );
+
+        // The candidates are proposed and the choice is not made: every *other*
+        // account is offered, and the account itself is not among them.
+        let ActionTarget::Operation { operation, request } = asked[0].target() else {
+            panic!("the statement has an operation to make it");
+        };
+        assert_eq!(*operation, OperationKey::RecordAccountTransferPartners);
+        assert_eq!(request.missing.len(), 1);
+        assert_eq!(request.missing[0].pointer, "/partners");
+        assert_eq!(request.missing[0].provided_by, ProvidedBy::Owner);
+        let subject = match asked[0].subject() {
+            Some(ActionSubject::Account(account)) => account,
+            other => panic!("the item names the account it is about: {other:?}"),
+        };
+        let candidates = request.missing[0]
+            .candidates
+            .as_ref()
+            .expect("the owner is offered his other accounts");
+        assert!(
+            candidates.iter().all(|candidate| candidate.id != subject),
+            "an account is not the other side of itself: {candidates:#?}"
+        );
+        assert_eq!(candidates.len(), 1);
+    }
+
+    /// With one account there is no other side, so the question is not asked.
+    #[test]
+    fn one_account_is_not_asked_what_it_transfers_with() {
+        let only = account();
+        assert!(!transfer_relationships_eligibility(std::slice::from_ref(
+            &only
+        )));
+        assert!(
+            actions_from_views(std::slice::from_ref(&only), &[], &[], &[])
+                .iter()
+                .all(|action| action.kind() != ActionKind::ResolveTransferRelationships)
+        );
+    }
+
+    /// The goal is closed by a statement, and «none of my others» is one.
+    #[test]
+    fn a_statement_naming_no_partner_closes_the_question_it_answers() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let accounts = [main.clone(), savings.clone()];
+        let statements = [stated(main.id, &[savings.id]), stated(savings.id, &[])];
+
+        assert!(transfer_relationships_completion(main.id, &statements));
+        assert!(transfer_relationships_completion(savings.id, &statements));
+        assert!(
+            actions_from_views(&accounts, &[], &[], &statements)
+                .iter()
+                .all(|action| action.kind() != ActionKind::ResolveTransferRelationships)
+        );
+    }
+
+    /// Being named by someone else's statement is not having made one.
+    ///
+    /// The far side of one relationship says nothing about the relationships
+    /// this account is the near side of, and reading it as an answer would
+    /// silence a question the owner never heard.
+    #[test]
+    fn being_named_as_a_partner_is_not_a_statement_of_ones_own() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let statements = [stated(main.id, &[savings.id])];
+
+        assert!(!transfer_relationships_completion(savings.id, &statements));
+        let asked: Vec<_> = actions_from_views(&[main, savings.clone()], &[], &[], &statements)
+            .into_iter()
+            .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+            .collect();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].subject(), Some(ActionSubject::Account(savings.id)));
+    }
+
+    /// The population is the accounts, so a new account reopens the goal.
+    ///
+    /// This is the property an existential predicate could not have: «some
+    /// relationship has been stated» would be satisfied by the first statement
+    /// and never asked again, and the account added afterwards — the second
+    /// bank, which is the whole case — would be the one nobody was asked about.
+    #[test]
+    fn a_new_account_reopens_the_transfer_question_however_many_are_answered() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let statements = [stated(main.id, &[savings.id]), stated(savings.id, &[])];
+        assert!(
+            actions_from_views(&[main.clone(), savings.clone()], &[], &[], &statements)
+                .iter()
+                .all(|action| action.kind() != ActionKind::ResolveTransferRelationships)
+        );
+
+        let everyday = named("Everyday");
+        let asked: Vec<_> =
+            actions_from_views(&[main, savings, everyday.clone()], &[], &[], &statements)
+                .into_iter()
+                .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+                .collect();
+        assert_eq!(asked.len(), 1, "only the new account is asked again");
+        assert_eq!(
+            asked[0].subject(),
+            Some(ActionSubject::Account(everyday.id))
+        );
+    }
+
+    /// Structure is asked about before an import is offered.
+    #[test]
+    fn the_structural_question_is_ordered_before_the_import() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let actions = actions_from_state(
+            &[main.clone(), savings.clone()],
+            &[],
+            &[],
+            &[],
+            &[no_facts(main.id), no_facts(savings.id)],
+            &[],
+        );
+        let mut sorted = actions;
+        sort_actions(&mut sorted);
+        let kinds: Vec<_> = sorted.iter().map(Action::kind).collect();
+        let structure = kinds
+            .iter()
+            .position(|kind| *kind == ActionKind::ResolveTransferRelationships)
+            .expect("the queue asks about structure");
+        let import = kinds
+            .iter()
+            .position(|kind| *kind == ActionKind::StartAccountImport)
+            .expect("the queue offers an import");
+        assert!(structure < import, "{kinds:?}");
     }
 
     #[test]
@@ -1866,6 +2158,7 @@ mod tests {
             std::slice::from_ref(&account),
             &[],
             &[],
+            &[],
             std::slice::from_ref(&activity),
             &[],
         );
@@ -1884,7 +2177,7 @@ mod tests {
         };
         assert!(account_import_completion(&completed));
         assert!(
-            actions_from_state(&[account], &[], &[], &[completed], &[])
+            actions_from_state(&[account], &[], &[], &[], &[completed], &[])
                 .iter()
                 .all(|action| action.kind() != ActionKind::StartAccountImport)
         );
@@ -1904,6 +2197,7 @@ mod tests {
         };
         actions_from_state(
             std::slice::from_ref(account),
+            &[],
             &[],
             &[],
             std::slice::from_ref(&activity),
@@ -2067,7 +2361,7 @@ mod tests {
             },
         ];
 
-        let actions = actions_from_state(&[first, second], &[], &[], &activity, &[]);
+        let actions = actions_from_state(&[first, second], &[], &[], &[], &activity, &[]);
         let ids: Vec<_> = actions
             .iter()
             .filter(|action| action.kind() == ActionKind::ProvideControlAssertion)
@@ -2086,15 +2380,21 @@ mod tests {
             first_effective_date: Some(time::macros::date!(2026 - 03 - 01)),
             last_effective_date: Some(time::macros::date!(2026 - 03 - 31)),
         };
-        let actions =
-            actions_from_state(std::slice::from_ref(&account), &[], &[], &[activity], &[]);
+        let actions = actions_from_state(
+            std::slice::from_ref(&account),
+            &[],
+            &[],
+            &[],
+            &[activity],
+            &[],
+        );
         assert!(
             actions
                 .iter()
                 .any(|action| action.kind() == ActionKind::ProvideControlAssertion)
         );
         assert!(
-            actions_from_state(&[], &[], &[], &[], &[])
+            actions_from_state(&[], &[], &[], &[], &[], &[])
                 .iter()
                 .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
         );

@@ -1011,6 +1011,7 @@ dependencies = [
  "iaam-store",
  "rand 0.10.2",
  "rust_decimal",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",

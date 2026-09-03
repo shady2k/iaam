@@ -670,7 +670,6 @@ async fn a_second_bank_joins_the_contour_instead_of_minting_another() {
 /// it: `INNER` with an amount, and neither the side this account was on nor the
 /// account on the other side.
 #[tokio::test]
-#[ignore = "iaam-6qsa: no operation shape expresses a row whose direction the source did not give"]
 async fn an_ambiguous_row_does_not_silently_become_a_deposit() {
     let harness = harness();
     let accounts = create_accounts(&harness).await;
@@ -697,9 +696,17 @@ async fn an_ambiguous_row_does_not_silently_become_a_deposit() {
         verdicts[0]["verdict"], "needs_classification",
         "a row with no direction must come back as a question, not a movement: {verdicts}"
     );
+    let detail = verdicts[0]["detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the verdict must carry the question: {verdicts}"));
+    // Which question, not merely that there is one. A row whose direction the
+    // source withheld must be asked about its direction; asking "is this
+    // income?" about it would settle the direction by assuming it, one step
+    // further along, and the owner's answer would record the guess as a rule.
+    // Asserting only that some question came back does not catch that.
     assert!(
-        verdicts[0]["detail"].is_string(),
-        "the verdict must carry the question the owner is to answer: {verdicts}"
+        detail.contains("INNER"),
+        "the question must quote what the source did state: {verdicts}"
     );
 
     // And nothing moved on the guess: the balance does not change until the
@@ -776,7 +783,6 @@ const DISCOVERY_KINDS: [&str; 5] = [
 /// With two banks and nothing imported, the queue's first item is about
 /// structure and not about importing.
 #[tokio::test]
-#[ignore = "iaam-7xh3: the queue has no discovery stage, so the setup order is the caller's to invent"]
 async fn the_queue_asks_about_structure_before_it_asks_for_an_import() {
     let harness = harness();
     let _accounts = create_accounts(&harness).await;
@@ -886,7 +892,12 @@ async fn an_opening_balance_is_asked_for_per_account() {
         );
     }
     // Asked once each, and the closing balance is not asked for beside it.
-    assert_eq!(asked.len(), 3, "{items:#?}");
+    //
+    // Five, not three: the month moved money into all five accounts, and since
+    // iaam-8axt the two whose whole content arrived by internal transfer are
+    // counted as having facts too. The number this assertion protects is «once
+    // each», and it was three only while two accounts were invisible.
+    assert_eq!(asked.len(), 5, "{items:#?}");
     assert!(
         !items
             .iter()
@@ -908,7 +919,6 @@ async fn an_opening_balance_is_asked_for_per_account() {
 /// `list_account_activity` joins on the account an event is recorded against,
 /// and a transfer is recorded against one side only.
 #[tokio::test]
-#[ignore = "iaam-8axt: activity counts one side of a transfer, so the receiving account looks empty"]
 async fn an_opening_balance_is_asked_for_an_account_that_only_received_transfers() {
     let harness = harness();
     let accounts = create_accounts(&harness).await;

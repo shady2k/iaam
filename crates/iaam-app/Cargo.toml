@@ -15,6 +15,10 @@ iaam-ingest = { path = "../iaam-ingest", version = "0.1.0" }
 # непрозрачными байтами, а ключ и сам шифр живут здесь.
 iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
 rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
+# `serde` itself, not only `serde_json`: an import session stores its rows,
+# questions and answers as JSON the store keeps opaque, and the types that
+# round-trip through it are declared here.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Один и только один механизм асинхронных трейтов (§3.2). Выбран async-trait:
 # порты обязаны быть объектобезопасными (`Arc<dyn Store>`), а RPITIT

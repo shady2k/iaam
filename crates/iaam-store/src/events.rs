@@ -1,7 +1,9 @@
 //! Fact log: recording and reading.
 
 use iaam_core::dates::EffectiveOrder;
-use iaam_core::event::kind::{CONTROL_ASSERTION_KIND, EventKind, IMPORT_COVERAGE_GAP_KIND};
+use iaam_core::event::kind::{
+    CASH_TRANSFER_KIND, CONTROL_ASSERTION_KIND, EventKind, FlowEndpoints, IMPORT_COVERAGE_GAP_KIND,
+};
 use iaam_core::event::{Event, Relation};
 use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::reconciliation::Dimension;
@@ -31,6 +33,24 @@ pub struct AccountActivityRecord {
     pub has_business_fact: bool,
     pub first_effective_date: Option<Date>,
     pub last_effective_date: Option<Date>,
+}
+
+impl AccountActivityRecord {
+    /// Widen the record to cover one more day this account had a fact on.
+    ///
+    /// The bounds are data-coverage bounds, so a fact reaching the account from
+    /// the other side of a transfer moves them exactly as one recorded against
+    /// it does: an account whose only day is the day money arrived is covered
+    /// on that day and on no other.
+    fn touch(&mut self, date: Date) {
+        self.has_business_fact = true;
+        self.first_effective_date = Some(
+            self.first_effective_date
+                .map_or(date, |first| first.min(date)),
+        );
+        self.last_effective_date =
+            Some(self.last_effective_date.map_or(date, |last| last.max(date)));
+    }
 }
 
 /// The state needed to match one control assertion without loading the journal.
@@ -145,8 +165,49 @@ impl SqliteStore {
         )
     }
 
-    /// Summarise every owned account without loading its journal events.
+    /// Summarise every owned account, counting **both** accounts a transfer
+    /// touched.
+    ///
+    /// `events.account` is the account an event is *recorded against*, and a
+    /// `CashTransfer` is recorded against one of the two it moves money
+    /// between. Joining on that column alone therefore reports an account whose
+    /// entire content arrived by internal transfer — savings fed from a current
+    /// account, a deposit opened by moving money across — as having no business
+    /// fact at all: the queue never asks it for a balance and offers it an
+    /// import instead, while it holds money at month end (iaam-8axt).
+    ///
+    /// The second account lives only in the event payload, so it is read in
+    /// Rust from [`EventKind::flow_endpoints`] rather than by `json_extract` in
+    /// the SQL or from a denormalised column:
+    ///
+    /// - a JSON path in the projection is pinned to the serde shape of a core
+    ///   type, and a renamed field would leave the query matching nothing
+    ///   without breaking the build — the drift `CONTROL_ASSERTION_KIND` and
+    ///   its neighbours exist to prevent;
+    /// - a `counterparty_account` column would have to be backfilled, and the
+    ///   journal is append-only *in the database*: `events_are_immutable`
+    ///   aborts any `UPDATE`, so the backfill would mean dropping and
+    ///   recreating the guard that makes the journal a journal.
+    ///
+    /// What it costs is reading the owner's transfer events — a subset of the
+    /// journal, not the whole of it — on each call.
     pub fn list_account_activity(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountActivityRecord>, StoreError> {
+        let mut activity = self.activity_recorded_against(owner)?;
+        for (from, to, date) in self.transfer_endpoints(owner)? {
+            for account in [from, to] {
+                if let Some(record) = activity.iter_mut().find(|record| record.account == account) {
+                    record.touch(date);
+                }
+            }
+        }
+        Ok(activity)
+    }
+
+    /// The bounds an account gets from the events recorded against it.
+    fn activity_recorded_against(
         &self,
         owner: OwnerId,
     ) -> Result<Vec<AccountActivityRecord>, StoreError> {
@@ -185,6 +246,37 @@ impl SqliteStore {
             });
         }
         Ok(activity)
+    }
+
+    /// Both accounts of every transfer the owner's journal holds, with its day.
+    ///
+    /// The endpoints come from the core's own [`EventKind::flow_endpoints`],
+    /// which is the single place that decides what a movement's endpoints are;
+    /// a kind that later grows a second account is picked up here without this
+    /// query being touched.
+    fn transfer_endpoints(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<(AccountId, AccountId, Date)>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, payload FROM events
+             WHERE owner = ?1 AND kind = ?2
+             ORDER BY effective_date, sequence, id",
+        )?;
+        let rows = statement.query_map(
+            params![owner.inner().to_string(), CASH_TRANSFER_KIND],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut endpoints = Vec::new();
+        for row in rows {
+            let (id, payload) = row?;
+            let event: Event = serde_json::from_str(&payload)
+                .map_err(|source| StoreError::EventDecode { id, source })?;
+            if let FlowEndpoints::BetweenAccounts { from, to } = event.kind.flow_endpoints() {
+                endpoints.push((from, to, event.order.date()));
+            }
+        }
+        Ok(endpoints)
     }
 
     /// List only an account's control assertions; payload matching stays in Rust.

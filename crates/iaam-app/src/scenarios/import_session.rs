@@ -34,7 +34,7 @@ use crate::ports::{
     ImportSessionState, ImportSessionView, NewImportQuestion, Principal,
 };
 use crate::scenarios::ingest::submit_candidates;
-use crate::scenarios::transfer_pairing::{self, LegOrigin, Proposals, TransferLeg};
+use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
 
 /// The durable question one row raised.
 ///
@@ -890,7 +890,7 @@ pub async fn plan_session(
     // The same matching pass the journal-level proposal runs, over the rows this
     // session is about to write. One function, so an owner shown a candidate
     // here is shown the same candidate after the commit.
-    let legs: Vec<TransferLeg> = read_rows
+    let legs: Vec<CashLeg> = read_rows
         .iter()
         .filter_map(|read| {
             let event = read.candidate.as_ref().ok()?;

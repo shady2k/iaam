@@ -30,7 +30,7 @@ use iaam_app::scenarios::reports::{
     AccountBalanceRow, BalancesReport, MoneyFlowReport, PopulationAccount, ReportPopulation,
     ReturnsOutcome,
 };
-use iaam_app::scenarios::transfer_pairing::{ConfirmedPairing, LegOrigin, Proposals, TransferLeg};
+use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -6343,6 +6343,8 @@ pub struct ImportPlanDto {
     pub account_resolution: AccountResolutionDto,
     pub scope_assessment: ScopeAssessmentDto,
     pub interpretation: InterpretationDto,
+    /// Transfer candidates, and the cash movements nothing was proposed
+    /// against — ordinarily most of the rows, and not pending work.
     pub cross_source_matching: CrossSourceMatchingDto,
     pub commit_delta: CommitDeltaDto,
     /// `ready`, `blocked` or `requires_owner_decision`.
@@ -6450,19 +6452,57 @@ pub struct RetainedRowDto {
     pub actual: Option<String>,
 }
 
-/// Transfers proposed out of two one-sided movements, and the legs nothing
+/// Transfers proposed out of two one-sided movements, and the movements nothing
 /// paired with.
 ///
 /// Both halves are published. A leg that vanished from the answer because
 /// nothing matched it is a leg the owner reads as an external flow by default,
 /// which is the defect rather than the fix.
+///
+/// **`unmatched` is not a list of failures, and this block is not a job queue.**
+/// Every cash movement carrying a posting date is offered to the matcher,
+/// because nothing printed in a row says whether it is half of a transfer: a
+/// payment in a shop and the outgoing leg of a transfer between two of the
+/// owner's banks are the same row until a counterpart turns up on another
+/// account. So a movement no counterpart was proposed for is listed here, and
+/// for everything that is not a transfer — a card payment, a salary, a cash
+/// withdrawal — that is its correct and permanent state. It will be listed on
+/// every reading of this route, for good, and there is nothing for the owner to
+/// do about it.
+///
+/// The normal shape of an import containing no transfers is therefore
+/// `candidates: []` beside an `unmatched` holding every row of it: five ordinary
+/// deposits and withdrawals produce five unmatched legs and nothing to confirm.
+/// A caller that reads that as an error will report one on every import the
+/// owner makes. What deserves attention is `candidates`, which are the pairs put
+/// to the owner to judge, and, inside an import session, the readiness that
+/// counts them.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CrossSourceMatchingDto {
+    /// Pairs proposed for the owner to confirm. Empty is the ordinary case: most
+    /// sources contain no transfer between two of the owner's own accounts.
     pub candidates: Vec<PairingCandidateDto>,
+    /// Cash movements for which no counterpart was proposed — permanently, for
+    /// every movement that is not half of a transfer.
+    ///
+    /// Read it as "nothing was proposed against these", never as "these failed
+    /// to match" or "these are still being worked on". A full `unmatched` beside
+    /// an empty `candidates` says only that the source held no transfer, which
+    /// is what most sources hold.
     pub unmatched: Vec<TransferLegDto>,
 }
 
-/// One side of a movement that may be half of a transfer.
+/// One side of a cash movement, which may or may not be half of a transfer.
+///
+/// Rendered from any recorded or planned `CashOut` or `CashIn` that carries a
+/// posting date, so appearing here — in `unmatched` above all — asserts nothing
+/// about the row beyond its having moved cash on a day.
+///
+/// The domain type behind it is called `CashLeg` for exactly that reason: naming
+/// it after transfers claimed of every row the thing the owner alone decides.
+/// The two names differ on purpose, and this one keeps `Transfer` because it is
+/// published in the OpenAPI schema and clients hold it; renaming the wire would
+/// break them for a word.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TransferLegDto {
     /// The journal event, when the leg is already recorded.
@@ -6489,6 +6529,10 @@ pub struct TransferLegDto {
 }
 
 /// Two legs proposed as one movement, and what the proposal rests on.
+///
+/// A proposal and nothing more: appearing here relates the two legs in no way
+/// the journal knows about, and both go on counting separately until the owner
+/// confirms the pairing.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PairingCandidateDto {
     pub outgoing: TransferLegDto,
@@ -6737,7 +6781,7 @@ impl CrossSourceMatchingDto {
 
 impl TransferLegDto {
     #[must_use]
-    pub fn from_domain(leg: &TransferLeg) -> Self {
+    pub fn from_domain(leg: &CashLeg) -> Self {
         let (event, session, row) = match leg.origin {
             LegOrigin::Recorded { event } => (Some(event.inner()), None, None),
             LegOrigin::Observed { session, row } => (None, Some(session.inner()), Some(row)),

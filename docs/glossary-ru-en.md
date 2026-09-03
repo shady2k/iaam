@@ -112,6 +112,7 @@ is how you match a term in them to the code.
 | маппинг колонок | column mapping | which export column feeds which field |
 | ключ строки | row key | the stable identity that makes a re-import idempotent |
 | нога (перевода) | leg | one of the two rows an internal transfer produces |
+| нога движения | cash leg | `CashLeg`; one side of a cash movement offered to the pairing matcher, which may or may not turn out to be a transfer leg |
 | скилл импорта | import skill | per-institution knowledge held as an agent skill, never as code |
 
 ## Refusals and quality

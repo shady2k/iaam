@@ -22,6 +22,12 @@
 //! disappears from the answer is a leg the owner reads as external flow by
 //! default — which is the defect, not the fix.
 //!
+//! That list is therefore where an ordinary one-sided movement stays, and stays
+//! permanently. A payment in a shop is a cash movement no counterpart will ever
+//! be proposed for, and it is reported unmatched on every reading, for good. A
+//! source none of whose rows are transfers yields no candidates and an unmatched
+//! leg for every row: that is this module working, not failing at anything.
+//!
 //! The same [`propose`] serves two callers, and deliberately one function:
 //! [`propose_journal_pairings`] over the events already recorded, and the import
 //! session's assessment over the rows it is about to record. A second matcher
@@ -65,13 +71,20 @@ pub enum LegOrigin {
     Observed { session: ImportSessionId, row: u32 },
 }
 
-/// One side of a movement that may be half of a transfer.
+/// One side of a cash movement, which may or may not be half of a transfer.
 ///
 /// Built from a recorded event or from a session's planned row, and identical in
 /// both cases: the matcher must not be able to tell them apart, or it would
 /// propose different pairs before and after a commit.
+///
+/// Named for cash rather than for transfers, and renamed from `TransferLeg` to
+/// say so. Every `CashOut` and `CashIn` carrying a posting date becomes one of
+/// these, and most of them are a shop payment or a salary that no transfer will
+/// ever claim; the old name asserted of every such row the one thing [`propose`]
+/// exists to leave to the owner. The transport type is still `TransferLegDto`,
+/// because that name is published in the OpenAPI schema and clients hold it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransferLeg {
+pub struct CashLeg {
     pub origin: LegOrigin,
     pub account: AccountId,
     /// Which way the money went on this account.
@@ -117,8 +130,8 @@ pub struct PairingEvidence {
 /// Two legs proposed as one movement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingCandidate {
-    pub outgoing: TransferLeg,
-    pub incoming: TransferLeg,
+    pub outgoing: CashLeg,
+    pub incoming: CashLeg,
     pub evidence: PairingEvidence,
 }
 
@@ -126,8 +139,10 @@ pub struct PairingCandidate {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Proposals {
     pub candidates: Vec<PairingCandidate>,
-    /// Legs no candidate covers. Reported, never dropped.
-    pub unmatched: Vec<TransferLeg>,
+    /// Legs no candidate covers: reported, never dropped, and ordinarily most
+    /// of them. Emptying this is not a goal — it empties only when every
+    /// movement handed to [`propose`] happens to be half of a proposed pair.
+    pub unmatched: Vec<CashLeg>,
 }
 
 /// What confirming one pairing wrote.
@@ -154,7 +169,7 @@ pub struct ConfirmedPairing {
 /// description, which the two banks write in two vocabularies, and not the
 /// institution, which this layer has no business knowing.
 #[must_use]
-pub fn propose(legs: &[TransferLeg]) -> Proposals {
+pub fn propose(legs: &[CashLeg]) -> Proposals {
     let mut candidates = Vec::new();
     for outgoing in legs.iter().filter(|leg| leg.direction == Movement::Out) {
         for incoming in legs.iter().filter(|leg| leg.direction == Movement::In) {
@@ -216,7 +231,7 @@ pub fn propose(legs: &[TransferLeg]) -> Proposals {
     }
 }
 
-fn pairs(outgoing: &TransferLeg, incoming: &TransferLeg) -> bool {
+fn pairs(outgoing: &CashLeg, incoming: &CashLeg) -> bool {
     outgoing.account != incoming.account
         && outgoing.currency == incoming.currency
         && outgoing.amount_minor == incoming.amount_minor
@@ -233,8 +248,13 @@ fn days_apart(left: Date, right: Date) -> i64 {
 /// already names both of its accounts, so it is not half of anything. An event
 /// with no cash-posted date is skipped rather than dated from something else —
 /// a proposal resting on a date nobody stated is a proposal resting on nothing.
+///
+/// Every other such event qualifies, deliberately and without judgement of what
+/// it looks like. Whether a row is half of a transfer is the question [`propose`]
+/// puts to the owner; withholding rows here on a guess about the description or
+/// the counterparty would answer it earlier, on worse evidence, and invisibly.
 #[must_use]
-pub fn leg_of_event(event: &Event) -> Option<TransferLeg> {
+pub fn leg_of_event(event: &Event) -> Option<CashLeg> {
     let (direction, amount) = match &event.kind {
         EventKind::CashOut { amount } => (Movement::Out, *amount),
         EventKind::CashIn { amount } => (Movement::In, *amount),
@@ -242,7 +262,7 @@ pub fn leg_of_event(event: &Event) -> Option<TransferLeg> {
     };
     let magnitude = amount.amount().raw().checked_abs().filter(|it| *it > 0)?;
     let date = event.dates.cash_posted.map(|posted| posted.0)?;
-    Some(TransferLeg {
+    Some(CashLeg {
         origin: LegOrigin::Recorded { event: event.id },
         account: event.account,
         direction,
@@ -272,7 +292,7 @@ pub async fn propose_journal_pairings(
         .load_events_through(principal.owner, Date::MAX)
         .await?;
     let effective = iaam_core::event::correction::resolve(&events).map_err(AppError::Correction)?;
-    let legs: Vec<TransferLeg> = effective.into_iter().filter_map(leg_of_event).collect();
+    let legs: Vec<CashLeg> = effective.into_iter().filter_map(leg_of_event).collect();
     Ok(propose(&legs))
 }
 
@@ -392,8 +412,8 @@ mod tests {
         direction: Movement,
         amount_minor: i64,
         day: Date,
-    ) -> TransferLeg {
-        TransferLeg {
+    ) -> CashLeg {
+        CashLeg {
             origin: LegOrigin::Observed {
                 session: ImportSessionId::new_random(),
                 row: origin,

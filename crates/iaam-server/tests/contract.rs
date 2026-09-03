@@ -249,8 +249,11 @@ fn add_reconciliation_assertion_for_period(
         ),
         relation: iaam_core::event::Relation::None,
         confidence: iaam_core::event::Confidence::Known,
+        // A fixture key, not an imitation of one the production path writes:
+        // this seed is stamped `contract-test`, and nothing here depends on it
+        // colliding with a claim the owner-stated route would record.
         idempotency_key: Some(format!(
-            "owner-balance:{}:{}:{}",
+            "contract-test-assertion:{}:{}:{}",
             account.inner(),
             period.from,
             period.to

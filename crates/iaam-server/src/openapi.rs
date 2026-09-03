@@ -42,9 +42,9 @@ use crate::dto::{
     QuotationBasisDto, QuotationBasisStatusDto, RateDto, RecomputePlanDto,
     ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest, RefusedRowDto,
     RequestPlanDto, RequiredInputDto, ResolutionOptionDto, ReturnsAnswerDto, ReturnsReportDto,
-    RowNameDto, SelectedPriceDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TaintDto, TokenDto, TristateDto, UncoveredPositionDto,
-    VerdictDto, ZeroReinvestmentMetricsDto,
+    RowNameDto, RuleMatcherDto, SelectedPriceDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TaintDto, TokenDto,
+    TristateDto, UncoveredPositionDto, VerdictDto, ZeroReinvestmentMetricsDto,
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
@@ -132,6 +132,7 @@ impl Modify for BearerSecurity {
         ClassificationRuleChangeDto,
         ClassificationRuleDto,
         ClassifiedAsDto,
+        RuleMatcherDto,
         PlannedCorrectionDto,
         RecomputePlanDto,
         ClassificationRuleRequest,

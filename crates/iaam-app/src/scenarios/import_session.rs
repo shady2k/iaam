@@ -14,7 +14,6 @@
 
 use std::collections::BTreeSet;
 
-use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
 use iaam_core::money::CurrencyCode;
 use iaam_ingest::classification::{
@@ -36,6 +35,7 @@ use crate::ports::{
     ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionView,
     NewImportQuestion, Principal,
 };
+use crate::scenarios::classification::{matcher_json, outcome_json};
 use crate::scenarios::ingest::submit_candidates;
 use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
 
@@ -1798,40 +1798,6 @@ fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
     (!matcher.asks_nothing()).then_some(matcher)
 }
 
-fn matcher_json(matcher: &RuleMatcher) -> serde_json::Value {
-    serde_json::json!({
-        "counterparty_account": matcher.counterparty_account,
-        "description_contains": matcher.description_contains,
-        "kind": matcher.kind,
-    })
-}
-
-/// A classification in the vocabulary the rule store keeps it in.
-///
-/// The inverse of the parser in [`crate::scenarios::classification`], and it must
-/// stay so: a rule written in words that parser cannot read is a decision the
-/// owner can never see again.
-fn outcome_json(classification: Classification) -> serde_json::Value {
-    match classification {
-        Classification::InternalTransfer { to } => serde_json::json!({
-            "kind": "internal_transfer",
-            "to": to.inner().to_string(),
-        }),
-        Classification::ExternalFlow => serde_json::json!({ "kind": "external_flow" }),
-        Classification::Income => serde_json::json!({ "kind": "income" }),
-        Classification::Fee { origin } => serde_json::json!({
-            "kind": "fee",
-            "origin": match origin {
-                FeeOrigin::Brokerage => "brokerage",
-                FeeOrigin::Depositary => "depositary",
-                FeeOrigin::AccountMaintenance => "account_maintenance",
-                FeeOrigin::MarginInterest => "margin_interest",
-                FeeOrigin::Other => "other",
-            },
-        }),
-    }
-}
-
 /// The observed row one question is about.
 fn observed_row(contents: &SessionContents, row: u32) -> Result<ObservedRow, AppError> {
     let observation = contents
@@ -1920,6 +1886,7 @@ fn require_submit(principal: &Principal) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::ports::AccountAliasView;
+    use iaam_core::event::kind::FeeOrigin;
     use iaam_ingest::observation::{ObservedCounterparty, ObservedDirection, RowIdentity};
     use iaam_ingest::operation::OperationDates;
     use time::macros::date;

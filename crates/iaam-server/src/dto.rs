@@ -9,7 +9,10 @@
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
 use crate::action_catalog::ActionCatalog;
-use iaam_app::ingest::classification::{Answer, AnswerShape, Movement};
+use iaam_app::error::AppError;
+use iaam_app::ingest::classification::{
+    Answer, AnswerShape, Classification, Movement, RuleMatcher,
+};
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::observation::{
     Intake, ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity,
@@ -22,7 +25,9 @@ use iaam_app::ports::{
 };
 use iaam_app::ports::{ImportQuestionView, ImportSessionView};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
-use iaam_app::scenarios::classification::{ClassifiedAs, PlannedCorrection, RuleChange};
+use iaam_app::scenarios::classification::{
+    ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
+};
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
 use iaam_app::scenarios::import_session::{
     HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow, RetentionReason,
@@ -6154,42 +6159,111 @@ pub struct OwnerBalanceRequest {
     pub source_hash: Option<String>,
 }
 
+/// What a classification rule tests a row against.
+///
+/// An object, on the way in and on the way out, and it used to be neither: the
+/// rule routes took and returned a **string containing** this JSON. A string is
+/// the one shape an LLM client cannot infer, because inference is copying the
+/// shape it just read, and a structure smuggled through a string reads as an
+/// opaque token rather than as three fields it may set.
+///
+/// Every member is optional and every one of them narrows: a matcher stating
+/// nothing matches nothing, by construction in
+/// [`iaam_app::ingest::classification::RuleMatcher::asks_nothing`]. It is
+/// accepted rather than refused here, because that refusal belongs to the
+/// classifier and not to the transport, and duplicating it would make two places
+/// decide what an empty rule means.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct RuleMatcherDto {
+    /// The counterparty the source printed, matched exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterparty_account: Option<String>,
+    /// A case-insensitive substring of the payment purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_contains: Option<String>,
+    /// The word the source used for the operation, matched exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl RuleMatcherDto {
+    #[must_use]
+    pub fn from_domain(matcher: &RuleMatcher) -> Self {
+        Self {
+            counterparty_account: matcher.counterparty_account.clone(),
+            description_contains: matcher.description_contains.clone(),
+            kind: matcher.kind.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn to_domain(&self) -> RuleMatcher {
+        RuleMatcher {
+            counterparty_account: self.counterparty_account.clone(),
+            description_contains: self.description_contains.clone(),
+            kind: self.kind.clone(),
+        }
+    }
+}
+
 /// Classification rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClassificationRuleDto {
     pub id: Uuid,
     pub version: u64,
-    pub matcher: String,
-    pub outcome: String,
+    pub matcher: RuleMatcherDto,
+    pub outcome: ClassifiedAsDto,
     pub created_at: String,
     pub retired_at: Option<String>,
     pub replaces: Option<Uuid>,
 }
 
 impl ClassificationRuleDto {
-    #[must_use]
-    pub fn from_port(rule: ClassificationRuleView) -> Self {
-        Self {
-            id: rule.id,
-            version: u64::from(rule.version),
-            matcher: rule.matcher,
-            outcome: rule.outcome,
-            created_at: rule.created_at,
-            retired_at: rule.retired_at,
-            replaces: rule.replaces,
-        }
+    /// A stored rule, rendered in the two shapes it may be written in.
+    ///
+    /// Fallible, and the failure is real: the store keeps the matcher and the
+    /// outcome as opaque JSON, so a rule written before this route was typed —
+    /// or by anything other than this route — can hold JSON the classifier
+    /// cannot read. It is read here by [`rule_from_view`], the same function the
+    /// classifier reads it with, rather than by a second parser of the same
+    /// text. Two readings of one stored rule would eventually disagree about
+    /// what the owner decided, and the listing is the surface on which he would
+    /// see the wrong one.
+    pub fn from_port(rule: ClassificationRuleView) -> Result<Self, AppError> {
+        let id = rule.id;
+        let created_at = rule.created_at.clone();
+        let retired_at = rule.retired_at.clone();
+        let replaces = rule.replaces;
+        let parsed = rule_from_view(rule)?;
+        Ok(Self {
+            id,
+            version: u64::from(parsed.version),
+            matcher: RuleMatcherDto::from_domain(&parsed.matcher),
+            outcome: ClassifiedAsDto::from_domain(classified_as(parsed.outcome)),
+            created_at,
+            retired_at,
+            replaces,
+        })
     }
 }
 
 /// A classification named in the vocabulary a rule outcome uses.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+///
+/// Deserialised as well as serialised, and used for both halves of a rule's
+/// outcome: what `POST /v1/classification-rules` accepts and what the listing
+/// prints are one type, so what a client reads is what it may send back. It is
+/// also what a recomputation plan names an event's `was` and `becomes` with —
+/// deliberately, because the plan must speak the vocabulary the owner writes
+/// rules in or it names a decision he cannot restate as a rule.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClassifiedAsDto {
+    /// `internal_transfer`, `external_flow`, `income` or `fee`.
     pub kind: String,
     /// Receiving account, for `internal_transfer` only.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Uuid>,
     /// Fee origin, for `fee` only.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 }
 
@@ -6200,6 +6274,20 @@ impl ClassifiedAsDto {
             to: classification.to.map(|account| account.inner()),
             origin: classification.origin.map(str::to_owned),
         }
+    }
+
+    /// The classification these three words name.
+    ///
+    /// Read by the application's own vocabulary reader, the one that reads a
+    /// stored rule, so a word this route accepts is a word the classifier can
+    /// act on. A second reader here would admit `fee` with an origin the
+    /// classifier refuses, and the rule would be written and lost in one call.
+    pub fn to_domain(&self) -> Result<Classification, AppError> {
+        outcome_from(
+            &self.kind,
+            self.to.map(|account| account.to_string()).as_deref(),
+            self.origin.as_deref(),
+        )
     }
 }
 
@@ -6254,20 +6342,24 @@ pub struct ClassificationRuleChangeDto {
 }
 
 impl ClassificationRuleChangeDto {
-    #[must_use]
-    pub fn from_domain(change: RuleChange) -> Self {
-        Self {
-            rule: ClassificationRuleDto::from_port(change.rule),
+    pub fn from_domain(change: RuleChange) -> Result<Self, AppError> {
+        Ok(Self {
+            rule: ClassificationRuleDto::from_port(change.rule)?,
             plan: RecomputePlanDto::from_domain(change.plan),
-        }
+        })
     }
 }
 
 /// Request to create or update a rule.
+///
+/// `matcher` and `outcome` are the objects the listing prints, not strings
+/// containing them. That is the whole of iaam-gpo3: a field whose read form
+/// does not round-trip as its write form is the one thing an LLM client cannot
+/// infer, because inference is copying the shape it just saw.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ClassificationRuleRequest {
-    pub matcher: String,
-    pub outcome: String,
+    pub matcher: RuleMatcherDto,
+    pub outcome: ClassifiedAsDto,
     #[serde(default)]
     pub replaces: Option<Uuid>,
 }

@@ -840,7 +840,7 @@ pub async fn list_classification_rules(
         rules
             .into_iter()
             .map(ClassificationRuleDto::from_port)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
@@ -875,14 +875,14 @@ pub async fn create_classification_rule(
     let change = create_rule(
         &state.services,
         &principal,
-        request.matcher,
-        request.outcome,
+        &request.matcher.to_domain(),
+        request.outcome.to_domain()?,
         request.replaces,
     )
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(ClassificationRuleChangeDto::from_domain(change)),
+        Json(ClassificationRuleChangeDto::from_domain(change)?),
     ))
 }
 

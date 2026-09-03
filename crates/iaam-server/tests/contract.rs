@@ -3139,8 +3139,8 @@ async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
 async fn classification_rules_are_visible_versioned_and_retirable() {
     let harness = harness();
     let request = json!({
-        "matcher": r#"{"kind":"income"}"#,
-        "outcome": r#"{"kind":"external_flow"}"#,
+        "matcher": { "kind": "income" },
+        "outcome": { "kind": "external_flow" },
     });
     let (status, created) = call(
         &harness.router,
@@ -3159,7 +3159,7 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
     .await;
     assert_eq!(status, StatusCode::OK, "{history}");
     assert_eq!(history.as_array().expect("history").len(), 1);
-    assert_eq!(history[0]["matcher"], r#"{"kind":"income"}"#);
+    assert_eq!(history[0]["matcher"], json!({ "kind": "income" }));
     assert!(!history.to_string().contains(BROKER_TOKEN), "{history}");
 
     let (status, body) = call(
@@ -3188,8 +3188,8 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
 async fn only_the_owner_can_manage_classification_rules() {
     let harness = harness();
     let rule = json!({
-        "matcher": r#"{"kind":"income"}"#,
-        "outcome": r#"{"kind":"external_flow"}"#,
+        "matcher": { "kind": "income" },
+        "outcome": { "kind": "external_flow" },
     });
     for (method, body) in [
         (
@@ -9644,8 +9644,8 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     // A rule on the description the source printed. Matching it requires the
     // subject rebuilt from the event to carry that description.
     let by_description = json!({
-        "matcher": r#"{"description_contains":"shop one"}"#,
-        "outcome": r#"{"kind":"fee","origin":"account_maintenance"}"#,
+        "matcher": { "description_contains": "shop one" },
+        "outcome": { "kind": "fee", "origin": "account_maintenance" },
     });
     let (status, first) = call(
         &harness.router,
@@ -9673,8 +9673,8 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     // A rule on the word the source used for the row — not on `cash_out`,
     // which is the classification this rule exists to revise.
     let by_source_kind = json!({
-        "matcher": r#"{"kind":"Card operation"}"#,
-        "outcome": r#"{"kind":"income"}"#,
+        "matcher": { "kind": "Card operation" },
+        "outcome": { "kind": "income" },
     });
     let (status, second) = call(
         &harness.router,
@@ -9714,13 +9714,141 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{plan}");
 }
 
+/// What the listing prints is what the create route accepts, unchanged.
+///
+/// The one thing an LLM client cannot infer is a write shape that differs from
+/// the read shape, because inference is copying the shape it just saw. So the
+/// test sends nothing of its own on the second write: it takes `matcher` and
+/// `outcome` out of the response verbatim and posts them back, and the rule that
+/// comes out has to be the rule that went in.
+///
+/// A rule created by answering an import question is round-tripped too, and it
+/// is the harder half: nothing about it was composed by a client, so it is the
+/// shape the server itself writes that has to be readable as a request.
+#[tokio::test]
+async fn a_classification_rule_round_trips_through_the_shape_it_is_read_in() {
+    let harness = harness();
+    let savings = account_with(&harness, &json!({ "title": "Savings" })).await;
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": { "counterparty_account": "Savings", "kind": "INNER" },
+                "outcome": { "kind": "internal_transfer", "to": savings },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (status, history) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let read = &history.as_array().expect("history")[0];
+    assert_eq!(
+        read["matcher"],
+        json!({ "counterparty_account": "Savings", "kind": "INNER" }),
+        "the matcher is read as the object it was written as: {read}"
+    );
+    assert_eq!(
+        read["outcome"],
+        json!({ "kind": "internal_transfer", "to": savings }),
+        "the outcome is read as the object it was written as: {read}"
+    );
+
+    // Nothing composed here: exactly what was read, sent back.
+    let (status, again) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({ "matcher": read["matcher"], "outcome": read["outcome"] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "what the listing prints must be accepted verbatim: {again}"
+    );
+    assert_eq!(again["matcher"], read["matcher"], "{again}");
+    assert_eq!(again["outcome"], read["outcome"], "{again}");
+
+    // The rule the server writes for itself, when the owner answers a question,
+    // has to survive the same journey.
+    let account = harness.account.inner();
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "round-trip-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"].as_str().expect("session");
+    let question = verdicts[0]["question_id"].as_str().expect("question");
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    let learned = answered["rule"]
+        .as_str()
+        .expect("the rule the answer wrote");
+
+    let (status, history) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let read = history
+        .as_array()
+        .expect("history")
+        .iter()
+        .find(|rule| rule["id"] == json!(learned))
+        .expect("the rule the answer wrote is in the listing");
+    let (status, again) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({ "matcher": read["matcher"], "outcome": read["outcome"] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a rule the server wrote must be readable as a request: {again}"
+    );
+    assert_eq!(again["matcher"], read["matcher"], "{again}");
+    assert_eq!(again["outcome"], read["outcome"], "{again}");
+}
+
 /// A rule matching nothing says so, rather than saying nothing.
 #[tokio::test]
 async fn a_classification_rule_that_matches_nothing_returns_an_empty_plan() {
     let harness = harness();
     let rule = json!({
-        "matcher": r#"{"description_contains":"nothing here"}"#,
-        "outcome": r#"{"kind":"income"}"#,
+        "matcher": { "description_contains": "nothing here" },
+        "outcome": { "kind": "income" },
     });
     let (status, created) = call(
         &harness.router,
@@ -15457,8 +15585,10 @@ async fn a_rejected_field_with_a_closed_vocabulary_publishes_its_values() {
 
 /// The classification outcome vocabulary travels as values, not as a sentence.
 ///
-/// The rule's outcome is a JSON string the caller composes, so the four
-/// classifications it may name are the caller's business and not the store's.
+/// `outcome.kind` is one of four words and the schema does not say which, so the
+/// refusal carries them. The check runs at the door — before the rule is stored
+/// — because a rule the classifier cannot read is a decision written and lost in
+/// the same call.
 #[tokio::test]
 async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
     let harness = harness();
@@ -15468,8 +15598,8 @@ async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
             "/v1/classification-rules",
             &harness.owner_token,
             &json!({
-                "matcher": r#"{"kind":"income"}"#,
-                "outcome": r#"{"kind":"gift"}"#,
+                "matcher": { "kind": "income" },
+                "outcome": { "kind": "gift" },
             }),
         ),
     )

@@ -323,3 +323,53 @@ prints only its identifier, with no name table beside it in the same response:
 Each of these is a shape change to a published type, so each is its own decision
 about breaking a client, and none of them is a reason to publish a new type that
 prints an identifier alone. A type added after this section carries the name.
+
+---
+
+## 4. A structure is never sent as a string
+
+> **A field whose value is a structure is a JSON object on the wire, in both
+> directions. It is never a JSON document encoded inside a JSON string, and the
+> shape a route prints is a shape the route that writes it accepts unchanged.**
+
+### 4.1 Why the read shape and the write shape must be one
+
+Every other rule in this file can be learned from documentation. This one cannot,
+because the client is a language model and the way a language model discovers a
+write shape is by copying the shape it just read. A field that reads as one thing
+and is written as another has no signal a client can follow: it has to guess, and
+each guess costs a rejected request.
+
+`POST /v1/classification-rules` used to take `matcher` and `outcome` as **strings
+containing** the JSON that the listing prints — and an external client needed two
+attempts to compose the write shape after reading the read shape. Both are now
+objects on both sides, and `RuleMatcherDto` and `ClassifiedAsDto` are the same
+types in the request body and in the response, so the round trip is a property of
+the type rather than of two definitions that agree today.
+
+### 4.2 Why a string is worse than an object even when it round-trips
+
+A structure inside a string does round-trip, in the narrow sense: copy the string
+back and the server parses it. What it does not do is say what may be put in it.
+An object publishes its members in the specification; a string publishes
+`type: string`, and the members exist only in prose the client has to find. It
+also puts the encoding in the client's hands — escaping, key order, whether a
+member may be omitted or must be `null` — none of which the client can verify
+before sending.
+
+The store keeps such values as opaque text on purpose: `import_sessions` and the
+rule tables document exactly that, and the reason is that the store must not know
+the classifier's vocabulary. That is a storage decision, and it stops at the
+storage boundary. What reaches the wire is the parsed structure, read by the same
+function the classifier reads it with — one reader, so a rule cannot be printed
+in a vocabulary it may not be written in.
+
+### 4.3 Where the rule is not yet kept
+
+`GET /v1/category-rules` prints `matcher` as a string holding the stored JSON,
+while `POST /v1/category-rules` documents an object. The write side does also
+accept the string, in seven spellings, so a client that copies what it read is
+accepted — the asymmetry is in what the two sides *say*, and a client that
+follows the specification writes a shape it will never read back. Straightening
+it means choosing one spelling of a category matcher and retiring the other six,
+which is its own decision about breaking a client and is not made here.

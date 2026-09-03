@@ -57,10 +57,14 @@ of your own is the most expensive mistake that can be made here.
 The agent is not part of the system and has no access to its storage. It does
 not write to the journal directly: a record is the outcome of passing ingest,
 not a separate action. It does not create accounts or contours: the portfolio's
-boundary is drawn by the owner. It does not correct or retract what is already
-recorded — that is the owner's act, and his credential is what the system will
-accept for it. And it does not hold the owner's statements — the owner loads
-them himself, and the agent sees exactly what the owner has shown it.
+boundary is drawn by the owner. It does not rule on what is already recorded —
+retracting a fact the owner holds is his act, and his credential is what the
+system will accept for it. The one exception proves the rule rather than
+softening it: an agent may take back an import it declared itself, while nothing
+has been built on it, because that is not a ruling on the owner's history but a
+return to the state before the agent acted. And it does not hold the owner's
+statements — the owner loads them himself, and the agent sees exactly what the
+owner has shown it.
 
 From this follows the thing that is easiest to violate out of the best
 intentions: a missing value is asked of the owner, not filled in. A guess that
@@ -112,10 +116,24 @@ money went and whose account was on the other side are facts about the owner's
 affairs; you may show him the question and the alternatives, and relay what he
 says.
 
-The owner's answer is kept as one of his classification rules, so the same
-counterparty is not asked about a second time. That is also why the answer
-matters beyond the one row: it is a decision recorded in his own vocabulary, and
-he can see it, change it, and retire it afterwards like any other rule.
+**An answer you relay settles the row and nothing beyond it.** Answering has two
+halves. Disposing of the line in front of you is import mechanics, and it is
+yours to do. Turning that disposal into a standing classification rule decides
+rows nobody has looked at yet — including months not yet imported, and including
+rows that will never be shown to anyone, because a row a rule matches is never
+asked about. That second half is the owner's, it is the same act as writing a
+rule directly, and under your credential the system now does only the first.
+Nothing is refused and nothing goes wrong: the answer simply comes back with no
+rule on it, the row is settled, and the import goes on.
+
+The consequence is worth telling the owner rather than hiding. The same
+counterparty will be asked about again next month, once per import, until he
+records the decision as a rule with his own credential. When you notice a
+question you have relayed before, that is the thing to say — not a second guess
+at the answer.
+
+A rule the owner does write is kept in his own vocabulary, and he can see it,
+change it, and retire it afterwards like any other.
 
 ## An import can be held open before it is committed
 
@@ -212,13 +230,30 @@ report is computed from what is in force rather than from everything ever
 written. A replacement goes further: it retracts and states what should have
 stood instead.
 
-Three things follow, and each of them is a way an agent gets this wrong.
+Four things follow, and each of them is a way an agent gets this wrong.
 
-**Correction is the owner's act.** Ask him; do not attempt it. The system will
-refuse an agent's credential for it, and that refusal is a limit of rights, not
-an absence of the capability. What the agent may properly do is find what went
-wrong, tell the owner exactly which facts are affected, and prepare the request
-for him to send.
+**Correcting the owner's history is his act.** Naming a fact of his and saying
+it should stop counting is a judgement about what he knows; ask him, and do not
+attempt it. The system refuses an agent's credential for it, and that refusal is
+a limit of rights, not an absence of the capability. What the agent may properly
+do is find what went wrong, tell the owner exactly which facts are affected, and
+prepare the request for him to send.
+
+**Undoing your own import is yours.** An import you declared and committed —
+your account, your channel, your label — you may retract, and you should, the
+moment a control total tells you it was wrong. That is not a ruling on the
+owner's history: it returns the journal to the state before you acted, and
+nothing the owner decided is reversed by it. You still acknowledge that the rows
+will stop counting, and the retraction is a journal fact like any other, so he
+can see what you did.
+
+The bound is narrow and it is checked, not trusted. It is your import, under the
+label you submitted it under; every row of it is still in force; and nothing has
+been built on it — no row reversed or replaced by anyone, and no balance of the
+owner's reconciled against the interval those rows fall in. Anything wider is
+his, and a refusal will say which of those conditions failed. Retracting twice
+is refused too: the second attempt reports that the rows are already reversed,
+which is also the answer to "did the first one land".
 
 **Retracting does not free a repeat import.** Duplicate detection reads the
 whole journal, and a retracted fact is still in it, so re-importing the same

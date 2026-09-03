@@ -3547,7 +3547,7 @@ pub async fn flow_report(
         .iter()
         .map(|action| action_dto(action, &catalog))
         .collect();
-    let dto = MoneyFlowReportDto::from_domain(&outcome, actions)
+    let dto = MoneyFlowReportDto::from_domain(&outcome, actions, &catalog)
         .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
 }
@@ -3581,6 +3581,7 @@ pub struct BalancesParams {
 pub async fn balances_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiQuery(params): ApiQuery<BalancesParams>,
 ) -> Result<Json<BalancesReportDto>, ApiFailure> {
     let as_of = parse_query_date("as_of", &params.as_of)?;
@@ -3592,7 +3593,7 @@ pub async fn balances_report(
         as_of,
     )
     .await?;
-    Ok(Json(BalancesReportDto::from_domain(&report)))
+    Ok(Json(BalancesReportDto::from_domain(&report, &catalog)))
 }
 
 /// What the owner holds at a date.
@@ -3629,6 +3630,7 @@ pub struct AssetSnapshotParams {
 pub async fn asset_snapshot_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiQuery(params): ApiQuery<AssetSnapshotParams>,
 ) -> Result<Json<AssetSnapshotDto>, ApiFailure> {
     let as_of = parse_query_date("as_of", &params.as_of)?;
@@ -3640,7 +3642,7 @@ pub async fn asset_snapshot_report(
         as_of,
     )
     .await?;
-    Ok(Json(AssetSnapshotDto::from_domain(&snapshot)))
+    Ok(Json(AssetSnapshotDto::from_domain(&snapshot, &catalog)))
 }
 
 /// Returns report parameters.
@@ -3676,6 +3678,7 @@ pub struct ReturnsParams {
 pub async fn returns_report(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiQuery(params): ApiQuery<ReturnsParams>,
 ) -> Result<Json<ReturnsAnswerDto>, ApiFailure> {
     let query = ReturnsQuery {
@@ -3689,7 +3692,7 @@ pub async fn returns_report(
         lot_rule: LotRuleVersion(1),
     };
     let outcome = returns(&state.services, &principal, &query).await?;
-    Ok(Json(ReturnsAnswerDto::from_domain(&outcome)))
+    Ok(Json(ReturnsAnswerDto::from_domain(&outcome, &catalog)))
 }
 
 /// Exchange rates supplied with the report request.
@@ -3713,6 +3716,7 @@ pub async fn returns_report(
 pub async fn returns_report_with_rates(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiQuery(params): ApiQuery<ReturnsParams>,
     ApiJson(rates): ApiJson<Vec<FxRateDto>>,
 ) -> Result<Json<ReturnsAnswerDto>, ApiFailure> {
@@ -3748,7 +3752,7 @@ pub async fn returns_report_with_rates(
         lot_rule: LotRuleVersion(1),
     };
     let outcome = returns(&state.services, &principal, &query).await?;
-    Ok(Json(ReturnsAnswerDto::from_domain(&outcome)))
+    Ok(Json(ReturnsAnswerDto::from_domain(&outcome, &catalog)))
 }
 
 fn instrument_dto(instrument: iaam_app::ports::InstrumentView) -> InstrumentDto {

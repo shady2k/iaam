@@ -41,6 +41,7 @@ use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
+use iaam_core::report::confidence::CaveatKind;
 use iaam_core::returns::{
     KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
 };
@@ -10515,7 +10516,12 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
-    for schema in ["ConfidenceDto", "CaveatDto", "CaveatSubjectDto"] {
+    for schema in [
+        "ConfidenceDto",
+        "CaveatDto",
+        "CaveatSubjectDto",
+        "ClosingOperationDto",
+    ] {
         assert!(
             spec["components"]["schemas"][schema].is_object(),
             "schema {schema} must be in OpenAPI"
@@ -10527,8 +10533,15 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
     assert!(confidence["caveats"].is_object(), "{confidence}");
 
     let caveat = &spec["components"]["schemas"]["CaveatDto"]["properties"];
-    for field in ["kind", "subject", "detail", "see"] {
+    for field in ["kind", "subject", "detail", "see", "closed_by"] {
         assert!(caveat[field].is_object(), "{field}: {caveat}");
+    }
+
+    // Spelled as an action's target spells it, so one client reader serves
+    // both.
+    let closing = &spec["components"]["schemas"]["ClosingOperationDto"]["properties"];
+    for field in ["operationId", "method", "path", "requestSchema"] {
+        assert!(closing[field].is_object(), "{field}: {closing}");
     }
 
     // `ReturnsAnswerDto` flattens the report into itself, which utoipa renders
@@ -10552,6 +10565,252 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
             "{report} must declare the register: {schema}"
         );
     }
+}
+
+/// Every remedy the caveat register names is a call this API actually declares.
+///
+/// This is the guard on the join the register now publishes. `CaveatKind` lives
+/// in the core and the action queue lives in the application, so the operation
+/// a caveat names could once have been written twice — a table in the transport
+/// beside the queue that actually offers those calls — and the two would drift
+/// on the first rename, leaving a report pointing at a call nothing answers.
+/// They are not written twice: `OperationKey` is one enum owned by the core, so
+/// a name that does not exist does not compile, and `ActionCatalog::from_openapi`
+/// resolves the whole vocabulary — not a list repeated by hand — against the
+/// completed contract, so a key nothing routes fails the server's start-up.
+///
+/// What is left for a test is that those two facts stay true: every key the
+/// register can name resolves through the same catalogue the queue uses, and
+/// resolves to the operation the document declares under that identifier.
+#[test]
+fn every_remedy_the_register_names_is_a_call_the_contract_publishes() {
+    let harness = harness();
+    let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
+
+    // The catalogue addresses the whole vocabulary. If it ever went back to a
+    // hand-written subset, a caveat naming a key outside it would resolve to
+    // nothing at the moment a client asked for the report.
+    for key in OperationKey::ALL {
+        assert_eq!(
+            catalog.operation(key).operation_id,
+            key.as_str(),
+            "{} is not addressed by the catalogue",
+            key.as_str()
+        );
+    }
+
+    for kind in CaveatKind::ALL {
+        for key in kind.closed_by() {
+            let resolved = catalog.operation(*key);
+            let item = harness
+                .api
+                .paths
+                .paths
+                .get(&resolved.path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} names {}, and the contract declares no {}",
+                        kind.code(),
+                        key.as_str(),
+                        resolved.path
+                    )
+                });
+            let operation = match resolved.method.as_str() {
+                "POST" => item.post.as_ref(),
+                "PUT" => item.put.as_ref(),
+                "PATCH" => item.patch.as_ref(),
+                method => panic!("{} names {key:?} under an unexpected {method}", kind.code()),
+            }
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} names {}, and {} {} is not declared",
+                    kind.code(),
+                    key.as_str(),
+                    resolved.method,
+                    resolved.path
+                )
+            });
+            assert_eq!(
+                operation.operation_id.as_deref(),
+                Some(key.as_str()),
+                "{} names {}, and {} {} answers to another identifier",
+                kind.code(),
+                key.as_str(),
+                resolved.method,
+                resolved.path
+            );
+            assert!(
+                !resolved.request_schema.is_empty(),
+                "{} names {}, whose request shape is not published",
+                kind.code(),
+                key.as_str()
+            );
+        }
+    }
+}
+
+/// A caveat carries the call that closes it, and says so when nothing does.
+///
+/// The gap this closes (iaam-f234): the register said what a report was silent
+/// about and not what to do about it. The only join was by `goal` — fetch
+/// `/v1/actions`, filter by the report's goal — which answers what stands
+/// between the caller and the *whole* report rather than what removes the line
+/// in hand, and an external agent read `complete: false` and went hunting
+/// through separate sections anyway.
+///
+/// Addressed, not merely named: the caveat carries the method and the path, in
+/// the spelling an action's target uses, so the call can be copied rather than
+/// composed. What it does not carry is a request plan — that is the queue's,
+/// because only the queue knows the account and the interval.
+#[tokio::test]
+async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does() {
+    let harness = harness();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    // A second account nobody has ruled on, and a movement on the first so that
+    // its cash figure is a running sum from an unknown start.
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": "1200.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-05" },
+                    "idempotency_key": "closed-by-deposit"
+                }, {
+                    "account": harness.account.inner(),
+                    "type": "opening_position",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "10",
+                    "cost_basis": "100.00",
+                    "currency": "RUB",
+                    "dates": { "trade": "2026-01-01" },
+                    "idempotency_key": "closed-by-position"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let caveats = report["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .clone();
+
+    let find = |kind: &str| {
+        caveats
+            .iter()
+            .find(|caveat| caveat["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} caveat: {report}"))
+            .clone()
+    };
+
+    // Both ways out, in the order the outstanding-work queue offers them: place
+    // the account in a contour, or rule it deliberately outside.
+    let outside = find("account_in_no_scope");
+    assert_eq!(
+        outside["closed_by"],
+        json!([
+            {
+                "operationId": "add_contour_version",
+                "method": "POST",
+                "path": "/v1/contours/{contour}/versions",
+                "requestSchema": "#/components/schemas/AddContourVersionRequest",
+            },
+            {
+                "operationId": "record_account_scope",
+                "method": "POST",
+                "path": "/v1/accounts/{id}/scope",
+                "requestSchema": "#/components/schemas/RecordAccountScopeRequest",
+            },
+        ]),
+        "{outside}"
+    );
+
+    // The opening assertion is what turns the figure into a balance, and it is
+    // the operation the queue names for the same state.
+    let running = find("running_cash_sum");
+    assert_eq!(
+        running["closed_by"][0]["operationId"],
+        "record_owner_balance"
+    );
+    assert_eq!(running["closed_by"][0]["method"], "POST");
+    assert_eq!(
+        running["closed_by"][0]["path"], "/v1/reconciliation/balance",
+        "{running}"
+    );
+    // The register points at the call; the queue fills it in. A caveat that
+    // carried a request plan would be computing one from what a caveat holds,
+    // which is its own identity and nothing else.
+    assert!(
+        running["closed_by"][0].get("request").is_none(),
+        "{running}"
+    );
+
+    // Absent, and it means nothing closes this — not that nobody decided. The
+    // holding is in the journal and no quote covers it; this API records prices
+    // from sources and accepts no value for a holding, so there is no call to
+    // name. The field is always present, so a client never has to tell «nothing
+    // closes this» from «nobody decided».
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+    let unclosable = snapshot["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .iter()
+        .find(|caveat| caveat["kind"] == "holding_not_valued")
+        .unwrap_or_else(|| panic!("no holding_not_valued caveat: {snapshot}"))
+        .clone();
+    assert_eq!(unclosable["closed_by"], json!([]), "{unclosable}");
 }
 
 /// Creating a contour and versioning one are two acts, and the create route

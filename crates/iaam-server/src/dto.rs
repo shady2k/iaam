@@ -8,6 +8,7 @@
 //! numbers: the JSON number `0.1` in binary floating point is not equal to one
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
+use crate::action_catalog::ActionCatalog;
 use iaam_app::ingest::classification::{Answer, AnswerShape, Movement};
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::observation::{
@@ -2270,7 +2271,8 @@ pub struct CaveatDto {
     /// What sort of gap this is — `account_in_no_scope`,
     /// `account_in_another_scope`, `running_cash_sum`, `period_reports_refused`,
     /// `undecomposed_movements`, `unexplained_cash_change`, `unpriced_position`,
-    /// `terminal_value_not_computed`, `return_not_computed`.
+    /// `holding_not_valued`, `terminal_value_not_computed`,
+    /// `return_not_computed`.
     ///
     /// A closed set. Every one of them is read off a computation the report
     /// already performs: nothing here folds the journal a second time.
@@ -2285,6 +2287,44 @@ pub struct CaveatDto {
     /// path through the answer: `[]` stands for every element of an array, and
     /// `subject` says which element. Read it instead of believing this block.
     pub see: String,
+    /// What to call about it. Always present; **empty means nothing in this API
+    /// acts on this kind of gap**, which is a decision and not an omission.
+    ///
+    /// The other half of `see`: `see` is where to check the fact, this is where
+    /// to act on it. Before it, a client that read `complete: false` had to
+    /// fetch `/v1/actions` and filter it by `goal` — which answers "what stands
+    /// between me and this whole report", not "what removes this line" — and a
+    /// run through the flow shows an agent doing exactly that and still hunting
+    /// through separate sections.
+    ///
+    /// Addressed the way an action's target is, through the same catalogue and
+    /// against the same completed contract, so one reader serves both. What it
+    /// does **not** carry is a `request`: the preset fields and the missing ones
+    /// depend on the account, the interval and what the owner has already said,
+    /// and only the outstanding-work queue computes them. A caveat says which
+    /// call; `/v1/actions` says how to fill it in.
+    ///
+    /// One call does not always empty a caveat — a caveat is one line per
+    /// account, currency or instrument, and closing it may take more than one
+    /// fact. `see` remains the check.
+    pub closed_by: Vec<ClosingOperationDto>,
+}
+
+/// One operation a caveat names, addressed against the completed contract.
+///
+/// `ResolutionOptionDto` without the `request`, and spelled identically in the
+/// three fields they share so that a client reading an action's target reads
+/// this with the same code. The request plan is what the two genuinely differ
+/// on: the queue holds an account and an interval and can preset fields from
+/// them, and a caveat kind holds nothing but its own identity.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ClosingOperationDto {
+    #[serde(rename = "operationId")]
+    pub operation_id: String,
+    pub method: String,
+    pub path: String,
+    #[serde(rename = "requestSchema")]
+    pub request_schema: String,
 }
 
 /// The typed subject of a caveat.
@@ -2312,8 +2352,12 @@ pub enum CaveatSubjectDto {
 }
 
 impl ConfidenceDto {
+    /// `catalog` is a parameter for the reason `MoneyFlowReportDto::from_domain`
+    /// takes its actions as one: the transport resolves an operation through its
+    /// catalogue and the DTO cannot, and a register that could be built without
+    /// addressing its remedies would eventually be built that way.
     #[must_use]
-    pub fn from_domain(confidence: &ReportConfidence) -> Self {
+    pub fn from_domain(confidence: &ReportConfidence, catalog: &ActionCatalog) -> Self {
         Self {
             goal: confidence.goal().code().to_owned(),
             // From the register, never beside it: the domain type has no
@@ -2322,19 +2366,36 @@ impl ConfidenceDto {
             caveats: confidence
                 .caveats()
                 .iter()
-                .map(CaveatDto::from_domain)
+                .map(|caveat| CaveatDto::from_domain(caveat, catalog))
                 .collect(),
         }
     }
 }
 
 impl CaveatDto {
-    fn from_domain(caveat: &Caveat) -> Self {
+    fn from_domain(caveat: &Caveat, catalog: &ActionCatalog) -> Self {
         Self {
             kind: caveat.kind().code().to_owned(),
             subject: CaveatSubjectDto::from_domain(caveat.subject()),
             detail: caveat.detail().to_owned(),
             see: caveat.see().to_owned(),
+            // Resolved, not spelled. The core names the operation and the
+            // catalogue says where it lives, so the register cannot publish a
+            // route the contract does not declare: `ActionCatalog::from_openapi`
+            // fails the server's start-up before it could.
+            closed_by: caveat
+                .closed_by()
+                .iter()
+                .map(|key| {
+                    let resolved = catalog.operation(*key);
+                    ClosingOperationDto {
+                        operation_id: resolved.operation_id.clone(),
+                        method: resolved.method.clone(),
+                        path: resolved.path.clone(),
+                        request_schema: resolved.request_schema.clone(),
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -2531,11 +2592,12 @@ impl MoneyFlowReportDto {
     pub fn from_domain(
         outcome: &MoneyFlowOutcome,
         actions: Vec<ActionDto>,
+        catalog: &ActionCatalog,
     ) -> Result<Self, MoneyFlowError> {
         // The whole outcome rather than its two halves: the register is a
         // statement about the pair, and a signature that took them separately
         // would let a caller summarise one flow beside another's population.
-        let confidence = ConfidenceDto::from_domain(&outcome.confidence()?);
+        let confidence = ConfidenceDto::from_domain(&outcome.confidence()?, catalog);
         let report = &outcome.report;
         let population = &outcome.population;
         let currencies = report
@@ -2832,12 +2894,12 @@ pub struct PositionQuantityDto {
 }
 
 impl BalancesReportDto {
-    pub fn from_domain(report: &BalancesReport) -> Self {
+    pub fn from_domain(report: &BalancesReport, catalog: &ActionCatalog) -> Self {
         Self {
             // Asked of the report itself. The transport neither folds the rows
             // nor decides what a caveat is: a register assembled here could
             // disagree with the answer printed beside it.
-            confidence: ConfidenceDto::from_domain(&report.confidence()),
+            confidence: ConfidenceDto::from_domain(&report.confidence(), catalog),
             accounts: report
                 .accounts
                 .iter()
@@ -3113,12 +3175,12 @@ pub struct AssetAccountDto {
 }
 
 impl AssetSnapshotDto {
-    pub fn from_domain(snapshot: &AssetSnapshot) -> Self {
+    pub fn from_domain(snapshot: &AssetSnapshot, catalog: &ActionCatalog) -> Self {
         Self {
             // Asked of the snapshot itself. The transport neither folds the
             // rows nor decides what a caveat is: a register assembled here
             // could disagree with the answer printed beside it.
-            confidence: ConfidenceDto::from_domain(&snapshot.confidence()),
+            confidence: ConfidenceDto::from_domain(&snapshot.confidence(), catalog),
             as_of: snapshot.as_of,
             cash: CashSideDto {
                 classes: snapshot
@@ -3286,9 +3348,9 @@ pub struct ReturnsAnswerDto {
 
 impl ReturnsAnswerDto {
     #[must_use]
-    pub fn from_domain(outcome: &ReturnsOutcome) -> Self {
+    pub fn from_domain(outcome: &ReturnsOutcome, catalog: &ActionCatalog) -> Self {
         Self {
-            confidence: ConfidenceDto::from_domain(&outcome.confidence()),
+            confidence: ConfidenceDto::from_domain(&outcome.confidence(), catalog),
             report: ReturnsReportDto::from_domain(&outcome.report),
             population: PopulationDto::from_domain(&outcome.population),
         }

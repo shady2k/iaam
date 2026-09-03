@@ -68,11 +68,12 @@ not any more. Decision 0004 gave an account the identity its source prints —
 `provider_account_id`, plus aliases with validity intervals for the cards over
 it — and resolution now tries iaam's identifier, then the printed identity and
 its aliases, then the title, stopping at the first tier that matches anything.
-A declaration may name the account by the number the bank prints, and the
-response hands back the identifier the rows must carry. `--account-map` is the
-pre-0004 workaround kept alive, and that decision named this exact situation as
-its own falsification: *"the owner finds himself maintaining a file that maps a
-source's identifier to a `provider_account_id`."*
+A declaration may name the account by the number the bank prints, and — since
+`iaam-varx` — so may every row. `--account-map` was the pre-0004 workaround kept
+alive, and decision 0004 named this exact situation as its own falsification:
+*"the owner finds himself maintaining a file that maps a source's identifier to
+a `provider_account_id`."* Decision 0005 finds that the test did not trip — the
+map resolves to a **title**, which is the pre-0004 shape — and retires it.
 
 **What the row was.** Nothing in an export distinguishes a payment to a stranger
 from a top-up of the same person's account at another bank; both are a name and
@@ -128,13 +129,16 @@ what the source stated, with the source's own sign and direction word, which the
 server settles or asks about. The item never mentions that shape, and the only
 worked example in the repository, the tool, does not use it.
 
-## 6. Where the line should be, and the two things that must move first
+## 6. Where the line should be, and the three things that must move first
 
 **A converter translates a format. The API reaches conclusions.** That is the
 line, and it is not the line today.
 
-It cannot simply be moved, because the conclusive channel is strictly more
-expressive than the observation channel, by exactly two outcomes:
+It cannot simply be moved, because the conclusive channel beats the observation
+channel in three ways. Two are about what a row may *say*; the third is about
+what saying it *costs*, and the third is the one that decides the question.
+
+**Two outcomes the observation channel cannot express.**
 
 - `Classification` has four outcomes — internal transfer, external flow, fee,
   income — and **no refund**. `OperationKindDto` has one. A row submitted as an
@@ -144,18 +148,51 @@ expressive than the observation channel, by exactly two outcomes:
   correct ground that the source named none. The tool names one where the bank's
   own category says so, and that naming is lost on the observation path.
 
-The consequence is an incentive pointing the wrong way. An agent that obeys the
-rule it is given — do not conclude what you were not told — produces a *poorer*
-journal than a converter that concludes well, and the poorer journal is the one
-that cannot be repaired by answering a question, because no question is asked
-about a refund. That is why the external agent reached for `build()`, and it is
-the defect rather than the agent's mistake.
+**And one question asked about every row.** This is decision 0005's finding, and
+it is stated here at length because it is larger than the two above and outlives
+them: closing both gaps in the vocabulary leaves it standing.
 
-Until both are settled, the honest arrangement is the current one stated out
-loud rather than implied: **the owner's converter concludes, because it is the
-only place that can.** What must not continue is documentation that reads as
-though an agent with a CSV could do the same work, and a tool that keeps its own
-copy of a directory the server now holds.
+`classify` in `crates/iaam-ingest/src/classification.rs` settles a row in
+exactly two ways — the directory recognised the counterparty as one of the
+owner's own accounts, or a rule matched — and answers `Ambiguous` otherwise.
+`question_for` beside it is **total**: every combination of counterparty and
+direction yields a question. There is no outcome meaning *nothing suggests
+otherwise, so this is ordinary external flow*, and that absence is deliberate —
+the alternative is a default, and a default is the guess the shape exists to
+refuse.
+
+The price is paid per row. A converter that concludes settles a month of
+ordinary shopping without asking anything. The same month submitted as
+observations raises one question per row that no rule already covers, which on a
+real statement is most of them.
+
+The loop that should absorb that price does not close. Answering a question
+mints a rule from `matcher_for` in
+`crates/iaam-app/src/scenarios/import_session.rs`, and that matcher fills all
+three fields at once — the counterparty, the **whole** description, and the word
+the source used — joined with "and". A rule made from one shop's row therefore
+matches that shop's row and next to nothing else. Answering a hundred questions
+produces a hundred rules, and the next statement asks a hundred more. The cost
+does not amortise; it repeats.
+
+So the honest path is not merely poorer than the concluding one. At the scale an
+import actually has, it is unusable, and no amount of obedience by the caller
+fixes that.
+
+**The consequence is an incentive pointing the wrong way.** An agent that obeys
+the rule it is given — do not conclude what you were not told — produces a
+*poorer* journal than a converter that concludes well, and the poorer journal is
+the one that cannot be repaired by answering a question, because no question is
+asked about a refund. It also produces a questionnaire the length of the
+statement. That is why the external agent reached for `build()`, and it is the
+defect rather than the agent's mistake.
+
+Until all three are settled, the honest arrangement is the current one stated
+out loud rather than implied: **the owner's converter concludes about what a row
+was, because it is the only place that can do so cheaply.** What must not
+continue is documentation that reads as though an agent with a CSV could do the
+same work. It no longer keeps its own copy of the directory: that half is
+decision 0005, and it is done.
 
 ## 7. What this does not settle
 
@@ -163,10 +200,13 @@ copy of a directory the server now holds.
   rule outcome that carries a direction must answer `implied_movement`, and a
   refund's direction is not the same question as a fee's; that is its own
   decision and probably its own record here.
-- Whether `--account-map` and `--counterparty-map` are retired against the
-  identity decision 0004 gave an account, or kept as the owner's private
-  shorthand. Retiring them moves the owner's judgement into rules he can read
-  and retire; keeping them leaves it in two files nothing versions.
+- ~~Whether `--account-map` and `--counterparty-map` are retired against the
+  identity decision 0004 gave an account~~ — settled by decision 0005, and the
+  answer is that the two files are two different things. `--account-map` is
+  retired against that identity. `--counterparty-map` is not an identity file at
+  all; it holds the owner's judgement about what a row was, and it is retired
+  only once the observation channel can carry that judgement, which is the three
+  gaps in §6.
 - Whether the tool should feed a session rather than the conclusive route. It
   concludes every row, so no question would be raised and the session would buy
   it only the assessment before commit — which is not nothing, and is the whole

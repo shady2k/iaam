@@ -108,6 +108,7 @@ use crate::dto::{
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
+use iaam_app::scenarios::import_session::AccountDirectory;
 use iaam_app::scenarios::import_session::SessionRevision;
 use iaam_core::batch::ControlSection;
 
@@ -593,9 +594,10 @@ pub async fn submit_corrections(
 
     // The batch is converted whole before anything is written: a correction is
     // one deliberate act, and half of one applied is worse than none.
+    let directory = AccountDirectory::load(&state.services, principal.owner).await?;
     let mut corrections = Vec::with_capacity(request.corrections.len());
     for (index, correction) in request.corrections.iter().enumerate() {
-        let domain = correction.to_domain().map_err(|rejection| {
+        let domain = correction.to_domain(&directory).map_err(|rejection| {
             invalid_field(
                 format!("corrections[{index}].{}", rejection.field),
                 &rejection.expected,
@@ -2945,11 +2947,12 @@ pub async fn ingest_operations(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
+    // One reading of the owner's accounts for the whole request. The
+    // declaration and every row are resolved against it, because they ask the
+    // same question and a second reading could answer it differently.
+    let directory = AccountDirectory::load(&state.services, principal.owner).await?;
     let declared = match &request.source {
-        Some(declared) => Some((
-            declared,
-            declared_account(&state, &principal, declared).await?.id,
-        )),
+        Some(declared) => Some((declared, directory.resolve_declared(&declared.account)?.id)),
         None => None,
     };
     let (source, import) = match declared {
@@ -2973,13 +2976,20 @@ pub async fn ingest_operations(
     // not against the text it was written as: a caller may declare the batch by
     // the number its bank prints, and the rows still name the account by its
     // iaam identifier, which is the one thing both sides can agree on.
+    // The row's own identifier goes through the same tiering, so a caller may
+    // now write the number its bank prints on the rows as well as on the
+    // declaration. A row naming nothing is not compared here: that is one
+    // unreadable row, and the loop below rejects it on its own.
     if let Some((_, account)) = declared {
         for (index, operation) in request.operations.iter().enumerate() {
-            if operation.account != account.inner() {
+            let Ok(named) = directory.resolve_row(&operation.account) else {
+                continue;
+            };
+            if named != account {
                 return Err(invalid_field(
                     format!("operations[{index}].account"),
                     &account.inner().to_string(),
-                    operation.account.to_string(),
+                    operation.account.clone(),
                 ));
             }
         }
@@ -2995,7 +3005,7 @@ pub async fn ingest_operations(
     let mut verdicts: Vec<VerdictDto> = Vec::with_capacity(request.operations.len());
     let mut accepted: Vec<(usize, Intake)> = Vec::new();
     for (index, operation) in request.operations.iter().enumerate() {
-        match operation.to_intake() {
+        match operation.to_intake(&directory) {
             Ok(intake) => accepted.push((index + 1, intake)),
             Err(rejection) => verdicts.push(VerdictDto::from_domain(
                 index + 1,
@@ -3208,8 +3218,12 @@ pub async fn add_import_rows(
     // session, so it has no position in that.
     let mut rejected: Vec<ImportRowDto> = Vec::new();
     let mut accepted: Vec<Intake> = Vec::new();
+    // Read once for the batch, exactly as the conclusive route reads it: the
+    // rows of a session name their account the same way the rows of a direct
+    // submission do.
+    let directory = AccountDirectory::load(&state.services, principal.owner).await?;
     for (index, operation) in request.operations.iter().enumerate() {
-        match operation.to_intake() {
+        match operation.to_intake(&directory) {
             Ok(intake) => accepted.push(intake),
             Err(rejection) => rejected.push(ImportRowDto::from_domain(&HeldRow::Rejected {
                 row: u32::try_from(index + 1).unwrap_or(u32::MAX),

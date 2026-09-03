@@ -81,7 +81,12 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::revoke_broker_access))
         .routes(routes!(routes::list_tokens, routes::create_token))
         .routes(routes!(routes::revoke_token))
-        .routes(routes!(routes::create_contour_version))
+        .routes(routes!(
+            routes::list_contours,
+            routes::create_contour_version
+        ))
+        .routes(routes!(routes::get_contour))
+        .routes(routes!(routes::add_contour_version))
         .routes(routes!(routes::ingest_operations))
         .routes(routes!(routes::ingest_journal_events))
         .routes(routes!(routes::ingest_csv))

@@ -21,11 +21,18 @@ pub struct AccountRecord {
 }
 
 /// The current version of a contour owned by one portfolio owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The title travels with the identity because it is a property of the version,
+/// not of the contour: a caller reading the composition back needs the name the
+/// owner gave it, and a caller adding an account to it needs the name it already
+/// carries rather than being asked to retype one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContourRecord {
     pub id: ContourId,
     pub owner: OwnerId,
     pub version: ContourVersion,
+    /// The title recorded with that version.
+    pub title: String,
 }
 
 /// The owner's recorded statement that an account sits outside every contour.
@@ -530,24 +537,39 @@ impl SqliteStore {
     /// The query starts from contour versions rather than membership rows so an
     /// empty contour remains visible; `load_contour` intentionally cannot
     /// distinguish that case from a missing version.
+    ///
+    /// The title comes from the row the aggregate selected, joined back rather
+    /// than picked out of the grouped set: SQLite would hand back the title of
+    /// an arbitrary version otherwise, and the name of a superseded composition
+    /// is exactly the wrong answer for a caller checking what the perimeter is
+    /// called now.
     pub fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourRecord>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT contour, MAX(version)
-             FROM contour_versions
-             WHERE owner = ?1
-             GROUP BY contour
-             ORDER BY contour",
+            "SELECT current.contour, current.version, current.title
+             FROM contour_versions AS current
+             JOIN (SELECT contour, MAX(version) AS version
+                   FROM contour_versions
+                   WHERE owner = ?1
+                   GROUP BY contour) AS latest
+               ON latest.contour = current.contour AND latest.version = current.version
+             WHERE current.owner = ?1
+             ORDER BY current.contour",
         )?;
         let rows = statement.query_map([owner.inner().to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         let mut contours = Vec::new();
         for row in rows {
-            let (id, version) = row?;
+            let (id, version, title) = row?;
             contours.push(ContourRecord {
                 id: ContourId(parse_uuid(&id, "contour")?),
                 owner,
                 version: ContourVersion(version),
+                title,
             });
         }
         Ok(contours)

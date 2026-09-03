@@ -3033,14 +3033,54 @@ impl TokenDto {
     }
 }
 
-/// New version of the perimeter composition.
+/// Creating a perimeter.
+///
+/// This request creates a contour and does nothing else. Adding a version to a
+/// contour that exists is `POST /v1/contours/{contour}/versions`, which names
+/// the contour in its path.
+///
+/// The two were one route, whose `contour` field was optional and whose absence
+/// meant «mint a fresh perimeter». An agent that had already drawn one called it
+/// again to bring a second bank inside and was given a second contour holding
+/// that bank alone — every operation recorded, every verdict positive, and the
+/// report over the newer contour showing one bank.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateContourVersionRequest {
-    /// Perimeter identifier. Absent — a new one is created.
+    /// Not accepted. A request naming a contour is refused with `422` rather
+    /// than honoured or ignored: honouring it is the defect, and ignoring it
+    /// would leave every client already sending the field creating perimeters it
+    /// did not ask for. Use `POST /v1/contours/{contour}/versions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contour: Option<Uuid>,
     pub title: String,
     pub accounts: Vec<Uuid>,
+}
+
+/// Adding a version to a contour that already exists.
+///
+/// The contour is named by the path, so there is no field whose absence could be
+/// read as «make me a new one».
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddContourVersionRequest {
+    /// The complete composition the contour is to have from this version.
+    ///
+    /// A version is a whole membership list, not a delta: sending only the
+    /// account being added would drop every existing member.
+    pub accounts: Vec<Uuid>,
+    /// The title for the new version. Absent — the title the contour already
+    /// carries is kept, so the owner is never asked to retype a name he has
+    /// already given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The version the caller believes is current. Absent — no precondition is
+    /// checked.
+    ///
+    /// A composition is written whole, so a caller that read version 1, decided
+    /// on a composition and sent it after someone else wrote version 2 does not
+    /// merge with that writer — it silently discards them. Stating the version
+    /// it reasoned from turns that into a `409`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<u32>,
 }
 
 /// Perimeter version response.
@@ -3048,6 +3088,32 @@ pub struct CreateContourVersionRequest {
 pub struct ContourVersionDto {
     pub contour: Uuid,
     pub version: u32,
+    /// The title the version carries.
+    pub title: String,
+    pub accounts: Vec<Uuid>,
+    /// Whether this call brought the contour into existence.
+    ///
+    /// The field the split makes necessary: a caller must be able to tell «I
+    /// created the perimeter» from «the perimeter was already there and I wrote
+    /// into it», and could not, because both answers looked identical.
+    pub created: bool,
+}
+
+/// A contour at its current version, with the composition that version names.
+///
+/// The read side of the same composition the write routes build, derived from
+/// it rather than stored beside it: an import skill has to be able to check the
+/// perimeter it was handed against what the system believes, and a second copy
+/// would be a second thing to keep in step.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ContourDto {
+    pub contour: Uuid,
+    pub title: String,
+    /// The current version. Every earlier one is still in the store; this is the
+    /// one a report uses when no version is asked for.
+    pub version: u32,
+    /// The accounts this version covers. Empty is a real answer: a version can
+    /// be recorded with no members, and it covers nothing.
     pub accounts: Vec<Uuid>,
 }
 

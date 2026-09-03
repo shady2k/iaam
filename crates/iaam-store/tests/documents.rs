@@ -319,3 +319,52 @@ fn a_broker_or_format_without_a_name_is_refused() {
     assert_eq!(BrokerCode::parse("finam").unwrap().as_str(), "finam");
     assert_eq!(ReportFormat::parse("xlsx").unwrap().as_str(), "xlsx");
 }
+
+#[test]
+fn a_document_is_readable_by_the_hash_that_names_it() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let uploaded = upload(owner, "e");
+    store.insert_document(&uploaded).unwrap();
+
+    // Provenance carries the hash, not the upload identifier: a caller holding
+    // a fact knows the document only by this name.
+    let read = store
+        .load_document_by_hash(owner, &uploaded.document_hash)
+        .unwrap()
+        .expect("a stored document is found by the hash that names it");
+    assert_eq!(read.id, uploaded.id);
+    assert_eq!(read.owner, owner);
+    assert_eq!(read.parser_version, uploaded.parser_version);
+    assert_eq!(read.body, uploaded.body);
+}
+
+#[test]
+fn a_document_of_another_owner_is_not_readable_by_hash() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let theirs = upload(OwnerId::new_random(), "f");
+    store.insert_document(&theirs).unwrap();
+
+    let stranger = OwnerId::new_random();
+    assert!(
+        store
+            .load_document_by_hash(stranger, &theirs.document_hash)
+            .unwrap()
+            .is_none(),
+        "a document owned by someone else cannot be read even with its exact hash"
+    );
+}
+
+#[test]
+fn a_hash_that_names_nothing_is_an_absence_rather_than_a_failure() {
+    let store = SqliteStore::open_in_memory().unwrap();
+
+    // The reparse path must tell «never stored» apart from «the store broke»:
+    // the first has an answer for the caller, the second has none.
+    assert!(
+        store
+            .load_document_by_hash(OwnerId::new_random(), &hash("a"))
+            .unwrap()
+            .is_none()
+    );
+}

@@ -73,6 +73,7 @@ impl ActionCatalog {
         for key in [
             OperationKey::CreateAccount,
             OperationKey::CreateContour,
+            OperationKey::AddContourVersion,
             OperationKey::RecordOwnerBalance,
             OperationKey::CreateCategoryRule,
         ] {

@@ -492,6 +492,21 @@ pub trait Store: Send + Sync {
         statement: AccountTransferStatementView,
     ) -> Result<(), AppError>;
 
+    /// Record, or replace, several of those statements at once.
+    ///
+    /// Not a loop over [`Self::record_account_transfer_statement`], and it must
+    /// not be implemented as one: that method commits per call, so a failure
+    /// part-way through would leave some statements replaced and the rest
+    /// standing as they were. Each entry still means exactly what the single
+    /// form means — one account's complete enumeration of its partners — and
+    /// naming one account inside another's list says nothing about that
+    /// account's own. Only the transport is shared.
+    async fn record_account_transfer_statements(
+        &self,
+        owner: OwnerId,
+        statements: Vec<AccountTransferStatementView>,
+    ) -> Result<(), AppError>;
+
     /// Withdraw it, returning the account to awaiting the owner's decision.
     async fn clear_account_transfer_statement(
         &self,

@@ -1015,31 +1015,40 @@ impl SqliteStore {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO account_transfer_statements (owner, account, recorded_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (owner, account) DO UPDATE SET recorded_at = excluded.recorded_at
-             WHERE account_transfer_statements.owner = excluded.owner",
-            params![
-                owner.inner().to_string(),
-                account.inner().to_string(),
-                now(),
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM account_transfer_partners WHERE owner = ?1 AND account = ?2",
-            params![owner.inner().to_string(), account.inner().to_string()],
-        )?;
-        for partner in partners {
-            transaction.execute(
-                "INSERT OR IGNORE INTO account_transfer_partners (owner, account, partner)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    owner.inner().to_string(),
-                    account.inner().to_string(),
-                    partner.inner().to_string(),
-                ],
-            )?;
+        write_transfer_statement(&transaction, owner, account, partners)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record, or replace, several of those statements in one transaction.
+    ///
+    /// Transport, not meaning. Each entry is the same complete enumeration the
+    /// single-account form records, and stating one account's partners still
+    /// says nothing about any other account's — the relation is directed here
+    /// because the question «these, and no others» is answerable only per
+    /// account.
+    ///
+    /// What the batch adds is atomicity, and it is why the loop the caller could
+    /// have written is not good enough: [`Self::record_account_transfer_statement`]
+    /// commits per call, so a failure on the fifth of twelve would leave four
+    /// statements replaced and eight standing as they were — the owner having
+    /// half-said something he was saying all at once. Everything here lands in
+    /// one immediate transaction or none of it does.
+    ///
+    /// An empty batch is a no-op rather than an error.
+    pub fn record_account_transfer_statements(
+        &mut self,
+        owner: OwnerId,
+        statements: &[AccountTransferStatementRecord],
+    ) -> Result<(), StoreError> {
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for statement in statements {
+            write_transfer_statement(&transaction, owner, statement.account, &statement.partners)?;
         }
         transaction.commit()?;
         Ok(())
@@ -1246,6 +1255,47 @@ fn read_account_detail(
         cash_class: parse_cash_class(cash_class.as_deref())?,
         aliases,
     })
+}
+
+/// Write one transfer statement inside a transaction the caller owns.
+///
+/// The single-account form and the batch form share this body rather than each
+/// carrying its own copy of the SQL: a second copy is a second thing to keep in
+/// step, and the one that drifted would record a statement subtly unlike the
+/// one the other records.
+fn write_transfer_statement(
+    conn: &rusqlite::Connection,
+    owner: OwnerId,
+    account: AccountId,
+    partners: &[AccountId],
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO account_transfer_statements (owner, account, recorded_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT (owner, account) DO UPDATE SET recorded_at = excluded.recorded_at
+         WHERE account_transfer_statements.owner = excluded.owner",
+        params![
+            owner.inner().to_string(),
+            account.inner().to_string(),
+            now(),
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM account_transfer_partners WHERE owner = ?1 AND account = ?2",
+        params![owner.inner().to_string(), account.inner().to_string()],
+    )?;
+    for partner in partners {
+        conn.execute(
+            "INSERT OR IGNORE INTO account_transfer_partners (owner, account, partner)
+             VALUES (?1, ?2, ?3)",
+            params![
+                owner.inner().to_string(),
+                account.inner().to_string(),
+                partner.inner().to_string(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn parse_uuid(value: &str, what: &'static str) -> Result<uuid::Uuid, StoreError> {

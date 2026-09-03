@@ -11173,6 +11173,403 @@ async fn a_transfer_statement_cannot_name_an_account_the_owner_does_not_hold() {
     );
 }
 
+/// The partners of one statement, in a comparable order.
+///
+/// The store returns them ordered by identifier rather than by the order the
+/// owner typed them, because what he stated is a set.
+fn sorted_partners(statement: &Value) -> Vec<&str> {
+    let mut named: Vec<&str> = statement["partners"]
+        .as_array()
+        .map(|partners| {
+            partners
+                .iter()
+                .map(|entry| entry.as_str().expect("account id"))
+                .collect()
+        })
+        .unwrap_or_default();
+    named.sort_unstable();
+    named
+}
+
+/// Twelve accounts were twelve calls; one batch answers them together.
+///
+/// The batch is transport and nothing else. It carries one entry per account,
+/// each a complete enumeration, because naming `Savings` inside `Main`'s answer
+/// establishes that money moves between the two and says nothing about whether
+/// `Savings` also moves money with `Everyday`. So the batch does not shrink the
+/// number of statements — it shrinks the number of round trips.
+#[tokio::test]
+async fn a_batch_answers_several_accounts_at_once_without_answering_any_for_another() {
+    let harness = harness();
+    let main = harness.account.inner().to_string();
+
+    let mut opened = Vec::new();
+    for title in ["Savings", "Everyday"] {
+        let (status, account) = call(
+            &harness.router,
+            post(
+                "/v1/accounts",
+                &harness.owner_token,
+                &json!({ "title": title, "institution": "Northline" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+        opened.push(account["id"].as_str().expect("account id").to_owned());
+    }
+    let savings = opened[0].clone();
+    let everyday = opened[1].clone();
+
+    assert_eq!(
+        transfer_partners_queue(&harness).await.len(),
+        3,
+        "each account is asked its own question"
+    );
+
+    // One call, three statements, and «none of my others» travels in it like any
+    // other answer.
+    let (status, recorded) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/transfer-partners",
+            &harness.owner_token,
+            &json!({
+                "statements": [
+                    { "account": main, "partners": [savings] },
+                    { "account": savings, "partners": [main, everyday] },
+                    { "account": everyday, "partners": [] },
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    let statements = recorded["statements"].as_array().expect("statements");
+    assert_eq!(statements.len(), 3, "{recorded}");
+    assert_eq!(statements[0]["account"], json!(main), "{recorded}");
+    assert_eq!(statements[0]["partners"], json!([savings]), "{recorded}");
+    assert_eq!(statements[1]["account"], json!(savings), "{recorded}");
+    // Read back in the store's order, which is by identifier rather than by the
+    // order the owner typed: what he stated is a set.
+    let mut expected = vec![main.as_str(), everyday.as_str()];
+    expected.sort_unstable();
+    assert_eq!(sorted_partners(&statements[1]), expected, "{recorded}");
+    assert_eq!(statements[2]["account"], json!(everyday), "{recorded}");
+    assert_eq!(
+        statements[2]["stated"], true,
+        "an empty list is a statement, in a batch as in a single call: {recorded}"
+    );
+
+    assert!(
+        transfer_partners_queue(&harness).await.is_empty(),
+        "every account has been ruled on"
+    );
+
+    // The batch is the same fact as the single call: read one back on its own
+    // route and it is what the batch put there.
+    let (status, read_back) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts/{savings}/transfer-partners"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read_back}");
+    assert_eq!(sorted_partners(&read_back), expected, "{read_back}");
+
+    // A fourth account reopens the goal for itself alone, exactly as it does
+    // after three single calls: being named in nobody's enumeration and naming
+    // nobody are different states, and the batch did not blur them.
+    let (status, spare) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Spare", "institution": "Southgate" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{spare}");
+    let asked = transfer_partners_queue(&harness).await;
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert_eq!(asked[0]["subject"]["id"], spare["id"], "{asked:#?}");
+}
+
+/// Every refusal the single-account route makes, the batch makes.
+///
+/// The two share the checking function, so this test is about the answers being
+/// the same ones — a caller must be able to read a batch's refusal the way it
+/// reads the refusal of the call the batch replaced.
+#[tokio::test]
+async fn a_batch_refuses_exactly_what_a_single_transfer_statement_refuses() {
+    let harness = harness();
+    let main = harness.account.inner().to_string();
+    let stranger = Uuid::new_v4();
+
+    let (status, savings) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{savings}");
+    let savings = savings["id"].as_str().expect("account id").to_owned();
+
+    // Drawing the relationship is the owner's judgement, in bulk as singly.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/transfer-partners",
+            &harness.agent_token,
+            &json!({ "statements": [{ "account": main, "partners": [savings] }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+
+    // An account is not the other side of itself.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/transfer-partners",
+            &harness.owner_token,
+            &json!({ "statements": [{ "account": main, "partners": [main] }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+
+    // An account identifier is not an access right, in either position, and the
+    // status is the one the single call gives: the batch is a cheaper way to
+    // make the same requests, not a different answer to them.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/transfer-partners",
+            &harness.owner_token,
+            &json!({ "statements": [{ "account": stranger, "partners": [main] }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/transfer-partners",
+            &harness.owner_token,
+            &json!({ "statements": [{ "account": main, "partners": [stranger] }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+
+    // Two enumerations for one account cannot both be the complete one. The
+    // request is well formed and its meaning is not, which is the line between
+    // `400` and `422` everywhere else in this API.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/transfer-partners",
+            &harness.owner_token,
+            &json!({
+                "statements": [
+                    { "account": main, "partners": [savings] },
+                    { "account": main, "partners": [] },
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an account named twice is a bad request, not a last-write-wins: {refusal}"
+    );
+    assert_eq!(
+        refusal["field"],
+        json!("/statements/1/account"),
+        "{refusal}"
+    );
+
+    // An empty batch is accepted and changes nothing: a caller with no items
+    // left to answer must not have to special-case the call it does not make.
+    let (status, empty) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/transfer-partners",
+            &harness.owner_token,
+            &json!({ "statements": [] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert_eq!(empty["statements"], json!([]), "{empty}");
+}
+
+/// A refused batch writes nothing — not even the entries before the bad one.
+///
+/// This is the property the batch exists to keep, and it is the reason the store
+/// grew a batch method rather than the route looping over the single one: that
+/// method commits per call, so a loop refused on the third entry would leave two
+/// statements replaced. The owner answering several accounts together has not
+/// half-said anything.
+#[tokio::test]
+async fn a_refused_batch_leaves_every_standing_statement_as_it_was() {
+    let harness = harness();
+    let main = harness.account.inner().to_string();
+    let stranger = Uuid::new_v4();
+
+    let (status, savings) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{savings}");
+    let savings = savings["id"].as_str().expect("account id").to_owned();
+
+    let (status, everyday) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Everyday", "institution": "Southgate" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{everyday}");
+    let everyday = everyday["id"].as_str().expect("account id").to_owned();
+
+    // A statement stands for `Main`, and `Everyday` has not been ruled on.
+    let (status, recorded) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            &harness.owner_token,
+            &json!({ "partners": [savings] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    // A batch that would replace `Main`'s statement and answer `Everyday`, with
+    // an account the owner does not hold in the last entry.
+    let (status, refusal) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/transfer-partners",
+            &harness.owner_token,
+            &json!({
+                "statements": [
+                    { "account": main, "partners": [] },
+                    { "account": everyday, "partners": [main] },
+                    { "account": savings, "partners": [stranger] },
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+
+    // The first entry did not replace what stood.
+    let (status, read_back) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts/{main}/transfer-partners"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read_back}");
+    assert_eq!(
+        read_back["partners"],
+        json!([savings]),
+        "the refused batch must not have emptied Main's statement: {read_back}"
+    );
+
+    // The second entry did not answer an unanswered question.
+    let (status, read_back) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts/{everyday}/transfer-partners"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read_back}");
+    assert_eq!(
+        read_back["stated"], false,
+        "the refused batch must not have recorded a statement for Everyday: {read_back}"
+    );
+
+    // And the queue still asks the two questions that were never answered.
+    let asked = transfer_partners_queue(&harness).await;
+    let subjects: Vec<&Value> = asked.iter().map(|item| &item["subject"]["id"]).collect();
+    assert_eq!(asked.len(), 2, "{asked:#?}");
+    assert!(subjects.contains(&&json!(savings)), "{asked:#?}");
+    assert!(subjects.contains(&&json!(everyday)), "{asked:#?}");
+}
+
+/// The queue names the per-account operation; the batch is found in the spec.
+///
+/// The decision, asserted so that changing it is deliberate. A single queue item
+/// covering many accounts would need a `RequestPlan` whose `missing` pointers
+/// address array elements — a shape nothing else in the catalogue uses — and it
+/// would give one state to twelve independent questions, so that answering eight
+/// of them could not be expressed. The item stays per account. What the batch
+/// gets instead is an `operation_id` in the completed document, which is where a
+/// caller finds the shape of every other route it calls.
+#[tokio::test]
+async fn the_queue_asks_per_account_and_the_batch_is_discoverable_from_the_specification() {
+    let harness = harness();
+
+    let (status, savings) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{savings}");
+
+    for item in transfer_partners_queue(&harness).await {
+        assert_eq!(
+            item["target"]["operationId"], "record_account_transfer_partners",
+            "the queue names the per-account operation: {item}"
+        );
+        assert_eq!(
+            item["target"]["path"], "/v1/accounts/{id}/transfer-partners",
+            "{item}"
+        );
+    }
+
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK, "{spec}");
+    let batch = &spec["paths"]["/v1/accounts/transfer-partners"]["put"];
+    assert_eq!(
+        batch["operationId"], "record_account_transfer_partners_batch",
+        "{spec}"
+    );
+    assert!(
+        batch["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+            .as_str()
+            .is_some_and(
+                |reference| reference.ends_with("RecordAccountTransferPartnersBatchRequest")
+            ),
+        "{batch}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Import sessions: a row that can say "I don't know" (iaam-3kru, iaam-6qsa)
 // ---------------------------------------------------------------------------

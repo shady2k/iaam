@@ -3410,6 +3410,45 @@ pub struct RecordAccountTransferPartnersRequest {
     pub partners: Vec<Uuid>,
 }
 
+/// One account's statement inside a batch.
+///
+/// The account moves from the path into the body, and nothing else changes: the
+/// list is still «these, and no others», still about this one account, and
+/// still says nothing about whether an account it names moves money with a
+/// third. That is why the batch carries one entry per account rather than a set
+/// of pairs — the relation is not what is being recorded, the closure is, and a
+/// closure is a fact about exactly one account.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountTransferPartnersStatementDto {
+    pub account: Uuid,
+    /// Legitimately empty: «money moves between this account and none of my
+    /// others», the answer that closes the queue item for an account that
+    /// stands alone.
+    #[serde(default)]
+    pub partners: Vec<Uuid>,
+}
+
+/// Recording those statements for several accounts in one call.
+///
+/// The queue asks the question once per account and twelve accounts were twelve
+/// round trips. This collapses the round trips and nothing else: every check the
+/// single-account route makes is made here, per entry, and the whole batch is
+/// refused if any entry fails one.
+///
+/// An account may appear at most once. Two enumerations for one account cannot
+/// both be the complete one, and picking the later would silently discard a
+/// statement the owner made.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecordAccountTransferPartnersBatchRequest {
+    pub statements: Vec<AccountTransferPartnersStatementDto>,
+}
+
+/// The statements as they stand after the batch, read back in the order asked.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountTransferPartnersBatchDto {
+    pub statements: Vec<AccountTransferPartnersDto>,
+}
+
 /// Account creation.
 ///
 /// Every field decision 0004 adds is optional, and a request that omits them all

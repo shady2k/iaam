@@ -80,6 +80,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
             routes::record_account_transfer_partners,
             routes::clear_account_transfer_partners
         ))
+        .routes(routes!(routes::record_account_transfer_partners_batch))
         .routes(routes!(routes::list_instruments, routes::create_instrument))
         .routes(routes!(routes::get_instrument))
         .routes(routes!(routes::resolve_instrument))

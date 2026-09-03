@@ -632,6 +632,26 @@ impl Store for SqliteAdapter {
         .await
     }
 
+    async fn record_account_transfer_statements(
+        &self,
+        owner: OwnerId,
+        statements: Vec<AccountTransferStatementView>,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            let records: Vec<AccountTransferStatementRecord> = statements
+                .into_iter()
+                .map(|statement| AccountTransferStatementRecord {
+                    account: statement.account,
+                    partners: statement.partners,
+                })
+                .collect();
+            store
+                .record_account_transfer_statements(owner, &records)
+                .map_err(store_error)
+        })
+        .await
+    }
+
     async fn clear_account_transfer_statement(
         &self,
         owner: OwnerId,

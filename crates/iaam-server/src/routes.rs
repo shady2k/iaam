@@ -71,23 +71,25 @@ use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
     AccountAliasDto, AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto,
-    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto, ActionsResponseDto,
-    AddContourVersionRequest, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest,
-    CashAssetClassDto, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest,
-    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
-    ClassificationRuleDto, ClassificationRuleRequest, ContourDto, ContourVersionDto,
-    CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
-    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
-    ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto,
-    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
-    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
-    MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
-    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
-    RecordAccountScopeRequest, RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
-    RequestPlanDto, RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
+    ActionTargetDto, ActionsResponseDto, AddContourVersionRequest, BalancesReportDto,
+    BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto,
+    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
+    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
+    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
+    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
+    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
+    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
+    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
+    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
+    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
+    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest,
+    RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
+    ReplaceAccountAliasesRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -106,6 +108,11 @@ pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
 pub const REPLACE_ACCOUNT_ALIASES_OPERATION_ID: &str = "replace_account_aliases";
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
+/// The batch form. Deliberately absent from [`OperationKey`]: the action queue
+/// names the per-account operation, one item per account, and this is the
+/// transport a caller holding several of those items may use instead.
+pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_BATCH_OPERATION_ID: &str =
+    "record_account_transfer_partners_batch";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 
@@ -1840,14 +1847,136 @@ pub async fn record_account_transfer_partners(
     // out of the agent's hands.
     require_admin(&principal)?;
     let account = AccountId(id);
-    owned_account(&state, &principal, account).await?;
+    let statement =
+        validated_transfer_statement(&state, &principal, account, request.partners, "partners")
+            .await?;
 
-    let mut partners = Vec::with_capacity(request.partners.len());
-    for partner in request.partners {
+    state
+        .services
+        .store
+        .record_account_transfer_statement(principal.owner, statement)
+        .await?;
+
+    Ok(Json(
+        account_transfer_partners_dto(&state, &principal, account).await?,
+    ))
+}
+
+/// Record those statements for several accounts in one call.
+///
+/// Transport only, and the shape says so. The batch is one entry per account,
+/// each carrying that account's whole enumeration, because the relation is not
+/// what is being recorded — the closure is. Naming `B` inside `A`'s list
+/// establishes that money moves between them and says nothing about whether `B`
+/// also moves money with `C`; closing `B`'s question from `A`'s answer would
+/// assert that `B` has no partners beyond those already named, which is a
+/// fabricated fact about the owner's money. The completeness statement is
+/// irreducible per account, so the count of statements cannot shrink. The count
+/// of round trips can, and this is that.
+///
+/// Every check the single-account route makes is made here, by calling the same
+/// function it calls, once per entry. A partial failure refuses everything: the
+/// route the owner would otherwise have called twelve times refuses one bad call
+/// outright, and a batch that wrote eleven and refused the twelfth would leave
+/// him having said something he was saying all at once.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/transfer-partners",
+    operation_id = RECORD_ACCOUNT_TRANSFER_PARTNERS_BATCH_OPERATION_ID,
+    request_body = RecordAccountTransferPartnersBatchRequest,
+    responses(
+        (status = 200, description = "Every statement recorded", body = AccountTransferPartnersBatchDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "An account named in the batch does not exist or belongs to someone else; nothing was recorded", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_transfer_partners_batch(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiJson(request): ApiJson<RecordAccountTransferPartnersBatchRequest>,
+) -> Result<Json<AccountTransferPartnersBatchDto>, ApiFailure> {
+    require_admin(&principal)?;
+
+    let mut accounts: Vec<AccountId> = Vec::with_capacity(request.statements.len());
+    let mut statements = Vec::with_capacity(request.statements.len());
+    for (index, entry) in request.statements.into_iter().enumerate() {
+        let account = AccountId(entry.account);
+        // Two enumerations for one account cannot both be the complete one, and
+        // last-write-wins would discard a statement the owner made without
+        // telling him which.
+        if accounts.contains(&account) {
+            return Err(unprocessable(
+                &format!("/statements/{index}/account"),
+                "an account named at most once in the batch",
+                &format!("a second statement for account {}", account.inner()),
+                "an account's transfer partners are one complete enumeration, and a batch naming \
+                 the same account twice does not say which of the two is it",
+            ));
+        }
+        accounts.push(account);
+        statements.push(
+            validated_transfer_statement(
+                &state,
+                &principal,
+                account,
+                entry.partners,
+                &format!("/statements/{index}/partners"),
+            )
+            .await?,
+        );
+    }
+
+    // Nothing is written until every entry has passed, and then all of it is
+    // written in one transaction: validation refuses a bad batch before the
+    // first row, and the store's batch method keeps a failure below this layer
+    // from leaving half the statements behind.
+    state
+        .services
+        .store
+        .record_account_transfer_statements(principal.owner, statements)
+        .await?;
+
+    let mut recorded = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        recorded.push(account_transfer_partners_dto(&state, &principal, account).await?);
+    }
+    Ok(Json(AccountTransferPartnersBatchDto {
+        statements: recorded,
+    }))
+}
+
+/// The checks that stand between a request and a recorded transfer statement.
+///
+/// One function, called by the single-account route and once per entry by the
+/// batch, so that the two cannot drift into accepting different things. The
+/// `field` is the only thing that varies: it names `partners` for the single
+/// form and the JSON pointer of the offending entry for the batch, and it
+/// changes what the refusal points at, never what is refused.
+///
+/// An account the owner does not hold — in either position — leaves through
+/// [`owned_account`]'s `404`, unchanged by the batching. A batch is a cheaper
+/// way to make the same twelve calls, and a caller must be able to read the
+/// answer the same way whichever way it made them.
+async fn validated_transfer_statement(
+    state: &ServerState,
+    principal: &Principal,
+    account: AccountId,
+    named: Vec<Uuid>,
+    field: &str,
+) -> Result<AccountTransferStatementView, ApiFailure> {
+    owned_account(state, principal, account).await?;
+
+    let mut partners = Vec::with_capacity(named.len());
+    for partner in named {
         let partner = AccountId(partner);
         if partner == account {
             return Err(unprocessable(
-                "partners",
+                field,
                 "the owner's other accounts",
                 "the account itself",
                 "a transfer has two sides, and an account is not the other side of itself",
@@ -1856,24 +1985,13 @@ pub async fn record_account_transfer_partners(
         // Refused rather than ignored: a named account that does not exist is a
         // mistake in the statement, and silently dropping it would record a
         // statement the owner did not make.
-        owned_account(&state, &principal, partner).await?;
+        owned_account(state, principal, partner).await?;
         if !partners.contains(&partner) {
             partners.push(partner);
         }
     }
 
-    state
-        .services
-        .store
-        .record_account_transfer_statement(
-            principal.owner,
-            AccountTransferStatementView { account, partners },
-        )
-        .await?;
-
-    Ok(Json(
-        account_transfer_partners_dto(&state, &principal, account).await?,
-    ))
+    Ok(AccountTransferStatementView { account, partners })
 }
 
 /// Withdraw the statement, returning the account to awaiting a decision.

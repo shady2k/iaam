@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::error::AppError;
 use crate::ports::{
     AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
-    ContourView, ControlAssertionView, Scope, Store,
+    ContourView, ControlAssertionView, ImportQuestionView, ImportSessionState, Scope, Store,
 };
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::source_row::RowName;
@@ -14,6 +14,7 @@ use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use iaam_ingest::Verdict;
+use iaam_ingest::classification::Question;
 
 /// The policy-visible kind of an outstanding action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -26,6 +27,13 @@ pub enum ActionKind {
     ResolveTransferRelationships,
     StartAccountImport,
     ProvideControlAssertion,
+    /// A row the source described without a settled direction or counterparty
+    /// is held in an import session, and the owner has not said what it was.
+    ///
+    /// Declared here, between the import and the diagnostics, because
+    /// [`frontier`] emits its items last and one of its tests requires the
+    /// frontier's order to be non-decreasing in this enum's order.
+    AnswerClassificationQuestion,
     CoverageGapUnrepaired,
     IndependentConfirmationMissing,
     DiscrepancyUnresolved,
@@ -46,6 +54,7 @@ impl ActionKind {
             Self::ResolveTransferRelationships => "resolve_transfer_relationships",
             Self::StartAccountImport => "start_account_import",
             Self::ProvideControlAssertion => "provide_control_assertion",
+            Self::AnswerClassificationQuestion => "answer_classification_question",
             Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
             Self::IndependentConfirmationMissing => "independent_confirmation_missing",
             Self::DiscrepancyUnresolved => "discrepancy_unresolved",
@@ -117,6 +126,60 @@ pub struct MissingInput {
     pub pointer: String,
     pub provided_by: ProvidedBy,
     pub candidates: Option<Vec<AccountCandidate>>,
+    /// The literal values this field admits, when it admits a closed set.
+    ///
+    /// Empty means the field is not a choice — a title, a balance, a date — and
+    /// says nothing about what may be written there. It is **not** the same as
+    /// `candidates`: a candidate is one of the owner's accounts offered for a
+    /// field whose type is an account, while an alternative is a value of the
+    /// field itself, and choosing one may require further fields that choosing
+    /// another does not.
+    pub alternatives: Vec<InputAlternative>,
+}
+
+/// One admissible value of a missing input, with what choosing it then needs.
+///
+/// The `requires` list is why this is not a bare `Vec<String>`. An answer to a
+/// classification question is one word — `paid`, `fee` — except for the two that
+/// name one of the owner's accounts, which cannot be written without also
+/// naming it. Published as a flat list of words, those two would either look
+/// complete when they are not, or oblige every field they need to be marked
+/// required for every value, which would refuse `paid` for want of an account
+/// no one asked it about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputAlternative {
+    /// The value written at the parent's pointer.
+    pub value: String,
+    /// Fields that become required only if this alternative is chosen.
+    pub requires: Vec<RequiredInput>,
+}
+
+/// A field one alternative requires. It does not carry alternatives of its own.
+///
+/// [`MissingInput`] without the `alternatives`, and the omission is the point
+/// rather than an oversight. A required field that were itself a closed choice
+/// would be a second question that cannot be phrased until the first is
+/// answered, which is the shape `Question::UnresolvedDirection` exists to
+/// refuse. Making the two types mutually recursive would also make the OpenAPI
+/// schema generated from them non-terminating, and it did: the generator
+/// overflowed its stack before this type existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredInput {
+    pub pointer: String,
+    pub provided_by: ProvidedBy,
+    pub candidates: Option<Vec<AccountCandidate>>,
+}
+
+impl MissingInput {
+    /// A field with no closed value set and no account candidates.
+    fn plain(pointer: &str, provided_by: ProvidedBy) -> Self {
+        Self {
+            pointer: pointer.to_owned(),
+            provided_by,
+            candidates: None,
+            alternatives: Vec::new(),
+        }
+    }
 }
 
 /// Request information attached to an operation target.
@@ -142,6 +205,8 @@ pub enum OperationKey {
     CreateCategoryRule,
     /// Record the owner's statement about one account's transfer partners.
     RecordAccountTransferPartners,
+    /// Answer one classification question held open by an import session.
+    AnswerImportQuestion,
 }
 impl OperationKey {
     /// The route operation identifier declared by the transport.
@@ -154,6 +219,7 @@ impl OperationKey {
             Self::RecordOwnerBalance => "record_owner_balance",
             Self::CreateCategoryRule => "create_category_rule",
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
+            Self::AnswerImportQuestion => "answer_import_question",
         }
     }
 }
@@ -295,6 +361,28 @@ fn identity(kind: ActionKind) -> String {
     kind.id().to_owned()
 }
 
+/// One question an import session holds, in the form the queue reads it.
+///
+/// Three facts that live in three places, resolved together because the item
+/// needs all three. The stored question is JSON — [`Question`] as `iaam-ingest`
+/// writes it — the answer is a column on the same row, and the state of the
+/// session holding it is a different row entirely.
+///
+/// Parsed in [`frontier`] rather than where the item is built: a stored question
+/// this build cannot read is a store failure, and [`actions_from_state`] returns
+/// a `Vec` and has no way to report one. Dropping such a row instead would put
+/// the queue back where this action found it — an outstanding question nothing
+/// mentions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassificationQuestion {
+    /// The stored question, its wording, and its answer if it has one.
+    pub view: ImportQuestionView,
+    /// The state of the session holding it.
+    pub session_state: ImportSessionState,
+    /// The typed question, read from [`ImportQuestionView::question`].
+    pub asked: Question,
+}
+
 /// Compute every currently outstanding setup action for an owner.
 pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, AppError> {
     let accounts = store.list_accounts(owner).await?;
@@ -302,6 +390,23 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
     let exclusions = store.list_account_scope_exclusions(owner).await?;
     let transfers = store.list_account_transfer_statements(owner).await?;
     let activity = store.list_account_activity(owner).await?;
+    // The two reads that make a question outlive the response that raised it.
+    // Every session is asked, not only the open ones: eligibility is a property
+    // of the item and is decided beside the gap and the completion, not by
+    // narrowing what is loaded.
+    let mut questions = Vec::new();
+    for session in store.list_import_sessions(owner).await? {
+        for view in store.list_import_questions(owner, session.id).await? {
+            let asked = serde_json::from_str(&view.question).map_err(|error| {
+                AppError::Store(format!("stored import question could not be read: {error}"))
+            })?;
+            questions.push(ClassificationQuestion {
+                view,
+                session_state: session.state,
+                asked,
+            });
+        }
+    }
     let mut assertions = Vec::new();
     for account in activity
         .iter()
@@ -313,14 +418,15 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
                 .await?,
         );
     }
-    Ok(actions_from_state(
-        &accounts,
-        &contours,
-        &exclusions,
-        &transfers,
-        &activity,
-        &assertions,
-    ))
+    Ok(actions_from_state(&OwnerState {
+        accounts: &accounts,
+        contours: &contours,
+        exclusions: &exclusions,
+        transfers: &transfers,
+        activity: &activity,
+        assertions: &assertions,
+        questions: &questions,
+    }))
 }
 
 /// Find every unresolved or informational fact in a reconciliation ledger.
@@ -597,11 +703,13 @@ fn undecomposed_outflows_action(
                         pointer: "/matcher".into(),
                         provided_by: ProvidedBy::Owner,
                         candidates: None,
+                        alternatives: Vec::new(),
                     },
                     MissingInput {
                         pointer: "/category".into(),
                         provided_by: ProvidedBy::Owner,
                         candidates: None,
+                        alternatives: Vec::new(),
                     },
                 ],
             },
@@ -739,16 +847,34 @@ fn row_name_text(name: &RowName) -> String {
         RowName::Fingerprint(name) => format!("fingerprint:{name}"),
     }
 }
-fn actions_from_state(
-    accounts: &[AccountView],
-    contours: &[ContourView],
-    exclusions: &[AccountScopeExclusionView],
-    transfers: &[AccountTransferStatementView],
-    activity: &[AccountActivityView],
-    assertions: &[ControlAssertionView],
-) -> Vec<Action> {
+/// Everything the frontier is computed from, read once and passed together.
+///
+/// A struct rather than seven positional slices, for the reason [`ActionFacts`]
+/// is one: the reads grow by one with each goal the queue learns, and an
+/// argument list that long is one a caller gets into the wrong order without the
+/// compiler noticing.
+struct OwnerState<'a> {
+    accounts: &'a [AccountView],
+    contours: &'a [ContourView],
+    exclusions: &'a [AccountScopeExclusionView],
+    transfers: &'a [AccountTransferStatementView],
+    activity: &'a [AccountActivityView],
+    assertions: &'a [ControlAssertionView],
+    questions: &'a [ClassificationQuestion],
+}
+
+fn actions_from_state(state: &OwnerState<'_>) -> Vec<Action> {
+    let OwnerState {
+        accounts,
+        contours,
+        exclusions,
+        transfers,
+        activity,
+        assertions,
+        questions,
+    } = *state;
     let mut actions = actions_from_views(accounts, contours, exclusions, transfers);
-    actions.reserve(activity.len() + assertions.len());
+    actions.reserve(activity.len() + assertions.len() + questions.len());
     for account in activity
         .iter()
         .filter(|activity| account_import_eligibility(activity) && account_import_gap(activity))
@@ -780,6 +906,13 @@ fn actions_from_state(
                 point,
             ));
         }
+    }
+    // Last, so the frontier's kinds stay non-decreasing in `ActionKind`'s own
+    // order: this kind is declared after the control assertion.
+    for question in questions.iter().filter(|question| {
+        classification_question_eligibility(question) && classification_question_gap(question)
+    }) {
+        actions.push(answer_classification_question_action(question, accounts));
     }
     actions
 }
@@ -831,6 +964,176 @@ fn control_assertion_completion(
             && assertion.point == Some(point)
             && assertion.dimension == dimension
     })
+}
+
+/// A question can be answered while the session holding it is open.
+///
+/// The eligibility, and it is not a formality. A committed session has every
+/// question answered — commit refuses otherwise — and an abandoned one will
+/// never be committed, so the route that answers its questions has nothing to
+/// settle and refuses too. An item for either would be work the owner cannot do,
+/// which is the kind of item a queue is learned to ignore for.
+const fn classification_question_eligibility(question: &ClassificationQuestion) -> bool {
+    matches!(question.session_state, ImportSessionState::Open)
+}
+
+fn classification_question_gap(question: &ClassificationQuestion) -> bool {
+    !classification_question_completion(question)
+}
+
+/// The goal is satisfied by an answer to **this** question and by nothing else.
+///
+/// Quantified over the questions, not over the sessions. «This session has no
+/// open question» is not a property a new question preserves, and a goal written
+/// that way would close the moment the last question of a session was answered
+/// and stay closed when the next row raised another. Asked of each question, a
+/// new question reopens the goal however many are already answered — the same
+/// property [`transfer_relationships_completion`] has for a new account.
+///
+/// Abandoning the session does not satisfy this. It removes the item by failing
+/// the eligibility above, and «the owner said what the row was» and «the owner
+/// threw the row away» are different facts that must not read as one.
+fn classification_question_completion(question: &ClassificationQuestion) -> bool {
+    !question.view.is_open()
+}
+
+/// A row the source described too thinly to classify, waiting on the owner.
+///
+/// `RequiredForGoal`, not `Blocking`, and the two readings were close enough to
+/// need deciding rather than feeling. `Blocking` is documented here as "work
+/// that prevents the system from accepting another action", and an open question
+/// does not: every other import runs, every other account is asserted over, every
+/// other session commits. What it prevents is the commit of the one session the
+/// owner himself opened, and he can abandon that session instead — a refusal
+/// scoped to one piece of work he controls is not the system refusing to accept
+/// another action.
+///
+/// What it does do is leave a row out of the journal while the owner is shown
+/// figures computed without it, with nothing on the figure saying so. That is
+/// exactly the line the control assertions and the transfer statements were
+/// graded on — the absence changes what the reported numbers mean — and it is
+/// `RequiredForGoal` for the same reason. Grading it `Blocking` would also sort
+/// it above «create your first account», which is the one item that genuinely
+/// stops everything.
+///
+/// `NeedsOwnerInput`, not `Ready`. `classify` refuses to guess a direction the
+/// source did not state; an agent choosing one on the owner's behalf is that
+/// same guess made one layer up, and a fully preset request does not change who
+/// may send it.
+///
+/// `Scope::Agent`, and this is the first item whose scope is not `Scope::Owner`.
+/// The route that answers checks `may_submit`, which an agent token satisfies,
+/// and the queue's business is to say what may be called: an item marked `owner`
+/// would tell an agent it may not send a request the server would accept. Who
+/// decides the answer and who may transmit it are different questions, and
+/// `NeedsOwnerInput` is where the first one is already answered.
+fn answer_classification_question_action(
+    question: &ClassificationQuestion,
+    accounts: &[AccountView],
+) -> Action {
+    let account = question.asked.account();
+    let title = accounts
+        .iter()
+        .find(|candidate| candidate.id == account)
+        .map_or_else(
+            || "an account that is no longer listed".to_owned(),
+            |candidate| candidate.title.clone(),
+        );
+
+    let mut preset = BTreeMap::new();
+    // Both are path segments of the answering route, and both are known: the
+    // question is the subject of this item and the session is on its row.
+    preset.insert(
+        "session".to_owned(),
+        question.view.session.inner().to_string().into(),
+    );
+    preset.insert(
+        "question".to_owned(),
+        question.view.id.inner().to_string().into(),
+    );
+
+    Action::new(
+        ActionFacts {
+            // One identity per question, so a second question is a second item
+            // and an agent deduplicating by id never collapses them — the same
+            // rule `start_account_import` follows per account.
+            id: format!(
+                "{}:{}",
+                ActionKind::AnswerClassificationQuestion.id(),
+                question.view.id.inner()
+            ),
+            kind: ActionKind::AnswerClassificationQuestion,
+            category: ActionCategory::RequiredForGoal,
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Agent),
+            subject: Some(ActionSubject::Account(account)),
+        },
+        format!(
+            "Account {} ({}) has row {} of import session {} held unclassified. {} Nothing else \
+             is refused while it stands, but the row is in no journal and in no report, and the \
+             session holding it will not commit until it is answered. The answer is written as a \
+             rule, so a row matching it settles by itself next time.",
+            account.inner(),
+            title,
+            question.view.row,
+            question.view.session.inner(),
+            question.view.prompt,
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::AnswerImportQuestion,
+            request: RequestPlan {
+                preset,
+                missing: vec![answer_input(question, accounts)],
+            },
+        },
+    )
+    .expect("classification question action has an operation target")
+}
+
+/// The `/answer` field, carrying the shapes **this** question admits.
+///
+/// The shapes are read from the question rather than listed here, and they are
+/// recomputed from the typed question rather than replayed from the JSON the
+/// store holds beside it. That JSON is what was offered when the question was
+/// asked; the answering route checks the answer against `Question::alternatives`
+/// as this build computes it, and the queue must offer what the route will
+/// accept and not what an older build once printed.
+fn answer_input(question: &ClassificationQuestion, accounts: &[AccountView]) -> MissingInput {
+    // The far side of an internal transfer is one of the owner's *other*
+    // accounts: the row is already on this one, and an account is not the other
+    // side of itself.
+    let others: Vec<AccountView> = accounts
+        .iter()
+        .filter(|candidate| candidate.id != question.asked.account())
+        .cloned()
+        .collect();
+
+    MissingInput {
+        pointer: "/answer".to_owned(),
+        provided_by: ProvidedBy::Owner,
+        candidates: None,
+        alternatives: question
+            .asked
+            .alternatives()
+            .into_iter()
+            .map(|shape| InputAlternative {
+                value: shape.code().to_owned(),
+                // Two of the six name an account, and only those two. The
+                // alternative says so itself rather than the field being marked
+                // required for all six, which would refuse `paid` for want of an
+                // account nothing asked it about.
+                requires: if shape.needs_account() {
+                    vec![RequiredInput {
+                        pointer: "/account".to_owned(),
+                        provided_by: ProvidedBy::Owner,
+                        candidates: Some(account_candidates(&others)),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect(),
+    }
 }
 
 fn actions_from_views(
@@ -1054,6 +1357,7 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
                             .cloned()
                             .collect::<Vec<_>>(),
                     )),
+                    alternatives: Vec::new(),
                 }],
             },
         },
@@ -1184,11 +1488,7 @@ fn provide_control_assertion_action(
                 // `/cash` is the one chosen input, so the request cannot be empty:
                 // the scenario rejects a balance carrying neither cash nor positions.
                 preset,
-                missing: vec![MissingInput {
-                    pointer: "/cash".into(),
-                    provided_by: ProvidedBy::Owner,
-                    candidates: None,
-                }],
+                missing: vec![MissingInput::plain("/cash", ProvidedBy::Owner)],
             },
         },
     )
@@ -1211,11 +1511,7 @@ fn first_account_action() -> Action {
             operation: OperationKey::CreateAccount,
             request: RequestPlan {
                 preset: BTreeMap::new(),
-                missing: vec![MissingInput {
-                    pointer: "/title".into(),
-                    provided_by: ProvidedBy::Owner,
-                    candidates: None,
-                }],
+                missing: vec![MissingInput::plain("/title", ProvidedBy::Owner)],
             },
         },
     )
@@ -1291,11 +1587,13 @@ fn account_scope_action(
                     pointer: "/contour".into(),
                     provided_by: ProvidedBy::Owner,
                     candidates: None,
+                    alternatives: Vec::new(),
                 },
                 MissingInput {
                     pointer: "/accounts".into(),
                     provided_by: ProvidedBy::Owner,
                     candidates: Some(account_candidates(accounts)),
+                    alternatives: Vec::new(),
                 },
             ],
         ),
@@ -1367,11 +1665,13 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
                         pointer: "/title".into(),
                         provided_by: ProvidedBy::Owner,
                         candidates: None,
+                        alternatives: Vec::new(),
                     },
                     MissingInput {
                         pointer: "/accounts".into(),
                         provided_by: ProvidedBy::Owner,
                         candidates: Some(candidates),
+                        alternatives: Vec::new(),
                     },
                 ],
             },
@@ -1384,6 +1684,7 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
 mod tests {
     use super::*;
     use crate::adapters::sqlite::SqliteAdapter;
+    use crate::ports::NewImportQuestion;
     use crate::ports::Store;
     use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
     use iaam_core::dates::{EffectiveOrder, EventDates};
@@ -1392,11 +1693,12 @@ mod tests {
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
     use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
     use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
-    use iaam_core::ids::{EventId, SourceId};
+    use iaam_core::ids::{EventId, ImportQuestionId, ImportSessionId, SourceId};
     use iaam_core::money::{CurrencyCode, Money, PostedMinor};
     use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
     use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
     use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
+    use iaam_ingest::classification::Answer;
     use iaam_store::SqliteStore;
     use std::collections::BTreeSet;
     use time::macros::date;
@@ -1864,14 +2166,15 @@ mod tests {
     #[test]
     fn an_item_the_agent_cannot_call_says_so_in_its_state() {
         let account = account();
-        let actions = actions_from_state(
-            std::slice::from_ref(&account),
-            &[],
-            &[],
-            &[],
-            &[no_facts(account.id)],
-            &[],
-        );
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[no_facts(account.id)],
+            assertions: &[],
+            questions: &[],
+        });
 
         for action in &actions {
             match action.target() {
@@ -1922,14 +2225,15 @@ mod tests {
         // sharing one is not a cosmetic collision: the second item is invisible.
         let first = AccountId::new_random();
         let second = AccountId::new_random();
-        let actions = actions_from_state(
-            &[with_id(first), with_id(second)],
-            &[],
-            &[],
-            &[],
-            &[no_facts(first), no_facts(second)],
-            &[],
-        );
+        let actions = actions_from_state(&OwnerState {
+            accounts: &[with_id(first), with_id(second)],
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[no_facts(first), no_facts(second)],
+            assertions: &[],
+            questions: &[],
+        });
 
         let identities: Vec<_> = actions
             .iter()
@@ -2086,14 +2390,15 @@ mod tests {
     fn the_structural_question_is_ordered_before_the_import() {
         let main = named("Main");
         let savings = named("Savings");
-        let actions = actions_from_state(
-            &[main.clone(), savings.clone()],
-            &[],
-            &[],
-            &[],
-            &[no_facts(main.id), no_facts(savings.id)],
-            &[],
-        );
+        let actions = actions_from_state(&OwnerState {
+            accounts: &[main.clone(), savings.clone()],
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[no_facts(main.id), no_facts(savings.id)],
+            assertions: &[],
+            questions: &[],
+        });
         let mut sorted = actions;
         sort_actions(&mut sorted);
         let kinds: Vec<_> = sorted.iter().map(Action::kind).collect();
@@ -2154,14 +2459,15 @@ mod tests {
             last_effective_date: None,
         };
 
-        let actions = actions_from_state(
-            std::slice::from_ref(&account),
-            &[],
-            &[],
-            &[],
-            std::slice::from_ref(&activity),
-            &[],
-        );
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: std::slice::from_ref(&activity),
+            assertions: &[],
+            questions: &[],
+        });
         let import = actions
             .iter()
             .find(|action| action.kind() == ActionKind::StartAccountImport)
@@ -2177,9 +2483,17 @@ mod tests {
         };
         assert!(account_import_completion(&completed));
         assert!(
-            actions_from_state(&[account], &[], &[], &[], &[completed], &[])
-                .iter()
-                .all(|action| action.kind() != ActionKind::StartAccountImport)
+            actions_from_state(&OwnerState {
+                accounts: &[account],
+                contours: &[],
+                exclusions: &[],
+                transfers: &[],
+                activity: &[completed],
+                assertions: &[],
+                questions: &[]
+            })
+            .iter()
+            .all(|action| action.kind() != ActionKind::StartAccountImport)
         );
     }
 
@@ -2195,14 +2509,15 @@ mod tests {
             first_effective_date: Some(period.from),
             last_effective_date: Some(period.to),
         };
-        actions_from_state(
-            std::slice::from_ref(account),
-            &[],
-            &[],
-            &[],
-            std::slice::from_ref(&activity),
-            recorded,
-        )
+        actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: std::slice::from_ref(&activity),
+            assertions: recorded,
+            questions: &[],
+        })
     }
 
     fn recorded_cash_assertion(
@@ -2361,7 +2676,15 @@ mod tests {
             },
         ];
 
-        let actions = actions_from_state(&[first, second], &[], &[], &[], &activity, &[]);
+        let actions = actions_from_state(&OwnerState {
+            accounts: &[first, second],
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &activity,
+            assertions: &[],
+            questions: &[],
+        });
         let ids: Vec<_> = actions
             .iter()
             .filter(|action| action.kind() == ActionKind::ProvideControlAssertion)
@@ -2380,23 +2703,32 @@ mod tests {
             first_effective_date: Some(time::macros::date!(2026 - 03 - 01)),
             last_effective_date: Some(time::macros::date!(2026 - 03 - 31)),
         };
-        let actions = actions_from_state(
-            std::slice::from_ref(&account),
-            &[],
-            &[],
-            &[],
-            &[activity],
-            &[],
-        );
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[activity],
+            assertions: &[],
+            questions: &[],
+        });
         assert!(
             actions
                 .iter()
                 .any(|action| action.kind() == ActionKind::ProvideControlAssertion)
         );
         assert!(
-            actions_from_state(&[], &[], &[], &[], &[], &[])
-                .iter()
-                .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
+            actions_from_state(&OwnerState {
+                accounts: &[],
+                contours: &[],
+                exclusions: &[],
+                transfers: &[],
+                activity: &[],
+                assertions: &[],
+                questions: &[]
+            })
+            .iter()
+            .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
         );
         assert!(!control_assertion_completion(
             &[],
@@ -3258,6 +3590,380 @@ mod tests {
                 event: EventId::new_random()
             })
             .is_none()
+        );
+    }
+
+    // --- The classification question in the queue ---------------------------
+    //
+    // The defect these cover: a question raised at intake was durable, and the
+    // only way to learn of one was the response that raised it. If the response
+    // was lost, the outstanding work was invisible.
+
+    fn unresolved(account: AccountId) -> Question {
+        Question::UnresolvedDirection {
+            account,
+            stated: Some("INNER".to_owned()),
+            counterparty: None,
+        }
+    }
+
+    fn asked(session: ImportSessionId, account: AccountId, row: u32) -> ClassificationQuestion {
+        let question = unresolved(account);
+        ClassificationQuestion {
+            view: ImportQuestionView {
+                id: ImportQuestionId::new_random(),
+                session,
+                row,
+                question: serde_json::to_string(&question).expect("question json"),
+                alternatives: serde_json::to_string(&question.alternatives())
+                    .expect("alternatives json"),
+                prompt: "Which was it?".to_owned(),
+                asked_at: "2026-03-01T00:00:00Z".to_owned(),
+                answered_at: None,
+                answer: None,
+                rule: None,
+            },
+            session_state: ImportSessionState::Open,
+            asked: question,
+        }
+    }
+
+    fn only_question_item(actions: &[Action]) -> &Action {
+        let mut found = actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::AnswerClassificationQuestion);
+        let item = found.next().expect("the queue holds the open question");
+        assert!(found.next().is_none(), "one item per question");
+        item
+    }
+
+    fn answer_field(action: &Action) -> &MissingInput {
+        let ActionTarget::Operation { request, .. } = action.target() else {
+            panic!("an answerable item names an operation");
+        };
+        request
+            .missing
+            .iter()
+            .find(|missing| missing.pointer == "/answer")
+            .expect("the answer field")
+    }
+
+    /// The question is discoverable from persisted state alone.
+    #[test]
+    fn an_open_classification_question_is_an_item_in_the_queue() {
+        let main = named("Main");
+        let session = ImportSessionId::new_random();
+        let question = asked(session, main.id, 3);
+
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&main),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            questions: std::slice::from_ref(&question),
+        });
+
+        let item = only_question_item(&actions);
+        assert_eq!(
+            item.id(),
+            format!(
+                "answer_classification_question:{}",
+                question.view.id.inner()
+            )
+        );
+        assert_eq!(item.subject(), Some(ActionSubject::Account(main.id)));
+        assert_eq!(item.category(), ActionCategory::RequiredForGoal);
+        assert_eq!(item.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(item.required_scope(), Some(Scope::Agent));
+    }
+
+    /// The item carries the operation that answers it, addressed to this question.
+    #[test]
+    fn the_item_names_the_operation_that_answers_it() {
+        let main = named("Main");
+        let session = ImportSessionId::new_random();
+        let question = asked(session, main.id, 3);
+
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&main),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            questions: std::slice::from_ref(&question),
+        });
+
+        let item = only_question_item(&actions);
+        let ActionTarget::Operation { operation, request } = item.target() else {
+            panic!("an item the owner can answer names an operation");
+        };
+        assert_eq!(*operation, OperationKey::AnswerImportQuestion);
+        assert_eq!(
+            request.preset.get("session").and_then(|id| id.as_str()),
+            Some(session.inner().to_string().as_str())
+        );
+        assert_eq!(
+            request.preset.get("question").and_then(|id| id.as_str()),
+            Some(question.view.id.inner().to_string().as_str())
+        );
+    }
+
+    /// The shapes travel with the item, and they are the ones this question admits.
+    #[test]
+    fn the_item_publishes_the_answer_shapes_the_question_admits() {
+        let main = named("Main");
+        let question = asked(ImportSessionId::new_random(), main.id, 1);
+
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&main),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            questions: std::slice::from_ref(&question),
+        });
+
+        let offered: Vec<&str> = answer_field(only_question_item(&actions))
+            .alternatives
+            .iter()
+            .map(|alternative| alternative.value.as_str())
+            .collect();
+        let admitted: Vec<&str> = question
+            .asked
+            .alternatives()
+            .iter()
+            .map(|shape| shape.code())
+            .collect();
+        assert_eq!(offered, admitted);
+    }
+
+    /// A yes-or-no question offers two shapes, and not the directionless six.
+    #[test]
+    fn a_different_question_publishes_different_shapes() {
+        let main = named("Main");
+        let inflow = Question::IsInflowIncome { account: main.id };
+        let mut question = asked(ImportSessionId::new_random(), main.id, 1);
+        question.view.question = serde_json::to_string(&inflow).expect("question json");
+        question.asked = inflow;
+
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&main),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            questions: std::slice::from_ref(&question),
+        });
+
+        let offered: Vec<&str> = answer_field(only_question_item(&actions))
+            .alternatives
+            .iter()
+            .map(|alternative| alternative.value.as_str())
+            .collect();
+        assert_eq!(offered, vec!["income", "received"]);
+    }
+
+    /// Only the two shapes that name an account ask for one, and never this one.
+    #[test]
+    fn only_the_shapes_that_name_an_account_ask_for_one() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let question = asked(ImportSessionId::new_random(), main.id, 1);
+
+        let actions = actions_from_state(&OwnerState {
+            accounts: &[main.clone(), savings.clone()],
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            questions: std::slice::from_ref(&question),
+        });
+
+        for alternative in &answer_field(only_question_item(&actions)).alternatives {
+            match alternative.value.as_str() {
+                "sent_to_own_account" | "received_from_own_account" => {
+                    let required = alternative
+                        .requires
+                        .first()
+                        .expect("naming an own account requires one");
+                    assert_eq!(required.pointer, "/account");
+                    let offered: Vec<_> = required
+                        .candidates
+                        .as_ref()
+                        .expect("the owner's other accounts")
+                        .iter()
+                        .map(|candidate| candidate.id)
+                        .collect();
+                    assert_eq!(
+                        offered,
+                        vec![savings.id],
+                        "an account is not the other side of itself"
+                    );
+                }
+                _ => assert!(
+                    alternative.requires.is_empty(),
+                    "{} needs no account: {alternative:?}",
+                    alternative.value
+                ),
+            }
+        }
+    }
+
+    /// The goal closes on the answer, and on nothing else.
+    #[test]
+    fn an_answered_question_is_not_an_item() {
+        let main = named("Main");
+        let mut question = asked(ImportSessionId::new_random(), main.id, 1);
+        question.view.answered_at = Some("2026-03-02T00:00:00Z".to_owned());
+        question.view.answer = Some(r#"{"answer":"paid"}"#.to_owned());
+
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&main),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            questions: std::slice::from_ref(&question),
+        });
+
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.kind() != ActionKind::AnswerClassificationQuestion),
+            "{actions:?}"
+        );
+        assert!(classification_question_completion(&question));
+    }
+
+    /// A session that will never commit raises no work the owner can do.
+    #[test]
+    fn a_question_in_a_closed_session_is_not_an_item() {
+        let main = named("Main");
+        for state in [ImportSessionState::Committed, ImportSessionState::Abandoned] {
+            let mut question = asked(ImportSessionId::new_random(), main.id, 1);
+            question.session_state = state;
+            assert!(!classification_question_eligibility(&question));
+            let actions = actions_from_state(&OwnerState {
+                accounts: std::slice::from_ref(&main),
+                contours: &[],
+                exclusions: &[],
+                transfers: &[],
+                activity: &[],
+                assertions: &[],
+                questions: std::slice::from_ref(&question),
+            });
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| action.kind() != ActionKind::AnswerClassificationQuestion),
+                "{state:?}: {actions:?}"
+            );
+            // Losing eligibility is not completion: the question is still open.
+            assert!(!classification_question_completion(&question));
+        }
+    }
+
+    /// A second, unrelated question is a second item with its own identity.
+    #[test]
+    fn two_open_questions_are_two_items() {
+        let main = named("Main");
+        let savings = named("Savings");
+        let session = ImportSessionId::new_random();
+        let first = asked(session, main.id, 1);
+        let second = asked(ImportSessionId::new_random(), savings.id, 1);
+
+        let actions = actions_from_state(&OwnerState {
+            accounts: &[main.clone(), savings.clone()],
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            questions: &[first.clone(), second.clone()],
+        });
+
+        let items: Vec<_> = actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::AnswerClassificationQuestion)
+            .collect();
+        assert_eq!(items.len(), 2, "{actions:?}");
+        let identities: BTreeSet<_> = items.iter().map(|item| item.id()).collect();
+        assert_eq!(identities.len(), 2, "{identities:?}");
+        let subjects: BTreeSet<_> = items
+            .iter()
+            .filter_map(|item| match item.subject() {
+                Some(ActionSubject::Account(account)) => Some(account),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subjects, BTreeSet::from([main.id, savings.id]));
+    }
+
+    /// Nothing but the store is consulted, and the answer removes the item.
+    ///
+    /// This is the defect in one test: the question reaches the queue from the
+    /// two persisted rows, with no ingest response anywhere in the call.
+    #[tokio::test]
+    async fn a_recorded_question_reaches_the_frontier_and_the_answer_removes_it() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let main = account();
+        store
+            .upsert_account(owner, main.clone())
+            .await
+            .expect("account");
+        let session = store
+            .open_import_session(owner, None, None)
+            .await
+            .expect("session");
+        let question = unresolved(main.id);
+        let recorded = store
+            .record_import_question(
+                owner,
+                session.id,
+                1,
+                NewImportQuestion {
+                    question: serde_json::to_string(&question).expect("question json"),
+                    alternatives: serde_json::to_string(&question.alternatives())
+                        .expect("alternatives json"),
+                    prompt: "Which was it?".to_owned(),
+                },
+            )
+            .await
+            .expect("question recorded");
+
+        let actions = frontier(owner, &store).await.expect("frontier");
+        let item = only_question_item(&actions);
+        assert_eq!(
+            item.id(),
+            format!("answer_classification_question:{}", recorded.id.inner())
+        );
+        assert_eq!(item.subject(), Some(ActionSubject::Account(main.id)));
+
+        store
+            .answer_import_question(
+                owner,
+                session.id,
+                recorded.id,
+                serde_json::to_string(&Answer::Paid).expect("answer json"),
+                None,
+            )
+            .await
+            .expect("answered");
+
+        let after = frontier(owner, &store).await.expect("frontier");
+        assert!(
+            after
+                .iter()
+                .all(|action| action.kind() != ActionKind::AnswerClassificationQuestion),
+            "answering removes the item: {after:?}"
         );
     }
 }

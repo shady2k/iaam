@@ -77,6 +77,7 @@ impl ActionCatalog {
             OperationKey::RecordOwnerBalance,
             OperationKey::CreateCategoryRule,
             OperationKey::RecordAccountTransferPartners,
+            OperationKey::AnswerImportQuestion,
         ] {
             let operation_id = key.as_str();
             let Some((path, method, operation)) = by_id.get(operation_id) else {

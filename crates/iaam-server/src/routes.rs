@@ -15,8 +15,8 @@ use axum::response::Response;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
-    AccountScope, Action, ActionCategory, ActionState, ActionSubject, ActionTarget, ProvidedBy,
-    account_scope,
+    AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
+    ActionTarget, MissingInput, ProvidedBy, account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
@@ -50,8 +50,8 @@ use iaam_app::sync::{
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{
-    AccountId, CategoryId, CategoryRuleId, CustodyId, ImportId, ImportQuestionId, ImportSessionId,
-    InstrumentId, SourceId,
+    AccountId, CategoryId, CategoryRuleId, CustodyId, EventId, ImportId, ImportQuestionId,
+    ImportSessionId, InstrumentId, SourceId,
 };
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
@@ -78,24 +78,27 @@ use crate::dto::{
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
     CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto,
-    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InstrumentDto, IssuedTokenDto,
-    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
-    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
-    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto,
-    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
-    ReconciliationStatusDto, RecordAccountScopeRequest, RecordAccountTransferPartnersRequest,
-    RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto,
-    SubmitCorrectionsRequest, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
-    TokenDto, TokenScopeDto, VerdictDto,
+    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
+    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
+    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
+    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, OwnerBalanceRequest,
+    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
+    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest,
+    RecordAccountTransferPartnersRequest, RequestPlanDto, RequiredInputDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::dto::{
-    AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest, ImportCommitDto,
-    ImportQuestionDto, ImportRowDto, ImportSessionContentsDto, ImportSessionDto,
-    OpenImportSessionRequest,
+    AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
+    CommitImportSessionRequest, ConfirmTransferPairingRequest, ConfirmedPairingDto,
+    CrossSourceMatchingDto, ImportCommitDto, ImportPlanDto, ImportQuestionDto, ImportRowDto,
+    ImportSessionContentsDto, ImportSessionDto, OpenImportSessionRequest,
 };
 use crate::error::{ApiError, ApiFailure};
-use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
+use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
+use iaam_app::scenarios::import_session::SessionRevision;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
@@ -139,24 +142,7 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
                 request_schema: resolved.request_schema.clone(),
                 request: RequestPlanDto {
                     preset: request.preset.clone(),
-                    missing: request
-                        .missing
-                        .iter()
-                        .map(|missing| MissingInputDto {
-                            pointer: missing.pointer.clone(),
-                            provided_by: provided_by_code(missing.provided_by),
-                            candidates: missing.candidates.as_ref().map(|candidates| {
-                                candidates
-                                    .iter()
-                                    .map(|candidate| AccountCandidateDto {
-                                        id: candidate.id.inner(),
-                                        title: candidate.title.clone(),
-                                        institution: candidate.institution.clone(),
-                                    })
-                                    .collect()
-                            }),
-                        })
-                        .collect(),
+                    missing: request.missing.iter().map(missing_input_dto).collect(),
                 },
             }
         }
@@ -188,6 +174,42 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
         }),
         target,
     }
+}
+
+/// One missing field, the alternatives it admits, and what each of them needs.
+fn missing_input_dto(missing: &MissingInput) -> MissingInputDto {
+    MissingInputDto {
+        pointer: missing.pointer.clone(),
+        provided_by: provided_by_code(missing.provided_by),
+        candidates: missing.candidates.as_deref().map(account_candidate_dtos),
+        alternatives: missing
+            .alternatives
+            .iter()
+            .map(|alternative| InputAlternativeDto {
+                value: alternative.value.clone(),
+                requires: alternative
+                    .requires
+                    .iter()
+                    .map(|required| RequiredInputDto {
+                        pointer: required.pointer.clone(),
+                        provided_by: provided_by_code(required.provided_by),
+                        candidates: required.candidates.as_deref().map(account_candidate_dtos),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn account_candidate_dtos(candidates: &[AccountCandidate]) -> Vec<AccountCandidateDto> {
+    candidates
+        .iter()
+        .map(|candidate| AccountCandidateDto {
+            id: candidate.id.inner(),
+            title: candidate.title.clone(),
+            institution: candidate.institution.clone(),
+        })
+        .collect()
 }
 
 fn provided_by_code(source: ProvidedBy) -> String {
@@ -2584,20 +2606,59 @@ pub async fn answer_import_question(
     Ok(Json(ImportQuestionDto::from_domain(&answered)))
 }
 
+/// What committing this session would do, before it does it (iaam-k1xa).
+///
+/// Computed by the code that commits, not beside it. That is the whole property:
+/// a preview written as a second implementation of the import describes a
+/// different import from the one that runs, and drifts from it silently — which
+/// is how rows came back with positive verdicts and were absent from the report
+/// the owner was shown.
+///
+/// The answer carries a `revision`. Send it back to the commit route and a
+/// session that changed in between refuses rather than writing something else.
+#[utoipa::path(
+    get,
+    path = "/v1/import-sessions/{session}/assessment",
+    params(("session" = Uuid, Path, description = "Import session identifier")),
+    responses(
+        (status = 200, description = "What committing would record, and what it would not", body = ImportPlanDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such session, or it belongs to someone else", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn assess_import_session(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<ImportPlanDto>, ApiFailure> {
+    let planned = iaam_app::scenarios::import_session::plan_session(
+        &state.services,
+        &principal,
+        ImportSessionId(id),
+    )
+    .await?;
+    Ok(Json(ImportPlanDto::from_domain(&planned.plan)))
+}
+
 /// Commit the session: write everything it holds, once.
 ///
 /// Refused while any question is unanswered. That refusal is the point of the
 /// session — committing with a question open records the guess the question
 /// exists to prevent.
+///
+/// Refused, too, when the caller names a `revision` the session no longer
+/// answers to: what would be written is not what the caller read.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions/{session}/commit",
     params(("session" = Uuid, Path, description = "Import session identifier")),
+    request_body = CommitImportSessionRequest,
     responses(
         (status = 200, description = "The session, closed, and a verdict per row", body = ImportCommitDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 404, description = "No such open session", body = ApiError),
-        (status = 422, description = "The session still has questions the owner has not answered", body = ApiError)
+        (status = 422, description = "Unanswered questions remain, or the revision no longer describes what would happen", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -2605,14 +2666,21 @@ pub async fn commit_import_session(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
+    ApiJsonOrDefault(request): ApiJsonOrDefault<CommitImportSessionRequest>,
 ) -> Result<Json<ImportCommitDto>, ApiFailure> {
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let verdicts = iaam_app::scenarios::import_session::commit_session(
+    // The body is optional, and so is the revision inside it: a caller that
+    // never read an assessment still commits, and is told in the answer which
+    // revision it committed under. Making the body mandatory would break every
+    // caller that already commits with nothing to say.
+    let revision = request.revision.map(SessionRevision);
+    let outcome = iaam_app::scenarios::import_session::commit_session(
         &state.services,
         &principal,
         ImportSessionId(id),
+        revision.as_ref(),
     )
     .await?;
     let contents = iaam_app::scenarios::import_session::read_session(
@@ -2623,12 +2691,91 @@ pub async fn commit_import_session(
     .await?;
     Ok(Json(ImportCommitDto {
         session: ImportSessionDto::from_domain(&contents.session),
-        rows: verdicts
+        revision: outcome.revision.0,
+        rows: outcome
+            .verdicts
             .iter()
             .enumerate()
             .map(|(index, verdict)| VerdictDto::from_domain(index + 1, verdict))
             .collect(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Transfer pairing (iaam-3ul2)
+// ---------------------------------------------------------------------------
+
+/// Transfers the journal's one-sided movements may be halves of.
+///
+/// One movement between two of the owner's banks is printed twice, once by each
+/// side, and nothing in either row says the two are one thing. Recorded
+/// independently they make a contour spanning both banks report an external
+/// outflow and an external inflow that never happened.
+///
+/// **Nothing is decided here.** Each candidate is published with the evidence it
+/// rests on — amount, currency, both dates, what each source printed — and the
+/// owner confirms. Legs nothing paired with are published too: a leg dropped
+/// from the answer is a leg read as external flow by default.
+#[utoipa::path(
+    get,
+    path = "/v1/transfer-pairings",
+    responses(
+        (status = 200, description = "Candidate pairs and the legs nothing matched", body = CrossSourceMatchingDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_transfer_pairings(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<CrossSourceMatchingDto>, ApiFailure> {
+    let proposals = iaam_app::scenarios::transfer_pairing::propose_journal_pairings(
+        &state.services,
+        &principal,
+    )
+    .await?;
+    Ok(Json(CrossSourceMatchingDto::from_domain(&proposals)))
+}
+
+/// Relate two recorded legs, on the owner's word.
+///
+/// Two correction facts, and no new kind of state: the outgoing leg is superseded
+/// by one transfer carrying a leg on each account, and the incoming leg is
+/// retracted because that transfer already states it. A relation kept outside the
+/// journal would be a second notion of what is effective.
+///
+/// Refused unless the two are a pair this build proposes. Without that check the
+/// route would relate any outflow to any inflow — the fabrication the proposal
+/// exists to prevent, with the owner's name on it.
+#[utoipa::path(
+    post,
+    path = "/v1/transfer-pairings",
+    request_body = ConfirmTransferPairingRequest,
+    responses(
+        (status = 200, description = "The pairing, recorded as corrections", body = ConfirmedPairingDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "These two events are not a proposed pair", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "The retraction was not acknowledged", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn confirm_transfer_pairing(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiJson(request): ApiJson<ConfirmTransferPairingRequest>,
+) -> Result<Json<ConfirmedPairingDto>, ApiFailure> {
+    let confirmed = iaam_app::scenarios::transfer_pairing::confirm_journal_pairing(
+        &state.services,
+        &principal,
+        EventId(request.outgoing),
+        EventId(request.incoming),
+        request.acknowledge_retraction,
+    )
+    .await?;
+    Ok(Json(ConfirmedPairingDto::from_domain(&confirmed)))
 }
 
 /// Abandon the session.

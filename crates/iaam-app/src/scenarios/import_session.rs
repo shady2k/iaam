@@ -12,8 +12,11 @@
 //! session already holds, and [`abandon_session`] does not read or write the
 //! journal at all.
 
+use std::collections::BTreeSet;
+
 use iaam_core::event::kind::FeeOrigin;
 use iaam_core::ids::{AccountId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
+use iaam_core::money::CurrencyCode;
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule, Movement,
     Question, RuleMatcher, classify,
@@ -21,14 +24,17 @@ use iaam_ingest::classification::{
 use iaam_ingest::observation::{Intake, ObservedRow};
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{Rejection, SubmittedOperation, Verdict, normalize};
+use sha2::{Digest, Sha256};
 
 use crate::AppServices;
+use crate::actions::{AccountScope, account_scope};
 use crate::error::AppError;
 use crate::ports::{
-    AccountView, ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionView,
-    NewImportQuestion, Principal,
+    AccountScopeExclusionView, AccountView, ContourView, ImportObservationView, ImportQuestionView,
+    ImportSessionState, ImportSessionView, NewImportQuestion, Principal,
 };
 use crate::scenarios::ingest::submit_candidates;
+use crate::scenarios::transfer_pairing::{self, LegOrigin, Proposals, TransferLeg};
 
 /// The durable question one row raised.
 ///
@@ -499,26 +505,47 @@ pub async fn answer_question(
 /// Refused while any question is unanswered. That refusal is the session's
 /// purpose: committing with a question open means recording the guess the
 /// question exists to prevent.
+///
+/// **This function does not decide what is written.** [`plan_session`] does, and
+/// commit is that same function carried one step further, into
+/// `submit_candidates`. The split is the whole of iaam-k1xa: an assessment
+/// produced beside the import rather than by it describes a different import
+/// from the one that runs, and the two drift. There is no second pass over the
+/// rows here, and there must never be one.
+///
+/// `revision` is the stamp the plan the caller read carried. Supplied, it is
+/// checked against the plan this commit just produced and a difference refuses:
+/// the rows, the answers, the owner's accounts or their classification rules
+/// changed between the reading and the writing, so the assessment the caller
+/// approved is not what would be recorded. Omitted, the commit proceeds and the
+/// outcome carries the revision it wrote under, so a caller that committed blind
+/// is at least told what it committed.
 pub async fn commit_session(
     services: &AppServices,
     principal: &Principal,
     session: ImportSessionId,
-) -> Result<Vec<Verdict>, AppError> {
+    revision: Option<&SessionRevision>,
+) -> Result<CommitOutcome, AppError> {
     require_submit(principal)?;
-    let contents = read_session(services, principal, session).await?;
-    if contents.session.state != ImportSessionState::Open {
+    let planned = plan_session(services, principal, session).await?;
+    if planned.plan.session.state != ImportSessionState::Open {
         return Err(AppError::Invalid {
             field: "session".to_owned(),
             expected: "an open import session".to_owned(),
-            actual: contents.session.state.code().to_owned(),
+            actual: planned.plan.session.state.code().to_owned(),
         });
     }
-    if contents.has_open_questions() {
-        let open = contents
-            .questions
-            .iter()
-            .filter(|question| question.is_open())
-            .count();
+    if let Some(stated) = revision
+        && *stated != planned.plan.revision
+    {
+        return Err(AppError::Invalid {
+            field: "revision".to_owned(),
+            expected: planned.plan.revision.0.clone(),
+            actual: stated.0.clone(),
+        });
+    }
+    let open = planned.plan.interpretation.open_questions.len();
+    if open > 0 {
         return Err(AppError::Invalid {
             field: "session".to_owned(),
             expected: "every question answered before the import is committed".to_owned(),
@@ -526,36 +553,654 @@ pub async fn commit_session(
         });
     }
 
-    let source = contents.session.source.unwrap_or_else(SourceId::new_random);
-    let resolver = Resolver::load(services, principal.owner).await?;
-    let mut candidates = Vec::with_capacity(contents.observations.len());
-    for observation in &contents.observations {
-        candidates.push(
-            operation_of(observation, &resolver)
-                .and_then(|operation| {
-                    normalize(
-                        &operation,
-                        NormalizationContext {
-                            owner: principal.owner,
-                            source,
-                        },
-                    )
-                })
-                .map(|normalized| {
-                    let mut event = normalized.event;
-                    if let Some(import) = contents.session.import {
-                        event.provenance = event.provenance.with_import(import);
-                    }
-                    event
-                }),
-        );
-    }
-    let verdicts = submit_candidates(services, principal, "operation", candidates).await?;
+    let verdicts = submit_candidates(services, principal, "operation", planned.candidates).await?;
     services
         .store
         .close_import_session(principal.owner, session, ImportSessionState::Committed)
         .await?;
-    Ok(verdicts)
+    Ok(CommitOutcome {
+        revision: planned.plan.revision,
+        verdicts,
+    })
+}
+
+/// What committing wrote, and under which reading of the session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitOutcome {
+    /// The revision the commit was planned from. A caller that supplied one has
+    /// it echoed; a caller that supplied none learns what it committed.
+    pub revision: SessionRevision,
+    /// A verdict per held row, in the order the rows were fed.
+    pub verdicts: Vec<Verdict>,
+}
+
+// ---------------------------------------------------------------------------
+// The assessment (iaam-k1xa)
+// ---------------------------------------------------------------------------
+
+/// A reading of the session, stamped by the plan that produced it.
+///
+/// Opaque on purpose: it is a fingerprint of the plan, and a caller that parsed
+/// it would be depending on how the plan is rendered rather than on what it
+/// says.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionRevision(pub String);
+
+/// What an import will and will not record, and what it is still waiting on.
+///
+/// Produced by [`plan_session`], which [`commit_session`] then carries one step
+/// further. The defect this answers is an import that committed before anything
+/// said what it would record: the reporter's rows arrived with positive verdicts
+/// and part of them absent from the report he was shown, and nothing in between
+/// had ever said so.
+///
+/// The seven sections are not a summary of the rows. Each answers a question the
+/// owner had no way to ask before committing, and they are separate because the
+/// answers can disagree — a row can be interpretable and outside the contour, or
+/// resolved and a duplicate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportPlan {
+    pub session: ImportSessionView,
+    /// The stamp [`commit_session`] checks. See [`SessionRevision`].
+    pub revision: SessionRevision,
+    pub source_inventory: SourceInventory,
+    pub account_resolution: AccountResolution,
+    pub scope_assessment: ScopeAssessment,
+    pub interpretation: Interpretation,
+    pub cross_source_matching: Proposals,
+    pub commit_delta: CommitDelta,
+    pub readiness: Readiness,
+}
+
+/// The plan, and the events it would append.
+///
+/// The candidates are not published: they carry freshly minted identifiers that
+/// mean nothing until they are written, and a caller holding them would believe
+/// it knew what the journal was about to contain.
+#[derive(Debug)]
+pub struct PlannedSession {
+    pub plan: ImportPlan,
+    candidates: Vec<Result<iaam_core::event::Event, Rejection>>,
+}
+
+/// What the session's own source named.
+///
+/// Not what the source *is* — that is the declaration, and it is above — but
+/// what its rows turned out to name once read. A statement that declares one
+/// account and carries rows for another is the failure the acceptance of this
+/// import must show before it happens rather than after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceInventory {
+    pub source: Option<SourceId>,
+    pub import: Option<ImportId>,
+    /// Documents the rows name, deduplicated, in first-seen order.
+    pub documents: Vec<String>,
+    pub rows: usize,
+    /// The earliest and latest day any row states, when any row states one.
+    pub period: Option<(time::Date, time::Date)>,
+    /// Accounts the rows are on, deduplicated.
+    pub accounts: Vec<AccountId>,
+}
+
+/// What the rows' accounts resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountResolution {
+    /// Named by a row and held by the owner's directory.
+    pub resolved: Vec<AccountId>,
+    /// Named by a row and **not** in the owner's directory. Every fact built on
+    /// one of these is a fact about an account the owner has never described.
+    pub missing: Vec<AccountId>,
+    /// Counterparty strings that name more than one of the owner's accounts.
+    /// Reported rather than resolved: picking one is the guess the whole module
+    /// refuses.
+    pub conflicting: Vec<String>,
+}
+
+/// Where each account the rows name stands relative to the reporting perimeter.
+///
+/// The three dispositions are [`crate::actions::AccountScope`]'s, read through
+/// it rather than recomputed: «inside» is derived from contour composition and
+/// «outside» is a statement the owner recorded, and a second implementation of
+/// that pair would let this assessment and the queue disagree about the same
+/// account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeAssessment {
+    /// Named by the latest version of at least one contour.
+    pub in_contour: Vec<AccountId>,
+    /// The owner has ruled it outside every contour, and said why.
+    pub explicitly_outside: Vec<AccountId>,
+    /// Neither, and the state a newly created account is in. Rows on such an
+    /// account are recorded and then appear in no contour's report — which is
+    /// exactly the shape of the reporter's complaint.
+    pub awaiting_disposition: Vec<AccountId>,
+}
+
+/// What each row was read as, and what is still unread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interpretation {
+    pub resolved: Vec<PlannedFact>,
+    pub open_questions: Vec<OpenQuestion>,
+}
+
+/// One question the session is still waiting on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenQuestion {
+    pub row: u32,
+    pub question: ImportQuestionId,
+    pub prompt: String,
+}
+
+/// One fact the commit would write, described without writing it.
+///
+/// The event identifier is deliberately absent: it is minted at commit, and a
+/// plan that carried one would be naming a fact that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFact {
+    pub row: u32,
+    /// The account the row is on — not necessarily the event's own account: a
+    /// transfer that arrived is submitted from the sending side, and the row is
+    /// still the receiving statement's row.
+    pub account: AccountId,
+    /// The event kind, in the journal's own vocabulary.
+    pub records_as: &'static str,
+    /// The cash this row moves on its own account, signed as the journal will
+    /// record it. Zero where the fact moves no cash on that account.
+    pub amount_minor: i64,
+    pub currency: CurrencyCode,
+    pub date: Option<time::Date>,
+    pub idempotency_key: Option<String>,
+}
+
+/// What the journal gains, and what it does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDelta {
+    /// Facts that would be appended.
+    pub facts: Vec<PlannedFact>,
+    /// Rows whose idempotency key the owner's journal already holds. They commit
+    /// to a `duplicate` verdict and add nothing — which is correct, and is also
+    /// exactly what «every verdict was positive and half the rows are not in the
+    /// report» looked like from the outside.
+    pub duplicates: Vec<PlannedFact>,
+    /// Rows the session keeps and the journal will not receive.
+    pub retained_unrecorded: Vec<RetainedRow>,
+}
+
+/// A row that stays in the session and becomes no fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedRow {
+    pub row: u32,
+    pub reason: RetentionReason,
+}
+
+/// Why a row records nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionReason {
+    /// The row could not be read into a fact at all.
+    Unreadable {
+        field: String,
+        expected: String,
+        actual: String,
+    },
+    /// The row raised a question the owner has not answered.
+    Unanswered { question: ImportQuestionId },
+}
+
+/// Whether this import can proceed, and on whose word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Readiness {
+    /// Every row is settled and nothing is waiting on anybody.
+    Ready,
+    /// The session cannot commit at all: it is already committed or abandoned.
+    Blocked { reason: String },
+    /// It could commit, and something the owner alone can settle would change
+    /// what it writes. Unanswered questions refuse the commit; unconfirmed
+    /// transfer candidates do not — leaving them unconfirmed records the two
+    /// legs separately, which is the state the journal is in today and is not a
+    /// fabrication. It is still reported, because committing without looking is
+    /// how the two legs came to be unrelated in the first place.
+    RequiresOwnerDecision {
+        unanswered_questions: usize,
+        transfer_candidates: usize,
+    },
+}
+
+impl Readiness {
+    /// Wire code. One place, so two routes cannot spell it differently.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Blocked { .. } => "blocked",
+            Self::RequiresOwnerDecision { .. } => "requires_owner_decision",
+        }
+    }
+}
+
+/// Read the session and say what committing it would do.
+///
+/// Everything [`commit_session`] needs is decided here, and nothing is written.
+/// The whole of iaam-k1xa is that this is one function rather than two: a
+/// preview written beside the import is a second implementation of it, and it
+/// describes a different import from the one that runs.
+pub async fn plan_session(
+    services: &AppServices,
+    principal: &Principal,
+    session: ImportSessionId,
+) -> Result<PlannedSession, AppError> {
+    let contents = read_session(services, principal, session).await?;
+    let resolver = Resolver::load(services, principal.owner).await?;
+    let contours = services.store.list_contours(principal.owner).await?;
+    let exclusions = services
+        .store
+        .list_account_scope_exclusions(principal.owner)
+        .await?;
+    // The keys the journal already holds, so the plan can say which rows will
+    // commit to `duplicate` rather than to a fact. Read here rather than at
+    // commit for the reason the whole split exists: what commit will do is what
+    // the owner is entitled to read before it does it.
+    let recorded_keys: BTreeSet<String> = services
+        .store
+        .load_events_through(principal.owner, time::Date::MAX)
+        .await?
+        .into_iter()
+        .filter_map(|event| event.idempotency_key)
+        .collect();
+
+    let source = contents.session.source.unwrap_or_else(SourceId::new_random);
+    let mut candidates = Vec::with_capacity(contents.observations.len());
+    let mut read_rows = Vec::with_capacity(contents.observations.len());
+    for observation in &contents.observations {
+        let intake = parse_intake(&observation.payload).ok();
+        let candidate = operation_of(observation, &resolver)
+            .and_then(|operation| {
+                normalize(
+                    &operation,
+                    NormalizationContext {
+                        owner: principal.owner,
+                        source,
+                    },
+                )
+            })
+            .map(|normalized| {
+                let mut event = normalized.event;
+                if let Some(import) = contents.session.import {
+                    event.provenance = event.provenance.with_import(import);
+                }
+                event
+            });
+        read_rows.push(ReadRow {
+            row: observation.row,
+            intake,
+            candidate: candidate.clone(),
+        });
+        candidates.push(candidate);
+    }
+
+    let source_inventory = inventory(&contents, &read_rows);
+    let account_resolution = account_resolution(&resolver, &read_rows);
+    let scope_assessment = scope_assessment(&source_inventory.accounts, &contours, &exclusions);
+    let open_questions: Vec<OpenQuestion> = contents
+        .questions
+        .iter()
+        .filter(|question| question.is_open())
+        .map(|question| OpenQuestion {
+            row: question.row,
+            question: question.id,
+            prompt: question.prompt.clone(),
+        })
+        .collect();
+
+    let mut facts = Vec::new();
+    let mut duplicates = Vec::new();
+    let mut retained = Vec::new();
+    for read in &read_rows {
+        match &read.candidate {
+            Ok(event) => {
+                let fact = planned_fact(read, event);
+                if fact
+                    .idempotency_key
+                    .as_deref()
+                    .is_some_and(|key| recorded_keys.contains(key))
+                {
+                    duplicates.push(fact);
+                } else {
+                    facts.push(fact);
+                }
+            }
+            Err(rejection) => retained.push(RetainedRow {
+                row: read.row,
+                reason: open_questions
+                    .iter()
+                    .find(|open| open.row == read.row)
+                    .map_or_else(
+                        || RetentionReason::Unreadable {
+                            field: rejection.field.clone(),
+                            expected: rejection.expected.clone(),
+                            actual: rejection.actual.clone(),
+                        },
+                        |open| RetentionReason::Unanswered {
+                            question: open.question,
+                        },
+                    ),
+            }),
+        }
+    }
+
+    let resolved: Vec<PlannedFact> = facts.iter().chain(duplicates.iter()).cloned().collect();
+    // The same matching pass the journal-level proposal runs, over the rows this
+    // session is about to write. One function, so an owner shown a candidate
+    // here is shown the same candidate after the commit.
+    let legs: Vec<TransferLeg> = read_rows
+        .iter()
+        .filter_map(|read| {
+            let event = read.candidate.as_ref().ok()?;
+            let mut leg = transfer_pairing::leg_of_event(event)?;
+            leg.origin = LegOrigin::Observed {
+                session,
+                row: read.row,
+            };
+            Some(leg)
+        })
+        .collect();
+    let cross_source_matching = transfer_pairing::propose(&legs);
+
+    let readiness = if contents.session.state == ImportSessionState::Open {
+        if open_questions.is_empty() && cross_source_matching.candidates.is_empty() {
+            Readiness::Ready
+        } else {
+            Readiness::RequiresOwnerDecision {
+                unanswered_questions: open_questions.len(),
+                transfer_candidates: cross_source_matching.candidates.len(),
+            }
+        }
+    } else {
+        Readiness::Blocked {
+            reason: format!(
+                "the session is {}, and a session leaves «open» once",
+                contents.session.state.code()
+            ),
+        }
+    };
+
+    let commit_delta = CommitDelta {
+        facts,
+        duplicates,
+        retained_unrecorded: retained,
+    };
+    let interpretation = Interpretation {
+        resolved,
+        open_questions,
+    };
+    let revision = fingerprint(
+        &contents.session,
+        &source_inventory,
+        &account_resolution,
+        &scope_assessment,
+        &interpretation,
+        &cross_source_matching,
+        &commit_delta,
+        &readiness,
+    );
+
+    Ok(PlannedSession {
+        plan: ImportPlan {
+            session: contents.session,
+            revision,
+            source_inventory,
+            account_resolution,
+            scope_assessment,
+            interpretation,
+            cross_source_matching,
+            commit_delta,
+            readiness,
+        },
+        candidates,
+    })
+}
+
+/// One row, read once and used by every section.
+struct ReadRow {
+    row: u32,
+    /// `None` when the stored payload cannot be parsed by this build.
+    intake: Option<Intake>,
+    candidate: Result<iaam_core::event::Event, Rejection>,
+}
+
+impl ReadRow {
+    /// The account the row is on, as the caller stated it.
+    fn account(&self) -> Option<AccountId> {
+        match self.intake.as_ref()? {
+            Intake::Observed { row } => Some(row.account),
+            Intake::Concluded { operation } => Some(operation.account),
+        }
+    }
+
+    /// The document the row names, when it names one.
+    fn document(&self) -> Option<&str> {
+        match self.intake.as_ref()? {
+            Intake::Observed { row } => row.identity.document.as_deref(),
+            Intake::Concluded { .. } => None,
+        }
+    }
+}
+
+fn inventory(contents: &SessionContents, rows: &[ReadRow]) -> SourceInventory {
+    let mut documents: Vec<String> = Vec::new();
+    let mut accounts: Vec<AccountId> = Vec::new();
+    let mut period: Option<(time::Date, time::Date)> = None;
+    for read in rows {
+        if let Some(document) = read.document()
+            && !documents.iter().any(|seen| seen == document)
+        {
+            documents.push(document.to_owned());
+        }
+        if let Some(account) = read.account()
+            && !accounts.contains(&account)
+        {
+            accounts.push(account);
+        }
+        if let Ok(event) = &read.candidate {
+            let day = event.order.date();
+            period = Some(match period {
+                None => (day, day),
+                Some((from, to)) => (from.min(day), to.max(day)),
+            });
+        }
+    }
+    SourceInventory {
+        source: contents.session.source,
+        import: contents.session.import,
+        documents,
+        rows: contents.observations.len(),
+        period,
+        accounts,
+    }
+}
+
+fn account_resolution(resolver: &Resolver, rows: &[ReadRow]) -> AccountResolution {
+    let mut resolved: Vec<AccountId> = Vec::new();
+    let mut missing: Vec<AccountId> = Vec::new();
+    let mut conflicting: Vec<String> = Vec::new();
+    for read in rows {
+        if let Some(account) = read.account() {
+            let known = resolver.accounts.iter().any(|held| held.id == account);
+            let bucket = if known { &mut resolved } else { &mut missing };
+            if !bucket.contains(&account) {
+                bucket.push(account);
+            }
+        }
+        if let Some(Intake::Observed { row }) = read.intake.as_ref()
+            && let Some(name) = row.counterparty_name()
+            && resolver.counterparty_matches(name) > 1
+            && !conflicting.iter().any(|seen| seen == name)
+        {
+            conflicting.push(name.to_owned());
+        }
+    }
+    AccountResolution {
+        resolved,
+        missing,
+        conflicting,
+    }
+}
+
+fn scope_assessment(
+    accounts: &[AccountId],
+    contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
+) -> ScopeAssessment {
+    let mut assessment = ScopeAssessment {
+        in_contour: Vec::new(),
+        explicitly_outside: Vec::new(),
+        awaiting_disposition: Vec::new(),
+    };
+    for account in accounts {
+        match account_scope(*account, contours, exclusions) {
+            AccountScope::Inside => assessment.in_contour.push(*account),
+            AccountScope::Outside => assessment.explicitly_outside.push(*account),
+            AccountScope::Undecided => assessment.awaiting_disposition.push(*account),
+        }
+    }
+    assessment
+}
+
+fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact {
+    let account = read.account().unwrap_or(event.account);
+    // `cash_effect_on` rather than a fold here: summing money is arithmetic and
+    // belongs to the core, which the architecture guard enforces (§3.1, §13).
+    // A mixture of currencies on one account is an error there, where the old
+    // fold turned it into `None` and then into a zero labelled RUB.
+    let effect = event.cash_effect_on(account).ok().flatten();
+    PlannedFact {
+        row: read.row,
+        account,
+        records_as: event.kind.discriminant(),
+        amount_minor: effect.map_or(0, |money| money.amount().raw()),
+        currency: effect.map_or(CurrencyCode::Rub, |money| money.currency()),
+        date: event.dates.cash_posted.map(|posted| posted.0),
+        idempotency_key: event.idempotency_key.clone(),
+    }
+}
+
+/// The stamp a plan carries, and commit refuses when it no longer matches.
+///
+/// A digest of everything the plan says, and of nothing else. That is what makes
+/// the refusal meaningful in both directions: **anything** that would change what
+/// commit writes — a row added, an answer given, an account created, a
+/// classification rule written or retired, a fact appended that now holds one of
+/// these rows' idempotency keys, the session itself closing — changes some
+/// section of the plan and therefore the stamp; and a change that alters nothing
+/// the plan says does not refuse a commit for no reason.
+///
+/// It is a hash rather than a counter for the same reason: a counter says the
+/// session was touched, and a plan is stale when what it describes changed, not
+/// when somebody looked at it.
+#[allow(clippy::too_many_arguments)]
+fn fingerprint(
+    session: &ImportSessionView,
+    inventory: &SourceInventory,
+    accounts: &AccountResolution,
+    scope: &ScopeAssessment,
+    interpretation: &Interpretation,
+    matching: &Proposals,
+    delta: &CommitDelta,
+    readiness: &Readiness,
+) -> SessionRevision {
+    use std::fmt::Write as _;
+
+    let mut rendered = String::new();
+    let _ = writeln!(
+        rendered,
+        "session {} {}",
+        session.id.inner(),
+        session.state.code()
+    );
+    let _ = writeln!(
+        rendered,
+        "inventory {:?} {:?} {:?} {} {:?} {:?}",
+        inventory.source.map(|id| id.inner()),
+        inventory.import.map(|id| id.inner()),
+        inventory.documents,
+        inventory.rows,
+        inventory.period,
+        inventory
+            .accounts
+            .iter()
+            .map(|id| id.inner())
+            .collect::<Vec<_>>()
+    );
+    let _ = writeln!(
+        rendered,
+        "accounts {:?} {:?} {:?}",
+        accounts
+            .resolved
+            .iter()
+            .map(|id| id.inner())
+            .collect::<Vec<_>>(),
+        accounts
+            .missing
+            .iter()
+            .map(|id| id.inner())
+            .collect::<Vec<_>>(),
+        accounts.conflicting
+    );
+    let _ = writeln!(
+        rendered,
+        "scope {:?} {:?} {:?}",
+        scope
+            .in_contour
+            .iter()
+            .map(|id| id.inner())
+            .collect::<Vec<_>>(),
+        scope
+            .explicitly_outside
+            .iter()
+            .map(|id| id.inner())
+            .collect::<Vec<_>>(),
+        scope
+            .awaiting_disposition
+            .iter()
+            .map(|id| id.inner())
+            .collect::<Vec<_>>()
+    );
+    for fact in &interpretation.resolved {
+        let _ = writeln!(rendered, "resolved {fact:?}");
+    }
+    for open in &interpretation.open_questions {
+        let _ = writeln!(
+            rendered,
+            "open {} {} {}",
+            open.row,
+            open.question.inner(),
+            open.prompt
+        );
+    }
+    for candidate in &matching.candidates {
+        let _ = writeln!(
+            rendered,
+            "candidate {:?} {:?} {:?}",
+            candidate.outgoing.origin, candidate.incoming.origin, candidate.evidence
+        );
+    }
+    for leg in &matching.unmatched {
+        let _ = writeln!(rendered, "unmatched {:?}", leg.origin);
+    }
+    for fact in &delta.facts {
+        let _ = writeln!(rendered, "fact {fact:?}");
+    }
+    for fact in &delta.duplicates {
+        let _ = writeln!(rendered, "duplicate {fact:?}");
+    }
+    for retained in &delta.retained_unrecorded {
+        let _ = writeln!(rendered, "retained {retained:?}");
+    }
+    let _ = writeln!(rendered, "readiness {readiness:?}");
+
+    let digest = Sha256::digest(rendered.as_bytes());
+    SessionRevision(digest.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    }))
 }
 
 /// Abandon the session.
@@ -633,6 +1278,25 @@ impl Resolver {
             .filter(|account| account.title.trim().to_lowercase() == wanted);
         let first = matched.next()?;
         matched.next().is_none().then_some(first.id)
+    }
+
+    /// How many of the owner's accounts a printed counterparty could be.
+    ///
+    /// [`Self::resolve_counterparty`] answers `None` both for a name that
+    /// matches nothing and for one that matches two accounts, and the two are
+    /// not the same thing to report: the first is a stranger and the second is
+    /// an ambiguity the owner can clear up by renaming an account.
+    fn counterparty_matches(&self, name: &str) -> usize {
+        if uuid::Uuid::parse_str(name)
+            .is_ok_and(|id| self.accounts.iter().any(|account| account.id.inner() == id))
+        {
+            return 1;
+        }
+        let wanted = name.trim().to_lowercase();
+        self.accounts
+            .iter()
+            .filter(|account| account.title.trim().to_lowercase() == wanted)
+            .count()
     }
 
     fn title(&self, account: AccountId) -> String {

@@ -232,6 +232,30 @@ impl Event {
         Money::sum(&amounts, currency)
     }
 
+    /// The cash this event moves on one account, or `None` when it moves none.
+    ///
+    /// Here rather than in the shell, where the fold used to live: summing money
+    /// is arithmetic, and every number a response carries has to come from the
+    /// core (§3.1, §13). A shell that adds two `Money` values itself is a second
+    /// place where currency mixing and overflow are decided, and the second
+    /// place is the one that gets it wrong.
+    ///
+    /// The currency is the one the account's own cash legs carry. Legs in a
+    /// different currency are not summed into it and are not silently dropped:
+    /// a mixture is an error, not a total, and `Money::sum` says so.
+    pub fn cash_effect_on(&self, account: AccountId) -> Result<Option<Money>, MoneyError> {
+        let amounts: Vec<Money> = self
+            .legs
+            .iter()
+            .filter(|leg| leg.account == account)
+            .filter_map(Leg::cash_effect)
+            .collect();
+        let Some(currency) = amounts.first().map(Money::currency) else {
+            return Ok(None);
+        };
+        Money::sum(&amounts, currency).map(Some)
+    }
+
     fn legs_of_kind(&self, kind: LegKind) -> Vec<&Leg> {
         self.legs.iter().filter(|l| l.kind == kind).collect()
     }

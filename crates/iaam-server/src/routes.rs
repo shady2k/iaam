@@ -3018,7 +3018,7 @@ pub async fn flow_report(
         .iter()
         .map(|action| action_dto(action, &catalog))
         .collect();
-    let dto = MoneyFlowReportDto::from_domain(&outcome.report, &outcome.population, actions)
+    let dto = MoneyFlowReportDto::from_domain(&outcome, actions)
         .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
 }

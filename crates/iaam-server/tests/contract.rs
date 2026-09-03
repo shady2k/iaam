@@ -7780,10 +7780,12 @@ async fn flow_report_actions_name_only_accounts_in_the_contour() {
         "{body}"
     );
     let mut figures = body.clone();
-    figures
-        .as_object_mut()
-        .expect("report object")
-        .remove("population");
+    let object = figures.as_object_mut().expect("report object");
+    object.remove("population");
+    // And the register, for the same reason: it is the population's summary,
+    // so it names exactly the accounts the population names and nothing else.
+    // The prohibition is on an outside account reaching the **figures**.
+    object.remove("confidence");
     assert!(
         !figures.to_string().contains(&outside),
         "an account outside the contour must not ride along: {body}"
@@ -10098,6 +10100,286 @@ async fn the_openapi_document_declares_the_population_a_report_covered() {
     assert!(balances["population"].is_object(), "{balances}");
     let flow = &spec["components"]["schemas"]["MoneyFlowReportDto"]["properties"];
     assert!(flow["population"].is_object(), "{flow}");
+}
+
+/// Follows a caveat's `see` path through the response it was published in.
+///
+/// `[]` stands for every element of an array: the path resolves when at least
+/// one element carries the rest of it. A caveat's whole contract is that the
+/// reader can check it at the field it names instead of believing the summary,
+/// so a pointer leading nowhere is a caveat nobody can check.
+fn see_resolves(report: &Value, path: &str) -> bool {
+    fn walk(value: &Value, segments: &[&str]) -> bool {
+        let Some((head, rest)) = segments.split_first() else {
+            return !value.is_null();
+        };
+        if let Some(name) = head.strip_suffix("[]") {
+            return value
+                .get(name)
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| walk(item, rest)));
+        }
+        value.get(head).is_some_and(|next| walk(next, rest))
+    }
+    walk(report, &path.split('.').collect::<Vec<_>>())
+}
+
+/// Every report opens by saying what would have to be true for its figures to
+/// be complete, and which of those things are not.
+///
+/// The failure this pins is not a missing fact. `population.completeness`,
+/// `accounts[].cash[].opening` and the rest were each published and each
+/// correct; `population` was simply the **last** top-level field of the
+/// balances answer, after `accounts` and `negative_cash`, and a run that read
+/// `covered=3, outside=15` took the rows for a complete statement of what the
+/// owner held. A caveat published after the figures has already lost to the
+/// reader who stopped at the figures.
+///
+/// So the assertions here are about position and about pointing: the register
+/// is the first key on the wire, and every caveat in it names a field of the
+/// same response that states the fact in full. It is never a second source of
+/// truth — that is why nothing here asserts an amount.
+#[tokio::test]
+async fn every_report_opens_with_what_its_figures_do_not_account_for() {
+    let harness = harness();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Reported", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"]
+        .as_str()
+        .expect("scope")
+        .to_owned();
+
+    // A second account in no scope at all: nobody has ruled on whether its
+    // money belongs in these figures.
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Second Bank" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("identifier").to_owned();
+
+    let reports = [
+        (
+            format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            "asset_snapshot",
+        ),
+        (
+            format!("/v1/reports/flow?contour={contour_id}&from=2026-01-01&to=2026-01-31"),
+            "money_flow",
+        ),
+        (
+            format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-01-31"),
+            "returns",
+        ),
+    ];
+
+    for (path, goal) in reports {
+        let (status, _headers, bytes) =
+            call_raw(&harness.router, get(&path, Some(&harness.owner_token))).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let body = String::from_utf8(bytes).expect("utf-8 response");
+
+        // On the wire, not merely present. `serde_json::Value` sorts keys, so
+        // the ordering this test exists for can only be checked on the bytes.
+        assert!(
+            body.starts_with("{\"confidence\":"),
+            "{path}: the register must be the first thing read: {body}"
+        );
+
+        let report: Value = serde_json::from_str(&body).expect("json response");
+        let confidence = &report["confidence"];
+        assert_eq!(confidence["goal"], goal, "{path}: {confidence}");
+        assert_eq!(
+            confidence["complete"], false,
+            "{path}: an account nobody has ruled on is outside these figures: {confidence}"
+        );
+
+        let caveats = confidence["caveats"].as_array().expect("caveats");
+        assert!(!caveats.is_empty(), "{path}: {confidence}");
+        // No score anywhere: what is published is a list of checkable things.
+        for key in ["score", "confidence_score", "percentage", "grade", "level"] {
+            assert!(
+                confidence.get(key).is_none(),
+                "{path}: the register must not grade the answer: {confidence}"
+            );
+        }
+
+        // Every caveat points at a field of this same response, and the field
+        // is there.
+        for caveat in caveats {
+            let see = caveat["see"].as_str().expect("a field to check");
+            assert!(
+                see_resolves(&report, see),
+                "{path}: caveat {caveat} points at {see}, which this response does not carry"
+            );
+            assert!(
+                !caveat["detail"].as_str().expect("a sentence").is_empty(),
+                "{path}: {caveat}"
+            );
+        }
+
+        let outside = caveats
+            .iter()
+            .find(|caveat| caveat["kind"] == "account_in_no_scope")
+            .unwrap_or_else(|| panic!("{path}: no caveat about the account in no scope: {report}"));
+        assert_eq!(
+            outside["subject"],
+            json!({ "type": "account", "id": savings }),
+            "{path}: {outside}"
+        );
+        assert_eq!(outside["see"], "population.outside[]", "{path}: {outside}");
+    }
+}
+
+/// A cash figure accumulated from a start nothing asserts is named in the
+/// register, by account and currency.
+///
+/// `cash.amount` under `opening: unasserted` is a running sum from an unknown
+/// start and is not a balance. The DTO said so precisely and the endpoint is
+/// still called balances and the field is still called amount; the register
+/// says it before either is read, and points back at the `opening` that carries
+/// the same fact.
+#[tokio::test]
+async fn a_running_cash_sum_is_named_by_account_and_currency() {
+    let harness = harness();
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Only account", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": "3000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-05" },
+                    "idempotency_key": "confidence-deposit"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+
+    // The population is whole here, so the register can only be speaking about
+    // the figure itself.
+    assert_eq!(report["population"]["completeness"], "whole", "{report}");
+    assert_eq!(report["accounts"][0]["cash"][0]["opening"], "unasserted");
+    let confidence = &report["confidence"];
+    assert_eq!(
+        confidence["complete"], false,
+        "a running sum is not a balance: {report}"
+    );
+    let caveat = confidence["caveats"]
+        .as_array()
+        .expect("caveats")
+        .iter()
+        .find(|caveat| caveat["kind"] == "running_cash_sum")
+        .unwrap_or_else(|| panic!("no caveat about the running sum: {report}"));
+    assert_eq!(
+        caveat["subject"],
+        json!({
+            "type": "account_currency",
+            "account": harness.account.inner().to_string(),
+            "currency": "RUB",
+        }),
+        "{caveat}"
+    );
+    assert_eq!(caveat["see"], "accounts[].cash[].opening", "{caveat}");
+    // The register summarises; it does not restate the amount, because a second
+    // copy of a figure is a second chance to state it wrongly.
+    assert!(
+        !caveat["detail"]
+            .as_str()
+            .expect("a sentence")
+            .contains("3000"),
+        "{caveat}"
+    );
+}
+
+/// The register's vocabulary is published, and the block is declared on every
+/// report that carries it.
+#[tokio::test]
+async fn the_openapi_document_declares_the_register_a_report_opens_with() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for schema in ["ConfidenceDto", "CaveatDto", "CaveatSubjectDto"] {
+        assert!(
+            spec["components"]["schemas"][schema].is_object(),
+            "schema {schema} must be in OpenAPI"
+        );
+    }
+    let confidence = &spec["components"]["schemas"]["ConfidenceDto"]["properties"];
+    assert!(confidence["goal"].is_object(), "{confidence}");
+    assert!(confidence["complete"].is_object(), "{confidence}");
+    assert!(confidence["caveats"].is_object(), "{confidence}");
+
+    let caveat = &spec["components"]["schemas"]["CaveatDto"]["properties"];
+    for field in ["kind", "subject", "detail", "see"] {
+        assert!(caveat[field].is_object(), "{field}: {caveat}");
+    }
+
+    // `ReturnsAnswerDto` flattens the report into itself, which utoipa renders
+    // as a composition rather than one property map, so the search follows
+    // `allOf` too.
+    fn declares_confidence(schema: &Value) -> bool {
+        schema["properties"]["confidence"].is_object()
+            || schema["allOf"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(declares_confidence))
+    }
+
+    for report in [
+        "BalancesReportDto",
+        "MoneyFlowReportDto",
+        "ReturnsAnswerDto",
+    ] {
+        let schema = &spec["components"]["schemas"][report];
+        assert!(
+            declares_confidence(schema),
+            "{report} must declare the register: {schema}"
+        );
+    }
 }
 
 /// Creating a contour and versioning one are two acts, and the create route

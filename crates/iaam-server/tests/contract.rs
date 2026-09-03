@@ -7683,7 +7683,11 @@ async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
     );
     assert_eq!(
         item["subject"],
-        json!({ "type": "account", "id": harness.account.inner() }),
+        json!({
+            "type": "account",
+            "id": harness.account.inner(),
+            "title": "Brokerage",
+        }),
         "{item}"
     );
     assert_eq!(item["category"], "required_for_goal", "{item}");
@@ -9800,7 +9804,11 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
     let item = named[0];
     assert_eq!(
         item["subject"],
-        json!({ "type": "account", "id": orphan }),
+        json!({
+            "type": "account",
+            "id": orphan,
+            "title": "Second Bank Current",
+        }),
         "the account is named in a typed field, not only in prose: {item}"
     );
     assert_eq!(item["category"], "required_for_goal", "{item}");
@@ -9865,6 +9873,175 @@ fn published_option<'a>(item: &'a Value, operation_id: &str) -> Option<&'a Value
         .as_array()?
         .iter()
         .find(|option| option["operationId"] == operation_id)
+}
+
+/// Every queue item about an account says what the owner calls it.
+///
+/// The queue is the surface the naming rule (`docs/api/conventions.md` §3) was
+/// written for. A client that opened an instance after an import got one
+/// `record_owner_balance` item per account, each naming a UUID and nothing
+/// else, and could not tell which bank any of them was about without a second
+/// request to `GET /v1/accounts` and a join it was left to perform. Asked which
+/// account, the owner cannot answer from a bare identifier, and neither can the
+/// agent asking on his behalf.
+///
+/// `institution` travels with the title for the case the title alone cannot
+/// settle: two accounts he calls `Savings` at two banks are one word apart in a
+/// list and are not the same question.
+#[tokio::test]
+async fn every_queue_item_about_an_account_names_the_account() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("account id").to_owned();
+
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    let items = actions.as_array().expect("action items");
+    assert!(!items.is_empty(), "{actions}");
+
+    let about_accounts: Vec<&Value> = items
+        .iter()
+        .filter(|item| item["subject"]["type"] == "account")
+        .collect();
+    assert!(
+        !about_accounts.is_empty(),
+        "a fresh instance with two accounts raises items about them: {actions}"
+    );
+    for item in &about_accounts {
+        let title = item["subject"]["title"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an account subject carries the owner's title: {item}"));
+        assert!(!title.is_empty(), "{item}");
+        // One reading of the store, not two: the sentence and the field are
+        // filled from the same account at the moment the item is built, so a
+        // client that renders either sees the same name.
+        assert!(
+            item["reason"].as_str().expect("reason").contains(title),
+            "the name beside the identifier and the name in the sentence differ: {item}"
+        );
+    }
+
+    let about_savings: Vec<&&Value> = about_accounts
+        .iter()
+        .filter(|item| item["subject"]["id"] == savings)
+        .collect();
+    assert!(!about_savings.is_empty(), "{actions}");
+    for item in about_savings {
+        assert_eq!(item["subject"]["title"], "Savings", "{item}");
+        assert_eq!(item["subject"]["institution"], "Northline", "{item}");
+    }
+
+    // The account the harness created carries no institution, and the key is
+    // absent rather than null: he has not said, which is not «it has none».
+    for item in &about_accounts {
+        if item["subject"]["id"] == json!(harness.account.inner()) {
+            assert_eq!(item["subject"]["title"], "Brokerage", "{item}");
+            assert!(
+                item["subject"].get("institution").is_none(),
+                "an institution the owner never gave is absent, not null: {item}"
+            );
+        }
+    }
+}
+
+/// An event subject stays a bare identifier, and that is the rule, not a gap.
+///
+/// The naming rule is about things the owner named. Nothing he said names an
+/// event: its identity is the identifier, and what it was is in the item's
+/// sentence. Printing a title for one would mean inventing a name for a fact.
+#[tokio::test]
+async fn an_event_subject_carries_no_name() {
+    let harness = harness();
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    for item in actions.as_array().expect("action items") {
+        if item["subject"]["type"] == "event" {
+            let keys: std::collections::BTreeSet<&str> = item["subject"]
+                .as_object()
+                .expect("subject object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                std::collections::BTreeSet::from(["type", "id"]),
+                "{item}"
+            );
+        }
+    }
+}
+
+/// The disposition answer names the account it is about.
+///
+/// `GET /v1/accounts/{id}/scope` exists to be read back to the owner — «is this
+/// one inside your perimeter, and if not, why» — and it answers about exactly
+/// one account, so nothing else in the response says which. A client that has
+/// just been handed the identifier by the queue can render the answer without a
+/// second call, and one that resolved the account from a report cannot render
+/// the wrong one.
+#[tokio::test]
+async fn an_account_scope_answer_names_the_account() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let savings = created["id"].as_str().expect("account id").to_owned();
+    let scope_path = format!("/v1/accounts/{savings}/scope");
+
+    let (status, before) = call(
+        &harness.router,
+        get(&scope_path, Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["account"], savings, "{before}");
+    assert_eq!(before["title"], "Savings", "{before}");
+    assert_eq!(before["institution"], "Northline", "{before}");
+    assert_eq!(before["disposition"], "undecided", "{before}");
+
+    // The write answers in the same shape as the read: an owner who has just
+    // ruled an account outside is told which account he ruled on.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({
+                "disposition": "outside",
+                "reason": "A counterparty's account, not the owner's money.",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["account"], savings, "{recorded}");
+    assert_eq!(recorded["title"], "Savings", "{recorded}");
+    assert_eq!(recorded["institution"], "Northline", "{recorded}");
+    assert_eq!(recorded["disposition"], "outside", "{recorded}");
 }
 
 /// The third state, reachable through the API.
@@ -9971,7 +10148,8 @@ async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
             .expect("action items")
             .iter()
             .any(|item| item["kind"] == "account_scope_undecided"
-                && item["subject"] == json!({ "type": "account", "id": outside })),
+                && item["subject"]
+                    == json!({ "type": "account", "id": outside, "title": "Shop One" })),
         "{reopened}"
     );
 }

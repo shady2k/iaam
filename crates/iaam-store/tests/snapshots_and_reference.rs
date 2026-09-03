@@ -15,7 +15,7 @@ use iaam_core::projection::lots::LotKey;
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
 use iaam_store::SqliteStore;
-use iaam_store::reference::{AccountRecord, InstrumentRecord};
+use iaam_store::reference::{AccountRecord, AccountScopeExclusionRecord, InstrumentRecord};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::macros::date;
 use uuid::Uuid;
@@ -586,4 +586,91 @@ fn every_token_scope_survives_a_round_trip_through_its_code() {
     assert_eq!(TokenScope::ReadOnly.code(), "read_only");
     assert_eq!(TokenScope::parse("administrator"), None);
     assert_eq!(TokenScope::parse(""), None);
+}
+
+#[test]
+fn a_scope_exclusion_is_one_current_statement_per_owner_and_account() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let other_owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let foreign = AccountId::new_random();
+
+    for (id, holder, title) in [(account, owner, "Shop One"), (foreign, other_owner, "Main")] {
+        store
+            .upsert_account(&AccountRecord {
+                id,
+                owner: holder,
+                title: title.into(),
+                institution: None,
+            })
+            .unwrap();
+    }
+
+    assert!(
+        store
+            .list_account_scope_exclusions(owner)
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .record_account_scope_exclusion(
+            owner,
+            &AccountScopeExclusionRecord {
+                account,
+                reason: "A counterparty's account.".into(),
+            },
+        )
+        .unwrap();
+    // A disposition is a current statement, not a history: restating it with a
+    // better reason replaces the row rather than adding a second one.
+    store
+        .record_account_scope_exclusion(
+            owner,
+            &AccountScopeExclusionRecord {
+                account,
+                reason: "Closed in the year it was opened.".into(),
+            },
+        )
+        .unwrap();
+
+    let listed = store.list_account_scope_exclusions(owner).unwrap();
+    assert_eq!(
+        listed,
+        vec![AccountScopeExclusionRecord {
+            account,
+            reason: "Closed in the year it was opened.".into(),
+        }]
+    );
+    // Another owner's statement is not visible, and the foreign key refuses a
+    // statement about an account this owner does not hold.
+    assert!(
+        store
+            .list_account_scope_exclusions(other_owner)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .record_account_scope_exclusion(
+                owner,
+                &AccountScopeExclusionRecord {
+                    account: foreign,
+                    reason: "Not mine to rule on.".into(),
+                },
+            )
+            .is_err()
+    );
+
+    store.clear_account_scope_exclusion(owner, account).unwrap();
+    assert!(
+        store
+            .list_account_scope_exclusions(owner)
+            .unwrap()
+            .is_empty()
+    );
+    // Clearing what is not there is not an error: the absence of a row is the
+    // state being asked for.
+    store.clear_account_scope_exclusion(owner, account).unwrap();
 }

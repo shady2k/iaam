@@ -70,6 +70,10 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
     let protected = OpenApiRouter::new()
         .routes(routes!(routes::list_actions))
         .routes(routes!(routes::list_accounts, routes::create_account))
+        .routes(routes!(
+            routes::get_account_scope,
+            routes::record_account_scope
+        ))
         .routes(routes!(routes::list_instruments, routes::create_instrument))
         .routes(routes!(routes::get_instrument))
         .routes(routes!(routes::resolve_instrument))

@@ -7393,7 +7393,17 @@ async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
         .collect();
     assert_eq!(
         keys,
-        std::collections::BTreeSet::from(["id", "kind", "category", "state", "reason", "target"]),
+        // `subject` joined the envelope with the coverage goal: a blocked
+        // diagnostic still names the account it is about, in a typed field
+        // rather than only in its sentence.
+        std::collections::BTreeSet::from([
+            "id", "kind", "category", "state", "reason", "subject", "target",
+        ]),
+        "{item}"
+    );
+    assert_eq!(
+        item["subject"],
+        json!({ "type": "account", "id": harness.account.inner() }),
         "{item}"
     );
     assert_eq!(item["category"], "required_for_goal", "{item}");
@@ -9424,5 +9434,310 @@ async fn a_classification_rule_that_matches_nothing_returns_an_empty_plan() {
             .expect("an empty plan is still a plan")
             .is_empty(),
         "{created}"
+    );
+}
+
+/// Two contours exist and one account belongs to neither.
+///
+/// The queue was silent about this for the whole life of an instance after its
+/// first contour: `create_first_contour` fires once, and nothing afterwards said
+/// anything about membership. An account created later — a second bank —
+/// imported every row correctly and was absent from every report.
+#[tokio::test]
+async fn an_account_in_no_contour_is_named_by_the_queue() {
+    let harness = harness();
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let second = second["id"].as_str().expect("account id").to_owned();
+
+    let (status, orphan) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Second Bank Current" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{orphan}");
+    let orphan = orphan["id"].as_str().expect("account id").to_owned();
+
+    for (title, member) in [
+        ("Household", harness.account.inner().to_string()),
+        ("Reserve", second),
+    ] {
+        let (status, created) = call(
+            &harness.router,
+            post(
+                "/v1/contours",
+                &harness.owner_token,
+                &json!({ "title": title, "accounts": [member] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+    }
+
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+
+    let named: Vec<&Value> = actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .filter(|item| item["kind"] == "account_scope_undecided")
+        .collect();
+    assert_eq!(named.len(), 1, "{actions}");
+    let item = named[0];
+    assert_eq!(
+        item["subject"],
+        json!({ "type": "account", "id": orphan }),
+        "the account is named in a typed field, not only in prose: {item}"
+    );
+    assert_eq!(item["category"], "required_for_goal", "{item}");
+    assert_eq!(item["state"], "needs_owner_input", "{item}");
+    assert_eq!(item["required_scope"], "owner", "{item}");
+    assert_eq!(
+        item["target"]["operationId"], "create_contour_version",
+        "the item must offer membership of an existing contour: {item}"
+    );
+    assert_eq!(item["target"]["method"], "POST", "{item}");
+    assert_eq!(item["target"]["path"], "/v1/contours", "{item}");
+    let candidates = item["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing inputs")
+        .iter()
+        .find(|missing| missing["pointer"] == "/accounts")
+        .expect("account selection input");
+    assert!(
+        candidates["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .any(|candidate| candidate["id"] == orphan),
+        "{item}"
+    );
+}
+
+/// The third state, reachable through the API.
+///
+/// An account can be outside the perimeter on purpose — a counterparty's, a
+/// closed one — and the queue must stop asking once the owner has said so. If
+/// the only way to silence the item were to put the account inside a contour,
+/// the fix would have replaced a silent omission with a permanent nag.
+#[tokio::test]
+async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
+    let harness = harness();
+    let (status, outside) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Shop One" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{outside}");
+    let outside = outside["id"].as_str().expect("account id").to_owned();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Household",
+                "accounts": [harness.account.inner()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let scope_path = format!("/v1/accounts/{outside}/scope");
+    let (status, before) = call(
+        &harness.router,
+        get(&scope_path, Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["disposition"], "undecided", "{before}");
+
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({
+                "disposition": "outside",
+                "reason": "A counterparty's account, not the owner's money.",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["disposition"], "outside", "{recorded}");
+    assert_eq!(
+        recorded["reason"], "A counterparty's account, not the owner's money.",
+        "{recorded}"
+    );
+
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    assert!(
+        actions["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .all(|item| item["kind"] != "account_scope_undecided"),
+        "a decided account raises nothing: {actions}"
+    );
+
+    // Withdrawing the decision reopens the goal rather than leaving the account
+    // silently settled for ever.
+    let (status, cleared) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({ "disposition": "undecided" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["disposition"], "undecided", "{cleared}");
+
+    let (status, reopened) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reopened}");
+    assert!(
+        reopened["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .any(|item| item["kind"] == "account_scope_undecided"
+                && item["subject"] == json!({ "type": "account", "id": outside })),
+        "{reopened}"
+    );
+}
+
+/// The disposition route refuses what it cannot honour, and says why.
+#[tokio::test]
+async fn a_scope_decision_needs_a_reason_and_cannot_claim_membership() {
+    let harness = harness();
+    let scope_path = format!("/v1/accounts/{}/scope", harness.account.inner());
+
+    let (status, inside) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({ "disposition": "inside" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{inside}");
+    assert_eq!(inside["field"], "disposition", "{inside}");
+
+    let (status, unreasoned) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({ "disposition": "outside" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{unreasoned}");
+    assert_eq!(unreasoned["field"], "reason", "{unreasoned}");
+
+    let (status, blank) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.owner_token,
+            &json!({ "disposition": "outside", "reason": "   " }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{blank}");
+
+    // The perimeter is the owner's judgement in either direction.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &scope_path,
+            &harness.agent_token,
+            &json!({ "disposition": "outside", "reason": "Closed years ago." }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+
+    // A missing account and someone else's are the same answer.
+    let (status, unknown) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts/{}/scope", Uuid::new_v4()),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+}
+
+/// An item the agent cannot call says so in its state, not only in its target.
+///
+/// The queue's states are the agent's map of what it may do. `needs_owner_input`
+/// elsewhere accompanies a real operation with a list of fields to collect;
+/// carrying it on an item with no operation at all made «collect these and call
+/// this» indistinguishable from «there is nothing here for you to call».
+#[tokio::test]
+async fn no_queue_item_promises_a_call_it_does_not_have() {
+    let harness = harness();
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+
+    let items = actions["items"].as_array().expect("action items");
+    assert!(
+        !items.is_empty(),
+        "the fixture must produce a queue to sweep"
+    );
+    for item in items {
+        if item["target"]["type"] == "none" {
+            assert_eq!(item["state"], "blocked", "{item}");
+            assert!(item["required_scope"].is_null(), "{item}");
+        } else {
+            assert_ne!(item["state"], "blocked", "{item}");
+        }
+    }
+    assert!(
+        items
+            .iter()
+            .any(|item| item["kind"] == "start_account_import" && item["state"] == "blocked"),
+        "{actions}"
     );
 }

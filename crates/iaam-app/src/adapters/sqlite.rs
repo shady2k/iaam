@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::AppError;
 use crate::ports::{
-    AccountActivityView, AccountView, AliasUpsert, AliasView, BrokerAccessView, BrokerChannel,
-    BrokerChannelFactory, BrokerEnvironment, BrokerVault, CategoryGroupView, CategoryRuleUpsert,
-    CategoryRuleView, CategoryStore, CategoryView, ClassificationRuleStore, ClassificationRuleView,
-    ContourView, ControlAssertionView, CustodyView, InstrumentDirectory, InstrumentUpsert,
-    InstrumentView, IssuedToken, JournalQuery, Principal, Recorded, Scope, SoleOwner, Store,
-    TokenAdmin, TokenView,
+    AccountActivityView, AccountScopeExclusionView, AccountView, AliasUpsert, AliasView,
+    BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
+    CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
+    ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
+    CustodyView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery,
+    Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -41,7 +41,9 @@ use iaam_store::events::{
     AccountActivityRecord, Appended, ControlAssertionRecord, JournalCursor as StoredJournalCursor,
     JournalQuery as StoredJournalQuery,
 };
-use iaam_store::reference::{AccountRecord, AliasRecord, ContourRecord, InstrumentRecord};
+use iaam_store::reference::{
+    AccountRecord, AccountScopeExclusionRecord, AliasRecord, ContourRecord, InstrumentRecord,
+};
 use iaam_store::tokens::{TokenRecord, TokenScope};
 use time::Date;
 use uuid::Uuid;
@@ -322,13 +324,25 @@ impl Store for SqliteAdapter {
     async fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourView>, AppError> {
         self.blocking(move |store| {
             let contours = store.list_contours(owner).map_err(store_error)?;
-            Ok(contours
-                .into_iter()
-                .map(|record: ContourRecord| ContourView {
+            let mut views = Vec::with_capacity(contours.len());
+            for record in contours {
+                let record: ContourRecord = record;
+                // `load_contour` returns `None` for a version with no members
+                // and for a version that does not exist; the identity came from
+                // the listing, so here only the first reading is possible and an
+                // empty composition is the honest answer.
+                let accounts = store
+                    .load_contour(owner, record.id, record.version)
+                    .map_err(store_error)?
+                    .map(|definition| definition.accounts().collect())
+                    .unwrap_or_default();
+                views.push(ContourView {
                     id: record.id,
                     version: record.version,
-                })
-                .collect())
+                    accounts,
+                });
+            }
+            Ok(views)
         })
         .await
     }
@@ -385,6 +399,59 @@ impl Store for SqliteAdapter {
                     dimension: record.dimension,
                 })
                 .collect())
+        })
+        .await
+    }
+
+    async fn list_account_scope_exclusions(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<AccountScopeExclusionView>, AppError> {
+        self.blocking(move |store| {
+            let exclusions = store
+                .list_account_scope_exclusions(owner)
+                .map_err(store_error)?;
+            Ok(exclusions
+                .into_iter()
+                .map(
+                    |record: AccountScopeExclusionRecord| AccountScopeExclusionView {
+                        account: record.account,
+                        reason: record.reason,
+                    },
+                )
+                .collect())
+        })
+        .await
+    }
+
+    async fn record_account_scope_exclusion(
+        &self,
+        owner: OwnerId,
+        exclusion: AccountScopeExclusionView,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .record_account_scope_exclusion(
+                    owner,
+                    &AccountScopeExclusionRecord {
+                        account: exclusion.account,
+                        reason: exclusion.reason,
+                    },
+                )
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn clear_account_scope_exclusion(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .clear_account_scope_exclusion(owner, account)
+                .map_err(store_error)
         })
         .await
     }

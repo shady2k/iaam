@@ -13,10 +13,13 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use axum::{Extension, Json};
 use iaam_app::AppServices;
-use iaam_app::actions::{Action, ActionCategory, ActionState, ActionTarget, ProvidedBy};
+use iaam_app::actions::{
+    AccountScope, Action, ActionCategory, ActionState, ActionSubject, ActionTarget, ProvidedBy,
+    account_scope,
+};
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
-use iaam_app::ports::{AccountView, Principal, Scope};
+use iaam_app::ports::{AccountScopeExclusionView, AccountView, Principal, Scope};
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
     list_category_rules, list_groups, preview_category_rule, retire_category,
@@ -60,10 +63,7 @@ use uuid::Uuid;
 use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::dto::{
-    AccountCandidateDto, AccountDto, ActionDto, ActionTargetDto, ActionsResponseDto,
-    BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    AccountCandidateDto, AccountDto, AccountScopeDispositionDto, AccountScopeDto, ActionDto, ActionSubjectDto, ActionTargetDto, ActionsResponseDto, BalancesReportDto, BrokerAccessDto, BrokerSyncRequest, CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
     ClassificationRuleRequest, ContourVersionDto, CorrectImportRequest, CreateAccountRequest,
     CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
     CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredSourceDto, DocumentDto, DocumentParams,
@@ -71,10 +71,7 @@ use crate::dto::{
     JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
     MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
     MoneyFlowReportDto, OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto,
-    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
-    RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto,
-    SubmitCorrectionsRequest, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto,
-    TokenDto, TokenScopeDto, VerdictDto,
+    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest, RequestPlanDto, ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsReportDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiPath, ApiQuery};
@@ -82,6 +79,7 @@ use iaam_app::scenarios::documents::UploadedDocument;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
+pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 
@@ -160,6 +158,12 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
         .to_owned(),
         reason: action.reason().to_owned(),
         required_scope: action.required_scope().map(|scope| scope.code().to_owned()),
+        subject: action.subject().map(|subject| match subject {
+            ActionSubject::Account(account) => ActionSubjectDto::Account {
+                id: account.inner(),
+            },
+            ActionSubject::Event(event) => ActionSubjectDto::Event { id: event.inner() },
+        }),
         target,
     }
 }
@@ -1423,6 +1427,192 @@ pub async fn create_account(
             institution: account.institution,
         }),
     ))
+}
+
+/// An account's scope disposition.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{id}/scope",
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    responses(
+        (status = 200, description = "The account's disposition", body = AccountScopeDto),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_account_scope(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<AccountScopeDto>, ApiFailure> {
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+    Ok(Json(account_scope_dto(&state, &principal, account).await?))
+}
+
+/// Record the owner's decision about an account's place in the perimeter.
+///
+/// The route that makes the third state resolvable. Without it the queue could
+/// name an account belonging to no contour and the owner had exactly one way to
+/// silence it — put the account inside a contour — which is the answer he may
+/// not have.
+#[utoipa::path(
+    post,
+    path = "/v1/accounts/{id}/scope",
+    operation_id = RECORD_ACCOUNT_SCOPE_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = RecordAccountScopeRequest,
+    responses(
+        (status = 200, description = "Disposition recorded", body = AccountScopeDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_scope(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<RecordAccountScopeRequest>,
+) -> Result<Json<AccountScopeDto>, ApiFailure> {
+    // Drawing the perimeter is the owner's judgement, in either direction: the
+    // same rule that keeps contour composition out of the agent's hands.
+    require_admin(&principal)?;
+    let account = AccountId(id);
+    owned_account(&state, &principal, account).await?;
+
+    match request.disposition {
+        AccountScopeDispositionDto::Inside => {
+            return Err(unprocessable(
+                "disposition",
+                "outside or undecided",
+                "inside",
+                "membership is a contour's composition and is recorded by creating                  a contour version, not by a flag on the account",
+            ));
+        }
+        AccountScopeDispositionDto::Outside => {
+            let reason = request
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .ok_or_else(|| {
+                    unprocessable(
+                        "reason",
+                        "a non-empty reason",
+                        "nothing",
+                        "an account ruled outside the perimeter without a reason is                          indistinguishable, a year later, from one that was overlooked",
+                    )
+                })?;
+            state
+                .services
+                .store
+                .record_account_scope_exclusion(
+                    principal.owner,
+                    AccountScopeExclusionView {
+                        account,
+                        reason: reason.to_owned(),
+                    },
+                )
+                .await?;
+        }
+        AccountScopeDispositionDto::Undecided => {
+            if request.reason.is_some() {
+                return Err(unprocessable(
+                    "reason",
+                    "no reason",
+                    "a reason",
+                    "withdrawing a decision leaves nothing for a reason to explain",
+                ));
+            }
+            state
+                .services
+                .store
+                .clear_account_scope_exclusion(principal.owner, account)
+                .await?;
+        }
+    }
+
+    Ok(Json(account_scope_dto(&state, &principal, account).await?))
+}
+
+/// Refuse an account identifier the owner does not hold.
+///
+/// A missing account and someone else's return the same `404` for the reason
+/// token revocation does: a different answer would tell an outsider that such a
+/// record exists (§14).
+async fn owned_account(
+    state: &ServerState,
+    principal: &Principal,
+    account: AccountId,
+) -> Result<(), ApiFailure> {
+    let accounts = state.services.store.list_accounts(principal.owner).await?;
+    if accounts.iter().any(|held| held.id == account) {
+        Ok(())
+    } else {
+        Err(ApiFailure::new(
+            StatusCode::NOT_FOUND,
+            ApiError::simple(
+                "not_found",
+                format!("not found: account {}", account.inner()),
+            ),
+        ))
+    }
+}
+
+/// Read the disposition back from the two places that hold one.
+async fn account_scope_dto(
+    state: &ServerState,
+    principal: &Principal,
+    account: AccountId,
+) -> Result<AccountScopeDto, ApiFailure> {
+    let contours = state.services.store.list_contours(principal.owner).await?;
+    let exclusions = state
+        .services
+        .store
+        .list_account_scope_exclusions(principal.owner)
+        .await?;
+    let naming: Vec<Uuid> = contours
+        .iter()
+        .filter(|contour| contour.accounts.contains(&account))
+        .map(|contour| contour.id.0)
+        .collect();
+    let (disposition, reason) = match account_scope(account, &contours, &exclusions) {
+        AccountScope::Inside => (AccountScopeDispositionDto::Inside, None),
+        AccountScope::Outside => (
+            AccountScopeDispositionDto::Outside,
+            exclusions
+                .iter()
+                .find(|exclusion| exclusion.account == account)
+                .map(|exclusion| exclusion.reason.clone()),
+        ),
+        AccountScope::Undecided => (AccountScopeDispositionDto::Undecided, None),
+    };
+    Ok(AccountScopeDto {
+        account: account.inner(),
+        disposition,
+        reason,
+        contours: naming,
+    })
+}
+
+fn unprocessable(field: &str, expected: &str, actual: &str, message: &str) -> ApiFailure {
+    ApiFailure::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ApiError {
+            code: "invalid_request".into(),
+            message: message.to_owned(),
+            field: Some(field.to_owned()),
+            expected: Some(expected.to_owned()),
+            actual: Some(actual.to_owned()),
+            correlation_id: None,
+        },
+    )
 }
 
 /// List of broker access entries.

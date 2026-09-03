@@ -5346,7 +5346,13 @@ mod tests {
         assert_eq!(offered, admitted);
     }
 
-    /// A yes-or-no question offers two shapes, and not the directionless six.
+    /// A question about one direction offers the answers that run that way, and
+    /// not the directionless seven.
+    ///
+    /// Three now rather than two, and `refund` is the third: money arriving that
+    /// nobody sent, money the capital earned and money a counterparty returned
+    /// are three facts the reports keep apart, and until the third had a word
+    /// the queue published a choice that could not express it (`iaam-7l7v`).
     #[test]
     fn a_different_question_publishes_different_shapes() {
         let main = named("Main");
@@ -5371,7 +5377,7 @@ mod tests {
             .iter()
             .map(|alternative| alternative.value.as_str())
             .collect();
-        assert_eq!(offered, vec!["income", "received"]);
+        assert_eq!(offered, vec!["income", "received", "refund"]);
     }
 
     /// Only the two shapes that name an account ask for one, and never this one.

@@ -131,38 +131,50 @@ worked example in the repository, the tool, does not use it.
 ## 6. Where the line should be, and the two things that must move first
 
 **A converter translates a format. The API reaches conclusions.** That is the
-line, and it is not the line today.
+line.
 
-It cannot simply be moved, because the conclusive channel is strictly more
-expressive than the observation channel, by exactly two outcomes:
+It could not simply be moved, because the conclusive channel used to be strictly
+more expressive than the observation channel. Decision 0005 closed that, and what
+it closed is worth stating precisely, because the same reasoning is what any
+future outcome has to survive:
 
-- `Classification` has four outcomes — internal transfer, external flow, fee,
-  income — and **no refund**. `OperationKindDto` has one. A row submitted as an
-  observation can therefore never come out as the thing a positive row with a
-  spending category is, and the tool's refund rule has nowhere to go.
-- An observation resolved as income always carries **no income kind**, on the
-  correct ground that the source named none. The tool names one where the bank's
-  own category says so, and that naming is lost on the observation path.
+- `Classification` had four outcomes — internal transfer, external flow, fee,
+  income — and **no refund**, while `OperationKindDto` had one. A row submitted
+  as an observation could therefore never come out as the thing a positive row
+  with a spending category is, and no question could repair it afterwards,
+  because none was ever asked about a return. It now has five, `Answer` and every
+  question that leaves an arrival open publish `refund`, and the money-flow
+  projection subtracts the resulting fact from what went out rather than adding
+  it to what came in.
+- An observation resolved as income always carried **no income kind**, on the
+  correct ground that the source named none. The ground is still correct about
+  the source and was never correct about the owner: `Classification::Income` and
+  `Answer::Income` now carry the kind, so he can name one, and the naming travels
+  into the rule his answer becomes rather than stopping at the row he looked at.
 
-The consequence is an incentive pointing the wrong way. An agent that obeys the
-rule it is given — do not conclude what you were not told — produces a *poorer*
-journal than a converter that concludes well, and the poorer journal is the one
-that cannot be repaired by answering a question, because no question is asked
-about a refund. That is why the external agent reached for `build()`, and it is
-the defect rather than the agent's mistake.
+The consequence was an incentive pointing the wrong way. An agent that obeyed the
+rule it is given — do not conclude what you were not told — produced a *poorer*
+journal than a converter that concluded well. That is why the external agent
+reached for `build()`, and it was the defect rather than the agent's mistake.
 
-Until both are settled, the honest arrangement is the current one stated out
-loud rather than implied: **the owner's converter concludes, because it is the
-only place that can.** What must not continue is documentation that reads as
-though an agent with a CSV could do the same work, and a tool that keeps its own
-copy of a directory the server now holds.
+**One gap of the same shape is still open, and it is named rather than hidden:
+tax.** `Classification` has no outcome for it, on the deliberate ground that
+`classification_of` puts a recorded tax outside rule recalculation altogether, so
+an observed tax payment still resolves as a withdrawal. A converter that says
+`tax` is still saying something the observation channel cannot.
+
+So the arrangement is no longer "the owner's converter concludes, because it is
+the only place that can". It concludes because it is the place that *has* the
+statement, and for the cash outcomes it is no longer the only place that could.
+What must not continue is a tool that keeps its own copy of a directory the
+server now holds.
 
 ## 7. What this does not settle
 
-- Whether `refund` and an income kind enter the classification vocabulary. A
-  rule outcome that carries a direction must answer `implied_movement`, and a
-  refund's direction is not the same question as a fee's; that is its own
-  decision and probably its own record here.
+- Whether a tax outcome enters the classification vocabulary. Decision 0005
+  settled `refund` and the income kind and deliberately left this one standing:
+  `classification_of` answers `None` for a recorded tax, so admitting `Tax` here
+  would overturn that in passing rather than by decision.
 - Whether `--account-map` and `--counterparty-map` are retired against the
   identity decision 0004 gave an account, or kept as the owner's private
   shorthand. Retiring them moves the owner's judgement into rules he can read

@@ -190,7 +190,13 @@ pub struct Event {
 /// Version 11 adds the variant [`EventKind::Refund`]: money a counterparty
 /// returns reverses spending, and reading it as an arrival reports income
 /// nobody earned.
-pub const SCHEMA_VERSION: u32 = 11;
+/// Version 12 adds the optional declaring principal inside [`Provenance`]. It
+/// defaults to absent, so facts already in the journal stay readable — and the
+/// absence is load-bearing rather than incidental: a retraction that may only
+/// take back what its own caller declared must refuse a fact that names no
+/// declarer, so the number is what tells a reader that «no principal» means
+/// «written before anyone was recorded» rather than «written by nobody».
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.
@@ -3143,7 +3149,14 @@ mod tests {
         //        readable — no existing variant changed shape — and the number
         //        tells software that does not know the variant that it cannot
         //        interpret every fact it may now meet.
-        assert_eq!(SCHEMA_VERSION, 11);
+        // 11 → 12: added the optional declaring principal in `Provenance`
+        //        (iaam-rond). Older facts stay readable because the field
+        //        defaults to absent — and here that absence is not merely
+        //        tolerated, it is the answer: an agent may retract only an
+        //        import it declared, so a fact naming no declarer must refuse
+        //        rather than be claimed. The number is what tells a reader that
+        //        «no principal» means «written before anyone was recorded».
+        assert_eq!(SCHEMA_VERSION, 12);
     }
 
     #[test]

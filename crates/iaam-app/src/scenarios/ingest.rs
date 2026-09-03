@@ -2,7 +2,7 @@
 
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::{Event, SCHEMA_VERSION};
-use iaam_core::ids::{ImportId, SourceId};
+use iaam_core::ids::{ImportId, PrincipalId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{
@@ -143,6 +143,20 @@ pub async fn submit_journal_events(
 /// `field` is the field name used to identify the rejection to the client: for operations it is
 /// `operation`, while journal facts have their own. A rejection naming an unrelated
 /// field sends the client to fix something they did not submit (§10.4).
+///
+/// The declaring principal is stamped here, in the same place and for the same
+/// reason as the permission check: this is the one function every caller-driven
+/// input passes through, so an input that forgets to stamp cannot write
+/// anything. Stamping at each input instead would leave the field absent
+/// wherever somebody forgot, and absent is indistinguishable from «recorded
+/// before the field existed» — the one thing a retraction keyed on it must
+/// never confuse (`iaam-rond`).
+///
+/// It is stamped on **every** submission and not only on those that name an
+/// import, because the field answers who presented a fact and that question is
+/// no less real for a batch that declared no label. Narrowing it to the case
+/// the retraction rule needs would make the journal's answer depend on what one
+/// rule happens to ask.
 pub async fn submit_candidates(
     services: &AppServices,
     principal: &Principal,
@@ -156,19 +170,21 @@ pub async fn submit_candidates(
             actual: principal.scope.code().to_owned(),
         });
     }
+    let declared_by = PrincipalId(principal.token_id);
 
     let mut verdicts = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         // The sequence number within a day is assigned by the store in the same
         // transaction as the insert: calling «get next» separately is
         // a race that gives two events the same number (§4.8).
-        let event = match candidate {
+        let mut event = match candidate {
             Ok(event) => event,
             Err(rejection) => {
                 verdicts.push(Verdict::Rejected { rejection });
                 continue;
             }
         };
+        event.provenance = event.provenance.with_declared_by(declared_by);
         verdicts.push(record_candidate(services, event, field).await?);
     }
     Ok(verdicts)

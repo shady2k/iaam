@@ -632,6 +632,15 @@ pub async fn submit_corrections(
 /// retracts instead every row of that account and channel which named no
 /// import — the rows recorded before an import could be named, and the only
 /// way to reach them.
+///
+/// **Who may call it (`iaam-rond`).** The owner, for any import. An agent, for
+/// an import it declared itself and has not yet built anything on — the exact
+/// bound, and the reasoning for it, are on
+/// `iaam_app::scenarios::correction::correct_import`. The route no longer
+/// refuses the agent outright: committing an import is open to it and rewrites
+/// every downstream report, so refusing it the retraction closed only the safer
+/// of the two directions and left an agent that discovers its own mistake by
+/// control total with nothing to do but wake the owner.
 #[utoipa::path(
     post,
     path = "/v1/corrections/imports",
@@ -640,13 +649,18 @@ pub async fn submit_corrections(
                    account and channel, under other labels, keep counting. A \
                    request without a label retracts every row of that account \
                    and channel that named no import. One reversal fact per \
-                   retracted event; nothing is deleted and nothing is mutated.",
+                   retracted event; nothing is deleted and nothing is mutated. \
+                   The owner may retract any import. An agent may retract only \
+                   one it declared itself, under the label it submitted under, \
+                   and only while every row of it is still effective and no \
+                   control assertion covers them; anything else is refused and \
+                   the refusal says which of those it was.",
     request_body = CorrectImportRequest,
     responses(
         (status = 200, description = "What the correction retracted", body = ImportCorrectionDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 409, description = "A correction key is held by an unrelated event", body = ApiError),
-        (status = 422, description = "Invalid source, or the acknowledgement is missing", body = ApiError),
+        (status = 422, description = "Invalid source, the acknowledgement is missing, or this import is not the caller's to retract", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError)
     ),
@@ -657,7 +671,12 @@ pub async fn correct_import(
     Extension(principal): Extension<Principal>,
     ApiBytes(body): ApiBytes,
 ) -> Result<Json<ImportCorrectionDto>, ApiFailure> {
-    require_admin(&principal)?;
+    // Only the floor is checked here. What an agent may retract depends on what
+    // the journal says it declared, and the transport has no journal: the
+    // scenario decides it against the same read the reversal is computed from.
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
     let request: CorrectImportRequest = serde_json::from_slice(&body).map_err(|error| {
         invalid_field("body", "import correction JSON object", error.to_string())
     })?;

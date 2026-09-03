@@ -406,7 +406,7 @@ content-type: application/linkset+json
 {"linkset":[{"anchor":"/v1","related":[{"href":"/v1/actions",…},{"href":"/v1/contours",…},{"goal":"asset_snapshot","href":"/v1/reports/assets",…},{"goal":"money_flow","href":"/v1/reports/flow",…},{"goal":"returns","href":"/v1/reports/returns",…},{"goal":"reconciliation","href":"/v1/reconciliation",…}],"service-desc":[{"href":"/v1/openapi.json",…}],"status":[{"href":"/v1/health",…}]}]}
 
 $ curl -sS http://127.0.0.1:8080/v1/health
-{"status":"ok","schema_version":11,"projection_version":8}
+{"status":"ok","schema_version":12,"projection_version":8}
 
 $ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/actions
 {"policy_version":1,"items":[{"id":"create_first_account","kind":"create_first_account","category":"blocking","state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered.","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}]}

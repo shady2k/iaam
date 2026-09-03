@@ -5,12 +5,14 @@
 //! The schema does not change; only the price source changes.
 
 pub mod candidate;
+pub mod selection;
 
 pub use candidate::{
     LegacyValuationOutcome, PriceCandidate, PriceFreshness, PriceKind, PriceOrigin,
     PriceProvenance, PriceQuery, PriceSelection, QuotationBasis, SelectedPrice,
     SourceExecutability, Uncovered, UncoveredReason, Venue, candidate_from_legacy_valuation,
 };
+pub use selection::{PriceDecision, PriceInputs, decide_price};
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

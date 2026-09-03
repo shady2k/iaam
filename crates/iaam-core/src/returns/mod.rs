@@ -45,13 +45,12 @@ use crate::rules::quotation::{QuotationError, QuotationRule, QuotationRuleVersio
 use crate::rules::{
     AccruedInterestError, AccruedInterestRule, AccruedInterestRuleVersion, AccruedInterestV1,
     CashflowInput, CashflowPlan, CashflowProjectionVersion, PostingKind, PostingMatchV2,
-    PostingMatchVersion, SourcePriorityVersion, ValuationPolicyV1, ValuationRule, Verdict,
-    historical_schedule_postings,
+    PostingMatchVersion, SourcePriorityVersion, Verdict, historical_schedule_postings,
 };
 use crate::valuation::{
-    FxSource, FxTable, LegacyValuationOutcome, PriceCandidate, PriceQuality, PriceQuery,
+    FxSource, FxTable, PriceCandidate, PriceDecision, PriceInputs, PriceQuality, PriceQuery,
     QuotationBasis, SelectedPrice, SourceExecutability, UncoveredReason as PolicyUncoveredReason,
-    ValuationError, Venue, candidate_from_legacy_valuation,
+    ValuationError, Venue, decide_price,
 };
 
 /// A value the system may refuse to compute.
@@ -1941,80 +1940,39 @@ fn position_assessments(
     state: &LedgerState,
     request: &ReturnsRequest<'_>,
 ) -> Vec<PositionAssessment> {
-    let defaults = ValuationPolicyV1::default();
-    let policy = ValuationPolicyV1 {
-        carry_forward_limit: defaults.carry_forward_limit,
-        price_max_age: defaults.price_max_age,
-        source_priority_version: SourcePriorityVersion(request.coordinate.source_priority_version),
+    let inputs = PriceInputs {
+        board: state.prices(),
+        market: request.market_prices,
+        source_priority: SourcePriorityVersion(request.coordinate.source_priority_version),
     };
-    let source = SourceId(uuid::Uuid::nil());
     state
         .balances()
         .iter_positions()
         .filter(|(key, quantity)| request.contour.contains(key.account) && !quantity.0.is_zero())
         .map(|(key, quantity)| {
-            let observations: Vec<_> = state
-                .prices()
-                .observations_at_or_before(key.instrument, request.as_of)
-                .copied()
-                .collect();
-            let raw_price = observations.first().copied();
-            let mut candidates = Vec::new();
-            let mut legacy_quality = None;
-            for price in &observations {
-                let candidate = PriceCandidate {
-                    instrument: price.instrument,
-                    price: price.price,
-                    currency: price.currency,
-                    // §10.3: owner price — money per unit
-                    // by definition, not guesswork. Entering a percentage
-                    // of face value via `EventKind::Valuation` is prohibited.
-                    basis: crate::valuation::QuotationBasis::MoneyPerUnit,
-                    basis_evidence: "journal:valuation".to_owned(),
-                    basis_evidence_contradicts: false,
-                    trade_date: price.as_of,
-                    observed_at: None,
-                    origin: crate::valuation::PriceOrigin::ReportParsed { source },
-                    executability: SourceExecutability::Unknown,
-                };
-                match candidate_from_legacy_valuation(price.quality, candidate) {
-                    LegacyValuationOutcome::Candidate(candidate) => candidates.push(candidate),
-                    LegacyValuationOutcome::LegacyDerived(quality) => {
-                        legacy_quality.get_or_insert(quality);
-                    }
-                }
-            }
-            candidates.extend(
-                request
-                    .market_prices
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.instrument == key.instrument
-                            && candidate.trade_date <= request.as_of
-                    })
-                    .cloned(),
+            // The one selection, shared with the asset snapshot. Assembling the
+            // candidates here again would give the two reports two answers to
+            // «what price values this instrument», and nothing would say which
+            // of them the owner should believe.
+            let decision = decide_price(
+                inputs,
+                &PriceQuery {
+                    instrument: key.instrument,
+                    as_of: request.as_of,
+                    knowledge_as_of: request.coordinate.knowledge_as_of,
+                },
             );
-            let kind = if candidates.is_empty() {
-                match legacy_quality {
-                    Some(quality) => PositionAssessmentKind::LegacyDerived(quality),
-                    None => PositionAssessmentKind::Uncovered(UncoveredReason::NoObservation),
+            let raw_price = state
+                .prices()
+                .price_at_or_before(key.instrument, request.as_of)
+                .copied();
+            let kind = match decision {
+                PriceDecision::Selected(selected) => PositionAssessmentKind::Selected(selected),
+                PriceDecision::LegacyDerived { quality, .. } => {
+                    PositionAssessmentKind::LegacyDerived(quality)
                 }
-            } else {
-                let result = policy.select(
-                    &PriceQuery {
-                        instrument: key.instrument,
-                        as_of: request.as_of,
-                        knowledge_as_of: request.coordinate.knowledge_as_of,
-                    },
-                    &candidates,
-                );
-                match result.selected() {
-                    Some(selected) => PositionAssessmentKind::Selected(Box::new(selected.clone())),
-                    None => PositionAssessmentKind::Uncovered(policy_uncovered_reason(
-                        result
-                            .uncovered_reason()
-                            .unwrap_or(PolicyUncoveredReason::NoObservation),
-                    )),
+                PriceDecision::Uncovered(reason) => {
+                    PositionAssessmentKind::Uncovered(policy_uncovered_reason(reason))
                 }
             };
             PositionAssessment {

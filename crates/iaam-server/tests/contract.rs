@@ -1528,6 +1528,166 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     let _ = std::fs::remove_file(path);
 }
 
+/// One share, one synced closing price, and the evidence that proves its unit.
+///
+/// Separate from [`seed_market`], whose rows carry a placeholder for the basis
+/// evidence and are therefore quoted in a unit nothing establishes — correct
+/// for the tests that use them, and unusable for a test about a figure.
+async fn seed_share_quote(harness: &Harness) {
+    let mut store = harness.market_store.lock().await;
+    let lease_expires_at = OffsetDateTime::now_utc() + TimeDuration::days(1);
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: harness.instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: "SHR".into(),
+            title: "Share One".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("market instrument");
+
+    let series = SeriesKey {
+        source_id: "moex-iss".into(),
+        dataset: "prices".into(),
+        series_key: format!("{}:TQBR:1", harness.instrument.inner()),
+    };
+    let run = store
+        .begin_run(
+            series,
+            date!(2026 - 08 - 03),
+            date!(2026 - 08 - 03),
+            lease_expires_at,
+        )
+        .expect("price run");
+    store
+        .record_prices(
+            &run,
+            &"d".repeat(64),
+            &[PriceRow {
+                instrument_id: harness.instrument.inner().to_string(),
+                board: "TQBR".into(),
+                session: 1,
+                trade_date: "2026-08-03".into(),
+                kind: "close".into(),
+                observed_at: "2026-08-04T00:00:00Z".into(),
+                price: "101.00".into(),
+                currency: "RUB".into(),
+                quotation_basis: "money_per_unit".into(),
+                // The request path the row came from: what proves the unit is
+                // money per share rather than a percentage of face value.
+                basis_evidence: "iss:engines/stock/markets/shares".into(),
+                executability: "executable".into(),
+            }],
+        )
+        .expect("price rows");
+    store
+        .finish_run(
+            &run,
+            RunOutcome::Succeeded,
+            Some(Coverage {
+                from: date!(2026 - 08 - 03),
+                to: date!(2026 - 08 - 03),
+            }),
+        )
+        .expect("price publication");
+}
+
+/// One instrument, one date, two routes — and one observation behind both.
+///
+/// The core proves that the two reports share a selection; this proves that the
+/// application actually wires the asset snapshot to it. `/v1/reports/assets`
+/// once valued holdings from the journal's board alone, so an owner who had
+/// synced market data and entered no valuation of his own read a securities
+/// half made of caveats while `/v1/reports/returns`, over the same holding on
+/// the same day, published a figure.
+#[tokio::test]
+async fn the_two_report_routes_publish_one_price_for_one_instrument() {
+    let harness = harness();
+    seed_share_quote(&harness).await;
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Brokerage", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    // A position and no `valuation` operation: the journal knows what he holds
+    // and nothing about what it is worth.
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "opening_position",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "10",
+                    "cost_basis": "900.00",
+                    "currency": "RUB",
+                    "dates": { "trade": "2026-08-01" },
+                    "idempotency_key": "agreement-position"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-08-03"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+
+    let (status, returns) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour_id}&currency=RUB&as_of=2026-08-03"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{returns}");
+
+    let snapshot_price = &snapshot["positions"]["holdings"][0]["price"];
+    let returns_price = &returns["data_quality"]["position_coverage"]["selected"][0]["price"];
+    assert_eq!(snapshot_price["kind"], "selected", "{snapshot}");
+    assert_eq!(
+        snapshot_price["price"], returns_price["price"],
+        "one figure, or the two routes disagree: {snapshot}"
+    );
+    assert_eq!(snapshot_price["trade_date"], returns_price["trade_date"]);
+    assert_eq!(snapshot_price["currency"], returns_price["currency"]);
+    assert_eq!(
+        snapshot_price["provenance"], returns_price["provenance"],
+        "the same source, chosen by the same policy: {snapshot}"
+    );
+    assert_eq!(snapshot_price["provenance"]["origin"]["kind"], "market");
+
+    // And the figure the snapshot published is that price applied to what he
+    // holds, so the agreement above is about the number he reads.
+    assert_eq!(
+        snapshot["positions"]["holdings"][0]["value"]["value"], "1010.00",
+        "{snapshot}"
+    );
+    assert_eq!(snapshot["confidence"]["complete"], true, "{snapshot}");
+}
+
 #[tokio::test]
 async fn returns_report_loads_official_fx_from_market_store() {
     let harness = harness();
@@ -13385,7 +13545,10 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
         harness.instrument.inner().to_string(),
         "{body}"
     );
-    assert_eq!(holding["price"]["as_of"], "2026-01-29", "{body}");
+    // The decision, not a bare figure: the same shape, from the same selection,
+    // that the returns report publishes for this instrument on this date.
+    assert_eq!(holding["price"]["kind"], "selected", "{body}");
+    assert_eq!(holding["price"]["trade_date"], "2026-01-29", "{body}");
     assert_eq!(holding["value"]["value"], "300", "{body}");
     // The whole, after the halves.
     assert_eq!(snapshot["total"][0]["value"], "800.00", "{body}");
@@ -13455,7 +13618,11 @@ async fn an_unvalued_holding_is_absent_from_the_snapshot_total_and_is_a_caveat()
     let holding = &snapshot["positions"]["holdings"][0];
     assert_eq!(holding["quantity"], "10", "{snapshot}");
     assert!(holding["value"].is_null(), "absent, never zero: {snapshot}");
-    assert!(holding["price"].is_null(), "{snapshot}");
+    // «I do not know», with the reason. Null said only that the report could
+    // not value the holding; it never said whether nothing had been observed or
+    // whether what had been observed was too old to use.
+    assert_eq!(holding["price"]["kind"], "uncovered", "{snapshot}");
+    assert_eq!(holding["price"]["reason"], "no_observation", "{snapshot}");
     assert_eq!(
         snapshot["positions"]["totals"],
         json!([]),

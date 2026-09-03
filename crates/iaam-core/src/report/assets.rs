@@ -34,7 +34,7 @@
 //! say which was wrong. The selection needs no report currency and no rate, so
 //! taking it costs this report none of its exactness.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use time::Date;
@@ -53,7 +53,7 @@ use crate::valuation::{
     decide_price,
 };
 
-use super::balances::{AccountCash, BalancesReport, CashOpening};
+use super::balances::{AccountCash, BalancesReport, CashFigure, CashOpening};
 use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence, ReportGoal};
 use super::population::ReportPopulation;
 
@@ -83,10 +83,12 @@ pub struct AssetAccount {
     pub account: AccountId,
     pub cash_class: Option<String>,
     /// The account's cash, each figure carrying what is known about the state
-    /// it accumulated from. A figure over an unasserted opening is a running
-    /// sum and not a balance, and it is summed into the class total all the
-    /// same — withholding it would make the total silently smaller, which is
-    /// worse. The register says so instead.
+    /// it accumulated from. A figure over an unasserted opening is movement
+    /// from an unknown start and not a balance, and it is folded into the class
+    /// total all the same — withholding it would make the total silently
+    /// smaller, which is worse. It is folded into the movement part of that
+    /// total, never into the balance part, so nothing is hidden and nothing is
+    /// added to a figure it is not the same kind of thing as.
     pub cash: Vec<AccountCash>,
     pub positions: Vec<(PositionKey, Quantity)>,
 }
@@ -99,11 +101,22 @@ pub struct CashClassTotal {
     /// The accounts folded into this figure, so a total can be traced to the
     /// rows beneath it without re-deriving the grouping.
     pub accounts: Vec<AccountId>,
-    /// One figure per currency, ascending by currency.
-    pub totals: Vec<Money>,
-    /// `Asserted` only when every figure summed here rests on an asserted
-    /// opening. One running sum makes the class total a running sum too.
-    pub opening: CashOpening,
+    /// One figure per currency, ascending by currency, each saying what kind of
+    /// figure it is.
+    ///
+    /// **Per currency, and no flag beside the list.** A class held an
+    /// `opening` of its own until this became [`CashFigure`], and that flag
+    /// collapsed two things a reader needs apart: an opening assertion is per
+    /// account *and currency*, so a class can be anchored in one currency and
+    /// not in another, and one word for the class said `unasserted` for both.
+    /// The distinction now rides on the figure it qualifies, which is the only
+    /// place it cannot be dropped on the way to the number.
+    ///
+    /// Members of a class may disagree — some of its accounts anchored in this
+    /// currency, some not — and then the figure is [`CashFigure::Mixed`] and
+    /// carries the two parts rather than their sum. See that type for why the
+    /// sum is not published.
+    pub totals: Vec<CashFigure>,
 }
 
 /// The exact half: cash, as the journal recorded it.
@@ -112,10 +125,10 @@ pub struct CashSide {
     /// One entry per class present in the population, ascending, with the
     /// unstated class first.
     pub classes: Vec<CashClassTotal>,
-    /// Every class added up, per currency.
-    pub totals: Vec<Money>,
-    /// `Asserted` only when every figure in every class is.
-    pub opening: CashOpening,
+    /// Every class added up, per currency, on the same terms as a class total:
+    /// a currency anchored on some accounts and not on others is `Mixed`, and
+    /// its two parts are stated instead of their sum.
+    pub totals: Vec<CashFigure>,
 }
 
 /// One instrument the owner holds, and what a quote said it was worth.
@@ -170,6 +183,20 @@ pub struct AssetSnapshot {
     /// Both halves added, per currency. **After** the halves, never instead of
     /// them: a reader who takes this figure alone cannot tell which part of it
     /// a market can move overnight.
+    ///
+    /// **A currency whose cash is not entirely balances has no entry here at
+    /// all.** This is the one figure in the answer that cannot say what it is —
+    /// it is a single number by definition, and the reader who stops at exactly
+    /// one number stops at this one. Where part of the cash in a currency is
+    /// movement from an unasserted start, no whole exists to state: adding a
+    /// flow to a stock produces a figure that denotes nothing, and publishing
+    /// it tagged would only move the trap here from the fields that now refuse
+    /// it. So the currency is absent, exactly as an unvalued holding is absent
+    /// from the position total rather than valued at zero — absence is a
+    /// question, and [`AssetSnapshot::confidence`] names it. Both halves above
+    /// still state everything they know, so nothing is withheld except the
+    /// addition, and a reader who decides the addition means something can
+    /// perform it.
     pub total: Vec<CalcMoney>,
     /// The rows the totals were folded from, in the balances answer's order.
     pub accounts: Vec<AssetAccount>,
@@ -286,57 +313,110 @@ pub fn asset_snapshot(
     })
 }
 
+/// One currency's cash while the fold runs: the two kinds kept apart.
+///
+/// They are never added into one accumulator, because the number that would
+/// come out is the one this report refuses to publish. Kept apart, each part
+/// stays a sum of like figures and the shape at the end says which parts there
+/// were.
+#[derive(Debug, Clone, Copy)]
+struct CashParts {
+    balance: Option<Money>,
+    movement: Option<Money>,
+}
+
+impl CashParts {
+    const EMPTY: Self = Self {
+        balance: None,
+        movement: None,
+    };
+
+    fn add(&mut self, figure: CashFigure) -> Result<(), AssetSnapshotError> {
+        if let Some(balance) = figure.balance() {
+            Self::accumulate(&mut self.balance, balance)?;
+        }
+        if let Some(movement) = figure.movement() {
+            Self::accumulate(&mut self.movement, movement)?;
+        }
+        Ok(())
+    }
+
+    fn accumulate(slot: &mut Option<Money>, money: Money) -> Result<(), AssetSnapshotError> {
+        *slot = Some(match *slot {
+            Some(sum) => sum.try_add(money)?,
+            None => money,
+        });
+        Ok(())
+    }
+
+    /// The figure these parts make. `None` only where nothing was added, which
+    /// the fold never produces: an accumulator is created by its first figure.
+    fn finish(self) -> Option<CashFigure> {
+        match (self.balance, self.movement) {
+            (Some(balance), Some(movement)) => Some(CashFigure::Mixed { balance, movement }),
+            (Some(balance), None) => Some(CashFigure::Balance(balance)),
+            (None, Some(movement)) => Some(CashFigure::Movement(movement)),
+            (None, None) => None,
+        }
+    }
+}
+
 /// One class's accumulator while the fold runs.
 struct ClassAccumulator {
     accounts: Vec<AccountId>,
-    totals: BTreeMap<CurrencyCode, Money>,
-    opening: CashOpening,
+    totals: BTreeMap<CurrencyCode, CashParts>,
 }
 
 /// The exact half, grouped by the class the owner declared.
+///
+/// The whole is accumulated from the same per-account figures as the classes,
+/// in the same pass, rather than from the class totals afterwards. Both are one
+/// fold of one set of rows, which is the property commit 54fc437 bought; and
+/// re-adding class totals would mean taking a `Mixed` class apart again to add
+/// its halves to the right places, which is the same arithmetic written twice.
 fn fold_cash(accounts: &[AssetAccount]) -> Result<CashSide, AssetSnapshotError> {
     // `None` sorts before `Some`, so the unstated group comes first: it is the
     // one the owner may still want to act on.
     let mut groups: BTreeMap<Option<String>, ClassAccumulator> = BTreeMap::new();
+    let mut whole: BTreeMap<CurrencyCode, CashParts> = BTreeMap::new();
     for row in accounts {
         let entry = groups
             .entry(row.cash_class.clone())
             .or_insert_with(|| ClassAccumulator {
                 accounts: Vec::new(),
                 totals: BTreeMap::new(),
-                opening: CashOpening::Asserted,
             });
         entry.accounts.push(row.account);
         for cash in &row.cash {
-            add_money(&mut entry.totals, cash.money)?;
-            if cash.opening == CashOpening::Unasserted {
-                entry.opening = CashOpening::Unasserted;
-            }
+            let figure = CashFigure::for_account(*cash);
+            entry
+                .totals
+                .entry(figure.currency())
+                .or_insert(CashParts::EMPTY)
+                .add(figure)?;
+            whole
+                .entry(figure.currency())
+                .or_insert(CashParts::EMPTY)
+                .add(figure)?;
         }
     }
 
-    let mut totals: BTreeMap<CurrencyCode, Money> = BTreeMap::new();
-    let mut opening = CashOpening::Asserted;
-    let mut classes = Vec::with_capacity(groups.len());
-    for (cash_class, group) in groups {
-        for money in group.totals.values() {
-            add_money(&mut totals, *money)?;
-        }
-        if group.opening == CashOpening::Unasserted {
-            opening = CashOpening::Unasserted;
-        }
-        classes.push(CashClassTotal {
+    let classes = groups
+        .into_iter()
+        .map(|(cash_class, group)| CashClassTotal {
             cash_class,
             accounts: group.accounts,
-            totals: group.totals.into_values().collect(),
-            opening: group.opening,
-        });
-    }
+            totals: group
+                .totals
+                .into_values()
+                .filter_map(CashParts::finish)
+                .collect(),
+        })
+        .collect();
 
     Ok(CashSide {
         classes,
-        totals: totals.into_values().collect(),
-        opening,
+        totals: whole.into_values().filter_map(CashParts::finish).collect(),
     })
 }
 
@@ -469,37 +549,42 @@ fn fold_positions(
     })
 }
 
-/// Both halves, per currency.
+/// Both halves, per currency, for the currencies that have a whole.
 ///
 /// Nothing is converted, so a currency present in only one half appears in the
 /// whole as that half alone — which is the truth, and is why the halves stand
 /// above this line rather than behind it.
+///
+/// A currency whose cash is not entirely balances is left out, and left out
+/// **completely**: its positions do not appear here either. The reason is not
+/// that the position half is in doubt — it is not — but that this list is a
+/// list of wholes, and a currency's whole is exactly what is unknown while part
+/// of its cash is movement from an unasserted start. A row carrying only the
+/// position half would be a smaller wrong answer to the same question, and
+/// [`PositionsSide::totals`] already states that half where it belongs.
 fn fold_total(
     cash: &CashSide,
     positions: &PositionsSide,
 ) -> Result<Vec<CalcMoney>, AssetSnapshotError> {
     let mut total: BTreeMap<CurrencyCode, CalcMoney> = BTreeMap::new();
-    for money in &cash.totals {
-        add_calc(
-            &mut total,
-            CalcMoney::new(money.to_calc_dec(), money.currency()),
-        )?;
+    let mut without_a_whole: BTreeSet<CurrencyCode> = BTreeSet::new();
+    for figure in &cash.totals {
+        match figure {
+            CashFigure::Balance(money) => add_calc(
+                &mut total,
+                CalcMoney::new(money.to_calc_dec(), money.currency()),
+            )?,
+            CashFigure::Movement(_) | CashFigure::Mixed { .. } => {
+                without_a_whole.insert(figure.currency());
+            }
+        }
     }
     for money in &positions.totals {
-        add_calc(&mut total, *money)?;
+        if !without_a_whole.contains(&money.currency()) {
+            add_calc(&mut total, *money)?;
+        }
     }
     Ok(total.into_values().collect())
-}
-
-fn add_money(
-    totals: &mut BTreeMap<CurrencyCode, Money>,
-    money: Money,
-) -> Result<(), AssetSnapshotError> {
-    let slot = totals
-        .entry(money.currency())
-        .or_insert_with(|| Money::zero(money.currency()));
-    *slot = slot.try_add(money)?;
-    Ok(())
 }
 
 fn add_calc(
@@ -566,6 +651,18 @@ mod tests {
             money,
             opening: CashOpening::Asserted,
         }
+    }
+
+    fn unasserted(money: Money) -> AccountCash {
+        AccountCash {
+            money,
+            opening: CashOpening::Unasserted,
+        }
+    }
+
+    /// The figure a total of asserted rows folds to.
+    const fn balance(money: Money) -> CashFigure {
+        CashFigure::Balance(money)
     }
 
     fn row(account: AccountId, cash: Vec<AccountCash>) -> AccountBalanceRow {
@@ -667,7 +764,7 @@ mod tests {
                     .filter(|money| money.currency() == total.currency())
                     .collect();
                 assert_eq!(
-                    Money::sum(&rows, total.currency()).expect("sum"),
+                    balance(Money::sum(&rows, total.currency()).expect("sum")),
                     *total,
                     "class {:?} in {:?}",
                     class.cash_class,
@@ -683,7 +780,10 @@ mod tests {
                 .flat_map(|row| row.cash.iter().map(|cash| cash.money))
                 .filter(|money| money.currency() == total.currency())
                 .collect();
-            assert_eq!(Money::sum(&rows, total.currency()).expect("sum"), *total);
+            assert_eq!(
+                balance(Money::sum(&rows, total.currency()).expect("sum")),
+                *total
+            );
         }
     }
 
@@ -715,7 +815,7 @@ mod tests {
         assert_eq!(groups, vec![None, Some("deposit")]);
         let not_stated = &snapshot.cash.classes[0];
         assert_eq!(not_stated.accounts, vec![unstated]);
-        assert_eq!(not_stated.totals, vec![rub(300)]);
+        assert_eq!(not_stated.totals, vec![balance(rub(300))]);
     }
 
     /// The two halves are stated apart and the whole is stated after them. The
@@ -734,7 +834,7 @@ mod tests {
         let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
             .expect("snapshot");
 
-        assert_eq!(snapshot.cash.totals, vec![rub(5_000)]);
+        assert_eq!(snapshot.cash.totals, vec![balance(rub(5_000))]);
         assert_eq!(
             total_in(&snapshot.positions.totals, CurrencyCode::Rub),
             Dec::new(2_000.into())
@@ -851,22 +951,19 @@ mod tests {
         );
     }
 
-    /// A figure accumulated from an unasserted start is a running sum, and a
-    /// class total containing one is a running sum too. It is still summed:
-    /// leaving it out would make the total quietly smaller, which is the worse
-    /// of the two failures.
+    /// A class anchored in one currency and not in another says so per
+    /// currency. The single `opening` word this replaced could not: it said
+    /// `unasserted` for the whole class, which understated the currency that
+    /// was anchored.
+    ///
+    /// The unanchored figure is still folded in. Leaving it out would make the
+    /// total quietly smaller, which is the worse of the two failures.
     #[test]
-    fn a_running_sum_inside_a_class_makes_the_class_total_a_running_sum() {
+    fn a_class_says_per_currency_which_of_its_figures_are_anchored() {
         let savings = account(10);
         let report = report(vec![row(
             savings,
-            vec![
-                asserted(rub(1_000)),
-                AccountCash {
-                    money: usd(400),
-                    opening: CashOpening::Unasserted,
-                },
-            ],
+            vec![asserted(rub(1_000)), unasserted(usd(400))],
         )]);
         let snapshot = asset_snapshot(
             AS_OF,
@@ -876,9 +973,14 @@ mod tests {
         )
         .expect("snapshot");
 
-        assert_eq!(snapshot.cash.classes[0].opening, CashOpening::Unasserted);
-        assert_eq!(snapshot.cash.opening, CashOpening::Unasserted);
-        assert!(snapshot.cash.totals.contains(&usd(400)));
+        assert_eq!(
+            snapshot.cash.classes[0].totals,
+            vec![
+                CashFigure::Balance(rub(1_000)),
+                CashFigure::Movement(usd(400))
+            ]
+        );
+        assert_eq!(snapshot.cash.totals, snapshot.cash.classes[0].totals);
 
         let confidence = snapshot.confidence();
         assert!(!confidence.complete());
@@ -893,6 +995,71 @@ mod tests {
                 account: savings,
                 currency: CurrencyCode::Usd,
             }
+        );
+    }
+
+    /// The case the class total exists to get right: two accounts in one class
+    /// and one currency, one anchored and one not.
+    ///
+    /// Their sum is neither a balance nor a movement — a stock added to a flow
+    /// — so no sum is published. Both parts are, each a sum of like figures,
+    /// and the reader who wants one number performs the addition knowing what
+    /// he is adding.
+    #[test]
+    fn a_class_whose_members_disagree_publishes_both_parts_and_no_sum() {
+        let anchored = account(10);
+        let adrift = account(11);
+        let report = report(vec![
+            row(anchored, vec![asserted(rub(1_000))]),
+            row(adrift, vec![unasserted(rub(400))]),
+        ]);
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &classes(&[(anchored, "savings"), (adrift, "savings")]),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        let mixed = CashFigure::Mixed {
+            balance: rub(1_000),
+            movement: rub(400),
+        };
+        assert_eq!(snapshot.cash.classes[0].totals, vec![mixed]);
+        assert_eq!(snapshot.cash.totals, vec![mixed]);
+        // Nothing anywhere in the answer states 1400: that figure is what the
+        // shape refuses.
+        assert_eq!(mixed.balance(), Some(rub(1_000)));
+        assert_eq!(mixed.movement(), Some(rub(400)));
+    }
+
+    /// A currency whose cash is not entirely balances has no whole, so it has
+    /// no entry in `total` — not even for the position half, which is exact.
+    /// The list is a list of wholes, and half of one is a smaller wrong answer
+    /// to the same question.
+    #[test]
+    fn a_currency_without_an_anchor_has_no_entry_in_the_whole() {
+        let adrift = account(10);
+        let held = instrument(1);
+        let mut rows = row(adrift, vec![unasserted(rub(5_000))]);
+        rows.positions = vec![(position(adrift, held), quantity(10))];
+        let report = report(vec![rows]);
+
+        let mut board = PriceBoard::new();
+        priced(&mut board, held, 200, date!(2026 - 01 - 29));
+        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
+            .expect("snapshot");
+
+        assert_eq!(snapshot.cash.totals, vec![CashFigure::Movement(rub(5_000))]);
+        assert_eq!(
+            total_in(&snapshot.positions.totals, CurrencyCode::Rub),
+            Dec::new(2_000.into()),
+            "the position half still states what it knows"
+        );
+        assert!(
+            snapshot.total.is_empty(),
+            "no whole exists while the cash is movement from an unknown start: {:?}",
+            snapshot.total
         );
     }
 

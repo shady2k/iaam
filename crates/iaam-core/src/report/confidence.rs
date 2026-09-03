@@ -2,7 +2,7 @@
 //! of those things are not.
 //!
 //! Every fact this module publishes is already published somewhere in the
-//! report it summarises. `population.completeness`, `accounts[].cash[].opening`
+//! report it summarises. `population.completeness`, `accounts[].cash[].kind`
 //! and the rest are each correct and each in the right place; the difficulty
 //! reported from a run through the whole flow was that a reader had to
 //! reconstruct "how much of this answer do I believe" from four fields in three
@@ -181,7 +181,7 @@ impl CaveatKind {
     pub const fn see(self) -> &'static str {
         match self {
             Self::AccountInNoScope | Self::AccountInAnotherScope => "population.outside[]",
-            Self::RunningCashSum => "accounts[].cash[].opening",
+            Self::RunningCashSum => "accounts[].cash[].kind",
             Self::PeriodReportsRefused => "accounts[].period_reports",
             Self::UndecomposedMovements => "currencies[].not_decomposed.by_account[]",
             Self::UnexplainedCashChange => "unexplained[]",

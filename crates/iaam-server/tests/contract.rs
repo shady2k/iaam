@@ -5550,8 +5550,10 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
     let row = &rows[0];
     assert_eq!(row["account"], harness.account.inner().to_string());
     assert_eq!(row["cash"][0]["currency"], "RUB");
-    assert_eq!(row["cash"][0]["amount"], "3000.00");
-    assert_eq!(row["cash"][0]["opening"], "unasserted");
+    assert_eq!(row["cash"][0]["kind"], "movement_since_unknown_start");
+    assert_eq!(row["cash"][0]["movement"], "3000.00");
+    // Nothing anchors this figure, so nothing in it is spelled `balance`.
+    assert!(row["cash"][0].get("balance").is_none());
     assert_eq!(body["negative_cash"], json!([]));
     assert_eq!(
         row["positions"][0]["instrument"],
@@ -5659,6 +5661,11 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
 /// assertion showed a negative cash balance on an account that cannot be
 /// overdrawn. The number was a running sum from an unknown start presented as a
 /// balance, and nothing on the answer said so.
+///
+/// It said so afterwards, in an `opening` field beside the amount, and that was
+/// still not enough — the amount could be read without the field, and was. So
+/// the figure now names itself: there is no `amount` to read, `movement` is
+/// spelled `movement`, and only an anchored figure is spelled `balance`.
 #[tokio::test]
 async fn a_cash_figure_says_whether_its_start_was_asserted() {
     let harness = harness();
@@ -5696,8 +5703,12 @@ async fn a_cash_figure_says_whether_its_start_was_asserted() {
     let (status, body) = call(&harness.router, get(&balances, Some(&harness.owner_token))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let cash = &body["accounts"][0]["cash"][0];
-    assert_eq!(cash["amount"], "3000.00", "{body}");
-    assert_eq!(cash["opening"], "unasserted", "{body}");
+    assert_eq!(cash["kind"], "movement_since_unknown_start", "{body}");
+    assert_eq!(cash["movement"], "3000.00", "{body}");
+    // The figure a reader would have lifted out and called a balance is not
+    // there under any name it could be mistaken for.
+    assert!(cash.get("amount").is_none(), "{body}");
+    assert!(cash.get("balance").is_none(), "{body}");
 
     // The remedy the queue asks for: an assertion about the state before the
     // interval's first event, recorded through the ordinary operation.
@@ -5718,8 +5729,9 @@ async fn a_cash_figure_says_whether_its_start_was_asserted() {
     let (status, body) = call(&harness.router, get(&balances, Some(&harness.owner_token))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let cash = &body["accounts"][0]["cash"][0];
-    assert_eq!(cash["amount"], "3000.00", "{body}");
-    assert_eq!(cash["opening"], "asserted", "{body}");
+    assert_eq!(cash["kind"], "balance", "{body}");
+    assert_eq!(cash["balance"], "3000.00", "{body}");
+    assert!(cash.get("movement").is_none(), "{body}");
 }
 
 /// An assertion that opens after the first movement leaves everything before it
@@ -5782,7 +5794,7 @@ async fn an_opening_assertion_that_starts_too_late_asserts_nothing() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        body["accounts"][0]["cash"][0]["opening"], "unasserted",
+        body["accounts"][0]["cash"][0]["kind"], "movement_since_unknown_start",
         "{body}"
     );
 }
@@ -5878,12 +5890,18 @@ async fn a_negative_cash_balance_is_stated_by_the_answer_and_not_refused() {
         .expect("plausible row");
 
     // The row is there, carrying the negative number rather than hiding it.
-    assert_eq!(overdrawn["cash"][0]["amount"], "-1500.00", "{body}");
-    assert_eq!(positive["cash"][0]["amount"], "4200.00", "{body}");
-    // Both were accumulated from an unasserted start. The plausible one is not
-    // exempt from the marker for looking plausible.
-    assert_eq!(overdrawn["cash"][0]["opening"], "unasserted", "{body}");
-    assert_eq!(positive["cash"][0]["opening"], "unasserted", "{body}");
+    assert_eq!(overdrawn["cash"][0]["movement"], "-1500.00", "{body}");
+    assert_eq!(positive["cash"][0]["movement"], "4200.00", "{body}");
+    // Both were accumulated from an unasserted start, so neither is spelled as
+    // a balance. The plausible one is not exempt for looking plausible.
+    assert_eq!(
+        overdrawn["cash"][0]["kind"], "movement_since_unknown_start",
+        "{body}"
+    );
+    assert_eq!(
+        positive["cash"][0]["kind"], "movement_since_unknown_start",
+        "{body}"
+    );
 
     // The entry is the open §11 span seen with its amount: same key, plus the
     // date it opened and what the perimeter makes of it. `resolved` is null
@@ -6044,11 +6062,11 @@ async fn margin_financing_refuses_one_accounts_period_reports_and_no_others() {
     );
     // The observable cash effect is retained: the perimeter declines to
     // reconstruct the economics, not to state the figure.
-    assert_eq!(blocked["cash"][0]["amount"], "-1540.00", "{body}");
+    assert_eq!(blocked["cash"][0]["movement"], "-1540.00", "{body}");
 
     assert_eq!(calculated["period_reports"], "calculated", "{body}");
     assert_eq!(calculated["period_reports_refused"], json!([]), "{body}");
-    assert_eq!(calculated["cash"][0]["amount"], "4200.00", "{body}");
+    assert_eq!(calculated["cash"][0]["movement"], "4200.00", "{body}");
 
     assert_eq!(
         body["negative_cash"],
@@ -6130,7 +6148,7 @@ async fn a_temporary_settlement_deficit_does_not_refuse_the_period_reports() {
     let row = &body["accounts"][0];
     assert_eq!(row["period_reports"], "calculated", "{body}");
     assert_eq!(row["period_reports_refused"], json!([]), "{body}");
-    assert_eq!(row["cash"][0]["amount"], "500.00", "{body}");
+    assert_eq!(row["cash"][0]["movement"], "500.00", "{body}");
     // The span closed before the report date, so nothing is negative now.
     assert_eq!(body["negative_cash"], json!([]), "{body}");
 }
@@ -10540,7 +10558,10 @@ async fn a_running_cash_sum_is_named_by_account_and_currency() {
     // The population is whole here, so the register can only be speaking about
     // the figure itself.
     assert_eq!(report["population"]["completeness"], "whole", "{report}");
-    assert_eq!(report["accounts"][0]["cash"][0]["opening"], "unasserted");
+    assert_eq!(
+        report["accounts"][0]["cash"][0]["kind"],
+        "movement_since_unknown_start"
+    );
     let confidence = &report["confidence"];
     assert_eq!(
         confidence["complete"], false,
@@ -10561,7 +10582,7 @@ async fn a_running_cash_sum_is_named_by_account_and_currency() {
         }),
         "{caveat}"
     );
-    assert_eq!(caveat["see"], "accounts[].cash[].opening", "{caveat}");
+    assert_eq!(caveat["see"], "accounts[].cash[].kind", "{caveat}");
     // The register summarises; it does not restate the amount, because a second
     // copy of a figure is a second chance to state it wrongly.
     assert!(
@@ -14488,27 +14509,171 @@ async fn the_asset_snapshot_groups_cash_by_the_class_the_owner_declared() {
             .find(|class| class["cash_class"] == json!(code))
             .unwrap_or_else(|| panic!("no group for {code:?}: {snapshot}"))
     };
-    assert_eq!(group(Some("deposit"))["totals"][0]["amount"], "1000.00");
-    assert_eq!(group(Some("savings"))["totals"][0]["amount"], "250.00");
+    // Nothing anchors any of these accounts, so every class total is movement
+    // from an unknown start and says so in the only field that carries a
+    // number.
+    let deposit = &group(Some("deposit"))["totals"][0];
+    assert_eq!(
+        deposit["kind"], "movement_since_unknown_start",
+        "{snapshot}"
+    );
+    assert_eq!(deposit["movement"], "1000.00", "{snapshot}");
+    assert_eq!(
+        group(Some("savings"))["totals"][0]["movement"],
+        "250.00",
+        "{snapshot}"
+    );
     // The account whose class the owner never stated is its own group. It is
     // never folded into a default one, which would put his money under a
     // heading he did not choose.
     let unstated = group(None);
-    assert_eq!(unstated["totals"][0]["amount"], "40.00", "{snapshot}");
+    assert_eq!(unstated["totals"][0]["movement"], "40.00", "{snapshot}");
     assert_eq!(
         unstated["accounts"].as_array().expect("accounts").len(),
         2,
         "the harness account has no class either: {snapshot}"
     );
 
-    // The whole, and it is the sum of the parts rather than a second reading.
-    assert_eq!(snapshot["cash"]["totals"][0]["amount"], "1290.00");
+    // The classes added up, and it is the sum of the parts rather than a second
+    // reading.
+    assert_eq!(snapshot["cash"]["totals"][0]["movement"], "1290.00");
     assert_eq!(snapshot["cash"]["totals"][0]["currency"], "RUB");
-    assert_eq!(snapshot["total"][0]["value"], "1290.00", "{snapshot}");
+    // No whole, because there is none to state: every figure inside it is
+    // movement from an unknown start, and adding those to position values would
+    // produce a number that is not what the owner holds.
+    assert_eq!(snapshot["total"], json!([]), "{snapshot}");
 
     // The register the answer opens with, naming the goal the outstanding-work
     // queue grades by.
     assert_eq!(snapshot["confidence"]["goal"], "asset_snapshot");
+}
+
+/// Two accounts in one class and one currency, one anchored by an opening
+/// assertion and one not. Their sum is neither a balance nor a movement — a
+/// stock added to a flow — so the class publishes both parts and no sum.
+///
+/// The shape this replaced said `unasserted` for the whole class and printed
+/// one number, which understated the anchored account and made the class total
+/// unusable at the same time. Nothing in this answer states the combined
+/// figure: a reader who wants it adds two labelled parts and knows what he
+/// added.
+#[tokio::test]
+async fn a_class_total_whose_accounts_disagree_states_both_parts_and_no_sum() {
+    let harness = harness();
+
+    let mut created = Vec::new();
+    for title in ["Savings One", "Savings Two"] {
+        let (status, account) = call(
+            &harness.router,
+            post(
+                "/v1/accounts",
+                &harness.owner_token,
+                &json!({ "title": title, "cash_class": "savings" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+        created.push(account["id"].as_str().expect("identifier").to_owned());
+    }
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({
+                "title": "Savings only",
+                "accounts": [created[0].clone(), created[1].clone()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let deposit = |account: &str, amount: &str, key: &str| {
+        json!({
+            "account": account,
+            "type": "deposit",
+            "amount": amount,
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-01-05" },
+            "idempotency_key": key
+        })
+    };
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [
+                    deposit(&created[0], "600.00", "mixed-anchored"),
+                    deposit(&created[1], "400.00", "mixed-adrift"),
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    // Only the first account is anchored. The second is left as it arrived,
+    // which is how every account looks after a first import.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.owner_token,
+            &json!({
+                "account": created[0],
+                "from": "2026-01-01",
+                "to": "2026-01-31",
+                "at": "opening",
+                "cash": { "currency": "RUB", "amount": "0.00" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+
+    let savings = &snapshot["cash"]["classes"][0];
+    assert_eq!(savings["cash_class"], "savings", "{snapshot}");
+    let total = &savings["totals"][0];
+    assert_eq!(total["kind"], "mixed", "{snapshot}");
+    assert_eq!(total["balance"], "600.00", "{snapshot}");
+    assert_eq!(total["movement"], "400.00", "{snapshot}");
+    // The figure the old shape published, and the one this refuses to.
+    assert!(total.get("amount").is_none(), "{snapshot}");
+    assert!(
+        !snapshot.to_string().contains("1000.00"),
+        "nothing states the sum of a stock and a flow: {snapshot}"
+    );
+
+    // The same treatment one level up, and no whole for the currency.
+    assert_eq!(snapshot["cash"]["totals"][0]["kind"], "mixed", "{snapshot}");
+    assert_eq!(snapshot["total"], json!([]), "{snapshot}");
+
+    // Which account is unanchored is said once, in the register, and is not
+    // copied onto the class row where it could fall out of step.
+    let caveat = snapshot["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .iter()
+        .find(|caveat| caveat["kind"] == "running_cash_sum")
+        .unwrap_or_else(|| panic!("no caveat about the running sum: {snapshot}"));
+    assert_eq!(caveat["subject"]["account"], created[1], "{snapshot}");
+    assert_eq!(caveat["see"], "accounts[].cash[].kind", "{snapshot}");
 }
 
 /// Cash is exact; a position is worth what a quote said on a date. Both halves
@@ -14574,6 +14739,27 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
     .await;
     assert_eq!(status, StatusCode::OK, "{verdicts}");
 
+    // The opening the whole depends on. Without it the cash half is movement
+    // from an unknown start, and then no whole exists to state at all — which
+    // is the subject of another test; this one is about the order the three
+    // figures are read in when there *is* a whole.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.owner_token,
+            &json!({
+                "account": harness.account.inner(),
+                "from": "2026-01-01",
+                "to": "2026-01-31",
+                "at": "opening",
+                "cash": { "currency": "RUB", "amount": "0.00" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
     let (status, _headers, bytes) = call_raw(
         &harness.router,
         get(
@@ -14586,8 +14772,10 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
     let body = String::from_utf8(bytes).expect("a JSON body");
     let snapshot: Value = serde_json::from_str(&body).expect("a JSON body");
 
-    // The exact half does not move when a quote does.
-    assert_eq!(snapshot["cash"]["totals"][0]["amount"], "500.00", "{body}");
+    // The exact half does not move when a quote does, and it is anchored, so
+    // it is spelled as the balance it is.
+    assert_eq!(snapshot["cash"]["totals"][0]["kind"], "balance", "{body}");
+    assert_eq!(snapshot["cash"]["totals"][0]["balance"], "500.00", "{body}");
     // The market-dependent half, and the date the price it used was for.
     assert_eq!(snapshot["positions"]["totals"][0]["value"], "300", "{body}");
     assert_eq!(
@@ -14789,7 +14977,7 @@ async fn a_negative_balance_the_owner_called_unexpected_is_reported_as_contradic
     // Nothing is suppressed: the row states the figure exactly as it would have
     // without the expectation.
     assert_eq!(
-        report["accounts"][0]["cash"][0]["amount"], "-80.00",
+        report["accounts"][0]["cash"][0]["movement"], "-80.00",
         "{report}"
     );
     // And the expectation contributes no caveat. The register is about what the

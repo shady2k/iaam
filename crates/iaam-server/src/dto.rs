@@ -28,8 +28,8 @@ use iaam_app::scenarios::import_session::{
     HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow, RetentionReason,
 };
 use iaam_app::scenarios::reports::{
-    AccountBalanceRow, AssetSnapshot, BalancesReport, Caveat, CaveatSubject, MoneyFlowOutcome,
-    PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
+    AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
+    MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
 use iaam_core::bond::offer::OfferChoice;
@@ -2760,10 +2760,12 @@ pub struct BalancesReportDto {
     /// of what the owner holds, and which of those things are not.
     ///
     /// **First**, before the rows. It was the reader who stopped at the numbers
-    /// that this answer failed: `amount` under an `unasserted` opening is a
-    /// running sum from an unknown start and not a balance, and `population`
-    /// stood last, after `accounts` and `negative_cash`. Both facts were
-    /// published and neither was reached.
+    /// that this answer failed: a cash figure over an unasserted opening is
+    /// movement from an unknown start and not a balance, and `population` stood
+    /// last, after `accounts` and `negative_cash`. Both facts were published
+    /// and neither was reached. `accounts[].cash[]` no longer lets the number
+    /// be reached without the distinction; this block still says which rows are
+    /// affected, in one place, without reading every row.
     pub confidence: ConfidenceDto,
     pub accounts: Vec<AccountBalanceDto>,
     /// Every account-and-currency in the scope whose cash balance is negative.
@@ -2772,9 +2774,10 @@ pub struct BalancesReportDto {
     /// A **warning, not a prohibition**: a technical overdraft happens on an
     /// ordinary account, and a margin balance is a liability that belongs in
     /// NAV. Nothing refuses, suppresses, or drops a row over it — the answer
-    /// states it and the reader judges. A negative balance on an account that
-    /// cannot be overdrawn is a reason to read `accounts[].cash[].opening`
-    /// before reading the number as a balance at all.
+    /// states it and the reader judges. A negative figure on an account that
+    /// cannot be overdrawn is most often not a balance at all:
+    /// `accounts[].cash[].kind` says `movement_since_unknown_start` for it, and
+    /// that is the first thing to read.
     pub negative_cash: Vec<NegativeCashDto>,
     /// The accounts this report covered, and the known accounts it did not.
     ///
@@ -2838,7 +2841,7 @@ pub struct NegativeCashDto {
     /// the owner records an expectation rather than a prohibition. Nothing is
     /// refused, suppressed or recalculated when this is true: the figure above
     /// stands, the report stays complete, and the reader is told where to look
-    /// first — usually at `accounts[].cash[].opening`, since the reported case
+    /// first — usually at `accounts[].cash[].kind`, since the reported case
     /// behind this was a missing opening assertion rather than an overdraft.
     ///
     /// Derived from `expectation`, never stored beside it: silence is not a
@@ -2850,7 +2853,7 @@ pub struct NegativeCashDto {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AccountBalanceDto {
     pub account: Uuid,
-    pub cash: Vec<BalanceCashDto>,
+    pub cash: Vec<CashFigureDto>,
     pub reconciliation: Vec<ReconciliationStatusDto>,
     pub positions: Vec<PositionQuantityDto>,
     /// `calculated` — nothing in §11 stops the period's tax and financial
@@ -2892,19 +2895,85 @@ pub struct PerimeterRefusalDto {
     pub classification: NegativeCashClassificationDto,
 }
 
-/// A cash figure and where its accumulation starts.
+/// A cash figure, in a shape that cannot be read without deciding what kind of
+/// figure it is.
+///
+/// This was `{currency, amount, opening}`, and the flag said correctly that an
+/// `unasserted` amount is a running sum from an unknown start and not a
+/// balance. It was not enough: `amount` could be read without reading
+/// `opening`, and it was — an agent ran a first import, took
+/// `accounts[].cash[].amount` for holdings, and reported an impossible negative
+/// asset. A caveat beside a number loses to the number.
+///
+/// So there is no field called `amount` any more. The figure is spelled
+/// `balance` exactly where it is one, `movement` where it is not, and the
+/// variant has to be settled before either can be reached. This is the answer
+/// `HoldingPriceDto` already gives for a price, in the same shape and for the
+/// same reason: one reader serves both.
+///
+/// **The `mixed` case is only ever a total.** One account and currency is
+/// covered by an opening assertion or is not, so its figure is `balance` or
+/// `movement`. A total folded across accounts can be a mixture of the two, and
+/// then it carries both parts and no sum of them — see `CashClassTotalDto`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct BalanceCashDto {
-    pub currency: CurrencyDto,
-    pub amount: String,
-    /// `asserted` — an opening assertion covers the state before this account's
-    /// first cash movement in this currency, so `amount` is a balance.
-    /// `unasserted` — nothing does, so `amount` is a running sum from an
-    /// unknown start and is not a balance. It rides on the cash figure rather
-    /// than beside it, in `reconciliation`, because it is what a caller reading
-    /// the figure needs in order to read it correctly, and because it differs
-    /// per account and currency.
-    pub opening: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CashFigureDto {
+    /// Every figure folded in rests on an opening assertion covering the state
+    /// before the first cash movement in this currency. `balance` is a balance.
+    Balance {
+        currency: CurrencyDto,
+        /// Decimal number as a string: binary floating-point loses pennies.
+        #[schema(example = "1000.00")]
+        balance: String,
+    },
+    /// Nothing asserts the state this accumulated from, so `movement` is what
+    /// the recorded interval moved and says nothing about what was there
+    /// before it. It can be negative on an account that cannot be overdrawn
+    /// without anything being wrong: money that arrived before the journal
+    /// began and was spent after it makes exactly that figure.
+    MovementSinceUnknownStart {
+        currency: CurrencyDto,
+        #[schema(example = "-500.00")]
+        movement: String,
+    },
+    /// Part of what was folded in is a balance and part is movement. Both parts
+    /// are stated and **their sum is not**: it would be neither of them.
+    Mixed {
+        currency: CurrencyDto,
+        /// The part covered by opening assertions.
+        #[schema(example = "1000.00")]
+        balance: String,
+        /// The part accumulated from an unknown start.
+        #[schema(example = "-500.00")]
+        movement: String,
+    },
+}
+
+impl CashFigureDto {
+    fn from_domain(figure: CashFigure) -> Self {
+        let currency = CurrencyDto::from_domain(figure.currency());
+        match figure {
+            CashFigure::Balance(money) => Self::Balance {
+                currency,
+                balance: decimal_amount(money),
+            },
+            CashFigure::Movement(money) => Self::MovementSinceUnknownStart {
+                currency,
+                movement: decimal_amount(money),
+            },
+            CashFigure::Mixed { balance, movement } => Self::Mixed {
+                currency,
+                balance: decimal_amount(balance),
+                movement: decimal_amount(movement),
+            },
+        }
+    }
+}
+
+/// A posted amount as the decimal string every cash figure in this module is
+/// spelled with.
+fn decimal_amount(money: Money) -> String {
+    money.to_calc_dec().inner().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2958,11 +3027,7 @@ impl AccountBalanceDto {
             cash: row
                 .cash
                 .iter()
-                .map(|cash| BalanceCashDto {
-                    currency: CurrencyDto::from_domain(cash.money.currency()),
-                    amount: cash.money.to_calc_dec().inner().to_string(),
-                    opening: cash.opening.code().to_owned(),
-                })
+                .map(|cash| CashFigureDto::from_domain(CashFigure::for_account(*cash)))
                 .collect(),
             reconciliation: row
                 .reconciliation
@@ -3028,6 +3093,16 @@ pub struct AssetSnapshotDto {
     /// A calculated value rather than a posted amount: the moment a quote
     /// enters a figure the figure stops being a bank balance, and the type says
     /// so.
+    ///
+    /// **A currency whose cash is not entirely balances is absent from this
+    /// list, halves and all.** It is the one figure here that cannot say what
+    /// it is — a whole is a single number by definition — and it is the figure
+    /// a reader in a hurry stops at. While part of a currency's cash is
+    /// movement from an unknown start there is no whole to state, so none is
+    /// stated, exactly as an unvalued holding is absent from the position total
+    /// rather than valued at zero. Nothing is withheld but the addition:
+    /// `cash.totals` and `positions.totals` state both halves for every
+    /// currency, and `confidence` names the accounts that would anchor them.
     pub total: Vec<CalcMoneyDto>,
     /// The rows every total above was folded from — the balances answer's own
     /// rows. They are here so a total can be checked against them inside one
@@ -3046,13 +3121,9 @@ pub struct CashSideDto {
     /// unstated class first. Always present; empty when the scope holds no
     /// account at all.
     pub classes: Vec<CashClassTotalDto>,
-    /// Every class added up, per currency.
-    pub totals: Vec<AmountDto>,
-    /// `asserted` — every figure summed here rests on an opening assertion, so
-    /// the totals are balances. `unasserted` — at least one does not, so at
-    /// least part of the sum is movement since an unknown start. The register
-    /// names which account and currency.
-    pub opening: String,
+    /// Every class added up, per currency, each entry saying what kind of
+    /// figure it is on the same terms a class total does.
+    pub totals: Vec<CashFigureDto>,
 }
 
 /// One class of cash and what the accounts declared to be it hold.
@@ -3067,10 +3138,27 @@ pub struct CashClassTotalDto {
     /// the rows beneath it.
     pub accounts: Vec<Uuid>,
     /// One figure per currency. Nothing is converted.
-    pub totals: Vec<AmountDto>,
-    /// `asserted` or `unasserted`, for this class. One running sum makes the
-    /// class total a running sum.
-    pub opening: String,
+    ///
+    /// **A class no longer carries one `opening` word for all its currencies.**
+    /// An opening assertion is per account *and* currency, so a class can be
+    /// anchored in one currency and not in another, and the single flag said
+    /// `unasserted` for both. Each figure now says it for itself.
+    ///
+    /// **When the accounts in a class disagree**, the figure is `mixed`: it
+    /// carries the balance part and the movement part and no sum of them. That
+    /// is the decision this shape records. The alternatives were worse. Calling
+    /// the whole thing movement understates a real balance and makes the
+    /// anchored accounts useless at the class level. Publishing one number
+    /// under a `mixed` label is worse still — a stock added to a flow denotes
+    /// nothing, and a labelled number is still a number a reader can lift out.
+    /// Two labelled parts are each a sum of like figures, and a reader who
+    /// wants one number must add them himself, which is the moment he decides
+    /// the addition means something.
+    ///
+    /// Which accounts lack the anchor is not repeated here: `confidence`
+    /// carries one `running_cash_sum` caveat per account and currency, and a
+    /// second copy on this row could fall out of step with it.
+    pub totals: Vec<CashFigureDto>,
 }
 
 /// Positions, at the prices the journal holds.
@@ -3191,7 +3279,7 @@ pub struct AssetAccountDto {
     pub account: Uuid,
     /// The class the owner declared, or null where he has not.
     pub cash_class: Option<String>,
-    pub cash: Vec<BalanceCashDto>,
+    pub cash: Vec<CashFigureDto>,
     pub positions: Vec<PositionQuantityDto>,
 }
 
@@ -3215,12 +3303,21 @@ impl AssetSnapshotDto {
                             .iter()
                             .map(|account| account.inner())
                             .collect(),
-                        totals: class.totals.iter().map(amount_dto).collect(),
-                        opening: class.opening.code().to_owned(),
+                        totals: class
+                            .totals
+                            .iter()
+                            .copied()
+                            .map(CashFigureDto::from_domain)
+                            .collect(),
                     })
                     .collect(),
-                totals: snapshot.cash.totals.iter().map(amount_dto).collect(),
-                opening: snapshot.cash.opening.code().to_owned(),
+                totals: snapshot
+                    .cash
+                    .totals
+                    .iter()
+                    .copied()
+                    .map(CashFigureDto::from_domain)
+                    .collect(),
             },
             positions: PositionsSideDto {
                 holdings: snapshot
@@ -3256,11 +3353,7 @@ impl AssetSnapshotDto {
                     cash: row
                         .cash
                         .iter()
-                        .map(|cash| BalanceCashDto {
-                            currency: CurrencyDto::from_domain(cash.money.currency()),
-                            amount: cash.money.to_calc_dec().inner().to_string(),
-                            opening: cash.opening.code().to_owned(),
-                        })
+                        .map(|cash| CashFigureDto::from_domain(CashFigure::for_account(*cash)))
                         .collect(),
                     positions: row
                         .positions
@@ -3275,15 +3368,6 @@ impl AssetSnapshotDto {
                 .collect(),
             population: PopulationDto::from_domain(&snapshot.population),
         }
-    }
-}
-
-/// A posted amount on the wire, spelled the way every other cash figure in this
-/// module is spelled.
-fn amount_dto(money: &Money) -> AmountDto {
-    AmountDto {
-        amount: money.to_calc_dec().inner().to_string(),
-        currency: CurrencyDto::from_domain(money.currency()),
     }
 }
 

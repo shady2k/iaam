@@ -3,8 +3,10 @@
 use async_trait::async_trait;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
+use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::ids::{
     AccountId, CategoryGroupId, CategoryId, CategoryRuleId, CustodyId, InstrumentId, OwnerId,
+    SourceId,
 };
 use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::Dimension;
@@ -259,6 +261,27 @@ pub struct JournalQuery {
     pub limit: u32,
 }
 
+/// A document to keep: the bytes the facts were parsed from.
+///
+/// The type belongs to the port rather than the store, for the reason
+/// [`Recorded`] does: the scenario that hands a document over must not learn
+/// about SQLite through the argument it passes. The broker and the format are
+/// plain strings here because that is what the parser registry calls itself;
+/// turning them into storage codes is the adapter's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentToKeep {
+    /// The identifier this upload would give the document. The store returns
+    /// the one already on record instead when the same file is sent twice, so
+    /// this is a proposal, not a decision.
+    pub id: SourceId,
+    pub owner: OwnerId,
+    pub broker: String,
+    pub format: String,
+    pub parser_version: ParserVersion,
+    pub document_hash: RawHash,
+    pub body: Vec<u8>,
+}
+
 /// Store for facts and reference data.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -353,6 +376,28 @@ pub trait Store: Send + Sync {
         version: ContourVersion,
         lot_rule: LotRuleVersion,
     ) -> Result<Option<Snapshot>, AppError>;
+
+    /// Keep the document the facts were parsed from, and name it.
+    ///
+    /// The returned identifier is the document's, not the caller's proposal:
+    /// the same file uploaded twice is one document, and a response that
+    /// invented a second identifier would name something that is not on record.
+    async fn keep_document(&self, document: DocumentToKeep) -> Result<SourceId, AppError>;
+
+    /// The bytes of the owner's document, by the hash that names it.
+    ///
+    /// Only the body crosses the port: nothing else about a stored document is
+    /// needed to parse it again, and the body is the most sensitive thing this
+    /// system holds — a port that returned more of it than a caller needs would
+    /// be a wider opening than it has to be.
+    ///
+    /// `None` means the document was never stored, which the reparse path must
+    /// tell apart from a failed read: the first has an answer for the caller.
+    async fn load_document_body(
+        &self,
+        owner: OwnerId,
+        document_hash: RawHash,
+    ) -> Result<Option<Vec<u8>>, AppError>;
 
     async fn find_principal(&self, token_hash: String) -> Result<Option<Principal>, AppError>;
     async fn record_token_use(

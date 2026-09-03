@@ -13,8 +13,8 @@ use crate::ports::{
     BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
     CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
     ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
-    CustodyView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery,
-    Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    CustodyView, DocumentToKeep, InstrumentDirectory, InstrumentUpsert, InstrumentView,
+    IssuedToken, JournalQuery, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -24,6 +24,7 @@ use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
+use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{
     AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, InstrumentId,
     OwnerId, SourceId,
@@ -36,7 +37,10 @@ use iaam_store::SqliteStore;
 use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::categories::NewCategoryRule;
-use iaam_store::documents::BrokerCode;
+use iaam_store::documents::{
+    BrokerCode, DocumentStored, NewDocument as StoredNewDocument,
+    ReportFormat as StoredReportFormat,
+};
 use iaam_store::events::{
     AccountActivityRecord, Appended, ControlAssertionRecord, JournalCursor as StoredJournalCursor,
     JournalQuery as StoredJournalQuery,
@@ -471,6 +475,53 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .load_snapshot(owner, contour, version, lot_rule)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn keep_document(&self, document: DocumentToKeep) -> Result<SourceId, AppError> {
+        let broker = BrokerCode::parse(&document.broker).ok_or_else(|| AppError::Invalid {
+            field: "broker".to_owned(),
+            expected: "the code the parser registry identifies the broker by".to_owned(),
+            actual: document.broker.clone(),
+        })?;
+        let format =
+            StoredReportFormat::parse(&document.format).ok_or_else(|| AppError::Invalid {
+                field: "format".to_owned(),
+                expected: "the code the parser registry identifies the format by".to_owned(),
+                actual: document.format.clone(),
+            })?;
+        let stored = StoredNewDocument {
+            id: document.id,
+            owner: document.owner,
+            broker,
+            format,
+            parser_version: document.parser_version,
+            document_hash: document.document_hash,
+            body: document.body,
+        };
+        self.blocking(move |store| {
+            store
+                .insert_document(&stored)
+                .map(|outcome| match outcome {
+                    DocumentStored::Inserted { id }
+                    | DocumentStored::AlreadyPresent { existing: id } => id,
+                })
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn load_document_body(
+        &self,
+        owner: OwnerId,
+        document_hash: RawHash,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        self.blocking(move |store| {
+            store
+                .load_document_by_hash(owner, &document_hash)
+                .map(|found| found.map(|document| document.body))
                 .map_err(store_error)
         })
         .await

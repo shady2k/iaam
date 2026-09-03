@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::Principal;
+use crate::ports::{DocumentToKeep, Principal};
 /// A single upload outcome with the row number from the source sheet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentRowVerdict {
@@ -47,13 +47,7 @@ pub async fn upload_report(
     directory: &Directory,
     account: Option<AccountId>,
 ) -> Result<UploadedDocument, AppError> {
-    if !principal.scope.may_submit() {
-        return Err(AppError::Invalid {
-            field: "scope".into(),
-            expected: "permission to submit transactions".into(),
-            actual: principal.scope.code().to_owned(),
-        });
-    }
+    require_submit(principal)?;
 
     let workbook = Workbook::open(bytes).map_err(|error| AppError::Invalid {
         field: "document".into(),
@@ -72,14 +66,29 @@ pub async fn upload_report(
             actual: "not specified".into(),
         });
     }
-    let source = SourceId::new_random();
-    let document_hash = hex_hash(bytes);
+    let raw_hash = hex_hash(bytes);
+    // The document is kept before its rows become facts, and the identifier it
+    // is kept under is the one the facts carry. Parsing first and storing
+    // afterwards would leave a failed parse with no source to try again from —
+    // which is the whole reason the raw material is stored at all (§10.1).
+    let source = services
+        .store
+        .keep_document(DocumentToKeep {
+            id: SourceId::new_random(),
+            owner: principal.owner,
+            broker: broker.code().to_owned(),
+            format: format.code().to_owned(),
+            parser_version: parser_version.clone(),
+            document_hash: raw_hash.clone(),
+            body: bytes.to_vec(),
+        })
+        .await?;
     let mut rows = submit_rows(
         services,
         principal,
         source,
         &parser_version,
-        &document_hash,
+        &raw_hash,
         &report,
     )
     .await?;
@@ -103,14 +112,14 @@ pub async fn upload_report(
                 source,
                 parser_version: parser_version.clone(),
             },
-            &document_hash,
+            &raw_hash,
             &report,
         )
         .await?;
     }
 
     Ok(UploadedDocument {
-        document_hash,
+        document_hash: raw_hash.as_str().to_owned(),
         source,
         broker,
         format,
@@ -119,24 +128,76 @@ pub async fn upload_report(
         rows,
     })
 }
-/// Re-parses the provided source and requires its hash to match.
+/// Re-parses the document the system kept, or the one the caller supplied.
+///
+/// The bytes are optional because every upload is stored: an agent that wants a
+/// document parsed again names it by its hash and holds none of the owner's
+/// data, which is the arrangement the design requires of it. Supplying them
+/// remains possible, and their hash is still checked, for documents uploaded
+/// before the system began storing sources — those recorded facts and kept no
+/// body, so a reparse of one has nothing to read. That fallback closes behind
+/// itself: parsing the supplied bytes stores them, and the next reparse of the
+/// same document needs none.
 pub async fn reparse_report(
     services: &AppServices,
     principal: &Principal,
     document_hash: &str,
-    bytes: &[u8],
+    bytes: Option<&[u8]>,
     directory: &Directory,
     account: Option<AccountId>,
 ) -> Result<UploadedDocument, AppError> {
-    let actual = hex_hash(bytes);
-    if actual != document_hash.to_ascii_lowercase() {
+    // The scope is checked before the store is touched, and not only inside
+    // `upload_report`: a caller who may not submit must not learn from the
+    // refusal whether a document with this hash exists (§14).
+    require_submit(principal)?;
+    let Some(requested) = RawHash::parse(document_hash) else {
         return Err(AppError::Invalid {
             field: "document".into(),
-            expected: "source with the specified SHA-256".into(),
-            actual,
+            expected: "SHA-256 of the source document".into(),
+            actual: document_hash.to_owned(),
         });
+    };
+    if let Some(bytes) = bytes {
+        let actual = hex_hash(bytes);
+        if actual != requested {
+            return Err(AppError::Invalid {
+                field: "document".into(),
+                expected: "source with the specified SHA-256".into(),
+                actual: actual.as_str().to_owned(),
+            });
+        }
+        return upload_report(services, principal, bytes, directory, account).await;
     }
-    upload_report(services, principal, bytes, directory, account).await
+    let stored = services
+        .store
+        .load_document_body(principal.owner, requested.clone())
+        .await?;
+    let Some(body) = stored else {
+        return Err(AppError::Invalid {
+            field: "document".into(),
+            expected: "a document the system kept, or its bytes in the request body".into(),
+            actual: "nothing stored under this hash, and no bytes sent: the document was \
+                     uploaded before the system began storing sources, or belongs to \
+                     another owner"
+                .into(),
+        });
+    };
+    upload_report(services, principal, &body, directory, account).await
+}
+
+/// The permission both entry points need.
+///
+/// One function rather than the same check written twice: a reparse that
+/// forgot it would let a read-only token drive an ingestion.
+fn require_submit(principal: &Principal) -> Result<(), AppError> {
+    if principal.scope.may_submit() {
+        return Ok(());
+    }
+    Err(AppError::Invalid {
+        field: "scope".into(),
+        expected: "permission to submit transactions".into(),
+        actual: principal.scope.code().to_owned(),
+    })
 }
 
 fn detect_parser(workbook: &Workbook) -> Result<&'static dyn ReportParser, AppError> {
@@ -170,17 +231,11 @@ async fn submit_rows(
     principal: &Principal,
     source: SourceId,
     parser_version: &ParserVersion,
-    document_hash: &str,
+    raw_hash: &RawHash,
     report: &ParsedReport,
 ) -> Result<Vec<DocumentRowVerdict>, AppError> {
     let mut rows = Vec::with_capacity(report.rows.len());
-    let Some(raw_hash) = RawHash::parse(document_hash) else {
-        return Err(AppError::Invalid {
-            field: "document".into(),
-            expected: "SHA-256".into(),
-            actual: document_hash.to_owned(),
-        });
-    };
+    let document_hash = raw_hash.as_str();
     for located in &report.rows {
         let ParsedRow::Operation(operation) = &located.outcome else {
             if let ParsedRow::Rejected(rejection) = &located.outcome {
@@ -246,7 +301,7 @@ struct AssertionOrigin {
 async fn append_control_assertions(
     services: &AppServices,
     origin: AssertionOrigin,
-    document_hash: &str,
+    raw_hash: &RawHash,
     report: &ParsedReport,
 ) -> Result<(), AppError> {
     let AssertionOrigin {
@@ -262,14 +317,8 @@ async fn append_control_assertions(
             actual: "not specified".into(),
         });
     };
-    let Some(raw_hash) = RawHash::parse(document_hash) else {
-        return Err(AppError::Invalid {
-            field: "document".into(),
-            expected: "SHA-256".into(),
-            actual: document_hash.to_owned(),
-        });
-    };
-    let provenance = Provenance::new(source, raw_hash, parser_version);
+    let document_hash = raw_hash.as_str();
+    let provenance = Provenance::new(source, raw_hash.clone(), parser_version);
     let events: Vec<Event> = report
         .sections
         .claims()
@@ -297,9 +346,15 @@ async fn append_control_assertions(
     Ok(())
 }
 
-fn hex_hash(bytes: &[u8]) -> String {
+/// The document's identity.
+///
+/// The return type is [`RawHash`] rather than a string because the digest of a
+/// SHA-256 is always a valid one: handing back a string would oblige every
+/// caller to re-parse it and to write an arm for a failure that cannot occur.
+fn hex_hash(bytes: &[u8]) -> RawHash {
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    RawHash::parse(&hex).expect("a SHA-256 digest is 64 hexadecimal characters")
 }
 
 #[cfg(test)]
@@ -309,7 +364,7 @@ mod tests {
     #[test]
     fn document_identity_is_a_stable_sha256_hex() {
         assert_eq!(
-            hex_hash(b"iaam"),
+            hex_hash(b"iaam").as_str(),
             "9b04d18aa56c16fde8f892a4ca34726b65abd2e2f2c9e9e03b475775f6e345e2"
         );
     }

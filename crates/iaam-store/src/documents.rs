@@ -205,6 +205,33 @@ impl SqliteStore {
         })
     }
 
+    /// Read the owner's document by the hash that names it.
+    ///
+    /// A read separate from [`SqliteStore::load_document`] because the hash, not
+    /// the upload identifier, is what `provenance` carries: a caller holding a
+    /// fact knows the document under this name and no other. The owner is in the
+    /// query for the same reason it is there — a foreign document must not reach
+    /// the caller even for an instant.
+    ///
+    /// Absence is `None` rather than [`StoreError::NotFound`]: a document that
+    /// was never stored has an answer for the caller — send its bytes — while a
+    /// failed read has none, and one return value for both would hide the
+    /// difference.
+    pub fn load_document_by_hash(
+        &self,
+        owner: OwnerId,
+        document_hash: &RawHash,
+    ) -> Result<Option<DocumentRecord>, StoreError> {
+        Ok(self
+            .query_documents(
+                "SELECT id, broker, format, parser_version, document_hash, uploaded_at, body
+                 FROM source_documents WHERE owner = ?1 AND document_hash = ?2",
+                params![owner.inner().to_string(), document_hash.as_str()],
+                owner,
+            )?
+            .pop())
+    }
+
     /// Documents parsed by a different parser version.
     ///
     /// This is a list of candidates for re-parsing, not a list of

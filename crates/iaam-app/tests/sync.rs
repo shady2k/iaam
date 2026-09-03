@@ -148,6 +148,66 @@ fn report_trade_event(
     }
 }
 
+/// The opening half of a control section, for cash and for the holding.
+///
+/// Present wherever a closing figure is expected to be compared at all: without
+/// an opening the source reaches back over, the closing figure is a sum from a
+/// start nothing states and the outcome is `OpeningNotAsserted` rather than a
+/// match (`iaam-d7hn`). Both are zero, because each account here is opened by
+/// the March trade itself.
+fn cash_opening_claim() -> ControlClaim {
+    ControlClaim::CashBalance {
+        currency: CurrencyCode::Rub,
+        amount: PostedMinor::new(0),
+        at: BalancePoint::Opening,
+    }
+}
+
+fn position_opening_claim(instrument: InstrumentId, custody: CustodyId) -> ControlClaim {
+    ControlClaim::PositionQuantity {
+        instrument,
+        custody,
+        quantity: iaam_core::money::Quantity::zero(),
+        at: BalancePoint::Opening,
+    }
+}
+
+/// The same opening claims, as the report channel's own events.
+fn report_opening_assertions(
+    owner: OwnerId,
+    account: AccountId,
+    source: SourceId,
+    holding: Option<(InstrumentId, CustodyId)>,
+) -> Vec<Event> {
+    let period = AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+        .unwrap_or_else(|| panic!("March period"));
+    let mut claims = vec![cash_opening_claim()];
+    claims.extend(holding.map(|(instrument, custody)| position_opening_claim(instrument, custody)));
+    claims
+        .into_iter()
+        .enumerate()
+        .map(|(index, claim)| Event {
+            id: EventId::new_random(),
+            schema_version: SCHEMA_VERSION,
+            owner,
+            account,
+            kind: EventKind::ControlAssertion { period, claim },
+            dates: EventDates::for_cash(CashPostedDate(period.from)),
+            order: EffectiveOrder::new(period.from, u32::try_from(index).unwrap()),
+            legs: Vec::new(),
+            provenance: Provenance::new(
+                source,
+                iaam_core::event::provenance::RawHash::parse(&"a".repeat(64))
+                    .unwrap_or_else(|| panic!("report hash")),
+                ParserVersion("finam-xlsx/1".to_owned()),
+            ),
+            relation: Relation::None,
+            confidence: Confidence::Known,
+            idempotency_key: Some(format!("report-opening-march-{index}")),
+        })
+        .collect()
+}
+
 fn report_cash_assertion(owner: OwnerId, account: AccountId, source: SourceId) -> Event {
     let period = AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
         .unwrap_or_else(|| panic!("March period"));
@@ -377,16 +437,31 @@ async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
     services
         .store
         .append_events(
-            vec![
-                existing.clone(),
-                report_cash_assertion(owner, account, report_source),
-            ],
+            [
+                vec![
+                    existing.clone(),
+                    report_cash_assertion(owner, account, report_source),
+                ],
+                report_opening_assertions(owner, account, report_source, None),
+            ]
+            .concat(),
             IdentityScope::Source,
         )
         .await
         .unwrap_or_else(|error| panic!("seed report: {error}"));
 
-    let broker = api(account, SourceId::new_random(), operation);
+    let broker = api_with_claims(
+        SourceId::new_random(),
+        operation,
+        vec![
+            cash_opening_claim(),
+            ControlClaim::CashBalance {
+                currency: CurrencyCode::Rub,
+                amount: PostedMinor::new(-10_000),
+                at: BalancePoint::Closing,
+            },
+        ],
+    );
     let outcome = sync_broker(
         &services,
         &principal(owner),
@@ -404,7 +479,8 @@ async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
         outcome.recorded.first(),
         Some(Verdict::Duplicate { existing: id }) if *id == existing.id
     ));
-    assert_eq!(outcome.assertions, 1);
+    // Two: the opening balance the source states as well as the closing one.
+    assert_eq!(outcome.assertions, 2);
     assert_eq!(outcome.assertions_withheld, None);
     let events = load(&services, owner).await;
     assert_eq!(
@@ -445,11 +521,20 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
     services
         .store
         .append_events(
-            vec![
-                existing,
-                report_cash_assertion(owner, account, report_source),
-                report_position_assertion(owner, account, report_source, instrument, custody),
-            ],
+            [
+                vec![
+                    existing,
+                    report_cash_assertion(owner, account, report_source),
+                    report_position_assertion(owner, account, report_source, instrument, custody),
+                ],
+                report_opening_assertions(
+                    owner,
+                    account,
+                    report_source,
+                    Some((instrument, custody)),
+                ),
+            ]
+            .concat(),
             IdentityScope::Source,
         )
         .await
@@ -460,6 +545,8 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
         api_source,
         operation,
         vec![
+            cash_opening_claim(),
+            position_opening_claim(instrument, custody),
             ControlClaim::CashBalance {
                 currency: CurrencyCode::Rub,
                 amount: PostedMinor::new(-10_000),
@@ -498,7 +585,8 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
     .await
     .unwrap_or_else(|error| panic!("sync: {error}"));
 
-    assert_eq!(outcome.assertions, 2);
+    // Four: an opening and a closing figure for cash and for the holding.
+    assert_eq!(outcome.assertions, 4);
     let events = load_all(&services, owner).await;
     let gap = events
         .iter()
@@ -597,11 +685,20 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
     services
         .store
         .append_events(
-            vec![
-                report_trade_event(owner, &operation, report_source),
-                report_cash_assertion(owner, account, report_source),
-                report_position_assertion(owner, account, report_source, instrument, custody),
-            ],
+            [
+                vec![
+                    report_trade_event(owner, &operation, report_source),
+                    report_cash_assertion(owner, account, report_source),
+                    report_position_assertion(owner, account, report_source, instrument, custody),
+                ],
+                report_opening_assertions(
+                    owner,
+                    account,
+                    report_source,
+                    Some((instrument, custody)),
+                ),
+            ]
+            .concat(),
             IdentityScope::Source,
         )
         .await
@@ -612,6 +709,8 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
         api_source,
         operation,
         vec![
+            cash_opening_claim(),
+            position_opening_claim(instrument, custody),
             ControlClaim::CashBalance {
                 currency: CurrencyCode::Rub,
                 amount: PostedMinor::new(-10_000),
@@ -1200,7 +1299,7 @@ async fn an_event_claiming_an_older_schema_version_is_refused_on_write() {
             field,
             expected,
             actual,
-        } if field == "event[0].schema_version" && expected == "11" && actual == "7"
+        } if field == "event[0].schema_version" && expected == "12" && actual == "7"
     ));
     assert!(load_all(&services, owner).await.is_empty());
 }

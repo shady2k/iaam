@@ -563,7 +563,10 @@ async fn no_operation_leaves_the_report_because_of_the_order_the_setup_was_done_
     // And the population is the same five accounts either way: an operation
     // that left the report would leave its account out of `covered` with it.
     for report in [&contour_drawn_first, &contour_drawn_last] {
-        assert_eq!(report["population"]["completeness"], "whole", "{report}");
+        assert_eq!(
+            report["population"]["known_account_coverage"], "whole",
+            "{report}"
+        );
         assert_eq!(
             report["population"]["covered"]
                 .as_array()
@@ -931,7 +934,10 @@ async fn the_report_names_the_accounts_it_covers_and_the_ones_it_does_not() {
 
     // Nobody has ruled on the two accounts left out, so the report says the
     // part of the owner's money it answers about is undelimited.
-    assert_eq!(population["completeness"], "undecided", "{report}");
+    assert_eq!(
+        population["known_account_coverage"], "undecided",
+        "{report}"
+    );
     for entry in population["outside"].as_array().expect("outside") {
         assert_eq!(entry["standing"], "outside_undecided", "{report}");
     }

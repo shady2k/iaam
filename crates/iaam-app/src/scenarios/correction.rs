@@ -18,9 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::correction::{CorrectionError, resolve};
+use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{EventId, ImportId, SourceId};
+use iaam_core::ids::{AccountId, EventId, ImportId, PrincipalId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{SubmittedOperation, Verdict, normalize};
@@ -197,13 +198,22 @@ pub async fn correct_events(
 /// saying «this import is retracted» would be a second, non-journal notion of
 /// what is effective, and the append-only journal would no longer be the whole
 /// account of what the owner knows.
+///
+/// **Who may call it.** The owner, for any import. An agent, for an import it
+/// declared itself and nothing has been built on — see
+/// [`undoes_only_its_own_declaration`] for the four conditions and for why they
+/// are decided here rather than at the transport. That is narrower than
+/// [`correct_events`] beside it, which stays owner-only, and the difference is
+/// the doctrine rather than an inconsistency: taking back your own declaration
+/// returns the journal to the state before you acted, and naming an event of the
+/// owner's to reverse is a judgement about his history.
 pub async fn correct_import(
     services: &AppServices,
     principal: &Principal,
     acknowledge_retraction: bool,
     target: ImportTarget,
 ) -> Result<ImportCorrectionOutcome, AppError> {
-    may_correct(principal)?;
+    may_retract_an_import(principal)?;
     acknowledged(acknowledge_retraction)?;
 
     let events = load_journal(services, principal).await?;
@@ -211,10 +221,15 @@ pub async fn correct_import(
     let (targets, already_reversed) = {
         let effective = resolve(&events).map_err(AppError::Correction)?;
         let targets: Vec<Event> = effective
-            .into_iter()
+            .iter()
             .filter(|event| target.covers(event))
-            .cloned()
+            .map(|event| (*event).clone())
             .collect();
+        // Checked against the journal this correction is computed from, and not
+        // in a step before it: see [`undoes_only_its_own_declaration`].
+        if !principal.scope.may_administer() {
+            undoes_only_its_own_declaration(principal, target, &events, &effective, &targets)?;
+        }
 
         let by_id: BTreeMap<EventId, &Event> =
             events.iter().map(|event| (event.id, event)).collect();
@@ -278,13 +293,27 @@ pub async fn correct_import(
     })
 }
 
-/// Only the owner corrects the journal.
+/// Only the owner corrects the journal event by event.
 ///
-/// A reversal rewrites what every downstream report says, and the agent is an
-/// external client that does not decide the portfolio's shape. This is why
-/// corrections do not ride the ingest transport: `Scope::may_submit` admits an
+/// A reversal rewrites what every downstream report says, and naming an
+/// arbitrary event to reverse is a judgement about the owner's history: which
+/// of the facts he holds should stop counting. Nothing about the caller's own
+/// conduct bounds it, so nothing narrower than the owner's scope will do.
+///
+/// This is also why corrections do not ride the ingest transport, and that half
+/// is unchanged by `iaam-rond`: [`crate::ports::Scope::may_submit`] admits an
 /// agent, and a relation field on an ingest row would make every ingest handler
 /// a retraction surface guarded by a per-row check that one input could forget.
+/// A separate route with its own gate is the right shape; only the gate on
+/// [`correct_import`] moved.
+///
+/// The reason that comment used to give — "the agent is an external client that
+/// does not decide the portfolio's shape" — was already false when it was
+/// written. Committing an import is open to the agent and rewrites every
+/// downstream report, so the agent does decide the portfolio's shape by adding
+/// to it; the gate closed only the safer direction, and left an agent that
+/// finds by control total that it wrote nonsense with nothing to do but wake the
+/// owner to undo the agent's own mistake.
 fn may_correct(principal: &Principal) -> Result<(), AppError> {
     if principal.scope.may_administer() {
         Ok(())
@@ -295,6 +324,161 @@ fn may_correct(principal: &Principal) -> Result<(), AppError> {
             actual: principal.scope.code().to_owned(),
         })
     }
+}
+
+/// Who may ask to retract a whole declared import at all.
+///
+/// The floor, not the rule. It admits the owner and the agent and refuses a
+/// read-only token, exactly as submission does; what an agent may retract is
+/// then decided by [`undoes_only_its_own_declaration`] against the journal,
+/// because that question cannot be answered from a scope alone.
+fn may_retract_an_import(principal: &Principal) -> Result<(), AppError> {
+    if principal.scope.may_submit() {
+        Ok(())
+    } else {
+        Err(AppError::Invalid {
+            field: "scope".to_owned(),
+            expected: "permission to submit operations".to_owned(),
+            actual: principal.scope.code().to_owned(),
+        })
+    }
+}
+
+/// The bound on an agent's retraction: it may take back its own declaration and
+/// nothing else (`iaam-rond`).
+///
+/// **The doctrine.** Retracting an import you yourself declared returns the
+/// journal to the state before you acted; no decision of the owner's is
+/// reversed, because none was made. Retracting anything else is a judgement
+/// about his history. The gate is therefore not "which route is this" but "what
+/// does this act do to the owner's decisions", and the four conditions below are
+/// that sentence made checkable.
+///
+/// 1. **The declaration named a label.** An unnamed target sweeps every row of
+///    an account and channel that named no import — rows from before imports
+///    could be named, and from channels that declare no source. That set is not
+///    anybody's declaration, so no caller can claim it as its own.
+/// 2. **Every event the target covers was submitted under this very credential.**
+///    Not "under some agent token": a token is the finest identity there is (see
+///    [`PrincipalId`]), and an import both the owner and the agent submitted
+///    rows into is one the owner has a stake in. Absent provenance fails the
+///    check rather than passing it — a fact recorded before anyone was written
+///    down names no declarer, and reading that silence as "mine" would hand
+///    every pre-existing import to whoever asked first.
+/// 3. **Every event the target covers is still effective.** One already reversed
+///    or replaced is one somebody has already ruled on: the transfer pairing
+///    that superseded an outgoing leg, a correction the owner made by hand.
+///    Sweeping the remainder would be finishing a judgement the agent did not
+///    make. It also means a retraction is not idempotent for an agent: the
+///    second call is refused, and the refusal says the rows are already
+///    reversed, which is the true answer to "did my first call land".
+/// 4. **Nothing has been reconciled against it.** A control assertion is a
+///    journal fact (§10.3) that was compared with the projection over an
+///    interval; retracting rows inside that interval changes what the comparison
+///    was made against, and the reconciliation status the owner has already read
+///    becomes a statement about a journal that no longer exists. An assertion
+///    the target itself covers does not block: it is being retracted along with
+///    the rows it was about.
+///
+/// **Why the check is here and not beside the caller.** Every one of these is a
+/// predicate over the journal, and it is the same journal the reversal is
+/// computed from — `load_journal` has already read it, `resolve` has already
+/// folded it, and the relation scan below already walks it. Cost is therefore
+/// one pass, not one query. The reason it must be here is stronger than cost: a
+/// check made in a step before `correct_import` would run against its own read,
+/// and between that read and the write the owner can record the very assertion
+/// condition 4 exists to protect. The reversal would then be written against a
+/// journal that no longer satisfies the precondition it was checked under. One
+/// read, one decision.
+fn undoes_only_its_own_declaration(
+    principal: &Principal,
+    target: ImportTarget,
+    journal: &[Event],
+    effective: &[&Event],
+    effective_covered: &[Event],
+) -> Result<(), AppError> {
+    let Some(import) = target.import() else {
+        return Err(AppError::Invalid {
+            field: "source.label".to_owned(),
+            expected: "the label this import was declared under: without one, the request \
+                       reaches every row of the account and channel that named no \
+                       import, which is nobody's declaration to take back"
+                .to_owned(),
+            actual: "absent".to_owned(),
+        });
+    };
+
+    let declared_by = PrincipalId(principal.token_id);
+    let covered: Vec<&Event> = journal
+        .iter()
+        .filter(|event| target.covers(event))
+        .collect();
+    let foreign = covered
+        .iter()
+        .filter(|event| event.provenance.declared_by() != Some(declared_by))
+        .count();
+    if foreign > 0 {
+        return Err(AppError::Invalid {
+            field: "source".to_owned(),
+            expected: "an import every row of which this token declared".to_owned(),
+            actual: format!(
+                "import {} holds {foreign} of {} rows submitted under another \
+                 credential, or under none recorded",
+                import.inner(),
+                covered.len()
+            ),
+        });
+    }
+
+    if covered.len() != effective_covered.len() {
+        return Err(AppError::Invalid {
+            field: "source".to_owned(),
+            expected: "an import none of whose rows has been reversed or replaced".to_owned(),
+            actual: format!(
+                "{} of {} rows are no longer effective",
+                covered.len() - effective_covered.len(),
+                covered.len()
+            ),
+        });
+    }
+
+    let covered_ids: BTreeSet<EventId> = covered.iter().map(|event| event.id).collect();
+    let accounts: BTreeSet<AccountId> = covered.iter().flat_map(|event| touched(event)).collect();
+    let dates: BTreeSet<time::Date> = covered.iter().map(|event| event.order.date()).collect();
+    for event in effective {
+        let EventKind::ControlAssertion { period, .. } = &event.kind else {
+            continue;
+        };
+        if covered_ids.contains(&event.id) || !accounts.contains(&event.account) {
+            continue;
+        }
+        if dates.iter().any(|date| period.contains(*date)) {
+            return Err(AppError::Invalid {
+                field: "source".to_owned(),
+                expected: "an import nothing has been reconciled against".to_owned(),
+                actual: format!(
+                    "control assertion {} covers {}..={} on an account these rows moved",
+                    event.id.inner(),
+                    period.from,
+                    period.to
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Every account an event moves, not only the one it is filed under.
+///
+/// A cash transfer is filed against one account and moves two, so an assertion
+/// about the far side is reconciled against this row just as much. Widening the
+/// set can only refuse more retractions, which is the direction a bound whose
+/// evidence is incomplete should err in.
+fn touched(event: &Event) -> BTreeSet<AccountId> {
+    std::iter::once(event.account)
+        .chain(event.legs.iter().map(|leg| leg.account))
+        .collect()
 }
 
 /// A correction is stated, never implied.
@@ -573,6 +757,29 @@ mod tests {
             confidence: Confidence::Known,
             idempotency_key: None,
         }
+    }
+
+    /// A transfer is filed against one account and moves two, and an assertion
+    /// about the far side is reconciled against the row just as much.
+    ///
+    /// Asserted at the helper rather than through the API because the API cannot
+    /// reach it: the far account of a transfer is not what the request names, so
+    /// a bound reading only `event.account` would pass every end-to-end test and
+    /// still let an agent retract rows a reconciled balance was computed from.
+    #[test]
+    fn the_accounts_an_event_touches_include_the_far_side_of_a_transfer() {
+        let far = AccountId(uuid::Uuid::from_u128(3));
+        let amount = Money::new(PostedMinor::new(1_000), CurrencyCode::Rub);
+        let mut event = deposit(9, SourceId::new_random());
+        event.legs = vec![Leg::cash(account(), amount), Leg::cash(far, amount)];
+
+        let touched = touched(&event);
+
+        assert!(
+            touched.contains(&account()),
+            "the account it is filed under"
+        );
+        assert!(touched.contains(&far), "and the one its other leg moves");
     }
 
     #[test]

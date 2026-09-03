@@ -101,13 +101,15 @@ use crate::dto::{
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
     CommitImportSessionRequest, ConfirmTransferPairingRequest, ConfirmedPairingDto,
-    CrossSourceMatchingDto, ImportCommitDto, ImportPlanDto, ImportQuestionDto, ImportRowDto,
-    ImportSessionContentsDto, ImportSessionDto, OpenImportSessionRequest,
+    ControlSectionDto, CrossSourceMatchingDto, ImportCommitDto, ImportPlanDto, ImportQuestionDto,
+    ImportRowDto, ImportSessionContentsDto, ImportSessionDto, OpenImportSessionRequest,
+    RecordedEventDto, StateImportControlFiguresRequest,
 };
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use iaam_app::scenarios::documents::UploadedDocument;
 use iaam_app::scenarios::import_session::SessionRevision;
+use iaam_core::batch::ControlSection;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
@@ -632,6 +634,15 @@ pub async fn submit_corrections(
 /// retracts instead every row of that account and channel which named no
 /// import — the rows recorded before an import could be named, and the only
 /// way to reach them.
+///
+/// **Who may call it (`iaam-rond`).** The owner, for any import. An agent, for
+/// an import it declared itself and has not yet built anything on — the exact
+/// bound, and the reasoning for it, are on
+/// `iaam_app::scenarios::correction::correct_import`. The route no longer
+/// refuses the agent outright: committing an import is open to it and rewrites
+/// every downstream report, so refusing it the retraction closed only the safer
+/// of the two directions and left an agent that discovers its own mistake by
+/// control total with nothing to do but wake the owner.
 #[utoipa::path(
     post,
     path = "/v1/corrections/imports",
@@ -640,13 +651,18 @@ pub async fn submit_corrections(
                    account and channel, under other labels, keep counting. A \
                    request without a label retracts every row of that account \
                    and channel that named no import. One reversal fact per \
-                   retracted event; nothing is deleted and nothing is mutated.",
+                   retracted event; nothing is deleted and nothing is mutated. \
+                   The owner may retract any import. An agent may retract only \
+                   one it declared itself, under the label it submitted under, \
+                   and only while every row of it is still effective and no \
+                   control assertion covers them; anything else is refused and \
+                   the refusal says which of those it was.",
     request_body = CorrectImportRequest,
     responses(
         (status = 200, description = "What the correction retracted", body = ImportCorrectionDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 409, description = "A correction key is held by an unrelated event", body = ApiError),
-        (status = 422, description = "Invalid source, or the acknowledgement is missing", body = ApiError),
+        (status = 422, description = "Invalid source, the acknowledgement is missing, or this import is not the caller's to retract", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError)
     ),
@@ -657,7 +673,12 @@ pub async fn correct_import(
     Extension(principal): Extension<Principal>,
     ApiBytes(body): ApiBytes,
 ) -> Result<Json<ImportCorrectionDto>, ApiFailure> {
-    require_admin(&principal)?;
+    // Only the floor is checked here. What an agent may retract depends on what
+    // the journal says it declared, and the transport has no journal: the
+    // scenario decides it against the same read the reversal is computed from.
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
     let request: CorrectImportRequest = serde_json::from_slice(&body).map_err(|error| {
         invalid_field("body", "import correction JSON object", error.to_string())
     })?;
@@ -840,7 +861,7 @@ pub async fn list_classification_rules(
         rules
             .into_iter()
             .map(ClassificationRuleDto::from_port)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
@@ -875,14 +896,14 @@ pub async fn create_classification_rule(
     let change = create_rule(
         &state.services,
         &principal,
-        request.matcher,
-        request.outcome,
+        &request.matcher.to_domain(),
+        request.outcome.to_domain()?,
         request.replaces,
     )
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(ClassificationRuleChangeDto::from_domain(change)),
+        Json(ClassificationRuleChangeDto::from_domain(change)?),
     ))
 }
 
@@ -3029,23 +3050,32 @@ fn intake_verdict_dto(row: usize, outcome: &IntakeOutcome) -> VerdictDto {
 /// than guessed at, and the refusal names both. The response carries the account
 /// the declaration resolved to, and that identifier is the one the rows of this
 /// session must name.
+///
+/// Refused when the declared import already has a session open **and that
+/// session holds rows**: it is a statement half imported, and only the caller
+/// knows whether the file in its hand is that statement or another one. The
+/// refusal names the session, says how long it has been open and what it holds,
+/// and publishes the two calls that end it. A session found holding nothing is
+/// handed back as before — that is a caller retrying the open call, and there is
+/// nothing in an empty session to mix a second statement into.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions",
     request_body = OpenImportSessionRequest,
     responses(
-        (status = 201, description = "Session opened, or the one this import already had", body = ImportSessionDto),
+        (status = 201, description = "Session opened, or the empty one this import already had", body = ImportSessionDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
-        (status = 422, description = "Request could not be read", body = ApiError)
+        (status = 422, description = "Request could not be read, or this import already has a session holding rows", body = ApiError)
     ),
     security(("bearer" = []))
 )]
 pub async fn open_import_session(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiJson(request): ApiJson<OpenImportSessionRequest>,
 ) -> Result<(StatusCode, Json<ImportSessionDto>), ApiFailure> {
     if !principal.scope.may_submit() {
@@ -3062,13 +3092,19 @@ pub async fn open_import_session(
         }
         None => (None, None, None),
     };
+    // Converted through the catalogue rather than with `?`: the refusal below
+    // offers calls rather than values — no label written into this request ends
+    // a session that is already open — and their addresses resolve only against
+    // the completed document. `ApiFailure::from(AppError)` has no catalogue to
+    // reach and would drop them.
     let session = iaam_app::scenarios::import_session::open_session(
         &state.services,
         &principal,
         source,
         import,
     )
-    .await?;
+    .await
+    .map_err(|error| ApiFailure::from_app(error, &catalog))?;
     Ok((
         StatusCode::CREATED,
         Json(ImportSessionDto {
@@ -3195,10 +3231,25 @@ pub async fn add_import_rows(
 
 /// Answer one of the session's questions.
 ///
-/// The answer is written as a durable classification rule as well as onto the
-/// row, so the next import of a matching row settles without asking. Nothing is
-/// recorded in the journal: the answer settles what the row is, and commit is
-/// what records it.
+/// The answer is written onto the row, and — for an owner token only — as a
+/// durable classification rule beside it, so the next import of a matching row
+/// settles without asking. Nothing is recorded in the journal: the answer
+/// settles what the row is, and commit is what records it.
+///
+/// **The split is `iaam-hnod`.** Settling one row is import mechanics and
+/// belongs to whoever is running the import. Generalising that settlement into a
+/// standing rule decides rows nobody has looked at yet, which is the same act
+/// `POST /v1/classification-rules` performs under an owner-only gate — so an
+/// agent that could do it here would be making the decision through a route
+/// whose name does not mention rules. Under an agent token the row settles and
+/// `rule` comes back absent; the owner turns the answer into a rule with his own
+/// token if he wants it to stand.
+///
+/// An answer carrying a field its own word does not take — an `account` beside
+/// `received`, an `origin` beside anything but `fee` — is refused rather than
+/// applied with the extra field dropped. Sending one is the signature of a
+/// caller that meant a different answer, and settling the row as the word it
+/// typed would record a decision nobody made.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions/{session}/questions/{question}/answer",
@@ -3214,7 +3265,7 @@ pub async fn add_import_rows(
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
-        (status = 422, description = "The answer is not one this question admits", body = ApiError)
+        (status = 422, description = "The answer is not one this question admits, or it carries a field its own word does not take", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -3321,6 +3372,7 @@ pub async fn commit_import_session(
         &principal,
         ImportSessionId(id),
         revision.as_ref(),
+        request.accept_control_mismatch,
     )
     .await
     .map_err(|error| ApiFailure::from_app(error, &catalog))?;
@@ -3339,7 +3391,114 @@ pub async fn commit_import_session(
             .enumerate()
             .map(|(index, verdict)| VerdictDto::from_domain(index + 1, verdict))
             .collect(),
+        control_assertions: outcome
+            .control_assertions
+            .iter()
+            .map(RecordedEventDto::from_domain)
+            .collect(),
     }))
+}
+
+/// State the control figures this session's source printed for itself.
+///
+/// A bank statement prints its own arithmetic — opening balance, closing
+/// balance, and how much crossed the account each way — and until now a session
+/// could not take it. The figures went in afterwards, through the owner-only
+/// reconciliation route, against a journal that already held whatever the import
+/// got wrong. So the one moment a mismatch was cheap was the one moment nothing
+/// compared anything, while the source had printed the answer on the same page
+/// as the rows.
+///
+/// Stating them makes the assessment compare: `control_reconciliation` puts both
+/// numbers beside each other per account and currency, and a disagreement takes
+/// the readiness to `does_not_reconcile`. Committing over one stays possible —
+/// a statement can itself be wrong — but takes `accept_control_mismatch`.
+///
+/// One interval per call, because a control section belongs to the document it
+/// is printed on. Restating a section replaces it: a transcription corrected is
+/// a correction.
+///
+/// **This is not the owner stating his balance.** That is
+/// `POST /v1/reconciliation/balance`, which is owner-only and writes under the
+/// owner-stated parser version, capped at `accepted_internal` by §10.4. What is
+/// stated here is what a document says, by whoever fed the document in — an
+/// agent may do it, exactly as an agent may feed in the rows — and it is written
+/// under its own parser version and its own key namespace, so neither claim can
+/// supersede or deduplicate the other.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/control-figures",
+    params(("session" = Uuid, Path, description = "Import session identifier")),
+    request_body = StateImportControlFiguresRequest,
+    responses(
+        (status = 200, description = "Every control section the session now holds", body = Vec<ControlSectionDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such open session", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "A section states nothing, names an account and currency twice, gives a signed turnover, or names an inverted interval", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn state_import_control_figures(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<StateImportControlFiguresRequest>,
+) -> Result<Json<Vec<ControlSectionDto>>, ApiFailure> {
+    if !principal.scope.may_submit() {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let period = AssertionPeriod::between(request.from, request.to).ok_or_else(|| {
+        invalid_field(
+            "period",
+            "from no later than to",
+            format!("{}..{}", request.from, request.to),
+        )
+    })?;
+    let mut stated = Vec::with_capacity(request.figures.len());
+    for (index, figures) in request.figures.iter().enumerate() {
+        let currency = figures.currency.to_domain();
+        // Each figure is parsed under its own pointer. A batch of four rejected
+        // as «one of them is not a decimal» would send the caller to read all
+        // four.
+        let amount = |value: &Option<String>, field: &str| {
+            value
+                .as_ref()
+                .map(|amount| {
+                    let pointer = format!("figures[{index}].{field}");
+                    let decimal = amount.parse::<Decimal>().map_err(|_| {
+                        invalid_field(pointer.clone(), "decimal string", amount.clone())
+                    })?;
+                    iaam_app::ingest::operation::to_minor_units(decimal, currency, "amount")
+                        .map(PostedMinor::new)
+                        .map_err(|rejection| {
+                            invalid_field(pointer, &rejection.expected, rejection.actual)
+                        })
+                })
+                .transpose()
+        };
+        stated.push(ControlSection {
+            account: AccountId(figures.account),
+            currency,
+            period,
+            opening: amount(&figures.opening, "opening")?,
+            closing: amount(&figures.closing, "closing")?,
+            debit_turnover: amount(&figures.debit_turnover, "debit_turnover")?,
+            credit_turnover: amount(&figures.credit_turnover, "credit_turnover")?,
+        });
+    }
+    let held = iaam_app::scenarios::import_session::state_control_figures(
+        &state.services,
+        &principal,
+        ImportSessionId(id),
+        stated,
+    )
+    .await?;
+    Ok(Json(
+        held.iter().map(ControlSectionDto::from_domain).collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3460,7 +3619,7 @@ pub async fn abandon_import_session(
 fn session_contents_dto(contents: &SessionContents) -> ImportSessionContentsDto {
     ImportSessionContentsDto {
         session: ImportSessionDto::from_domain(&contents.session),
-        rows: contents.observations.len(),
+        row_count: contents.observations.len(),
         questions: contents
             .questions
             .iter()
@@ -3471,6 +3630,11 @@ fn session_contents_dto(contents: &SessionContents) -> ImportSessionContentsDto 
             .iter()
             .filter(|question| question.is_open())
             .count(),
+        control_figures: contents
+            .control_figures
+            .iter()
+            .map(ControlSectionDto::from_domain)
+            .collect(),
     }
 }
 

@@ -221,6 +221,7 @@ fn balances_from(state: &LedgerState, fixture: &Fixture) -> BalancesReport {
             accounts: vec![PopulationAccount {
                 account: fixture.account,
                 title: "Brokerage".to_owned(),
+                institution: None,
                 standing: AccountStanding::Covered,
             }],
         },

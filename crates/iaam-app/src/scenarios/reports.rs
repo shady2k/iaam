@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::event::Event;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::ids::{AccountId, InstrumentId};
@@ -19,8 +18,8 @@ use iaam_core::projection::balances::Balances;
 use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
-use iaam_core::reconciliation::ReconciliationLedger;
-use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
+use iaam_core::reconciliation::claim::AssertionPeriod;
+use iaam_core::reconciliation::{OpeningAnchor, OpeningAnchors, ReconciliationLedger};
 use iaam_core::report::assets;
 use iaam_core::returns::{
     KnowledgeCoordinate, ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs,
@@ -63,7 +62,7 @@ pub use iaam_core::report::confidence::{
     returns_confidence,
 };
 pub use iaam_core::report::population::{
-    AccountStanding, PopulationAccount, PopulationCompleteness, ReportPopulation,
+    AccountStanding, KnownAccountCoverage, PopulationAccount, ReportPopulation,
 };
 
 /// Yield report request.
@@ -154,17 +153,29 @@ impl MoneyFlowOutcome {
     }
 }
 
-/// The population, from the contour the fold was given and the accounts the
-/// system knows about.
+/// The population, from the contour the fold was given, the accounts the system
+/// knows about, and the two things that can put an account outside on purpose.
 ///
-/// `placed_elsewhere` is the set of accounts some contour of the owner claims.
-/// It is a parameter rather than a lookup here so that the decision this
-/// function makes — which of three standings an account has — can be tested
-/// without a store, and so that the store round-trips happen once per report.
+/// `placed_elsewhere` is the set of accounts some other contour of the owner
+/// claims. `ruled_outside` is the set he has ruled outside every contour of his
+/// through `record_account_scope`, with a reason. Both are parameters rather
+/// than lookups here so that the decision this function makes — which of four
+/// standings an account has — can be tested without a store, and so that the
+/// store round-trips happen once per report.
+///
+/// **Membership outranks a disposition.** Nothing clears an exclusion when an
+/// account is later added to a contour, so an account can carry both, and then
+/// the two disagree about whether the owner wants it reported. When they do,
+/// this reports the membership — which is what [`crate::actions::account_scope`]
+/// reports to the outstanding-work queue. The queue and the report reading one
+/// pair of facts in two different orders would be one question with two
+/// answers, and the reader would have no way to tell which of them the owner
+/// had actually said last.
 fn population_from(
     definition: &ContourDefinition,
     accounts: Vec<AccountView>,
     placed_elsewhere: &BTreeSet<AccountId>,
+    ruled_outside: &BTreeSet<AccountId>,
 ) -> ReportPopulation {
     let entries = accounts
         .into_iter()
@@ -173,12 +184,15 @@ fn population_from(
                 AccountStanding::Covered
             } else if placed_elsewhere.contains(&account.id) {
                 AccountStanding::OutsidePlacedElsewhere
+            } else if ruled_outside.contains(&account.id) {
+                AccountStanding::OutsideByDecision
             } else {
                 AccountStanding::OutsideUndecided
             };
             PopulationAccount {
                 account: account.id,
                 title: account.title,
+                institution: account.institution,
                 standing,
             }
         })
@@ -193,12 +207,18 @@ fn population_from(
 /// Every account claimed by a contour of this owner other than the one the
 /// report was computed over.
 ///
-/// Membership elsewhere is the strongest evidence available today that the
-/// owner has ruled on an account: he drew a contour and put it in one. It is
-/// **not** evidence that leaving it out of this report was intended — only that
-/// the account is not one the system has never been told anything about. The
-/// authoritative disposition is a separate notion (see `ReportPopulation`);
-/// when it exists, this derivation is what it replaces.
+/// Membership elsewhere is evidence that the owner has ruled on where an
+/// account belongs: he drew a contour and put it in one. It is **not** evidence
+/// that leaving it out of this report was intended — only that the account is
+/// not one the system has never been told anything about.
+///
+/// The authoritative disposition is a separate notion, and it did not replace
+/// this derivation when it arrived: the two answer different questions, so they
+/// stand beside each other as two of the four standings. This one says the
+/// account is somewhere; [`account_scope_exclusions`] says the owner wants it
+/// nowhere.
+///
+/// [`account_scope_exclusions`]: crate::ports::ReferenceStore::list_account_scope_exclusions
 ///
 /// Each contour is read at the version the store currently holds: the question
 /// is what the owner has decided by now, not what he had decided when the
@@ -240,7 +260,24 @@ async fn report_population(
     let accounts = services.store.list_accounts(principal.owner).await?;
     let placed_elsewhere =
         accounts_placed_elsewhere(services, principal, definition, &accounts).await?;
-    Ok(population_from(definition, accounts, &placed_elsewhere))
+    // The owner's own ruling, read rather than inferred. Before this read the
+    // report derived every standing from contour membership, so a disposition
+    // recorded in as many words changed nothing a reader of the report could
+    // see — while the register beside it went on naming the call that recorded
+    // it as the way to close the caveat.
+    let ruled_outside = services
+        .store
+        .list_account_scope_exclusions(principal.owner)
+        .await?
+        .into_iter()
+        .map(|exclusion| exclusion.account)
+        .collect();
+    Ok(population_from(
+        definition,
+        accounts,
+        &placed_elsewhere,
+        &ruled_outside,
+    ))
 }
 
 async fn resolve_contour(
@@ -470,12 +507,17 @@ async fn balances_with_prices(
     let population = report_population(services, principal, &definition).await?;
     let contour_accounts: Vec<AccountId> =
         population.covered().map(|entry| entry.account).collect();
-    // Both read the effective set for the same reason `Balances` does above: a
+    // The effective set for the same reason `Balances` uses it above: a
     // retracted movement is not this account's first one, and a retracted
-    // assertion anchors nothing. Reading the raw journal here would put the two
-    // answers back into one function, one line apart from where that was fixed.
-    let first_cash = first_cash_movements(&effective);
-    let openings = opening_cash_assertions(&effective);
+    // assertion anchors nothing.
+    //
+    // The rule itself is `iaam_core::reconciliation::OpeningAnchors` and is not
+    // restated here. It used to be, and reconciliation applied a different one
+    // over the same silence: this answer refused to call an unanchored fold a
+    // balance while reconciliation called it zero and told the owner his own
+    // anchor was wrong (`iaam-d7hn`). Two copies of one rule is what made that
+    // possible.
+    let anchors = OpeningAnchors::of(&effective);
     let mut rows = Vec::with_capacity(contour_accounts.len());
     for account in contour_accounts {
         let cash = balances
@@ -483,7 +525,7 @@ async fn balances_with_prices(
             .filter(|(owner_account, _)| *owner_account == account)
             .map(|(_, money)| AccountCash {
                 money,
-                opening: cash_opening(&first_cash, &openings, account, money.currency()),
+                opening: cash_opening(anchors.cash(account, money.currency())),
             })
             .collect();
         let reconciliation =
@@ -574,82 +616,17 @@ fn period_reports(perimeter: &PerimeterAssessment, account: AccountId) -> Period
     )
 }
 
-/// The earliest effective date of a cash movement, per account and currency.
+/// The balances answer's word for what the core rule decided.
 ///
-/// Keyed by the leg's account rather than the event's: a transfer between two
-/// accounts is one event and moves cash on both, and it is the leg that the
-/// projection accumulates.
-fn first_cash_movements(events: &[&Event]) -> BTreeMap<(AccountId, CurrencyCode), Date> {
-    let mut first = BTreeMap::new();
-    for event in events {
-        let Some(date) = event.dates.effective_date() else {
-            continue;
-        };
-        for leg in &event.legs {
-            let Some(money) = leg.cash_effect() else {
-                continue;
-            };
-            first
-                .entry((leg.account, money.currency()))
-                .and_modify(|known: &mut Date| {
-                    if date < *known {
-                        *known = date;
-                    }
-                })
-                .or_insert(date);
-        }
-    }
-    first
-}
-
-/// Every opening cash assertion in the journal, as the start of the interval it
-/// speaks about — that date is what has to reach back far enough.
-fn opening_cash_assertions(events: &[&Event]) -> Vec<(AccountId, CurrencyCode, Date)> {
-    events
-        .iter()
-        .filter_map(|event| match event.kind {
-            EventKind::ControlAssertion {
-                period,
-                claim:
-                    ControlClaim::CashBalance {
-                        currency,
-                        at: BalancePoint::Opening,
-                        ..
-                    },
-            } => Some((event.account, currency, period.from)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Whether an opening assertion covers the state before the first cash movement.
-///
-/// An opening assertion states the balance before the first event of its
-/// interval, so it anchors the whole accumulation exactly when its interval
-/// starts no later than the first movement. An assertion that opens after that
-/// movement leaves everything before it unasserted, and the sum is still a
-/// running one.
-///
-/// An account with cash but no dated movement cannot be anchored by anything,
-/// so it reads as unasserted rather than as a balance.
-fn cash_opening(
-    first_cash: &BTreeMap<(AccountId, CurrencyCode), Date>,
-    openings: &[(AccountId, CurrencyCode, Date)],
-    account: AccountId,
-    currency: CurrencyCode,
-) -> CashOpening {
-    let Some(first) = first_cash.get(&(account, currency)) else {
-        return CashOpening::Unasserted;
-    };
-    if openings
-        .iter()
-        .any(|(asserted_account, asserted_currency, from)| {
-            *asserted_account == account && *asserted_currency == currency && from <= first
-        })
-    {
-        CashOpening::Asserted
-    } else {
-        CashOpening::Unasserted
+/// A translation and nothing else: the rule lives in
+/// [`OpeningAnchors`](iaam_core::reconciliation::OpeningAnchors), which
+/// reconciliation reads too, and this maps its answer onto the vocabulary this
+/// report publishes. Two spellings of one distinction are tolerable; two rules
+/// were not.
+const fn cash_opening(anchor: OpeningAnchor) -> CashOpening {
+    match anchor {
+        OpeningAnchor::Asserted => CashOpening::Asserted,
+        OpeningAnchor::Unasserted => CashOpening::Unasserted,
     }
 }
 
@@ -1173,6 +1150,7 @@ async fn build_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iaam_core::operation::OperationKey;
     use iaam_core::projection::invariants::InvariantViolation;
     use time::macros::date;
 
@@ -1318,54 +1296,6 @@ mod tests {
     }
 
     #[test]
-    fn an_opening_assertion_anchors_only_what_it_reaches_back_over() {
-        // An opening assertion states the balance before the first event of its
-        // own interval. It therefore anchors the accumulation exactly when that
-        // interval starts no later than the first movement; one that opens
-        // after the movement leaves everything before it unasserted, and the
-        // figure is still a running sum.
-        let account = AccountId::new_random();
-        let other = AccountId::new_random();
-        let first = date!(2026 - 08 - 05);
-        let mut movements = BTreeMap::new();
-        movements.insert((account, CurrencyCode::Rub), first);
-        movements.insert((account, CurrencyCode::Usd), first);
-
-        let covering = [(account, CurrencyCode::Rub, date!(2026 - 08 - 01))];
-        assert_eq!(
-            cash_opening(&movements, &covering, account, CurrencyCode::Rub),
-            CashOpening::Asserted
-        );
-        // The same currency, another account: an assertion is not shared.
-        assert_eq!(
-            cash_opening(&movements, &covering, other, CurrencyCode::Rub),
-            CashOpening::Unasserted
-        );
-        // The same account, another currency: nor is it shared across those.
-        assert_eq!(
-            cash_opening(&movements, &covering, account, CurrencyCode::Usd),
-            CashOpening::Unasserted
-        );
-
-        // The boundary: an interval opening on the day of the first movement
-        // still speaks about the state before it.
-        let on_the_day = [(account, CurrencyCode::Rub, first)];
-        assert_eq!(
-            cash_opening(&movements, &on_the_day, account, CurrencyCode::Rub),
-            CashOpening::Asserted
-        );
-        let a_day_late = [(account, CurrencyCode::Rub, date!(2026 - 08 - 06))];
-        assert_eq!(
-            cash_opening(&movements, &a_day_late, account, CurrencyCode::Rub),
-            CashOpening::Unasserted
-        );
-        assert_eq!(
-            cash_opening(&movements, &[], account, CurrencyCode::Rub),
-            CashOpening::Unasserted
-        );
-    }
-
-    #[test]
     fn the_manifest_separates_a_deliberate_exclusion_from_an_open_question() {
         // The distinction the manifest exists for. Without it the two outside
         // accounts read alike, and a report over a contour nobody has finished
@@ -1394,7 +1324,7 @@ mod tests {
         ];
         let placed: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
 
-        let population = population_from(&definition, accounts, &placed);
+        let population = population_from(&definition, accounts, &placed, &BTreeSet::new());
 
         assert_eq!(population.contour, definition.id());
         assert_eq!(population.version, ContourVersion(3));
@@ -1424,7 +1354,10 @@ mod tests {
         );
         // One account nobody has ruled on outranks any number of deliberate
         // exclusions beside it: the answer is about an undecided part.
-        assert_eq!(population.completeness(), PopulationCompleteness::Undecided);
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Undecided
+        );
     }
 
     #[test]
@@ -1438,10 +1371,13 @@ mod tests {
             institution: None,
         }];
 
-        let population = population_from(&definition, accounts, &BTreeSet::new());
+        let population = population_from(&definition, accounts, &BTreeSet::new(), &BTreeSet::new());
 
         assert_eq!(population.outside().count(), 0);
-        assert_eq!(population.completeness(), PopulationCompleteness::Whole);
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Whole
+        );
     }
 
     #[test]
@@ -1464,10 +1400,106 @@ mod tests {
         ];
         let placed: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
 
-        let population = population_from(&definition, accounts, &placed);
+        let population = population_from(&definition, accounts, &placed, &BTreeSet::new());
 
         assert_eq!(population.undecided().count(), 0);
-        assert_eq!(population.completeness(), PopulationCompleteness::Bounded);
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Bounded
+        );
+    }
+
+    /// The bug this standing was added for. The owner ruled the account
+    /// outside, in as many words and with a reason; before the disposition was
+    /// read, the manifest still called it an account nobody had ruled on, and
+    /// the register beside it still offered him the call he had already made.
+    #[test]
+    fn an_account_the_owner_ruled_outside_is_not_reported_as_one_nobody_ruled_on() {
+        let inside = AccountId::new_random();
+        let ruled_out = AccountId::new_random();
+        let definition =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [inside]);
+        let accounts = vec![
+            AccountView {
+                id: inside,
+                title: "Main".to_owned(),
+                institution: None,
+            },
+            AccountView {
+                id: ruled_out,
+                title: "Savings".to_owned(),
+                institution: Some("Second Bank".to_owned()),
+            },
+        ];
+        let ruled_outside: BTreeSet<AccountId> = [ruled_out].into_iter().collect();
+
+        let population = population_from(&definition, accounts, &BTreeSet::new(), &ruled_outside);
+
+        assert_eq!(
+            population
+                .outside()
+                .map(|entry| (entry.account, entry.standing))
+                .collect::<Vec<_>>(),
+            vec![(ruled_out, AccountStanding::OutsideByDecision)]
+        );
+        assert_eq!(population.undecided().count(), 0);
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Bounded
+        );
+        // The name and the bank travel with the identifier: this is the list
+        // the owner is asked to rule on, and two accounts he calls one word are
+        // one line apart in it.
+        let entry = population.outside().next().expect("the ruled-out account");
+        assert_eq!(entry.title, "Savings");
+        assert_eq!(entry.institution.as_deref(), Some("Second Bank"));
+        // And the register no longer offers him the call he already made.
+        let kinds: Vec<_> = population
+            .caveats()
+            .iter()
+            .map(|caveat| caveat.kind())
+            .collect();
+        assert_eq!(kinds, vec![CaveatKind::AccountRuledOutside]);
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| kind.closed_by().contains(&OperationKey::RecordAccountScope)),
+            "the register still names the call the owner has already made"
+        );
+    }
+
+    /// Membership and a disposition can both be recorded for one account —
+    /// nothing clears the exclusion when the account joins a contour — and the
+    /// report must then say what the outstanding-work queue says.
+    #[test]
+    fn membership_outranks_a_disposition_the_owner_never_withdrew() {
+        let inside = AccountId::new_random();
+        let elsewhere = AccountId::new_random();
+        let definition =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [inside]);
+        let accounts = vec![
+            AccountView {
+                id: inside,
+                title: "Main".to_owned(),
+                institution: None,
+            },
+            AccountView {
+                id: elsewhere,
+                title: "Savings".to_owned(),
+                institution: None,
+            },
+        ];
+        let both: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
+
+        let population = population_from(&definition, accounts, &both, &both);
+
+        assert_eq!(
+            population
+                .outside()
+                .map(|entry| entry.standing)
+                .collect::<Vec<_>>(),
+            vec![AccountStanding::OutsidePlacedElsewhere]
+        );
     }
 
     #[test]
@@ -1476,19 +1508,21 @@ mod tests {
         // standings sharing a code is the defect with a manifest bolted on.
         let standings = [
             AccountStanding::Covered,
+            AccountStanding::OutsideByDecision,
             AccountStanding::OutsidePlacedElsewhere,
             AccountStanding::OutsideUndecided,
         ];
         let codes: BTreeSet<&str> = standings.iter().map(|standing| standing.code()).collect();
         assert_eq!(codes.len(), standings.len());
         assert!(!AccountStanding::Covered.is_outside());
+        assert!(AccountStanding::OutsideByDecision.is_outside());
         assert!(AccountStanding::OutsidePlacedElsewhere.is_outside());
         assert!(AccountStanding::OutsideUndecided.is_outside());
 
         let completeness = [
-            PopulationCompleteness::Whole,
-            PopulationCompleteness::Bounded,
-            PopulationCompleteness::Undecided,
+            KnownAccountCoverage::Whole,
+            KnownAccountCoverage::Bounded,
+            KnownAccountCoverage::Undecided,
         ];
         let codes: BTreeSet<&str> = completeness.iter().map(|value| value.code()).collect();
         assert_eq!(codes.len(), completeness.len());

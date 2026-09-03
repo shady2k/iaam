@@ -71,7 +71,6 @@ expression: report
     }
   },
   "population": {
-    "completeness": "whole",
     "contour": "[uuid]",
     "contour_version": 1,
     "covered": [
@@ -81,6 +80,7 @@ expression: report
         "title": "Brokerage"
       }
     ],
+    "known_account_coverage": "whole",
     "outside": []
   },
   "report_currency": "RUB",

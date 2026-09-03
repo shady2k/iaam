@@ -297,6 +297,96 @@ fn a_transfer_to_the_same_account_is_rejected_before_the_legs_are_built() {
     assert_eq!(rejection.field, "to");
 }
 
+/// Signed cash a set of events moves on one account, summed over their legs.
+fn cash_on(events: &[iaam_core::event::Event], account: AccountId) -> i64 {
+    events
+        .iter()
+        .flat_map(|event| event.legs.iter())
+        .filter(|leg| leg.account == account)
+        .filter_map(|leg| leg.cash_effect())
+        .map(|money| money.amount().raw())
+        .sum()
+}
+
+#[test]
+fn a_transfer_is_submitted_once_and_moves_both_accounts_by_itself() {
+    // One row states the whole movement. The receiving account is moved by the
+    // leg ingestion writes for it, not by a second submission, which is why
+    // there is nothing to send from the other statement.
+    let main = AccountId::new_random();
+    let savings = AccountId::new_random();
+    let mut operation = submit(OperationKind::Transfer {
+        to: savings,
+        amount_minor: 50_000,
+        currency: CurrencyCode::Rub,
+    });
+    operation.account = main;
+
+    let event = normalize(&operation, context())
+        .expect("a transfer between two accounts")
+        .event;
+    match event.kind {
+        EventKind::CashTransfer { from, to, .. } => {
+            assert_eq!(
+                from, main,
+                "the operation's own account is the sending side"
+            );
+            assert_eq!(to, savings);
+        }
+        other => panic!("expected a cash transfer, got {other:?}"),
+    }
+    let events = [event];
+    assert_eq!(cash_on(&events, main), -50_000);
+    assert_eq!(cash_on(&events, savings), 50_000);
+}
+
+#[test]
+fn mirroring_a_transfer_from_the_other_statement_counts_it_twice() {
+    // The mistake this pins: two banks each print the movement, and the caller
+    // submits a row per printed side. Nothing refuses it — a second submission
+    // of one movement is indistinguishable from a second movement — so both
+    // accounts move by twice the sum. The transfer is submitted once, and
+    // `Transfer` has no shape for the receiving half precisely because of this.
+    let main = AccountId::new_random();
+    let savings = AccountId::new_random();
+    let one_side = |from: AccountId, to: AccountId| {
+        let mut operation = submit(OperationKind::Transfer {
+            to,
+            amount_minor: 50_000,
+            currency: CurrencyCode::Rub,
+        });
+        operation.account = from;
+        normalize(&operation, context())
+            .expect("a transfer between two accounts")
+            .event
+    };
+
+    let mirrored = [one_side(main, savings), one_side(main, savings)];
+    assert_eq!(
+        cash_on(&mirrored, main),
+        -100_000,
+        "the sending account is debited once per submission, not once per movement"
+    );
+    assert_eq!(cash_on(&mirrored, savings), 100_000);
+}
+
+#[test]
+fn a_negative_transfer_amount_is_refused_rather_than_read_as_the_outgoing_leg() {
+    // The model that produces plausible output and is wrong: "one leg with a
+    // negative amount". Direction is carried by the two accounts, so a sign has
+    // nothing to say, and stating one is refused on the field the caller sent.
+    let mut operation = submit(OperationKind::Transfer {
+        to: AccountId::new_random(),
+        amount_minor: -50_000,
+        currency: CurrencyCode::Rub,
+    });
+    operation.account = AccountId::new_random();
+    let rejection = normalize(&operation, context()).unwrap_err();
+    assert_eq!(rejection.field, "amount");
+    assert_eq!(rejection.expected, "positive value");
+    assert_eq!(rejection.actual, "-500.00");
+}
+
 #[test]
 fn every_verdict_has_a_machine_readable_code_and_says_whether_it_was_recorded() {
     // The verdict is a contract with the external agent (§10.4): it parses the code

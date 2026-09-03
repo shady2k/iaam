@@ -35,16 +35,25 @@ use crate::dto::{
     MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
     MarketSyncRequest, MissingInputDto, MoneyFlowCurrencyDto, MoneyFlowReportDto,
     NegativeBalanceExpectationDto, NegativeCashDto, NotDecomposedAccountDto, NotDecomposedDto,
-    OfferChoiceDto, OpeningAssertionsDto, OperationDatesDto, OperationDto, OperationKindDto,
-    OwnerBalanceRequest, PerimeterRefusalDto, PlannedCorrectionDto, PopulationAccountDto,
-    PopulationDto, PositionCoverageDto, PositionsSideDto, PostingKindDto, PriceFreshnessDto,
-    PriceOriginDto, PriceProvenanceDto, PriceQualityDto, PriceSelectionDto, ProspectiveMetricDto,
-    QuotationBasisDto, QuotationBasisStatusDto, RateDto, RecomputePlanDto,
+    ObservationBasisDto, OfferChoiceDto, OpeningAssertionsDto, OperationDatesDto, OperationDto,
+    OperationKindDto, OwnerBalanceRequest, PerimeterRefusalDto, PlannedCorrectionDto,
+    PopulationAccountDto, PopulationDto, PositionCoverageDto, PositionsSideDto, PostingKindDto,
+    PriceFreshnessDto, PriceOriginDto, PriceProvenanceDto, PriceQualityDto, PriceSelectionDto,
+    ProspectiveMetricDto, QuotationBasisDto, QuotationBasisStatusDto, RateDto, RecomputePlanDto,
     ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountScopeRequest, RefusedRowDto,
     RequestPlanDto, RequiredInputDto, ResolutionOptionDto, ReturnsAnswerDto, ReturnsReportDto,
-    RowNameDto, SelectedPriceDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TaintDto, TokenDto, TristateDto, UncoveredPositionDto,
-    VerdictDto, ZeroReinvestmentMetricsDto,
+    RowNameDto, RuleMatcherDto, SelectedPriceDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TaintDto, TokenDto,
+    TristateDto, UncoveredPositionDto, VerdictDto, ZeroReinvestmentMetricsDto,
+};
+// The import assessment's own types, in a block of their own rather than merged
+// into the list above. Merging one name into a wrapped list of two hundred
+// reflows a third of them, and this file is edited by several changes at once;
+// a second `use` of the same module is the shape `routes.rs` already uses for
+// the same reason.
+use crate::dto::{
+    BatchTotalDto, ControlCheckDto, ControlComparisonDto, ControlReconciliationDto,
+    ControlSectionDto, RecordedEventDto, StateImportControlFiguresRequest, StatedControlFiguresDto,
 };
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
@@ -129,9 +138,11 @@ impl Modify for BearerSecurity {
         ClaimOutcomeDetailDto,
         ClaimOutcomeDto,
         ClaimValueDto,
+        ObservationBasisDto,
         ClassificationRuleChangeDto,
         ClassificationRuleDto,
         ClassifiedAsDto,
+        RuleMatcherDto,
         PlannedCorrectionDto,
         RecomputePlanDto,
         ClassificationRuleRequest,
@@ -246,6 +257,14 @@ impl Modify for BearerSecurity {
         TokenDto,
         UncoveredPositionDto,
         VerdictDto,
+        BatchTotalDto,
+        StateImportControlFiguresRequest,
+        StatedControlFiguresDto,
+        ControlSectionDto,
+        ControlReconciliationDto,
+        ControlComparisonDto,
+        ControlCheckDto,
+        RecordedEventDto,
         // The published vocabularies: every code the API can return, each with
         // the sentence that explains it (§13).
         VerdictCodeDto,

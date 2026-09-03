@@ -6,6 +6,7 @@
 //! extraneous. Therefore, the unit of status is an interval×dimension pair,
 //! not an event, and an event has no “confidence level” field.
 
+pub mod anchor;
 pub mod check;
 pub mod claim;
 pub mod evidence;
@@ -19,7 +20,8 @@ use time::Date;
 use crate::event::correction::resolve;
 use crate::event::{Event, kind::EventKind};
 use crate::ids::AccountId;
-use check::{ClaimOutcome, check_claim};
+pub use anchor::{OpeningAnchor, OpeningAnchors};
+use check::{ClaimOutcome, ObservationBasis, check_claim, observation_basis};
 use claim::{AssertionPeriod, BalancePoint, ControlClaim};
 pub use evidence::{Evidence, Ground, IdentityScope, SourceChannel};
 use observed::{ObserveError, observe};
@@ -129,11 +131,21 @@ impl DimensionStatus {
     }
 }
 
-/// One checked assertion together with its outcome.
+/// One checked assertion, its outcome, and what the outcome was reached from.
+///
+/// The three travel together because two of them are unreadable apart. An
+/// outcome without its basis states a verdict on a comparison it does not
+/// describe, and that was the defect: an owner told `discrepant` had to
+/// reconstruct by hand which events the observed figure had been summed from
+/// (`iaam-lg2t`). A claim without its outcome is just the document again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimCheck {
     pub claim: ControlClaim,
     pub outcome: ClaimOutcome,
+    /// What the observed side of this comparison was folded from. Present for
+    /// every outcome, including `matched`: the width of a confirmation is part
+    /// of what it confirms.
+    pub basis: ObservationBasis,
 }
 
 /// Assertion of account completeness over an interval.
@@ -256,6 +268,11 @@ impl ReconciliationLedger {
                             claim.dimension(),
                             exceptions,
                         ),
+                        // From the same observation the outcome was reached
+                        // from, in the same expression: a basis assembled later
+                        // from another fold could describe a comparison that was
+                        // never made.
+                        basis: observation_basis(claim, &observed),
                     })
                     .collect(),
             );
@@ -794,6 +811,26 @@ mod internals {
     use crate::money::{CurrencyCode, PostedMinor, Quantity};
     use crate::numeric::decimal::Dec;
     use time::macros::date;
+
+    /// A basis for a check assembled by hand.
+    ///
+    /// These tests exercise the registry's merging and evidence rules, which
+    /// never read the basis; what they need is a value that is not a lie. One
+    /// event dated within the interval and an asserted start is the ordinary
+    /// case, and stating it explicitly is why `ObservationBasis` has no
+    /// `Default`: a default here would be a placeholder standing in for a real
+    /// fold, which is the shape §4.9 forbids.
+    fn basis() -> check::ObservationBasis {
+        check::ObservationBasis {
+            folded: observed::FoldSpan {
+                events: 1,
+                first: Some(date!(2026 - 03 - 10)),
+                last: Some(date!(2026 - 03 - 10)),
+            },
+            start: check::ObservedStart::Asserted,
+            compared: check::Compared::Level,
+        }
+    }
 
     /// A channel with a document derived from the parser name.
     ///
@@ -1345,6 +1382,7 @@ mod internals {
                     currency: CurrencyCode::Rub,
                 },
             }),
+            basis: basis(),
         }];
         assert!(
             ground_one(
@@ -1360,6 +1398,7 @@ mod internals {
         let matched_closing = vec![ClaimCheck {
             claim: cash(100_000, BalancePoint::Closing),
             outcome: ClaimOutcome::Matched,
+            basis: basis(),
         }];
         assert!(
             ground_one(
@@ -1397,6 +1436,7 @@ mod internals {
         let outcomes = vec![ClaimCheck {
             claim: cash(100_000, BalancePoint::Opening),
             outcome: ClaimOutcome::Matched,
+            basis: basis(),
         }];
         assert!(
             ground_one(
@@ -1419,6 +1459,7 @@ mod internals {
         let matched = vec![ClaimCheck {
             claim: cash(100_000, BalancePoint::Closing),
             outcome: ClaimOutcome::Matched,
+            basis: basis(),
         }];
         let no_taint = [BTreeSet::new(), BTreeSet::new()];
 
@@ -1494,6 +1535,7 @@ mod internals {
         let outcomes = vec![ClaimCheck {
             claim: cash(100_000, BalancePoint::Opening),
             outcome: ClaimOutcome::Matched,
+            basis: basis(),
         }];
 
         assert!(
@@ -1528,6 +1570,7 @@ mod internals {
             outcome: ClaimOutcome::NotComparable {
                 reason: check::NotComparable::NoJournalCoverage,
             },
+            basis: basis(),
         }];
         assert!(ground_one(0, &broken, &[current.clone()], &[BTreeSet::new()],).is_none());
     }

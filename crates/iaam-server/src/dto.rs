@@ -9,7 +9,10 @@
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
 use crate::action_catalog::ActionCatalog;
-use iaam_app::ingest::classification::{Answer, AnswerShape, Movement};
+use iaam_app::error::AppError;
+use iaam_app::ingest::classification::{
+    Answer, AnswerShape, Classification, Movement, RuleMatcher,
+};
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::observation::{
     Intake, ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity,
@@ -20,18 +23,22 @@ use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CashAssetClass, CategoryRuleView, CategoryView,
     ClassificationRuleView, IssuedToken, NegativeBalanceExpectation, Scope, TokenView,
 };
-use iaam_app::ports::{ImportQuestionView, ImportSessionView};
+use iaam_app::ports::{ImportQuestionView, ImportSessionView, Recorded};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
-use iaam_app::scenarios::classification::{ClassifiedAs, PlannedCorrection, RuleChange};
+use iaam_app::scenarios::classification::{
+    ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
+};
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
 use iaam_app::scenarios::import_session::{
-    HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow, RetentionReason,
+    ControlReconciliation, HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow,
+    RetentionReason,
 };
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
     MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
+use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -42,7 +49,7 @@ use iaam_core::instrument::AliasNamespace;
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::money_flow::MoneyFlowError;
-use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue};
+use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue, ObservationBasis};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{ClaimCheck, Dimension, ReconciliationStatus, Taint};
 use iaam_core::returns::zero_reinvestment::{
@@ -527,6 +534,36 @@ pub struct OperationDto {
     pub kind: OperationKindDto,
     #[serde(default)]
     pub dates: OperationDatesDto,
+    /// A name the caller gives **the fact**, so sending it twice records it
+    /// once (§10.6, level two).
+    ///
+    /// A key names a fact, not a slot. Re-sending under a key the journal
+    /// already holds is answered `duplicate` with the identifier of the first
+    /// event, whatever the rest of the body says — the key is matched before
+    /// the operation is compared to anything, so a **corrected** row under a
+    /// key already used writes nothing and the journal keeps the wrong number.
+    /// The response is a success, and it is easy to read as "the correction
+    /// landed".
+    ///
+    /// This is the natural first move of an agent client — "the numbers were
+    /// wrong, so I fixed them and resent" — and it is precisely the one that
+    /// does nothing. **A fact that turned out wrong is corrected, never
+    /// resent**: `POST /v1/corrections` with a `replacement` retracts the
+    /// recorded event and states what should have stood instead, and it is the
+    /// only thing that changes a number already in the journal. Re-use is not
+    /// reversal: nothing on the ingest path writes a retraction, so a repeated
+    /// submission is a no-op rather than a retract-and-add.
+    ///
+    /// The key is scoped to the **owner**, not to the account, the source or
+    /// the import: two unrelated statements whose rows are keyed `row-1` are
+    /// one fact as far as this field is concerned. Construct keys that are
+    /// unique across everything the owner will ever import — the document and
+    /// the row within it, rather than the row alone.
+    ///
+    /// Omitting it is not a lesser version of sending it. Without a key a
+    /// second submission of the same row is a second event, because two
+    /// identical purchases on one day are an ordinary thing and the system has
+    /// no right to merge them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2246,7 +2283,7 @@ fn issue(value: &MaterialIssue) -> String {
 /// **First in every report that carries it**, before the accounts, the
 /// currencies and the population. A caveat published after the figures has
 /// already lost to the reader who stopped at the figures — which is the
-/// difficulty this block answers: `population.completeness` was the last
+/// difficulty this block answers: `population` was the last
 /// top-level field of the balances answer, and a run that read `covered=3,
 /// outside=15` as an ordinary complete result never got that far.
 ///
@@ -2280,6 +2317,12 @@ pub struct ConfidenceDto {
     /// Exactly `caveats == []`, and derived from it rather than stated beside
     /// it: there is no way to build this block asserting completeness over a
     /// non-empty register.
+    ///
+    /// Bounded by what the report can see. Every caveat is read off a
+    /// computation the report itself performed, so `true` says "nothing the
+    /// fold could check is missing" — and for the population half of the
+    /// register, what the fold can check is the accounts this instance has been
+    /// told about. See `population.known_account_coverage`.
     pub complete: bool,
     /// The specific things that are not. Always present; empty exactly when
     /// `complete` is true.
@@ -2290,10 +2333,10 @@ pub struct ConfidenceDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CaveatDto {
     /// What sort of gap this is — `account_in_no_scope`,
-    /// `account_in_another_scope`, `running_cash_sum`, `period_reports_refused`,
-    /// `undecomposed_movements`, `unexplained_cash_change`, `unpriced_position`,
-    /// `holding_not_valued`, `terminal_value_not_computed`,
-    /// `return_not_computed`.
+    /// `account_in_another_scope`, `account_ruled_outside`, `running_cash_sum`,
+    /// `period_reports_refused`, `undecomposed_movements`,
+    /// `unexplained_cash_change`, `unpriced_position`, `holding_not_valued`,
+    /// `terminal_value_not_computed`, `return_not_computed`.
     ///
     /// A closed set. Every one of them is read off a computation the report
     /// already performs: nothing here folds the journal a second time.
@@ -2344,8 +2387,10 @@ pub struct ClosingOperationDto {
     pub operation_id: String,
     pub method: String,
     pub path: String,
-    #[serde(rename = "requestSchema")]
-    pub request_schema: String,
+    /// The component schema the call's body answers to. Absent for a call that
+    /// takes no body — see [`crate::action_catalog::ActionOperation`].
+    #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
+    pub request_schema: Option<String>,
 }
 
 /// The typed subject of a caveat.
@@ -2448,19 +2493,43 @@ impl CaveatSubjectDto {
 /// computed afterwards can see what was left out. This block is the second
 /// statement, and without it a report over part of the owner's money reads as
 /// an answer about all of it.
+///
+/// **`covered` and `outside` together are the whole denominator, and it is the
+/// accounts this instance has been told about.** An account of the owner's that
+/// was never created here appears in neither list, and it is not reported as
+/// missing: it is invisible to the fold rather than omitted by it. That bound
+/// is why the verdict below is called `known_account_coverage` and not
+/// `completeness` — the old name invited a client to read `whole` as "these
+/// figures are all of his money", which this API cannot know and does not say.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PopulationDto {
     /// The scope the report was computed over.
     pub contour: Uuid,
     pub contour_version: u32,
+    /// How much of what the system knows about this report answered about.
+    ///
     /// `whole` — every account the system knows of is covered. `bounded` —
-    /// accounts are outside, and each of them is in a scope the owner drew.
-    /// `undecided` — accounts are outside that no scope claims, so the report
-    /// answers about a part of the owner's money that nobody has delimited.
+    /// accounts are outside, and the owner has ruled on each of them, whether
+    /// by placing it in a scope of his own or by ruling it outside every scope.
+    /// `undecided` — accounts are outside that nobody has ruled on at all, so
+    /// the report answers about a part of the owner's money that nobody has
+    /// delimited.
     ///
     /// `undecided` outranks `bounded`: one account nobody has ruled on is
-    /// enough, however many deliberate omissions stand beside it.
-    pub completeness: String,
+    /// enough, however many deliberate omissions stand beside it. And an
+    /// account he ruled outside deliberately is `bounded`, never `whole`: this
+    /// field says what the figures cover, not how tidy his decisions are.
+    ///
+    /// **Read the name before reporting the value.** `whole` says "every
+    /// account we know of", never "everything he has". Nothing in this API sees
+    /// a source document — the import path receives the rows a client chose to
+    /// send it — so an export holding seven accounts of which four were ever
+    /// created here produces `whole` over the four, and a client that reports
+    /// that as complete coverage is making a claim this API did not make. The
+    /// check is not in this field: it is comparing `covered` and `outside`
+    /// against the accounts the source actually holds, which only the holder of
+    /// the source can do.
+    pub known_account_coverage: String,
     /// The accounts inside the report's scope — the population the figures were
     /// folded over. Always present; the same set the report's own rows are
     /// built from.
@@ -2478,11 +2547,18 @@ pub struct PopulationAccountDto {
     /// The account's title, so that an owner asked to rule on an omission is
     /// not asked about a bare identifier.
     pub title: String,
-    /// `covered` — inside the report's scope. `outside_placed_elsewhere` —
-    /// outside it, and the owner has placed the account in a scope of his own.
-    /// `outside_undecided` — outside it and in no scope at all: **nobody has
-    /// ruled on whether it belongs**, which is a different statement from a
-    /// deliberate omission and must not be read as one.
+    /// The institution he said holds it, when he said. Absent, never null and
+    /// never guessed: two accounts he calls one word, at two banks, are one
+    /// line apart in `outside` and are not the same question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
+    /// `covered` — inside the report's scope. `outside_by_decision` — outside
+    /// it because the owner ruled the account outside every scope and said why.
+    /// `outside_placed_elsewhere` — outside it, and he has placed the account
+    /// in a scope of his own: he said where it belongs, not that it does not
+    /// belong here. `outside_undecided` — outside it and in no scope at all:
+    /// **nobody has ruled on whether it belongs**, which is a different
+    /// statement from a deliberate omission and must not be read as one.
     pub standing: String,
 }
 
@@ -2492,7 +2568,7 @@ impl PopulationDto {
         Self {
             contour: population.contour.0,
             contour_version: population.version.0,
-            completeness: population.completeness().code().to_owned(),
+            known_account_coverage: population.known_account_coverage().code().to_owned(),
             covered: population
                 .covered()
                 .map(PopulationAccountDto::from_domain)
@@ -2510,6 +2586,7 @@ impl PopulationAccountDto {
         Self {
             account: entry.account.inner(),
             title: entry.title.clone(),
+            institution: entry.institution.clone(),
             standing: entry.standing.code().to_owned(),
         }
     }
@@ -3816,8 +3893,10 @@ pub enum ActionTargetDto {
         operation_id: String,
         method: String,
         path: String,
-        #[serde(rename = "requestSchema")]
-        request_schema: String,
+        /// The component schema the call's body answers to. Absent for a call
+        /// that takes no body — see [`crate::action_catalog::ActionOperation`].
+        #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
+        request_schema: Option<String>,
         request: RequestPlanDto,
     },
     /// Two or more admissible resolutions, in the order the item offers them.
@@ -3841,8 +3920,10 @@ pub struct ResolutionOptionDto {
     pub operation_id: String,
     pub method: String,
     pub path: String,
-    #[serde(rename = "requestSchema")]
-    pub request_schema: String,
+    /// The component schema the call's body answers to. Absent for a call that
+    /// takes no body — see [`crate::action_catalog::ActionOperation`].
+    #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
+    pub request_schema: Option<String>,
     pub request: RequestPlanDto,
 }
 
@@ -5334,7 +5415,23 @@ mod tests {
     }
 
     fn claim_check(claim: ControlClaim, outcome: ClaimOutcome) -> ClaimCheck {
-        ClaimCheck { claim, outcome }
+        ClaimCheck {
+            claim,
+            outcome,
+            // Stated rather than defaulted: a basis exists to describe a real
+            // fold, and a placeholder standing in for one is the shape §4.9
+            // forbids. One March event over an asserted start is the ordinary
+            // case these rendering tests are about.
+            basis: iaam_core::reconciliation::check::ObservationBasis {
+                folded: iaam_core::reconciliation::observed::FoldSpan {
+                    events: 1,
+                    first: Some(time::macros::date!(2026 - 03 - 10)),
+                    last: Some(time::macros::date!(2026 - 03 - 10)),
+                },
+                start: iaam_core::reconciliation::check::ObservedStart::Asserted,
+                compared: iaam_core::reconciliation::check::Compared::Level,
+            },
+        }
     }
 
     fn rendered(check: &ClaimCheck) -> serde_json::Value {
@@ -5529,6 +5626,92 @@ mod tests {
             "an absent document is omitted, not blank: {value}"
         );
     }
+
+    fn answer(word: &str) -> AnswerImportQuestionRequest {
+        AnswerImportQuestionRequest {
+            answer: word.to_owned(),
+            account: None,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn an_answer_that_names_no_account_refuses_one() {
+        // The mistake this catches is not untidiness. A caller that sends an
+        // account beside `received` believes it answered
+        // `received_from_own_account`, and the two say different things about
+        // where the money came from. Applying the answer it typed rather than
+        // the one it meant settles the row wrongly and says nothing.
+        for word in ["paid", "received", "fee", "income"] {
+            let request = AnswerImportQuestionRequest {
+                account: Some(Uuid::new_v4()),
+                ..answer(word)
+            };
+            let rejection = request
+                .to_domain()
+                .expect_err("an account the answer does not take is refused");
+            assert_eq!(rejection.field, "account");
+            assert!(
+                rejection.expected.contains(word),
+                "the refusal names the answer that was given: {rejection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_answers_that_name_an_account_still_take_one() {
+        for word in ["sent_to_own_account", "received_from_own_account"] {
+            let account = Uuid::new_v4();
+            let request = AnswerImportQuestionRequest {
+                account: Some(account),
+                ..answer(word)
+            };
+            let decision = request.to_domain().expect("the account is required here");
+            assert!(decision.shape().needs_account());
+            // And absence is still the malformed answer it always was.
+            let rejection = answer(word)
+                .to_domain()
+                .expect_err("this answer is incomplete without an account");
+            assert_eq!(rejection.field, "account");
+            assert_eq!(rejection.actual, "absent");
+        }
+    }
+
+    #[test]
+    fn only_the_fee_answer_carries_an_origin() {
+        for word in [
+            "sent_to_own_account",
+            "received_from_own_account",
+            "paid",
+            "received",
+            "income",
+        ] {
+            let request = AnswerImportQuestionRequest {
+                account: matches!(word, "sent_to_own_account" | "received_from_own_account")
+                    .then(Uuid::new_v4),
+                origin: Some(FeeOriginDto::Brokerage),
+                ..answer(word)
+            };
+            let rejection = request
+                .to_domain()
+                .expect_err("an origin the answer does not take is refused");
+            assert_eq!(rejection.field, "origin");
+            // The value is named as the caller spelled it, not as Rust spells it.
+            assert_eq!(rejection.actual, "brokerage");
+        }
+        let accepted = AnswerImportQuestionRequest {
+            origin: Some(FeeOriginDto::Depositary),
+            ..answer("fee")
+        }
+        .to_domain()
+        .expect("a fee carries its origin");
+        assert_eq!(
+            accepted,
+            Answer::Fee {
+                origin: FeeOrigin::Depositary
+            }
+        );
+    }
 }
 /// Report upload parameters. The route body is the workbook's binary bytes.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -5664,6 +5847,92 @@ pub struct DiscrepancyDto {
     pub delta: ClaimValueDto,
 }
 
+/// What the observed side of a comparison was folded from.
+///
+/// **A `discrepant` outcome used to state three numbers and nothing about where
+/// the middle one came from.** The owner facing one had no way to ask the system
+/// what it had added up: he summed the account's legs by hand over the whole
+/// period and spent five iterations guessing why the total did not agree with
+/// the system's. The fold was in the system the whole time; only its width was
+/// unpublished.
+///
+/// Present on **every** outcome. A `matched` says how wide the confirmation is —
+/// a balance folded over one imported month is not the evidence a balance folded
+/// over four years is — and a `not_comparable` needs it most, because `start` is
+/// the whole of its reason.
+///
+/// It carries a count and a window, not the events. Their identities would be an
+/// unbounded list on every outcome, and they are already answerable, for exactly
+/// this window and account, from the operations listing.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ObservationBasisDto {
+    /// How many of the account's events were folded into the observed figure.
+    pub events_folded: u64,
+    /// The effective date of the earliest one. Null when none was folded — an
+    /// opening figure over a journal that begins inside the interval.
+    ///
+    /// These are the dates actually folded, **not** the interval's boundaries,
+    /// which `from` and `to` on the status above already give. A March closing
+    /// balance over a journal that begins in February is folded from February,
+    /// and naming March would name a window the figure does not come from.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub folded_from: Option<Date>,
+    /// The effective date of the latest one. Null under the same condition.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub folded_through: Option<Date>,
+    /// What the fold began from, as one of four words.
+    ///
+    /// `asserted` — the journal states what was held before the first movement
+    /// folded in, so the figure is a balance. `unasserted` — nothing states it,
+    /// so the figure is movement from an unknown start; this is the reason a
+    /// balance claim answers `not_comparable`. `no_recorded_movement` — the
+    /// journal has never moved this currency or holding, so the claim was
+    /// compared against the absence of a record rather than against a sum.
+    /// `not_a_balance` — the claim is an interval total, which starts from no
+    /// state at all.
+    pub start: String,
+    /// Which quantity was actually put against the claim.
+    ///
+    /// `level` — the figure itself. `change_since_stated_balance` — the change
+    /// since an earlier balance a source stated, which is comparable even where
+    /// `start` is `unasserted`, because the unknown start is in both folds and
+    /// cancels out of their difference.
+    ///
+    /// **Read it before reporting a `matched`.** A matched change says the
+    /// movements recorded since that earlier statement account exactly for the
+    /// distance to this one; it says nothing about the level, which is still
+    /// unknown. A matched change and a matched level are different findings and
+    /// must not be reported alike.
+    pub compared: String,
+    /// The date of the stated balance a change is measured from. Null where
+    /// `compared` is `level`.
+    ///
+    /// It narrows the window above rather than replacing it: `folded_from` and
+    /// `events_folded` describe the whole fold the observed figure came out of,
+    /// and the movements that had to account for the change are the part of it
+    /// after this date. Both are stated because both are asked — the first
+    /// says how much history the figure rests on, the second what the verdict
+    /// is actually about.
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub compared_since: Option<Date>,
+}
+
+impl ObservationBasisDto {
+    fn from_domain(basis: ObservationBasis) -> Self {
+        Self {
+            events_folded: basis.folded.events,
+            folded_from: basis.folded.first,
+            folded_through: basis.folded.last,
+            start: basis.start.code().to_owned(),
+            compared: basis.compared.code().to_owned(),
+            compared_since: basis.compared.since(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimOutcomeDetailDto {
     pub code: String,
@@ -5675,11 +5944,15 @@ pub struct ClaimOutcomeDetailDto {
     pub exception: Option<String>,
 }
 
-/// Outcome of one control assertion.
+/// Outcome of one control assertion, with what it was reached from.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimOutcomeDto {
     pub claim: ClaimDto,
     pub outcome: ClaimOutcomeDetailDto,
+    /// The fold the outcome's `observed` figure came out of. Always present:
+    /// a verdict that does not describe the comparison it is a verdict on is
+    /// what sent the owner to add up his own account by hand.
+    pub basis: ObservationBasisDto,
 }
 
 impl ClaimOutcomeDto {
@@ -5718,6 +5991,7 @@ impl ClaimOutcomeDto {
         Self {
             claim: claim_dto(check.claim),
             outcome,
+            basis: ObservationBasisDto::from_domain(check.basis),
         }
     }
 }
@@ -6154,42 +6428,111 @@ pub struct OwnerBalanceRequest {
     pub source_hash: Option<String>,
 }
 
+/// What a classification rule tests a row against.
+///
+/// An object, on the way in and on the way out, and it used to be neither: the
+/// rule routes took and returned a **string containing** this JSON. A string is
+/// the one shape an LLM client cannot infer, because inference is copying the
+/// shape it just read, and a structure smuggled through a string reads as an
+/// opaque token rather than as three fields it may set.
+///
+/// Every member is optional and every one of them narrows: a matcher stating
+/// nothing matches nothing, by construction in
+/// [`iaam_app::ingest::classification::RuleMatcher::asks_nothing`]. It is
+/// accepted rather than refused here, because that refusal belongs to the
+/// classifier and not to the transport, and duplicating it would make two places
+/// decide what an empty rule means.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct RuleMatcherDto {
+    /// The counterparty the source printed, matched exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterparty_account: Option<String>,
+    /// A case-insensitive substring of the payment purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_contains: Option<String>,
+    /// The word the source used for the operation, matched exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl RuleMatcherDto {
+    #[must_use]
+    pub fn from_domain(matcher: &RuleMatcher) -> Self {
+        Self {
+            counterparty_account: matcher.counterparty_account.clone(),
+            description_contains: matcher.description_contains.clone(),
+            kind: matcher.kind.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn to_domain(&self) -> RuleMatcher {
+        RuleMatcher {
+            counterparty_account: self.counterparty_account.clone(),
+            description_contains: self.description_contains.clone(),
+            kind: self.kind.clone(),
+        }
+    }
+}
+
 /// Classification rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClassificationRuleDto {
     pub id: Uuid,
     pub version: u64,
-    pub matcher: String,
-    pub outcome: String,
+    pub matcher: RuleMatcherDto,
+    pub outcome: ClassifiedAsDto,
     pub created_at: String,
     pub retired_at: Option<String>,
     pub replaces: Option<Uuid>,
 }
 
 impl ClassificationRuleDto {
-    #[must_use]
-    pub fn from_port(rule: ClassificationRuleView) -> Self {
-        Self {
-            id: rule.id,
-            version: u64::from(rule.version),
-            matcher: rule.matcher,
-            outcome: rule.outcome,
-            created_at: rule.created_at,
-            retired_at: rule.retired_at,
-            replaces: rule.replaces,
-        }
+    /// A stored rule, rendered in the two shapes it may be written in.
+    ///
+    /// Fallible, and the failure is real: the store keeps the matcher and the
+    /// outcome as opaque JSON, so a rule written before this route was typed —
+    /// or by anything other than this route — can hold JSON the classifier
+    /// cannot read. It is read here by [`rule_from_view`], the same function the
+    /// classifier reads it with, rather than by a second parser of the same
+    /// text. Two readings of one stored rule would eventually disagree about
+    /// what the owner decided, and the listing is the surface on which he would
+    /// see the wrong one.
+    pub fn from_port(rule: ClassificationRuleView) -> Result<Self, AppError> {
+        let id = rule.id;
+        let created_at = rule.created_at.clone();
+        let retired_at = rule.retired_at.clone();
+        let replaces = rule.replaces;
+        let parsed = rule_from_view(rule)?;
+        Ok(Self {
+            id,
+            version: u64::from(parsed.version),
+            matcher: RuleMatcherDto::from_domain(&parsed.matcher),
+            outcome: ClassifiedAsDto::from_domain(classified_as(parsed.outcome)),
+            created_at,
+            retired_at,
+            replaces,
+        })
     }
 }
 
 /// A classification named in the vocabulary a rule outcome uses.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+///
+/// Deserialised as well as serialised, and used for both halves of a rule's
+/// outcome: what `POST /v1/classification-rules` accepts and what the listing
+/// prints are one type, so what a client reads is what it may send back. It is
+/// also what a recomputation plan names an event's `was` and `becomes` with —
+/// deliberately, because the plan must speak the vocabulary the owner writes
+/// rules in or it names a decision he cannot restate as a rule.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClassifiedAsDto {
+    /// `internal_transfer`, `external_flow`, `income` or `fee`.
     pub kind: String,
     /// Receiving account, for `internal_transfer` only.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Uuid>,
     /// Fee origin, for `fee` only.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 }
 
@@ -6200,6 +6543,20 @@ impl ClassifiedAsDto {
             to: classification.to.map(|account| account.inner()),
             origin: classification.origin.map(str::to_owned),
         }
+    }
+
+    /// The classification these three words name.
+    ///
+    /// Read by the application's own vocabulary reader, the one that reads a
+    /// stored rule, so a word this route accepts is a word the classifier can
+    /// act on. A second reader here would admit `fee` with an origin the
+    /// classifier refuses, and the rule would be written and lost in one call.
+    pub fn to_domain(&self) -> Result<Classification, AppError> {
+        outcome_from(
+            &self.kind,
+            self.to.map(|account| account.to_string()).as_deref(),
+            self.origin.as_deref(),
+        )
     }
 }
 
@@ -6254,20 +6611,24 @@ pub struct ClassificationRuleChangeDto {
 }
 
 impl ClassificationRuleChangeDto {
-    #[must_use]
-    pub fn from_domain(change: RuleChange) -> Self {
-        Self {
-            rule: ClassificationRuleDto::from_port(change.rule),
+    pub fn from_domain(change: RuleChange) -> Result<Self, AppError> {
+        Ok(Self {
+            rule: ClassificationRuleDto::from_port(change.rule)?,
             plan: RecomputePlanDto::from_domain(change.plan),
-        }
+        })
     }
 }
 
 /// Request to create or update a rule.
+///
+/// `matcher` and `outcome` are the objects the listing prints, not strings
+/// containing them. That is the whole of iaam-gpo3: a field whose read form
+/// does not round-trip as its write form is the one thing an LLM client cannot
+/// infer, because inference is copying the shape it just saw.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ClassificationRuleRequest {
-    pub matcher: String,
-    pub outcome: String,
+    pub matcher: RuleMatcherDto,
+    pub outcome: ClassifiedAsDto,
     #[serde(default)]
     pub replaces: Option<Uuid>,
 }
@@ -6848,6 +7209,9 @@ pub struct JournalEventDto {
     /// inside a nested object.
     #[serde(flatten)]
     pub fact: JournalFactDto,
+    /// As on [`OperationDto::idempotency_key`], including the failure it makes
+    /// easy: a corrected fact re-sent under a key already recorded is answered
+    /// `duplicate` and changes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7159,6 +7523,43 @@ fn format_source_time(time: time::Time) -> String {
 /// opening a parallel one holding half the answers.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OpenImportSessionRequest {
+    /// Declaring it and omitting it open **two different products**, and the
+    /// choice cannot be revised afterwards: a session's identity is fixed when
+    /// it opens.
+    ///
+    /// **Declared** — a named import. The account is resolved once, here, by
+    /// whatever identifier the caller has (see [`DeclaredSourceDto::account`]),
+    /// and the response echoes it back. Everything the session later commits is
+    /// stamped with a source derived from that account and channel, and with an
+    /// import identity when a `label` was given. What this buys is retraction as
+    /// a unit: `POST /v1/corrections/imports`, given the same three fields,
+    /// retracts exactly this import and leaves the account's other imports in
+    /// force. A labelled declaration also reaches the session it already
+    /// opened, rather than opening a second one holding half the answers —
+    /// **that reuse is keyed on the label**, so a declaration without one opens
+    /// a fresh session on every call.
+    ///
+    /// **Absent** — a free session. Nothing scopes it to an account, and rows
+    /// for several accounts sit in it together. This is the shape for an export
+    /// that covers a whole institution: one session, questions answered once,
+    /// one commit. Reading the account requirement on `DeclaredSourceDto` as a
+    /// property of sessions is what turns such an export into four staged
+    /// imports, and it is not one.
+    ///
+    /// What a free session costs is the handle. Its rows are committed under a
+    /// source minted for the occasion, which is neither declared nor reported
+    /// back — the session's own `source` stays absent — and under no import at
+    /// all. `POST /v1/corrections/imports` keys on a declaration and so cannot
+    /// reach them: a free session's rows are corrected one event at a time
+    /// through `POST /v1/corrections`, having been found in the journal first.
+    ///
+    /// One thing a declaration does **not** buy: the session does not check that
+    /// the rows fed to it name the declared account, and cannot. It stores the
+    /// source and import, both one-way derivations, and the account itself is
+    /// gone by the time rows arrive. A row for another account is held, and
+    /// committed, under this import's identity. (The batch route does check it,
+    /// because there the declaration and the rows are in one request.) Feed a
+    /// declared session only the account it was declared for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DeclaredSourceDto>,
 }
@@ -7269,9 +7670,19 @@ pub struct ImportQuestionDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<String>,
     /// The classification rule the answer created, so the same counterparty is
-    /// not asked about twice. Absent when the row offered nothing a rule can
-    /// match on: a rule that asks nothing matches nothing, and writing one would
-    /// record a decision that never applies.
+    /// not asked about twice.
+    ///
+    /// Absent for either of two reasons, and a client cannot tell them apart
+    /// from this field alone — it knows which applies because it knows what
+    /// token it holds:
+    ///
+    /// - the row offered nothing a rule can match on, so no rule was written
+    ///   under any scope: a rule that asks nothing matches nothing, and writing
+    ///   one would record a decision that never applies;
+    /// - the answer came in under an agent token, which settles the row and
+    ///   generalises nothing (`iaam-hnod`). A standing rule decides rows nobody
+    ///   has looked at, and that is the owner's judgement, made with his own
+    ///   token through `POST /v1/classification-rules`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<Uuid>,
 }
@@ -7305,12 +7716,32 @@ pub struct ImportSessionContentsDto {
     #[serde(flatten)]
     pub session: ImportSessionDto,
     /// How many rows are held, conclusive and observed together.
-    pub rows: usize,
+    ///
+    /// `row_count` and not `rows`, and the suffix is the whole point: a plural
+    /// noun standing beside `questions`, which is a list of one row's worth of
+    /// thing each, reads as the list of rows — an external client wrote
+    /// `len(rows)` against it twice before reading this sentence. A name a
+    /// client can be wrong about is worse than an ugly one it cannot.
+    ///
+    /// The rows themselves are deliberately not published here. They are
+    /// published, per row and with what each would become, by
+    /// `GET /v1/import-sessions/{session}/assessment`, and that route computes
+    /// them by planning the commit. A second rendering built from the stored
+    /// observations alone would call a row `held` that the assessment calls
+    /// unreadable, and two readings of one session that can disagree is the
+    /// defect the single-planner design exists to prevent.
+    pub row_count: usize,
     /// Every question, answered and unanswered.
     pub questions: Vec<ImportQuestionDto>,
     /// How many are still waiting on the owner. Commit refuses while this is
     /// not zero.
     pub unanswered: usize,
+    /// The control sections the source printed, as the session holds them.
+    ///
+    /// Empty is the ordinary state of a session fed by a converter that reads
+    /// only rows, and it is worth reading back: a caller that stated figures and
+    /// finds none here transcribed them onto a different session.
+    pub control_figures: Vec<ControlSectionDto>,
 }
 
 /// The owner's answer to one question.
@@ -7318,13 +7749,27 @@ pub struct ImportSessionContentsDto {
 /// `answer` is one of the words the question published in its alternatives.
 /// `account` is required by exactly the two that name one, and refused by the
 /// rest: an answer carrying an account the question does not take is a caller
-/// mistake worth naming rather than ignoring.
+/// mistake worth naming rather than ignoring. `origin` follows the same rule
+/// for the one answer that takes it.
+///
+/// The refusal is the point rather than tidiness. An LLM client resends fields
+/// it no longer needs, and a superfluous `account` beside `received` is the
+/// signature of a caller that believes it answered `received_from_own_account`
+/// — the difference between money arriving from outside the perimeter and money
+/// arriving from another of the owner's own accounts. Accepting it would settle
+/// the row as the answer it did not mean, silently, and every report would then
+/// be computed from that.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AnswerImportQuestionRequest {
     pub answer: String,
+    /// The owner's account on the other side, for `sent_to_own_account` and
+    /// `received_from_own_account` only. Required by those two, refused by the
+    /// other four.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<Uuid>,
-    /// Where a fee came from, for the `fee` answer only.
+    /// Where a fee came from, for the `fee` answer only. Refused on the other
+    /// five; optional on `fee` itself, where absence means the origin was not
+    /// stated and the fee is recorded as `other` rather than as a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<FeeOriginDto>,
 }
@@ -7335,6 +7780,11 @@ impl AnswerImportQuestionRequest {
     /// The account is checked here rather than deeper: a missing one is a
     /// malformed answer, and a superfluous one is a caller that believes it
     /// answered something else.
+    ///
+    /// Both checks read [`AnswerShape`] rather than re-listing which answers
+    /// take what. The list already exists — it is what a question publishes in
+    /// its alternatives — and a second copy here would eventually admit a field
+    /// the published alternative said nothing about.
     pub fn to_domain(&self) -> Result<Answer, Rejection> {
         let account = self.account.map(AccountId);
         let answer = match self.answer.as_str() {
@@ -7362,6 +7812,27 @@ impl AnswerImportQuestionRequest {
                 });
             }
         };
+        // A field the answer does not take, refused rather than dropped. The
+        // answer word is validated first, so the refusal can name the answer the
+        // caller actually gave instead of guessing at what it meant.
+        let shape = answer.shape();
+        if let Some(superfluous) = self.account.filter(|_| !shape.needs_account()) {
+            return Err(Rejection {
+                field: "account".into(),
+                expected: format!("no account: the `{}` answer names none", shape.code()),
+                actual: superfluous.to_string(),
+            });
+        }
+        if let Some(superfluous) = self.origin.filter(|_| shape != AnswerShape::Fee) {
+            return Err(Rejection {
+                field: "origin".into(),
+                expected: format!(
+                    "no origin: only the `{}` answer carries one",
+                    AnswerShape::Fee.code()
+                ),
+                actual: wire_word(superfluous),
+            });
+        }
         Ok(answer)
     }
 
@@ -7374,6 +7845,18 @@ impl AnswerImportQuestionRequest {
     }
 }
 
+/// The word a serialisable value goes over the wire as.
+///
+/// Read back out of `serde` rather than written out again beside the type: a
+/// rejection must name the value the caller sent, and a hand-copied list of
+/// wire words drifts from the `rename_all` that produces them.
+fn wire_word<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|json| json.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "a value".to_owned())
+}
+
 /// What committing a session wrote.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImportCommitDto {
@@ -7384,6 +7867,45 @@ pub struct ImportCommitDto {
     pub revision: String,
     /// A verdict per held row, in the order the rows were fed.
     pub rows: Vec<VerdictDto>,
+    /// The journal events the source's own control section became.
+    ///
+    /// Written at the same commit as the rows and reported apart from them,
+    /// because `rows` is a verdict per row read by position and an assertion is
+    /// not any row's outcome. Empty where the source stated no control section.
+    ///
+    /// This is the reconciliation the owner would otherwise have had to make
+    /// separately, already made: the figures are in the journal, dated to the
+    /// end of the period they speak about, and every later reconciliation report
+    /// compares them with what the rows actually came to.
+    pub control_assertions: Vec<RecordedEventDto>,
+}
+
+/// One journal event a commit wrote, or found already written.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecordedEventDto {
+    /// `inserted` or `duplicate`.
+    ///
+    /// `duplicate` is the ordinary answer to re-importing a statement whose
+    /// control section the journal already holds: the same source stating the
+    /// same figure for the same account and period is one fact, not two.
+    pub outcome: String,
+    pub event: Uuid,
+}
+
+impl RecordedEventDto {
+    #[must_use]
+    pub fn from_domain(recorded: &Recorded) -> Self {
+        match recorded {
+            Recorded::Inserted { id } => Self {
+                outcome: "inserted".to_owned(),
+                event: id.inner(),
+            },
+            Recorded::Duplicate { existing } => Self {
+                outcome: "duplicate".to_owned(),
+                event: existing.inner(),
+            },
+        }
+    }
 }
 
 /// One row a session is holding.
@@ -7472,6 +7994,251 @@ impl ImportRowDto {
 pub struct CommitImportSessionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    /// Record the rows even though they do not add up to the control figures the
+    /// source printed for itself.
+    ///
+    /// Absent or `false`, such a commit is refused, and the refusal names every
+    /// figure that disagrees with both numbers and the difference. `true` is a
+    /// sentence the caller had to write after reading them: a source's own
+    /// control section can be wrong, and this is how a batch is recorded anyway.
+    ///
+    /// It changes nothing about what is written. The figures are recorded as
+    /// assertions either way, so a disagreement the caller accepted is in the
+    /// journal, and reconciliation reports it as `discrepant` for as long as it
+    /// stands.
+    #[serde(default)]
+    pub accept_control_mismatch: bool,
+}
+
+/// The control figures a source printed for itself, as the caller transcribed
+/// them.
+///
+/// One statement, one interval: `from` and `to` are the period every figure in
+/// the call is about, because a control section belongs to the document it is
+/// printed on. A session importing two statements states them in two calls.
+///
+/// Every figure is optional and separately so. Absent means the source did not
+/// print it — never zero (§4.9): a zero is a figure a statement does print, and
+/// substituting one for silence would manufacture a mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StateImportControlFiguresRequest {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub to: Date,
+    pub figures: Vec<StatedControlFiguresDto>,
+}
+
+/// What one statement printed about one account in one currency.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StatedControlFiguresDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    /// What the account held before the first row of the period, as a decimal
+    /// string. May be negative: §11 says an overdrawn account is a valid state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening: Option<String>,
+    /// What it held after the last one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing: Option<String>,
+    /// Everything that arrived over the period, as a **positive** decimal
+    /// string: a turnover carries no sign, the side does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debit_turnover: Option<String>,
+    /// Everything that left, as a positive decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_turnover: Option<String>,
+}
+
+/// A control section as the session holds it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ControlSectionDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub period_from: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub period_to: Date,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opening: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closing: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debit_turnover: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_turnover: Option<String>,
+}
+
+impl ControlSectionDto {
+    #[must_use]
+    pub fn from_domain(section: &ControlSection) -> Self {
+        let rendered = |amount: Option<PostedMinor>| {
+            amount.map(|amount| minor_amount(amount.raw(), section.currency))
+        };
+        Self {
+            account: section.account.inner(),
+            currency: CurrencyDto::from_domain(section.currency),
+            period_from: section.period.from,
+            period_to: section.period.to,
+            opening: rendered(section.opening),
+            closing: rendered(section.closing),
+            debit_turnover: rendered(section.debit_turnover),
+            credit_turnover: rendered(section.credit_turnover),
+        }
+    }
+}
+
+/// The batch, checked against the control figures its own source printed.
+///
+/// The one section of an assessment that compares two numbers rather than
+/// describing one. `mismatched_figures` is a fact about the whole comparison
+/// rather than about any row of it, which is why this is an object and not a
+/// bare array (conventions §1).
+///
+/// An empty `comparisons` says the source stated no control section and the
+/// rows were compared with nothing. That is not the same answer as «they
+/// agreed», and an import that could not be checked must not read like one that
+/// passed.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ControlReconciliationDto {
+    pub comparisons: Vec<ControlComparisonDto>,
+    /// How many stated figures disagree with the rows. A figure that could not
+    /// be checked is not one of them: §10.4 keeps «nothing to compare against»
+    /// apart from «the numbers do not match».
+    pub mismatched_figures: usize,
+}
+
+/// One account and one currency: what the source said, what the rows say.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ControlComparisonDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    /// The section the source printed here. Absent where the rows moved money
+    /// and nothing was stated about it — which refuses nothing, and is the
+    /// difference between «it agreed» and «it was never checked».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stated: Option<ControlSectionDto>,
+    /// What the rows come to. Zero over zero rows where the source stated
+    /// figures for an account and currency no row touched — which is not an
+    /// absence but the answer «nothing arrived».
+    pub observed: BatchTotalDto,
+    /// One entry per figure the source stated. Empty where it stated none.
+    pub checks: Vec<ControlCheckDto>,
+}
+
+/// One stated figure, checked — with both numbers on the page.
+///
+/// `observed` is printed even when the check matched. A result that said only
+/// «matched» would not say what it had compared, and the whole value of this
+/// section is that a reader can see the two figures that were put beside each
+/// other.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ControlCheckDto {
+    /// `closing_balance`, `debit_turnover` or `credit_turnover`.
+    ///
+    /// An opening balance is never checked and is not missing from the list: a
+    /// batch holds movements, not a starting position, so there is nothing to
+    /// compare one with. It is the term the closing check is built from.
+    pub figure: String,
+    /// `matched`, `mismatched` or `not_checked`.
+    pub outcome: String,
+    /// What the source stated.
+    pub claimed: String,
+    /// What the rows come to. Absent for `not_checked`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<String>,
+    /// `claimed` minus `observed`: positive where the source sees more than the
+    /// rows do. Absent for `not_checked`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    /// Why nothing was compared, for `not_checked`. Currently only
+    /// `opening_balance_not_stated`: a closing balance is checked as the opening
+    /// balance plus what the rows move, and the journal's own balance is
+    /// deliberately not substituted — the batch would then be checked against
+    /// facts that are not in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ControlReconciliationDto {
+    #[must_use]
+    pub fn from_domain(control: &ControlReconciliation) -> Self {
+        Self {
+            comparisons: control
+                .comparisons
+                .iter()
+                .map(ControlComparisonDto::from_domain)
+                .collect(),
+            mismatched_figures: control.mismatches(),
+        }
+    }
+}
+
+impl ControlComparisonDto {
+    #[must_use]
+    pub fn from_domain(comparison: &ControlComparison) -> Self {
+        let currency = comparison.currency;
+        Self {
+            account: comparison.account.inner(),
+            currency: CurrencyDto::from_domain(currency),
+            stated: comparison
+                .stated
+                .as_ref()
+                .map(ControlSectionDto::from_domain),
+            observed: BatchTotalDto::from_domain(&comparison.observed),
+            checks: comparison
+                .checks
+                .iter()
+                .map(|check| ControlCheckDto::from_domain(check, currency))
+                .collect(),
+        }
+    }
+}
+
+impl ControlCheckDto {
+    #[must_use]
+    pub fn from_domain(check: &ControlCheck, currency: CurrencyCode) -> Self {
+        let rendered = |amount: PostedMinor| minor_amount(amount.raw(), currency);
+        let base = Self {
+            figure: check.figure().code().to_owned(),
+            outcome: check.code().to_owned(),
+            claimed: String::new(),
+            observed: None,
+            delta: None,
+            reason: None,
+        };
+        match check {
+            ControlCheck::Matched {
+                claimed, observed, ..
+            } => Self {
+                claimed: rendered(*claimed),
+                observed: Some(rendered(*observed)),
+                ..base
+            },
+            ControlCheck::Mismatched {
+                claimed,
+                observed,
+                delta,
+                ..
+            } => Self {
+                claimed: rendered(*claimed),
+                observed: Some(rendered(*observed)),
+                delta: Some(rendered(*delta)),
+                ..base
+            },
+            ControlCheck::NotChecked {
+                claimed, reason, ..
+            } => Self {
+                claimed: rendered(*claimed),
+                reason: Some(reason.code().to_owned()),
+                ..base
+            },
+        }
+    }
 }
 
 /// What an import will and will not record.
@@ -7493,9 +8260,12 @@ pub struct ImportPlanDto {
     /// against — ordinarily most of the rows, and not pending work.
     pub cross_source_matching: CrossSourceMatchingDto,
     pub commit_delta: CommitDeltaDto,
-    /// `ready`, `blocked` or `requires_owner_decision`.
+    /// The rows, checked against the control figures the source printed for
+    /// itself.
+    pub control_reconciliation: ControlReconciliationDto,
+    /// `ready`, `blocked`, `requires_owner_decision` or `does_not_reconcile`.
     pub readiness: String,
-    /// Why, for `blocked` and `requires_owner_decision`.
+    /// Why, for everything but `ready`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readiness_detail: Option<String>,
 }
@@ -7508,7 +8278,10 @@ pub struct SourceInventoryDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import: Option<Uuid>,
     pub documents: Vec<String>,
-    pub rows: usize,
+    /// How many rows the session holds. A count, named so that it cannot be
+    /// read as the list it sits between — `documents` above it and `accounts`
+    /// below it are both lists, and `rows` between them read as a third.
+    pub row_count: usize,
     #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = Date)]
     pub period_from: Option<Date>,
@@ -7580,6 +8353,67 @@ pub struct CommitDeltaDto {
     pub duplicates: Vec<PlannedFactDto>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRowDto>,
+    /// What `facts` come to, per account and currency.
+    ///
+    /// One number to compare with one number. Without it a client checking a
+    /// two-hundred-row import against the figure on the statement has to add up
+    /// two hundred decimal strings, and this API's client is a language model in
+    /// a system that deliberately keeps money arithmetic in the core.
+    pub fact_totals: Vec<BatchTotalDto>,
+    /// What `duplicates` come to, per account and currency.
+    ///
+    /// Separate from `fact_totals` because they answer different questions: one
+    /// is what the journal gains, the other is what the source restated and the
+    /// journal already holds. Their sum is neither, which is why it is not
+    /// published.
+    pub duplicate_totals: Vec<BatchTotalDto>,
+}
+
+/// What one account's rows in one currency come to.
+///
+/// `debit` and `credit` are **absolute values**, the way a statement's turnover
+/// section prints them: the side carries the sign. `net` is signed, because a
+/// month that spent more than it received is the ordinary case and a total
+/// without a sign could not say so.
+///
+/// The account is a bare identifier, and this is the one place in the API where
+/// that needs saying rather than assuming. The rule (conventions §3) is that a
+/// published identifier of a thing the owner named carries his name for it; the
+/// exemption it grants is for a response that carries its own join table,
+/// computed by the same fold. This response does: `account_resolution` names
+/// every account these rows are on, splitting them into the ones the owner's
+/// directory holds and the ones it does not. The second list is why a name
+/// cannot simply be printed here — a total over rows on an account the directory
+/// has never heard of is exactly what this section must be able to publish, and
+/// an invented or omitted title on those rows would be worse than the identifier
+/// that is right beside them in `facts`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BatchTotalDto {
+    pub account: Uuid,
+    pub currency: CurrencyDto,
+    /// How many of the rows above this total folded. Rows that moved no cash on
+    /// the account are not among them.
+    pub rows: usize,
+    /// What arrived, as a positive decimal string.
+    pub debit: String,
+    /// What left, as a positive decimal string.
+    pub credit: String,
+    /// `debit` minus `credit`, signed.
+    pub net: String,
+}
+
+impl BatchTotalDto {
+    #[must_use]
+    pub fn from_domain(total: &BatchTotal) -> Self {
+        Self {
+            account: total.account.inner(),
+            currency: CurrencyDto::from_domain(total.currency),
+            rows: total.rows,
+            debit: minor_amount(total.debit.raw(), total.currency),
+            credit: minor_amount(total.credit.raw(), total.currency),
+            net: minor_amount(total.net.raw(), total.currency),
+        }
+    }
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -7757,6 +8591,13 @@ impl ImportPlanDto {
                 )),
                 plan.readiness.code(),
             ),
+            Readiness::DoesNotReconcile { mismatched_figures } => (
+                Some(format!(
+                    "{mismatched_figures} control figure(s) the source printed do not \
+                     agree with the rows; see control_reconciliation"
+                )),
+                plan.readiness.code(),
+            ),
         };
         Self {
             session: ImportSessionDto::from_domain(&plan.session),
@@ -7765,7 +8606,7 @@ impl ImportPlanDto {
                 source: plan.source_inventory.source.map(|id| id.inner()),
                 import: plan.source_inventory.import.map(|id| id.inner()),
                 documents: plan.source_inventory.documents.clone(),
-                rows: plan.source_inventory.rows,
+                row_count: plan.source_inventory.rows,
                 period_from: plan.source_inventory.period.map(|(from, _)| from),
                 period_to: plan.source_inventory.period.map(|(_, to)| to),
                 accounts: plan
@@ -7848,7 +8689,22 @@ impl ImportPlanDto {
                     .iter()
                     .map(RetainedRowDto::from_domain)
                     .collect(),
+                fact_totals: plan
+                    .commit_delta
+                    .fact_totals
+                    .iter()
+                    .map(BatchTotalDto::from_domain)
+                    .collect(),
+                duplicate_totals: plan
+                    .commit_delta
+                    .duplicate_totals
+                    .iter()
+                    .map(BatchTotalDto::from_domain)
+                    .collect(),
             },
+            control_reconciliation: ControlReconciliationDto::from_domain(
+                &plan.control_reconciliation,
+            ),
             readiness: readiness.to_owned(),
             readiness_detail,
         }

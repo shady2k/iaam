@@ -381,7 +381,7 @@ mod tests {
     use super::*;
     use crate::contour::{ContourId, ContourVersion};
     use crate::money::{CurrencyCode, PostedMinor};
-    use crate::report::population::{AccountStanding, PopulationAccount, PopulationCompleteness};
+    use crate::report::population::{AccountStanding, KnownAccountCoverage, PopulationAccount};
     use uuid::Uuid;
 
     fn account(index: u128) -> AccountId {
@@ -398,6 +398,7 @@ mod tests {
                 .map(|(index, standing)| PopulationAccount {
                     account: account(index as u128 + 10),
                     title: format!("Account {index}"),
+                    institution: None,
                     standing: *standing,
                 })
                 .collect(),
@@ -443,21 +444,21 @@ mod tests {
             for opening in [CashOpening::Asserted, CashOpening::Unasserted] {
                 let report = report(&standings, opening);
                 assert_ne!(
-                    report.population.completeness(),
-                    PopulationCompleteness::Whole
+                    report.population.known_account_coverage(),
+                    KnownAccountCoverage::Whole
                 );
                 assert!(
                     !report.confidence().complete(),
                     "a report over a {:?} population read as complete",
-                    report.population.completeness()
+                    report.population.known_account_coverage()
                 );
             }
         }
 
         let whole = report(&[AccountStanding::Covered], CashOpening::Unasserted);
         assert_eq!(
-            whole.population.completeness(),
-            PopulationCompleteness::Whole
+            whole.population.known_account_coverage(),
+            KnownAccountCoverage::Whole
         );
         assert!(
             !whole.confidence().complete(),

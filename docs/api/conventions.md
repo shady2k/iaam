@@ -91,6 +91,21 @@ that no item can carry, and the honest answer for this route was no. A
 something that moves and published everywhere `ActionDto` is published — not
 beside one of the four.
 
+### 1.4b A count is named as a count
+
+Where a response does publish a count — because the thing counted is not in the
+response and the client therefore cannot count it — the field is named so that it
+cannot be read as a list. `ImportSessionContentsDto.row_count` and
+`SourceInventoryDto.row_count` are both `row_count` and not `rows`, and the
+suffix was bought with a client's mistake: `rows` sat beside `questions`, a list
+of one-row-shaped items, and an external agent wrote `len(rows)` against it twice
+before reading the field description.
+
+The rule has a companion in §1.3: `rows` is the right name for a list of rows,
+and `POST /v1/import-sessions/{session}/commit` uses it for exactly that. One
+word cannot be both, and the count is the one that gives way — a client that
+indexes into a list it was given is doing the ordinary thing.
+
 ### 1.5 What this means when a new list route is added
 
 Decide the shape when the route is published, because it cannot be changed
@@ -132,7 +147,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/reconciliation` | `ReconciliationResponseDto` | object, `statuses` | three lists — `statuses`, `gaps`, `actions` — none of them a property of another's rows |
 | `GET /v1/transfer-pairings` | `CrossSourceMatchingDto` | object, `candidates` | `without_counterpart` — the legs nothing paired with, which no candidate can carry |
 | `GET /v1/accounts/{id}/transfer-partners` | `AccountTransferPartnersDto` | object, `partners` | `stated` — whether the owner has ruled at all, which an empty array cannot say |
-| `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, and how many questions are unanswered |
+| `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, `row_count`, and how many questions are unanswered |
 | `GET /v1/reports/balances` | `BalancesReportDto` | object, `accounts` | `negative_cash`, `population` |
 | `GET /v1/reports/returns` | `ReturnsAnswerDto` | object | not a list at the top level; `population` sits beside the report's own figures |
 | `GET /v1/reports/flow` | `MoneyFlowReportDto` | object, `currencies` | the interval, the scope version, `population`, `actions` |
@@ -275,6 +290,7 @@ And the types that print a bare identifier on purpose.
 | `AccountBalanceDto`, `NegativeCashDto`, `AssetAccountDto`, `CashClassTotalDto`, `NotDecomposedAccountDto`, `AccountResidualDto`, `EarningSourceAmountDto`, `CaveatSubjectDto` | `account` | the answer these sit in carries `population`, whose `covered` and `outside` name every account it mentions and every account it left out. The join table is in the same response, computed by the same fold, and one report row cannot disagree with it |
 | `ReconciliationStatusDto`, `TaintDto` | `account` | the caller named the account in the request; the response answers about that one and no other |
 | `JournalEventReadDto`, `JournalLegDto`, `OperationDto`, `VerdictDto` | `account` | a row-level echo of what the caller submitted or asked for |
+| `BatchTotalDto`, `ControlComparisonDto` | `account` | the import assessment they sit in carries `account_resolution`, whose `resolved` and `missing` name every account the rows are on and say which of them the owner's directory holds. The join table is in the same response, computed by the same fold. It is also why a name cannot simply be printed: a total over rows on an account the directory has never heard of is precisely what these sections must be able to publish |
 | every request body | — | §3.2 |
 
 Two things follow for a client. Where a response carries a `population` block, it
@@ -308,3 +324,256 @@ prints only its identifier, with no name table beside it in the same response:
 Each of these is a shape change to a published type, so each is its own decision
 about breaking a client, and none of them is a reason to publish a new type that
 prints an identifier alone. A type added after this section carries the name.
+
+---
+
+## 4. What gates an act
+
+> **What gates an act is what it does to the owner's decisions, not which
+> endpoint it arrived at. Two acts that reach the same consequence are gated the
+> same way, even when one of them is a side effect of a route named after
+> something else — and one route that performs two acts of different consequence
+> is gated twice, once per act.**
+
+### 4.1 Why the endpoint is the wrong unit
+
+There are three scopes — owner, agent, read-only — and the temptation is to read
+them as three lists of routes. That reading fails in both directions, and it had
+failed in both by the time this section was written.
+
+It fails downward, by leaving a hole. `POST /v1/classification-rules` was
+owner-only, because a standing rule classifies rows nobody has looked at yet.
+Answering an import question was open to the agent, because an import is
+mechanics. But answering also wrote a classification rule, so the decision the
+agent could not make directly it made through a route whose name does not
+mention rules. The agent-facing document forbade it in prose — *never answer one
+yourself; relay what he says* — and prose is not a gate. The endpoint list said
+the rule route was protected while the thing it protected was reachable
+elsewhere.
+
+It fails upward, by refusing what it has no reason to refuse.
+`POST /v1/corrections/imports` was owner-only, and the reason recorded in the
+code was that "a reversal rewrites what every downstream report says, and the
+agent is an external client that does not decide the portfolio's shape". The
+first clause is true. The second was already false when it was written:
+committing an import session is open to the agent, and it rewrites every
+downstream report just as thoroughly. The agent does decide the portfolio's
+shape — by adding to it. The gate closed the safer of the two directions and
+left the other open, and the practical result was an agent that discovered by
+control total that it had written nonsense and could do nothing but wake the
+owner to undo the agent's own mistake.
+
+Both defects have one cause. Scope was being drawn around routes, and a route is
+a name, not a consequence.
+
+### 4.2 The rule
+
+Ask what the act does to decisions the owner has made or will have to live with.
+
+- **It disposes of something the caller itself submitted, and nothing else
+  changes.** Agent. Recording a row, settling a row, committing an import,
+  abandoning a session.
+- **It states a standing decision that will apply to things nobody has looked
+  at.** Owner. A classification rule, a category rule, a contour version, an
+  account and its declarations, a token.
+- **It rules on what is already in the journal — which of the owner's facts
+  should stop counting, or what should have stood instead.** Owner.
+- **It returns the journal to the state before the caller acted, reversing no
+  decision of the owner's, because he made none about it.** Agent, under a bound
+  narrow enough to be checked rather than trusted. Today this is exactly one
+  act: §4.5.
+
+Read-only is the absence of all four.
+
+### 4.3 What each scope may do
+
+| Act | Owner | Agent | Read-only |
+|---|---|---|---|
+| Read any report, the journal, the action queue | yes | yes | yes |
+| Submit rows, open and feed an import session | yes | yes | no |
+| Settle one row by answering its question | yes | yes | no |
+| Generalise that answer into a standing rule | yes | **no** | no |
+| Commit or abandon an import session | yes | yes | no |
+| Synchronise a broker or the market reference | yes | yes | no |
+| Repair custody, upload and reparse a document | yes | yes | no |
+| Retract an import the caller declared, untouched | yes | **yes** | no |
+| Retract any other import | yes | no | no |
+| Reverse or replace a named journal event | yes | no | no |
+| Confirm a transfer pairing (writes two corrections) | yes | no | no |
+| Record a control balance | yes | no | no |
+| Write classification, category and account rules | yes | no | no |
+| Create accounts, contours, categories, instruments | yes | no | no |
+| Issue and revoke tokens and broker access | yes | no | no |
+
+Two rows of that table are the ones §4.1 got wrong, and each is stated below with
+the line drawn where it is.
+
+### 4.4 Answering a question, and generalising the answer
+
+Answering an import question does two things of different consequence, and they
+are now gated separately inside one route.
+
+Settling the row is mechanics: it disposes of one line the caller already
+submitted, and the portfolio changes by exactly that line. Writing the
+classification rule generalises the settlement into a decision that will classify
+rows nobody has looked at — from months not yet imported, and including rows that
+will never be shown to anyone, because a row a rule matches is never asked about.
+That is the same act `POST /v1/classification-rules` performs, so it is gated the
+same way, and the agent's answer now settles the row and writes no rule.
+
+The route was not closed to the agent, because the agent's half of it is
+legitimate and closing it would stop the import. `rule` simply comes back absent.
+A client cannot tell that absence from the other one — a row that offered nothing
+a matcher could match on — and does not need to: it knows which token it holds.
+
+The cost is real and is the point. An agent relaying the owner's answers is asked
+about the same counterparty again next month, because nobody recorded that the
+answer generalises. Recording it is one call the owner makes with his own token,
+and what he gets is a decision in his own vocabulary that he can read back, edit
+and retire.
+
+### 4.5 Retracting an import, and retracting anything else
+
+Retracting an import the caller declared is a return to the state before it
+acted. No decision of the owner's is reversed, because he made none: the rows
+appeared because the agent put them there. Refusing it protects nothing and costs
+the owner an interruption to undo somebody else's mistake — while the far more
+consequential act of *writing* those rows was never gated at all.
+
+Retracting anything else is a judgement about the owner's history: which of the
+facts he holds should stop counting. There the old refusal is right and stands.
+
+The line between the two is a bound, and a bound is only worth as much as the
+evidence behind it. An agent may retract an import when all four hold:
+
+1. it named a **label** — the account, channel and label it submitted under. A
+   request without a label reaches the rows that named no import at all, and
+   those are nobody's declaration to take back;
+2. **every** row the target covers was submitted under this very credential — not
+   under some agent token. An import both parties fed is one the owner has a
+   stake in;
+3. every row of it is still effective — none reversed, none replaced. One that
+   is not is one somebody has already ruled on, and sweeping the remainder would
+   finish a judgement the agent did not make;
+4. no control assertion of the owner's covers those rows. An assertion was
+   compared against the projection over an interval; retracting rows inside it
+   changes what the comparison was made against, and a reconciliation status he
+   has already read becomes a statement about a journal that no longer exists.
+
+Three consequences a client should expect. The refusal names which condition
+failed, because "no" without the reason sends an agent to ask the owner for
+something it could have fixed itself. Retracting twice is refused by condition 3,
+and that refusal is also the answer to "did my first call land". And the
+acknowledgement is still required and the reversal is still a journal fact, so
+the owner sees what was done either way.
+
+### 4.6 What the bound rests on, and what it does not know
+
+Condition 2 needs an answer to "did this caller declare that import", and a scope
+cannot give it: a scope says what a caller may do and never what it did. Nothing
+else recorded it either — provenance answered which source, which parser and
+which import, never which principal — so the honest state of affairs was that the
+system could not know.
+
+It records it now. Every submission stamps the credential it arrived under into
+the event's provenance, at the one place every caller-driven input already passes
+through for its permission check, so an input that forgets to stamp cannot write
+anything. Provenance is the right home for it and not a table beside the journal:
+it already answers where a fact came from, and a second place recording that is a
+second place that can disagree with the fact.
+
+What this does **not** know is worth stating, because each is a way the bound is
+narrower or looser than it looks:
+
+- **It is the token, not the client.** Two programs handed one token are one
+  principal, and either may retract what the other declared. That is a
+  consequence of how the owner keeps his keys, and the system cannot see past it.
+  It cuts the same way for the owner: rows he submits under the agent's token are
+  the agent's to retract.
+- **A rotated token forgets.** Issue the agent a new token and it can no longer
+  retract what it declared under the old one. The retraction becomes the owner's
+  again, which is the safe direction.
+- **Facts recorded before the field existed name no declarer**, and every rule
+  reading it refuses on absence rather than assuming. No import that predates
+  this change is retractable by an agent, ever. That is fail-closed by
+  construction, and the schema version is what tells a reader that "no principal"
+  means "written before anyone was recorded" rather than "written by nobody".
+
+### 4.7 Where the check goes
+
+A gate that depends on the journal belongs inside the operation that reads the
+journal, not in a step before it.
+
+Every one of the four conditions above is a predicate over the same events the
+reversal is computed from, so the cost is one pass over a slice already in
+memory, not one query. That is the smaller reason. The larger one is that a check
+performed beside the operation runs against its own read of the journal, and
+between that read and the write the owner can record the very assertion condition
+4 exists to protect. The reversal would then be written against a journal that no
+longer satisfies the precondition it was checked under. One read, one decision.
+
+The transport keeps only the floor — the scope that cannot be right under any
+journal, which for a retraction is read-only. Everything narrower is decided
+where the evidence is.
+
+### 4.8 What is not changed by any of this
+
+Corrections do not ride the ingest transport, and that is unaffected. Submission
+admits an agent, so a relation field on an ingest row would turn every intake
+handler into a retraction surface guarded by a per-row check one input could
+forget. A separate route with its own gate is the right shape; §4.5 changed the
+gate and not the shape.
+
+And the rule cuts both ways by design. A new route that turns out to write a
+standing decision as a side effect is gated on that decision, not on its own
+name — which is the whole of §4.1 read forwards instead of backwards.
+
+---
+
+## 5. A structure is never sent as a string
+
+> **A field whose value is a structure is a JSON object on the wire, in both
+> directions. It is never a JSON document encoded inside a JSON string, and the
+> shape a route prints is a shape the route that writes it accepts unchanged.**
+
+### 5.1 Why the read shape and the write shape must be one
+
+Every other rule in this file can be learned from documentation. This one cannot,
+because the client is a language model and the way a language model discovers a
+write shape is by copying the shape it just read. A field that reads as one thing
+and is written as another has no signal a client can follow: it has to guess, and
+each guess costs a rejected request.
+
+`POST /v1/classification-rules` used to take `matcher` and `outcome` as **strings
+containing** the JSON that the listing prints — and an external client needed two
+attempts to compose the write shape after reading the read shape. Both are now
+objects on both sides, and `RuleMatcherDto` and `ClassifiedAsDto` are the same
+types in the request body and in the response, so the round trip is a property of
+the type rather than of two definitions that agree today.
+
+### 5.2 Why a string is worse than an object even when it round-trips
+
+A structure inside a string does round-trip, in the narrow sense: copy the string
+back and the server parses it. What it does not do is say what may be put in it.
+An object publishes its members in the specification; a string publishes
+`type: string`, and the members exist only in prose the client has to find. It
+also puts the encoding in the client's hands — escaping, key order, whether a
+member may be omitted or must be `null` — none of which the client can verify
+before sending.
+
+The store keeps such values as opaque text on purpose: `import_sessions` and the
+rule tables document exactly that, and the reason is that the store must not know
+the classifier's vocabulary. That is a storage decision, and it stops at the
+storage boundary. What reaches the wire is the parsed structure, read by the same
+function the classifier reads it with — one reader, so a rule cannot be printed
+in a vocabulary it may not be written in.
+
+### 5.3 Where the rule is not yet kept
+
+`GET /v1/category-rules` prints `matcher` as a string holding the stored JSON,
+while `POST /v1/category-rules` documents an object. The write side does also
+accept the string, in seven spellings, so a client that copies what it read is
+accepted — the asymmetry is in what the two sides *say*, and a client that
+follows the specification writes a shape it will never read back. Straightening
+it means choosing one spelling of a category matcher and retiring the other six,
+which is its own decision about breaking a client and is not made here.

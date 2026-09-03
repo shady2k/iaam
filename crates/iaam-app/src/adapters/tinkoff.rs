@@ -1995,6 +1995,39 @@ mod tests {
         assert_eq!(snapshot.as_of, PortfolioAsOf::Current);
     }
 
+    /// An opening position assertion of nothing held, for the instrument and
+    /// depository the portfolio claim names.
+    ///
+    /// Built by rewriting an already normalised event rather than assembling an
+    /// envelope by hand: a hand-written envelope can diverge from the real one,
+    /// and the test would then be testing the fixture.
+    fn position_opening_anchor(
+        event: &iaam_core::event::Event,
+        claim: &ControlClaim,
+        period: iaam_core::reconciliation::claim::AssertionPeriod,
+    ) -> iaam_core::event::Event {
+        let ControlClaim::PositionQuantity {
+            instrument,
+            custody,
+            ..
+        } = *claim
+        else {
+            panic!("a position claim");
+        };
+        let mut anchor = event.clone();
+        anchor.kind = EventKind::ControlAssertion {
+            period,
+            claim: ControlClaim::PositionQuantity {
+                instrument,
+                custody,
+                quantity: iaam_core::money::Quantity::zero(),
+                at: iaam_core::reconciliation::claim::BalancePoint::Opening,
+            },
+        };
+        anchor.legs = Vec::new();
+        anchor
+    }
+
     #[test]
     fn recorded_buy_matches_the_non_zero_portfolio_position() {
         let operations = parse_operations(include_str!(
@@ -2029,9 +2062,18 @@ mod tests {
         )
         .expect("trade normalization")
         .event;
-        let observed =
-            iaam_core::reconciliation::observed::observe(&[&event], trading_account(), period)
-                .expect("observation");
+        // The holding's fold needs a stated start, or the quantity observed is
+        // the net of the trades imported and not the position, and nothing can
+        // be compared (`iaam-d7hn`). What this test is about is the adapter's
+        // mapping, so the anchor is supplied: an opening assertion of nothing
+        // held, reaching the start of the period.
+        let anchor = position_opening_anchor(&event, &claim, period);
+        let observed = iaam_core::reconciliation::observed::observe(
+            &[&anchor, &event],
+            trading_account(),
+            period,
+        )
+        .expect("observation");
 
         assert_eq!(
             iaam_core::reconciliation::check::check_claim(&claim, &observed),

@@ -57,16 +57,43 @@ of your own is the most expensive mistake that can be made here.
 The agent is not part of the system and has no access to its storage. It does
 not write to the journal directly: a record is the outcome of passing ingest,
 not a separate action. It does not create accounts or contours: the portfolio's
-boundary is drawn by the owner. It does not correct or retract what is already
-recorded — that is the owner's act, and his credential is what the system will
-accept for it. And it does not hold the owner's statements — the owner loads
-them himself, and the agent sees exactly what the owner has shown it.
+boundary is drawn by the owner. It does not rule on what is already recorded —
+retracting a fact the owner holds is his act, and his credential is what the
+system will accept for it. The one exception proves the rule rather than
+softening it: an agent may take back an import it declared itself, while nothing
+has been built on it, because that is not a ruling on the owner's history but a
+return to the state before the agent acted. And it does not hold the owner's
+statements — the owner loads them himself, and the agent sees exactly what the
+owner has shown it.
 
 From this follows the thing that is easiest to violate out of the best
 intentions: a missing value is asked of the owner, not filled in. A guess that
 has reached the journal is indistinguishable from a fact — every report will
 read it as one, and only the owner, who knows what actually happened, can
 retract it.
+
+## Where an import begins, and what you are not holding
+
+An import has a step before its first call: somebody turns a bank's export into
+rows this system can read. That step is not in this API, it is not yours, and it
+is the step the outstanding-work queue asks for without naming.
+
+The owner runs a converter of his own against his own file. It knows the
+export's columns, and it knows the two things an export never states: which
+printed name is an account of his at another institution, and which positive row
+is a merchant giving money back rather than money arriving. You are handed
+neither the file nor those answers, so you cannot reproduce that step and must
+not try to — reading his export to work them out is the thing the design forbids
+outright, not a shortcut with a cost.
+
+What you are handed is what he pastes and what the API answers. On rows he
+pastes, submit what the source stated rather than a conclusion you reached for
+it — the shape for that is the next section. Where he has a converter, give him
+the command and work from the summary he brings back.
+
+`docs/import-boundary.md` is the map: which channel writes what, who runs each,
+what his converter is responsible for knowing, and where that line is drawn
+wrongly today. Read it before extending an import, not before running one.
 
 ## A row you cannot classify is submitted as such
 
@@ -112,10 +139,24 @@ money went and whose account was on the other side are facts about the owner's
 affairs; you may show him the question and the alternatives, and relay what he
 says.
 
-The owner's answer is kept as one of his classification rules, so the same
-counterparty is not asked about a second time. That is also why the answer
-matters beyond the one row: it is a decision recorded in his own vocabulary, and
-he can see it, change it, and retire it afterwards like any other rule.
+**An answer you relay settles the row and nothing beyond it.** Answering has two
+halves. Disposing of the line in front of you is import mechanics, and it is
+yours to do. Turning that disposal into a standing classification rule decides
+rows nobody has looked at yet — including months not yet imported, and including
+rows that will never be shown to anyone, because a row a rule matches is never
+asked about. That second half is the owner's, it is the same act as writing a
+rule directly, and under your credential the system now does only the first.
+Nothing is refused and nothing goes wrong: the answer simply comes back with no
+rule on it, the row is settled, and the import goes on.
+
+The consequence is worth telling the owner rather than hiding. The same
+counterparty will be asked about again next month, once per import, until he
+records the decision as a rule with his own credential. When you notice a
+question you have relayed before, that is the thing to say — not a second guess
+at the answer.
+
+A rule the owner does write is kept in his own vocabulary, and he can see it,
+change it, and retire it afterwards like any other.
 
 ## An import can be held open before it is committed
 
@@ -212,13 +253,30 @@ report is computed from what is in force rather than from everything ever
 written. A replacement goes further: it retracts and states what should have
 stood instead.
 
-Three things follow, and each of them is a way an agent gets this wrong.
+Four things follow, and each of them is a way an agent gets this wrong.
 
-**Correction is the owner's act.** Ask him; do not attempt it. The system will
-refuse an agent's credential for it, and that refusal is a limit of rights, not
-an absence of the capability. What the agent may properly do is find what went
-wrong, tell the owner exactly which facts are affected, and prepare the request
-for him to send.
+**Correcting the owner's history is his act.** Naming a fact of his and saying
+it should stop counting is a judgement about what he knows; ask him, and do not
+attempt it. The system refuses an agent's credential for it, and that refusal is
+a limit of rights, not an absence of the capability. What the agent may properly
+do is find what went wrong, tell the owner exactly which facts are affected, and
+prepare the request for him to send.
+
+**Undoing your own import is yours.** An import you declared and committed —
+your account, your channel, your label — you may retract, and you should, the
+moment a control total tells you it was wrong. That is not a ruling on the
+owner's history: it returns the journal to the state before you acted, and
+nothing the owner decided is reversed by it. You still acknowledge that the rows
+will stop counting, and the retraction is a journal fact like any other, so he
+can see what you did.
+
+The bound is narrow and it is checked, not trusted. It is your import, under the
+label you submitted it under; every row of it is still in force; and nothing has
+been built on it — no row reversed or replaced by anyone, and no balance of the
+owner's reconciled against the interval those rows fall in. Anything wider is
+his, and a refusal will say which of those conditions failed. Retracting twice
+is refused too: the second attempt reports that the rows are already reversed,
+which is also the answer to "did the first one land".
 
 **Retracting does not free a repeat import.** Duplicate detection reads the
 whole journal, and a retracted fact is still in it, so re-importing the same
@@ -286,6 +344,37 @@ loses precision and an amount in the journal is a fact.
 digit after the separator is refused, not rounded: rounding at the input
 substitutes a convenient number for a fact.
 
+## A transfer between the owner's own accounts is one row, not two
+
+A transfer operation names the account the money left and the account it
+arrived at, and it is **submitted once, from the sending side**. The system
+writes both movements from that single row: the sending account is debited and
+the receiving account is credited, in one fact that holds both accounts.
+
+There is deliberately no way to state the receiving half on its own, and the
+consequence is the mistake that costs an import. When two banks each print the
+movement — an outgoing row in one statement, an incoming row in the other — a
+row per printed side records **two transfers**, not the two halves of one. Both
+accounts then move by twice the sum, and it multiplies again with every export
+that overlaps. Import the sending side and drop the receiving row.
+
+Three properties follow, and each of them has been got wrong by a model that
+still produced plausible output:
+
+- **The amount is positive, like every other amount.** A negative amount is
+  refused, not read as "the outgoing leg". Direction is carried by the two
+  accounts, so the sign has nothing left to say.
+- **The two accounts must differ.** A transfer to itself moves nothing and is
+  refused on the destination field.
+- **A transfer is not a deposit plus a withdrawal.** Those two say the money
+  crossed the boundary of the owner's accounts, and a report counts them as
+  money entering and leaving. A transfer says it stayed inside and merely
+  moved. Recording a transfer as a pair overstates both what came in and what
+  went out, in the same month.
+
+If you cannot tell whether the other side is one of the owner's own accounts,
+that is exactly the row you submit as an observation and let the owner answer.
+
 ## Idempotency keys
 
 Always send an idempotency key if you can construct one. Repeating a request
@@ -293,6 +382,25 @@ with the same key returns `duplicate` and the identifier of the first event —
 that is the right answer, not an error. Without a key, sending again creates a
 second event: two identical purchases on one day are a legitimate situation,
 and the system has no right to merge them.
+
+**A key names a fact, not a slot, and this is where agents lose an afternoon.**
+The key is matched before anything in the body is looked at. So a row you
+**corrected** and resent under the key you used the first time is answered
+`duplicate` and writes nothing: the journal keeps the wrong number, and the
+answer looks like success. Re-sending is not a retraction — nothing on the
+import path retracts anything, so it is a no-op rather than a
+retract-and-add.
+
+A fact that turned out wrong is **corrected, never resent.** The correction is
+a replacement: it retracts the recorded fact and states what should have stood
+instead. It is the owner's act, not yours — find the affected events, tell him
+what is wrong, and prepare the request. Advising him to "send it again with the
+right numbers" wastes the afternoon and leaves the journal exactly as it was.
+
+Keys are scoped to the **owner**, not to the account or the import. Two
+unrelated statements whose rows are both keyed `row-1` are one fact as far as
+this is concerned, and the second is silently discarded. Build a key from the
+document and the row within it, never from the row alone.
 
 ## What to assert for a reconstructed opening
 
@@ -342,6 +450,39 @@ result a balance. For the same reason a currency whose cash is not entirely
 anchored has **no entry** in the snapshot's `total` at all — no whole exists to
 state, and both halves above it still say everything they know.
 
+**Reconciliation says the same thing in its own words.** A source's balance
+assertion over a fold nothing anchors is `not_comparable` with the reason
+`opening_not_asserted` — not `discrepant`. The distinction matters because the
+two are opposite instructions: `discrepant` means the figures disagree and one
+of them is wrong; `opening_not_asserted` means there is no baseline to hold the
+figure against, and nothing the owner stated is being contradicted. Never
+report the second as an error he made. What lifts it is an opening assertion
+reaching back to the start of the recorded history, or the import of the
+history before it.
+
+**A balance can be checked without being known.** Where nothing anchors the
+start of a history, the system cannot say what an account holds — but between
+two balances a source stated it can say whether the recorded movements account
+for the distance. Such an outcome carries `compared` =
+`change_since_stated_balance` and the date it is measured from. A `matched`
+there is a statement about the interval, not about the holding: report it as
+"the movements since that date add up", never as "the balance is confirmed".
+A `discrepant` there is the strongest finding reconciliation makes over an
+unanchored history, and it means the two stated balances and the movements
+between them do not join. It is a discrepancy and not a correction: a later
+statement does not overwrite an earlier one, and correcting a recorded
+assertion is an explicit act with its own operation.
+
+**Never reconstruct what the system compared.** Every reconciliation outcome
+carries a `basis`: how many of the account's events were folded into the
+observed figure, the first and last dates folded, and what the fold started
+from. Read it before reporting anything about the outcome. The window is the
+account's recorded history reaching into the interval, not the interval that
+was asked about, and a balance folded over one imported month is not the
+evidence a balance folded over four years is. Do not add up the owner's
+operations yourself to work out what the number was made of — that is the work
+this field exists to end.
+
 A negative cash figure is reported as a fact and is never refused or hidden. It
 is not by itself an error: a margin account is legitimately negative, and a card
 can carry a technical overdraft. On an account where the owner would not expect
@@ -373,28 +514,70 @@ Read it before reading any figure. The report's own quality fields —
 `data_quality`, uncovered positions, unproven bases — are about defects **inside**
 the calculation. They can every one be clean while the wrong accounts were
 selected, because selection happens before the calculation and nothing in it can
-see what was left out. Completeness of a calculation and completeness of its
+see what was left out. Completeness of a calculation and coverage of its
 population are two statements, and only the second one says whose money was
 counted.
 
-`population.completeness` is the summary:
+`population.known_account_coverage` is the summary:
 
 - `whole` — every account the system knows of is inside the report.
-- `bounded` — accounts are outside it, and each of them sits in a scope the
-  owner drew.
-- `undecided` — accounts are outside it that no scope claims at all.
+- `bounded` — accounts are outside it, and the owner has ruled on every one of
+  them.
+- `undecided` — accounts are outside it that he has not ruled on at all.
 
 **`undecided` is not a milder `bounded`.** "Four accounts are outside this report
 and nobody has decided whether they belong" is a different sentence from "four
 accounts are outside this report on purpose", and only the second makes the
 figures an answer about a boundary the owner chose. Each entry in
-`population.outside` carries the same distinction per account, as
-`outside_placed_elsewhere` or `outside_undecided`, with the account's title so
-the owner can be asked about it by name.
+`population.outside` carries the distinction per account, with the account's
+title and institution so the owner can be asked about it by name:
 
-So a report whose `population.completeness` is `undecided` is reported as what
-it is: an answer about part of the owner's money, with the undecided accounts
-named. Never as "the portfolio returned X".
+- `outside_by_decision` — he ruled the account outside every scope and gave a
+  reason. Report it as a boundary he drew, and do not ask him again.
+- `outside_placed_elsewhere` — the account sits in another scope of his. He said
+  where it belongs; he did **not** say it does not belong here, so this is
+  weaker than the line above and must not be reported as the same thing.
+- `outside_undecided` — no scope claims it and he has ruled nothing. Nobody has
+  decided whether its money belongs in these figures.
+
+A deliberate exclusion never makes the population `whole`. `whole` says the
+figures cover every account the system knows of; money he ruled out is still
+money he has, and the honest report is "these figures cover the part he chose".
+
+So a report whose `population.known_account_coverage` is `undecided` is reported
+as what it is: an answer about part of the owner's money, with the undecided
+accounts named. Never as "the portfolio returned X".
+
+### `whole` is not "everything he has"
+
+**Read the field's name, and report the value it actually carries.** The
+denominator is the accounts this instance has been told about — `covered` and
+`outside` together, published in full, by title and institution. An account of
+the owner's that was never created here is in neither list, and it is not
+reported as missing: it is invisible to the fold, not omitted by it.
+
+This is not a defect that a field could fix. The system never sees a source
+document. An import sends it the rows a client chose to send, so a statement of
+what the document held would be that client's word republished as the system's
+knowledge — and a client that silently dropped three accounts is the same client
+that would supply the total. The one place the system does compare both sides is
+a channel it fetched itself, and there it records the shortfall as a fact of its
+own: a coverage gap, naming the refused rows and the dimensions they would have
+moved.
+
+So the check belongs to whoever holds the source, and it is a comparison, not a
+lookup:
+
+- Before reporting coverage, read `covered` and `outside` against the accounts
+  the source actually holds. Seven accounts in an export and four in the two
+  lists is a report that will answer `whole` and mean four.
+- An account in the source that is in neither list has never been created here.
+  Say so as that — "the system holds no account for this one" — and offer to
+  create it. It is a different sentence from any of the three `outside`
+  standings, and the report cannot make it for you.
+- Never report `known_account_coverage: whole` as "this covers everything he
+  has". It covers everything the system was told about, which is the claim the
+  field's name makes and the only one it can support.
 
 ## How to read the return report
 

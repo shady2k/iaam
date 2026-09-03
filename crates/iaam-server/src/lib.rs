@@ -107,6 +107,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::get_import_session))
         .routes(routes!(routes::add_import_rows))
         .routes(routes!(routes::answer_import_question))
+        .routes(routes!(routes::state_import_control_figures))
         .routes(routes!(routes::assess_import_session))
         .routes(routes!(routes::commit_import_session))
         .routes(routes!(routes::abandon_import_session))

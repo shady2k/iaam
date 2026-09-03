@@ -2716,11 +2716,17 @@ pub async fn commit_import_session(
 /// rests on — amount, currency, both dates, what each source printed — and the
 /// owner confirms. Legs nothing paired with are published too: a leg dropped
 /// from the answer is a leg read as external flow by default.
+///
+/// `unmatched` is therefore most of the journal, permanently, and is not work
+/// waiting to be done: every cash movement with a posting date is offered to the
+/// matcher, and a payment in a shop has no counterpart to propose and never
+/// will. An empty `candidates` beside a long `unmatched` is this route's
+/// ordinary answer, not an error.
 #[utoipa::path(
     get,
     path = "/v1/transfer-pairings",
     responses(
-        (status = 200, description = "Candidate pairs and the legs nothing matched", body = CrossSourceMatchingDto),
+        (status = 200, description = "Candidate pairs, and the cash movements nothing was proposed against", body = CrossSourceMatchingDto),
         (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))

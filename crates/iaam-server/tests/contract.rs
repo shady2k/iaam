@@ -13184,6 +13184,131 @@ async fn a_session_is_declared_by_the_identifier_the_source_prints() {
     );
 }
 
+/// A row names its account the way its statement prints it (`iaam-varx`).
+///
+/// The declaration has taken the source's identifier since it was widened, and
+/// the row did not: `account` was a `Uuid`, so one flow answered «which account
+/// is this» in two vocabularies and the caller had to copy an identifier out of
+/// one response to say the same thing again on every row. Both ends now go
+/// through the one directory, and a converter that never read `/v1/accounts` can
+/// submit a batch.
+#[tokio::test]
+async fn a_row_names_its_account_by_the_identifier_the_source_prints() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+    let before = journal_rows(&harness).await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": "acct-1", "channel": "file", "label": "march" },
+                "operations": [{
+                    "account": "acct-1",
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-02" },
+                    "idempotency_key": "row-named-by-identifier",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "accepted", "{verdicts}");
+    assert!(
+        journal_rows(&harness).await > before,
+        "the row was recorded without the caller ever naming a uuid: {verdicts}"
+    );
+
+    // And the account it landed on is the one the identifier names, not a
+    // second account minted from the string.
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    assert_eq!(
+        accounts.as_array().expect("accounts").len(),
+        1,
+        "{accounts}"
+    );
+    assert_eq!(accounts[0]["id"], created, "{accounts}");
+}
+
+/// A row naming no account of the owner's is one rejected row, not a rejected
+/// request.
+///
+/// The field used to be a `Uuid`, so a value that named nothing failed the whole
+/// body at deserialisation and the readable rows beside it were never judged.
+/// §10.1 says an unreadable operation is one row's problem, and this is now one:
+/// the rejection carries `account`, and the row beside it is recorded.
+#[tokio::test]
+async fn a_row_naming_no_account_is_rejected_beside_rows_that_are_not() {
+    let harness = harness();
+    account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    {
+                        "account": "acct-1",
+                        "type": "deposit",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-02" },
+                        "idempotency_key": "readable-row",
+                    },
+                    {
+                        "account": "an-account-he-never-declared",
+                        "type": "deposit",
+                        "amount": "2000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-03" },
+                        "idempotency_key": "row-naming-nothing",
+                    },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "accepted", "{verdicts}");
+    assert_eq!(verdicts[1]["verdict"], "rejected", "{verdicts}");
+    assert_eq!(verdicts[1]["field"], "account", "{verdicts}");
+    assert!(
+        verdicts[1]["actual"]
+            .as_str()
+            .is_some_and(|actual| actual.contains("an-account-he-never-declared")),
+        "the refusal quotes what arrived, so the owner can see which string \
+         reached nothing: {verdicts}"
+    );
+}
+
 /// The identifier and iaam's own name for the account reach one session.
 ///
 /// Two declarations of one import must not open two sessions holding half the

@@ -2171,7 +2171,7 @@ enum Assessment {
 /// this printed string name» — and two implementations of it could come to
 /// disagree, which is how a batch gets declared against one account while its
 /// rows resolve against another.
-struct AccountDirectory {
+pub struct AccountDirectory {
     accounts: Vec<AccountDetailView>,
 }
 
@@ -2208,11 +2208,41 @@ impl Resolver {
     }
 }
 
+/// Why a printed identifier named no single account, before a field name is put
+/// on it.
+///
+/// The two halves of a refusal that do not depend on where the identifier was
+/// written: what the field admits and what arrived. The field itself is added by
+/// the caller, because the same failure is `source.account` on a declaration and
+/// `account` on a row.
+struct UnresolvedAccount {
+    expected: String,
+    actual: String,
+}
+
 impl AccountDirectory {
-    async fn load(services: &AppServices, owner: OwnerId) -> Result<Self, AppError> {
-        Ok(Self {
-            accounts: services.store.list_account_details(owner).await?,
-        })
+    /// The owner's accounts, read once.
+    ///
+    /// Public because a route that judges rows one by one needs the same
+    /// directory the declaration is resolved against, and needs it **once**: a
+    /// batch of two hundred rows that each loaded the directory would read the
+    /// store two hundred times to answer the same question.
+    pub async fn load(services: &AppServices, owner: OwnerId) -> Result<Self, AppError> {
+        Ok(Self::from_accounts(
+            services.store.list_account_details(owner).await?,
+        ))
+    }
+
+    /// A directory over accounts already in hand.
+    ///
+    /// [`Self::load`] is how a route gets one. This is for a caller that has the
+    /// accounts already and must not read them a second time — the resolution
+    /// must be over one reading, or a batch could be declared against the
+    /// directory as it was and have its rows judged against the directory as it
+    /// became.
+    #[must_use]
+    pub const fn from_accounts(accounts: Vec<AccountDetailView>) -> Self {
+        Self { accounts }
     }
 
     /// Every account a printed counterparty could be, from the strongest kind of
@@ -2293,14 +2323,60 @@ impl AccountDirectory {
     /// [`Resolver::resolve_counterparty`] refuses. The refusal names both the
     /// identifier and the accounts it reached: an ambiguity the owner cannot
     /// see is one he cannot clear.
-    fn resolve_declared(&self, printed: &str) -> Result<AccountDetailView, AppError> {
+    pub fn resolve_declared(&self, printed: &str) -> Result<AccountDetailView, AppError> {
+        self.resolve(printed).map_err(|refusal| AppError::Invalid {
+            // The pointer the caller sent it under. Every route reading a
+            // declaration spells it this way, beside `source.channel` and
+            // `source.label`, which are refused from the same object.
+            field: "source.account".to_owned(),
+            expected: refusal.expected,
+            actual: refusal.actual,
+        })
+    }
+
+    /// The account **one row** names, refused in the vocabulary a row is judged
+    /// in.
+    ///
+    /// The same resolution the declaration goes through, and deliberately the
+    /// same call: `account` on a row and `source.account` on the batch are the
+    /// one question «which of the owner's accounts is this», and two answers to
+    /// it are how a row is recorded against an account its own batch was not
+    /// declared for.
+    ///
+    /// What differs is only what a refusal is. A declaration is one statement
+    /// about the whole request, so a declaration that names no account refuses
+    /// the request. A row is judged on its own — §10.1 — so a row that names no
+    /// account is one rejected row beside the ones that were read, and a
+    /// [`Rejection`] is the shape that says so.
+    ///
+    /// **No date is asked for here either.** A row carries one, and an alias
+    /// interval could be read against it — but the row's account is the account
+    /// whose statement the row is *on*, not a counterparty guessed from a
+    /// printed string, and refusing a row because the card it was declared under
+    /// had been replaced by the time the statement was exported would refuse the
+    /// statement that shows the replacement. The interval still decides where it
+    /// can decide something: on a row's counterparty, in
+    /// [`Resolver::resolve_counterparty`].
+    pub fn resolve_row(&self, printed: &str) -> Result<AccountId, Rejection> {
+        match self.resolve(printed) {
+            Ok(account) => Ok(account.id),
+            Err(refusal) => Err(Rejection {
+                field: "account".to_owned(),
+                expected: refusal.expected,
+                actual: refusal.actual,
+            }),
+        }
+    }
+
+    /// The one account a printed identifier names, or why it names none.
+    ///
+    /// The refusal is built here and worded once, so the declaration and the row
+    /// refuse an identifier in the same words under two different field names.
+    /// Two wordings would eventually describe two different rules.
+    fn resolve(&self, printed: &str) -> Result<AccountDetailView, UnresolvedAccount> {
         let matched = self.candidates(printed, None);
         let [only] = matched[..] else {
-            return Err(AppError::Invalid {
-                // The pointer the caller sent it under. Every route reading a
-                // declaration spells it this way, beside `source.channel` and
-                // `source.label`, which are refused from the same object.
-                field: "source.account".to_owned(),
+            return Err(UnresolvedAccount {
                 expected: if matched.is_empty() {
                     "an account of the owner's, named by its iaam identifier or \
                      by the identifier its source prints for it"

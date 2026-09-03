@@ -29,6 +29,7 @@ use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
 };
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
+use iaam_app::scenarios::import_session::AccountDirectory;
 use iaam_app::scenarios::import_session::{
     ControlReconciliation, HeldRow, ImportPlan, PlannedFact, Readiness, RetainedRow,
     RetentionReason,
@@ -529,7 +530,29 @@ pub enum OperationKindDto {
 /// Complete operation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OperationDto {
-    pub account: Uuid,
+    /// The account this row is on, named however the caller can name it: this
+    /// account's iaam identifier, or the identifier its source prints for it —
+    /// its `provider_account_id`, or one of its aliases, a card among them.
+    ///
+    /// The same field, the same tiering and the same refusals as
+    /// `source.account` on the declaration, because it is the same question. It
+    /// used to be a `Uuid` while the declaration took either, which left one
+    /// flow answering «which account is this» in two vocabularies: a caller
+    /// holding a statement could open a session by the number its bank prints
+    /// and then had to copy an identifier out of the response to say the same
+    /// thing again, row by row.
+    ///
+    /// A caller sending an iaam identifier is answered exactly as it was: an
+    /// identifier that parses as one of the owner's accounts *is* that account,
+    /// before any other tier is consulted, and JSON has always carried it as a
+    /// string.
+    ///
+    /// A row naming no account of the owner's, or naming two, is **one rejected
+    /// row** and not a rejected request (§10.1). A row that names an account
+    /// other than the one the batch declared is still the whole batch's problem,
+    /// and is refused as it always was: that row contradicts a statement the
+    /// caller made over all of them.
+    pub account: String,
     #[serde(flatten)]
     pub kind: OperationKindDto,
     #[serde(default)]
@@ -603,7 +626,12 @@ impl OperationDto {
     /// The two arms are the point: a conclusion is converted to an operation
     /// exactly as it always was, and an observation is converted to an
     /// observation rather than to a conclusion nobody made.
-    pub fn to_intake(&self) -> Result<Intake, Rejection> {
+    ///
+    /// The directory is an argument rather than something reached for, so the
+    /// conversion stays the pure synchronous function it was: the caller reads
+    /// the owner's accounts **once** per request and every row of the batch is
+    /// resolved against that one reading.
+    pub fn to_intake(&self, directory: &AccountDirectory) -> Result<Intake, Rejection> {
         let OperationKindDto::UnresolvedDirection {
             amount,
             currency,
@@ -613,12 +641,12 @@ impl OperationDto {
         } = &self.kind
         else {
             return Ok(Intake::Concluded {
-                operation: Box::new(self.to_domain()?),
+                operation: Box::new(self.to_domain(directory)?),
             });
         };
         Ok(Intake::Observed {
             row: Box::new(ObservedRow {
-                account: AccountId(self.account),
+                account: directory.resolve_row(&self.account)?,
                 direction: match direction.as_deref() {
                     Some(stated) => ObservedDirection::parse(stated)?,
                     // Absent means the source said nothing, which is
@@ -659,10 +687,10 @@ impl OperationDto {
     /// The only place where transport meets the domain. A rejection
     /// is returned with the field, the expected value and the received value — this is the response body
     /// `422` (§13).
-    pub fn to_domain(&self) -> Result<SubmittedOperation, Rejection> {
+    pub fn to_domain(&self, directory: &AccountDirectory) -> Result<SubmittedOperation, Rejection> {
         let kind = self.kind_to_domain()?;
         Ok(SubmittedOperation {
-            account: AccountId(self.account),
+            account: directory.resolve_row(&self.account)?,
             kind,
             dates: OperationDates {
                 trade: self.dates.trade,
@@ -969,14 +997,14 @@ impl CorrectionDto {
     ///
     /// The rejection names the field of the operation, without the batch index:
     /// the caller's loop position is known to the handler, not to one element.
-    pub fn to_domain(&self) -> Result<CorrectionRequest, Rejection> {
+    pub fn to_domain(&self, directory: &AccountDirectory) -> Result<CorrectionRequest, Rejection> {
         Ok(match self {
             Self::Reversal { target } => CorrectionRequest::Reversal {
                 target: EventId(*target),
             },
             Self::Replacement { target, operation } => CorrectionRequest::Replacement {
                 target: EventId(*target),
-                operation: Box::new(operation.to_domain()?),
+                operation: Box::new(operation.to_domain(directory)?),
             },
         })
     }
@@ -5001,9 +5029,27 @@ mod tests {
         assert!(serde_json::from_value::<AmountDto>(raw).is_err());
     }
 
+    /// The one account these conversions resolve against.
+    ///
+    /// Built from a view rather than reached for: the conversion takes a
+    /// directory now, so a test that did not supply one would be testing a
+    /// signature that does not exist.
+    fn directory() -> AccountDirectory {
+        AccountDirectory::from_accounts(vec![iaam_app::ports::AccountDetailView {
+            id: AccountId(Uuid::from_u128(3)),
+            title: "Main".to_owned(),
+            institution: None,
+            provider: None,
+            provider_account_id: None,
+            cash_class: None,
+            negative_balance_expectation: None,
+            aliases: Vec::new(),
+        }])
+    }
+
     fn income_operation(kind: Option<IncomeKindDto>) -> OperationDto {
         OperationDto {
-            account: Uuid::from_u128(3),
+            account: Uuid::from_u128(3).to_string(),
             kind: OperationKindDto::Income {
                 instrument: Some(Uuid::from_u128(7)),
                 amount: "1200.00".to_owned(),
@@ -5024,7 +5070,7 @@ mod tests {
         // withholding from the external agent information the system has.
         assert!(matches!(
             income_operation(Some(IncomeKindDto::Coupon))
-                .to_domain()
+                .to_domain(&directory())
                 .unwrap()
                 .kind,
             OperationKind::Income {
@@ -5034,7 +5080,7 @@ mod tests {
         ));
         assert!(matches!(
             income_operation(Some(IncomeKindDto::DepositInterest))
-                .to_domain()
+                .to_domain(&directory())
                 .unwrap()
                 .kind,
             OperationKind::Income {
@@ -5048,7 +5094,7 @@ mod tests {
     fn an_income_without_a_kind_stays_without_one() {
         // The absence of the field means «not asserted», not «dividend».
         assert!(matches!(
-            income_operation(None).to_domain().unwrap().kind,
+            income_operation(None).to_domain(&directory()).unwrap().kind,
             OperationKind::Income { kind: None, .. }
         ));
     }
@@ -5060,7 +5106,7 @@ mod tests {
         assert!(text.contains(r#""kind":"dividend""#), "{text}");
         let restored: OperationDto = serde_json::from_str(&text).unwrap();
         assert!(matches!(
-            restored.to_domain().unwrap().kind,
+            restored.to_domain(&directory()).unwrap().kind,
             OperationKind::Income {
                 kind: Some(IncomeKind::Dividend),
                 ..

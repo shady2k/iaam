@@ -115,6 +115,61 @@ pub(super) fn statuses_for_account(
         .collect()
 }
 
+/// Version of the owner-stated idempotency key form.
+///
+/// Part of the key itself, as `CANONICAL_VERSION` is part of the ingest
+/// fingerprint: keys have already been deduplicated against, so a change of
+/// form must be visible in the value rather than inferred from its shape.
+const OWNER_BALANCE_KEY_VERSION: u8 = 2;
+
+/// The key under which one owner-stated claim is the same submission twice.
+///
+/// Version 1 was `owner-balance:{account}:{from}:{to}` and named none of what
+/// separates one claim from another. Two consequences, both observed: an
+/// opening claim and a closing claim for one account and period collided, so
+/// the closing one was answered at §10.6 level 2 with the opening event and
+/// never reached the journal; and every event of a single call — cash plus each
+/// position — carried one key, so a call stating four facts wrote one.
+///
+/// # Events already written under version 1
+///
+/// They keep their old key, and a resubmission of the very same claim now
+/// misses them and inserts a second event. That is accepted deliberately.
+///
+/// Rewriting them was considered first and rejected on this schema's own
+/// terms: `events` carries `events_are_immutable`, a trigger whose comment
+/// says the log is append-only «not as an agreement but as behaviour of the
+/// database», because code discipline does not survive the first data-repair
+/// script. A migration that suspended it to restamp a key would be that
+/// script.
+///
+/// Looking the old key up alongside the new one was considered second and is
+/// worse than useless. The old key cannot tell «the same claim, restated» from
+/// «the other balance point of the same period»: it collapses both, which is
+/// the bug. Colliding with it would therefore keep refusing a closing claim
+/// posted after an opening one — reasserting the defect for exactly the
+/// journals that already suffer it. To collide only in the honest case you
+/// must compare claims, and comparing claims is what the new key does.
+///
+/// What the accepted duplication costs is bounded: the unique index on
+/// `(owner, idempotency_key)` means at most one version-1 event exists per
+/// account and period, so at most one duplicate per period can arise, and only
+/// for an owner who restates a claim he already stated. The duplicate states a
+/// fact he did state; it is not a wrong number. It cannot fabricate agreement
+/// between sources either — E3 requires two channels that
+/// `is_independent_of` each other, and every owner-stated event shares the
+/// `owner-stated/1` parser version, so no pair of them is ever independent.
+/// A duplicate that bothers him is retracted like any other event.
+fn owner_balance_key(account: AccountId, period: AssertionPeriod, claim: &ControlClaim) -> String {
+    format!(
+        "owner-balance:v{OWNER_BALANCE_KEY_VERSION}:{}:{}:{}:{}",
+        account.inner(),
+        period.from,
+        period.to,
+        claim.subject_key()
+    )
+}
+
 /// Records only the owner's cash and position assertions.
 pub async fn record_owner_balance(
     services: &AppServices,
@@ -184,12 +239,7 @@ pub async fn record_owner_balance(
             provenance: provenance.clone(),
             relation: Relation::None,
             confidence: Confidence::Known,
-            idempotency_key: Some(format!(
-                "owner-balance:{}:{}:{}",
-                balance.account.inner(),
-                balance.period.from,
-                balance.period.to
-            )),
+            idempotency_key: Some(owner_balance_key(balance.account, balance.period, &claim)),
         })
         .collect();
     crate::scenarios::ingest::append_checked(services, events, IdentityScope::Source).await

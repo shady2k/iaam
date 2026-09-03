@@ -150,6 +150,58 @@ impl ControlClaim {
         }
     }
 
+    /// What the claim is *about*, apart from the value it states.
+    ///
+    /// Two claims share a subject key exactly when they are two statements of
+    /// one fact — the same account's cash in the same currency at the same
+    /// point of the same interval — so one supersedes or repeats the other.
+    /// Anything that would make them separate facts is in the key: the
+    /// discriminant, the balance point where there is one, and the currency,
+    /// instrument and custody that name which cash and which position.
+    ///
+    /// The value asserted is deliberately **not** in the key. A subject is the
+    /// question, not the answer; folding the amount in would make «the balance
+    /// was 100» and «no, it was 120» two different facts that both stand, when
+    /// the second is a correction of the first and the journal has
+    /// [`Relation`](crate::event::Relation) for saying so.
+    ///
+    /// The match is exhaustive over all six variants, including the four the
+    /// owner-stated path never builds. A `_` arm would have been shorter and
+    /// would have quietly given `FeesTotal` and `IncomeTotal` in one currency
+    /// the same subject; a seventh variant added later must answer this
+    /// question before it compiles.
+    ///
+    /// The interval totals carry no balance point on purpose. A turnover, a fee
+    /// total or a withheld-tax total speaks about the whole interval and has no
+    /// «at»: printing one here would make «opening turnover» expressible in a
+    /// key while remaining unrepresentable in the type.
+    #[must_use]
+    pub fn subject_key(&self) -> String {
+        let discriminant = self.discriminant();
+        match self {
+            Self::CashBalance { currency, at, .. } => {
+                format!("{discriminant}:{}:{}", at.code(), currency.code())
+            }
+            Self::PositionQuantity {
+                instrument,
+                custody,
+                at,
+                ..
+            } => format!(
+                "{discriminant}:{}:{}:{}",
+                at.code(),
+                instrument.inner(),
+                custody.inner()
+            ),
+            Self::CashTurnover { currency, .. }
+            | Self::FeesTotal { currency, .. }
+            | Self::IncomeTotal { currency, .. }
+            | Self::TaxWithheldTotal { currency, .. } => {
+                format!("{discriminant}:{}", currency.code())
+            }
+        }
+    }
+
     /// The value that must be non-negative, and the name of its field.
     ///
     /// `None` means «a negative value is valid»: the cash
@@ -327,6 +379,156 @@ mod tests {
         assert_eq!(BalancePoint::Opening.code(), "opening");
         assert_eq!(BalancePoint::Closing.code(), "closing");
         assert_ne!(BalancePoint::Opening.code(), BalancePoint::Closing.code());
+    }
+
+    #[test]
+    fn a_subject_key_separates_the_two_balance_points() {
+        // The defect that motivated the key (iaam-ihyi): an opening claim and a
+        // closing claim for one account and interval are two facts, and a key
+        // that could not say which one it named let the second be deduplicated
+        // against the first.
+        let opening = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: rub(100),
+            at: BalancePoint::Opening,
+        };
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: rub(100),
+            at: BalancePoint::Closing,
+        };
+        assert_ne!(opening.subject_key(), closing.subject_key());
+    }
+
+    #[test]
+    fn a_subject_key_ignores_the_value_asserted() {
+        // A subject is the question, not the answer. Two figures for the same
+        // account, currency and point are a correction, and the journal says so
+        // with a relation rather than by letting both stand as separate facts.
+        let claim = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: rub(100),
+            at: BalancePoint::Closing,
+        };
+        let corrected = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: rub(120),
+            at: BalancePoint::Closing,
+        };
+        assert_eq!(claim.subject_key(), corrected.subject_key());
+    }
+
+    #[test]
+    fn a_subject_key_separates_currencies_instruments_and_custodies() {
+        let rubles = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: rub(100),
+            at: BalancePoint::Closing,
+        };
+        let dollars = ControlClaim::CashBalance {
+            currency: CurrencyCode::Usd,
+            amount: rub(100),
+            at: BalancePoint::Closing,
+        };
+        assert_ne!(rubles.subject_key(), dollars.subject_key());
+
+        let instrument = InstrumentId::new_random();
+        let custody = CustodyId::new_random();
+        let held = ControlClaim::PositionQuantity {
+            instrument,
+            custody,
+            quantity: Quantity(Dec::new(Decimal::from(10))),
+            at: BalancePoint::Closing,
+        };
+        let other_instrument = ControlClaim::PositionQuantity {
+            instrument: InstrumentId::new_random(),
+            custody,
+            quantity: Quantity(Dec::new(Decimal::from(10))),
+            at: BalancePoint::Closing,
+        };
+        let other_custody = ControlClaim::PositionQuantity {
+            instrument,
+            custody: CustodyId::new_random(),
+            quantity: Quantity(Dec::new(Decimal::from(10))),
+            at: BalancePoint::Closing,
+        };
+        assert_ne!(held.subject_key(), other_instrument.subject_key());
+        assert_ne!(
+            held.subject_key(),
+            other_custody.subject_key(),
+            "one holding in two depositories is two facts"
+        );
+    }
+
+    #[test]
+    fn every_claim_kind_has_its_own_subject_in_one_currency() {
+        // Six kinds stated for one currency over one interval must not collide:
+        // a fee total is not an income total, and a `_` arm in `subject_key`
+        // would have made them one.
+        let currency = CurrencyCode::Rub;
+        let claims = [
+            ControlClaim::CashBalance {
+                currency,
+                amount: rub(1),
+                at: BalancePoint::Opening,
+            },
+            ControlClaim::CashBalance {
+                currency,
+                amount: rub(1),
+                at: BalancePoint::Closing,
+            },
+            ControlClaim::PositionQuantity {
+                instrument: InstrumentId::new_random(),
+                custody: CustodyId::new_random(),
+                quantity: Quantity(Dec::one()),
+                at: BalancePoint::Closing,
+            },
+            ControlClaim::CashTurnover {
+                currency,
+                debit: rub(1),
+                credit: rub(1),
+            },
+            ControlClaim::FeesTotal {
+                currency,
+                amount: rub(1),
+            },
+            ControlClaim::IncomeTotal {
+                currency,
+                amount: rub(1),
+            },
+            ControlClaim::TaxWithheldTotal {
+                currency,
+                amount: rub(1),
+            },
+        ];
+        let mut keys: Vec<String> = claims.iter().map(ControlClaim::subject_key).collect();
+        let count = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), count, "subject keys collided");
+    }
+
+    #[test]
+    fn an_interval_total_carries_no_balance_point() {
+        // A turnover speaks about the whole interval. Printing a point in its
+        // key would make «opening turnover» expressible in a key while
+        // remaining unrepresentable in the type.
+        let turnover = ControlClaim::CashTurnover {
+            currency: CurrencyCode::Rub,
+            debit: rub(500),
+            credit: rub(400),
+        };
+        assert_eq!(turnover.subject_key(), "cash_turnover:RUB");
+        assert!(
+            !turnover
+                .subject_key()
+                .contains(BalancePoint::Opening.code())
+        );
+        assert!(
+            !turnover
+                .subject_key()
+                .contains(BalancePoint::Closing.code())
+        );
     }
 
     #[test]

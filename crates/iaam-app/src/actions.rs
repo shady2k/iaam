@@ -106,7 +106,7 @@ impl ActionKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::CreateFirstAccount,
         Self::CreateFirstContour,
         Self::AccountScopeUndecided,
@@ -139,7 +139,7 @@ impl ActionKind {
     /// what it blocks fails at construction rather than publishing a required
     /// item that names nothing.
     ///
-    /// Exhaustive on purpose. A seventeenth kind cannot compile until someone
+    /// Exhaustive on purpose. An eighteenth kind cannot compile until someone
     /// has answered, for that kind, the question this whole type exists to
     /// answer.
     ///
@@ -3542,7 +3542,7 @@ mod tests {
             "two kinds share an identity, or one is listed twice: {:?}",
             ActionKind::ALL.map(ActionKind::id)
         );
-        assert_eq!(ActionKind::ALL.len(), 16, "a kind was added without a goal");
+        assert_eq!(ActionKind::ALL.len(), 17, "a kind was added without a goal");
     }
 
     /// Every kind graded `RequiredForGoal` names at least one goal, and every
@@ -3554,7 +3554,7 @@ mod tests {
     /// the mapping, written a second time, from what the reports actually read.
     ///
     /// The `match` is exhaustive on purpose, and that is what keeps this from
-    /// going stale. A seventeenth kind does not slip through — it stops the test
+    /// going stale. An eighteenth kind does not slip through — it stops the test
     /// from compiling, so whoever adds it answers, here, which reports their new
     /// item stands in the way of, before the queue can publish an item that
     /// names none.
@@ -6930,6 +6930,19 @@ mod tests {
     fn queue_for_retirement(account: &AccountView, retired: &[RetiredProduct]) -> Vec<Action> {
         actions_from_state(&OwnerState {
             accounts: std::slice::from_ref(account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            retired,
+            sessions: &[],
+            questions: &[],
+            rules: &[],
+        })
+        .expect("actions from state")
+    }
+
     // --- The unfinished import session in the queue (iaam-8ano) --------------
     //
     // The defect these cover: a session that held rows raised an item only
@@ -6983,8 +6996,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired,
-            questions: &[],
+            retired: &[],
             sessions,
             questions,
             rules: &[],
@@ -7137,6 +7149,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[ceased(first.id, false), ceased(second.id, false)],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -7148,6 +7161,8 @@ mod tests {
             .collect();
         assert_eq!(identities.len(), 2);
         assert_ne!(identities[0], identities[1]);
+    }
+
     /// The defect, in one test: rows held, nothing to answer, nothing in the
     /// queue.
     #[test]

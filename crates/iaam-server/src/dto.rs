@@ -7877,7 +7877,7 @@ pub struct ImportQuestionDto {
     /// The owner's accounts an answer that names one may name, each with the
     /// title and institution he gave it.
     ///
-    /// **This is iaam-boj4.** Two of the six answers name one of his own
+    /// **This is iaam-boj4.** Two of the answers name one of his own
     /// accounts, and the question used to say only `needs_account: true`. A
     /// client answering one therefore had to call `GET /v1/accounts` and join —
     /// the last identifier on the import path it had to fetch instead of copying
@@ -8073,8 +8073,8 @@ pub struct ImportSessionContentsDto {
 pub struct AnswerImportQuestionRequest {
     pub answer: String,
     /// The owner's account on the other side, for `sent_to_own_account` and
-    /// `received_from_own_account` only. Required by those two, refused by the
-    /// other four.
+    /// `received_from_own_account` only. Required by those two, refused by every
+    /// other answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<Uuid>,
     /// Where a fee came from, for the `fee` answer only. Refused on the other

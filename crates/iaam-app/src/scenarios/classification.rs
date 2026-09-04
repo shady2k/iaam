@@ -31,8 +31,9 @@ pub async fn list_rules(
 /// A classification named the way the rule that decides it names one.
 ///
 /// The vocabulary is the rule outcome's own — `internal_transfer`,
-/// `external_flow`, `income`, `fee` — so the plan answers in the words the
-/// owner wrote the rule in, rather than in the journal's event discriminants.
+/// `external_flow`, `refund`, `income`, `fee` — so the plan answers in the words
+/// the owner wrote the rule in, rather than in the journal's event
+/// discriminants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifiedAs {
     pub kind: &'static str,

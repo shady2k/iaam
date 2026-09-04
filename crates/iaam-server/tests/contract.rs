@@ -15154,6 +15154,7 @@ async fn an_open_classification_question_is_an_item_in_the_action_queue() {
             "received",
             "fee",
             "income",
+            "refund",
         ],
         "{item}"
     );
@@ -18452,12 +18453,12 @@ async fn a_rejected_field_with_a_closed_vocabulary_publishes_its_values() {
 
 /// The classification outcome vocabulary travels as values, not as a sentence.
 ///
-/// `outcome.kind` is one of four words and the schema does not say which, so the
-/// refusal carries them. The check runs at the door — before the rule is stored
-/// — because a rule the classifier cannot read is a decision written and lost in
-/// the same call.
+/// `outcome.kind` is one of a closed set of words and the schema does not say
+/// which, so the refusal carries them. The check runs at the door — before the
+/// rule is stored — because a rule the classifier cannot read is a decision
+/// written and lost in the same call.
 #[tokio::test]
-async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
+async fn a_rejected_classification_outcome_publishes_the_words_it_admits() {
     let harness = harness();
     let (status, body) = call(
         &harness.router,
@@ -18482,7 +18483,7 @@ async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
         .collect();
     assert_eq!(
         admitted,
-        ["internal_transfer", "external_flow", "income", "fee"],
+        ["internal_transfer", "external_flow", "refund", "income", "fee"],
         "{body}"
     );
 }

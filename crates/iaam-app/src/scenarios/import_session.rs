@@ -127,7 +127,7 @@ impl SessionContents {
 
 /// A question, and the accounts an answer to it may name.
 ///
-/// **Why the pair exists (iaam-boj4).** Two of the six answers —
+/// **Why the pair exists (iaam-boj4).** Two of the answers —
 /// `sent_to_own_account` and `received_from_own_account` — name one of the
 /// owner's own accounts, and the question published only `needs_account: true`.
 /// A client holding the question therefore had to call `GET /v1/accounts` and
@@ -4224,9 +4224,10 @@ mod tests {
 
     #[test]
     fn a_fee_and_income_still_settle_a_directionless_row() {
-        // Two of the four outcomes are a direction: a fee leaves and income
-        // arrives. Nothing about them is a guess, and the fix must not take
-        // them away — a row settled as a fee has never needed to be asked.
+        // A fee and income are each a direction of their own: a fee leaves
+        // the account and income arrives at it. Nothing about them is a guess,
+        // and the fix must not take them away — a row settled as a fee has
+        // never needed to be asked.
         let main = account(1);
         let fee = ruled(
             vec![detail(main, "Main")],

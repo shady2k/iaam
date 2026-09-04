@@ -132,8 +132,8 @@ impl Scope {
 /// caller the route will not refuse *for its scope*; it may still refuse for
 /// what the request says or for what the journal holds.
 ///
-/// Exhaustive on purpose, like [`crate::actions::ActionKind::goals`]: an
-/// eighteenth [`OperationKey`] cannot compile until someone has said what
+/// Exhaustive on purpose, like [`crate::actions::ActionKind::goals`]: a
+/// nineteenth [`OperationKey`] cannot compile until someone has said what
 /// authority its call demands.
 #[must_use]
 pub const fn required_scope(operation: OperationKey) -> Scope {
@@ -170,10 +170,17 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         // each row turns out to be is settled afterwards, by the owner's
         // directory, by a standing rule of his, or by his answer. Nothing
         // reaches the journal until a commit, which has this same floor.
+        //
+        // Feeding a session row by row is the same act said in this API's own
+        // vocabulary rather than the source's, so it keeps the same floor: the
+        // rows are held out of the journal either way, and the two ways in
+        // cannot differ in authority without making which shape a caller sent
+        // decide what it is allowed to say.
         OperationKey::SubmitOperations
         | OperationKey::OpenImportSession
         | OperationKey::SyncBroker
         | OperationKey::ReadImportDocument
+        | OperationKey::AddImportRows
         | OperationKey::AnswerImportQuestion
         | OperationKey::CommitImportSession
         | OperationKey::AbandonImportSession => Scope::Agent,
@@ -1922,6 +1929,7 @@ mod tests {
             OperationKey::OpenImportSession,
             OperationKey::SyncBroker,
             OperationKey::ReadImportDocument,
+            OperationKey::AddImportRows,
             OperationKey::AnswerImportQuestion,
             OperationKey::CommitImportSession,
             OperationKey::AbandonImportSession,
@@ -1940,8 +1948,8 @@ mod tests {
     ///
     /// They are written out by hand on purpose — moving a call across the line
     /// should be a deliberate edit — and a hand-written list drifts from the
-    /// enum exactly where the next mistake is. So the count is pinned: an
-    /// eighteenth key added to `ALL` and to neither list would otherwise pass
+    /// enum exactly where the next mistake is. So the count is pinned: a
+    /// nineteenth key added to `ALL` and to neither list would otherwise pass
     /// the table test by not appearing in it.
     #[test]
     fn the_table_above_covers_every_operation() {
@@ -1954,7 +1962,7 @@ mod tests {
             .filter(|operation| required_scope(**operation) == Scope::Agent)
             .count();
         assert_eq!(owner, 10, "the owner-only half of §4.3");
-        assert_eq!(agent, 7, "the half an agent reaches, §4.3");
+        assert_eq!(agent, 8, "the half an agent reaches, §4.3");
         assert_eq!(owner + agent, OperationKey::ALL.len());
     }
 

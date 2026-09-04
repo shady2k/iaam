@@ -581,11 +581,19 @@ impl<'a> AccountNames<'a> {
 /// it stopped being needed. It would also make this enum answer two questions:
 /// each word here names **who supplies a value**, and a converter is a step
 /// rather than a source. The half that was genuinely unattributed — the rows —
-/// is not a missing field of any request this type describes: it is the body of
+/// was not a missing field of the request it was argued about: it is the body of
 /// `POST /v1/import-sessions/{session}/rows`, a later call, and a pointer into
 /// it could not be satisfied by filling in the request it was published on. What
-/// the item gains instead is a sentence naming the shape a row is submitted in,
-/// which is a fact about this API and therefore something the queue may state.
+/// the item gained instead was a sentence naming the shape a row is submitted
+/// in, which is a fact about this API and therefore something the queue may
+/// state.
+///
+/// The later call now has a resolution of its own (`iaam-ripl`), so the rows
+/// **are** a missing field — of that call, marked `ExternalDocument`, on the
+/// option `start_account_import` publishes beside the one that opens the
+/// session. That does not reopen the case for a fourth word; it removes the
+/// last thing the word was standing in for. A field the queue can point at is
+/// what the sentence was a substitute for.
 ///
 /// **The axis is where the value comes from, not what it cost to get.** That is
 /// the sentence `iaam-k6l7` went looking for a fourth word for, and it is the
@@ -3175,17 +3183,51 @@ fn activity_period(activity: &AccountActivityView) -> Option<AssertionPeriod> {
 /// missing route. So the reason now says both — what the owner must do himself,
 /// and what to call once he has done it.
 ///
-/// Two options rather than one, ordered and not ranked, which is what
-/// `account_scope_action` established `Options` for: a statement is the ordinary
-/// answer and a broker channel is the answer for the accounts that have one, and
-/// publishing either alone would leave the other reachable only by reading the
-/// specification.
+/// Four options, ordered and not ranked, which is what `account_scope_action`
+/// established `Options` for: a statement is the ordinary answer and a broker
+/// channel is the answer for the accounts that have one, and publishing either
+/// alone would leave the other reachable only by reading the specification.
+///
+/// **The order is the promise, and the first entry is the call the caller can
+/// make now.** `iaam-bhu3` is what happens when it is not: a register offered a
+/// state's remedies with the ordinary one absent, and the mapping chose from a
+/// list that did not contain the answer. Here the ordinary answer is *two*
+/// calls — open a session, then put the statement into it — and the session did
+/// not exist a moment ago, so opening it stays first and the two ways of
+/// putting a statement in follow it. The broker sync is last because it is the
+/// answer for the accounts that have a channel, and it is a remedy entire.
+///
+/// **A two-step act is said with the mechanism that already exists for a value
+/// the caller does not hold** (`iaam-j5oz`). `POST
+/// /v1/import-sessions/{session}/document` takes the session in its path, and a
+/// resolution that named it while saying nothing about where the session comes
+/// from would be a call the caller cannot make — worse than one that does not
+/// exist, because a client reads `target` as the contract. So the session is a
+/// [`MissingInput`] marked [`ProvidedBy::Caller`], exactly as `/broker` is a
+/// path segment marked [`ProvidedBy::Owner`] on the option below it: the queue
+/// already says «this field is yours to fill in», and which call the value came
+/// out of is what the reason is for.
+///
+/// What was rejected: a fourth `ProvidedBy` word for «the call before this one»,
+/// which would make one field answer two questions and is the same mistake
+/// `iaam-tt71` declined; a fifth [`ActionTarget`] variant for an ordered
+/// sequence, which is a fourth mechanism for a fact three of them already
+/// carry; and leaving the document channel unpublished and describing it in
+/// prose, which is `iaam-1tij` again, one level down.
+///
+/// **Both ways of putting a statement in are offered, and neither is the only
+/// one.** `read_import_document` conveys the institution's own file and a
+/// reviewed profile reads it; `add_import_rows` takes rows already written in
+/// this API's words, which is what a caller holds when the owner pasted them or
+/// ran his own converter. A queue that named only the first would tell such a
+/// caller to obtain a profile it cannot install, and one that named only the
+/// second would hide the ordinary way a cash statement arrives.
 ///
 /// The item reads `agent`, for the reason `answer_classification_question_action`
-/// gives: both routes keep [`Scope::Agent`] as their floor, and an item marked
-/// `owner` would tell an agent it may not send a request the server would
-/// accept. Both options read `agent`, which is why this item hid `iaam-woeh`
-/// rather than exposing it — its two resolutions happen to agree.
+/// gives: all four routes keep [`Scope::Agent`] as their floor, and an item
+/// marked `owner` would tell an agent it may not send a request the server would
+/// accept. Every option reads `agent`, which is why this item hid `iaam-woeh`
+/// rather than exposing it — its resolutions happen to agree.
 ///
 /// **The reason names the shape a row is submitted in, and that closes
 /// `iaam-tt71`.** «Feed it the rows» presupposed something that turns a
@@ -3239,6 +3281,51 @@ fn start_account_import_action(account: &AccountView) -> Action {
         },
     };
 
+    // The second step of the ordinary answer, and the first one that puts
+    // anything in the session. Nothing is preset: the route reads the account
+    // off the session opened above, and which profile reads the document is
+    // this instance's to decide — naming one here would have the queue choose
+    // a reader for a file it has never seen.
+    let document = ResolutionOption {
+        operation: OperationKey::ReadImportDocument,
+        request: RequestPlan {
+            preset: BTreeMap::new(),
+            missing: vec![
+                // The identifier the resolution above returns. `Caller`, by the
+                // word's own meaning: it is one of the client's own identifiers,
+                // held from the call it just made, and asking the owner for it
+                // would be asking him to read back something he never saw.
+                //
+                // The document itself is deliberately **not** listed beside it.
+                // It is the request body entire and not a field of one, and
+                // `ProvidedBy` already settles what that means: a pointer into
+                // a body that has no fields could not be satisfied by filling
+                // anything in. The route's own description says what the body
+                // is, and this item's reason says who fetches it.
+                MissingInput::plain("/session", ProvidedBy::Caller),
+            ],
+        },
+    };
+
+    // The other way into the same session, for a caller that already holds the
+    // rows in this API's own words rather than the institution's file.
+    let rows = ResolutionOption {
+        operation: OperationKey::AddImportRows,
+        request: RequestPlan {
+            preset: BTreeMap::new(),
+            missing: vec![
+                MissingInput::plain("/session", ProvidedBy::Caller),
+                // `ExternalDocument` and not a fourth word for whatever produced
+                // them: the axis is who holds the value, and the statement holds
+                // it however much converting it took to type. That is the
+                // sentence on [`ProvidedBy`], and this is the request it was
+                // waiting for — the rows are a field of *this* call, so the
+                // queue can now point at them instead of describing them.
+                MissingInput::plain("/operations", ProvidedBy::ExternalDocument),
+            ],
+        },
+    };
+
     // The broker sync knows the account and nothing else. `broker` is a path
     // segment and is not preset: which channel this account is held at is the
     // owner's to name, and the queue cannot read it off an account that has no
@@ -3278,9 +3365,16 @@ fn start_account_import_action(account: &AccountView) -> Action {
             "Account {} ({}) has no business facts; import a statement or connect a broker. \
              Fetching the statement out of the bank is a step outside this API — no \
              operation here downloads the document, and the owner obtains it himself. \
-             Recording it is not: open an import session for this account and feed it the \
-             rows the document printed. Deciding what a row was is not a step between \
-             those two — a row whose direction or nature the reader cannot tell is sent \
+             Recording it is not, and it is two calls rather than one: open an import \
+             session for this account, then put the statement into the session that call \
+             returns. The session's identifier is what the second call takes in its path, \
+             which is why it is published as a field to fill in rather than as one already \
+             known — nothing here can know it before the first call is made. There are two \
+             ways to put the statement in and they end in the same session: send the \
+             institution's own export as it prints it and a source profile reads it, or \
+             send the rows in this API's own shape when that is what you hold. Deciding \
+             what a row was is not a step between those two — a row whose direction or \
+             nature the reader cannot tell is sent \
              as `unresolved_direction`, carrying the source's own sign, its direction \
              word and the party it named, and the session settles it against the owner's \
              accounts and rules or asks him about it. Then read the assessment the \
@@ -3294,9 +3388,9 @@ fn start_account_import_action(account: &AccountView) -> Action {
             account.id.inner(),
             account.title
         ),
-        ActionTarget::from_options(vec![session, sync]),
+        ActionTarget::from_options(vec![session, document, rows, sync]),
     )
-    .expect("account import action publishes both of its resolutions")
+    .expect("account import action publishes every one of its resolutions")
 }
 
 /// The request for one control assertion, at the point it is wanted for.
@@ -4077,6 +4171,176 @@ mod tests {
 
     fn store() -> SqliteAdapter {
         SqliteAdapter::new(SqliteStore::open_in_memory().expect("in-memory store"))
+    }
+
+    /// This crate's own source, so a guard can check what the queue offers
+    /// rather than what a comment says it offers.
+    ///
+    /// Two files and not one, because a resolution is built in two places: here,
+    /// where the frontier's items are assembled, and in the import-session
+    /// scenario, where a refusal publishes the calls that end a session. A scan
+    /// of one of them would pass by having less to sweep.
+    const ACTION_SOURCE: &str = include_str!("actions.rs");
+    const IMPORT_SESSION_SOURCE: &str = include_str!("scenarios/import_session.rs");
+
+    /// The operation keys a source names in code, ignoring prose and fixtures.
+    ///
+    /// Both exclusions are load-bearing, which is why they are proved separately
+    /// below. A doc comment naming a key is a mention and not an offer — much of
+    /// this file's prose names one call to explain why a *different* one is the
+    /// remedy — and a resolution built inside `mod tests` is a fixture the queue
+    /// never publishes. A scan that counted either would report every key
+    /// covered while an item was missing, which is the failure mode of every
+    /// source-reading check.
+    ///
+    /// A line-based reading, so a key named in a trailing comment on a line of
+    /// code would be counted. That over-counts rather than under-counts and no
+    /// line in either file does it; the guard below refuses a name that is not a
+    /// key at all, which is the drift this reading could otherwise hide.
+    fn keys_named_in(source: &str) -> BTreeSet<String> {
+        let body = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(published, _)| published);
+        let mut names = BTreeSet::new();
+        for line in body.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for (index, marker) in line.match_indices("OperationKey::") {
+                let name: String = line[index + marker.len()..]
+                    .chars()
+                    .take_while(|character| character.is_ascii_alphanumeric())
+                    .collect();
+                if !name.is_empty() {
+                    names.insert(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// Every operation this API publishes is named by an item or by a caveat.
+    ///
+    /// **The guard that was missing** (`iaam-z36f`). Every other check in this
+    /// line is narrower: one says an action names a goal, one says a caveat's
+    /// remedy resolves against the contract, one says an offered route is gated
+    /// by the floor it publishes, and `iaam-3nqt`'s says a named remedy actually
+    /// removes the caveat it is named for. All of them start from a call that is
+    /// already offered. None asks whether a call is offered at all.
+    ///
+    /// «Every reachable state has an act that leaves it» is not enumerable — a
+    /// state is whatever a journal can be in. This is the half that is: the
+    /// vocabulary of acts is a closed list, so a key **nothing** points at is
+    /// either dead weight or an item that was never written, and the queue
+    /// cannot tell which until someone asks. `iaam-1tij` was the second answer:
+    /// the document channel was a call this API published and no resolution
+    /// could name, and it was a field report that found it.
+    ///
+    /// It is a coverage check and not a correctness one, deliberately. That an
+    /// item offering a key offers the *right* key is `iaam-3nqt`'s question, and
+    /// this one would be worth little on its own — which is why the write-route
+    /// sweep in `iaam_server::routes` is its other half: that one refuses a
+    /// route that is neither a key nor declared not to be, so a channel cannot
+    /// stay unofferable by staying unnamed, and this one refuses a key that
+    /// nothing offers, so it cannot be named and then forgotten.
+    #[test]
+    fn every_operation_key_is_offered_by_an_item_or_a_caveat() {
+        let mut offered = keys_named_in(ACTION_SOURCE);
+        offered.extend(keys_named_in(IMPORT_SESSION_SOURCE));
+        // The register is read as itself rather than scanned: `closed_by` is a
+        // typed table in the core, so there is nothing to parse and nothing to
+        // drift.
+        for kind in CaveatKind::ALL {
+            for key in kind.closed_by() {
+                offered.insert(format!("{key:?}"));
+            }
+        }
+
+        // The scan reads a name as an offer, so a name that is no key at all
+        // means it has started reading something else — an associated constant,
+        // a variant since renamed — and what it reports is no longer about this
+        // vocabulary.
+        for name in &offered {
+            assert!(
+                OperationKey::ALL
+                    .iter()
+                    .any(|key| format!("{key:?}") == *name),
+                "the scan read {name} as an operation key and this vocabulary \
+                 has none: teach `keys_named_in` about it, or the coverage it \
+                 reports is about something else"
+            );
+        }
+
+        let orphans: Vec<&str> = OperationKey::ALL
+            .iter()
+            .filter(|key| !offered.contains(&format!("{key:?}")))
+            .map(|key| key.as_str())
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "{orphans:?} are calls this API publishes that no item and no \
+             caveat points at. Either a state is missing its item, or the key \
+             is dead and belongs out of the vocabulary — and a queue cannot \
+             say which, which is why this has to be decided here"
+        );
+    }
+
+    /// The scan reads resolutions, and not prose and not fixtures.
+    ///
+    /// A guard that passes vacuously is worse than none — `iaam-3nqt` exists
+    /// because existence was all that was checked — and a scan that matched
+    /// everything would report full coverage of anything. So the three
+    /// exclusions are made against an input written here, where what the answer
+    /// should be is not in question.
+    #[test]
+    fn the_offer_scan_reads_resolutions_and_not_prose_or_fixtures() {
+        let source = concat!(
+            "/// The membership operation is [`OperationKey::AddContourVersion`].\n",
+            "    // Not OperationKey::RecordOwnerBalance, which asserts a figure.\n",
+            "let way_out = ResolutionOption { operation: OperationKey::CreateAccount };\n",
+            "\n#[cfg(test)]\nmod tests {\n",
+            "    let fixture = OperationKey::SyncBroker;\n}\n",
+        );
+        assert_eq!(
+            keys_named_in(source),
+            BTreeSet::from(["CreateAccount".to_owned()]),
+            "a key named in prose, in a comment, or in a fixture is not one the \
+             queue offers"
+        );
+    }
+
+    /// And it finds the resolutions the two real files build.
+    ///
+    /// The other half of the same argument: the exclusions above could be got
+    /// right by a scan that excluded everything. This pins a key each file is
+    /// known to build a resolution for, and that neither file names the whole
+    /// vocabulary by itself — a scan that did would be matching, not reading.
+    #[test]
+    fn the_offer_scan_finds_the_resolutions_the_crate_builds() {
+        let items = keys_named_in(ACTION_SOURCE);
+        for name in [
+            "OpenImportSession",
+            "ReadImportDocument",
+            "AddImportRows",
+            "SyncBroker",
+        ] {
+            assert!(
+                items.contains(name),
+                "{name} is a resolution of `start_account_import` and the scan \
+                 did not find it"
+            );
+        }
+
+        let refusals = keys_named_in(IMPORT_SESSION_SOURCE);
+        assert!(
+            refusals.contains("AnswerImportQuestion"),
+            "the session scenario publishes the call that settles a row"
+        );
+        assert!(
+            refusals.len() < OperationKey::ALL.len(),
+            "a scan that found every key in every file would pass by matching \
+             everything: {refusals:?}"
+        );
     }
 
     /// Every kind is in [`ActionKind::ALL`] exactly once.
@@ -5591,13 +5855,18 @@ mod tests {
         );
     }
 
-    /// An account with nothing in it is offered both routes that begin an import.
+    /// An account with nothing in it is offered every route that begins an import.
     ///
     /// The item used to be `Blocked`, on a sentence that was true of fetching the
     /// document and of nothing else. An agent reads `state` as its map of what it
     /// may call, so the queue disowned the two routes that do exist.
+    ///
+    /// It then offered two of the four (`iaam-j5oz`). Opening a session and
+    /// synchronising a broker were published; the two calls that actually put a
+    /// statement into the session were prose. An agent that read the target as
+    /// its contract could open a session and had nowhere to go with it.
     #[test]
-    fn an_account_awaiting_its_first_import_names_both_routes_that_begin_one() {
+    fn an_account_awaiting_its_first_import_names_every_route_that_begins_one() {
         let account = account();
         let actions = actions_from_state(&OwnerState {
             accounts: std::slice::from_ref(&account),
@@ -5619,7 +5888,8 @@ mod tests {
             .expect("account import action");
 
         assert_eq!(import.state(), ActionState::NeedsOwnerInput);
-        // Both routes check `may_submit`, so an agent may send either.
+        // Every route here keeps `Scope::Agent` as its floor, so an agent may
+        // send any of them.
         assert_eq!(import.required_scope(), Some(Scope::Agent));
 
         let resolutions = import.target().resolutions();
@@ -5628,8 +5898,14 @@ mod tests {
                 .iter()
                 .map(|(operation, _)| *operation)
                 .collect::<Vec<_>>(),
-            vec![OperationKey::OpenImportSession, OperationKey::SyncBroker],
-            "the statement is the ordinary answer and the broker channel the other"
+            vec![
+                OperationKey::OpenImportSession,
+                OperationKey::ReadImportDocument,
+                OperationKey::AddImportRows,
+                OperationKey::SyncBroker,
+            ],
+            "the order is the promise: the call that can be made now, then the \
+             two that put a statement into what it returns, then the channel"
         );
 
         // The session is opened for this account and nothing else is known: the
@@ -5651,9 +5927,42 @@ mod tests {
             ]
         );
 
+        // The two-step act said honestly: the second call takes a session in its
+        // path, the item names it as a field the caller fills in, and the
+        // caller's own previous call is where the value comes from. Nothing is
+        // preset, because nothing here knows the session.
+        let document = resolutions[1].1;
+        assert!(document.preset.is_empty(), "{document:?}");
+        assert_eq!(
+            document
+                .missing
+                .iter()
+                .map(|input| (input.pointer.as_str(), input.provided_by))
+                .collect::<Vec<_>>(),
+            vec![("/session", ProvidedBy::Caller)],
+            "the session is the value the caller does not hold yet, and the \
+             document is the body entire rather than a field of one"
+        );
+
+        // The other way in: rows already in this API's own words. The rows are a
+        // field of *this* request, which is why they can be pointed at at all —
+        // `iaam-tt71` argued about them as a field of the call above.
+        let rows = resolutions[2].1;
+        assert!(rows.preset.is_empty(), "{rows:?}");
+        assert_eq!(
+            rows.missing
+                .iter()
+                .map(|input| (input.pointer.as_str(), input.provided_by))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/session", ProvidedBy::Caller),
+                ("/operations", ProvidedBy::ExternalDocument),
+            ]
+        );
+
         // The sync knows the account; which broker, and over what interval, are
         // the owner's to name.
-        let sync = resolutions[1].1;
+        let sync = resolutions[3].1;
         assert_eq!(
             sync.preset.get("account"),
             Some(&serde_json::Value::from(account.id.inner().to_string()))
@@ -5683,6 +5992,15 @@ mod tests {
         assert!(
             import.reason().contains("open an import session"),
             "{}",
+            import.reason()
+        );
+        // And the two-step act is said in the prose as well as in the fields: a
+        // client that reads only `reason` must not be left to guess where the
+        // session in the second call's path comes from.
+        assert!(
+            import.reason().contains("two calls rather than one"),
+            "the item must say that putting a statement in takes an open \
+             session first: {}",
             import.reason()
         );
         // And the half that was missing (`iaam-tt71`): «feed it the rows» named

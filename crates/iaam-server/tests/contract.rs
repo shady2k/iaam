@@ -8531,21 +8531,53 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
                 _ => vec![target],
             };
             for resolution in resolutions {
-                // A call that takes no request body has no request schema and
-                // therefore requires nothing, so the sweep over it is vacuous
-                // rather than absent — the same reading the shape test above
-                // makes of `requestSchema` being declared and not required.
-                // `abandon_import_session` is that call, and the queue offers
-                // it: `import_session_unfinished` publishes both of the calls
-                // that end a session.
+                // A call with no request schema has no **body field** to
+                // supply, and that is narrower than having nothing to supply.
+                // `abandon_import_session` genuinely has nothing — the session
+                // is in the path and there is nothing to say about abandoning
+                // it — and the queue offers it, because
+                // `import_session_unfinished` publishes both calls that end a
+                // session. `read_import_document` has no schema either, for a
+                // different reason: its body is an institution's export as it
+                // prints it, which no component schema describes. It still
+                // takes the session in its path, and the item that offers it
+                // has to say so, because the caller does not hold one until it
+                // has made the call before.
+                //
+                // So the rule here is not «nothing may be missing» but «what is
+                // missing must be something this route declares». A pointer
+                // that named a body field on a route with no body schema would
+                // send the caller to fill in a request that has no such field,
+                // which is the guess this whole sweep exists to prevent.
                 let Some(schema_reference) = resolution["requestSchema"].as_str() else {
-                    assert!(
-                        resolution["request"]["missing"]
-                            .as_array()
-                            .expect("missing inputs")
-                            .is_empty(),
-                        "a call with no request body has no field to supply: {resolution}"
-                    );
+                    let path = resolution["path"].as_str().expect("route path");
+                    let method = resolution["method"]
+                        .as_str()
+                        .expect("route method")
+                        .to_ascii_lowercase();
+                    let declared: Vec<&str> = body_of_spec["paths"][path][&method]["parameters"]
+                        .as_array()
+                        .map(|parameters| {
+                            parameters
+                                .iter()
+                                .map(|parameter| {
+                                    parameter["name"].as_str().expect("parameter name")
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for entry in resolution["request"]["missing"]
+                        .as_array()
+                        .expect("missing inputs")
+                    {
+                        let pointer = entry["pointer"].as_str().expect("missing pointer");
+                        assert!(
+                            declared.contains(&pointer.trim_start_matches('/')),
+                            "{method} {path} has no request schema, so {pointer} \
+                             can only be a parameter it declares, and it \
+                             declares {declared:?}: {resolution}"
+                        );
+                    }
                     continue;
                 };
                 let schema_name = schema_reference
@@ -23675,6 +23707,142 @@ fn the_document_channel_resolves_to_the_route_that_answers_it() {
     // `request_schema` being an `Option` is what makes that so: the catalogue
     // requires the identifier to resolve and nothing more.
     assert_eq!(resolved.request_schema, None, "{resolved:?}");
+}
+
+/// The row channel is an operation the contract publishes, and it resolves
+/// (`iaam-ripl`).
+///
+/// The nearest sibling of the defect above, left standing when that one was
+/// fixed. `POST /v1/import-sessions/{session}/rows` is the other way rows enter
+/// a session — the one for a caller holding rows in this API's own words rather
+/// than an institution's file — and it was equally unofferable: a write route
+/// with no key, so it stated its own authority and no resolution could point at
+/// it, while the queue's own item had been telling callers to make the call
+/// since the item existed.
+///
+/// The identifier is the handler's own name, as its sibling's is: utoipa
+/// defaults `operation_id` to the function it documents and this route declares
+/// none, so the default is pinned here with the address it resolves to.
+#[test]
+fn the_row_channel_resolves_to_the_route_that_answers_it() {
+    let harness = harness();
+    let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
+    let resolved = catalog.operation(OperationKey::AddImportRows);
+
+    assert_eq!(resolved.operation_id, "add_import_rows");
+    assert_eq!(resolved.method, "POST");
+    assert_eq!(resolved.path, "/v1/import-sessions/{session}/rows");
+    // The same floor the document channel keeps. The rows are held out of the
+    // journal whichever way they arrive, so which shape they came in must not
+    // decide what the caller is allowed to say.
+    assert_eq!(resolved.required_scope, iaam_app::ports::Scope::Agent);
+    // Unlike its sibling, this one takes a JSON body a component schema
+    // describes, which is what lets the queue point at the rows themselves.
+    assert_eq!(
+        resolved.request_schema.as_deref(),
+        Some("#/components/schemas/AddImportRowsRequest"),
+        "{resolved:?}"
+    );
+}
+
+/// Beginning an import is published as an ordered set of four calls, and the
+/// two that take a session say where the session comes from (`iaam-j5oz`).
+///
+/// The item offered two of the four: opening a session, and synchronising a
+/// broker. The two calls that actually put a statement into the session were
+/// prose, so an agent that reads `target` as its contract — which is what
+/// `target` is for — could open a session and had nowhere to go with it.
+///
+/// The order is half of what is checked. `iaam-bhu3` is what happens when the
+/// first entry is not the remedy for the ordinary case, and here the ordinary
+/// case is two calls: the one that can be made now comes first, the two that
+/// need what it returns follow it, and the channel for the accounts that have
+/// one is last.
+///
+/// The other half is that the second and third calls are honest. Each takes a
+/// session in its path, the caller holds none, and the queue says so with the
+/// mechanism it already had for a value the caller does not hold — a missing
+/// input marked `caller`, exactly as the broker option marks its own path
+/// segment. A resolution that named the call and left the session unexplained
+/// would be worse than no resolution at all.
+#[tokio::test]
+async fn beginning_an_import_publishes_every_call_that_begins_one() {
+    let harness = harness();
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+
+    let item = actions
+        .as_array()
+        .expect("action items")
+        .iter()
+        .find(|item| item["kind"] == "start_account_import")
+        .expect("an account with no facts is in this fixture");
+    let options = item["target"]["options"]
+        .as_array()
+        .expect("resolution options");
+    let offered: Vec<&str> = options
+        .iter()
+        .map(|option| option["operationId"].as_str().expect("operation id"))
+        .collect();
+    assert_eq!(
+        offered,
+        vec![
+            "open_import_session",
+            "read_import_document",
+            "add_import_rows",
+            "sync_broker",
+        ],
+        "{item}"
+    );
+
+    let asked = |option: &serde_json::Value| -> Vec<(String, String)> {
+        option["request"]["missing"]
+            .as_array()
+            .expect("missing inputs")
+            .iter()
+            .map(|input| {
+                (
+                    input["pointer"].as_str().expect("pointer").to_owned(),
+                    input["provided_by"]
+                        .as_str()
+                        .expect("provided_by")
+                        .to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    // The document channel: the session is the caller's own identifier, held
+    // from the call above it. The document is not listed beside it — it is the
+    // request body entire and not a field of one, which is the same reading
+    // `ProvidedBy` makes of the rows it was once argued about.
+    assert_eq!(
+        asked(&options[1]),
+        vec![("/session".to_owned(), "caller".to_owned())],
+        "{item}"
+    );
+    // The row channel: the same session, and the rows themselves, which *are* a
+    // field of this call. `external_document`, because the axis is who holds the
+    // value and the statement holds it however much converting it took to type.
+    assert_eq!(
+        asked(&options[2]),
+        vec![
+            ("/session".to_owned(), "caller".to_owned()),
+            ("/operations".to_owned(), "external_document".to_owned()),
+        ],
+        "{item}"
+    );
+
+    // Every one of the four admits an agent, so the item does too — and the
+    // item's floor is the narrowest of them, not a fourth statement beside them.
+    for option in options {
+        assert_eq!(option["requiredScope"], "agent", "{option}");
+    }
+    assert_eq!(item["required_scope"], "agent", "{item}");
 }
 
 /// Reading the catalogue of profiles is a read, and a read gets no key.

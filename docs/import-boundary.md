@@ -304,6 +304,26 @@ The item gains a **third option**, not a fourth word; that is a change to
 work rather than something this document can do: the option's address comes from
 the channel's own entry in the contract.
 
+**The options are there** (`iaam-j5oz`, `iaam-ripl`, decision 0025). The item now
+publishes four, ordered: open a session, read the document into it, put rows into
+it, or synchronise a broker channel. The document channel is the second because
+the first is the only one a caller holding nothing can make, and the two calls
+that take a session in their path publish `/session` as a missing field marked
+`caller` — the mechanism that already existed for a value the caller does not
+hold, and the same one the broker option uses for its own path segment.
+
+The fourth option is the one this section was about. Feeding a session row by row
+was, until now, exactly as unofferable as the document channel: it was a write
+route with no `OperationKey`, so nothing could point at it, and the item's «feed
+it the rows» was prose an agent had to resolve against the specification by
+itself. It has a name now, and the rows are a **field of that call** — published
+as missing and marked `external_document`, because the axis is who holds the
+value and the statement holds it however much converting it took to type. That
+does not reopen the case for a fourth word; it removes the last thing the word
+was standing in for. The sentence naming the shape stays, because a caller
+reading the reason still needs to know that a row nobody has concluded goes in as
+`unresolved_direction`.
+
 ## 6. Where the line should be, and the one thing that must move first
 
 **A converter translates a format. The API reaches conclusions.** That is the

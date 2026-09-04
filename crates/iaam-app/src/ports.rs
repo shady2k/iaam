@@ -159,6 +159,13 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         // the sentence that says it is still nobody's account of his. It is also
         // the only thing keeping those records refused deliberately rather than
         // provisionally, which is not a distinction an agent may draw for him.
+        //
+        // The withdrawal of that statement travels under the same key and so
+        // keeps the same floor, and that is the whole of why a settled item is
+        // owner-scoped: an agent may not take back a judgement it could not have
+        // made. It is a property of this call, read off this call. It is not a
+        // claim that the item is waiting on him — `ActionState::Settled` is the
+        // word for what such an item wants, and it wants nothing (`iaam-c143`).
         OperationKey::RecordAccountNameDisposition => Scope::Owner,
         // A control balance is the owner's own statement of what an account
         // held, and reconciliation is computed against it: conventions §4.3,

@@ -435,13 +435,55 @@ impl ActionCategory {
     }
 }
 
-/// Whether an action can be invoked without asking the owner.
+/// What is wanted of whoever reads this item, and from whom.
+///
+/// **Not «whether an action can be invoked without asking the owner»**, which is
+/// what this said until `iaam-c143`. That question has a yes, a no and a third
+/// word for «neither», and none of the three can say that nothing is wanted at
+/// all. A caller that had just recorded three statements of the owner's read
+/// three items still marked as needing him, went to find out what they were
+/// holding up, and reported that search to him. They were holding up nothing,
+/// and he was made to work it out from a description of this vocabulary.
+///
+/// [`ActionCategory`] grades urgency, and it was honest about those three: they
+/// were [`ActionCategory::Informational`] already. That is not a substitute for
+/// the fourth word here. A caller deciding what to raise reads the field that
+/// says what is wanted, and telling it to consult the urgency first is one rule
+/// written in two places — the arrangement `required_scope` and
+/// `ActionCategory::goals` are both here to avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionState {
+    /// A call is published, and an agent's own credential reaches it.
     Ready,
+    /// A value or a judgement is wanted that only the owner can supply.
     NeedsOwnerInput,
     /// No operation in this API is available for this item.
     Blocked,
+    /// Nothing is wanted. The item states a fact, and the fact still stands.
+    ///
+    /// **The item does not disappear, which is why this is a state and not a
+    /// deletion.** What settles an item is a decision of the owner's, and the
+    /// decision leaves something standing — records refused, a figure in no
+    /// report — that this queue is the only surface saying anything about.
+    /// Dropping the item would hide the consequence of his own decision from
+    /// him, which is the silent drop this module refuses everywhere else.
+    ///
+    /// **Not [`Self::Blocked`], and the difference is that there is a way back.**
+    /// `Blocked` says no call in this API touches the item. A settled item
+    /// publishes one: the withdrawal of the statement that settled it. So the
+    /// invariants bind it as they bind every other non-blocked item — it must
+    /// publish a resolution — and [`Action::required_scope`] answers for it.
+    ///
+    /// **Not [`Self::Ready`] either, and for a reason that is not about
+    /// urgency.** The withdrawal is the owner's: an agent may not take back a
+    /// judgement it could not have made. That floor is a property of the call
+    /// and is read off the call; what this state says is that no one is being
+    /// waited on.
+    ///
+    /// **What a caller does with it.** Show it when he asks what has been
+    /// decided. Never raise it as work, and never go looking for what it is
+    /// holding up: nothing is, and the search is what `iaam-c143` recorded.
+    Settled,
 }
 
 /// The typed thing an action is about.
@@ -1735,6 +1777,12 @@ pub enum ActionInvariantError {
     /// [`ActionTarget::None`], which was legal and should not have been: an
     /// item the owner must act on through no call in this API is
     /// [`ActionState::Blocked`], and that is the word for it.
+    ///
+    /// [`ActionState::Settled`] is bound by the same refusal, deliberately. An
+    /// item that wants nothing **and** publishes no way back states a fact
+    /// nothing in this API touches, and `Blocked` is already the word for that;
+    /// what distinguishes a settled item is precisely that the statement which
+    /// settled it can be withdrawn.
     NonBlockedWithoutScope,
     /// A set of resolutions holding fewer than two of them.
     ///
@@ -1752,6 +1800,27 @@ pub enum ActionInvariantError {
     /// precondition on everything — which is how the frontier was read, and it
     /// was never what any of it did.
     RequiredForNoGoal,
+    /// An item that requires no action, saying the owner must act.
+    ///
+    /// The defect `iaam-c143` was filed on, refused where the item is built
+    /// rather than left for a caller to notice. [`ActionCategory::Informational`]
+    /// is «a fact that requires no action»; [`ActionState::NeedsOwnerInput`] is
+    /// «something is wanted of him». Whenever the two appear together one of them
+    /// is false, and the queue is the worst place for that: a caller reads one
+    /// field, not both, so the contradiction is invisible from where it is acted
+    /// on. It was acted on — three settled items were investigated for what they
+    /// blocked, and the investigation was relayed to the owner.
+    InformationalNeedingInput,
+    /// An item that wants nothing, graded as work.
+    ///
+    /// The converse, refused for its own reason and not for symmetry.
+    /// [`ActionState::Settled`] says nothing is wanted; every category but
+    /// [`ActionCategory::Informational`] says something is — work that blocks
+    /// the system, work a named report is short of, or work worth doing. This is
+    /// what stops the fourth word being reached for as a way of quieting an item
+    /// that is still work: quieting it means answering the category, and the
+    /// category is computed from what the item is.
+    SettledWithWork,
 }
 
 /// The narrower of two floors: the one a token reaching the other also reaches.
@@ -1793,7 +1862,15 @@ pub struct Action {
 }
 
 impl Action {
-    /// Construct an action while rejecting a ready item without an operation.
+    /// Construct an action, refusing every pair of fields that contradicts itself.
+    ///
+    /// Seven refusals rather than the one the name of this comment used to
+    /// promise, and the last two say that urgency and what-is-wanted are not
+    /// independent of each other: an item that requires no action may not ask
+    /// for one, and an item that wants nothing may not be graded as work
+    /// (`iaam-c143`). Refused here rather than swept afterwards, for
+    /// `MissingInput::plain`'s reason — a guard catches the pair after it is
+    /// built, and a constructor leaves nothing to catch.
     pub fn new(
         facts: ActionFacts,
         reason: impl Into<String>,
@@ -1822,6 +1899,17 @@ impl Action {
         }
         if matches!(facts.category, ActionCategory::RequiredForGoal(goals) if goals.is_empty()) {
             return Err(ActionInvariantError::RequiredForNoGoal);
+        }
+        if matches!(
+            (facts.category, facts.state),
+            (ActionCategory::Informational, ActionState::NeedsOwnerInput)
+        ) {
+            return Err(ActionInvariantError::InformationalNeedingInput);
+        }
+        if facts.state == ActionState::Settled
+            && !matches!(facts.category, ActionCategory::Informational)
+        {
+            return Err(ActionInvariantError::SettledWithWork);
         }
         Ok(Self {
             id: facts.id,
@@ -5070,10 +5158,18 @@ fn declining_option(printed: &str) -> ResolutionOption {
 /// module refuses everywhere else. So the queue keeps saying how many, and says
 /// why.
 ///
-/// **`NeedsOwnerInput` and not `Ready`.** Nothing is asked of him — that is what
-/// `Informational` says — but the one act this item still offers is the
-/// withdrawal of his own statement, and an agent may not withdraw a judgement it
-/// could not have made.
+/// **`Settled`, and it said `NeedsOwnerInput` until `iaam-c143`.** Nothing is
+/// asked of him — that is what `Informational` says one field over — and the
+/// state had no word for it, so the item stood in the queue claiming his input
+/// while asking him for nothing. It was read as written: a caller that had just
+/// recorded three of these went looking for what they blocked, found nothing,
+/// and told him what it had done to find out. The queue said this needed him,
+/// and it did not.
+///
+/// The one act the item still offers is the withdrawal of his own statement, and
+/// an agent may not withdraw a judgement it could not have made. That is a floor
+/// on the call, read off the call by [`Action::required_scope`]; it was never a
+/// reason to publish the item as waiting on him.
 ///
 /// **The way back is the withdrawal and not `create_account`.** Offering both
 /// would publish, on an item that says the matter is settled, the very act he
@@ -5097,7 +5193,7 @@ fn declined_account_name_action(
             id,
             kind: ActionKind::CreateAccountNamedByDocument,
             category: ActionCategory::Informational,
-            state: ActionState::NeedsOwnerInput,
+            state: ActionState::Settled,
             subject: None,
         },
         format!(
@@ -5925,13 +6021,23 @@ mod tests {
         let term = named("Term");
         let mut items = Vec::new();
 
-        // Nothing described, and two documents that named accounts. Two and not
-        // one, because one printed name is a set of one and publishes no
-        // proposal, so a heap holding one would let the sweeps run over a queue
-        // in which nothing was ever offered over a set (`iaam-hdr7`).
+        // Nothing described, and three documents that named accounts. At least
+        // two undeclined, because one printed name is a set of one and publishes
+        // no proposal, so a heap holding one would let the sweeps run over a
+        // queue in which nothing was ever offered over a set (`iaam-hdr7`). And
+        // one he has declared is no account of his, which is the only item this
+        // queue settles: without it every sweep over what the states mean runs
+        // over a heap in which nothing wants nothing (`iaam-c143`).
         items.extend(queue_wanting(
             &[],
-            &[wanted("Shop One", 3, 1), wanted("Shop Two", 5, 1)],
+            &[
+                wanted("Shop One", 3, 1),
+                wanted("Shop Two", 5, 1),
+                AccountNamedByDocument {
+                    declined: Some("a shop I pay".to_owned()),
+                    ..wanted("Shop Three", 7, 1)
+                },
+            ],
         ));
 
         // One account, no perimeter, no facts: the first perimeter, the
@@ -5995,6 +6101,60 @@ mod tests {
         // wants a correction, and an unconfirmed period wants a broker.
         items.extend(every_diagnostic());
         items
+    }
+
+    /// Nothing this queue publishes asks for something it does not want.
+    ///
+    /// The sweep `iaam-c143` asked for before a fourth word was minted, kept
+    /// afterwards as what will notice the next item in that position.
+    /// [`Action::new`] refuses the pair, so this cannot fail while every item is
+    /// built through the producers — which is what it proves: that the producers
+    /// are the only way these items are made. It fails the day one is assembled
+    /// around the constructor.
+    ///
+    /// Both witnesses are demanded rather than assumed. An item that wants
+    /// nothing has to be in the heap, or this is a loop over items that could
+    /// never have shown the defect; and an item that does want something has to
+    /// be too, or the sweep proves only that `Informational` is absent.
+    #[test]
+    fn no_item_the_queue_publishes_asks_for_something_it_does_not_want() {
+        let items = every_queue_item();
+        for action in &items {
+            assert_ne!(
+                (action.category(), action.state()),
+                (ActionCategory::Informational, ActionState::NeedsOwnerInput),
+                "{} states a fact that requires no action and still says the \
+                 owner must act",
+                action.id()
+            );
+            if action.state() == ActionState::Settled {
+                assert_eq!(
+                    action.category(),
+                    ActionCategory::Informational,
+                    "{} wants nothing and is graded as work",
+                    action.id()
+                );
+                assert!(
+                    !action.target().resolutions().is_empty(),
+                    "{} is settled and publishes no way back out of it, which is \
+                     what `blocked` says",
+                    action.id()
+                );
+            }
+        }
+        assert!(
+            items
+                .iter()
+                .any(|action| action.state() == ActionState::Settled),
+            "the heap settles nothing, so this swept a queue in which the defect \
+             could not have appeared"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|action| action.state() == ActionState::NeedsOwnerInput),
+            "the heap asks the owner for nothing, so this proved nothing either"
+        );
     }
 
     /// Every field the owner fills in carries the question to put to him.
@@ -7190,8 +7350,15 @@ mod tests {
         );
         assert_eq!(
             action.state(),
-            ActionState::NeedsOwnerInput,
-            "an agent may not withdraw a judgement it could not have made"
+            ActionState::Settled,
+            "he decided this, and the queue asks him for nothing on account of it"
+        );
+        assert_eq!(
+            action.required_scope(),
+            Some(Scope::Owner),
+            "the withdrawal is still his, and an agent may not take back a \
+             judgement it could not have made — which is a floor on that call \
+             and not a claim that the item is waiting on him"
         );
     }
 
@@ -9363,6 +9530,91 @@ mod tests {
         )
         .expect("a blocked item with no target is valid");
         assert_eq!(blocked.required_scope(), None);
+    }
+
+    /// A withdrawal, as a target: the one call a settled item publishes.
+    ///
+    /// Written once because three refusals below are about the pairing of the
+    /// state with the category, and each needs a target that is not itself the
+    /// defect — a specimen refused for two reasons proves neither.
+    fn withdrawal() -> ActionTarget {
+        let mut preset = BTreeMap::new();
+        preset.insert("printed".to_owned(), "Shop One".into());
+        preset.insert("disposition".to_owned(), "undecided".into());
+        ActionTarget::Operation {
+            operation: OperationKey::RecordAccountNameDisposition,
+            request: RequestPlan {
+                preset,
+                missing: Vec::new(),
+            },
+        }
+    }
+
+    /// An item that requires no action cannot say the owner must act.
+    ///
+    /// The pair `iaam-c143` was filed on, and the whole of its cost was that a
+    /// caller believed the field: it read `needs_owner_input`, went to find out
+    /// what the item was holding up, and relayed the search to the owner. The
+    /// specimen is well formed in every other respect, so the refusal that fires
+    /// is the one being proved.
+    #[test]
+    fn an_item_that_requires_no_action_cannot_say_the_owner_must_act() {
+        let result = Action::new(
+            ActionFacts {
+                id: "a fact that asks".to_owned(),
+                kind: ActionKind::CreateAccountNamedByDocument,
+                category: ActionCategory::Informational,
+                state: ActionState::NeedsOwnerInput,
+                subject: None,
+            },
+            "nothing is asked of you, and the state says otherwise",
+            withdrawal(),
+        );
+        assert_eq!(result, Err(ActionInvariantError::InformationalNeedingInput));
+    }
+
+    /// An item that wants nothing cannot be graded as work.
+    ///
+    /// The converse, and it is what keeps the fourth word from becoming a way to
+    /// quiet an item that is still work: an item required for a goal is short of
+    /// something, and saying nothing is wanted does not supply it.
+    #[test]
+    fn an_item_that_wants_nothing_cannot_be_graded_as_work() {
+        let result = Action::new(
+            ActionFacts {
+                id: "work called settled".to_owned(),
+                kind: ActionKind::CreateAccountNamedByDocument,
+                category: ActionCategory::required_for(ActionKind::CreateAccountNamedByDocument),
+                state: ActionState::Settled,
+                subject: None,
+            },
+            "a report is short of this, and the state says nobody is waiting",
+            withdrawal(),
+        );
+        assert_eq!(result, Err(ActionInvariantError::SettledWithWork));
+    }
+
+    /// A settled item publishes the way back, or the word for it is `blocked`.
+    ///
+    /// The fourth state is threaded through the invariant that was already
+    /// there rather than exempted from it. What distinguishes a settled item
+    /// from a blocked one is precisely that the statement which settled it can
+    /// be withdrawn; an item that wants nothing and offers nothing is a fact no
+    /// call in this API touches, and that is what `blocked` says.
+    #[test]
+    fn a_settled_item_publishes_the_withdrawal_that_undoes_it() {
+        let result = Action::new(
+            ActionFacts {
+                id: "settled with no way back".to_owned(),
+                kind: ActionKind::CreateAccountNamedByDocument,
+                category: ActionCategory::Informational,
+                state: ActionState::Settled,
+                subject: None,
+            },
+            "he decided it, and nothing here takes the decision back",
+            ActionTarget::None,
+        );
+        assert_eq!(result, Err(ActionInvariantError::NonBlockedWithoutScope));
     }
 
     /// An item that is not blocked and offers no way out is refused.

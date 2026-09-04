@@ -7370,7 +7370,7 @@ async fn a_balance_point_taken_from_an_action_is_accepted_verbatim() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let action = body
+        let action = body["items"]
             .as_array()
             .expect("action items")
             .iter()
@@ -7427,7 +7427,8 @@ async fn the_action_queue_asks_for_the_opening_balance_before_the_closing_one() 
     assert_eq!(status, StatusCode::OK, "{verdicts}");
 
     let assertion_requests = |body: &Value| -> Vec<Value> {
-        body.as_array()
+        body["items"]
+            .as_array()
             .expect("action items")
             .iter()
             .filter(|item| item["kind"] == "provide_control_assertion")
@@ -8323,11 +8324,14 @@ async fn actions_endpoint_is_authenticated_and_reports_the_empty_owner_frontier(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // A bare array, under §1 of `docs/api/conventions.md`. The wrapper existed
-    // for `policy_version`, and `policy_version` was a literal nothing derived
-    // and nothing bumped — so there was no fact about the answer as a whole for
-    // the object to carry, which is exactly what the rule asks.
-    let items = body.as_array().expect("action items");
+    // An object, under §1 of `docs/api/conventions.md`, and the fact it carries
+    // is not the one it used to. `policy_version` was a literal nothing derived
+    // and nothing bumped, so there was no fact about the answer as a whole for
+    // the object to hold and the route became a bare array; the standing of the
+    // four reports is such a fact — an absence of items is what says a report is
+    // unobstructed, and no item can state an absence — so the object is back
+    // without the field that emptied it.
+    let items = body["items"].as_array().expect("action items");
     assert!(body.get("policy_version").is_none(), "{body}");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], "create_first_account");
@@ -8353,6 +8357,158 @@ async fn actions_endpoint_is_authenticated_and_reports_the_empty_owner_frontier(
     );
 }
 
+/// The queue says which of the four reports nothing outstanding stands in the
+/// way of, and names the items standing in the way of the rest.
+///
+/// The gap this closes (`iaam-i3nx`): every required item already declared which
+/// reports its work stands in the way of, and nobody published the inverse. An
+/// agent holding the queue could say how many things there were to do and could
+/// not say which questions about his money it was able to answer today, which is
+/// the one a person asks first.
+///
+/// Swept over both fixtures rather than asserted against one expected document:
+/// the properties below are what a client may rely on, and a document written
+/// out here would be kept green by being edited to whatever the queue became.
+/// Two named witnesses follow the sweep, because the sweep alone passes on a
+/// fold that put every item into every report.
+#[tokio::test]
+async fn the_queue_says_where_each_report_stands_and_names_what_stands_in_the_way() {
+    for harness in [harness(), empty_owner_harness()] {
+        let (status, body) = call(
+            &harness.router,
+            get("/v1/actions", Some(&harness.owner_token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let items = body["items"].as_array().expect("action items");
+        let reports = body["reports"].as_array().expect("report standings");
+        let named: Vec<&str> = reports
+            .iter()
+            .map(|report| report["goal"].as_str().expect("a goal name"))
+            .collect();
+        assert_eq!(
+            named,
+            ["asset_snapshot", "money_flow", "returns", "reconciliation"],
+            "the four reports are the closed vocabulary the items are graded by: {body}"
+        );
+
+        let ids: BTreeSet<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("an item id"))
+            .collect();
+        for report in reports {
+            // The name is ours and the sentence is what a person can be told, so
+            // a sentence spelled in wire words would leave a caller with nothing
+            // to say about a report it is offering him.
+            let answers = report["answers"].as_str().expect("what the report answers");
+            assert!(
+                !answers.is_empty()
+                    && !answers.contains('_')
+                    && !answers.contains('/')
+                    && answers != report["goal"],
+                "{report} says what it answers in this system's own words"
+            );
+            for blocker in report["blocked_by"].as_array().expect("the obstacles") {
+                let blocker = blocker.as_str().expect("an item id");
+                assert!(
+                    ids.contains(blocker),
+                    "{report} names {blocker}, which is in no item of this queue: {body}"
+                );
+            }
+        }
+
+        // The fold is the items' own grading read backwards, so it can be
+        // checked against them item by item — in both directions, because a
+        // fold that named every item on every report would satisfy the first
+        // direction alone.
+        for item in items {
+            let id = item["id"].as_str().expect("an item id");
+            let blocking = item["category"] == "blocking";
+            let goals: BTreeSet<&str> = item["goals"]
+                .as_array()
+                .expect("the goals of an item")
+                .iter()
+                .map(|goal| goal.as_str().expect("a goal name"))
+                .collect();
+            for report in reports {
+                let goal = report["goal"].as_str().expect("a goal name");
+                let standing: Vec<&str> = report["blocked_by"]
+                    .as_array()
+                    .expect("the obstacles")
+                    .iter()
+                    .map(|blocker| blocker.as_str().expect("an item id"))
+                    .collect();
+                // A blocking item stops the next call rather than any one
+                // report, so it names no goal of its own and stands in the way
+                // of all four; everything else stands exactly where it says.
+                assert_eq!(
+                    standing.contains(&id),
+                    blocking || goals.contains(goal),
+                    "{id} and {goal} disagree about each other: {body}"
+                );
+            }
+        }
+    }
+
+    // Witness one: the standings are not one list published four times. This
+    // fixture holds an account in no scope, which keeps three reports and not
+    // reconciliation — a report computed for an account, which resolves no
+    // scope at all.
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let blocked_by = |goal: &str| -> Vec<String> {
+        body["reports"]
+            .as_array()
+            .expect("report standings")
+            .iter()
+            .find(|report| report["goal"] == goal)
+            .unwrap_or_else(|| panic!("no standing for {goal}: {body}"))["blocked_by"]
+            .as_array()
+            .expect("the obstacles")
+            .iter()
+            .map(|blocker| blocker.as_str().expect("an item id").to_owned())
+            .collect()
+    };
+    assert!(
+        blocked_by("asset_snapshot").contains(&"create_first_contour".to_owned()),
+        "{body}"
+    );
+    assert!(
+        !blocked_by("reconciliation").contains(&"create_first_contour".to_owned()),
+        "an item that decides which accounts a report covers is in the way of the one \
+         report that resolves no scope: {body}"
+    );
+
+    // Witness two: an instance holding nothing does not answer «all four». Its
+    // whole queue is one blocking item, which declares no goal — so a fold
+    // reading only what the items declare would publish four unobstructed
+    // reports about a system with no account, no scope and no fact in it.
+    let empty = empty_owner_harness();
+    let (status, body) = call(&empty.router, get("/v1/actions", Some(&empty.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().expect("action items");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["category"], "blocking", "{body}");
+    assert_eq!(
+        items[0]["goals"],
+        json!([]),
+        "the witness names a goal, so it no longer witnesses anything: {body}"
+    );
+    for report in body["reports"].as_array().expect("report standings") {
+        assert_eq!(
+            report["blocked_by"],
+            json!(["create_first_account"]),
+            "{report} reads as unobstructed on an instance that holds nothing: {body}"
+        );
+    }
+}
+
 /// Every field the published queue asks the owner for carries his question.
 ///
 /// The field report `iaam-ytvf` was filed on is a client-visible one: an agent
@@ -8372,7 +8528,7 @@ async fn every_field_the_queue_asks_the_owner_for_arrives_with_the_question_to_p
             call(&owner.router, get("/v1/actions", Some(&owner.owner_token))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        for item in body.as_array().expect("action items") {
+        for item in body["items"].as_array().expect("action items") {
             let mut plans = vec![&item["target"]["request"]];
             if let Some(options) = item["target"]["options"].as_array() {
                 plans.extend(options.iter().map(|option| &option["request"]));
@@ -8444,7 +8600,7 @@ async fn actions_endpoint_reports_the_first_contour_and_its_candidates() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let items = body.as_array().expect("action items");
+    let items = body["items"].as_array().expect("action items");
     assert_eq!(items.len(), 2);
     let item = items
         .iter()
@@ -8663,7 +8819,7 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        for item in body.as_array().expect("action items") {
+        for item in body["items"].as_array().expect("action items") {
             let target = &item["target"];
             // A target carrying several ways out is swept option by option, the
             // same way `ActionTarget::resolutions` reads it. Checking only the
@@ -11481,7 +11637,7 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
 
-    let named: Vec<&Value> = actions
+    let named: Vec<&Value> = actions["items"]
         .as_array()
         .expect("action items")
         .iter()
@@ -11596,7 +11752,7 @@ async fn every_queue_item_about_an_account_names_the_account() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    let items = actions.as_array().expect("action items");
+    let items = actions["items"].as_array().expect("action items");
     assert!(!items.is_empty(), "{actions}");
 
     let about_accounts: Vec<&Value> = items
@@ -11658,7 +11814,7 @@ async fn an_event_subject_carries_no_name() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    for item in actions.as_array().expect("action items") {
+    for item in actions["items"].as_array().expect("action items") {
         if item["subject"]["type"] == "event" {
             let keys: std::collections::BTreeSet<&str> = item["subject"]
                 .as_object()
@@ -12290,7 +12446,7 @@ async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
     assert!(
-        actions
+        actions["items"]
             .as_array()
             .expect("action items")
             .iter()
@@ -12319,7 +12475,7 @@ async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
     .await;
     assert_eq!(status, StatusCode::OK, "{reopened}");
     assert!(
-        reopened
+        reopened["items"]
             .as_array()
             .expect("action items")
             .iter()
@@ -12418,7 +12574,7 @@ async fn no_queue_item_promises_a_call_it_does_not_have() {
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
 
-    let items = actions.as_array().expect("action items");
+    let items = actions["items"].as_array().expect("action items");
     assert!(
         !items.is_empty(),
         "the fixture must produce a queue to sweep"
@@ -12462,7 +12618,7 @@ async fn every_resolution_publishes_its_own_floor_and_the_item_publishes_the_nar
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
 
-    let items = actions.as_array().expect("action items");
+    let items = actions["items"].as_array().expect("action items");
     assert!(
         !items.is_empty(),
         "the fixture must produce a queue to sweep"
@@ -14028,7 +14184,7 @@ async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
     let queue = |token: &str| get("/v1/actions", Some(token));
     let (status, actions) = call(&harness.router, queue(&harness.owner_token)).await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    let item = actions
+    let item = actions["items"]
         .as_array()
         .expect("the queue")
         .iter()
@@ -14187,7 +14343,7 @@ async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
     let (status, actions) = call(&harness.router, queue(&harness.owner_token)).await;
     assert_eq!(status, StatusCode::OK, "{actions}");
     assert!(
-        actions
+        actions["items"]
             .as_array()
             .expect("the queue")
             .iter()
@@ -14228,7 +14384,7 @@ async fn a_queue_for_an_owner_who_has_retired_nothing_carries_no_such_item() {
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
     assert!(
-        actions
+        actions["items"]
             .as_array()
             .expect("the queue")
             .iter()
@@ -14769,7 +14925,7 @@ async fn the_queue_points_an_undecided_account_at_an_existing_contour() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    let item = actions
+    let item = actions["items"]
         .as_array()
         .expect("action items")
         .iter()
@@ -14980,7 +15136,7 @@ async fn transfer_partners_queue(harness: &Harness) -> Vec<Value> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    actions
+    actions["items"]
         .as_array()
         .expect("action items")
         .iter()
@@ -18520,7 +18676,7 @@ async fn open_question_items(harness: &Harness) -> Vec<Value> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    actions
+    actions["items"]
         .as_array()
         .expect("action items")
         .iter()
@@ -18537,7 +18693,7 @@ async fn unfinished_session_items(harness: &Harness) -> Vec<Value> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    actions
+    actions["items"]
         .as_array()
         .expect("action items")
         .iter()
@@ -23079,7 +23235,7 @@ async fn adopt_rule_items(harness: &Harness) -> Vec<Value> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
-    actions
+    actions["items"]
         .as_array()
         .expect("action items")
         .iter()
@@ -24341,7 +24497,7 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{queue}");
-    let wanted: Vec<&Value> = queue
+    let wanted: Vec<&Value> = queue["items"]
         .as_array()
         .expect("action items")
         .iter()
@@ -24704,7 +24860,7 @@ async fn beginning_an_import_publishes_every_call_that_begins_one() {
     .await;
     assert_eq!(status, StatusCode::OK, "{actions}");
 
-    let item = actions
+    let item = actions["items"]
         .as_array()
         .expect("action items")
         .iter()

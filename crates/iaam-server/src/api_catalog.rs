@@ -11,11 +11,15 @@
 //! So the document names three things beyond the contract and the health
 //! resource:
 //!
-//! - **the four goals**, taken from [`ReportGoal`] rather than spelled here, and
-//!   the route that answers each. The same four names are published by the
-//!   outstanding-work queue on every item and by every report's confidence
-//!   register, so a client holding a caveat that says `money_flow` can ask this
-//!   document which route that is;
+//! - **the four goals**, taken from [`ReportGoal`] rather than spelled here —
+//!   the code, the line saying what each answers, and the route that answers it.
+//!   The line was written here and moved to the goal itself when the
+//!   outstanding-work queue began publishing the same four names to be read out
+//!   (`iaam-i3nx`); two descriptions of one report, published by one system, is
+//!   the divergence [`ReportGoal::code`] is in the core to prevent. Those names
+//!   are published by the outstanding-work queue on every item and by every
+//!   report's confidence register, so a client holding a caveat that says
+//!   `money_flow` can ask this document which route that is;
 //! - **the queue**, which is the answer to "what should I do first" and the only
 //!   route that reads this instance's state to produce it;
 //! - **the scopes**, because every one of the four goal routes requires a scope
@@ -103,22 +107,6 @@ const fn answering_operation(goal: ReportGoal) -> &'static str {
     }
 }
 
-/// What a goal is, in one line, for a reader deciding where to go.
-///
-/// Prose, and deliberately not derived from anything: the machine-readable name
-/// beside it is [`ReportGoal::code`], and a title that drifts costs a reader a
-/// sentence, where a code that drifts costs a client the join.
-const fn goal_title(goal: ReportGoal) -> &'static str {
-    match goal {
-        ReportGoal::AssetSnapshot => {
-            "What the owner holds at a date: cash and positions, and the whole."
-        }
-        ReportGoal::MoneyFlow => "Where money came from and where it went, over an interval.",
-        ReportGoal::Returns => "What the money earned, before tax.",
-        ReportGoal::Reconciliation => "Whether the journal agrees with what the sources say.",
-    }
-}
-
 /// The discovery document, serialised once at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiCatalog {
@@ -173,7 +161,7 @@ impl ApiCatalog {
         for goal in ReportGoal::ALL {
             related.push(link(
                 resolve(answering_operation(goal))?,
-                goal_title(goal),
+                goal.answers(),
                 Some(goal.code()),
             ));
         }

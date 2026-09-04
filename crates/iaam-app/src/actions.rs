@@ -2001,6 +2001,128 @@ impl Action {
     }
 }
 
+/// One of the four reports, and the outstanding work standing between the owner
+/// and it.
+///
+/// **The inverse of [`ActionKind::goals`], and until `iaam-i3nx` nobody
+/// published it.** Every required item already declares which reports its work
+/// stands in the way of, so an agent holding the queue could say «there are five
+/// things to do» and could not say «I can show you where the money went and what
+/// you hold; how it has done needs these two first» — which is the sentence a
+/// person asks for first. The mapping was there; only the fold was missing, and
+/// a caller doing it for itself has to know that an item naming no goal at all
+/// can still stand in the way of every one of them, which is the half nothing
+/// told it.
+///
+/// **Not a route of its own, and not a fact an item could carry.** It is folded
+/// out of the same queue in the same reading, because a second address is a
+/// second thing to find and not finding things is the defect this whole surface
+/// is written against. It sits beside the items rather than on one of them for
+/// the opposite reason: what a report with nothing outstanding needs said is
+/// said by the *absence* of items, and an absence is the one thing no item can
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportStanding {
+    goal: ReportGoal,
+    blocked_by: Vec<String>,
+}
+
+impl ReportStanding {
+    /// The report this standing is about.
+    #[must_use]
+    pub const fn goal(&self) -> ReportGoal {
+        self.goal
+    }
+
+    /// The outstanding items standing between the owner and this report, by
+    /// identity, in the queue's own order — so the first named is the most
+    /// urgent.
+    ///
+    /// **Named and not counted.** «Blocked by two items» makes the caller scan
+    /// the queue to find out which two, and the identifiers are in the same
+    /// response already: it is decision 0034's defect turned round — a group
+    /// that publishes what its members share and not which rows they are.
+    ///
+    /// It is also why no `answerable` flag sits beside this list. The flag would
+    /// be the list's own emptiness written a second time, and two statements of
+    /// one fact in one response can come to disagree; `RowGroup` refused a count
+    /// beside its members for the same reason.
+    ///
+    /// **Empty is the narrow claim and not the wide one.** It says nothing in
+    /// this queue stands in the way. It does not say the report will satisfy
+    /// him: a report states what it is silent or partial about in its own
+    /// confidence register, and this queue cannot see that register — the two
+    /// join on the goal's name and neither contains the other. An instance
+    /// holding nothing at all is the case that makes the difference concrete,
+    /// and it is why [`ActionCategory::Blocking`] counts here.
+    #[must_use]
+    pub fn blocked_by(&self) -> &[String] {
+        &self.blocked_by
+    }
+}
+
+/// Which reports the queue leaves unobstructed, and what stands in the way of
+/// the rest.
+///
+/// **All four, always, in [`ReportGoal::ALL`] order.** A fold that published
+/// only the obstructed ones would answer «which reports are answerable» with
+/// silence, which is the reading a caller cannot distinguish from a report this
+/// build has forgotten about.
+///
+/// **A pure fold over the queue that was already computed**, taking no port and
+/// reading nothing: it is derived from what the items carry, so it cannot
+/// disagree with them and cannot fail where they succeeded.
+///
+/// **Only over a whole queue.** Three other responses embed the same items
+/// bound to what was asked for — one account and a range, one synchronisation's
+/// own verdicts, one report's own diagnostics — and «nothing stands in the way
+/// of this report» folded out of a slice of the queue is exactly the false
+/// reassurance this system must never give by accident. So it is called where
+/// [`frontier`] is published whole, and the narrowness is the reason it takes a
+/// slice of already-computed items rather than being returned by `frontier`
+/// itself.
+#[must_use]
+pub fn report_standings(queue: &[Action]) -> [ReportStanding; 4] {
+    ReportGoal::ALL.map(|goal| ReportStanding {
+        goal,
+        blocked_by: queue
+            .iter()
+            .filter(|action| stands_in_the_way_of(action, goal))
+            .map(|action| action.id().to_owned())
+            .collect(),
+    })
+}
+
+/// Whether one item stands between the owner and one report.
+///
+/// **Two clauses, and the second is the one that keeps the first honest.** The
+/// required category answers «which reports is this work required for», read off
+/// the single table on the kind. A blocking item answers nothing there — it
+/// names no goal, deliberately, because it stops the next call rather than a
+/// report — and the queue of an instance holding nothing at all is exactly one
+/// blocking item. Folded on the first clause alone, such an instance would
+/// publish all four reports with nothing standing in the way of any of them,
+/// which is the worst sentence this surface can produce and the one it exists
+/// to prevent.
+///
+/// **This is not a widening of [`ActionKind::goals`].** That table stays the one
+/// statement of what a *kind's work* is required for, and [`Action::new`] still
+/// refuses a required item naming no goal. Blocking is a second and different
+/// fact — the system will not accept another act until this is done, so it
+/// stands in the way of every report by standing in the way of everything — and
+/// writing it into the table as `ReportGoals::ALL` would grade a stop as
+/// required work and quietly delete that refusal.
+///
+/// A recommendation and a statement of fact stand in the way of nothing, which
+/// is what those two words mean.
+fn stands_in_the_way_of(action: &Action, goal: ReportGoal) -> bool {
+    match action.category() {
+        ActionCategory::Blocking => true,
+        ActionCategory::RequiredForGoal(goals) => goals.contains(goal),
+        ActionCategory::Recommended | ActionCategory::Informational => false,
+    }
+}
+
 /// The identity of an action, which is not the same thing as its kind.
 ///
 /// The first two actions are existential — the owner has no account, the owner
@@ -9530,6 +9652,166 @@ mod tests {
         )
         .expect("a blocked item with no target is valid");
         assert_eq!(blocked.required_scope(), None);
+    }
+
+    /// An item of a given kind, built the shortest way a specimen can be built.
+    ///
+    /// Written for the standings below and taking the kind rather than the
+    /// category, so that a specimen's goals are the ones the single table on
+    /// [`ActionKind`] declares. A test that chose its own goal set would prove
+    /// the fold against a mapping this crate does not use.
+    fn item(id: &str, kind: ActionKind, category: ActionCategory) -> Action {
+        Action::new(
+            ActionFacts {
+                id: id.to_owned(),
+                kind,
+                category,
+                state: ActionState::NeedsOwnerInput,
+                subject: None,
+            },
+            "invented for this test",
+            withdrawal(),
+        )
+        .expect("a specimen with a call and a state that wants one")
+    }
+
+    /// The standing of one report, by name, out of a whole set of them.
+    fn standing_for(standings: &[ReportStanding; 4], goal: ReportGoal) -> &ReportStanding {
+        standings
+            .iter()
+            .find(|standing| standing.goal() == goal)
+            .unwrap_or_else(|| panic!("no standing for {}", goal.code()))
+    }
+
+    /// The fold is the items' own grading read the other way, and it names the
+    /// items rather than counting them.
+    ///
+    /// Two reports are obstructed here and two are not, so the test can fail in
+    /// both directions: a fold that named everything on every report would break
+    /// the two empty ones, and one that named nothing would break the two full
+    /// ones. The recommendation is in the queue for the same reason — it is the
+    /// specimen that must appear in no standing at all, and a fold that simply
+    /// listed the queue would carry it into all four.
+    #[test]
+    fn a_report_names_the_items_standing_in_its_way_and_no_others() {
+        let queue = [
+            item(
+                "retired",
+                ActionKind::RetiredAccountNotEmpty,
+                ActionCategory::required_for(ActionKind::RetiredAccountNotEmpty),
+            ),
+            item(
+                "gap",
+                ActionKind::CoverageGapUnrepaired,
+                ActionCategory::required_for(ActionKind::CoverageGapUnrepaired),
+            ),
+            item(
+                "rule",
+                ActionKind::AdoptClassificationRule,
+                ActionCategory::Recommended,
+            ),
+        ];
+        let standings = report_standings(&queue);
+
+        assert_eq!(
+            standing_for(&standings, ReportGoal::AssetSnapshot).blocked_by(),
+            ["retired"]
+        );
+        assert_eq!(
+            standing_for(&standings, ReportGoal::Reconciliation).blocked_by(),
+            ["gap"]
+        );
+        for unobstructed in [ReportGoal::MoneyFlow, ReportGoal::Returns] {
+            assert!(
+                standing_for(&standings, unobstructed)
+                    .blocked_by()
+                    .is_empty(),
+                "{} is obstructed by work that is not required for it",
+                unobstructed.code()
+            );
+        }
+        assert!(
+            standings
+                .iter()
+                .all(|standing| !standing.blocked_by().contains(&"rule".to_owned())),
+            "a recommendation stands in the way of nothing, and this one is in a standing"
+        );
+    }
+
+    /// An instance holding nothing at all does not publish four answerable
+    /// reports.
+    ///
+    /// **The specimen this whole fold is written against.** A brand new
+    /// instance's queue is exactly one item, `create_first_account`, and it is
+    /// blocking — so it names no goal, because the single table on
+    /// [`ActionKind`] grades what work is *required for* and a blocking item
+    /// stops the next call rather than any one report. Folded on the items'
+    /// declared goals alone, such an instance would answer «which reports can
+    /// you produce for me?» with «all four», about a system holding no account,
+    /// no scope and no fact.
+    ///
+    /// The item's empty goal set is asserted here rather than assumed, because
+    /// it is the whole reason the test is not vacuous: if the specimen declared
+    /// a goal, the fold would pass on the first clause and prove nothing about
+    /// the second.
+    #[test]
+    fn an_instance_whose_queue_is_one_blocking_item_publishes_no_unobstructed_report() {
+        let queue = [item(
+            "create_first_account",
+            ActionKind::CreateFirstAccount,
+            ActionCategory::Blocking,
+        )];
+        assert!(
+            queue[0].category().goals().is_empty(),
+            "the specimen names a goal, so the blocking clause is not what is being proved"
+        );
+
+        for standing in report_standings(&queue) {
+            assert_eq!(
+                standing.blocked_by(),
+                ["create_first_account"],
+                "{} reads as unobstructed on an instance that holds nothing",
+                standing.goal().code()
+            );
+        }
+    }
+
+    /// All four reports are published whatever the queue holds, in the order the
+    /// vocabulary is published in, and each item is named in the queue's own
+    /// order.
+    ///
+    /// The empty queue is the case a partial fold would pass: publishing only
+    /// the obstructed reports would answer «which of the four can I have» with
+    /// silence, and a caller cannot tell that from a report this build has
+    /// forgotten.
+    #[test]
+    fn every_report_has_a_standing_and_names_its_obstacles_in_the_queues_order() {
+        assert_eq!(
+            report_standings(&[]).map(|standing| standing.goal()),
+            ReportGoal::ALL,
+            "an empty queue publishes something other than the four reports"
+        );
+
+        // Two items, both required for the asset snapshot, in an order the fold
+        // must not invent one of its own for: the queue is sorted by urgency
+        // before it is published, and the first obstacle named should be the
+        // first one to work on.
+        let queue = [
+            item(
+                "first",
+                ActionKind::StartAccountImport,
+                ActionCategory::required_for(ActionKind::StartAccountImport),
+            ),
+            item(
+                "second",
+                ActionKind::RetiredAccountNotEmpty,
+                ActionCategory::required_for(ActionKind::RetiredAccountNotEmpty),
+            ),
+        ];
+        assert_eq!(
+            standing_for(&report_standings(&queue), ReportGoal::AssetSnapshot).blocked_by(),
+            ["first", "second"]
+        );
     }
 
     /// A withdrawal, as a target: the one call a settled item publishes.

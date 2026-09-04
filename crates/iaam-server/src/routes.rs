@@ -119,6 +119,8 @@ use crate::dto::{
     SourceDocumentDto, SourceDocumentParams, SourceProfileCatalogueDto,
     source_profile_catalogue_dto,
 };
+// Types added by wave AB, in a block of their own for the same reason.
+use crate::dto::{ActionsResponseDto, ReportStandingDto};
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use crate::vocabulary::ProvidedByDto;
@@ -155,30 +157,49 @@ pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_BATCH_OPERATION_ID: &str =
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 
-/// The computed actions currently blocking or advancing owner setup.
+/// The computed actions currently blocking or advancing owner setup, and which
+/// of the four reports they stand between the owner and.
+///
+/// The second half is folded from the first and is published only here. Three
+/// other responses carry these same items bound to what was asked of them — one
+/// account and a range, one synchronisation's own verdicts, one report's own
+/// diagnostics — and "nothing stands in the way of this report" read off a slice
+/// of the queue would be a reassurance nothing in that slice could support.
 #[utoipa::path(
     get,
     path = "/v1/actions",
-    responses((status = 200, description = "Computed owner actions", body = Vec<ActionDto>)),
+    responses((
+        status = 200,
+        description = "Computed owner actions, and where each report stands",
+        body = ActionsResponseDto
+    )),
     security(("bearer" = []))
 )]
 pub async fn list_actions(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
-) -> Result<Json<Vec<ActionDto>>, ApiFailure> {
+) -> Result<Json<ActionsResponseDto>, ApiFailure> {
     let actions = iaam_app::actions::frontier(
         principal.owner,
         state.services.store.as_ref(),
         state.services.rules.as_ref(),
     )
     .await?;
-    Ok(Json(
-        actions
+    // Folded from the items that are about to be published and not from a
+    // second reading, so the two halves of one response cannot describe two
+    // states of this instance.
+    let reports = iaam_app::actions::report_standings(&actions)
+        .iter()
+        .map(ReportStandingDto::from_domain)
+        .collect();
+    Ok(Json(ActionsResponseDto {
+        items: actions
             .iter()
             .map(|action| action_dto(action, &catalog))
             .collect(),
-    ))
+        reports,
+    }))
 }
 
 fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {

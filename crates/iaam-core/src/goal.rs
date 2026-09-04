@@ -83,6 +83,40 @@ impl ReportGoal {
             Self::Reconciliation => "reconciliation",
         }
     }
+
+    /// What this report answers, in one line, for a reader who has only the
+    /// code beside it.
+    ///
+    /// **Not a script** (`iaam-i3nx`). It fixes what has to be conveyed about a
+    /// report and leaves the wording to whoever is speaking, which is decision
+    /// 0036's settlement for every published question: a caller that says this
+    /// in the owner's own register has obeyed it, and one that quotes it at him
+    /// has not disobeyed it either.
+    ///
+    /// **Here rather than beside one of its two publishers, and that is the
+    /// whole reason it moved.** The sentences were written for the discovery
+    /// catalog, where a cold client reads the four names and decides where to
+    /// go. The outstanding-work queue now publishes the same four names beside
+    /// what stands in the way of each, and the far end of that response is a
+    /// person. A second set of sentences would be two answers to «what is
+    /// `returns`?» from one system, differing by however much two authors
+    /// differ — which is the defect [`Self::code`] was moved here to prevent,
+    /// one column over.
+    ///
+    /// Prose, and derived from nothing on purpose: the code beside it is the
+    /// join, so a sentence that drifts costs a reader a sentence, where a code
+    /// that drifts costs a client the join.
+    #[must_use]
+    pub const fn answers(self) -> &'static str {
+        match self {
+            Self::AssetSnapshot => {
+                "What the owner holds at a date: cash and positions, and the whole."
+            }
+            Self::MoneyFlow => "Where money came from and where it went, over an interval.",
+            Self::Returns => "What the money earned, before tax.",
+            Self::Reconciliation => "Whether the journal agrees with what the sources say.",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +137,49 @@ mod tests {
             ReportGoal::ALL.map(ReportGoal::code),
             ["asset_snapshot", "money_flow", "returns", "reconciliation"],
             "the four agreed names changed; every client filtering by goal breaks"
+        );
+    }
+
+    /// The sentence exists for a reader holding the code and nothing else, so
+    /// three ways of giving him nothing are refused rather than assumed: a
+    /// sentence spelled in this system's own words, a sentence that is the code
+    /// again, and one sentence doing duty for two goals.
+    ///
+    /// Asserted against the codes and against each other, never against four
+    /// strings written out here — a list of expected sentences passes by being
+    /// edited to whatever the sentences became, which proves nothing about
+    /// them.
+    #[test]
+    fn every_goal_says_what_it_answers_without_using_this_systems_own_words() {
+        let mut said: Vec<&str> = Vec::new();
+        for goal in ReportGoal::ALL {
+            let answers = goal.answers();
+            assert!(
+                !answers.contains('_') && !answers.contains('/'),
+                "«{answers}» shows a wire name to whoever is read it"
+            );
+            assert!(
+                !answers.contains(goal.code()),
+                "«{answers}» answers «what is {}?» with «{}»",
+                goal.code(),
+                goal.code()
+            );
+            assert!(
+                answers.ends_with('.') && answers.split_whitespace().count() > 4,
+                "«{answers}» is a label and not a sentence"
+            );
+            said.push(answers);
+        }
+        let distinct = {
+            let mut sorted = said.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted.len()
+        };
+        assert_eq!(
+            distinct,
+            said.len(),
+            "two of the four reports are described by one sentence: {said:?}"
         );
     }
 }

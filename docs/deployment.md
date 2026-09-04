@@ -433,7 +433,7 @@ $ curl -sS http://127.0.0.1:8080/v1/health
 {"status":"ok","schema_version":12,"projection_version":8}
 
 $ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/actions
-[{"id":"create_first_account","kind":"create_first_account","category":"blocking","goals":[],"state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered. Which accounts to create is a question this instance answers rather than guesses at, …","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","requiredScope":"owner","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}]
+{"items":[{"id":"create_first_account","kind":"create_first_account","category":"blocking","goals":[],"state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered. Which accounts to create is a question this instance answers rather than guesses at, …","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","requiredScope":"owner","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}],"reports":[{"goal":"asset_snapshot","answers":"What the owner holds at a date: cash and positions, and the whole.","blocked_by":["create_first_account"]},{"goal":"money_flow","answers":"Where money came from and where it went, over an interval.","blocked_by":["create_first_account"]},{"goal":"returns","answers":"What the money earned, before tax.","blocked_by":["create_first_account"]},{"goal":"reconciliation","answers":"Whether the journal agrees with what the sources say.","blocked_by":["create_first_account"]}]}
 ```
 
 The first call is the discovery document (RFC 9727) and the entry point for an
@@ -452,15 +452,28 @@ server actually registered — transport, storage and the trust root in one
 answer. On a freshly claimed instance the queue holds exactly the item above,
 and an agent's work starts there rather than in any document a human maintains.
 
-The queue is a **bare array**, not an object with an `items` field. It carried
-one until the `policy_version` beside it turned out to be a literal that nothing
-ever moved; `docs/api/conventions.md` §1.4a records the removal and the rule it
-follows from. A client that unwraps this response finds nothing to unwrap.
-`goals` is empty here because the item is `blocking` — it stops the next call
+The queue is under `items`. It was a bare array for a while — the wrapper it
+had carried a `policy_version` that turned out to be a literal nothing ever
+moved — and it is an object again for a fact that is genuinely about the whole
+answer rather than about any item; `docs/api/conventions.md` §1.4a records both
+turns and the rule they follow from.
+
+`goals` is empty on this item because it is `blocking` — it stops the next call
 rather than standing between the owner and a report. On an item graded
 `required_for_goal` it names which of the four reports the item blocks, in the
 same words the reports themselves use, so "what is in the way of the asset
-snapshot" is a filter on this array rather than a reading of the whole queue.
+snapshot" is a filter on this list rather than a reading of the whole queue.
+
+`reports` is that mapping folded the other way, and it is why the response is an
+object: which reports are answerable right now is said, for an answerable one, by
+no item appearing — and no item can state that it is absent. Each of the four
+carries what it answers, in a sentence a person can be read, and the identity of
+every item standing in its way, most urgent first. An empty `blocked_by` says
+nothing outstanding stands in the way of that report. It does not say the report
+is complete: a report states what it is silent or partial about in its own
+confidence register, which this queue does not read. Here all four are held up by
+the one blocking item, which is what a freshly claimed instance should say — it
+holds no account, no scope and no fact.
 
 **On failure** — `{"code":"unauthorized", …}` means the header is missing,
 misspelled or carries a revoked token; §7 issues a new one, and only a console

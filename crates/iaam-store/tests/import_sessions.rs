@@ -24,7 +24,7 @@ fn asking() -> NewQuestion {
 }
 
 #[test]
-fn one_declared_import_has_one_open_session() {
+fn a_declaration_reaches_one_session_and_an_undeclared_batch_its_own() {
     // Two sessions over one statement would split its questions across two
     // places, and the owner would answer one of them.
     let mut store = store();
@@ -43,14 +43,33 @@ fn one_declared_import_has_one_open_session() {
     assert_eq!(first.id, again.id);
     assert_eq!(first.state, SessionState::Open);
 
-    // A batch that named no import is not recognisable, so it gets its own.
-    let unnamed = store
+    // A declaration naming a source and no label names no import, and it is
+    // recognised anyway — by the source (iaam-zv54). Keying reuse on the label
+    // alone recognised such a declaration by nothing and opened a fresh session
+    // on every call, splitting one declaration's questions across as many
+    // sessions as the caller made calls, which is the failure the reuse exists
+    // to prevent. It is still a session of its own and not the one above: that
+    // one names an import, and this declaration does not name it.
+    let unlabelled = store
         .open_import_session(owner, Some(account), Some(source), None)
         .expect("session opens");
-    let unnamed_again = store
+    assert_ne!(unlabelled.id, first.id);
+    let unlabelled_again = store
         .open_import_session(owner, Some(account), Some(source), None)
+        .expect("the same declaration reaches the same session");
+    assert_eq!(unlabelled.id, unlabelled_again.id);
+
+    // A batch that declared nothing at all is recognisable by nothing, so it
+    // gets its own every time. That is the honest answer rather than an
+    // oversight: joining two undeclared batches would join two unrelated
+    // exports.
+    let undeclared = store
+        .open_import_session(owner, None, None, None)
         .expect("session opens");
-    assert_ne!(unnamed.id, unnamed_again.id);
+    let undeclared_again = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens");
+    assert_ne!(undeclared.id, undeclared_again.id);
 }
 
 /// The account a declaration named is stored, and comes back on every read

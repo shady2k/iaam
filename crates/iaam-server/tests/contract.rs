@@ -16259,6 +16259,13 @@ async fn a_batch_inside_its_stated_interval_reports_a_fit_and_needs_no_flag() {
 /// a language model, in a system that deliberately keeps money arithmetic inside
 /// the core.
 ///
+/// The session is opened with **no declaration**, and that is as much the point
+/// as the arithmetic is. A total per account is only a total per account when
+/// the batch spans more than one, and a declared session takes rows for the
+/// account it declared and no other (iaam-tmvz) — so the batch below can only
+/// be held by a free session, which is exactly what a free session is for: an
+/// export covering a whole institution is one session, not one per account.
+///
 /// Every amount and account here is invented (CLAUDE.md).
 #[tokio::test]
 async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
@@ -16291,11 +16298,7 @@ async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
 
     let (status, session) = call(
         &harness.router,
-        post(
-            "/v1/import-sessions",
-            &harness.owner_token,
-            &json!({ "source": { "account": main, "channel": "file", "label": "totalled" } }),
-        ),
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{session}");
@@ -16368,7 +16371,7 @@ async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
     let on_main = totals
         .iter()
         .find(|total| total["account"] == json!(main.to_string()))
-        .expect("a total for the declared account");
+        .expect("a total for the first account");
     assert_eq!(on_main["rows"], 2, "{plan}");
     assert_eq!(on_main["debit"], "1000.00", "{plan}");
     assert_eq!(on_main["credit"], "250.00", "both sides positive: {plan}");

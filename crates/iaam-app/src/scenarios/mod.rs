@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod journal;
 pub mod market_reference;
 pub mod reports;
+pub mod retirement;
 pub mod schedule;
 pub mod transfer_pairing;
 

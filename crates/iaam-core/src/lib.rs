@@ -20,6 +20,7 @@ pub mod perimeter;
 pub mod projection;
 pub mod reconciliation;
 pub mod report;
+pub mod retirement;
 pub mod returns;
 pub mod rules;
 pub mod settlement;

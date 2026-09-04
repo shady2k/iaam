@@ -393,6 +393,7 @@ mod tests {
         ReportPopulation {
             contour: ContourId(Uuid::from_u128(1)),
             version: ContourVersion(1),
+            retirement_revision: crate::retirement::RetirementRevision::NONE,
             accounts: standings
                 .iter()
                 .enumerate()
@@ -401,6 +402,7 @@ mod tests {
                     title: format!("Account {index}"),
                     institution: None,
                     standing: *standing,
+                    retirement: None,
                 })
                 .collect(),
         }

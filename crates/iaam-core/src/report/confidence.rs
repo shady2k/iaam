@@ -88,6 +88,21 @@ pub enum CaveatKind {
     /// the field it points at, and the two reports publish the same silence in
     /// two different places.
     HoldingNotValued,
+    /// An account the owner has retired still shows something in the snapshot,
+    /// so its row and its class membership stand.
+    ///
+    /// **The rule that makes retirement safe, published.** A retired account's
+    /// row is dropped only where every one of its figures is zero — so a
+    /// retirement removes a line and never moves a number — and this is what
+    /// the report says when it could not drop one. Without it, a reader who
+    /// knows an account is retired and finds it in the rows has to work out
+    /// whether the suppression is broken or the account still holds money.
+    ///
+    /// It is a caveat and not a refusal, because the two facts it sits between
+    /// are both legitimate: the owner says the product ceased, and the journal
+    /// says something is still on it. Which of the two is wrong is his to
+    /// decide, and [`Self::closed_by`] names one call for each side.
+    RetiredAccountNotEmpty,
     /// The portfolio value at the report date could not be computed.
     TerminalValueNotComputed,
     /// The rate of return could not be computed.
@@ -100,7 +115,7 @@ impl CaveatKind {
     /// Iterated by the guard that resolves [`Self::closed_by`] against the
     /// published contract: a table checked for the kinds someone remembered to
     /// list is a table with a hole in it exactly where the mistake is.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::AccountInNoScope,
         Self::AccountInAnotherScope,
         Self::AccountRuledOutside,
@@ -110,6 +125,7 @@ impl CaveatKind {
         Self::UnexplainedCashChange,
         Self::UnpricedPosition,
         Self::HoldingNotValued,
+        Self::RetiredAccountNotEmpty,
         Self::TerminalValueNotComputed,
         Self::ReturnNotComputed,
     ];
@@ -127,6 +143,7 @@ impl CaveatKind {
             Self::UnexplainedCashChange => "unexplained_cash_change",
             Self::UnpricedPosition => "unpriced_position",
             Self::HoldingNotValued => "holding_not_valued",
+            Self::RetiredAccountNotEmpty => "retired_account_not_empty",
             Self::TerminalValueNotComputed => "terminal_value_not_computed",
             Self::ReturnNotComputed => "return_not_computed",
         }
@@ -151,6 +168,7 @@ impl CaveatKind {
             Self::UnexplainedCashChange => "unexplained[]",
             Self::UnpricedPosition => "data_quality.position_coverage.uncovered[]",
             Self::HoldingNotValued => "positions.holdings[].value",
+            Self::RetiredAccountNotEmpty => "accounts[]",
             Self::TerminalValueNotComputed => "terminal_value",
             Self::ReturnNotComputed => "xirr_pre_tax",
         }
@@ -223,6 +241,18 @@ impl CaveatKind {
     ///   rather than accepting a value for a holding; a call that let one be
     ///   supplied to close a caveat would be the invented number the whole
     ///   register exists to refuse.
+    /// - `RetiredAccountNotEmpty` — the two sides of one disagreement, in the
+    ///   order the owner should read them. `record_account_retirement`
+    ///   withdraws the statement, which is the answer where the product had not
+    ///   in fact ceased on the date he named; `submit_corrections` rules on the
+    ///   journal, which is the answer where it had and a fact on the account
+    ///   should stop counting. Neither is advice about which is right: this
+    ///   column answers "what call reaches this line", and a state with two
+    ///   legitimate resolutions names both, as `account_in_no_scope` does.
+    ///   What is **not** here is an import: bringing in the movements that
+    ///   emptied the account would also close the line, and no operation key
+    ///   names "record the rows that were missing" — the two above are the
+    ///   calls addressed to this state rather than to the journal in general.
     /// - `TerminalValueNotComputed`, `ReturnNotComputed` — nothing, for the
     ///   reason above: both are absent *because* something they are derived
     ///   from is, and the caveat for that thing stands beside them.
@@ -237,6 +267,10 @@ impl CaveatKind {
                 &[OperationKey::AddContourVersion]
             }
             Self::RunningCashSum => &[OperationKey::RecordOwnerBalance],
+            Self::RetiredAccountNotEmpty => &[
+                OperationKey::RecordAccountRetirement,
+                OperationKey::SubmitCorrections,
+            ],
             Self::UndecomposedMovements => &[OperationKey::CreateCategoryRule],
             Self::PeriodReportsRefused
             | Self::UnexplainedCashChange
@@ -281,6 +315,9 @@ impl CaveatKind {
             }
             Self::HoldingNotValued => {
                 "The journal holds no quote for this instrument at or before the report date, so the holding is absent from the position half of the snapshot rather than valued at zero."
+            }
+            Self::RetiredAccountNotEmpty => {
+                "The owner has retired this account, and the snapshot still shows a figure for it, so its row and its class membership stand. A retirement never hides money: a retired account's row is dropped only where every one of its figures is zero."
             }
             Self::TerminalValueNotComputed => {
                 "The portfolio value at the report date could not be computed, so every figure derived from it is absent rather than approximate."

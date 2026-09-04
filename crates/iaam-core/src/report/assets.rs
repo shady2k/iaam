@@ -54,7 +54,7 @@ use crate::valuation::{
     decide_price,
 };
 
-use super::balances::{AccountCash, BalancesReport, CashFigure, CashOpening};
+use super::balances::{AccountBalanceRow, AccountCash, BalancesReport, CashFigure, CashOpening};
 use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence};
 use super::population::ReportPopulation;
 
@@ -232,6 +232,23 @@ impl AssetSnapshot {
                 }
             }
         }
+        // The exact complement of `retired_and_empty`: a retired account either
+        // has no row here, or it has one and this names it. The two are read
+        // from one manifest and one date, so a retirement can neither hide a
+        // figure nor leave a row unexplained.
+        for row in &self.accounts {
+            if self
+                .population
+                .accounts
+                .iter()
+                .any(|entry| entry.account == row.account && entry.retired_by(self.as_of))
+            {
+                caveats.push(Caveat::new(
+                    CaveatKind::RetiredAccountNotEmpty,
+                    CaveatSubject::Account(row.account),
+                ));
+            }
+        }
         for holding in &self.positions.holdings {
             if holding.value.is_none() {
                 caveats.push(Caveat::new(
@@ -292,6 +309,7 @@ pub fn asset_snapshot(
     let accounts: Vec<AssetAccount> = report
         .accounts
         .iter()
+        .filter(|row| !retired_and_empty(&report.population, as_of, row))
         .map(|row| AssetAccount {
             account: row.account,
             cash_class: classes.get(&row.account).cloned(),
@@ -312,6 +330,53 @@ pub fn asset_snapshot(
         accounts,
         population: report.population.clone(),
     })
+}
+
+/// Whether a row may be left out: the owner says the product ceased, and the
+/// journal shows nothing on it (`iaam-gua5`).
+///
+/// **Two facts, and neither alone does anything.** The retirement alone would
+/// hide money; a zero row alone is an account the owner still has and still
+/// wants listed. Together they are the closed product that would otherwise sit
+/// in every asset report for ever as a zero-balance shell — which is the whole
+/// of the case this exists for, because the alternative the owner reaches for
+/// first, dropping the account from a later contour version, turns the movement
+/// that returned its balance into money leaving the perimeter and stops the
+/// interest it paid from being folded at all.
+///
+/// **The safety property is that suppression cannot move a number.** Only a row
+/// every one of whose figures is zero may be dropped, and such a row adds zero
+/// to its class total and zero to the whole. So a retirement removes a line and
+/// never a figure, and a reader who suspects it of hiding money can check that
+/// claim against this predicate rather than against the fold.
+///
+/// One thing it *can* change, stated here because a reader will find it: a
+/// class whose figure was [`CashFigure::Mixed`] only because the dropped row
+/// contributed a zero movement now reads as a plain balance, and a currency may
+/// gain an entry in [`AssetSnapshot::total`] that it did not have. Both follow
+/// from the same arithmetic — the qualification exists so that a flow is never
+/// added to a stock, and the flow that has gone was zero.
+///
+/// **Zero is read from the figures, not from the anchor.** A cash figure over
+/// an unasserted opening is movement from an unknown start, and a *zero* such
+/// movement is still not proof that the account is empty. It is treated as
+/// empty here all the same, and the reason is the first paragraph: the owner
+/// has stated that the product ceased, which is evidence about the balance that
+/// no fold holds, and the row he is asking to be rid of contributes nothing to
+/// any figure either way. Requiring an asserted opening as well would mean the
+/// feature almost never fired — a deposit opened and closed inside one imported
+/// month is anchored by nothing — while removing no risk, because the row it
+/// would have kept is a row of zeros.
+fn retired_and_empty(population: &ReportPopulation, as_of: Date, row: &AccountBalanceRow) -> bool {
+    population
+        .accounts
+        .iter()
+        .any(|entry| entry.account == row.account && entry.retired_by(as_of))
+        && row.cash.iter().all(|cash| cash.money.is_zero())
+        && row
+            .positions
+            .iter()
+            .all(|(_, quantity)| quantity.0.is_zero())
 }
 
 /// One currency's cash while the fold runs: the two kinds kept apart.
@@ -606,6 +671,7 @@ mod tests {
     use crate::money::PostedMinor;
     use crate::report::balances::{AccountBalanceRow, PeriodReports};
     use crate::report::population::{AccountStanding, PopulationAccount};
+    use crate::retirement::RetirementRevision;
     use crate::valuation::{
         InstrumentPrice, PriceKind, PriceOrigin, PriceQuality, SourceExecutability,
         UncoveredReason, Venue,
@@ -680,6 +746,7 @@ mod tests {
         let population = ReportPopulation {
             contour: ContourId(Uuid::from_u128(1)),
             version: ContourVersion(1),
+            retirement_revision: RetirementRevision::NONE,
             accounts: accounts
                 .iter()
                 .map(|row| PopulationAccount {
@@ -687,6 +754,7 @@ mod tests {
                     title: format!("Account {}", row.account.inner()),
                     institution: None,
                     standing: AccountStanding::Covered,
+                    retirement: None,
                 })
                 .collect(),
         };
@@ -731,6 +799,261 @@ mod tests {
             .iter()
             .find(|money| money.currency() == currency)
             .map_or_else(Dec::zero, CalcMoney::value)
+    }
+
+    /// Mark one of the report's accounts as retired on a date.
+    ///
+    /// Written against the manifest rather than through a second map, because
+    /// the manifest is where the fold reads it: one statement, so the rows a
+    /// snapshot publishes and the accounts it names cannot disagree about which
+    /// products still exist.
+    fn retire(report: &mut BalancesReport, account: AccountId, effective_on: Date) {
+        for entry in &mut report.population.accounts {
+            if entry.account == account {
+                entry.retirement = Some(effective_on);
+            }
+        }
+        report.population.retirement_revision = report.population.retirement_revision.successor();
+    }
+
+    /// The case the declaration exists for: a closed product stops appearing as
+    /// a zero-balance shell.
+    ///
+    /// The account keeps its standing — it is still inside the contour, which is
+    /// what keeps the movement that emptied it internal and the interest it paid
+    /// an earning — and it is still named by the population. What goes is the
+    /// row, and with it the class the row was the only member of.
+    #[test]
+    fn a_retired_account_that_holds_nothing_leaves_the_snapshot_but_not_the_population() {
+        let live = account(10);
+        let closed = account(11);
+        let mut report = report(vec![
+            row(live, vec![asserted(rub(1_000))]),
+            row(closed, vec![asserted(rub(0))]),
+        ]);
+        retire(&mut report, closed, date!(2026 - 01 - 10));
+
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &classes(&[(live, "card_account"), (closed, "deposit")]),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .map(|row| row.account)
+                .collect::<Vec<_>>(),
+            vec![live],
+            "the closed product still has a row"
+        );
+        assert_eq!(
+            snapshot
+                .cash
+                .classes
+                .iter()
+                .map(|class| class.cash_class.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("card_account".to_owned())],
+            "the class whose only member closed is still reported"
+        );
+        assert!(
+            snapshot
+                .population
+                .accounts
+                .iter()
+                .any(|entry| entry.account == closed
+                    && entry.standing == AccountStanding::Covered
+                    && entry.retirement == Some(date!(2026 - 01 - 10))),
+            "the population stopped naming the account it still folded"
+        );
+    }
+
+    /// Suppression removes a line and never a figure.
+    ///
+    /// The property that makes the whole feature safe to switch on: only a row
+    /// every one of whose figures is zero may be dropped, and such a row adds
+    /// zero to every total. So the same month, retired and not retired, states
+    /// the same money.
+    #[test]
+    fn retiring_an_empty_account_moves_no_number() {
+        let live = account(10);
+        let closed = account(11);
+        let rows = vec![
+            row(live, vec![asserted(rub(1_000)), asserted(usd(250))]),
+            row(closed, vec![asserted(rub(0)), asserted(usd(0))]),
+        ];
+        let before = asset_snapshot(
+            AS_OF,
+            &report(rows.clone()),
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        let mut report = report(rows);
+        retire(&mut report, closed, date!(2026 - 01 - 10));
+        let after = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        assert_eq!(after.cash.totals, before.cash.totals);
+        assert_eq!(after.total, before.total);
+        assert_eq!(after.positions.totals, before.positions.totals);
+    }
+
+    /// **Retirement must not hide money.** An account the owner retired that
+    /// still holds something keeps its row, its class membership and its place
+    /// in every total, and the register says why it is still there.
+    ///
+    /// The two halves are exact complements — a retired account either has no
+    /// row or has one and a caveat — so neither a suppression that swallowed a
+    /// balance nor a row nobody could explain is reachable.
+    #[test]
+    fn a_retired_account_that_still_holds_money_keeps_its_row_and_earns_a_caveat() {
+        let closed = account(11);
+        let mut report = report(vec![row(closed, vec![asserted(rub(20_000))])]);
+        retire(&mut report, closed, date!(2026 - 01 - 10));
+
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &classes(&[(closed, "deposit")]),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        assert_eq!(
+            snapshot.cash.totals,
+            vec![balance(rub(20_000))],
+            "a retirement changed a published total"
+        );
+        assert_eq!(snapshot.accounts.len(), 1);
+        let confidence = snapshot.confidence();
+        assert!(
+            confidence
+                .caveats()
+                .iter()
+                .any(|caveat| caveat.kind() == CaveatKind::RetiredAccountNotEmpty
+                    && caveat.subject() == CaveatSubject::Account(closed)),
+            "the row stands and nothing says why: {:?}",
+            confidence.caveats()
+        );
+    }
+
+    /// A position is money too. Cash of zero is not enough to drop the row.
+    #[test]
+    fn a_retired_account_still_holding_a_position_keeps_its_row() {
+        let closed = account(11);
+        let held = instrument(1);
+        let mut only = row(closed, vec![asserted(rub(0))]);
+        only.positions = vec![(position(closed, held), quantity(3))];
+        let mut report = report(vec![only]);
+        retire(&mut report, closed, date!(2026 - 01 - 10));
+
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.accounts.len(), 1, "a holding was suppressed");
+        assert_eq!(snapshot.positions.holdings.len(), 1);
+        assert!(
+            snapshot
+                .confidence()
+                .caveats()
+                .iter()
+                .any(|caveat| caveat.kind() == CaveatKind::RetiredAccountNotEmpty)
+        );
+    }
+
+    /// A snapshot taken before the date the product ceased is unchanged.
+    ///
+    /// The declaration is effective-dated, and the report it changes is taken
+    /// `as_of` a date: a retirement declared today must not rewrite what the
+    /// owner held in a month when the product was still open.
+    #[test]
+    fn a_snapshot_before_the_effective_date_is_unchanged() {
+        let closed = account(11);
+        let rows = vec![row(closed, vec![asserted(rub(0))])];
+        let mut report = report(rows);
+        retire(&mut report, closed, date!(2026 - 02 - 10));
+
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.accounts.len(), 1, "the row went before its date");
+        assert!(
+            snapshot
+                .confidence()
+                .caveats()
+                .iter()
+                .all(|caveat| caveat.kind() != CaveatKind::RetiredAccountNotEmpty),
+            "a caveat about a product that had not ceased yet"
+        );
+    }
+
+    /// A zero movement from an unasserted start is dropped with the row.
+    ///
+    /// The deliberate looseness, tested so that the decision is visible rather
+    /// than incidental: a deposit opened and closed inside one imported month
+    /// is anchored by nothing, so demanding an asserted opening would mean the
+    /// declaration almost never fired. What is dropped is still a row of zeros.
+    #[test]
+    fn a_retired_account_whose_movement_nets_to_zero_is_dropped() {
+        let closed = account(11);
+        let mut report = report(vec![row(closed, vec![unasserted(rub(0))])]);
+        retire(&mut report, closed, date!(2026 - 01 - 10));
+
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        assert!(snapshot.accounts.is_empty());
+        assert!(snapshot.cash.classes.is_empty());
+    }
+
+    /// The complement, and the one that would let a retirement hide a hole: a
+    /// deposit whose principal predates the imported interval sums to movement
+    /// that is not zero, and the row stays.
+    #[test]
+    fn a_retired_account_whose_movement_is_not_zero_stays_visible() {
+        let closed = account(11);
+        let mut report = report(vec![row(closed, vec![unasserted(rub(-20_000))])]);
+        retire(&mut report, closed, date!(2026 - 01 - 10));
+
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.accounts.len(), 1);
+        assert_eq!(
+            snapshot.cash.totals,
+            vec![CashFigure::Movement(rub(-20_000))]
+        );
     }
 
     /// The invariant the whole module exists for: the class totals and the
@@ -1077,6 +1400,7 @@ mod tests {
             title: "Elsewhere".into(),
             institution: None,
             standing: AccountStanding::OutsideUndecided,
+            retirement: None,
         });
         let snapshot = asset_snapshot(
             AS_OF,

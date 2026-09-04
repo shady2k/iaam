@@ -40,7 +40,7 @@ use super::categories::load_index;
 use crate::AppServices;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
-use crate::ports::{AccountView, NegativeBalanceExpectation, Principal};
+use crate::ports::{AccountRetirementsView, AccountView, NegativeBalanceExpectation, Principal};
 
 pub use iaam_core::goal::ReportGoal;
 /// The report vocabulary, in the core.
@@ -163,6 +163,13 @@ impl MoneyFlowOutcome {
 /// standings an account has — can be tested without a store, and so that the
 /// store round-trips happen once per report.
 ///
+/// `retirements` is the second axis: which of the owner's products have ceased,
+/// and the coordinate his declarations stand at. It is a parameter for the
+/// reason the two sets above are, and it decides nothing about a standing —
+/// a retired account is normally still `Covered`, because a closed term deposit
+/// stays inside the contour so that the interest it paid keeps counting as an
+/// earning and the movement that returned its balance stays internal.
+///
 /// **Membership outranks a disposition.** Nothing clears an exclusion when an
 /// account is later added to a contour, so an account can carry both, and then
 /// the two disagree about whether the owner wants it reported. When they do,
@@ -176,6 +183,7 @@ fn population_from(
     accounts: Vec<AccountView>,
     placed_elsewhere: &BTreeSet<AccountId>,
     ruled_outside: &BTreeSet<AccountId>,
+    retirements: &AccountRetirementsView,
 ) -> ReportPopulation {
     let entries = accounts
         .into_iter()
@@ -194,12 +202,20 @@ fn population_from(
                 title: account.title,
                 institution: account.institution,
                 standing,
+                // The second axis, read beside the standing and never instead
+                // of it. A retired account is normally still `Covered` — a
+                // closed term deposit stays inside the contour so that the
+                // interest it paid keeps counting as an earning — so a
+                // retirement must not be allowed to become a fifth standing or
+                // to remove the entry.
+                retirement: retirements.effective_on(account.id),
             }
         })
         .collect();
     ReportPopulation {
         contour: definition.id(),
         version: definition.version(),
+        retirement_revision: retirements.revision,
         accounts: entries,
     }
 }
@@ -272,11 +288,21 @@ async fn report_population(
         .into_iter()
         .map(|exclusion| exclusion.account)
         .collect();
+    // The products the owner says no longer exist, with the coordinate they are
+    // read at. Both come back from one call so that the manifest cannot state a
+    // revision that does not name the retirements it printed — and the asset
+    // fold reads them from the manifest rather than from a second lookup of its
+    // own, so what a snapshot suppresses and what it names are one statement.
+    let retirements = services
+        .store
+        .list_account_retirements(principal.owner)
+        .await?;
     Ok(population_from(
         definition,
         accounts,
         &placed_elsewhere,
         &ruled_outside,
+        &retirements,
     ))
 }
 
@@ -1295,6 +1321,72 @@ mod tests {
         assert_eq!(report.data_quality.status, DataQualityStatus::Clean);
     }
 
+    /// The state of the second axis for an owner who has closed nothing: the
+    /// coordinate every report published before this declaration existed states
+    /// now, and the one every report over an untouched owner goes on stating.
+    fn nobody_retired() -> AccountRetirementsView {
+        AccountRetirementsView {
+            revision: iaam_core::retirement::RetirementRevision::NONE,
+            statements: Vec::new(),
+        }
+    }
+
+    /// The two axes are read separately, and the retired account is still
+    /// covered.
+    ///
+    /// This is `iaam-gua5`'s load-bearing bound written where a reader of the
+    /// manifest will meet it. A closed term deposit stays inside the contour so
+    /// that the interest it paid keeps counting as an earning and the movement
+    /// that returned its balance stays internal; what the retirement adds is a
+    /// date beside its entry. If the standing changed, the answer the whole
+    /// declaration exists to preserve would be destroyed by the declaration.
+    #[test]
+    fn a_retired_account_is_still_covered_and_still_named() {
+        let inside = AccountId::new_random();
+        let definition =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(2), [inside]);
+        let accounts = vec![AccountView {
+            id: inside,
+            title: "Term".to_owned(),
+            institution: None,
+        }];
+        let retirements = AccountRetirementsView {
+            revision: iaam_core::retirement::RetirementRevision(4),
+            statements: vec![iaam_core::retirement::AccountRetirement {
+                account: inside,
+                effective_on: date!(2026 - 03 - 10),
+            }],
+        };
+
+        let population = population_from(
+            &definition,
+            accounts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &retirements,
+        );
+
+        assert_eq!(
+            population.retirement_revision,
+            iaam_core::retirement::RetirementRevision(4),
+            "the manifest states the coordinate it was read at"
+        );
+        let entry = population.covered().next().expect("the retired account");
+        assert_eq!(entry.account, inside);
+        assert_eq!(entry.standing, AccountStanding::Covered);
+        assert_eq!(entry.retirement, Some(date!(2026 - 03 - 10)));
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Whole,
+            "a closed product made the report read as partial"
+        );
+        assert!(
+            population.caveats().is_empty(),
+            "a retirement is not an omission: {:?}",
+            population.caveats()
+        );
+    }
+
     #[test]
     fn the_manifest_separates_a_deliberate_exclusion_from_an_open_question() {
         // The distinction the manifest exists for. Without it the two outside
@@ -1324,7 +1416,13 @@ mod tests {
         ];
         let placed: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
 
-        let population = population_from(&definition, accounts, &placed, &BTreeSet::new());
+        let population = population_from(
+            &definition,
+            accounts,
+            &placed,
+            &BTreeSet::new(),
+            &nobody_retired(),
+        );
 
         assert_eq!(population.contour, definition.id());
         assert_eq!(population.version, ContourVersion(3));
@@ -1371,7 +1469,13 @@ mod tests {
             institution: None,
         }];
 
-        let population = population_from(&definition, accounts, &BTreeSet::new(), &BTreeSet::new());
+        let population = population_from(
+            &definition,
+            accounts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &nobody_retired(),
+        );
 
         assert_eq!(population.outside().count(), 0);
         assert_eq!(
@@ -1400,7 +1504,13 @@ mod tests {
         ];
         let placed: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
 
-        let population = population_from(&definition, accounts, &placed, &BTreeSet::new());
+        let population = population_from(
+            &definition,
+            accounts,
+            &placed,
+            &BTreeSet::new(),
+            &nobody_retired(),
+        );
 
         assert_eq!(population.undecided().count(), 0);
         assert_eq!(
@@ -1433,7 +1543,13 @@ mod tests {
         ];
         let ruled_outside: BTreeSet<AccountId> = [ruled_out].into_iter().collect();
 
-        let population = population_from(&definition, accounts, &BTreeSet::new(), &ruled_outside);
+        let population = population_from(
+            &definition,
+            accounts,
+            &BTreeSet::new(),
+            &ruled_outside,
+            &nobody_retired(),
+        );
 
         assert_eq!(
             population
@@ -1491,7 +1607,7 @@ mod tests {
         ];
         let both: BTreeSet<AccountId> = [elsewhere].into_iter().collect();
 
-        let population = population_from(&definition, accounts, &both, &both);
+        let population = population_from(&definition, accounts, &both, &both, &nobody_retired());
 
         assert_eq!(
             population

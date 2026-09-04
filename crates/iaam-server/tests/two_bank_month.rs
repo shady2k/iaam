@@ -1137,3 +1137,219 @@ async fn a_correction_changes_the_reports_and_leaves_the_journal_auditable() {
     );
     assert_eq!(correcting["relation"]["target"], original, "{correcting}");
 }
+
+// ---------------------------------------------------------------------------
+// 9. The deposit that closed during the month is retired (iaam-gua5)
+// ---------------------------------------------------------------------------
+
+/// What the term deposit held before the month began.
+///
+/// Its principal predates the imported interval, so without this the account's
+/// cash is the movement over March and not a balance: two accruals and a
+/// closing row sum to a figure the fold cannot call a balance, and the report is
+/// right to keep showing it. Recorded as the §10.7 reconstructed opening it is —
+/// not as money arriving from outside, which would put it in `came_in`.
+const TERM_OPENING_AMOUNT: &str = "20000.00";
+
+/// The reconstructed opening for the closing deposit, imported on its own.
+///
+/// Kept out of [`term_rows`] on purpose: it changes the month's `cash_delta`,
+/// and every figure in [`expected_figures`] is the fixture added up by hand.
+/// The test below asserts the report is *unchanged by the retirement*, which is
+/// the claim that matters here and needs no absolute figure at all.
+fn term_opening(accounts: Accounts) -> Value {
+    import(
+        accounts.term,
+        "northline-term-opening",
+        vec![json!({
+            "account": accounts.term,
+            "type": "opening_cash",
+            "amount": TERM_OPENING_AMOUNT,
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-03-01" },
+            "idempotency_key": "term-opening",
+        })],
+    )
+}
+
+async fn asset_snapshot(harness: &Harness, contour: &str, as_of: &str) -> Value {
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour}&as_of={as_of}"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// The accounts an asset snapshot published a row for.
+fn snapshot_rows(snapshot: &Value) -> Vec<String> {
+    snapshot["accounts"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["account"].as_str().expect("account").to_owned())
+        .collect()
+}
+
+/// The whole of `iaam-gua5`, end to end, over the month's own closed deposit.
+///
+/// The three things the owner wants at once, and which any two of were
+/// available before: the interest counted as what the capital earned, the
+/// returned principal counted as a movement between his own accounts, and the
+/// closed product gone from the asset report.
+///
+/// **The flow report is compared against itself, before and after.** That is
+/// the strongest form of the bound the declaration is held to — retirement does
+/// not reach `contour::classify` — and it needs no figure written out: if a
+/// single quantity moved, the two documents differ. The alternative, dropping
+/// the account from a later contour version, would turn the closing transfer
+/// into money leaving the perimeter and stop the interest being folded at all,
+/// so it fails this assertion by construction.
+#[tokio::test]
+async fn retiring_the_closed_deposit_empties_the_asset_report_and_moves_no_figure() {
+    let harness = harness();
+    let accounts = create_accounts(&harness).await;
+    import_northline(&harness, accounts).await;
+    import_southgate(&harness, accounts).await;
+    submit(&harness, &term_opening(accounts)).await;
+    let contour = draw_contour(&harness, "Household", &accounts.all()).await;
+
+    let term = accounts.term.to_string();
+    let before_flow = flow_report(&harness, &contour).await;
+    // The interest is an earning and the closing movement is internal, which is
+    // what the deposit staying inside the contour buys.
+    assert_eq!(rub(&before_flow)["earned_by_capital"], INTEREST_AMOUNT);
+    assert_eq!(rub(&before_flow)["internal_transfers"], "50350.00");
+
+    let before_snapshot = asset_snapshot(&harness, &contour, "2025-04-01").await;
+    assert!(
+        snapshot_rows(&before_snapshot).contains(&term),
+        "the shell is there to be removed: {before_snapshot}"
+    );
+    assert_eq!(
+        before_snapshot["population"]["retirement_revision"], 0,
+        "an owner who has retired nothing is at the coordinate every report starts from: \
+         {before_snapshot}"
+    );
+
+    let (status, retired) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{term}/retirement"),
+            &harness.owner_token,
+            &json!({ "state": "retired", "effective_on": "2025-03-10" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retired}");
+    assert_eq!(retired["title"], "Term Deposit", "{retired}");
+
+    // 1. Nothing the month reported changed. Not one quantity, not the
+    //    population, not the register.
+    let after_flow = flow_report(&harness, &contour).await;
+    assert_eq!(
+        figures(&after_flow),
+        figures(&before_flow),
+        "a retirement reached the classifier: {after_flow}"
+    );
+    assert_eq!(
+        after_flow["population"]["known_account_coverage"],
+        before_flow["population"]["known_account_coverage"],
+        "{after_flow}"
+    );
+
+    // 2. The closed product is gone from the asset report.
+    let after_snapshot = asset_snapshot(&harness, &contour, "2025-04-01").await;
+    let mut expected = snapshot_rows(&before_snapshot);
+    expected.retain(|account| account != &term);
+    assert_eq!(
+        snapshot_rows(&after_snapshot),
+        expected,
+        "the closed deposit still has a row: {after_snapshot}"
+    );
+    assert_eq!(
+        after_snapshot["population"]["retirement_revision"], 1,
+        "the manifest does not name the state it was read at: {after_snapshot}"
+    );
+
+    // 3. And it is still named by the population it was folded into, covered,
+    //    with the date it ceased beside it. An account the fold still covers
+    //    that vanished from the manifest would leave the report's own name
+    //    table short of exactly the rows that are missing.
+    let entry = after_snapshot["population"]["covered"]
+        .as_array()
+        .expect("covered")
+        .iter()
+        .find(|entry| entry["account"] == json!(term))
+        .unwrap_or_else(|| panic!("the retired account left the population: {after_snapshot}"));
+    assert_eq!(entry["standing"], "covered", "{after_snapshot}");
+    assert_eq!(entry["retirement"], "2025-03-10", "{after_snapshot}");
+    assert_eq!(entry["title"], "Term Deposit", "{after_snapshot}");
+
+    // 4. A snapshot from before the day it closed is untouched: the declaration
+    //    is effective-dated, and the product was open then.
+    let earlier = asset_snapshot(&harness, &contour, "2025-03-05").await;
+    assert!(
+        snapshot_rows(&earlier).contains(&term),
+        "a retirement rewrote a date the product was open on: {earlier}"
+    );
+}
+
+/// The same month with the retirement declared a day too early: the deposit
+/// still holds its principal on the day it is said to have ceased, so its row
+/// stands and the register says why.
+///
+/// **A retirement never hides money**, and this is the case that would hide it:
+/// the closing row is dated the tenth, and a statement that the product ceased
+/// on the ninth is a statement about an account the journal still shows a
+/// balance on. Nothing refuses the declaration — it is his statement about his
+/// product, and refusing it would make his word conditional on how much of his
+/// history has been imported — so what carries the weight is that the row
+/// survives and is explained.
+#[tokio::test]
+async fn a_deposit_retired_before_it_emptied_keeps_its_row_and_earns_a_caveat() {
+    let harness = harness();
+    let accounts = create_accounts(&harness).await;
+    import_northline(&harness, accounts).await;
+    import_southgate(&harness, accounts).await;
+    submit(&harness, &term_opening(accounts)).await;
+    let contour = draw_contour(&harness, "Household", &accounts.all()).await;
+
+    let term = accounts.term.to_string();
+    let (status, retired) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{term}/retirement"),
+            &harness.owner_token,
+            &json!({ "state": "retired", "effective_on": "2025-03-09" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retired}");
+
+    let snapshot = asset_snapshot(&harness, &contour, "2025-03-09").await;
+    assert!(
+        snapshot_rows(&snapshot).contains(&term),
+        "a retirement hid the deposit's principal: {snapshot}"
+    );
+    let caveat = snapshot["confidence"]["caveats"]
+        .as_array()
+        .expect("register")
+        .iter()
+        .find(|caveat| caveat["kind"] == "retired_account_not_empty")
+        .unwrap_or_else(|| panic!("the row stands and nothing says why: {snapshot}"));
+    assert_eq!(caveat["subject"]["account"], json!(term), "{snapshot}");
+    assert_eq!(caveat["see"], "accounts[]", "{snapshot}");
+
+    // A day later the closing row has been folded in, the account holds nothing,
+    // and the same declaration removes the row.
+    let emptied = asset_snapshot(&harness, &contour, "2025-03-10").await;
+    assert!(
+        !snapshot_rows(&emptied).contains(&term),
+        "the emptied deposit still has a row: {emptied}"
+    );
+}

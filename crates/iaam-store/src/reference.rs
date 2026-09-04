@@ -7,6 +7,7 @@ use iaam_core::instrument::{
 };
 use iaam_core::money::CurrencyCode;
 use iaam_core::report::balances::NegativeBalanceExpectation;
+use iaam_core::retirement::{AccountRetirement, RetirementRevision};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use time::Date;
 use time::format_description::well_known::Iso8601;
@@ -251,6 +252,25 @@ pub struct AccountTransferStatementRecord {
 pub struct AccountScopeExclusionRecord {
     pub account: AccountId,
     pub reason: String,
+}
+
+/// The owner's recorded statement that one product ceased to exist, and the
+/// revision the whole set of them stands at.
+///
+/// The two travel together because they are read together, in one call and one
+/// transaction. A caller that fetched the statements and then the revision
+/// would publish a coordinate that does not name the state it published — off
+/// by one write, in whichever direction the two reads happened to straddle it —
+/// and the coordinate exists precisely so that a report is reproducible.
+///
+/// `statements` holds only the retirements in force: an account whose latest
+/// row withdraws its retirement is absent, exactly as an account that was never
+/// retired is. What distinguishes the two is the revision, and the history the
+/// table keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRetirementsRecord {
+    pub revision: RetirementRevision,
+    pub statements: Vec<AccountRetirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1204,6 +1224,143 @@ impl SqliteStore {
             params![owner.inner().to_string(), account.inner().to_string()],
         )?;
         Ok(())
+    }
+
+    /// Record the owner's statement that one product ceased to exist on a date.
+    ///
+    /// **An insert, never an upsert**, and that is the difference from
+    /// [`Self::record_account_scope_exclusion`] one line above. A disposition is
+    /// a current statement the owner may restate with a better reason; a
+    /// retirement is effective-dated and suppresses a row in the asset snapshot
+    /// from that date on, so restating it with a different date would silently
+    /// change what every snapshot between the two dates says. The caller checks
+    /// that no statement stands before calling; what this guarantees is that the
+    /// history is only ever added to.
+    ///
+    /// The revision is allocated inside the same immediate transaction as the
+    /// row, so two concurrent declarations cannot mint one coordinate twice —
+    /// which would leave two different states of this axis answering to one
+    /// number, and the number is what a report offers a reader as proof that
+    /// two answers are comparable.
+    ///
+    /// Returns the revision the declaration minted: the caller publishes it, and
+    /// deriving it from a second read would be a second answer to what this call
+    /// did.
+    pub fn record_account_retirement(
+        &mut self,
+        owner: OwnerId,
+        retirement: &AccountRetirement,
+    ) -> Result<RetirementRevision, StoreError> {
+        self.append_retirement(owner, retirement.account, Some(retirement.effective_on))
+    }
+
+    /// Withdraw the statement, returning the account to «he has not said».
+    ///
+    /// A further row and not a delete, which is the whole of the difference from
+    /// [`Self::clear_account_scope_exclusion`]. Deleting the retirement would
+    /// change what an earlier revision said, and an earlier revision is what a
+    /// published snapshot named; the withdrawal is therefore itself a revision,
+    /// and a reader can see that something on this axis moved.
+    pub fn withdraw_account_retirement(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<RetirementRevision, StoreError> {
+        self.append_retirement(owner, account, None)
+    }
+
+    /// One row of the history, at the next revision.
+    ///
+    /// Both calls above are this one with a date or without it, because the two
+    /// differ in nothing else: a withdrawal is a statement about the same
+    /// account at the same coordinate, and writing them twice would give the
+    /// sequence two chances to be allocated differently.
+    fn append_retirement(
+        &mut self,
+        owner: OwnerId,
+        account: AccountId,
+        effective_on: Option<Date>,
+    ) -> Result<RetirementRevision, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let head: u32 = transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) FROM account_retirements WHERE owner = ?1",
+            params![owner.inner().to_string()],
+            |row| row.get(0),
+        )?;
+        let revision = RetirementRevision(head).successor();
+        transaction.execute(
+            "INSERT INTO account_retirements (owner, revision, account, effective_on, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                owner.inner().to_string(),
+                revision.0,
+                account.inner().to_string(),
+                effective_on.map(date_to_text),
+                now(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(revision)
+    }
+
+    /// The retirements in force, and the revision they are in force at.
+    ///
+    /// One call and one transaction for both, so a report cannot state a
+    /// coordinate that does not name the statements it printed. `&mut self` is
+    /// what the transaction costs, and it is worth paying here for the reason
+    /// the other list functions do not pay it: they answer a question whose
+    /// answer is one query, and this one answers a question whose answer is two.
+    ///
+    /// «In force» is, per account, the newest row that is not a withdrawal —
+    /// which is why the history is walked backwards per account rather than
+    /// filtered on `effective_on IS NOT NULL` alone. Filtering alone would
+    /// resurrect a retirement the owner has since withdrawn, because the row
+    /// that declared it is still there and always will be.
+    pub fn list_account_retirements(
+        &mut self,
+        owner: OwnerId,
+    ) -> Result<AccountRetirementsRecord, StoreError> {
+        let transaction = self.conn.transaction()?;
+        let head: u32 = transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) FROM account_retirements WHERE owner = ?1",
+            params![owner.inner().to_string()],
+            |row| row.get(0),
+        )?;
+        let mut statement = transaction.prepare(
+            "SELECT current.account, current.effective_on
+             FROM account_retirements AS current
+             WHERE current.owner = ?1
+               AND current.revision = (
+                   SELECT MAX(later.revision) FROM account_retirements AS later
+                   WHERE later.owner = current.owner AND later.account = current.account
+               )
+               AND current.effective_on IS NOT NULL
+             ORDER BY current.account",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut statements = Vec::new();
+        for row in rows {
+            let (account, effective_on) = row?;
+            statements.push(AccountRetirement {
+                account: AccountId(parse_uuid(&account, "account")?),
+                effective_on: Date::parse(&effective_on, &Iso8601::DATE).map_err(|_| {
+                    StoreError::NotFound {
+                        what: "retirement date",
+                        id: effective_on.clone(),
+                    }
+                })?,
+            });
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(AccountRetirementsRecord {
+            revision: RetirementRevision(head),
+            statements,
+        })
     }
 
     /// Record, or replace, the owner's statement about one account's transfer

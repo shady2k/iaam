@@ -11341,6 +11341,480 @@ async fn an_account_scope_answer_names_the_account() {
     assert_eq!(recorded["disposition"], "outside", "{recorded}");
 }
 
+/// A retirement is a statement about the product, and the answer names both the
+/// account and the coordinate the whole axis stands at.
+///
+/// The revision is the half a reader cannot reconstruct. A retirement changes
+/// what an asset snapshot prints, so two runs of one report over one contour
+/// version can differ; the coordinate is what says whether two answers are
+/// comparable, and it advances on every accepted call including a withdrawal.
+#[tokio::test]
+async fn a_retirement_names_the_account_and_the_revision_it_minted() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Term", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let term = created["id"].as_str().expect("account id").to_owned();
+    let path = format!("/v1/accounts/{term}/retirement");
+
+    let (status, before) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["account"], term, "{before}");
+    assert_eq!(before["title"], "Term", "{before}");
+    assert_eq!(before["institution"], "Northline", "{before}");
+    assert_eq!(before["state"], "in_use", "{before}");
+    assert!(before.get("effective_on").is_none(), "{before}");
+    // Zero is a coordinate, not a missing one: it is where every owner starts.
+    assert_eq!(before["revision"], 0, "{before}");
+
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            &path,
+            &harness.owner_token,
+            &json!({ "state": "retired", "effective_on": "2025-12-01" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    assert_eq!(recorded["state"], "retired", "{recorded}");
+    assert_eq!(recorded["effective_on"], "2025-12-01", "{recorded}");
+    assert_eq!(recorded["revision"], 1, "{recorded}");
+    assert_eq!(recorded["title"], "Term", "{recorded}");
+
+    let (status, after) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after["state"], "retired", "{after}");
+    assert_eq!(after["effective_on"], "2025-12-01", "{after}");
+    assert_eq!(after["revision"], 1, "{after}");
+}
+
+/// Each of the four refusals, and each for its own reason.
+///
+/// A second statement is refused rather than replacing the first, because
+/// replacing it would move the boundary under every snapshot already taken
+/// between the two dates. A future date is refused because a product that has
+/// not ceased has not ceased, and accepting it would arm a change to a report
+/// that begins on a day nobody revisits. An account the owner does not hold is
+/// not found, because an identifier is not an access right. And drawing the
+/// perimeter — in either direction, on either axis — is his judgement.
+#[tokio::test]
+async fn a_retirement_refuses_a_second_statement_a_future_date_a_stranger_and_an_agent() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Term" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let term = created["id"].as_str().expect("account id").to_owned();
+    let path = format!("/v1/accounts/{term}/retirement");
+    let retire = |on: &str| json!({ "state": "retired", "effective_on": on });
+
+    // The clock stands at 2026-01-01.
+    let (status, future) = call(
+        &harness.router,
+        post(&path, &harness.owner_token, &retire("2026-06-01")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{future}");
+    assert_eq!(future["code"], "invalid_request", "{future}");
+    assert_eq!(future["field"], "effective_on", "{future}");
+
+    let (status, agent) = call(
+        &harness.router,
+        post(&path, &harness.agent_token, &retire("2025-12-01")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{agent}");
+
+    let (status, stranger) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{}/retirement", Uuid::new_v4()),
+            &harness.owner_token,
+            &retire("2025-12-01"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{stranger}");
+
+    let (status, first) = call(
+        &harness.router,
+        post(&path, &harness.owner_token, &retire("2025-12-01")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    let (status, second) = call(
+        &harness.router,
+        post(&path, &harness.owner_token, &retire("2025-11-01")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{second}");
+
+    // And the first still stands, on the date it was recorded under: a refused
+    // second statement that had moved the boundary would be worse than one that
+    // had been accepted, because nothing would say it had.
+    let (status, held) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    assert_eq!(held["effective_on"], "2025-12-01", "{held}");
+    assert_eq!(held["revision"], 1, "{held}");
+}
+
+/// Withdrawing is a further revision, and withdrawing nothing is refused.
+///
+/// The sequence's one promise is that every revision changed something: an
+/// owner comparing two reports at revisions 6 and 7 must not find them
+/// identical with nothing to explain it.
+#[tokio::test]
+async fn withdrawing_a_retirement_is_a_further_revision_and_never_a_no_op() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Term" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let term = created["id"].as_str().expect("account id").to_owned();
+    let path = format!("/v1/accounts/{term}/retirement");
+
+    let (status, nothing_to_withdraw) = call(
+        &harness.router,
+        post(&path, &harness.owner_token, &json!({ "state": "in_use" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{nothing_to_withdraw}");
+
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            &path,
+            &harness.owner_token,
+            &json!({ "state": "retired", "effective_on": "2025-12-01" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, dated_withdrawal) = call(
+        &harness.router,
+        post(
+            &path,
+            &harness.owner_token,
+            &json!({ "state": "in_use", "effective_on": "2025-12-01" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{dated_withdrawal}"
+    );
+
+    let (status, withdrawn) = call(
+        &harness.router,
+        post(&path, &harness.owner_token, &json!({ "state": "in_use" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{withdrawn}");
+    assert_eq!(withdrawn["state"], "in_use", "{withdrawn}");
+    assert_eq!(withdrawn["revision"], 2, "{withdrawn}");
+
+    // And the account can be retired again, on a different date: the history is
+    // appended to, never edited.
+    let (status, again) = call(
+        &harness.router,
+        post(
+            &path,
+            &harness.owner_token,
+            &json!({ "state": "retired", "effective_on": "2025-11-01" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["effective_on"], "2025-11-01", "{again}");
+    assert_eq!(again["revision"], 3, "{again}");
+}
+
+/// The two bounds `iaam-gua5` is held to, asserted over one closed product.
+///
+/// A term deposit is opened, emptied into another account of the owner's, and
+/// retired. Afterwards: the asset snapshot no longer carries its row, the
+/// population still names it as covered with its retirement stated beside it,
+/// and a snapshot taken before the date it ceased is unchanged.
+///
+/// The population half is the one to break carefully. An account the fold still
+/// covers that vanished from the manifest would leave the report's own name
+/// table incomplete for exactly the accounts whose rows are missing.
+#[tokio::test]
+async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() {
+    let harness = harness();
+    let account = |title: &str| {
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": title, "institution": "Northline" }),
+        )
+    };
+    let (status, created) = call(&harness.router, account("Term")).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let term = created["id"].as_str().expect("account id").to_owned();
+    let (status, created) = call(&harness.router, account("Main")).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let main = created["id"].as_str().expect("account id").to_owned();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [term, main] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [
+                    {
+                        "account": term,
+                        "type": "opening_cash",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-05" },
+                        "idempotency_key": "retirement-term-opening"
+                    },
+                    {
+                        "account": term,
+                        "type": "transfer",
+                        "to_account": main,
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-10" },
+                        "idempotency_key": "retirement-term-closed"
+                    }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let snapshot = |as_of: &str| {
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of={as_of}"),
+            Some(&harness.owner_token),
+        )
+    };
+    let rows = |snapshot: &Value| -> Vec<String> {
+        snapshot["accounts"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row["account"].as_str().expect("account").to_owned())
+            .collect()
+    };
+
+    let (status, before) = call(&harness.router, snapshot("2026-01-31")).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert!(
+        rows(&before).contains(&term),
+        "the emptied deposit is there to be removed: {before}"
+    );
+
+    let (status, retired) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{term}/retirement"),
+            &harness.owner_token,
+            &json!({ "state": "retired", "effective_on": "2026-01-10" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retired}");
+
+    let (status, after) = call(&harness.router, snapshot("2026-01-31")).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(
+        rows(&after),
+        vec![main.clone()],
+        "the closed product still has a row: {after}"
+    );
+
+    // The population still names it, covered, with the date beside it — and the
+    // manifest states the coordinate it was read at.
+    let population = &after["population"];
+    assert_eq!(population["retirement_revision"], 1, "{after}");
+    let entry = population["covered"]
+        .as_array()
+        .expect("covered")
+        .iter()
+        .find(|entry| entry["account"] == json!(term))
+        .unwrap_or_else(|| panic!("the retired account left the population: {after}"));
+    assert_eq!(entry["standing"], "covered", "{after}");
+    assert_eq!(entry["retirement"], "2026-01-10", "{after}");
+    assert_eq!(entry["title"], "Term", "{after}");
+
+    // A snapshot from before the date the product ceased is untouched.
+    let (status, earlier) = call(&harness.router, snapshot("2026-01-07")).await;
+    assert_eq!(status, StatusCode::OK, "{earlier}");
+    assert!(
+        rows(&earlier).contains(&term),
+        "a retirement rewrote a month the product was open in: {earlier}"
+    );
+
+    // And the balances answer is not the asset snapshot: it states what the
+    // journal holds per account, and a reader reconciling it against a
+    // statement needs the account there.
+    let (status, balances) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{balances}");
+    assert!(
+        balances["accounts"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|row| row["account"] == json!(term)),
+        "the balances answer dropped a row: {balances}"
+    );
+}
+
+/// **A retirement never hides money.**
+///
+/// The rule that makes the whole declaration safe to switch on: a retired
+/// account's row is dropped only where every one of its figures is zero, so the
+/// suppression removes a line and never a number. Where something is still
+/// there the row stands, its class membership stands, and the register says
+/// why — because a suppression that quietly did not happen is as confusing as
+/// one that hid a balance.
+#[tokio::test]
+async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Term", "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let term = created["id"].as_str().expect("account id").to_owned();
+
+    let (status, contour_response) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [term] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("scope");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": term,
+                    "type": "opening_cash",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-05" },
+                    "idempotency_key": "retirement-still-holding"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, retired) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{term}/retirement"),
+            &harness.owner_token,
+            &json!({ "state": "retired", "effective_on": "2026-01-10" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retired}");
+
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+    assert!(
+        snapshot["accounts"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|row| row["account"] == json!(term)),
+        "a retirement hid money: {snapshot}"
+    );
+
+    let caveat = snapshot["confidence"]["caveats"]
+        .as_array()
+        .expect("register")
+        .iter()
+        .find(|caveat| caveat["kind"] == "retired_account_not_empty")
+        .unwrap_or_else(|| panic!("the row stands and nothing says why: {snapshot}"));
+    assert_eq!(caveat["subject"]["account"], json!(term), "{snapshot}");
+    // The two sides of the disagreement, both addressable: withdraw the
+    // statement, or rule on the journal.
+    let remedies: Vec<&str> = caveat["closed_by"]
+        .as_array()
+        .expect("remedies")
+        .iter()
+        .map(|entry| entry["operationId"].as_str().expect("operation"))
+        .collect();
+    assert_eq!(
+        remedies,
+        vec!["record_account_retirement", "submit_corrections"],
+        "{snapshot}"
+    );
+}
+
 /// The third state, reachable through the API.
 ///
 /// An account can be outside the perimeter on purpose — a counterparty's, a

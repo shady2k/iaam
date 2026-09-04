@@ -32,9 +32,40 @@ pub struct Rejection {
 /// and every code's published meaning states which side of it the code falls
 /// on — but the reason is here, because it belongs to the whole vocabulary
 /// rather than to any one of its ten entries.
+///
+/// **A verdict answers a write; confirmation answers a read.** That is why
+/// `Accepted` is in this list and is produced by nothing, and why it is not an
+/// omission waiting to be filled in. A verdict is computed once, in the
+/// response to the request that wrote the row; it is never stored and there is
+/// no call that restates it. Whether reconciliation matched is the opposite
+/// kind of thing: a property of an account, a dimension and an interval,
+/// folded when a report is read, and raised or lowered by evidence that
+/// arrives afterwards. Nothing on the write path can say «reconciliation
+/// matched» about a row, and a code that said it would already be stale by the
+/// time the response was parsed. The system does have the word, in the
+/// vocabulary built to carry it: `iaam_core::reconciliation::DimensionStatus`,
+/// published in the data quality block as `accepted_internal` and
+/// `accepted_independent`, which is where §10.3's «the status will rise by
+/// itself» actually happens. Decision 0009 is this argument at length,
+/// including why the code is described rather than removed.
+///
+/// `Discrepancy` and `NeedsReconciliation` are unproduced too, and for a
+/// different reason that this comment must not blur into the one above:
+/// theirs is a gap rather than an impossibility. A commit that overrides a
+/// control mismatch writes rows the source's own figures contradict, and that
+/// is a discrepancy something could report; a missing owner remainder is asked
+/// for by the action queue instead. Both are recorded as open work, not
+/// settled here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
-    /// Recorded; reconciliation matched.
+    /// Recorded, and reconciliation matched — which nothing constructs.
+    ///
+    /// **Reserved.** Kept rather than deleted because §10.4 names it and
+    /// because dropping a value from a published enum is a breaking change that
+    /// buys nothing — the branch is unreachable, so no client can ever have
+    /// taken it, and no client's behaviour changes when it goes. What a reader
+    /// needs instead is to be told, which the published meaning below does. The
+    /// reasoning is on the type above.
     Accepted { event: EventId },
     /// Recorded; independent confirmation is not yet available.
     Provisional { event: EventId },
@@ -77,7 +108,13 @@ pub enum Verdict {
 /// pass the name of a macro that accepts
 /// `Variant => "code": "meaning",` arms and it will be called with the whole
 /// list. A code therefore cannot exist without a meaning, and a client reading
-/// the contract sees the same ten entries the server can produce.
+/// the contract sees the same ten entries this type declares.
+///
+/// It does **not** follow that all ten are emitted, and the table used to claim
+/// it did. A code no path produces is a promise a client waits on for ever, so
+/// where that is the case the meaning says so in the sentence the client
+/// actually reads — the schema is the only document it has, and a caveat kept
+/// anywhere else is a caveat it never sees.
 ///
 /// A hand-written copy of this table drifts — the one in the agent skill
 /// listed eight of the ten and omitted `possible_duplicate` and `quarantined`,
@@ -87,7 +124,7 @@ macro_rules! verdict_vocabulary {
     ($receiver:path) => {
         $receiver! {
             Accepted => "accepted":
-                "The fact was recorded and reconciliation matched.",
+                "Reserved, and no path emits it. A verdict answers one write, while whether reconciliation matched is a property of an account, a dimension and an interval that is folded when a report is read and moves as later evidence arrives. Do not wait for this code, and do not read its absence as a failure to confirm: confirmation is reported by the data quality block, as `accepted_internal` or `accepted_independent`.",
             Provisional => "provisional":
                 "The fact was recorded; no independent confirmation is available yet.",
             PossibleDuplicate => "possible_duplicate":

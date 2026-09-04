@@ -82,8 +82,8 @@ use utoipa::{IntoParams, PartialSchema, ToSchema};
 use uuid::Uuid;
 
 use crate::vocabulary::{
-    DataQualityStatusDto, NegativeCashClassificationDto, NotComputableCodeDto, VerdictCodeDto,
-    described_vocabulary,
+    DataQualityStatusDto, NegativeCashClassificationDto, NotComputableCodeDto, ProvidedByDto,
+    VerdictCodeDto, described_vocabulary,
 };
 
 // Custom date format: the standard serialisation of `time::Date` is not
@@ -3968,10 +3968,16 @@ pub struct RequestPlanDto {
 }
 
 /// One missing request field and its source.
+///
+/// `provided_by` is a vocabulary and not a bare string. It arrived as one, with
+/// three codes written out in the transport and nothing in the document to say
+/// what any of them meant, and a reader who could not see that the word names
+/// the *holder* of the value read it as naming the *work* of obtaining one —
+/// and concluded a fourth code was missing (`iaam-k6l7`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MissingInputDto {
     pub pointer: String,
-    pub provided_by: String,
+    pub provided_by: ProvidedByDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<AccountCandidateDto>>,
     /// The literal values this field admits, when it admits a closed set.
@@ -4014,7 +4020,7 @@ pub struct InputAlternativeDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequiredInputDto {
     pub pointer: String,
-    pub provided_by: String,
+    pub provided_by: ProvidedByDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<AccountCandidateDto>>,
 }

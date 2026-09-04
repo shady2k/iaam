@@ -1997,6 +1997,24 @@ fn published_vocabulary(spec: &serde_json::Value, schema: &str) -> Vec<String> {
         .collect()
 }
 
+/// The sentence one published vocabulary gives one of its codes.
+///
+/// Read from the document for the reason [`published_vocabulary`] is: a client
+/// learns a code's meaning from the schema and from nowhere else, so a caveat
+/// that lives in a Rust comment is a caveat nobody outside this repository can
+/// act on.
+fn published_meaning(spec: &serde_json::Value, schema: &str, code: &str) -> String {
+    spec["components"]["schemas"][schema]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema} must publish its codes as a oneOf: {spec}"))
+        .iter()
+        .find(|item| item["enum"][0] == code)
+        .unwrap_or_else(|| panic!("{schema} does not list {code}"))["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("code {code} in {schema} arrives without a meaning"))
+        .to_owned()
+}
+
 /// Whether a property points at the named schema, directly or through the
 /// `oneOf` that an optional field is rendered as.
 fn refers_to(property: &serde_json::Value, schema: &str) -> bool {
@@ -2042,6 +2060,44 @@ async fn the_openapi_document_enumerates_and_explains_every_verdict() {
             "rejected",
             "quarantined",
         ]
+    );
+}
+
+#[tokio::test]
+async fn the_verdict_vocabulary_admits_that_nothing_emits_accepted() {
+    // `accepted` is published and no path constructs it: a verdict is the
+    // answer to one write, and whether reconciliation matched is a property of
+    // an account, a dimension and an interval that is folded on read and moves
+    // afterwards. A previous reader took the old sentence — "the fact was
+    // recorded and reconciliation matched" — at its word and wrote two tests
+    // waiting for a code that never arrives.
+    //
+    // The code stays listed: removing a value from a published enum breaks a
+    // client for no gain, because the branch was unreachable and no client can
+    // ever have taken it. What must not stay is the silence, so the check is on
+    // the sentence rather than on the list — and it holds a future
+    // implementation to changing the description in the same edit.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let meaning = published_meaning(&spec, "VerdictCodeDto", "accepted");
+    assert!(
+        meaning.contains("no path emits it"),
+        "the meaning of `accepted` must say that nothing produces it: {meaning}"
+    );
+    assert!(
+        meaning.contains("accepted_internal") && meaning.contains("accepted_independent"),
+        "the meaning of `accepted` must send the reader to where confirmation is \
+         actually reported: {meaning}"
+    );
+
+    // The codes something does emit say nothing of the kind, so a client cannot
+    // read the caveat as decoration on the whole vocabulary.
+    let provisional = published_meaning(&spec, "VerdictCodeDto", "provisional");
+    assert!(
+        !provisional.contains("no path emits it"),
+        "a code production emits must not be described as reserved: {provisional}"
     );
 }
 
@@ -2114,6 +2170,43 @@ async fn the_openapi_document_enumerates_and_explains_the_data_quality_status() 
     assert_eq!(
         published_vocabulary(&spec, "DataQualityStatusDto"),
         vec!["clean", "mixed", "incomplete"]
+    );
+}
+
+#[tokio::test]
+async fn the_openapi_document_enumerates_and_explains_where_a_missing_input_comes_from() {
+    // `provided_by` reached the wire as a bare `string` with three codes
+    // written out in the transport and no sentence anywhere. What a caller had
+    // to do with it — decide whom to ask — is exactly what a code without a
+    // meaning cannot be used for, and a reader who could not see that the word
+    // names the holder of a value rather than the work of obtaining one
+    // concluded a fourth code was missing (`iaam-k6l7`). The list and the
+    // sentences are what close that, so both are checked here.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for schema in ["MissingInputDto", "RequiredInputDto"] {
+        let property = &spec["components"]["schemas"][schema]["properties"]["provided_by"];
+        assert!(
+            refers_to(property, "ProvidedByDto"),
+            "{schema}.provided_by must point at the vocabulary: {property}"
+        );
+    }
+
+    assert_eq!(
+        published_vocabulary(&spec, "ProvidedByDto"),
+        vec!["owner", "external_document", "caller"]
+    );
+
+    // The one sentence the vocabulary exists to publish: a value the owner had
+    // to export, convert or restate is still read off the document that printed
+    // it. Without it the reader has three bare words and reinvents a fourth.
+    let document = published_meaning(&spec, "ProvidedByDto", "external_document");
+    assert!(
+        document.contains("converting it") && document.contains("not sources of it"),
+        "`external_document` must say that deriving a value does not change where it \
+         came from: {document}"
     );
 }
 

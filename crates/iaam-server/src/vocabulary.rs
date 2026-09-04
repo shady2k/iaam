@@ -5,6 +5,7 @@
 //! document that lists them, and a hand-written list drifts away from the code
 //! that produces it. So the vocabularies here are **expanded from the domain**:
 //! `iaam_app::ingest::verdict_vocabulary!`,
+//! `iaam_app::provided_by_vocabulary!`,
 //! `iaam_core::not_computable_vocabulary!`,
 //! `iaam_core::negative_cash_classification_vocabulary!` and
 //! `iaam_core::data_quality_status_vocabulary!` each call a macro in this
@@ -27,6 +28,7 @@ use utoipa::ToSchema;
 use utoipa::openapi::RefOr;
 use utoipa::openapi::schema::{ObjectBuilder, OneOfBuilder, Schema, SchemaType, Type};
 
+use iaam_app::actions::ProvidedBy;
 use iaam_app::ingest::Verdict;
 use iaam_core::perimeter::NegativeCashClassification;
 use iaam_core::returns::{DataQualityStatus, NotComputable};
@@ -127,6 +129,27 @@ macro_rules! define_verdict_code_dto {
 }
 
 iaam_app::ingest::verdict_vocabulary!(define_verdict_code_dto);
+
+macro_rules! define_provided_by_code_dto {
+    ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
+        vocabulary_enum! {
+            /// Where the value of a missing request field must come from.
+            ///
+            /// It names **who holds the value**, and deliberately not what the
+            /// owner had to do to read it: a figure he exported from somewhere
+            /// and converted is `external_document` all the same. The argument
+            /// is on `iaam_app::actions::ProvidedBy`; what belongs here is that
+            /// the reader of this schema is the one who needs it, because the
+            /// field used to arrive as a bare string and left a caller to guess.
+            ProvidedByDto from ProvidedBy {
+                "Where the value of this field must come from. The word names who holds the value, not the work of obtaining it: a figure the owner had to export and convert is still read off the document that printed it. `caller` is the client's to fill in on its own; the other two send it to the owner or to a document he has."
+            }
+            $($variant => $code : $meaning),+
+        }
+    };
+}
+
+iaam_app::provided_by_vocabulary!(define_provided_by_code_dto);
 
 macro_rules! define_not_computable_code_dto {
     ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
@@ -277,6 +300,17 @@ mod tests {
             DataQualityStatusDto::from_domain(&status).code(),
             status.code()
         );
+
+        // The three `provided_by` codes were literals in the transport before
+        // they were a vocabulary, and the strings a caller reads had to survive
+        // being given a type.
+        for source in [ProvidedBy::Owner, ProvidedBy::ExternalDocument, ProvidedBy::Caller] {
+            assert_eq!(ProvidedByDto::from_domain(&source).code(), source.code());
+            assert_eq!(
+                serde_json::to_value(ProvidedByDto::from_domain(&source)).expect("serialisation"),
+                serde_json::Value::String(source.code().to_owned())
+            );
+        }
 
         for classification in [
             NegativeCashClassification::TemporarySettlementDeficit,

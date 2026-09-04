@@ -158,6 +158,18 @@ Naming the shape is not naming the tool, which §8 rejects and still should.
 `unresolved_direction` is a value of this API's own contract, published in the
 document the same caller is already reading.
 
+**The three words are now published with their meanings** (`iaam-k6l7`). They
+were not: `provided_by` reached the wire as a bare string, with the codes written
+out in the transport and the contract saying neither what the list was nor what
+any entry meant. That is why the fourth word kept being rediscovered — a reader
+with three unexplained codes cannot tell that the axis is *who holds the value*
+rather than *what it took to read it*, and a value the owner exported, converted
+and restated looks like a case with no word for it. It has one, and
+`external_document`'s published sentence now says so: fetching, converting and
+restating are steps on the way to a value, not sources of it. The vocabulary is
+expanded from `iaam_app::provided_by_vocabulary!`, so the code, the meaning and
+the transport's conversion come from one list and cannot drift apart.
+
 ## 6. Where the line should be, and the one thing that must move first
 
 **A converter translates a format. The API reaches conclusions.** That is the

@@ -14036,7 +14036,10 @@ async fn a_row_names_its_account_by_the_identifier_the_source_prints() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{verdicts}");
-    assert_eq!(verdicts[0]["verdict"], "accepted", "{verdicts}");
+    // "provisional", not "accepted": a row with no independent confirmation to
+    // reconcile against is recorded provisionally, and that is the system
+    // working as designed. What this test pins is which account it reached.
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
     assert!(
         journal_rows(&harness).await > before,
         "the row was recorded without the caller ever naming a uuid: {verdicts}"
@@ -14107,7 +14110,10 @@ async fn a_row_naming_no_account_is_rejected_beside_rows_that_are_not() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{verdicts}");
-    assert_eq!(verdicts[0]["verdict"], "accepted", "{verdicts}");
+    // "provisional", not "accepted": nothing independent has confirmed the
+    // account yet, so a freshly recorded row is provisional. The point here is
+    // that the readable row was judged at all, beside the one that was not.
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
     assert_eq!(verdicts[1]["verdict"], "rejected", "{verdicts}");
     assert_eq!(verdicts[1]["field"], "account", "{verdicts}");
     assert!(

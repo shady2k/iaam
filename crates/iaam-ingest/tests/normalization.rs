@@ -8,6 +8,7 @@ use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::PriceQuality;
+use iaam_ingest::classification::Movement;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{
     OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict, normalize,
@@ -110,6 +111,24 @@ fn all_kinds() -> Vec<OperationKind> {
             price: Dec::new(Decimal::new(1_005, 1)),
             currency: CurrencyCode::Rub,
             quality: PriceQuality::OwnerEstimate,
+        },
+        // Both readings of one submitted kind: the direction is a field here
+        // because a source may not state it, and the two readings become two
+        // different facts.
+        OperationKind::OwnAccountMovement {
+            movement: Some(Movement::Out),
+            amount_minor: 60_000,
+            currency: CurrencyCode::Rub,
+        },
+        OperationKind::OwnAccountMovement {
+            movement: Some(Movement::In),
+            amount_minor: 60_000,
+            currency: CurrencyCode::Rub,
+        },
+        OperationKind::OwnAccountMovement {
+            movement: None,
+            amount_minor: 60_000,
+            currency: CurrencyCode::Rub,
         },
     ]
 }
@@ -478,4 +497,58 @@ fn an_operation_without_a_source_category_carries_none() {
     });
     let event = normalize(&operation, context()).expect("normalises").event;
     assert_eq!(event.provenance.source_category(), None);
+}
+
+// --- an own-account movement with an unnamed far side (iaam-fmih) -----------
+
+#[test]
+fn a_stated_direction_posts_one_signed_leg_on_the_rows_own_account() {
+    let operation = submit(OperationKind::OwnAccountMovement {
+        movement: Some(Movement::Out),
+        amount_minor: 480_000,
+        currency: CurrencyCode::Rub,
+    });
+    let event = normalize(&operation, context()).expect("normalises").event;
+    event.validate_structure().expect("valid shape");
+    assert!(matches!(
+        event.kind,
+        EventKind::OwnAccountMovement { amount } if amount.amount().raw() == -480_000
+    ));
+    assert_eq!(event.legs.len(), 1);
+    assert_eq!(event.legs[0].account, operation.account);
+}
+
+#[test]
+fn an_unstated_direction_posts_nothing_at_all() {
+    // The whole point: without a direction the journal cannot honestly debit or
+    // credit the account, so it records the movement and posts no leg. A fact
+    // with a leg here would be a fabricated direction.
+    let operation = submit(OperationKind::OwnAccountMovement {
+        movement: None,
+        amount_minor: 480_000,
+        currency: CurrencyCode::Rub,
+    });
+    let event = normalize(&operation, context()).expect("normalises").event;
+    event.validate_structure().expect("valid shape");
+    assert!(matches!(
+        event.kind,
+        EventKind::UnresolvedOwnAccountMovement { amount } if amount.amount().raw() == 480_000
+    ));
+    assert!(event.legs.is_empty());
+}
+
+#[test]
+fn an_own_account_movement_is_submitted_with_a_positive_amount() {
+    // The sign is the variant's job everywhere else here, and the direction's
+    // job in this one. A caller using the sign as well has a model of the kind
+    // that the code does not share.
+    let operation = submit(OperationKind::OwnAccountMovement {
+        movement: Some(Movement::Out),
+        amount_minor: -480_000,
+        currency: CurrencyCode::Rub,
+    });
+    assert!(matches!(
+        normalize(&operation, context()),
+        Err(Rejection { ref field, .. }) if field == "amount"
+    ));
 }

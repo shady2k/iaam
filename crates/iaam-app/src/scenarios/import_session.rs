@@ -30,7 +30,7 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule,
-    ClassificationSubject, Movement, Question, RuleMatcher, classify,
+    ClassificationSubject, FarSide, Movement, Question, RuleMatcher, classify,
 };
 use iaam_ingest::csv_source::{AccountEntry, AccountNames, UnresolvedAccount};
 use iaam_ingest::observation::{Intake, ObservedRow};
@@ -83,6 +83,13 @@ pub enum HeldRow {
     Held { row: u32 },
     /// Held, and waiting on the owner.
     Questioned { asked: AskedQuestion },
+    /// Held, and it will produce no fact at all — which is correct for it.
+    ///
+    /// Told here rather than only in the plan, because the caller is entitled
+    /// to know at the moment it feeds the row: read as [`Self::Held`] it would
+    /// promise a fact the commit will not write, and the caller would have to
+    /// discover the difference by comparing counts.
+    Settled { row: u32, reason: NoFactReason },
     /// Not held: the row could not be read, so there was nothing to hold.
     Rejected { row: u32, rejection: Rejection },
 }
@@ -92,7 +99,7 @@ impl HeldRow {
     #[must_use]
     pub const fn row(&self) -> u32 {
         match self {
-            Self::Held { row } | Self::Rejected { row, .. } => *row,
+            Self::Held { row } | Self::Rejected { row, .. } | Self::Settled { row, .. } => *row,
             Self::Questioned { asked } => asked.row,
         }
     }
@@ -269,11 +276,16 @@ pub async fn submit_intake(
     // with nothing.
     let mut settled: Vec<Option<Result<SubmittedOperation, Rejection>>> = Vec::new();
     let mut pending: Vec<Option<(&ObservedRow, Question)>> = Vec::new();
+    // The third outcome, kept in its own list rather than folded into either of
+    // the two above: such a row opens no session, because there is nothing to
+    // ask, and produces no candidate, because there is nothing to write.
+    let mut no_fact: Vec<Option<NoFactReason>> = Vec::new();
     for intake in rows {
         match intake {
             Intake::Concluded { operation } => {
                 settled.push(Some(Ok((**operation).clone())));
                 pending.push(None);
+                no_fact.push(None);
             }
             Intake::Observed { row } => match resolver.assess(row) {
                 Assessment::Settled {
@@ -282,10 +294,17 @@ pub async fn submit_intake(
                 } => {
                     settled.push(Some(row.resolve(classification, movement)));
                     pending.push(None);
+                    no_fact.push(None);
+                }
+                Assessment::NoFact { reason } => {
+                    settled.push(None);
+                    pending.push(None);
+                    no_fact.push(Some(reason));
                 }
                 Assessment::Ambiguous { question } => {
                     settled.push(None);
                     pending.push(Some((row.as_ref(), question)));
+                    no_fact.push(None);
                 }
             },
         }
@@ -347,6 +366,17 @@ pub async fn submit_intake(
             })?;
             outcomes.push(IntakeOutcome {
                 verdict,
+                asked: None,
+            });
+            continue;
+        }
+        // Before the question, because a row settled without a fact raised
+        // none: it is answered here and nothing is parked.
+        if let Some(reason) = no_fact[index] {
+            outcomes.push(IntakeOutcome {
+                verdict: Verdict::NoFact {
+                    reason: reason.code().to_owned(),
+                },
                 asked: None,
             });
             continue;
@@ -823,6 +853,10 @@ pub async fn add_rows(
             Assessment::Settled { .. } => outcomes.push(HeldRow::Held {
                 row: observation.row,
             }),
+            Assessment::NoFact { reason } => outcomes.push(HeldRow::Settled {
+                row: observation.row,
+                reason,
+            }),
             Assessment::Ambiguous { question } => {
                 let prompt = resolver.render(&question);
                 let alternatives = question.alternatives();
@@ -1078,9 +1112,13 @@ pub async fn answer_question(
         .admitting(alternatives)
         .into());
     }
-    // An answer naming an account must name one of the owner's, and it must not
-    // name the account the row is already on: a transfer to itself is not a
-    // movement, and the far side of an internal transfer is what a rule matches.
+    // An answer naming an account must name one of the owner's. That is the
+    // whole of this check, and the comment used to claim a second half — «and
+    // it must not name the account the row is already on» — beside code that
+    // performs no such test. The rule is real and is enforced twice, in
+    // `ObservedRow::resolve` below and again in `Event::validate_transfer`; it
+    // is not enforced here, and a reader who trusted the old wording would go
+    // looking for the missing check rather than for the two that exist.
     if let Some(account) = named_account(answer) {
         let accounts = services.store.list_accounts(principal.owner).await?;
         if !accounts.iter().any(|known| known.id == account) {
@@ -1358,7 +1396,12 @@ pub async fn commit_session(
         return Err(refusal);
     }
 
-    let verdicts = submit_candidates(
+    // One verdict per **held row**, in the order the rows were fed. The
+    // candidates are only the rows that become facts, so the settled ones are
+    // put back at their own positions here: a caller reads this list by
+    // position, and a list that renumbered itself around a settled row would
+    // report every later row's outcome against the wrong row.
+    let written = submit_candidates(
         services,
         principal,
         "operation",
@@ -1366,6 +1409,23 @@ pub async fn commit_session(
         planned.candidates,
     )
     .await?;
+    let mut written = written.into_iter();
+    let mut verdicts = Vec::with_capacity(planned.dispositions.len());
+    for disposition in &planned.dispositions {
+        match disposition {
+            Disposition::NoFact(reason) => verdicts.push(Verdict::NoFact {
+                reason: reason.code().to_owned(),
+            }),
+            Disposition::Candidate => {
+                let verdict = written.next().ok_or_else(|| {
+                    AppError::Store(
+                        "the commit produced fewer verdicts than it had candidates".to_owned(),
+                    )
+                })?;
+                verdicts.push(verdict);
+            }
+        }
+    }
     // The assertions go in **after** the rows, and the order is not arbitrary:
     // an assertion is a statement about a period, and one written over a journal
     // that does not yet hold the period's rows is a discrepancy against an empty
@@ -1753,6 +1813,25 @@ pub struct PlannedSession {
     /// `commit_delta.retained_unrecorded`. This is that same fact in the shape
     /// the journal records it, not a second finding.
     declined: Vec<DeclinedRow>,
+    /// One entry per held row, in the order the rows were fed, saying whether
+    /// that row is among `candidates` or produced nothing.
+    ///
+    /// Private, and it exists so that [`CommitOutcome::verdicts`] stays a list
+    /// a caller reads **by row position**. `candidates` holds only the rows
+    /// that become facts, so without this the verdict list would silently
+    /// renumber every row after a settled one — the failure mode where every
+    /// verdict is positive and the rows they describe are not the rows the
+    /// caller sent.
+    dispositions: Vec<Disposition>,
+}
+
+/// Where one held row's verdict comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// The row is the next element of `candidates`.
+    Candidate,
+    /// The row produced nothing, and this is why.
+    NoFact(NoFactReason),
 }
 
 // No source is held here. It was, while a session that declared none had one
@@ -2111,10 +2190,29 @@ pub async fn plan_session(
         .collect();
 
     let mut candidates = Vec::with_capacity(contents.observations.len());
+    let mut dispositions = Vec::with_capacity(contents.observations.len());
     let mut read_rows = Vec::with_capacity(contents.observations.len());
     for observation in &contents.observations {
         let intake = parse_intake(&observation.payload).ok();
-        let operation = operation_of(observation, &resolver);
+        let resolution = resolution_of(observation, &resolver);
+        // A settled row that produces nothing leaves the fact pipeline here and
+        // is carried by `settled` instead. It is not folded into `operation`
+        // with a rejection, because it is not one: everything downstream of a
+        // rejection — the coverage gap, the retention reason, the refusal to
+        // commit — is about a row something is owed for.
+        let settled = match &resolution {
+            Ok(RowResolution::NoFact(reason)) => Some(*reason),
+            Ok(RowResolution::Fact(_)) | Err(_) => None,
+        };
+        let operation = match resolution {
+            Ok(RowResolution::Fact(operation)) => Ok(*operation),
+            Ok(RowResolution::NoFact(_)) => Err(Rejection {
+                field: "row".to_owned(),
+                expected: "a row that becomes a fact".to_owned(),
+                actual: "a row settled without one".to_owned(),
+            }),
+            Err(rejection) => Err(rejection),
+        };
         // The origin is derived from the session and the account this row names,
         // so that this function called twice — which is exactly what committing
         // does — plans the same provenance both times. See [`session_origin`].
@@ -2145,9 +2243,20 @@ pub async fn plan_session(
             operation: operation.ok(),
             row_key: observation.row_key.clone(),
             payload: observation.payload.clone(),
-            candidate: candidate.clone(),
+            candidate: if settled.is_some() {
+                None
+            } else {
+                Some(candidate.clone())
+            },
+            settled,
         });
-        candidates.push(candidate);
+        match settled {
+            Some(reason) => dispositions.push(Disposition::NoFact(reason)),
+            None => {
+                dispositions.push(Disposition::Candidate);
+                candidates.push(candidate);
+            }
+        }
     }
 
     let source_inventory = inventory(&contents, &read_rows);
@@ -2172,8 +2281,22 @@ pub async fn plan_session(
     // else, for the reason the whole planner is one function: a second walk
     // over the rows would describe a different import from the one that runs.
     let mut declined: Vec<DeclinedRow> = Vec::new();
+    let mut settled_without_fact: Vec<SettledRow> = Vec::new();
     for read in &read_rows {
-        match &read.candidate {
+        let Some(candidate) = &read.candidate else {
+            // Settled, and settled is not retained: nothing is owed, nothing is
+            // declined, and no coverage gap is written. A gap here would say
+            // this attempt could not confirm the dimensions this row moves,
+            // when the row moves none.
+            if let Some(reason) = read.settled {
+                settled_without_fact.push(SettledRow {
+                    row: read.row,
+                    reason,
+                });
+            }
+            continue;
+        };
+        match candidate {
             Ok(event) => {
                 let fact = planned_fact(read, event);
                 if fact
@@ -2220,7 +2343,7 @@ pub async fn plan_session(
     let legs: Vec<CashLeg> = read_rows
         .iter()
         .filter_map(|read| {
-            let event = read.candidate.as_ref().ok()?;
+            let event = read.candidate.as_ref()?.as_ref().ok()?;
             let mut leg = transfer_pairing::leg_of_event(event)?;
             leg.origin = LegOrigin::Observed {
                 session,
@@ -2238,6 +2361,7 @@ pub async fn plan_session(
         facts,
         duplicates,
         retained_unrecorded: retained,
+        settled_without_fact,
     };
     // Compared against the facts **and** the duplicates. A statement's turnover
     // covers every row it printed, including the ones this journal already
@@ -2322,6 +2446,7 @@ pub async fn plan_session(
 
     Ok(PlannedSession {
         declined,
+        dispositions,
         plan: ImportPlan {
             session: contents.session,
             revision,
@@ -2357,7 +2482,16 @@ struct ReadRow {
     /// named by a fingerprint of what it sent — as the sync path fingerprints
     /// a row its source did not identify.
     payload: String,
-    candidate: Result<iaam_core::event::Event, Rejection>,
+    /// The event the row would become, or `None` where the row is settled and
+    /// deliberately becomes none.
+    ///
+    /// The `Option` is the third outcome and not a convenience: `Err` already
+    /// means «this row should have become a fact and could not», and everything
+    /// downstream of it — the coverage gap, the retention reason, the refusal
+    /// to commit — says that something is owed. Nothing is owed here.
+    candidate: Option<Result<iaam_core::event::Event, Rejection>>,
+    /// Why the row produced nothing, where that is what happened.
+    settled: Option<NoFactReason>,
 }
 
 impl ReadRow {
@@ -2370,6 +2504,15 @@ impl ReadRow {
     /// same way.
     fn account(&self) -> Option<AccountId> {
         Some(self.intake.as_ref()?.account())
+    }
+
+    /// The day the row states, read from the row itself rather than from the
+    /// event it would become.
+    fn stated_day(&self) -> Option<time::Date> {
+        match self.intake.as_ref()? {
+            Intake::Observed { row } => row.dates.effective_date(),
+            Intake::Concluded { operation } => operation.dates.effective_date(),
+        }
     }
 
     /// The document the row names, when it names one.
@@ -2396,8 +2539,15 @@ fn inventory(contents: &SessionContents, rows: &[ReadRow]) -> SourceInventory {
         {
             accounts.push(account);
         }
-        if let Ok(event) = &read.candidate {
-            let day = event.order.date();
+        // A settled row has no event to be dated by, and it is still a row the
+        // document printed: taking its day from what the row states keeps the
+        // period from stopping short of the statement it came from.
+        let day = match (&read.candidate, read.settled) {
+            (Some(Ok(event)), _) => Some(event.order.date()),
+            (None, Some(_)) => read.stated_day(),
+            _ => None,
+        };
+        if let Some(day) = day {
             period = Some(match period {
                 None => (day, day),
                 Some((from, to)) => (from.min(day), to.max(day)),
@@ -2670,6 +2820,9 @@ fn fingerprint(
     }
     for retained in &delta.retained_unrecorded {
         let _ = writeln!(rendered, "retained {retained:?}");
+    }
+    for settled in &delta.settled_without_fact {
+        let _ = writeln!(rendered, "settled {settled:?}");
     }
     // Derived from the lists above, and stamped anyway: the digest's contract is
     // that it covers everything the plan says, and a section left out because it
@@ -3154,11 +3307,101 @@ pub async fn abandon_session(
 enum Assessment {
     Settled {
         classification: Classification,
-        movement: Movement,
+        /// `None` where the source stated no direction and the classification
+        /// survives that, which exactly one of them does. See
+        /// [`ObservedRow::resolve`].
+        movement: Option<Movement>,
+    },
+    /// The row is understood and deliberately becomes no journal fact.
+    ///
+    /// Not a failure and not an [`Self::Ambiguous`] awaiting an answer: this is
+    /// a settled reading of the row that happens to have nothing to record.
+    NoFact {
+        reason: NoFactReason,
     },
     Ambiguous {
         question: Question,
     },
+}
+
+/// What one stored row settles as.
+///
+/// The distinction the session could not draw before `iaam-tb5o`: a row that
+/// produced nothing was describable only as unreadable or unanswered, and both
+/// hold the commit. `Verdict::Quarantined` does not help — it is the answer to
+/// **a write**, computed once in the response that wrote the batch, and what is
+/// wanted here is a durable disposition of a row that the plan can publish
+/// before anything is written and the commit can then honour.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowResolution {
+    /// The row becomes this operation, and the commit writes the fact.
+    Fact(Box<SubmittedOperation>),
+    /// The row is settled and produces no journal fact at all.
+    NoFact(NoFactReason),
+}
+
+/// Why a row correctly produces nothing.
+///
+/// A closed enumeration with one member, and the closure is the point rather
+/// than an accident of having found only one case. «This row produced nothing»
+/// must be a determination somebody can audit, tied to the evidence that
+/// supports it; an importer that merely came up empty must never be able to
+/// present itself as one of these. That is the same rule
+/// `iaam_core::event::source_row` was built under for a refused row's identity,
+/// and it is why the reason is a value here rather than a free string.
+///
+/// **The one member is the one the directory can establish on its own.** An
+/// owner-declared no-fact would be a second determination on different
+/// evidence — his word rather than his account map — and it would need a way
+/// for him to say so, which is an answer shape this does not add. Naming it as
+/// absent is the honest state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoFactReason {
+    /// The identifier the source printed for the far side resolves to the very
+    /// account the row is on, so the two sides are two payment instruments over
+    /// one account.
+    ///
+    /// The honest financial record is nothing. The account's balance does not
+    /// change, no asset class changes, and there will never be a second
+    /// statement to pair with, because there is no second leg. A zero-net pair
+    /// of facts would invent two movements the model says did not happen, and
+    /// `CashTransfer { from: X, to: X }` is refused by the core itself
+    /// (`EventValidationError::TransferToSelf`) for that same reason.
+    ///
+    /// **The mapping this rests on already exists** and is decision 0004's:
+    /// two cards over one underlying account are one account with two aliases,
+    /// each with a validity interval, so the far side's identifier resolves
+    /// through the same tiering as any other. Nothing about the account model
+    /// changes here; what changes is that the resolution stops being thrown
+    /// away as a rejected row.
+    ///
+    /// A direction is not needed and is deliberately not consulted: whichever
+    /// way the money ran between two instruments over one account, the account
+    /// moved by nothing. That is what lets this settle a row no question could
+    /// have settled.
+    OneAccountTwoInstruments { account: AccountId },
+}
+
+impl NoFactReason {
+    /// Wire code. One place, so two routes cannot spell it differently.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OneAccountTwoInstruments { .. } => "one_account_two_instruments",
+        }
+    }
+
+    /// The reason in words, for the owner reading the plan.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::OneAccountTwoInstruments { .. } => {
+                "the source names the far side as this same account, so the row moves \
+                 money between two payment instruments over one account and changes \
+                 no balance"
+            }
+        }
+    }
 }
 
 /// The owner's accounts, and the one place a printed identifier is turned into
@@ -3457,6 +3700,24 @@ impl Resolver {
             .counterparty_name()
             .and_then(|name| self.resolve_counterparty(name, row.dates.effective_date()))
             .filter(|resolved| !self.denies(row.account, *resolved));
+        // Read **before** the classifier, because the classifier has no word
+        // for it: `Counterparty::OwnAccount(row.account)` becomes
+        // `InternalTransfer { to: row.account }`, which `ObservedRow::resolve`
+        // then refuses as a transfer to itself — so the row used to come out
+        // unreadable, and the one thing the directory actually established
+        // about it was thrown away with the rejection.
+        //
+        // Nothing is hidden by settling it here: the plan publishes the row and
+        // this reason before the commit writes anything, so an owner whose bank
+        // prints the near side in the counterparty column sees a row named as
+        // producing nothing rather than a row silently dropped.
+        if resolved == Some(row.account) {
+            return Assessment::NoFact {
+                reason: NoFactReason::OneAccountTwoInstruments {
+                    account: row.account,
+                },
+            };
+        }
         let subject = row.subject(resolved);
         let classification = match classify(&subject, &self.rules) {
             ClassificationResult::Resolved { classification, .. } => classification,
@@ -3464,12 +3725,21 @@ impl Resolver {
                 return Assessment::Ambiguous { question };
             }
         };
-        match movement_of(classification, row) {
-            Some(movement) => Assessment::Settled {
+        match (classification, movement_of(classification, row)) {
+            (classification, Some(movement)) => Assessment::Settled {
                 classification,
-                movement,
+                movement: Some(movement),
             },
-            None => Assessment::Ambiguous {
+            // The one outcome the journal can record without a direction, so
+            // the one outcome that does not become a question. Everything else
+            // still does, and must: «the source printed a word for it» is not
+            // «the source said which way it went», and the four rows that
+            // opened this bead were four questions about exactly that.
+            (Classification::OwnAccountMovement, None) => Assessment::Settled {
+                classification,
+                movement: None,
+            },
+            (_, None) => Assessment::Ambiguous {
                 question: Question::UnresolvedDirection {
                     account: row.account,
                     stated: row.source_kind.clone(),
@@ -3698,18 +3968,27 @@ fn observed_row(observations: &[ImportObservationView], row: u32) -> Result<Obse
     }
 }
 
-/// The operation one stored row commits as.
-fn operation_of(
+/// What one stored row settles as.
+///
+/// Three outcomes and not two, which is `iaam-tb5o`: a fact, no fact and a
+/// reason, or a rejection. A row that deliberately produces nothing used to
+/// have to borrow the rejection, and a rejection retains the row and refuses
+/// nothing else — so the one disposition the importer could establish on its
+/// own looked exactly like a row it had failed to read.
+fn resolution_of(
     observation: &ImportObservationView,
     resolver: &Resolver,
-) -> Result<SubmittedOperation, Rejection> {
+) -> Result<RowResolution, Rejection> {
     let intake = parse_intake(&observation.payload).map_err(|error| Rejection {
         field: "observation".to_owned(),
         expected: "a row this build can read".to_owned(),
         actual: error.to_string(),
     })?;
     let row = match intake {
-        Intake::Concluded { operation } => return Ok(*operation),
+        // A caller that concluded has said there is a fact, so there is one to
+        // write or a rejection to report. Nothing here second-guesses it into
+        // producing nothing.
+        Intake::Concluded { operation } => return Ok(RowResolution::Fact(operation)),
         Intake::Observed { row } => *row,
     };
     if let Some(answer) = &observation.answer {
@@ -3718,13 +3997,18 @@ fn operation_of(
             expected: "an answer this build can read".to_owned(),
             actual: error.to_string(),
         })?;
-        return row.resolve_with(answer);
+        return row
+            .resolve_with(answer)
+            .map(|operation| RowResolution::Fact(Box::new(operation)));
     }
     match resolver.assess(&row) {
         Assessment::Settled {
             classification,
             movement,
-        } => row.resolve(classification, movement),
+        } => row
+            .resolve(classification, movement)
+            .map(|operation| RowResolution::Fact(Box::new(operation))),
+        Assessment::NoFact { reason } => Ok(RowResolution::NoFact(reason)),
         // Commit refuses while a question is open, so this is reached only for a
         // row that raised none and still cannot be settled — which the assessment
         // above rules out. Refusing rather than guessing keeps that true even if
@@ -3881,6 +4165,7 @@ mod tests {
             amount_minor: -1_000,
             currency: CurrencyCode::Rub,
             counterparty: ObservedCounterparty::Named(counterparty.to_owned()),
+            far_side: FarSide::Unstated,
             source_kind: Some("transfer".to_owned()),
             description: None,
             dates: OperationDates {
@@ -4152,6 +4437,104 @@ mod tests {
         );
     }
 
+    // --- two payment instruments over one account (iaam-tb5o) --------------
+
+    #[test]
+    fn a_far_side_that_resolves_to_this_very_account_settles_without_a_fact() {
+        // Decision 0004's alias, doing the work it was designed for: two cards
+        // over one underlying account are one account with two aliases, so the
+        // identifier the source printed for the far side resolves to the very
+        // account the row is on. The honest record is nothing — the balance
+        // does not change and there is no second leg to wait for — and no
+        // question is asked, which is the owner's actual requirement.
+        let main = account(1);
+        let resolver = resolver(vec![with_alias(
+            detail(main, "Main"),
+            "card-two",
+            time::macros::date!(2024 - 01 - 01),
+            None,
+        )]);
+        match resolver.assess(&row(main, "card-two", None)) {
+            Assessment::NoFact { reason } => assert_eq!(
+                reason,
+                NoFactReason::OneAccountTwoInstruments { account: main }
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn it_settles_whether_or_not_the_source_stated_a_direction() {
+        // The determination does not consult one, and could not be helped by
+        // one: whichever way the money ran between two instruments over one
+        // account, the account moved by nothing. That is what lets it settle a
+        // row no question could have settled.
+        let main = account(1);
+        let resolver = resolver(vec![with_identity(detail(main, "Main"), "acct-1")]);
+        match resolver.assess(&directionless(row(main, "acct-1", None))) {
+            Assessment::NoFact { reason } => assert_eq!(
+                reason,
+                NoFactReason::OneAccountTwoInstruments { account: main }
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_far_side_that_is_a_different_account_is_still_a_transfer() {
+        // The falsification: if any resolved own account settled without a
+        // fact, every internal transfer would vanish from the journal.
+        let main = account(1);
+        let savings = account(2);
+        let resolver = resolver(vec![detail(main, "Main"), detail(savings, "Savings")]);
+        match resolver.assess(&row(main, "Savings", None)) {
+            Assessment::Settled { classification, .. } => assert_eq!(
+                classification,
+                Classification::InternalTransfer { to: savings }
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // --- a source that names whose account the far side is (iaam-cp94) -----
+
+    #[test]
+    fn a_source_asserting_its_own_accounts_is_recorded_rather_than_asked_about() {
+        // The four rows of the run this wave came from: a date, an amount, no
+        // direction, no counterparty, and the source's own word for a movement
+        // between the owner's accounts. Each of them used to raise a question
+        // and hold the commit.
+        let main = account(1);
+        let resolver = resolver(vec![detail(main, "Main")]);
+        let mut asserted = directionless(row(main, "Somebody", None));
+        asserted.counterparty = ObservedCounterparty::Unknown;
+        asserted.far_side = FarSide::OwnAccount;
+        match resolver.assess(&asserted) {
+            Assessment::Settled {
+                classification,
+                movement,
+            } => {
+                assert_eq!(classification, Classification::OwnAccountMovement);
+                assert_eq!(movement, None, "and nothing invented a direction");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_same_row_without_the_assertion_is_still_a_question() {
+        let main = account(1);
+        let resolver = resolver(vec![detail(main, "Main")]);
+        let mut plain = directionless(row(main, "Somebody", None));
+        plain.counterparty = ObservedCounterparty::Unknown;
+        assert!(matches!(
+            resolver.assess(&plain),
+            Assessment::Ambiguous {
+                question: Question::UnresolvedDirection { .. }
+            }
+        ));
+    }
+
     // --- what the owner's transfer statement does -------------------------
 
     #[test]
@@ -4180,6 +4563,9 @@ mod tests {
                 "the owner said money does not move between these two, so this \
                  must be asked and not derived: {classification:?}"
             ),
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
+            }
         }
     }
 
@@ -4198,6 +4584,9 @@ mod tests {
             ),
             Assessment::Ambiguous { question } => {
                 panic!("nothing here withdraws a declared pair: {question:?}")
+            }
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
             }
         }
     }
@@ -4223,6 +4612,9 @@ mod tests {
                  same pair whichever side he was asked about"
             ),
             Assessment::Ambiguous { question } => panic!("{question:?}"),
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
+            }
         }
     }
 
@@ -4241,6 +4633,9 @@ mod tests {
                 "silence is not a denial, and it is the state a new account is in"
             ),
             Assessment::Ambiguous { question } => panic!("{question:?}"),
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
+            }
         }
     }
 
@@ -4291,6 +4686,9 @@ mod tests {
             } => panic!(
                 "the source stated no direction, so there is none to settle                  with: {classification:?} {movement:?}"
             ),
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
+            }
         }
     }
 
@@ -4327,6 +4725,9 @@ mod tests {
             Assessment::Settled { movement, .. } => panic!(
                 "the rule names the far side and no direction; the owner                  answered «received» when he wrote it: {movement:?}"
             ),
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
+            }
         }
     }
 
@@ -4349,10 +4750,13 @@ mod tests {
                     classification,
                     Classification::InternalTransfer { to: checking }
                 );
-                assert_eq!(movement, Movement::Out, "the source printed «out»");
+                assert_eq!(movement, Some(Movement::Out), "the source printed «out»");
             }
             Assessment::Ambiguous { question } => {
                 panic!("the source stated the direction: {question:?}")
+            }
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
             }
         }
 
@@ -4366,10 +4770,13 @@ mod tests {
                     Classification::InternalTransfer { to: checking },
                     "the far side is the same account whichever way the row ran"
                 );
-                assert_eq!(movement, Movement::In, "and the source printed «in»");
+                assert_eq!(movement, Some(Movement::In), "and the source printed «in»");
             }
             Assessment::Ambiguous { question } => {
                 panic!("the source stated the direction: {question:?}")
+            }
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
             }
         }
     }
@@ -4398,9 +4805,12 @@ mod tests {
         );
 
         match fee.assess(&directionless(row(main, "Somebody", None))) {
-            Assessment::Settled { movement, .. } => assert_eq!(movement, Movement::Out),
+            Assessment::Settled { movement, .. } => assert_eq!(movement, Some(Movement::Out)),
             Assessment::Ambiguous { question } => {
                 panic!("a fee leaves the account, and that is not a guess: {question:?}")
+            }
+            Assessment::NoFact { reason } => {
+                panic!("nothing here resolves the far side to this row's own account: {reason:?}")
             }
         }
     }

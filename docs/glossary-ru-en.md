@@ -50,6 +50,7 @@ is how you match a term in them to the code.
 | владелец | owner | |
 | контур | contour | |
 | периметр | perimeter | |
+| платёжный инструмент | payment instrument | a card or other means of paying against an account; **not** an account of its own — two of them over one account are one account with two aliases (decision 0004) |
 | график выплат | schedule | `BondSchedule` |
 | оферта | offer | the right itself is `offer right` |
 | погашение | redemption | partial one is a partial redemption |
@@ -113,6 +114,11 @@ is how you match a term in them to the code.
 | ключ строки | row key | the stable identity that makes a re-import idempotent |
 | нога (перевода) | leg | one of the two rows an internal transfer produces |
 | нога движения | cash leg | `CashLeg`; one side of a cash movement offered to the pairing matcher, which may or may not turn out to be a transfer leg |
+| дальняя сторона | far side | the account on the other end of a movement, seen from the account whose statement the row is on; never «destination», which asserts a direction |
+| утверждение о дальней стороне | far-side assertion | `FarSide`; what the **source** said about whose account the far side is. `own_account` or `unstated`, and never inferred |
+| движение между своими счетами | own-account movement | `EventKind::OwnAccountMovement`; a movement whose far side is the owner's and unnamed. Distinct from a **transfer**, which names both accounts |
+| движение без направления | unresolved own-account movement | `EventKind::UnresolvedOwnAccountMovement`; the same movement with no direction stated, so it posts no leg |
+| строка без факта | settled without a fact | `RowResolution::NoFact`; a row read, understood and correctly producing no journal fact. Not a refusal and not a quarantine |
 | скилл импорта | import skill | per-institution knowledge held as an agent skill, never as code |
 
 ## Refusals and quality
@@ -137,6 +143,7 @@ is how you match a term in them to the code.
 | инвариант | invariant | |
 | порог | threshold | |
 | карантин | quarantine | the `Quarantined` row: neither a fact nor lost |
+| неопределённый поток | indeterminate flow | `FlowClass::Indeterminate`; the cash moved on a contour account and whether it crossed the boundary cannot be decided. An answer, not a missing one |
 
 ## Transport and infrastructure
 

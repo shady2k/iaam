@@ -30,10 +30,10 @@ pub struct Rejection {
 /// no fact behind it records nothing, because there is nothing to record.
 /// `is_recorded` below draws that line, and every code's published meaning
 /// states which side of it the code falls on — but the reason is here, because
-/// it belongs to the whole vocabulary rather than to any one of its ten
+/// it belongs to the whole vocabulary rather than to any one of its eleven
 /// entries.
 ///
-/// The line is drawn over all ten, including the three no path emits. That is
+/// The line is drawn over all eleven, including the three no path emits. That is
 /// not idle: it is what makes the last paragraph below able to say that
 /// `NeedsReconciliation` is on the side it belongs on and false about every
 /// situation it would describe.
@@ -144,6 +144,29 @@ pub enum Verdict {
     Rejected { rejection: Rejection },
     /// The row was read and no fact was recorded from it.
     Quarantined { reason: String },
+    /// The row was read, understood, and correctly produced no fact.
+    ///
+    /// The eleventh code, and the one the vocabulary was missing rather than
+    /// reserving (`iaam-tb5o`). Every other code that records nothing says
+    /// something went wrong or is pending: `rejected` could not be parsed,
+    /// `quarantined` could not be written, `needs_classification` is waiting on
+    /// the owner. None of those is true of a row whose honest financial record
+    /// **is** nothing — a movement between two payment instruments over one
+    /// account, where the balance does not change and there is no second leg to
+    /// wait for.
+    ///
+    /// It is not `quarantined` wearing a friendlier reason, and the difference
+    /// is not a nicety: `quarantined` is what `ImportCoverageGap` is computed
+    /// from, so filing this row there would record a fact saying the import
+    /// could not confirm the dimensions this row moves — when the row moves
+    /// none and the import is complete without it.
+    ///
+    /// `reason` is a code from a closed list, not free text, for the reason
+    /// `iaam_core::event::source_row` gives about a refused row's identity: a
+    /// determination that a row needed no fact has to be auditable, and an
+    /// importer that merely came up empty must not be able to present itself
+    /// as one of these.
+    NoFact { reason: String },
 }
 
 /// The verdict vocabulary: every variant, its wire code, and what the code means.
@@ -153,16 +176,16 @@ pub enum Verdict {
 /// pass the name of a macro that accepts
 /// `Variant => "code": "meaning",` arms and it will be called with the whole
 /// list. A code therefore cannot exist without a meaning, and a client reading
-/// the contract sees the same ten entries this type declares.
+/// the contract sees the same eleven entries this type declares.
 ///
-/// It does **not** follow that all ten are emitted, and the table used to claim
+/// It does **not** follow that all eleven are emitted, and the table used to claim
 /// it did. A code no path produces is a promise a client waits on for ever, so
 /// where that is the case the meaning says so in the sentence the client
 /// actually reads — the schema is the only document it has, and a caveat kept
 /// anywhere else is a caveat it never sees.
 ///
 /// A hand-written copy of this table drifts — the one in the agent skill
-/// listed eight of the ten and omitted `possible_duplicate` and `quarantined`,
+/// listed eight of the then ten and omitted `possible_duplicate` and `quarantined`,
 /// both of which are emitted in production.
 #[macro_export]
 macro_rules! verdict_vocabulary {
@@ -188,6 +211,8 @@ macro_rules! verdict_vocabulary {
                 "Nothing was recorded: the row could not be parsed.",
             Quarantined => "quarantined":
                 "Nothing was recorded: the row was read, but no fact could be written from it.",
+            NoFact => "no_fact":
+                "Nothing was recorded, and nothing should have been: the row was read and understood to require no journal fact. `detail` carries the code of the determination that established it — today `one_account_two_instruments`, a movement between two payment instruments over one account, which changes no balance and has no second leg. This is a settled row, not a failure and not something to retry.",
         }
     };
 }
@@ -226,7 +251,8 @@ impl Verdict {
             | Self::NeedsClassification { .. }
             | Self::Unsupported { .. }
             | Self::Rejected { .. }
-            | Self::Quarantined { .. } => false,
+            | Self::Quarantined { .. }
+            | Self::NoFact { .. } => false,
         }
     }
 }
@@ -235,7 +261,7 @@ impl Verdict {
 mod tests {
     use super::*;
 
-    fn every_verdict() -> [Verdict; 10] {
+    fn every_verdict() -> [Verdict; 11] {
         let event = EventId::new_random();
         let account = AccountId::new_random();
         [
@@ -273,17 +299,37 @@ mod tests {
             Verdict::Quarantined {
                 reason: "row could not be recorded".to_owned(),
             },
+            Verdict::NoFact {
+                reason: "one_account_two_instruments".to_owned(),
+            },
         ]
     }
 
     #[test]
+    fn a_settled_row_that_produced_nothing_is_not_a_quarantined_one() {
+        // Both record nothing, and only one of them is a failure. The codes
+        // must differ, because `quarantined` is what a coverage gap is computed
+        // from and this row leaves no gap.
+        let settled = Verdict::NoFact {
+            reason: "one_account_two_instruments".to_owned(),
+        };
+        let failed = Verdict::Quarantined {
+            reason: "row could not be recorded".to_owned(),
+        };
+        assert_ne!(settled.code(), failed.code());
+        assert!(!settled.is_recorded());
+    }
+
+    #[test]
     fn every_verdict_has_a_distinct_code_and_all_six_spec_verdicts_exist() {
-        // §10.4 names six verdicts. Duplicate, Rejected, and Quarantined are
-        // service variants: they handle a duplicate, an unparsed row, or a
-        // parsed row that could not be recorded. Losing any verdict becomes
-        // silence where the owner expects a response.
+        // §10.4 names six verdicts. Duplicate, Rejected, Quarantined and
+        // NoFact are service variants: they handle a duplicate, an unparsed
+        // row, a parsed row that could not be recorded, and a row that
+        // correctly produced none. Losing any verdict becomes silence where
+        // the owner expects a response.
         let all = every_verdict();
         let mut codes: Vec<&str> = all.iter().map(Verdict::code).collect();
+        assert_eq!(codes.len(), 11, "every verdict is listed here");
         let count = codes.len();
         codes.sort_unstable();
         codes.dedup();

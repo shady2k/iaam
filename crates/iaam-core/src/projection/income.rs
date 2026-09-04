@@ -154,6 +154,8 @@ impl IncomeLedger {
             | EventKind::Refund { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
+            | EventKind::OwnAccountMovement { .. }
+            | EventKind::UnresolvedOwnAccountMovement { .. }
             | EventKind::Fee { .. }
             | EventKind::Tax { .. }
             | EventKind::OpeningPosition { .. }

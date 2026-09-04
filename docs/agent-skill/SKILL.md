@@ -126,6 +126,50 @@ own accounts is an internal transfer, and a row matching a rule the owner has
 already written is classified by that rule. Only what neither settles becomes a
 question.
 
+### When the source says whose account the far side is
+
+Some statements file a row as a movement between the owner's own accounts and
+say nothing else about it: no direction, no counterparty. That claim has a field
+of its own on the observation shape, beside the direction word and beside the
+counterparty, and it takes two values — the source asserted the far side is one
+of the owner's accounts, or it said nothing about it.
+
+It is **stronger** than the direction word that means «internal to this
+institution», which is equally true of a payment to a stranger who banks there,
+and **weaker** than naming the account, which such a row does not do.
+
+Three things follow, and the third is the one to get right.
+
+- **Set it only where the export says so in words.** It is a transcription, like
+  the direction. Deciding that a counterparty is one of the owner's accounts is
+  a conclusion, it is reached against his directory on the server, and you must
+  not reach it for him. A row where you set this because it seemed likely is a
+  movement that will never appear as spending and never leave the perimeter.
+- **It carries no direction, and none is inferred from it.** A row that asserts
+  it and states no direction is recorded as a movement between the owner's own
+  accounts with the far side unnamed, posting nothing, and **no question is
+  raised**. A row that also states a direction posts one leg — and still not as
+  money leaving the perimeter.
+- **It does not decide which of the owner's accounts.** That is settled later,
+  by the far side's own statement, or not at all.
+
+### A row that is settled by producing nothing
+
+Two payment instruments over one underlying account are one account, with the
+second identifier recorded as an alias. Money moving between them changes no
+balance and has no second leg, so the honest record is **no fact at all**.
+
+Where the identifier the source printed for the far side resolves to the very
+account the row is on, that determination is made without asking anything, and
+it is reported in its own words: the row is `settled` when you feed it, it
+appears in the plan's list of rows settled without a fact, and its commit
+verdict is `no_fact` with the determination's code beside it.
+
+**Do not read that as a failure and do not retry it.** It is not `quarantined`,
+which means a fact could not be written; nothing was written because nothing
+should have been. The one thing it does explain is a batch total that is short
+of the statement's own turnover with nothing wrong.
+
 ## A question is a thing, not a sentence
 
 The question that comes back is a durable resource with an identifier, and it
@@ -694,13 +738,13 @@ and do not report each date to the owner separately.
 **Never call `provisional` an error.** It means no independent confirmation has
 arrived yet, which is an ordinary state of a correct journal.
 
-**And never wait for a reconciliation verdict.** Three of the ten codes —
+**And never wait for a reconciliation verdict.** Three of the eleven codes —
 `accepted`, `discrepancy` and `needs_reconciliation` — are published and produced
 by nothing, which each one's own published sentence now says. The three are not a
 backlog: they are the reconciliation ones, and the boundary is the point. A
 verdict answers one write, while reconciliation is a property of an account, a
 dimension and an interval, folded when a report is read and moved by evidence
-that arrives later. The seven codes you will actually see are the ones about a
+that arrives later. The eight codes you will actually see are the ones about a
 row.
 
 Read each of the three where it is answered, and never from a row's verdict:
@@ -756,7 +800,7 @@ than repeating immediately.
 
 ## What here is checked
 
-The ten verdict codes and the "is the fact recorded" rule are fixed in
+The eleven verdict codes and the "is the fact recorded" rule are fixed in
 `crates/iaam-ingest/src/verdict.rs` and its tests. The grounds of independence,
 the statuses by dimension, the four shares of `nav_coverage`, the recomputation
 of history and the §11 perimeter are checked by the `iaam-core` tests in

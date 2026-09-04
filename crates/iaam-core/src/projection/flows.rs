@@ -71,6 +71,7 @@ pub enum FlowError {
 pub struct FlowLog {
     external: Vec<ExternalFlow>,
     internal: u64,
+    indeterminate: u64,
     irrelevant: u64,
 }
 
@@ -101,6 +102,26 @@ impl FlowLog {
         self.irrelevant
     }
 
+    /// Cash movements on contour accounts that could not be placed relative to
+    /// the boundary.
+    ///
+    /// Counted apart from [`Self::internal`] and never folded into it. A
+    /// movement whose far side the source called the owner's and did not name
+    /// **may** have left the contour, and the returns path is exactly where
+    /// guessing costs the most: counted as internal it silently changes no
+    /// return, and counted as external it changes one on no evidence. So it is
+    /// counted as itself, and a reader who sees a non-zero figure here knows
+    /// the return was computed over a journal that could not classify
+    /// everything in it.
+    ///
+    /// It counts **movements**, like its two neighbours, so an unresolved
+    /// own-account movement — which posts no leg — is not counted here. The
+    /// money-flow report is where that one is named, by magnitude and account.
+    #[must_use]
+    pub const fn indeterminate(&self) -> u64 {
+        self.indeterminate
+    }
+
     pub fn apply(&mut self, event: &Event, contour: &ContourDefinition) -> Result<(), FlowError> {
         let (direction, id, version) = match classify(contour, event) {
             FlowClass::ExternalIn { contour, version } => (FlowDirection::In, contour, version),
@@ -108,6 +129,18 @@ impl FlowLog {
             FlowClass::Internal => {
                 if moves_money(event) {
                     self.internal += 1;
+                }
+                return Ok(());
+            }
+            // Deliberately not pushed into `external`, and deliberately not
+            // folded into `internal`. Pushing it would need a `FlowDirection`,
+            // which is the guess; folding it into `internal` would assert the
+            // money stayed inside the contour, which is the other guess. The
+            // series is left short by exactly the movements nobody could
+            // classify, and the count says how many.
+            FlowClass::Indeterminate { .. } => {
+                if moves_money(event) {
+                    self.indeterminate += 1;
                 }
                 return Ok(());
             }
@@ -277,6 +310,51 @@ mod tests {
         log.apply(&transfer(account, other, rub(10_000)), &both)
             .unwrap();
         assert_eq!(log.internal(), 1);
+    }
+
+    #[test]
+    fn a_movement_to_an_unnamed_own_account_is_counted_apart_from_both() {
+        // Neither a contribution nor an internal reallocation: the far side may
+        // be inside this contour or outside it, and the journal does not know.
+        let account = AccountId::new_random();
+        let contour = contour_of([account]);
+        let event = event_with(
+            account,
+            date!(2025 - 06 - 06),
+            1,
+            EventKind::OwnAccountMovement {
+                amount: rub(-40_000),
+            },
+            vec![Leg::cash(account, rub(-40_000))],
+        );
+        let mut log = FlowLog::new();
+        log.apply(&event, &contour).unwrap();
+        assert!(log.external().is_empty());
+        assert_eq!(log.internal(), 0);
+        assert_eq!(log.irrelevant(), 0);
+        assert_eq!(log.indeterminate(), 1);
+    }
+
+    #[test]
+    fn an_unresolved_own_account_movement_moves_nothing_and_counts_nothing() {
+        // It posts no leg, so there is no movement to count. What it is, the
+        // money-flow report says by magnitude; what it is not is a flow.
+        let account = AccountId::new_random();
+        let contour = contour_of([account]);
+        let event = event_with(
+            account,
+            date!(2025 - 06 - 06),
+            1,
+            EventKind::UnresolvedOwnAccountMovement {
+                amount: rub(40_000),
+            },
+            vec![],
+        );
+        let mut log = FlowLog::new();
+        log.apply(&event, &contour).unwrap();
+        assert!(log.external().is_empty());
+        assert_eq!(log.internal(), 0);
+        assert_eq!(log.indeterminate(), 0);
     }
 
     #[test]

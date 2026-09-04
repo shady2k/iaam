@@ -248,6 +248,22 @@ statement. That is why the external agent reached for `build()`, and it is the
 defect rather than the agent's mistake. Decision 0006 closed the first half; the
 questionnaire is the half that remains.
 
+**A third gap of the same shape is now closed: whose account the far side is**
+(decision 0013). `ObservedDirection::Inner` — the value a converter had for a
+row a source files as internal — means the movement did not leave the
+institution, which is equally true of a payment to a stranger who banks there.
+A source asserting the stronger claim, that the far side is an account of the
+owner's, had it rounded off at intake, and nothing downstream could separate the
+two again. `FarSide` carries it now, beside the direction and beside the
+counterparty rather than inside either, and it reaches the observation channel's
+published shape for the reason above: the parity rule is that the channel must
+be able to say everything the conclusive one can.
+
+It buys the questionnaire back on exactly the rows it is about. A row asserting
+it and stating no direction is recorded as a movement between the owner's own
+accounts with the far side unnamed, and raises no question — where before it
+raised one per row and held the commit.
+
 **One vocabulary gap of the same shape is still open, and it is named rather
 than hidden: tax.** `Classification` has no outcome for it, on the deliberate
 ground that `classification_of` puts a recorded tax outside rule recalculation
@@ -266,6 +282,16 @@ second half is decision 0005, and it is done.
 
 ## 7. What this does not settle
 
+- Whether an owner can *say* that the far side is his own account without
+  naming which. The source can, since decision 0013; he cannot, because every
+  answer states a direction and this claim states none. Nothing is blocked by
+  the gap — such a row is recorded rather than asked about — but he cannot
+  volunteer the assertion where his source failed to make it.
+- How two unresolved own-account movements, printed by two banks for one
+  economic movement, are related. `GET /v1/transfer-pairings` matches an
+  outgoing leg against an incoming one, and neither of these carries a
+  direction. Decision 0013 §5 says why admitting the oriented one alone would
+  propose transfers nobody made.
 - Whether a tax outcome enters the classification vocabulary. Decision 0006
   settled `refund` and the income kind and deliberately left this one standing:
   `classification_of` answers `None` for a recorded tax, so admitting `Tax` here

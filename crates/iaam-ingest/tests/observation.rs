@@ -8,7 +8,7 @@ use iaam_core::ids::{AccountId, ClassificationRuleId};
 use iaam_core::money::CurrencyCode;
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule, Counterparty,
-    Movement, Question, RuleMatcher, classify,
+    FarSide, Movement, Question, RuleMatcher, classify,
 };
 use iaam_ingest::observation::{ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity};
 use iaam_ingest::operation::{OperationDates, OperationKind};
@@ -21,6 +21,7 @@ fn inner_row(account: AccountId) -> ObservedRow {
         amount_minor: 250_000,
         currency: CurrencyCode::Rub,
         counterparty: ObservedCounterparty::Unknown,
+        far_side: FarSide::Unstated,
         source_kind: Some("INNER".to_owned()),
         description: None,
         dates: OperationDates {
@@ -129,7 +130,7 @@ fn the_far_side_of_an_internal_transfer_is_read_against_the_rows_own_account() {
     let sent = row
         .resolve(
             Classification::InternalTransfer { to: savings },
-            Movement::Out,
+            Some(Movement::Out),
         )
         .expect("an outgoing internal transfer resolves");
     assert_eq!(sent.account, account);
@@ -141,7 +142,7 @@ fn the_far_side_of_an_internal_transfer_is_read_against_the_rows_own_account() {
     let received = row
         .resolve(
             Classification::InternalTransfer { to: savings },
-            Movement::In,
+            Some(Movement::In),
         )
         .expect("an incoming internal transfer resolves");
     assert_eq!(
@@ -239,12 +240,12 @@ fn an_answer_whose_direction_contradicts_what_it_names_is_refused() {
             Classification::Fee {
                 origin: FeeOrigin::Other
             },
-            Movement::In
+            Some(Movement::In)
         )
         .is_err()
     );
     assert!(
-        row.resolve(Classification::Income { kind: None }, Movement::Out)
+        row.resolve(Classification::Income { kind: None }, Some(Movement::Out))
             .is_err()
     );
     // A refund that left is the same contradiction, and unlike the other two it
@@ -252,7 +253,8 @@ fn an_answer_whose_direction_contradicts_what_it_names_is_refused() {
     // but from a rule, which carries no direction and matches a merchant's
     // purchases as readily as its returns.
     assert!(
-        row.resolve(Classification::Refund, Movement::Out).is_err(),
+        row.resolve(Classification::Refund, Some(Movement::Out))
+            .is_err(),
         "a refund is money coming back, so one that left is not a fact"
     );
 }
@@ -264,7 +266,7 @@ fn an_internal_transfer_to_this_very_account_is_refused() {
     assert!(
         row.resolve(
             Classification::InternalTransfer { to: account },
-            Movement::Out
+            Some(Movement::Out)
         )
         .is_err(),
         "a transfer to itself is not a movement"
@@ -279,7 +281,7 @@ fn a_row_stating_no_amount_is_refused_rather_than_recorded_as_zero() {
         ..inner_row(account)
     };
     assert!(
-        row.resolve(Classification::ExternalFlow, Movement::In)
+        row.resolve(Classification::ExternalFlow, Some(Movement::In))
             .is_err(),
         "a row that states no movement is not a movement of zero"
     );
@@ -406,6 +408,7 @@ fn merchant_inflow(account: AccountId) -> ObservedRow {
         amount_minor: 125_000,
         currency: CurrencyCode::Rub,
         counterparty: ObservedCounterparty::Named("Shop One".to_owned()),
+        far_side: FarSide::Unstated,
         source_kind: Some("RETURN".to_owned()),
         description: None,
         dates: OperationDates {
@@ -522,7 +525,7 @@ fn every_conclusion_a_cash_row_can_be_is_reachable_from_an_observation() {
     let far = AccountId::new_random();
     let row = merchant_inflow(account);
 
-    let cases: [(Classification, Movement, &str); 7] = [
+    let cases: [(Classification, Movement, &str); 8] = [
         (Classification::ExternalFlow, Movement::In, "deposit"),
         (Classification::ExternalFlow, Movement::Out, "withdrawal"),
         (
@@ -550,11 +553,16 @@ fn every_conclusion_a_cash_row_can_be_is_reachable_from_an_observation() {
             "income",
         ),
         (Classification::Refund, Movement::In, "refund"),
+        (
+            Classification::OwnAccountMovement,
+            Movement::Out,
+            "own_account_movement",
+        ),
     ];
 
     for (classification, movement, expected) in cases {
         let operation = row
-            .resolve(classification, movement)
+            .resolve(classification, Some(movement))
             .unwrap_or_else(|error| panic!("{classification:?} + {movement:?}: {error:?}"));
         let actual = match operation.kind {
             OperationKind::Deposit { .. } => "deposit",
@@ -563,6 +571,7 @@ fn every_conclusion_a_cash_row_can_be_is_reachable_from_an_observation() {
             OperationKind::Fee { .. } => "fee",
             OperationKind::Income { .. } => "income",
             OperationKind::Refund { .. } => "refund",
+            OperationKind::OwnAccountMovement { .. } => "own_account_movement",
             other => panic!("an observation must not become {other:?}"),
         };
         assert_eq!(actual, expected, "{classification:?} + {movement:?}");
@@ -612,4 +621,107 @@ fn a_named_counterparty_the_directory_does_not_know_narrows_the_question() {
             counterparty: Some("Shop One".to_owned()),
         }
     );
+}
+
+// --- the two journal shapes an unnamed own account produces (iaam-fmih) -----
+
+/// The row this whole wave is about: an amount, a date, the source's own word
+/// for a movement between the owner's accounts, no direction, nobody named.
+fn own_account_row(account: AccountId) -> ObservedRow {
+    ObservedRow {
+        far_side: FarSide::OwnAccount,
+        ..inner_row(account)
+    }
+}
+
+#[test]
+fn a_directionless_own_account_movement_resolves_without_a_direction() {
+    let account = AccountId::new_random();
+    let operation = own_account_row(account)
+        .resolve(Classification::OwnAccountMovement, None)
+        .expect("the one classification that survives an absent direction");
+    assert_eq!(operation.account, account);
+    assert!(matches!(
+        operation.kind,
+        OperationKind::OwnAccountMovement {
+            movement: None,
+            amount_minor: 250_000,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn every_other_classification_still_needs_a_direction() {
+    // The refusal is the whole reason `UnresolvedDirection` is still asked:
+    // «the source printed a word for it» is not «the source said which way it
+    // went», and only one outcome can be recorded without the second.
+    let account = AccountId::new_random();
+    let row = own_account_row(account);
+    for classification in [
+        Classification::ExternalFlow,
+        Classification::Refund,
+        Classification::Income { kind: None },
+        Classification::Fee {
+            origin: FeeOrigin::Other,
+        },
+        Classification::InternalTransfer {
+            to: AccountId::new_random(),
+        },
+    ] {
+        assert!(
+            row.resolve(classification, None).is_err(),
+            "{classification:?} cannot be recorded without a direction"
+        );
+    }
+}
+
+#[test]
+fn a_stated_direction_makes_the_same_row_a_posted_movement() {
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        direction: ObservedDirection::Out,
+        ..own_account_row(account)
+    };
+    let operation = row
+        .resolve(Classification::OwnAccountMovement, Some(Movement::Out))
+        .expect("a stated direction resolves");
+    assert!(matches!(
+        operation.kind,
+        OperationKind::OwnAccountMovement {
+            movement: Some(Movement::Out),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn the_assertion_reaches_the_classifier_through_the_subject() {
+    // The seam: the value the caller stated has to arrive where the decision is
+    // made, or the whole shape is a field nobody reads.
+    let account = AccountId::new_random();
+    assert_eq!(
+        own_account_row(account).subject(None).far_side,
+        FarSide::OwnAccount
+    );
+    assert_eq!(
+        inner_row(account).subject(None).far_side,
+        FarSide::Unstated,
+        "a row that asserted nothing carries nothing"
+    );
+}
+
+#[test]
+fn a_row_stored_before_the_assertion_existed_reads_as_stating_nothing() {
+    // The session keeps rows as JSON, so a session opened by an older build
+    // must still parse — and what such a row meant is «the source said nothing
+    // about the far side», which is `Unstated` and not «somebody else's».
+    let account = AccountId::new_random();
+    let mut value = serde_json::to_value(inner_row(account)).expect("serialises");
+    value
+        .as_object_mut()
+        .expect("a row is an object")
+        .remove("far_side");
+    let restored: ObservedRow = serde_json::from_value(value).expect("an older row still parses");
+    assert_eq!(restored.far_side, FarSide::Unstated);
 }

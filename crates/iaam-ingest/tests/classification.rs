@@ -17,8 +17,8 @@ use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity
 use iaam_core::numeric::decimal::Dec;
 use iaam_ingest::classification::{
     Basis, Classification, ClassificationResult, ClassificationRule, ClassificationSubject,
-    Correction, CorrectionStep, Counterparty, Movement, Question, RuleMatcher, classification_of,
-    classify, recompute_plan,
+    Correction, CorrectionStep, Counterparty, FarSide, Movement, Question, RuleMatcher,
+    classification_of, classify, recompute_plan,
 };
 use rust_decimal::Decimal;
 use time::macros::date;
@@ -51,6 +51,7 @@ fn transfer_to(name: &str, account: AccountId) -> ClassificationSubject {
         description: Some("Перевод по номеру счёта".to_owned()),
         source_kind: Some("Перевод".to_owned()),
         movement: Some(Movement::Out),
+        far_side: FarSide::Unstated,
     }
 }
 
@@ -66,6 +67,7 @@ fn a_transfer_to_an_own_account_needs_no_rule() {
         description: None,
         source_kind: None,
         movement: Some(Movement::Out),
+        far_side: FarSide::Unstated,
     };
 
     assert_eq!(
@@ -178,6 +180,7 @@ fn the_description_matcher_ignores_letter_case() {
         description: Some("КОМИССИЯ ЗА ОБСЛУЖИВАНИЕ".to_owned()),
         source_kind: None,
         movement: Some(Movement::Out),
+        far_side: FarSide::Unstated,
     };
     let by_description = rule(
         1,
@@ -250,6 +253,7 @@ fn an_outflow_without_a_counterparty_asks_fee_or_withdrawal() {
         description: None,
         source_kind: None,
         movement: Some(Movement::Out),
+        far_side: FarSide::Unstated,
     };
 
     assert_eq!(
@@ -269,6 +273,7 @@ fn an_inflow_without_a_counterparty_asks_income_or_return() {
         description: None,
         source_kind: None,
         movement: Some(Movement::In),
+        far_side: FarSide::Unstated,
     };
 
     assert_eq!(
@@ -611,4 +616,111 @@ fn a_settled_offer_carries_no_classification_either() {
         ],
     );
     assert_eq!(classification_of(&event), None);
+}
+
+// --- what the source says about the far side (iaam-cp94) --------------------
+
+/// A row whose source asserted the far side is the owner's, naming nobody and
+/// no direction.
+fn asserted_own(account: AccountId) -> ClassificationSubject {
+    ClassificationSubject {
+        account,
+        counterparty: Counterparty::Unknown,
+        description: None,
+        source_kind: Some("INNER".to_owned()),
+        movement: None,
+        far_side: FarSide::OwnAccount,
+    }
+}
+
+#[test]
+fn a_source_that_says_the_far_side_is_the_owners_settles_the_row_without_a_question() {
+    // The four rows this bead was filed for: an amount, a date, no direction,
+    // no counterparty, and a word meaning «between your own accounts». Every
+    // one of them used to raise `UnresolvedDirection` and block the commit.
+    let account = AccountId::new_random();
+    assert_eq!(
+        classify(&asserted_own(account), &[]),
+        ClassificationResult::Resolved {
+            classification: Classification::OwnAccountMovement,
+            basis: Basis::Derived,
+        }
+    );
+}
+
+#[test]
+fn the_assertion_says_nothing_about_direction() {
+    // It is not a direction, and nothing may read one out of it: a fact with a
+    // direction debits or credits the account, and the source said which way
+    // for neither of these.
+    assert_eq!(Classification::OwnAccountMovement.implied_movement(), None);
+}
+
+#[test]
+fn a_rule_the_owner_wrote_beats_the_word_the_source_printed() {
+    // The order matters and is the owner's: his standing decision about this
+    // counterparty is a stronger statement than a bank's own filing of the row.
+    let account = AccountId::new_random();
+    let rule = ClassificationRule {
+        id: iaam_core::ids::ClassificationRuleId::new_random(),
+        version: 1,
+        matcher: RuleMatcher {
+            counterparty_account: None,
+            description_contains: None,
+            kind: Some("INNER".to_owned()),
+        },
+        outcome: Classification::ExternalFlow,
+    };
+    assert!(matches!(
+        classify(&asserted_own(account), &[rule]),
+        ClassificationResult::Resolved {
+            classification: Classification::ExternalFlow,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_far_side_the_directory_recognised_beats_the_assertion_too() {
+    // The directory names *which* account, which is strictly more than the
+    // source said. Answering the weaker outcome here would throw away the one
+    // thing that makes a complete transfer possible.
+    let account = AccountId::new_random();
+    let savings = AccountId::new_random();
+    let subject = ClassificationSubject {
+        counterparty: Counterparty::OwnAccount(savings),
+        ..asserted_own(account)
+    };
+    assert!(matches!(
+        classify(&subject, &[]),
+        ClassificationResult::Resolved {
+            classification: Classification::InternalTransfer { to },
+            ..
+        } if to == savings
+    ));
+}
+
+#[test]
+fn a_row_whose_source_said_nothing_about_the_far_side_is_still_asked_about() {
+    // The falsification: if `Unstated` settled anything, the assertion would be
+    // buying nothing and every directionless row would stop being a question.
+    let account = AccountId::new_random();
+    let subject = ClassificationSubject {
+        far_side: FarSide::Unstated,
+        ..asserted_own(account)
+    };
+    assert!(matches!(
+        classify(&subject, &[]),
+        ClassificationResult::Ambiguous {
+            question: Question::UnresolvedDirection { .. }
+        }
+    ));
+}
+
+#[test]
+fn the_two_words_the_far_side_may_carry_survive_the_wire() {
+    for value in [FarSide::Unstated, FarSide::OwnAccount] {
+        assert_eq!(FarSide::parse(value.code()).expect("its own code"), value);
+    }
+    assert!(FarSide::parse("own").is_err(), "a near miss is refused");
 }

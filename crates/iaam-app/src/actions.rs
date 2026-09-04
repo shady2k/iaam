@@ -7807,6 +7807,7 @@ mod tests {
             counterparty: Counterparty::Named("Shop One".to_owned()),
             description: Some("card purchase 0001".to_owned()),
             source_kind: Some("card".to_owned()),
+            source_category: None,
             movement: None,
             far_side: FarSide::Unstated,
         }
@@ -7818,6 +7819,7 @@ mod tests {
             counterparty_account: Some("Shop One".to_owned()),
             description_contains: None,
             kind: None,
+            source_category: None,
         }
     }
 
@@ -7978,6 +7980,7 @@ mod tests {
                 counterparty_account: Some("Shop One".to_owned()),
                 description_contains: Some("card purchase".to_owned()),
                 kind: None,
+                source_category: None,
             },
             Classification::ExternalFlow,
         );

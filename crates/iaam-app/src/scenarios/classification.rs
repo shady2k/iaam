@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use iaam_core::event::Event;
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind};
+use iaam_core::event::{Event, SOURCE_CATEGORY_IS_A_CATEGORY_FROM};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, OwnerId};
 use iaam_ingest::classification::{
     Classification, ClassificationRule, ClassificationSubject, Correction, Counterparty, FarSide,
@@ -163,12 +163,13 @@ pub fn matcher_json(matcher: &RuleMatcher) -> Value {
         "counterparty_account": matcher.counterparty_account,
         "description_contains": matcher.description_contains,
         "kind": matcher.kind,
+        "source_category": matcher.source_category,
     })
 }
 
 /// The condition, in the form a request body carries it.
 ///
-/// The same three fields as [`matcher_json`] and deliberately not the same
+/// The same four fields as [`matcher_json`] and deliberately not the same
 /// shape: what a rule is **stored** as states every key, so a reader of the
 /// store sees what the rule does not ask about; what a rule is **sent** as is
 /// the shape `RuleMatcherDto` publishes, which omits an absent field, and that
@@ -193,6 +194,7 @@ pub fn matcher_request_json(matcher: &RuleMatcher) -> Value {
             matcher.description_contains.as_ref(),
         ),
         ("kind", matcher.kind.as_ref()),
+        ("source_category", matcher.source_category.as_ref()),
     ] {
         if let Some(value) = value {
             object.insert(field.to_owned(), Value::String(value.clone()));
@@ -424,6 +426,10 @@ fn matcher_and_outcome(
             counterparty_account: optional_string(&matcher, "counterparty_account", "matcher")?,
             description_contains: optional_string(&matcher, "description_contains", "matcher")?,
             kind: optional_string(&matcher, "kind", "matcher")?,
+            // Absent from every rule stored before `iaam-93lz`, and `None` is
+            // what those rules meant: the condition could not be written, so no
+            // rule that predates the field is silently widened by reading it.
+            source_category: optional_string(&matcher, "source_category", "matcher")?,
         },
         parse_outcome(outcome)?,
     ))
@@ -655,9 +661,39 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         // the journal holds, which for that row is a description and a
         // counterparty and no operation word.
         source_kind: event.provenance.source_kind().map(str::to_owned),
+        source_category: source_category_evidence(event),
         movement,
         far_side,
     })
+}
+
+/// The source's own category, where the journal itself says the field holds one.
+///
+/// **Read through the version and not straight off provenance**, which is the
+/// one place this differs from every field beside it. Decision 0020 §3 fixed
+/// that a fact below [`SOURCE_CATEGORY_IS_A_CATEGORY_FROM`] may carry the
+/// source's *operation word* in `source_category`: one slot held both facts on
+/// the observation path, both paths stamped the same parser version, and the
+/// two cannot be told apart afterwards. §3 refused a migration for that reason
+/// and gave the reader this boundary instead.
+///
+/// So a rule the owner wrote about a category is not tested against a fact whose
+/// category field may not hold one. Nothing is rewritten and nothing is guessed:
+/// the older row is reconsidered on the evidence the journal holds for it, which
+/// is what §3 already says happens to its operation word — `source_kind` is
+/// `None` on every fact below 14, and this is the same sentence one field over.
+///
+/// The cost is a false negative: a pre-14 fact whose source really did print a
+/// category stops being reachable by a category condition. That is the direction
+/// this program takes every such choice in — a rule that fires on evidence that
+/// may not be what it claims writes a wrong fact into a correction plan, while a
+/// rule that does not fire leaves the row exactly as the owner already accepted
+/// it.
+fn source_category_evidence(event: &Event) -> Option<String> {
+    if event.schema_version < SOURCE_CATEGORY_IS_A_CATEGORY_FROM {
+        return None;
+    }
+    event.provenance.source_category().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -748,6 +784,7 @@ mod tests {
                 counterparty_account: None,
                 description_contains: Some("shop one".to_owned()),
                 kind: None,
+                source_category: None,
             })
             .matcher
             .matches(&subject),
@@ -776,6 +813,7 @@ mod tests {
                 counterparty_account: None,
                 description_contains: None,
                 kind: Some("Transfers".to_owned()),
+                source_category: None,
             })
             .matcher
             .matches(&subject),
@@ -823,6 +861,114 @@ mod tests {
             Some("Groceries"),
             "the category is what the money was for, and answers a different question"
         );
+    }
+
+    #[test]
+    fn the_rebuilt_subject_carries_the_category_the_source_filed_the_row_under() {
+        // Without this the fourth arm of `RuleMatcher` is dead on the recompute
+        // path exactly as the description once was: a rule the owner wrote about
+        // the category his bank printed would settle a row at intake and match
+        // nothing when he edited the rule and asked for the plan.
+        let account = AccountId::new_random();
+        let event = cash_out_of(
+            account,
+            provenance_of().with_source_category("Bank interest"),
+        );
+
+        let subject = subject(&event).expect("a cash outflow is a classification subject");
+
+        assert_eq!(subject.source_category.as_deref(), Some("Bank interest"));
+        assert!(
+            rule_matching(RuleMatcher {
+                counterparty_account: None,
+                description_contains: None,
+                kind: None,
+                source_category: Some("Bank interest".to_owned()),
+            })
+            .matcher
+            .matches(&subject),
+            "a rule naming the source's own category must match on recompute"
+        );
+    }
+
+    #[test]
+    fn a_fact_recorded_before_the_two_words_were_split_offers_no_category() {
+        // The boundary decision 0020 §3 promised a reader. Below schema version
+        // 14 the observation path wrote the source's *operation word* into
+        // `source_category`, and the two cannot be told apart afterwards — so
+        // the field is not offered as evidence of a category, and the row is
+        // reconsidered on what the journal does hold. Reading it anyway would
+        // put an operation word into a correction plan as the owner's category
+        // decision.
+        let account = AccountId::new_random();
+        let mut event = cash_out_of(account, provenance_of().with_source_category("INNER"));
+        event.schema_version = SOURCE_CATEGORY_IS_A_CATEGORY_FROM - 1;
+
+        let subject = subject(&event).expect("a cash outflow is a classification subject");
+
+        assert_eq!(subject.source_category, None);
+        assert!(
+            !rule_matching(RuleMatcher {
+                counterparty_account: None,
+                description_contains: None,
+                kind: None,
+                source_category: Some("INNER".to_owned()),
+            })
+            .matcher
+            .matches(&subject),
+            "a category rule must not fire on a field that may hold an operation word"
+        );
+    }
+
+    #[test]
+    fn a_category_condition_survives_the_shape_the_store_keeps_it_in() {
+        // The encoder and the one reader of the stored format are a pair, and a
+        // condition the encoder writes that the reader drops is a decision the
+        // owner made and can never see again. Both request and storage shapes
+        // are checked, because the action queue presets the first and the
+        // classifier reads the second.
+        let matcher = RuleMatcher {
+            counterparty_account: None,
+            description_contains: None,
+            kind: None,
+            source_category: Some("Bank interest".to_owned()),
+        };
+        let stored = serde_json::to_string(&matcher_json(&matcher)).expect("matcher json");
+        let outcome = serde_json::to_string(&outcome_json(Classification::Income {
+            kind: Some(IncomeKind::DepositInterest),
+        }))
+        .expect("outcome json");
+
+        let (read_back, decided) = matcher_and_outcome(&stored, &outcome)
+            .expect("the encoder writes what the reader reads");
+
+        assert_eq!(read_back, matcher);
+        assert_eq!(
+            decided,
+            Classification::Income {
+                kind: Some(IncomeKind::DepositInterest)
+            }
+        );
+        assert_eq!(
+            matcher_request_json(&matcher),
+            serde_json::json!({ "source_category": "Bank interest" }),
+            "the request shape omits what the rule does not ask about"
+        );
+    }
+
+    #[test]
+    fn a_rule_stored_before_the_category_condition_existed_still_asks_what_it_asked() {
+        // Every rule already in the store was written without the key. A reader
+        // that treated the absence as anything but «this rule does not ask about
+        // the category» would widen or narrow a standing decision of the
+        // owner's on a deployment rather than on a decision of his.
+        let stored = r#"{"counterparty_account":null,"description_contains":null,"kind":"INNER"}"#;
+        let outcome = r#"{"kind":"own_account_movement"}"#;
+
+        let (matcher, _) = matcher_and_outcome(stored, outcome).expect("an older stored rule");
+
+        assert_eq!(matcher.source_category, None);
+        assert_eq!(matcher.kind.as_deref(), Some("INNER"));
     }
 
     #[test]

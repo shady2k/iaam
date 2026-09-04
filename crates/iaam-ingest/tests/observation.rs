@@ -92,6 +92,83 @@ fn a_counterparty_the_directory_recognises_settles_what_the_row_is() {
 }
 
 #[test]
+fn the_category_the_source_filed_the_row_under_reaches_the_classifier() {
+    // The field arrived with `iaam-p683` and nothing carried it into the
+    // subject, so a matcher reading it could never have fired — the defect
+    // `iaam-3nqt` was filed for, one field over. This is the seam, and it is
+    // asserted before the arm that depends on it.
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        source_kind: None,
+        source_category: Some("Bank interest".to_owned()),
+        direction: ObservedDirection::In,
+        ..inner_row(account)
+    };
+
+    assert_eq!(
+        row.subject(None).source_category.as_deref(),
+        Some("Bank interest")
+    );
+    assert_eq!(
+        row.subject(None).source_kind,
+        None,
+        "the two words stay in their own fields"
+    );
+}
+
+#[test]
+fn a_row_naming_only_a_category_settles_under_the_owners_standing_rule() {
+    // The channel end to end for the export that prints no operation-type
+    // column: the profile transcribes the category and decides nothing
+    // (decision 0019 §6), and the owner's own rule is what says the row is
+    // interest on a balance.
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        source_kind: None,
+        source_category: Some("Bank interest".to_owned()),
+        direction: ObservedDirection::In,
+        ..inner_row(account)
+    };
+    let standing = ClassificationRule {
+        id: ClassificationRuleId::new_random(),
+        version: 1,
+        matcher: RuleMatcher {
+            counterparty_account: None,
+            description_contains: None,
+            kind: None,
+            source_category: Some("Bank interest".to_owned()),
+        },
+        outcome: Classification::Income {
+            kind: Some(IncomeKind::DepositInterest),
+        },
+    };
+
+    let ClassificationResult::Resolved { classification, .. } =
+        classify(&row.subject(None), std::slice::from_ref(&standing))
+    else {
+        panic!("a matching rule must settle the row");
+    };
+    let operation = row
+        .resolve(classification, Some(Movement::In))
+        .expect("income that arrived is a fact this journal holds");
+    assert_eq!(
+        operation.kind,
+        OperationKind::Income {
+            instrument: None,
+            gross_minor: 250_000,
+            currency: CurrencyCode::Rub,
+            kind: Some(IncomeKind::DepositInterest),
+        }
+    );
+    assert_eq!(
+        operation.source_category.as_deref(),
+        Some("Bank interest"),
+        "the fact keeps the evidence the decision was made from"
+    );
+    assert_eq!(operation.source_kind, None);
+}
+
+#[test]
 fn a_rule_the_owner_already_wrote_settles_the_row_without_asking_again() {
     // The durable half of the answer: the owner decides once, and the next
     // import of the same shape is not put to them a second time.
@@ -105,6 +182,7 @@ fn a_rule_the_owner_already_wrote_settles_the_row_without_asking_again() {
             counterparty_account: None,
             description_contains: None,
             kind: Some("INNER".to_owned()),
+            source_category: None,
         },
         outcome: Classification::InternalTransfer { to: savings },
     };

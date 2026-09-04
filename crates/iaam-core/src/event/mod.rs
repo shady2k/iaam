@@ -213,6 +213,25 @@ pub struct Event {
 /// source said.
 pub const SCHEMA_VERSION: u32 = 14;
 
+/// The version from which [`provenance::Provenance::source_category`] holds a
+/// source's **category** on every path, and nothing else.
+///
+/// This is the boundary decision 0020 §3 promised a reader, named so that the
+/// readers who need it do not each spell the number themselves. Below it, on the
+/// observation path, that field may hold the source's *operation word*: one slot
+/// carried both facts, both paths stamped the same parser version, and §3
+/// refused a migration because telling the two apart afterwards is not possible
+/// and guessing would write, as the source's own category, a word the source
+/// never used there.
+///
+/// So a rule the owner writes about a source's **category** must not be tested
+/// against a fact below this version. That is not the same as rewriting the
+/// fact: what the fact carries is what the path meant at the time, and this
+/// merely declines to read it as evidence of something it may not be — exactly
+/// as §3 already has recomputation reconsider such a row with no operation word
+/// at all, `Provenance::source_kind` being `None` on every one of them.
+pub const SOURCE_CATEGORY_IS_A_CATEGORY_FROM: u32 = 14;
+
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.
 pub(crate) fn compare_for_replay(left: &Event, right: &Event) -> std::cmp::Ordering {

@@ -627,11 +627,19 @@ pub struct OperationDto {
     pub source_operation_id: Option<String>,
     /// The source's own word for what the row was **for**, verbatim.
     ///
-    /// Evidence, never a verdict: the owner's category rules may match it, and
-    /// nothing here turns it into one of his categories. Send the source's
-    /// category column and nothing else — an operation-type word belongs in
-    /// `source_kind` beside it, and putting it here makes every category rule
-    /// written on a real category miss this row.
+    /// Evidence, never a verdict: the owner's rules may match it, and nothing
+    /// here turns it into one of his categories or into a decision about what
+    /// the row was. Send the source's category column and nothing else — an
+    /// operation-type word belongs in `source_kind` beside it, and putting it
+    /// here makes every rule written on a real category miss this row.
+    ///
+    /// **Two of his rule vocabularies read it.** A category rule with a
+    /// `source_category` matcher says which of his categories the row belongs
+    /// in; a classification rule with a `source_category` condition says what
+    /// the row *is* — a fee, income, a movement between his own accounts. The
+    /// second was added by `iaam-93lz`; before it, a source's category could be
+    /// transcribed through this whole channel and no classification rule could
+    /// name it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
     /// The source's own word for what the row **was**, verbatim.
@@ -7074,7 +7082,7 @@ pub struct OwnerBalanceRequest {
 /// rule routes took and returned a **string containing** this JSON. A string is
 /// the one shape an LLM client cannot infer, because inference is copying the
 /// shape it just read, and a structure smuggled through a string reads as an
-/// opaque token rather than as three fields it may set.
+/// opaque token rather than as the fields it may set.
 ///
 /// Every member is optional and every one of them narrows: a matcher stating
 /// nothing matches nothing, by construction in
@@ -7082,6 +7090,11 @@ pub struct OwnerBalanceRequest {
 /// accepted rather than refused here, because that refusal belongs to the
 /// classifier and not to the transport, and duplicating it would make two places
 /// decide what an empty rule means.
+///
+/// Present members are joined with **and**: a matcher naming a category and a
+/// counterparty matches a row that prints both. That is how a condition written
+/// on a value out of one institution's vocabulary is narrowed so it cannot
+/// reach another institution's rows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RuleMatcherDto {
     /// The counterparty the source printed, matched exactly.
@@ -7091,8 +7104,31 @@ pub struct RuleMatcherDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description_contains: Option<String>,
     /// The word the source used for the operation, matched exactly.
+    ///
+    /// What the operation **was** — the cell an institution fills with its own
+    /// word for a transfer or a card payment. Sent as `source_kind` on an
+    /// operation and as `kind` here, which is what every stored rule has always
+    /// called it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// The category the source filed the row under, matched exactly.
+    ///
+    /// What the operation was **for**, and a different field from `kind` beside
+    /// it — the same distinction `source_kind` and `source_category` draw on an
+    /// operation, and the same string `source_category` carries there. A rule
+    /// written on one does not fire on the other.
+    ///
+    /// It is the same value a **category** rule matches with its
+    /// `source_category` matcher, and the two rules decide different things: a
+    /// category rule files the row under one of the owner's categories, and this
+    /// one says what the row is — a fee, income, a movement between his own
+    /// accounts.
+    ///
+    /// A rule written on it is tested only against facts recorded at schema
+    /// version 14 or above. Below that the observation path wrote the operation
+    /// word into this field, and the two cannot be told apart afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_category: Option<String>,
 }
 
 impl RuleMatcherDto {
@@ -7102,6 +7138,7 @@ impl RuleMatcherDto {
             counterparty_account: matcher.counterparty_account.clone(),
             description_contains: matcher.description_contains.clone(),
             kind: matcher.kind.clone(),
+            source_category: matcher.source_category.clone(),
         }
     }
 
@@ -7111,6 +7148,7 @@ impl RuleMatcherDto {
             counterparty_account: self.counterparty_account.clone(),
             description_contains: self.description_contains.clone(),
             kind: self.kind.clone(),
+            source_category: self.source_category.clone(),
         }
     }
 }

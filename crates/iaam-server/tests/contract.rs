@@ -16427,6 +16427,166 @@ async fn an_answer_that_names_income_may_name_which_earning_it_was() {
     );
 }
 
+/// A row an institution filed under a category, and named nothing else by.
+///
+/// Invented end to end: `Bank interest` is a category word made up for this
+/// test and read off no export. The row prints no counterparty and no
+/// operation-type word, which is the shape of every row of the first source
+/// profile — that export has no operation-type column at all.
+fn filed_row(account: Uuid, key: &str) -> Value {
+    json!({
+        "account": account,
+        "type": "unresolved_direction",
+        "amount": "125.00",
+        "currency": "RUB",
+        "direction": "in",
+        "dates": { "cash_posted": "2025-03-31" },
+        "source_category": "Bank interest",
+        "idempotency_key": key,
+    })
+}
+
+/// One row of a session, submitted under a label of its own.
+async fn one_row_session(harness: &Harness, label: &str, row: Value) -> (String, Value) {
+    let account = harness.account.inner();
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": label } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [row] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    (id, rows[0].clone())
+}
+
+/// A standing rule on the category the source filed the row under (`iaam-93lz`).
+///
+/// Decision 0019 §6 has a profile transcribe an institution's own category and
+/// never map it, on the ground that the owner's rules do that job — they are
+/// his, editable, and re-runnable over rows already recorded, where a map baked
+/// into a profile is frozen into every fact at import. The classification
+/// vocabulary had no condition for the field, so for the export this profile
+/// reads — which prints no operation-type word at all — «a row this institution
+/// filed under this category is interest on a balance» could not be written as a
+/// standing rule in any form.
+///
+/// The falsification is the first half: the same row with no rule is a question.
+#[tokio::test]
+async fn a_rule_on_the_sources_own_category_settles_a_row_naming_no_operation_word() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (_, asked) = one_row_session(&harness, "march", filed_row(account, "filed-one")).await;
+    assert_eq!(
+        asked["state"], "needs_classification",
+        "with no rule the row is a question, or the rule below settles nothing: {asked}"
+    );
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": { "source_category": "Bank interest" },
+                "outcome": { "kind": "income", "income_kind": "deposit_interest" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(
+        created["matcher"],
+        json!({ "source_category": "Bank interest" }),
+        "the condition is read back as the object it was written as: {created}"
+    );
+
+    let (session, held) = one_row_session(&harness, "april", filed_row(account, "filed-two")).await;
+    assert_eq!(
+        held["state"], "held",
+        "his standing rule settles the row without asking him again: {held}"
+    );
+    assert_eq!(held["question_id"], Value::Null, "{held}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=filed-two",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["rows"][0]["kind"], "income", "{page}");
+    assert_eq!(
+        page["rows"][0]["source_category"], "Bank interest",
+        "and the fact keeps the evidence the decision was made from: {page}"
+    );
+}
+
+/// A category condition does not fire on the operation word, or the reverse.
+///
+/// The two words are separate fields end to end (decision 0020 §2), and a
+/// client reads them as separate fields on the wire. A rule written on one that
+/// matched the other would put them back in one slot where it matters most —
+/// in the owner's own standing decisions.
+#[tokio::test]
+async fn a_rule_on_a_category_leaves_a_row_naming_that_word_as_its_operation_word_open() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": { "source_category": "Bank interest" },
+                "outcome": { "kind": "income", "income_kind": "deposit_interest" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let mut named = filed_row(account, "worded-one");
+    named["source_category"] = Value::Null;
+    named["source_kind"] = json!("Bank interest");
+
+    let (_, asked) = one_row_session(&harness, "march", named).await;
+    assert_eq!(
+        asked["state"], "needs_classification",
+        "the source called the operation this; it did not file the row under \
+         it, and a rule about the second must not decide the first: {asked}"
+    );
+}
+
 /// A session defers everything, and abandoning it leaves the journal untouched.
 #[tokio::test]
 async fn an_abandoned_import_session_writes_nothing_to_the_journal() {

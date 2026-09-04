@@ -1026,8 +1026,9 @@ pub enum Generalisation {
     /// No rule can be built from this row, under any token. A matcher that asks
     /// nothing matches nothing, and an "everything" rule would silently
     /// reclassify the portfolio — so a row carrying no counterparty, no
-    /// description and no word from the source generalises into nothing, and
-    /// there is no call the owner could make that would change that.
+    /// description, no word from the source and no category the source filed it
+    /// under generalises into nothing, and there is no call the owner could make
+    /// that would change that.
     Impossible,
 }
 
@@ -1125,9 +1126,9 @@ pub fn subject_of(
 ///    import of a matching row resolves without asking. See [`may_generalise`]:
 ///    settling this row is import mechanics, and standing rules are the owner's
 ///    judgement. A row that offers nothing to match on — no counterparty, no
-///    description, no word from the source — gets **no** rule either way,
-///    because a matcher that asks nothing matches nothing and an "everything"
-///    rule would silently reclassify the portfolio.
+///    description, no operation word and no category of the source's own —
+///    gets **no** rule either way, because a matcher that asks nothing matches
+///    nothing and an "everything" rule would silently reclassify the portfolio.
 ///
 /// Steps 2 and 3 were the other way round until `iaam-77hk`, and the swap is the
 /// whole of that bead: the answer is the owner's fact and the rule is derived
@@ -4466,7 +4467,7 @@ const fn named_account(answer: Answer) -> Option<AccountId> {
 /// never applies while looking like one that does.
 ///
 /// **One field, not every field the row offers (`iaam-g7yc`).** This used to
-/// fill all three at once, and [`RuleMatcher::matches`] joins present fields
+/// fill every field at once, and [`RuleMatcher::matches`] joins present fields
 /// with «and»: the rule then demanded the counterparty exactly *and* the
 /// source's word exactly *and* the description as a substring — and the
 /// description it was given is the row's **whole** description, so as a
@@ -4482,7 +4483,9 @@ const fn named_account(answer: Answer) -> Option<AccountId> {
 /// something, and a proposal the owner is asked to adopt should have the shape
 /// of a rule somebody would write.
 ///
-/// **Which one, and why in this order.**
+/// **Which one, and why in this order.** Decision 0008 fixed the first three of
+/// these; the third of them is now the fourth, and the reason for the insertion
+/// is under step 3.
 ///
 /// 1. The **counterparty** where the row names one. The classification is a
 ///    claim about who the money moved with — «anything with this counterparty is
@@ -4493,7 +4496,15 @@ const fn named_account(answer: Answer) -> Option<AccountId> {
 ///    exactly against a vocabulary one source controls, and it is what a row
 ///    with no counterparty has instead of one: the bank's word for a movement
 ///    internal to itself is the whole evidence such a row carries.
-/// 3. Otherwise the **description**, which is last because it is the only one
+/// 3. Otherwise the **category the source filed the row under**, added by
+///    `iaam-93lz` and matched exactly against a vocabulary one source controls,
+///    exactly as the word above it is. It comes third rather than second
+///    because it says what the movement was *for* and the question being
+///    generalised is what the movement *was*; it comes before the description
+///    because it is a value out of a closed vocabulary and a description is
+///    prose. The first profile that ships prints no operation-type word at all,
+///    so for its rows this is what step 2 would have been.
+/// 4. Otherwise the **description**, which is last because it is the only one
 ///    matched as a substring and the only one taken whole. A whole description
 ///    is close to unique to its row, so this is barely a generalisation — but it
 ///    is the difference between a rule and none, and the row would otherwise
@@ -4501,8 +4512,8 @@ const fn named_account(answer: Answer) -> Option<AccountId> {
 ///    built from it under any token. That would be false.
 ///
 /// **The trade-off is real and is not resolved in this direction by accident.**
-/// A matcher on one field settles more rows than a matcher on three, and one of
-/// them can be settled wrongly: a source word like the one a bank prints on
+/// A matcher on one field settles more rows than a matcher on several, and one
+/// of them can be settled wrongly: a source word like the one a bank prints on
 /// every transfer would carry a classification onto rows that do not deserve it.
 /// Two things bound that. The proposal is only ever *offered* — it is published
 /// as the body of `POST /v1/classification-rules` for the owner to read, narrow
@@ -4516,24 +4527,34 @@ fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
             counterparty_account: Some(counterparty.to_owned()),
             description_contains: None,
             kind: None,
+            source_category: None,
         }
     } else if let Some(kind) = row.source_kind.clone() {
         RuleMatcher {
             counterparty_account: None,
             description_contains: None,
             kind: Some(kind),
+            source_category: None,
+        }
+    } else if let Some(category) = row.source_category.clone() {
+        RuleMatcher {
+            counterparty_account: None,
+            description_contains: None,
+            kind: None,
+            source_category: Some(category),
         }
     } else {
         RuleMatcher {
             counterparty_account: None,
             description_contains: row.description.clone(),
             kind: None,
+            source_category: None,
         }
     };
-    // Still the last word, and deliberately not replaced by a fourth branch
+    // Still the last word, and deliberately not replaced by one more branch
     // returning `None`: «a matcher that asks nothing is no matcher» is one rule,
     // and it is stated once whatever the field policy above becomes. It is what
-    // answers for the row that prints none of the three.
+    // answers for the row that prints none of the four.
     (!matcher.asks_nothing()).then_some(matcher)
 }
 
@@ -5392,6 +5413,7 @@ mod tests {
                 counterparty_account: Some("Somebody".to_owned()),
                 description_contains: None,
                 kind: None,
+                source_category: None,
             },
             outcome: learned.classification(),
         };
@@ -5480,6 +5502,7 @@ mod tests {
                     counterparty_account: Some("Somebody".to_owned()),
                     description_contains: None,
                     kind: None,
+                    source_category: None,
                 },
                 outcome: Classification::Fee {
                     origin: FeeOrigin::AccountMaintenance,
@@ -5586,6 +5609,7 @@ mod tests {
         let mut row = row(on, "Savings", None);
         row.counterparty = ObservedCounterparty::Unknown;
         row.source_kind = None;
+        row.source_category = None;
         row.description = None;
         row
     }
@@ -5856,8 +5880,70 @@ mod tests {
     /// The one row that still generalises into nothing, unchanged by the field
     /// policy above: a matcher that asks nothing matches nothing.
     #[test]
-    fn a_row_printing_none_of_the_three_proposes_no_matcher() {
+    fn a_row_printing_none_of_the_four_proposes_no_matcher() {
         assert_eq!(matcher_for(&unmatchable(account(1))), None);
+    }
+
+    /// A row whose source named no counterparty and no operation word falls to
+    /// the category it was filed under, ahead of the description.
+    ///
+    /// This is the shape the first profile produces on every row, and under the
+    /// three-field chain it proposed the **whole description** — a condition
+    /// close to unique to the row it was learned from, which is the emptiness
+    /// decision 0008 was written to end.
+    #[test]
+    fn a_row_naming_only_a_category_generalises_on_the_category() {
+        let mut filed = unmatchable(account(1));
+        filed.source_category = Some("Bank interest".to_owned());
+        filed.description = Some("statement line 0001".to_owned());
+
+        let proposed = matcher_for(&filed).expect("a matcher");
+
+        assert_eq!(proposed.source_category.as_deref(), Some("Bank interest"));
+        assert_eq!(
+            proposed.description_contains, None,
+            "the whole description is the last resort, not an addition to the \
+             category"
+        );
+        assert_eq!(proposed.counterparty_account, None);
+        assert_eq!(proposed.kind, None);
+    }
+
+    /// And it recognises the next row filed the same way, which is the only
+    /// thing that makes adopting the proposal worth a call.
+    #[test]
+    fn a_category_proposal_recognises_the_next_row_filed_the_same_way() {
+        let main = account(1);
+        let mut settled = unmatchable(main);
+        settled.source_category = Some("Bank interest".to_owned());
+        settled.description = Some("statement line 0001".to_owned());
+        let proposed = matcher_for(&settled).expect("a matcher");
+
+        let mut later = unmatchable(main);
+        later.source_category = Some("Bank interest".to_owned());
+        later.description = Some("statement line 0002".to_owned());
+        assert!(
+            proposed.matches(&later.subject(None)),
+            "same category, different line: the rule is about how the source \
+             filed it, not about how it spelled the line"
+        );
+    }
+
+    /// The order between the two words the source contributes.
+    ///
+    /// The word for what the operation **was** comes first, because that is the
+    /// question being generalised; the category says what it was **for** and is
+    /// one axis over. A row printing both must propose the word.
+    #[test]
+    fn a_row_printing_both_of_the_sources_words_proposes_the_operation_word() {
+        let mut both = unmatchable(account(1));
+        both.source_kind = Some("credit".to_owned());
+        both.source_category = Some("Bank interest".to_owned());
+
+        let proposed = matcher_for(&both).expect("a matcher");
+
+        assert_eq!(proposed.kind.as_deref(), Some("credit"));
+        assert_eq!(proposed.source_category, None);
     }
 
     #[test]
@@ -5887,6 +5973,7 @@ mod tests {
                     counterparty_account: None,
                     description_contains: None,
                     kind: None,
+                    source_category: None,
                 },
                 outcome: Classification::ExternalFlow,
             }

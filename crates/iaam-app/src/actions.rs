@@ -1804,10 +1804,10 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
             .into_iter()
             .map(|shape| InputAlternative {
                 value: shape.code().to_owned(),
-                // Two of the six name an account, and only those two. The
+                // Two of the shapes name an account, and only those two. The
                 // alternative says so itself rather than the field being marked
-                // required for all six, which would refuse `paid` for want of an
-                // account nothing asked it about.
+                // required for all of them, which would refuse `paid` for want
+                // of an account nothing asked it about.
                 requires: if shape.needs_account() {
                     vec![RequiredInput {
                         pointer: "/account".to_owned(),

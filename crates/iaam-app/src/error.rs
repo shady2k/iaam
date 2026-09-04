@@ -384,8 +384,8 @@ mod tests {
         // The whole point of the variant: `expected` is a sentence and a client
         // that wants to retry would have to parse it. The values are the same
         // fact in a form nothing has to read.
-        let rejection = FieldRejection::new("outcome", "one of four outcomes", "settled")
-            .admitting_codes(&["internal_transfer", "external_flow", "income", "fee"]);
+        let rejection = FieldRejection::new("outcome", "one of the outcomes", "settled")
+            .admitting_codes(&["internal_transfer", "external_flow", "refund", "income", "fee"]);
         assert_eq!(rejection.pointer(), "/outcome");
         assert_eq!(
             rejection
@@ -393,7 +393,7 @@ mod tests {
                 .iter()
                 .map(|alternative| alternative.value.as_str())
                 .collect::<Vec<_>>(),
-            ["internal_transfer", "external_flow", "income", "fee"]
+            ["internal_transfer", "external_flow", "refund", "income", "fee"]
         );
         assert!(rejection.resolutions.is_empty());
         assert_eq!(AppError::from(rejection).code(), "invalid_request");

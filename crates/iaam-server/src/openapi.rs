@@ -62,7 +62,8 @@ use crate::dto::{IntervalFitDto, OwnerBalanceOutcomeDto, QuestionGeneralisationD
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
-    DataQualityStatusDto, NegativeCashClassificationDto, NotComputableCodeDto, VerdictCodeDto,
+    DataQualityStatusDto, NegativeCashClassificationDto, NotComputableCodeDto, ProvidedByDto,
+    VerdictCodeDto,
 };
 
 /// Authentication scheme. Declared separately: `utoipa` generates it
@@ -277,6 +278,7 @@ impl Modify for BearerSecurity {
         VerdictCodeDto,
         NotComputableCodeDto,
         DataQualityStatusDto,
+        ProvidedByDto,
     ))
 )]
 pub struct ApiDoc;

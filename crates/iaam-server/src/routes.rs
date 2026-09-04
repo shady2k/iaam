@@ -16,8 +16,7 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
     AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
-    ActionTarget, InputAlternative, MissingInput, OperationKey, ProvidedBy, RequestPlan,
-    account_scope,
+    ActionTarget, InputAlternative, MissingInput, OperationKey, RequestPlan, account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
@@ -112,6 +111,7 @@ use crate::dto::{
 use crate::dto::OwnerBalanceOutcomeDto;
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
+use crate::vocabulary::ProvidedByDto;
 use iaam_app::scenarios::documents::UploadedDocument;
 use iaam_app::scenarios::import_session::{AccountDirectory, AnswerableQuestion, SessionRevision};
 use iaam_core::batch::ControlSection;
@@ -244,7 +244,7 @@ pub(crate) fn resolution_option_dto(
 fn missing_input_dto(missing: &MissingInput) -> MissingInputDto {
     MissingInputDto {
         pointer: missing.pointer.clone(),
-        provided_by: provided_by_code(missing.provided_by),
+        provided_by: ProvidedByDto::from_domain(&missing.provided_by),
         candidates: missing.candidates.as_deref().map(account_candidate_dtos),
         alternatives: missing
             .alternatives
@@ -268,7 +268,7 @@ pub(crate) fn input_alternative_dto(alternative: &InputAlternative) -> InputAlte
             .iter()
             .map(|required| RequiredInputDto {
                 pointer: required.pointer.clone(),
-                provided_by: provided_by_code(required.provided_by),
+                provided_by: ProvidedByDto::from_domain(&required.provided_by),
                 candidates: required.candidates.as_deref().map(account_candidate_dtos),
             })
             .collect(),
@@ -284,15 +284,6 @@ fn account_candidate_dtos(candidates: &[AccountCandidate]) -> Vec<AccountCandida
             institution: candidate.institution.clone(),
         })
         .collect()
-}
-
-fn provided_by_code(source: ProvidedBy) -> String {
-    match source {
-        ProvidedBy::Owner => "owner",
-        ProvidedBy::ExternalDocument => "external_document",
-        ProvidedBy::Caller => "caller",
-    }
-    .to_owned()
 }
 
 /// List of instruments in the global reference catalogue.

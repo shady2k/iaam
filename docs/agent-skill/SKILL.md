@@ -632,6 +632,14 @@ and do not report each date to the owner separately.
 **Never call `provisional` an error.** It means no independent confirmation has
 arrived yet, which is an ordinary state of a correct journal.
 
+**And never wait for `accepted`.** The verdict vocabulary publishes the word and
+nothing produces it, which its own published sentence now says. A verdict answers
+one write, while whether reconciliation matched is a property of an account, a
+dimension and an interval, folded when a report is read and moved by evidence
+that arrives later. Confirmation is read from the data quality block, as
+`accepted_internal` or `accepted_independent`; the absence of `accepted` from a
+row's verdict says nothing about it either way.
+
 ## A fact can be quoted, a derived value cannot
 
 The key rate, an FX rate and a price as of a date are served as reference

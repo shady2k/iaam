@@ -464,12 +464,68 @@ impl<'a> AccountNames<'a> {
 /// it could not be satisfied by filling in the request it was published on. What
 /// the item gains instead is a sentence naming the shape a row is submitted in,
 /// which is a fact about this API and therefore something the queue may state.
+///
+/// **The axis is where the value comes from, not what it cost to get.** That is
+/// the sentence `iaam-k6l7` went looking for a fourth word for, and it is the
+/// answer to the same question: a figure the owner exported, converted and
+/// restated in another unit is still `ExternalDocument`, because the document
+/// is what holds it and the conversion is how he came to read it. A word for
+/// the derivation would make one field answer two questions — who has the
+/// value, and what must be done before it can be typed — and a caller reading
+/// such a field could no longer tell from it whom to ask. The distinction was
+/// unwritten, which is why it kept being rediscovered as a gap; it is written
+/// here and, more to the point, in the meanings below, because the caller that
+/// needs it reads the contract and not this file.
+///
+/// Published through `provided_by_vocabulary!` below, for the reason the module doc
+/// of `iaam_server::vocabulary` gives: these three codes reached the wire as a
+/// bare `string` with no enumeration and no sentence, which is exactly the
+/// shape that made the fourth word look necessary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvidedBy {
     Owner,
     ExternalDocument,
     Caller,
 }
+
+/// The `provided_by` vocabulary: every variant, its wire code, and what the
+/// code means.
+///
+/// Built like `iaam_ingest::verdict_vocabulary!` and for the same reason: the
+/// three codes used to be written out once here and again as string literals in
+/// the transport, and the contract published neither the list nor a word of
+/// explanation. Pass the name of a macro that accepts
+/// `Variant => "code": "meaning",` arms and it will be called with the whole
+/// list.
+#[macro_export]
+macro_rules! provided_by_vocabulary {
+    ($receiver:path) => {
+        $receiver! {
+            Owner => "owner":
+                "The owner decides or states this himself. It is a choice, a title or a figure that exists nowhere else, and no document and no client can supply it on his behalf.",
+            ExternalDocument => "external_document":
+                "The value is printed on something outside this system — a statement, an export, a contract — and is read off it. It stays this word however much work reading it took: fetching the file, converting it and restating a figure in another unit are steps on the way to the value, not sources of it. This field names who holds the value, not what must be done before it can be typed.",
+            Caller => "caller":
+                "The client fills this in from what it already knows about the transmission — how the rows arrived, which of its own identifiers this is — without putting a question to the owner.",
+        }
+    };
+}
+
+macro_rules! define_provided_by_code {
+    ($($variant:ident => $code:literal : $meaning:literal),+ $(,)?) => {
+        impl ProvidedBy {
+            /// Machine-readable code for the API (§13).
+            #[must_use]
+            pub const fn code(self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $code,)+
+                }
+            }
+        }
+    };
+}
+
+provided_by_vocabulary!(define_provided_by_code);
 
 /// An account the owner can choose for contour membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
